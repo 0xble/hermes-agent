@@ -24,6 +24,18 @@ def _clear_preflight_output_state(agent: Any) -> None:
     agent._ephemeral_output_cap_is_retry_boost = False
 
 
+def _retry_boost_is_active(agent: Any) -> bool:
+    """A truncation continuation must stay larger than the previous request.
+
+    ``_arm_output_ceiling`` writes both the durable ceiling and the one-shot cap.
+    Doing that while a retry boost is armed would make the ceiling helper ignore
+    the boost and send the same undersized request again.
+    """
+    return bool(getattr(agent, "_ephemeral_output_cap_is_retry_boost", False)) and getattr(
+        agent, "_ephemeral_max_output_tokens", None
+    ) is not None
+
+
 def _arm_output_ceiling(agent: Any, shrunk: int) -> bool:
     """Arm a turn output ceiling only when the builder would honor it.
 
@@ -94,14 +106,8 @@ def run_preflight_gate(
     _compressor = agent.context_compressor
     window = getattr(_compressor, "context_length", None)
     can_shrink_output = getattr(agent, "api_mode", None) not in {"codex_app_server", "bedrock_converse"}
-    if (api_messages is not None and isinstance(window, int) and window > 0
-            and can_shrink_output
-            and not request_fits(agent, api_messages, "", wire=True, tools=tools_for_api)):
-        # Input that fits with a useful answer runway only needs a smaller output cap, the
-        # same remedy the provider's "max_tokens too large" clamp applies after a rejection.
-        shrunk = affordable_output_cap(agent, api_messages, tools=tools_for_api)
-        if shrunk is not None and _arm_output_ceiling(agent, shrunk):
-            logger.info("Pre-send fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
+    # The chars/4 pressure figure is not a hard-window measurement. Only an
+    # anchored or checkpoint-pruned native estimate may fail the turn closed.
     _wire_input_tokens = (
         wire_accurate_input_tokens(
             agent, api_messages, tools=tools_for_api,
@@ -109,12 +115,36 @@ def run_preflight_gate(
         )
         if api_messages is not None else None
     )
+    # A restored native checkpoint's usage anchor describes the input that
+    # produced the checkpoint, not its pruned replay. The one-response latch
+    # defers that figure until the issuer returns real usage. The adapter's
+    # checkpoint-pruned estimate is the payload actually sent, so it stays.
+    _awaiting_checkpoint_usage = bool(getattr(
+        _compressor, "awaiting_real_usage_after_compression", False
+    ))
+    _native_wire_tokens = (
+        _wire_input_tokens if not getattr(agent, "_request_pressure_anchored", False) else None
+    )
+    if (api_messages is not None and isinstance(window, int) and window > 0
+            and can_shrink_output
+            and _wire_input_tokens is not None
+            and not _retry_boost_is_active(agent)
+            and not request_fits(
+                agent, api_messages, "", wire=True, tools=tools_for_api,
+                input_tokens=_wire_input_tokens,
+            )):
+        # Input that fits with a useful answer runway only needs a smaller output cap, the
+        # same remedy the provider's "max_tokens too large" clamp applies after a rejection.
+        shrunk = affordable_output_cap(agent, api_messages, tools=tools_for_api)
+        if shrunk is not None and _arm_output_ceiling(agent, shrunk):
+            logger.info("Pre-send fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
     _hard_window_preflight = (
-        _wire_input_tokens is not None and isinstance(window, int) and window > 0
+        _native_wire_tokens is not None and isinstance(window, int) and window > 0
         and getattr(agent, "api_mode", None) != "codex_app_server"
+        and not _awaiting_checkpoint_usage
         and not request_fits(
             agent, api_messages, "", wire=True, tools=tools_for_api,
-            input_tokens=_wire_input_tokens,
+            input_tokens=_native_wire_tokens,
         )
     )
     if _hard_window_preflight:
@@ -128,7 +158,7 @@ def run_preflight_gate(
             system_message=system_message, user_message=user_message,
             max_compression_attempts=max_compression_attempts, effective_task_id=effective_task_id,
         )
-        if result.action in {"break", "return"}:
+        if result.action in {"break", "return"} and not _retry_boost_is_active(agent):
             _clear_preflight_output_state(agent)
         return result
 
@@ -167,13 +197,15 @@ def run_preflight_gate(
         # An anchored figure is real usage + delta: never deferred. Only a whole-context rough
         # estimate waits for the provider's count.
         defer_preflight=(
-            (lambda _t: False) if getattr(agent, "_request_pressure_anchored", False)
+            (lambda _t: True)
+            if _awaiting_checkpoint_usage and not getattr(agent, "_request_pressure_anchored", False)
+            else (lambda _t: False) if getattr(agent, "_request_pressure_anchored", False)
             else getattr(_compressor, "should_defer_preflight_to_real_usage", lambda _t: False)
         ),
         moa_prepared_request=_moa_prepared_request, system_message=system_message,
         user_message=user_message, max_compression_attempts=max_compression_attempts,
         effective_task_id=effective_task_id,
     )
-    if result.action in {"break", "return"}:
+    if result.action in {"break", "return"} and not _retry_boost_is_active(agent):
         _clear_preflight_output_state(agent)
     return result

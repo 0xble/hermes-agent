@@ -97,7 +97,7 @@ def test_ceiling_arms_and_request_continues(monkeypatch):
 
 
 def test_recovery_compacts_then_continues(monkeypatch):
-    agent = _agent()
+    agent = _agent(_request_pressure_anchored=False)
     small = [{"role": "user", "content": "z"}]
     agent._compress_context = MagicMock(return_value=(small, "sys2"))
     _fits_when(monkeypatch, lambda _a, m: len(m) == 1)
@@ -111,7 +111,8 @@ def test_recovery_compacts_then_continues(monkeypatch):
 
 
 def test_hard_window_fail_closed_retains_session(monkeypatch):
-    agent = _agent(compression_enabled=False, _preflight_output_ceiling=2_000)
+    agent = _agent(compression_enabled=False, _preflight_output_ceiling=2_000,
+                   _request_pressure_anchored=False)
     _fits_when(monkeypatch, lambda *_: False)
     v = _gate(agent)
     assert v.action == "return"
@@ -127,7 +128,7 @@ def test_hard_window_fail_closed_retains_session(monkeypatch):
 
 
 def test_no_progress_compaction_fails_closed_as_retained(monkeypatch):
-    agent = _agent()
+    agent = _agent(_request_pressure_anchored=False)
     agent._compress_context = MagicMock(side_effect=lambda m, *_a, **_k: (m, "sys"))
     _fits_when(monkeypatch, lambda *_: False)
     v = _gate(agent, attempts=2, max_attempts=3)
@@ -139,7 +140,7 @@ def test_no_progress_compaction_fails_closed_as_retained(monkeypatch):
 
 
 def test_lock_deferral_returns_compression_deferred(monkeypatch):
-    agent = _agent()
+    agent = _agent(_request_pressure_anchored=False)
 
     def _lock_skip(messages, *_a, **_k):
         agent._compression_skipped_due_to_lock = LOCK_HOLDER
@@ -157,9 +158,12 @@ def test_lock_deferral_returns_compression_deferred(monkeypatch):
 
 
 def test_cooldown_returns_compression_deferred(monkeypatch):
-    agent = _agent(context_compressor=_compressor(
-        get_active_compression_failure_cooldown=lambda: 30.0,
-    ))
+    agent = _agent(
+        _request_pressure_anchored=False,
+        context_compressor=_compressor(
+            get_active_compression_failure_cooldown=lambda: 30.0,
+        ),
+    )
     agent._compress_context = MagicMock()
     _fits_when(monkeypatch, lambda *_: False)
     v = _gate(agent)
@@ -205,6 +209,44 @@ def test_codex_responses_prices_only_caps_sent_by_transport(provider, base_url, 
                             _ephemeral_max_output_tokens=None, _preflight_output_ceiling=None,
                             provider=provider, base_url=base_url)
     assert effective_wire_max_output_tokens(agent) == expected
+
+
+def test_checkpoint_latch_prefers_native_wire_over_stale_anchor(monkeypatch):
+    import agent.codex_responses_adapter as adapter
+
+    monkeypatch.setattr(adapter, "estimate_native_responses_preflight_tokens", lambda *_a, **_k: 7_000)
+    agent = SimpleNamespace(
+        _request_pressure_anchored=True,
+        context_compressor=SimpleNamespace(awaiting_real_usage_after_compression=True),
+    )
+    assert fit.wire_accurate_input_tokens(agent, _BIG, request_pressure_tokens=180_000) == 7_000
+
+
+def test_checkpoint_latch_does_not_fail_closed_on_stale_anchor(monkeypatch):
+    agent = _agent(
+        api_mode="codex_responses",
+        context_compressor=_compressor(awaiting_real_usage_after_compression=True),
+    )
+    agent._compress_context = MagicMock()
+    _fits_when(monkeypatch, lambda *_: False, wire_tokens=180_000)
+    v = _gate(agent, pressure=180_000)
+    assert v.action == "fallthrough"
+    agent._compress_context.assert_not_called()
+
+
+def test_rough_pressure_does_not_fail_closed_without_wire_measurement(monkeypatch):
+    """A chars/4 pressure figure can trigger ordinary compression, not a hard abort."""
+    agent = _agent(
+        _request_pressure_anchored=False,
+        context_compressor=_compressor(should_compress=lambda tokens: tokens >= 100),
+    )
+    agent._compress_context = MagicMock(return_value=([{"role": "user", "content": "z"}], "sys"))
+    monkeypatch.setattr(fit, "wire_accurate_input_tokens", lambda *_a, **_k: None)
+    monkeypatch.setattr(fit, "request_fits", lambda *_a, **_k: True)
+    v = _gate(agent, pressure=200)
+    assert v.action == "continue"
+    assert v.result is None
+    agent._compress_context.assert_called_once()
 
 
 def test_length_retry_boost_is_not_reclamped_by_stale_ceiling():

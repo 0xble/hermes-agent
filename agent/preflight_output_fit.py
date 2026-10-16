@@ -74,12 +74,24 @@ def wire_accurate_input_tokens(
     A fresh usage anchor (real ``prompt_tokens`` plus delta) or the checkpoint-pruned
     native payload estimate is accurate enough to fail closed on. The generic
     chars/4 heuristic is not: it may only lower the output cap or wait for real usage.
+
+    A native checkpoint is one exception: the adapter's estimate is the payload the
+    next request actually sends, including the current turn. An older usage anchor can
+    describe the input that produced the checkpoint rather than its pruned replay, so
+    the native figure wins while the one-response deferral latch is armed.
     """
+    native = _native_wire_tokens(agent, messages, tools)
+    if native is not None and bool(getattr(
+        getattr(agent, "context_compressor", None),
+        "awaiting_real_usage_after_compression",
+        False,
+    )):
+        return native
     if getattr(agent, "_request_pressure_anchored", False) is True and isinstance(
         request_pressure_tokens, int
     ) and not isinstance(request_pressure_tokens, bool) and request_pressure_tokens >= 0:
         return request_pressure_tokens
-    return _native_wire_tokens(agent, messages, tools)
+    return native
 
 
 def request_fits(

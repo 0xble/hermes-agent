@@ -259,10 +259,18 @@ def _preflight_compression(
         # snapshot may arm the interrupted-turn rollback.
         if isinstance(_snapshot_val, int) and not isinstance(_snapshot_val, bool):
             agent._turn_preflight_display_snapshot = _snapshot_val
-    # An anchored figure is real usage + delta: never deferred.
-    _preflight_deferred = not getattr(agent, "_request_pressure_anchored", False) and getattr(
-        _compressor, "should_defer_preflight_to_real_usage", lambda _tokens: False
-    )(_preflight_tokens)
+    _preflight_deferred = (
+        (
+            bool(getattr(_compressor, "awaiting_real_usage_after_compression", False))
+            and not getattr(agent, "_request_pressure_anchored", False)
+        )
+        or (
+            not getattr(agent, "_request_pressure_anchored", False)
+            and getattr(
+                _compressor, "should_defer_preflight_to_real_usage", lambda _tokens: False
+            )(_preflight_tokens)
+        )
+    )
     _codex_native_auto = _codex_native_auto_compaction(agent)
 
     if not _preflight_deferred:

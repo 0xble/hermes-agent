@@ -1213,6 +1213,12 @@ def _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry):
         agent, api_messages, active_system_prompt)
     _retry.primary_recovery_attempted = False
     _retry.restart_with_rebuilt_messages = True
+    # The previous route's usage no longer describes the rebuilt request. A
+    # compaction latch armed before the switch must not defer the new route's
+    # first preflight; its first usage reading rearms the latch if needed.
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        compressor.awaiting_real_usage_after_compression = False
     return active_system_prompt
 
 
