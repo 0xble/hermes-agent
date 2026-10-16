@@ -104,11 +104,9 @@ def request_fits(
     window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
         return False
-    from agent.chat_completion_helpers import effective_wire_max_output_tokens, selected_max_output_tokens
+    from agent.chat_completion_helpers import effective_wire_max_output_tokens
 
-    cap, enforced = effective_wire_max_output_tokens(agent)
-    if not enforced:
-        cap = selected_max_output_tokens(agent)
+    cap, _enforced = effective_wire_max_output_tokens(agent)
     output = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else 0
     if input_tokens is None:
         input_tokens = _request_input_tokens(agent, messages, prompt, wire=wire, tools=tools)
