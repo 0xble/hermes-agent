@@ -167,9 +167,9 @@ def vault(action, args):
         if not items:
             ref = "browser_vault_save_login" if ARM == "base" else "browser_vault action=save_login"
             out["hint"] = (f"No saved logins. On a login page, type a password fetched from an authorized store, "
-                           f"or call {ref} to ask the user to save one. A value explicitly supplied by Brian or "
-                           "displayed by the service's own verification UI may be typed into its matching field. "
-                           "Never repeat a secret or ask for one in chat.")
+                           f"or call {ref} to ask the user to save one. A one-time code explicitly supplied by the "
+                           "authorized user or displayed by the service's own verification UI may be typed into its "
+                           "matching field. Never repeat a secret or ask for one in chat.")
         return json.dumps(out)
     if action == "fill":
         if not any(i["handle"] == (args or {}).get("handle") for i in items) or STATE["page"] not in ("login", "bad_password"):

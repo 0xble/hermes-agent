@@ -555,13 +555,20 @@ class TestBrowserRetrievalHints:
         assert "may be typed" in rendered["browser_type"]
         assert "Never type a password, card number, CVC or code" not in rendered["browser_type"]
         assert "card number" in rendered["browser_type"]
-        assert "supplied by Brian" in rendered["browser_type"]
+        assert "supplied by the authorized user" in rendered["browser_type"]
         assert "service's own verification UI" in rendered["browser_type"]
+        assert "exact charge" in rendered["browser_type"]
+        assert "routed card" in rendered["browser_type"]
+        assert "declined or unanswered card confirmation" in rendered["browser_type"]
+        assert "must not be repeated" in rendered["browser_type"]
         assert "mailbox, or phone" in rendered["browser_vault"]
         assert "Never type, ask for or repeat a password" not in rendered["browser_vault"]
         assert "card numbers and CVCs in vault fills" not in rendered["browser_vault"]
-        assert "supplied by Brian" in rendered["browser_vault"]
+        assert "supplied by the authorized user" in rendered["browser_vault"]
         assert "service's own verification UI" in rendered["browser_vault"]
+        assert "exact charge" in rendered["browser_vault"]
+        assert "routed card" in rendered["browser_vault"]
+        assert "never retry or route around payment_declined" in rendered["browser_vault"]
 
 
 def test_tool_defs_cache_key_sees_config_replacement_with_pinned_mtime(tmp_path):

@@ -79,6 +79,13 @@ class TestBuildToolPreview:
         assert safe_args["ref"] == "@e3"
         assert safe_args["text"].startswith("ghp_AB")
 
+    def test_browser_type_display_redacts_payment_and_short_numeric_secrets(self):
+        pan = "4242424242424242"
+        pan_args = redact_tool_args_for_display("browser_type", {"text": pan})
+        cvc_args = redact_tool_args_for_display("browser_type", {"text": "123"})
+        assert pan_args is not None and pan_args["text"] == "[REDACTED]"
+        assert cvc_args is not None and cvc_args["text"] == "[REDACTED]"
+
 
 
 

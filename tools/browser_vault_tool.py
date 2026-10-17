@@ -436,10 +436,10 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
                        "No saved logins. On a login page, type a password you fetched yourself from an authorized store "
                        "for that service (credential CLI or 1Password CLI), or call browser_vault_save_login to ask the "
                        "user to save one. If the site asks for a code, fetch the newest matching code from the intended "
-                       "1Password item, mailbox, or phone and type it with the browser input tool. A value explicitly "
-                       "supplied by Brian or displayed by the service's own verification UI may also be entered in its "
-                       "matching field. Never repeat a secret in a reply, file, log, or memory, and preserve the exact "
-                       "origin and target field.")
+                       "1Password item, mailbox, or phone and type it with the browser input tool. A one-time code "
+                       "explicitly supplied by the authorized user or displayed by the service's own verification UI may "
+                       "also be entered in its matching field. Never repeat a secret in a reply, file, log, or memory, and "
+                       "preserve the exact origin and target field.")
     if locked:
         out["locked"] = locked
     if errors:
@@ -837,7 +837,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     if retry_key is not None and _payment_retry_blocked(retry_key):
         _discard_fill_metadata()
         return json.dumps({"success": False, "error_type": "payment_retry_refused",
-                           "error": "Card confirmation was declined or unanswered on this origin. Do not retry without reconciling the payment state or obtaining fresh approval."})
+                           "error": "Card confirmation was declined or unanswered on this origin. Do not retry or route around it with browser input. Do not proceed without fresh approval for the exact charge and payment-state reconciliation."})
 
     # ── Inspect + classify page controls ────────────────────────────────────
     def _inspect_page() -> tuple[str, list[ClassifiedLoginControl]] | str:
@@ -872,8 +872,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 # processor frame lands here too: without a card-number target the fill cannot pay.
                 return json.dumps({"success": False, "error_type": "no_payment_fields", "error": (
                     "No card number field was found on the current page. Card inputs may be inside a payment "
-                    "processor's embedded frame. Inspect the frame with the supported browser input tools or use "
-                    "the named saved-wallet route; do not treat this vault-inspection result as a card-entry handoff.")})
+                    "processor's embedded frame. After current approval for the exact charge and selection of the "
+                    "routed card, inspect the frame with the supported browser input tools or use the named saved-wallet "
+                    "route; do not treat this vault-inspection result as a card-entry handoff.")})
             return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
         return nonce, classified
 
@@ -904,7 +905,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                                "error_type": "payment_declined" if decision == "decline" else "payment_prompt_unanswered",
                                "error": ("The user declined this payment card." if decision == "decline" else
                                          "The payment card prompt went unanswered.") +
-                                        " Do not retry without fresh approval and payment-state reconciliation."})
+                                        " Do not retry or route around this result with browser input. A fresh exact-charge approval through the payment approval surface and payment-state reconciliation are required before any new attempt."})
         inspected = _inspect_page()
         if isinstance(inspected, str):
             _discard_fill_metadata()
@@ -1132,12 +1133,13 @@ BROWSER_VAULT_SCHEMA = {
         "Hermes saves and fills it); enter_code (a one-time/2FA code after the password: generated from a saved "
         "authenticator key when available; otherwise fetch the newest matching code from the intended 1Password item, "
         "mailbox, or phone and type it with the browser input tool, calling enter_code only when no such source exists; "
-        "a code explicitly supplied by Brian or displayed by the service's own verification UI may also be typed into "
+        "a code explicitly supplied by the authorized user or displayed by the service's own verification UI may also be typed into "
         "its matching field. no_code_field means use a stored 1Password passkey through the canonical-origin browser/"
         "system prompt or try the issuer's web/desktop approval and email/SMS/TOTP alternatives; hand off only a phone-only "
         "approval, hardware security key, or Touch ID/Face ID sensor read); unlock (backend: ask the user to unlock "
-        "1Password/Bitwarden). Never repeat a secret in a reply, file, log, or memory. Stop on save_declined; never "
-        "retry payment_declined."
+        "1Password/Bitwarden). Payment values require current approval for the exact charge and the selected routed "
+        "card. Never repeat a secret in a reply, file, log, or memory. Stop on save_declined; never retry or route "
+        "around payment_declined with browser input."
     ),
     "parameters": {
         "type": "object",

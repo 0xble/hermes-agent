@@ -50,6 +50,24 @@ def test_browser_type_keeps_normal_text_in_output(monkeypatch):
     assert mock_run.call_args.args[2] == ["@search", text]
 
 
+def test_browser_type_redacts_payment_values_in_output(monkeypatch):
+    monkeypatch.delenv("CAMOFOX_URL", raising=False)
+    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    pan = "4242424242424242"
+
+    with patch(
+        "tools.browser_tool_session._run_browser_command",
+        return_value={"success": True},
+    ) as mock_run:
+        result = json.loads(browser_type("@card", pan, task_id="redaction-test"))
+
+    assert result["success"] is True
+    assert result["typed"] == "[REDACTED]"
+    assert pan not in json.dumps(result)
+    mock_run.assert_called_once()
+    assert mock_run.call_args.args[2] == ["@card", pan]
+
+
 def test_browser_type_failure_redacts_api_key_in_error(monkeypatch):
     monkeypatch.delenv("CAMOFOX_URL", raising=False)
     monkeypatch.delenv("BROWSER_CDP_URL", raising=False)

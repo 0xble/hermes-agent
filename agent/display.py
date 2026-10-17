@@ -305,6 +305,32 @@ def _read_file_line_label(args: dict) -> str:
     return f"L{offset}-{offset + limit - 1}" if isinstance(limit, int) and limit > 1 else f"L{offset}"
 
 
+def _luhn_valid(digits: str) -> bool:
+    """Return whether a digit string passes the payment-card checksum."""
+    if not digits.isdigit() or not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    parity = len(digits) % 2
+    for index, digit in enumerate(digits):
+        value = int(digit)
+        if index % 2 == parity:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
+def _redact_browser_typed_value(typed_text: Any) -> str:
+    """Redact ordinary secret patterns plus numeric OTP/CVC/PAN values."""
+    needle = "" if typed_text is None else str(typed_text)
+    redacted = redact_sensitive_text(needle, force=True) if needle else needle
+    compact = re.sub(r"[ -]", "", needle)
+    if compact.isdigit() and (len(compact) in {3, 4} or _luhn_valid(compact)):
+        return "[REDACTED]"
+    return redacted
+
+
 def redact_browser_typed_text_for_display(value: Any, typed_text: Any) -> Any:
     """Replace every occurrence of a secret-looking browser_type value with its redacted form.
 
@@ -313,7 +339,7 @@ def redact_browser_typed_text_for_display(value: Any, typed_text: Any) -> Any:
     ``security.redact_secrets``: a leaked typed credential is a security boundary.
     """
     needle = "" if typed_text is None else str(typed_text)
-    redacted = redact_sensitive_text(needle, force=True) if needle else needle
+    redacted = _redact_browser_typed_value(typed_text)
     if redacted == needle:
         return value
     if isinstance(value, str):
@@ -332,7 +358,7 @@ def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | No
     if not isinstance(args, dict):
         return args
     if tool_name == "browser_type" and isinstance(args.get("text"), str):
-        return {**args, "text": redact_sensitive_text(args["text"], force=True)}
+        return {**args, "text": _redact_browser_typed_value(args["text"])}
     return args
 
 
