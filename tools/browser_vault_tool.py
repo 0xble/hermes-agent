@@ -417,7 +417,10 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
-                entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
+                entry["two_factor"] = ("automatic" if meta.has_otp else
+                                        "automatic if the manager stores a TOTP seed, else fetch the newest matching code "
+                                        "from the intended 1Password item, mailbox, or phone; ask the user only when no "
+                                        "supported source exists")
             if meta.identifier:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type
