@@ -253,6 +253,7 @@ class GatewayConfigLoadersMixin:
         """The session's explicit ``/reasoning`` pick, or ``None`` when it runs on config."""
         if not session_key:
             return None
+        self._apply_pending_bulk_reset_if_idle(session_key)
         _r_state = self._peek_session_state(session_key)
         if _r_state is not None and _r_state.conversation.reasoning_override is not None:
             return _r_state.conversation.reasoning_override

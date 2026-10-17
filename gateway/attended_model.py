@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
+from agent.i18n import t
+
 logger = logging.getLogger("gateway.attended_model")
 
 _RELAY_HEADER_RE = re.compile(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]")
@@ -40,6 +42,46 @@ _AUTOMATION_KINDS = {
     "process", "process_complete", "process_notification", "relay", "relay_delivery", "relay_fyi",
     "subagent", "system", "synthetic",
 }
+
+
+_KNOWN_MODEL_FAMILIES = {"claude", "gemini", "gpt", "llama", "mistral", "qwen", "deepseek", "glm"}
+
+
+def friendly_model_name(model: str) -> str:
+    """Return a short card label for a model id, preserving unknown ids verbatim."""
+    raw = str(model or "").strip()
+    if not raw:
+        return raw
+    candidate = raw.rsplit("/", 1)[-1]
+    if ":" in candidate:
+        prefix, suffix = candidate.split(":", 1)
+        if prefix.lower() in _KNOWN_MODEL_FAMILIES or prefix.lower().startswith("custom"):
+            candidate = suffix
+    lower = candidate.lower()
+    if lower.startswith("claude-"):
+        parts = candidate.split("-")[1:]
+        if parts and parts[-1].isdigit() and len(parts) >= 2 and parts[-2].isdigit():
+            parts = parts[:-2] + [f"{parts[-2]}.{parts[-1]}"]
+        return " ".join(part.capitalize() for part in parts)
+    if lower.startswith("gpt-"):
+        parts = candidate.split("-")[1:]
+        if parts:
+            first = f"GPT-{parts.pop(0)}"
+            return " ".join([first, *(part.capitalize() for part in parts)])
+    if lower.startswith("gemini-"):
+        return "Gemini " + " ".join(part.capitalize() for part in candidate.split("-")[1:])
+    if lower in {"opus", "sonnet", "haiku"}:
+        return candidate.capitalize()
+    return raw
+
+
+def format_attended_switch_notice(model: str, effort: str) -> str:
+    """Render the one-shot attended switch-in status card."""
+    return t(
+        "gateway.model.attended_switched",
+        model=friendly_model_name(model),
+        effort=effort or "none",
+    )
 
 
 @dataclass(frozen=True)

@@ -470,11 +470,15 @@ class ModelFlagParseResult:
     force_refresh: bool = False
     is_session: bool = False
     is_once: bool = False
+    is_all: bool = False
 
 
 # --- Flag parsing
 
-_BOOL_FLAGS = {"--global": "is_global", "--session": "is_session", "--refresh": "force_refresh", "--once": "is_once"}
+_BOOL_FLAGS = {
+    "--global": "is_global", "--session": "is_session", "--refresh": "force_refresh",
+    "--once": "is_once", "--all": "is_all",
+}
 _VALUE_FLAGS = {"--provider": "explicit_provider", "--reasoning": "reasoning_effort"}
 
 
@@ -483,8 +487,9 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     ``--refresh``, ``--once``.
 
     ``--once`` is parsed here but interpreted by each caller (each frontend has its own
-    live-session restore hook). ``is_global`` / ``is_session`` are raw flag presences; the
-    effective persistence decision belongs to :func:`resolve_persist_behavior`. ``reasoning_effort``
+    live-session restore hook). ``--all`` is an administrative reset modifier handled by the gateway;
+    other surfaces must reject it rather than treating it as a model id. ``is_global`` / ``is_session`` are raw
+    flag presences; the effective persistence decision belongs to :func:`resolve_persist_behavior`. ``reasoning_effort``
     is the raw level word (validated by :func:`hermes_constants.parse_reasoning_effort` at apply
     time) so a model pick and its effort travel as ONE request on every surface."""
     # Telegram/iOS auto-convert ``--`` to an em/en dash: normalize a single Unicode dash before
@@ -576,6 +581,7 @@ class ModelSwitchRequest:
     is_global: bool = False
     is_session: bool = False
     is_once: bool = False
+    is_all: bool = False
     force_refresh: bool = False
     scope: str = "default"
     errors: tuple = ()
@@ -614,7 +620,7 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
     return ModelSwitchRequest(
         raw=raw, target=parsed.model_input, scope=scope, errors=tuple(errors),
         **{f: getattr(parsed, f)
-           for f in ("explicit_provider", "reasoning_effort", "is_global", "is_session", "is_once", "force_refresh")})
+           for f in ("explicit_provider", "reasoning_effort", "is_global", "is_session", "is_once", "is_all", "force_refresh")})
 
 
 def _effective_model_candidate(value: Any) -> str:

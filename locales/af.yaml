@@ -51,6 +51,7 @@ gateway:
   model:
     error_prefix: "Fout: {error}"
     switched: "Model verander na `{model}`"
+    attended_switched: "🤖 Model switched to `{model}` · {effort}"
     provider_label: "Verskaffer: {provider}"
     context_label: "Konteks: {tokens} tokens"
     max_output_label: "Maks. uitvoer: {tokens} tokens"
@@ -67,6 +68,9 @@ gateway:
     usage_switch_provider: "`/model <name> --provider <slug>` — verander verskaffer"
     usage_persist: "`/model <name> --global` — stoor permanent"
     reset_done: "✓ Model override reset."
+    reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    reset_all_usage: "Usage: `/model reset --all`"
+    reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "Hierdie gateway loop kode van {boot_rev}, maar die uitcheck op skyf is nou {disk_rev}. Om modelle te wissel kan 'n verouderde-module-omval veroorsaak — herbegin die gateway om die nuwe kode te laai: hermes gateway restart"
     err_switch_failed: "Modelwisseling na {model} het misluk ({error}); bly op {current}."
     err_config_not_updated: "config.yaml nie opgedateer nie ({error})"

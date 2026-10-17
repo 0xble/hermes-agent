@@ -51,6 +51,7 @@ gateway:
   model:
     error_prefix: "오류: {error}"
     switched: "모델이 `{model}`(으)로 전환되었습니다"
+    attended_switched: "🤖 Model switched to `{model}` · {effort}"
     provider_label: "제공자: {provider}"
     context_label: "컨텍스트: {tokens} 토큰"
     max_output_label: "최대 출력: {tokens} 토큰"
@@ -67,6 +68,9 @@ gateway:
     usage_switch_provider: "`/model <name> --provider <slug>` — 제공자 전환"
     usage_persist: "`/model <name> --global` — 영구 저장"
     reset_done: "✓ Model override reset."
+    reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    reset_all_usage: "Usage: `/model reset --all`"
+    reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "이 게이트웨이는 {boot_rev} 코드로 실행 중인데 디스크의 체크아웃은 현재 {disk_rev}이에요. 지금 모델을 전환하면 오래된 모듈 때문에 충돌할 수 있어요. 새 코드를 불러오려면 게이트웨이를 재시작하세요: hermes gateway restart"
     err_switch_failed: "{model}(으)로 모델 전환에 실패했어요({error}). {current}을(를) 계속 사용해요."
     err_config_not_updated: "config.yaml이 업데이트되지 않았어요({error})"

@@ -26,6 +26,7 @@ def test_provider_flag_and_scopes():
     assert parse_model_switch_args("sonnet \u2013session").scope == "session"  # iOS/Telegram en-dash
     assert parse_model_switch_args("sonnet --once").scope == "once"
     assert parse_model_switch_args("--refresh").force_refresh is True
+    assert parse_model_switch_args("reset --all").is_all is True
 
 
 def test_once_with_global_conflict():

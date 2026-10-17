@@ -41,7 +41,9 @@ from gateway.session import (
     build_session_context,
 )
 from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
-from gateway.attended_model import is_active, parse_attended_config, resolve_attended_model
+from gateway.attended_model import (
+    format_attended_switch_notice, is_active, parse_attended_config, resolve_attended_model,
+)
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
@@ -372,7 +374,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             ).get("effort", "") or "none"
             self._handoff_attended_state(
                 session_key,
-                conversation={"pending_attended_notice": f"↻ {target_model} · {effort}"},
+                conversation={
+                    "pending_attended_notice": format_attended_switch_notice(target_model, effort),
+                },
             )
         return route
 

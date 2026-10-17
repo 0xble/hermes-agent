@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
 from gateway.attended_model import (
+    format_attended_switch_notice,
+    friendly_model_name,
     is_active,
     is_genuine_user_message,
     parse_attended_config,
@@ -98,6 +100,14 @@ def test_precedence_once_session_temporary_attended_default():
     state.pop("temporary_model")
     assert resolve_attended_model(state, 1001, cfg).model == "attended"
     assert resolve_attended_model({"default_model": "default", "default_provider": "p"}, 1001, cfg).model == "default"
+
+
+def test_attended_switch_notice_uses_card_style_and_friendly_name():
+    assert friendly_model_name("claude-opus-5-5") == "Opus 5.5"
+    assert friendly_model_name("gpt-6-astra") == "GPT-6 Astra"
+    assert format_attended_switch_notice("claude-opus-5-5", "high") == (
+        "🤖 Model switched to `Opus 5.5` · high"
+    )
 
 
 def test_channel_model_is_default_but_attended_beats_it():

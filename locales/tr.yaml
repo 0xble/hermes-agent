@@ -51,6 +51,7 @@ gateway:
   model:
     error_prefix: "Hata: {error}"
     switched: "Model `{model}` olarak değiştirildi"
+    attended_switched: "🤖 Model switched to `{model}` · {effort}"
     provider_label: "Sağlayıcı: {provider}"
     context_label: "Bağlam: {tokens} token"
     max_output_label: "Maks. çıktı: {tokens} token"
@@ -67,6 +68,9 @@ gateway:
     usage_switch_provider: "`/model <name> --provider <slug>` — sağlayıcıyı değiştir"
     usage_persist: "`/model <name> --global` — kalıcı kaydet"
     reset_done: "✓ Model override reset."
+    reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    reset_all_usage: "Usage: `/model reset --all`"
+    reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "Bu gateway {boot_rev} sürümünün kodunu çalıştırıyor ancak diskteki checkout artık {disk_rev}. Model değiştirmek eski modül çökmesi riski taşır — yeni kodu yüklemek için gateway'i yeniden başlatın: hermes gateway restart"
     err_switch_failed: "{model} modeline geçiş başarısız oldu ({error}); {current} modelinde kalınıyor."
     err_config_not_updated: "config.yaml güncellenmedi ({error})"

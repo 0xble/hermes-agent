@@ -141,8 +141,26 @@ class GatewayAgentCacheMixin:
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
+    def _apply_pending_bulk_reset_if_idle(self, session_key: str) -> None:
+        """Finish a bulk reset deferred while this session's agent was mid-turn."""
+        pending = getattr(self, "_bulk_reset_pending_sessions", None)
+        if not isinstance(pending, set) or session_key not in pending:
+            return
+        if session_key in (getattr(self, "_running_agents", {}) or {}):
+            return
+        pending.discard(session_key)
+        self._session_model_overrides.pop(session_key, None)
+        self._session_reasoning_overrides.pop(session_key, None)
+        state = self._peek_session_state(session_key)
+        if state is not None:
+            state.conversation.model_override = None
+            state.conversation.reasoning_override = None
+            state.conversation.model_override_scope = "session"
+            state.conversation.reasoning_override_scope = "session"
+
     def _session_model_override(self, session_key: str) -> Optional[dict]:
         """Current in-memory /model override for ``session_key`` (None when absent)."""
+        self._apply_pending_bulk_reset_if_idle(session_key)
         state = self._peek_session_state(session_key)
         return state.conversation.model_override if state else None
 

@@ -648,6 +648,52 @@ class GatewayModelCommandsMixin:
             event=event, command="model", title=warning.title, message=message, handler=_on_cost_confirm,
         )
 
+    def _model_reset_all_is_authorized(self, source) -> bool:
+        """Require an explicit gateway admin; without slash gating, use the configured DM owner list."""
+        from gateway.slash_access import policy_for_runner_source
+
+        policy = policy_for_runner_source(self, source)
+        if policy.enabled:
+            return bool(policy.is_admin(getattr(source, "user_id", None)))
+        chat_type = str(getattr(source, "chat_type", "") or "").lower()
+        if chat_type not in {"dm", "direct", "private"}:
+            return False
+        adapter = (getattr(self, "adapters", {}) or {}).get(getattr(source, "platform", None))
+        configured = getattr(adapter, "_allow_from", None) or getattr(adapter, "allow_from", None)
+        if configured is None:
+            return False
+        return str(getattr(source, "user_id", "")) in {str(value) for value in configured}
+
+    async def _reset_all_session_overrides(self) -> int:
+        """Clear persisted and in-memory model/reasoning picks without changing a live turn's route."""
+        keys: set[str] = set()
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            with contextlib.suppress(Exception):
+                keys.update(await asyncio.to_thread(store.override_session_keys))
+        for mapping_name in ("_session_model_overrides", "_session_reasoning_overrides"):
+            with contextlib.suppress(Exception):
+                keys.update(getattr(self, mapping_name, {}).keys())
+        running = set((getattr(self, "_running_agents", {}) or {}).keys())
+        pending = getattr(self, "_bulk_reset_pending_sessions", None)
+        if not isinstance(pending, set):
+            pending = self._bulk_reset_pending_sessions = set()
+        for session_key in sorted(keys):
+            if session_key in running:
+                pending.add(session_key)
+            await self._persist_session_model_override(session_key, None, scope="session")
+            self._set_reasoning_override(session_key, None, scope="session")
+            with contextlib.suppress(Exception):
+                state = self._peek_session_state(session_key)
+                if state is not None:
+                    state.conversation.model_override = None
+                    state.conversation.model_override_scope = "session"
+                    state.conversation.reasoning_override = None
+                    state.conversation.reasoning_override_scope = "session"
+            if session_key not in running:
+                self._evict_cached_agent(session_key)
+        return len(keys)
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model. Taken under the switch lock BEFORE the first await so
         concurrent commands commit in issue order (see ``_model_switch_lock``)."""
@@ -675,6 +721,20 @@ class GatewayModelCommandsMixin:
         # Check for session override. See #30479.
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(source)
+        if request.is_all:
+            if (
+                request.target.strip().lower() != "reset"
+                or request.explicit_provider
+                or request.reasoning_effort
+                or request.is_global
+                or request.is_session
+                or request.is_once
+            ):
+                return t("gateway.model.reset_all_usage")
+            if not self._model_reset_all_is_authorized(source):
+                return t("gateway.model.reset_all_admin_only")
+            count = await self._reset_all_session_overrides()
+            return t("gateway.model.reset_all_done", count=count)
         attended_enabled = parse_attended_config(_load_gateway_config()).enabled
         if attended_enabled and request.target.strip().lower() == "reset" and not request.explicit_provider:
             async with self._session_model_override_lock(session_key):

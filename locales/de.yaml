@@ -51,6 +51,7 @@ gateway:
   model:
     error_prefix: "Fehler: {error}"
     switched: "Modell gewechselt zu `{model}`"
+    attended_switched: "🤖 Model switched to `{model}` · {effort}"
     provider_label: "Anbieter: {provider}"
     context_label: "Kontext: {tokens} Tokens"
     max_output_label: "Max. Ausgabe: {tokens} Tokens"
@@ -67,6 +68,9 @@ gateway:
     usage_switch_provider: "`/model <name> --provider <slug>` — Anbieter wechseln"
     usage_persist: "`/model <name> --global` — dauerhaft speichern"
     reset_done: "✓ Model override reset."
+    reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    reset_all_usage: "Usage: `/model reset --all`"
+    reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "Dieses Gateway führt Code aus {boot_rev} aus, der Checkout auf der Festplatte ist inzwischen aber {disk_rev}. Ein Modellwechsel könnte durch veraltete Module abstürzen — starten Sie das Gateway neu, um den neuen Code zu laden: hermes gateway restart"
     err_switch_failed: "Modellwechsel zu {model} fehlgeschlagen ({error}); {current} bleibt aktiv."
     err_config_not_updated: "config.yaml nicht aktualisiert ({error})"
