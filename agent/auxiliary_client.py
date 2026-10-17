@@ -3182,11 +3182,29 @@ def _auxiliary_route_identity(label: str, base_url: Optional[str] = None) -> Aux
     return AuxiliaryRouteIdentity(*key)
 
 
+def _health_store_call(action: str, fn: Callable[..., Any], *args: Any, default: Any = None, **kwargs: Any) -> Any:
+    """Run one shared route-health store operation, failing open on storage errors.
+
+    The store is an optimization shared across callers. An unreadable or unwritable state
+    directory must never fail an auxiliary call or discard a successful response.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except OSError as exc:
+        logger.warning("Auxiliary route health: could not %s: %s", action, exc)
+        return default
+
+
 def _mark_provider_unhealthy(
     provider: str, ttl: Optional[float] = None, *, base_url: Optional[str] = None,
     reason: str = _AUX_UNHEALTHY_PAYMENT_REASON, level: int = logging.WARNING,
 ) -> None:
-    """Hide one auxiliary route in the compatibility cache and typed store."""
+    """Hide one auxiliary route until the TTL expires.
+
+    Shareable failures are persisted first and the compatibility cache adopts the stored
+    record, so a failed write never poisons this process. Task or parser failures the store
+    refuses to share still quarantine locally, so the ordered fallback walk advances.
+    """
     label = _normalize_chain_label(provider)
     if not label:
         return
@@ -3200,15 +3218,25 @@ def _mark_provider_unhealthy(
         logger.warning("Auxiliary: could not persist unhealthy state for %s: %s", label, exc)
         return
     if record is None:
-        return
-    _aux_unhealthy_until[key] = record.expires_at
-    _aux_unhealthy_reason[key] = record.reason
+        expires_at = time.time() + ttl
+        _aux_unhealthy_until[key] = expires_at
+        _aux_unhealthy_reason[key] = reason
+    else:
+        expires_at = record.expires_at
+        _aux_unhealthy_until[key] = expires_at
+        _aux_unhealthy_reason[key] = record.reason
     logger.log(
         level,
         "Auxiliary: marking %s unhealthy for %ds (%s). "
         "Subsequent auxiliary calls will skip it until %s.",
-        label, int(ttl), reason, time.strftime("%H:%M:%S", time.localtime(record.expires_at)),
+        label, int(ttl), reason, time.strftime("%H:%M:%S", time.localtime(expires_at)),
     )
+
+
+def _clear_local_health(key: Any) -> None:
+    _aux_unhealthy_until.pop(key, None)
+    _aux_unhealthy_logged_at.pop(key, None)
+    _aux_unhealthy_reason.pop(key, None)
 
 
 def _clear_provider_health(provider: str, base_url: Optional[str] = None) -> None:
@@ -3217,11 +3245,10 @@ def _clear_provider_health(provider: str, base_url: Optional[str] = None) -> Non
         return
     key = _unhealthy_cache_key(label, base_url)
     identity = _auxiliary_route_identity(label, base_url)
-    cleared = _clear_auxiliary_health_after_probe(identity)
-    if cleared or _read_auxiliary_health(identity) is None:
-        _aux_unhealthy_until.pop(key, None)
-        _aux_unhealthy_logged_at.pop(key, None)
-        _aux_unhealthy_reason.pop(key, None)
+    cleared = _health_store_call(
+        "clear recovered route", _clear_auxiliary_health_after_probe, identity, default=False)
+    if cleared or _health_store_call("read route", _read_auxiliary_health, identity) is None:
+        _clear_local_health(key)
 
 
 def _is_provider_unhealthy(label: str, base_url: Optional[str] = None) -> bool:
@@ -3229,31 +3256,45 @@ def _is_provider_unhealthy(label: str, base_url: Optional[str] = None) -> bool:
     if not label:
         return False
     key = _unhealthy_cache_key(label, base_url)
-    record = _read_auxiliary_health(_auxiliary_route_identity(label, base_url))
+    identity = _auxiliary_route_identity(label, base_url)
+    local_until = _aux_unhealthy_until.get(key)
+    if local_until is not None and time.time() < local_until:
+        return True
+    try:
+        record = _read_auxiliary_health(identity)
+    except OSError as exc:
+        logger.warning("Auxiliary route health: could not read route: %s", exc)
+        if local_until is not None:
+            _clear_local_health(key)
+        return False
     if record is not None:
         _aux_unhealthy_until[key] = record.expires_at
         _aux_unhealthy_reason[key] = record.reason
         return True
-    # Typed state is authoritative. Clear stale compatibility entries so a recovery
-    # in another process is visible to this caller too.
-    _aux_unhealthy_until.pop(key, None)
-    _aux_unhealthy_logged_at.pop(key, None)
-    _aux_unhealthy_reason.pop(key, None)
-    probe = _claim_auxiliary_probe(_auxiliary_route_identity(label, base_url))
+    if local_until is not None:
+        _clear_local_health(key)
+    probe = _health_store_call("claim recovery probe", _claim_auxiliary_probe, identity)
     return probe is False
+
+
+def _claim_notice_for(label: str, base_url: Optional[str]) -> bool:
+    """True when this caller should log the route's notice; one claim per health epoch."""
+    identity = _auxiliary_route_identity(label, base_url)
+    record = _health_store_call("read route", _read_auxiliary_health, identity)
+    if record is None:
+        return True
+    return bool(_health_store_call(
+        "claim notice", _claim_auxiliary_notice, identity, record.epoch, default=True))
 
 
 def _log_skip_unhealthy(
     label: str, task: Optional[str] = None, *, base_url: Optional[str] = None,
 ) -> None:
-    """Log a skipped unhealthy provider at most once per minute per route."""
+    """Log a skipped unhealthy provider at most once per minute per route and once per epoch."""
     now = time.time()
     key = _unhealthy_cache_key(label, base_url)
     if now - _aux_unhealthy_logged_at.get(key, 0.0) >= 60:
-        record = _read_auxiliary_health(_auxiliary_route_identity(label, base_url))
-        if record is not None and not _claim_auxiliary_notice(
-            _auxiliary_route_identity(label, base_url), record.epoch,
-        ):
+        if not _claim_notice_for(label, base_url):
             return
         _aux_unhealthy_logged_at[key] = now
         expires_at = _aux_unhealthy_until.get(key, now)
@@ -3266,11 +3307,7 @@ def _log_skip_unhealthy(
 
 def _warn_auxiliary_route_once(route: Any, reason: str, error: BaseException) -> None:
     label = _normalize_chain_label(route.resolved_provider or "")
-    base_url = route.base_info
-    record = _read_auxiliary_health(_auxiliary_route_identity(label, base_url)) if label else None
-    if record is not None and not _claim_auxiliary_notice(
-        _auxiliary_route_identity(label, base_url), record.epoch,
-    ):
+    if label and not _claim_notice_for(label, route.base_info):
         return
     logger.warning(
         "Auxiliary %s%s: %s on %s and all fallbacks exhausted "
@@ -3284,7 +3321,7 @@ def _reset_aux_unhealthy_cache() -> None:
     _aux_unhealthy_until.clear()
     _aux_unhealthy_logged_at.clear()
     _aux_unhealthy_reason.clear()
-    _reset_auxiliary_health()
+    _health_store_call("reset route health", _reset_auxiliary_health)
 
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
@@ -7971,10 +8008,10 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         _mark_provider_unhealthy(
             _recoverable_pool_provider(resolved_provider, route.client, main_runtime=route.main_runtime)
             or resolved_provider,
+            ttl=fallback_candidate_quarantine_ttl(reason),
             base_url=route.base_info,
             reason=reason,
         )
-        logger.debug("Auxiliary route failure quarantined via route health", exc_info=False)
     if reason == "request timed out":
         # WARNING, naming the endpoint, the budget and the knob: the only other trace of a slow
         # local model is the fallback provider's complaint about a model it never had (#89445).

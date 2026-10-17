@@ -1,6 +1,7 @@
 """Tests for agent.auxiliary_client resolution chain, provider overrides, and model overrides."""
 
 import base64
+import contextlib
 import json
 import logging
 import time
@@ -120,6 +121,61 @@ def test_log_skip_unhealthy_deduplicates_same_epoch_and_reopens_on_new_lane(capl
 
     messages = [record.getMessage() for record in caplog.records if "skipping openrouter" in record.getMessage()]
     assert len(messages) == 2
+
+
+def test_known_provider_failure_on_client_url_is_seen_by_provider_wide_walks():
+    aux._mark_provider_unhealthy(
+        "openrouter", base_url="https://openrouter.ai/api/v1/", reason="payment error",
+    )
+
+    assert aux._is_provider_unhealthy("openrouter") is True
+    assert aux._is_provider_unhealthy("openrouter", aux._custom_health_base_url("openrouter")) is True
+
+
+def test_unshared_failure_still_quarantines_locally():
+    aux._mark_provider_unhealthy("nous", ttl=60, reason="invalid provider response")
+
+    assert aux._is_provider_unhealthy("nous") is True
+    assert aux._read_auxiliary_health(aux._auxiliary_route_identity("nous")) is None
+
+
+def test_route_health_store_errors_fail_open(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise OSError("read-only state directory")
+
+    for name in (
+        "_read_auxiliary_health", "_claim_auxiliary_probe", "_claim_auxiliary_notice",
+        "_clear_auxiliary_health_after_probe", "_reset_auxiliary_health",
+    ):
+        monkeypatch.setattr(aux, name, unavailable)
+
+    assert aux._is_provider_unhealthy("openrouter") is False
+    aux._clear_provider_health("openrouter")
+    aux._log_skip_unhealthy("openrouter")
+    aux._reset_aux_unhealthy_cache()
+
+
+def test_primary_rate_limit_uses_short_lane_hold(monkeypatch):
+    marks = []
+    monkeypatch.setattr(aux, "_mark_provider_unhealthy", lambda *a, **kw: marks.append(kw))
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {})
+    monkeypatch.setattr(aux, "_try_payment_fallback", lambda *a, **kw: (None, None, ""))
+    monkeypatch.setattr(aux, "_try_configured_fallback_chain", lambda *a, **kw: (None, None, ""))
+    monkeypatch.setattr(aux, "_try_main_fallback_chain", lambda *a, **kw: (None, None, ""))
+    err = Exception("Rate limit exceeded")
+    err.status_code = 429
+    route = aux._LadderRoute(
+        client=MagicMock(base_url="https://openrouter.ai/api/v1/"), task="compression", tag="",
+        async_mode=False, base_info="https://openrouter.ai/api/v1/", resolved_provider="openrouter",
+        resolved_model="m", resolved_base_url=None, resolved_api_key=None, resolved_api_mode=None,
+        final_model="m", main_runtime=None, route_info=None, timeout=30.0,
+    )
+
+    ladder = aux._ladder_provider_fallback(err, route)
+    with contextlib.suppress(StopIteration, TypeError):
+        next(ladder)
+
+    assert marks and marks[0]["ttl"] == 60.0 and marks[0]["reason"] == "rate limit"
 
 
 class TestResolveTaskProviderModel:
@@ -4656,7 +4712,7 @@ class TestAuxUnhealthyCache:
                 messages=[{"role": "user", "content": "hi"}],
             )
             # After the 402, OpenRouter is in the unhealthy cache.
-            assert _is_provider_unhealthy("openrouter", primary_client.base_url) is True
+            assert _is_provider_unhealthy("openrouter") is True
 
     def test_custom_billing_failure_keeps_distinct_endpoint_eligible(self):
         """A hosted custom endpoint's billing state must not quarantine a local custom endpoint."""
