@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import unicodedata
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Optional
@@ -480,11 +481,18 @@ _BOOL_FLAGS = {
     "--once": "is_once", "--all": "is_all",
 }
 _VALUE_FLAGS = {"--provider": "explicit_provider", "--reasoning": "reasoning_effort"}
+_UNICODE_DASH_CHARS = "".join(
+    chr(code) for code in range(0x110000)
+    if code != 0x002D and unicodedata.category(chr(code)) == "Pd"
+) + "\u2212"
+_UNICODE_FLAG_RE = re.compile(
+    f"[{re.escape(_UNICODE_DASH_CHARS)}](provider|reasoning|global|session|refresh|once|all)"
+)
 
 
 def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     """Parse /model flags: ``--provider X``, ``--reasoning <level>``, ``--global``, ``--session``,
-    ``--refresh``, ``--once``.
+    ``--refresh``, ``--once``, ``--all``.
 
     ``--once`` is parsed here but interpreted by each caller (each frontend has its own
     live-session restore hook). ``--all`` is an administrative reset modifier handled by the gateway;
@@ -492,9 +500,9 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     flag presences; the effective persistence decision belongs to :func:`resolve_persist_behavior`. ``reasoning_effort``
     is the raw level word (validated by :func:`hermes_constants.parse_reasoning_effort` at apply
     time) so a model pick and its effort travel as ONE request on every surface."""
-    # Telegram/iOS auto-convert ``--`` to an em/en dash: normalize a single Unicode dash before
-    # a flag keyword.
-    raw_args = re.sub(r'[\u2012\u2013\u2014\u2015](provider|reasoning|global|session|refresh|once)', r'--\1', raw_args)
+    # Normalize only a Unicode dash that introduces a known flag, so a dash inside
+    # a model id remains opaque.
+    raw_args = _UNICODE_FLAG_RE.sub(r"--\1", raw_args)
 
     # Hand-rolled: model IDs may contain colons/slashes and the historical parser did not
     # require shell quoting.

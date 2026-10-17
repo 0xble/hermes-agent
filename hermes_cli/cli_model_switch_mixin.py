@@ -848,6 +848,9 @@ class CLIModelSwitchMixin:
             # CLI decoration: "  ✗ " prefix over the canonical error copy.
             _cprint(f"  ✗ {request.error_messages()[0]}")
             return
+        if request.is_all:
+            _cprint("  ✗ /model --all is only available in the gateway.")
+            return
         one_turn = request.is_once
         persist_global = resolve_persist_behavior(
             request.is_global, request.is_session, is_once=one_turn,

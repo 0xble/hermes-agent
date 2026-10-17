@@ -83,7 +83,11 @@ def _allows(allowed: set[str], candidate: Optional[str]) -> bool:
 
 
 def _adapter_config_extra(adapter) -> dict:
-    return getattr(getattr(adapter, "config", None), "extra", None) or {}
+    config = getattr(adapter, "config", None)
+    extra = getattr(config, "extra", None)
+    if isinstance(extra, dict):
+        return extra
+    return config if isinstance(config, dict) else {}
 
 
 # Nostr npub -> hex (Buzz): ``BUZZ_ALLOWED_USERS`` accepts hex or ``npub1…`` but inbound pubkeys
@@ -487,6 +491,20 @@ class GatewayAuthorizationMixin:
             return False
         extra = _adapter_config_extra(adapter)
         adapter_allow = extra.get("group_allow_from" if is_group else "allow_from")
+        if adapter_allow is None and not is_group:
+            # Plugin/platform adapters sometimes preserve the authored spelling in config.extra,
+            # while core adapters may expose the already-resolved list as an instance attribute.
+            for key in ("allowFrom", "allowed_users", "allowedUsers"):
+                if extra.get(key) is not None:
+                    adapter_allow = extra[key]
+                    break
+            if adapter_allow is None:
+                for attr in ("_allow_from", "allow_from", "_allowed_user_ids", "allowed_user_ids"):
+                    with contextlib.suppress(Exception):
+                        value = getattr(adapter, attr, None)
+                        if value is not None:
+                            adapter_allow = value
+                            break
         if not adapter_allow:
             # Plugin platforms (Buzz, DingTalk) spell their env allowlist as ``extra.allowed_users``;
             # under multiplex only the default profile's list reaches the env (first-writer-wins

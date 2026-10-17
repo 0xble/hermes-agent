@@ -45,6 +45,11 @@ _AUTOMATION_KINDS = {
 
 
 _KNOWN_MODEL_FAMILIES = {"claude", "gemini", "gpt", "llama", "mistral", "qwen", "deepseek", "glm"}
+_CLAUDE_DISPLAY_RE = re.compile(
+    r"^claude-(?:(?P<version>\d+(?:-\d+)?)-)?(?P<family>opus|sonnet|haiku)"
+    r"(?:-(?P<family_version>\d{1,2}(?:-\d{1,2})?))?(?:-(?P<date>\d{8}))?$",
+    re.IGNORECASE,
+)
 
 
 def friendly_model_name(model: str) -> str:
@@ -59,10 +64,18 @@ def friendly_model_name(model: str) -> str:
             candidate = suffix
     lower = candidate.lower()
     if lower.startswith("claude-"):
-        parts = candidate.split("-")[1:]
-        if parts and parts[-1].isdigit() and len(parts) >= 2 and parts[-2].isdigit():
-            parts = parts[:-2] + [f"{parts[-2]}.{parts[-1]}"]
-        return " ".join(part.capitalize() for part in parts)
+        match = _CLAUDE_DISPLAY_RE.fullmatch(candidate)
+        if match:
+            version = match.group("version") or ""
+            family = match.group("family").capitalize()
+            family_version = match.group("family_version") or ""
+            if family_version:
+                family_version = family_version.replace("-", ".")
+                family = f"{family} {family_version}"
+            if version:
+                version = version.replace("-", ".")
+                return f"{version} {family}"
+            return family
     if lower.startswith("gpt-"):
         parts = candidate.split("-")[1:]
         if parts:

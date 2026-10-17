@@ -658,11 +658,13 @@ class GatewayModelCommandsMixin:
         chat_type = str(getattr(source, "chat_type", "") or "").lower()
         if chat_type not in {"dm", "direct", "private"}:
             return False
-        adapter = (getattr(self, "adapters", {}) or {}).get(getattr(source, "platform", None))
-        configured = getattr(adapter, "_allow_from", None) or getattr(adapter, "allow_from", None)
-        if configured is None:
-            return False
-        return str(getattr(source, "user_id", "")) in {str(value) for value in configured}
+        # Reuse the gateway's canonical adapter/config authorization source. Some adapters (notably
+        # Telegram) keep the operator list in ``config.extra.allow_from`` rather than exposing it on
+        # the adapter itself. This is intentionally DM-only; group traffic stays denied above.
+        authorize_from_extra = getattr(self, "_adapter_extra_allowlist_authorizes", None)
+        return callable(authorize_from_extra) and bool(
+            authorize_from_extra(source, getattr(source, "user_id", ""), False)
+        )
 
     async def _reset_all_session_overrides(self) -> int:
         """Clear persisted and in-memory model/reasoning picks without changing a live turn's route."""

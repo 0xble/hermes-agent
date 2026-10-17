@@ -206,6 +206,8 @@ def _switch_request(raw_input: str, parsed_flags, persist_override) -> tuple[str
     # Conflict validation is the shared parser's; surface it with the canonical copy.
     for code in getattr(f, "errors", ()):
         raise ValueError(MODEL_SWITCH_ERROR_TEXT[code])
+    if getattr(f, "is_all", False):
+        raise ValueError("/model --all is only available in the gateway.")
     if is_global_flag and one_turn:
         raise ValueError(MODEL_SWITCH_ERROR_TEXT[MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL])
     if persist_override is None:
