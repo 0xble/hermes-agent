@@ -1473,3 +1473,86 @@ def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profil
     (plugin / "__init__.py").write_text("def register(ctx):\n    pass\n")
     releases.smoke_plugins(source, home)
     assert not (home / "logs").exists()
+
+
+def test_candidate_import_smoke_accepts_enabled_portable_plugin(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "portable-test"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [portable-test]\n", encoding="utf-8")
+    (plugin / "plugin.json").write_text(json.dumps({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": "portable-test",
+    }), encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    releases.smoke_plugins(source, home)
+
+
+def test_candidate_import_smoke_accepts_enabled_manifest_only_language_pack(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "language-pack"
+    (plugin / "locales").mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [language-pack]\n", encoding="utf-8")
+    (plugin / "plugin.yaml").write_text(
+        "name: language-pack\nversion: '1.0'\nprovides_locales: [pl]\n", encoding="utf-8"
+    )
+    (plugin / "locales" / "pl.yaml").write_text("name: Polski\n", encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    releases.smoke_plugins(source, home)
+
+
+def test_candidate_import_smoke_rejects_enabled_portable_plugin_load_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "portable-test"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [portable-test]\n", encoding="utf-8")
+    (plugin / "plugin.json").write_text(json.dumps({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": "portable-test",
+        "extensions": {"com.nousresearch.hermes": {"servers": {"worker": {}}}},
+    }), encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    with pytest.raises(RuntimeError, match="no matching mcp.json server"):
+        releases.smoke_plugins(source, home)
+
+
+def test_candidate_import_smoke_rejects_disabled_enabled_portable_plugin(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "portable-test"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled: [portable-test]\n  disabled: [portable-test]\n", encoding="utf-8"
+    )
+    (plugin / "plugin.json").write_text(json.dumps({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": "portable-test",
+    }), encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    with pytest.raises(RuntimeError, match="disabled via config"):
+        releases.smoke_plugins(source, home)
+
+
+def test_candidate_import_smoke_rejects_disabled_enabled_manifest_only_language_pack(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "language-pack"
+    (plugin / "locales").mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled: [language-pack]\n  disabled: [language-pack]\n", encoding="utf-8"
+    )
+    (plugin / "plugin.yaml").write_text(
+        "name: language-pack\nversion: '1.0'\nprovides_locales: [pl]\n", encoding="utf-8"
+    )
+    (plugin / "locales" / "pl.yaml").write_text("name: Polski\n", encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    with pytest.raises(RuntimeError, match="disabled via config"):
+        releases.smoke_plugins(source, home)
