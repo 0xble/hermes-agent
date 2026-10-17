@@ -405,8 +405,9 @@ class GatewaySessionCommandsMixin:
         # The canonical projection skips bookkeeping rows (role=user + display_kind) and pure
         # handoffs while still recognizing a real ask embedded in a compaction carrier.
         from agent.context_compressor import (
-            history_before_user_originated_turn, retryable_user_text, split_user_originated_turn,
+            history_before_user_originated_turn, split_user_originated_turn,
             user_originated_turn_view)
+        from agent.context_compressor_retry import retryable_user_text
 
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)

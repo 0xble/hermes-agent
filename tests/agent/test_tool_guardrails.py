@@ -182,6 +182,58 @@ def test_skill_read_tools_are_idempotent_and_block_repeated_identical_success_ou
         assert blocked.code == "idempotent_no_progress_block"
 
 
+def test_context_loss_reanchors_reads_without_erasing_failure_protection():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=5,
+        )
+    )
+    skill_args = {"name": "demo-skill"}
+    skill_result = '{"success":true,"content":"same"}'
+
+    for _ in range(5):
+        assert controller.before_call("skill_view", skill_args).action == "allow"
+        controller.after_call("skill_view", skill_args, skill_result, failed=False)
+    assert controller.before_call("skill_view", skill_args).code == "idempotent_no_progress_block"
+
+    failing_args = {"path": "/missing"}
+    for _ in range(4):
+        controller.after_call("read_file", failing_args, '{"error":"missing"}', failed=True)
+
+    controller.reset_idempotent_read_progress()
+    assert controller.before_call("skill_view", skill_args).action == "allow"
+    reanchor = controller.after_call("skill_view", skill_args, skill_result, failed=False)
+    assert reanchor.action == "allow"
+    for _ in range(4):
+        assert controller.before_call("skill_view", skill_args).action == "allow"
+        controller.after_call("skill_view", skill_args, skill_result, failed=False)
+    assert controller.before_call("skill_view", skill_args).code == "idempotent_no_progress_block"
+
+    controller.after_call("read_file", failing_args, '{"error":"missing"}', failed=True)
+    assert controller.before_call("read_file", failing_args).code == "repeated_exact_failure_block"
+
+
+def test_context_loss_clears_success_read_observation_state_and_stale_halt():
+    controller = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    args = {"path": "/tmp/demo.txt"}
+    result = "content " * 100
+
+    for call_id in ("a", "b"):
+        controller.after_call("read_file", args, result, failed=False)
+        controller.observe_call("read_file", args, result, tool_call_id=call_id)
+    assert controller._call_history
+
+    controller.reset_idempotent_read_progress()
+
+    assert controller.halt_decision is None
+    assert not controller._call_history
+    observation = controller.observe_call("read_file", args, result, tool_call_id="c")
+    assert observation.notice is None
+    assert observation.stub is None
+
+
 def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)

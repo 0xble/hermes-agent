@@ -6,8 +6,28 @@ Fork patch identity: `agent-friction-repairs`.
 
 This unit owns small, evidence-backed fixes where runtime bookkeeping makes the
 model repeat work or misread execution state. It covers context-pruning dedupe,
-local execute_code session-kernel eviction reporting, terminal retry hints, and
-execute_code sandbox file-tool failures.
+skill_view reload-marker preservation across compaction and tail demotion, the
+idempotent-read guardrail at content-loss boundaries, local execute_code session-kernel
+eviction reporting, terminal retry hints, and execute_code sandbox file-tool failures.
+
+## Idempotent-read guardrail at content-loss boundaries
+
+When compaction, committed tool-result pruning, micro-compaction, or a provider
+checkpoint removes earlier read results from model-visible context, the next
+`skill_view` or `read_file` call is a recovery read. The boundary hook re-arms
+read deduplication and clears only successful-read repeat state, including stale
+read halt decisions. Failed-call counters, mutation progress, and same-turn
+loop caps remain unchanged.
+
+Focused proof includes `tests/agent/test_tool_guardrails.py` and
+`tests/agent/test_read_dedup_rewrite_boundaries.py`. A same-turn 5-call
+`skill_view` loop still blocks, while the first read after a content-loss
+boundary is allowed and serves full content.
+
+Related prior art is upstream issue [#109683](https://github.com/NousResearch/hermes-agent/issues/109683)
+and commit [`f7e565d`](https://github.com/eventh0riz0n/hermes-agent/commit/f7e565d887722458b7666627a405f0f525f907a7).
+This fork keeps the smallest fixed behavior: boundary resets apply to successful-read state only,
+without adding a user-facing mode switch.
 
 ## Terminal retry hints
 
@@ -26,6 +46,10 @@ found` 181 times. Focused verification: `scripts/run_tests.sh tests/tools/test_b
 ## Proof surface
 
 - `tests/agent/test_context_compressor.py::TestSummarizeToolResultRefusals::test_dedupe_does_not_stub_unread_pending_results`
+- `tests/agent/test_context_compressor_tail.py`
+- `tests/agent/test_ghost_skill_pruning.py`
+- `tests/tools/test_skill_view_dedup.py`
+- `tests/tools/test_skill_view_dedup.py::TestSkillViewDedupRaces`
 - `tests/tools/test_code_kernel.py::TestKernelOwnershipAndLifecycle::test_lru_eviction_reports_state_reset`
 - `tests/tools/test_code_execution_file_rpc.py::test_generated_tool_errors_raise_and_block_empty_fallback`
 - `tests/agent/test_protected_tail_pressure.py`
@@ -39,8 +63,11 @@ lifecycle behavior passing, and make the file tools (`read_file`, `write_file`,
 UDS and file-based transports so failed reads cannot feed empty fallback content
 into a later write. UDS is proven end to end; the file transport is proven by
 the shared `_parse_tool_result` path, which also rejects a `read_file` result
-that omits its content via the dedup stub. Sandbox RPC reads bypass normal
-read-result deduplication so a script always receives real file content.
+that omits its content via the dedup stub. Skill-view coverage must prove that
+compaction and tail demotion retain reload markers for all served skill bodies,
+failed views do not create reload obligations, and byte-identical repeat views
+are the only ones that return `content_returned: false`. Sandbox RPC reads bypass
+normal read-result deduplication so a script always receives real file content.
 
 A sandbox `read_file` not-found result is a backend-namespace failure, not a
 successful empty read: project-mode execute_code and its RPC file tools use the
