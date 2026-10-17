@@ -393,6 +393,23 @@ async def test_rehydrate_does_not_overwrite_concurrent_choice(change, phase, mon
         return session_state(session_key)
 
     monkeypatch.setattr(runner, "_session_state", observed_state)
+    loop = asyncio.get_running_loop()
+    runtime_started = asyncio.Event()
+    runtime_release = threading.Event()
+    if phase == "store":
+        load_runtime = runner._load_session_agent_runtime
+
+        def blocked_runtime(**kwargs):
+            loop.call_soon_threadsafe(runtime_started.set)
+            assert runtime_release.wait(10), "runtime resolution did not release"
+            return load_runtime(**kwargs)
+
+        # Keep the detached runtime snapshot behind an event while the queued switch commits. Without
+        # this barrier, awaiting the switch task does not order it before an already-finished worker
+        # snapshot, so the assertion observes a valid old-model resolution and flakes by task scheduling.
+        monkeypatch.setattr(runner, "_load_session_agent_runtime", blocked_runtime)
+    else:
+        runtime_release.set()
     resolution = asyncio.create_task(runner._resolve_session_agent_runtime_async(
         source=source, session_key=key
     ))
@@ -414,16 +431,21 @@ async def test_rehydrate_does_not_overwrite_concurrent_choice(change, phase, mon
 
             switch = asyncio.create_task(switch_model())
             await asyncio.wait_for(switch_started.wait(), 5)
-            # The switch now queues behind hydration instead of racing its read.
-            # Release the read before awaiting the lock-owning switch.
+            # The switch queues behind hydration. Release the read, then hold the detached runtime
+            # snapshot until the lock-owning switch has committed.
             gate.release.set()
+            if phase == "store":
+                await asyncio.wait_for(runtime_started.wait(), 5)
             await asyncio.wait_for(switch, 5)
             assert runner._session_model_override(key)["model"] == "new-model"
         else:
             runner._clear_conversation_scope(key, reason="session_reset")
             await runner.async_session_store.set_model_override(key, None)
             assert runner._session_model_override(key) is None
-        gate.release.set()
+            gate.release.set()
+            if phase == "store":
+                await asyncio.wait_for(runtime_started.wait(), 5)
+        runtime_release.set()
         model, _ = await asyncio.wait_for(resolution, 10)
         override = runner._session_model_override(key)
         assert (override or {}).get("model") == ("new-model" if change == "model" else None), (
@@ -434,6 +456,7 @@ async def test_rehydrate_does_not_overwrite_concurrent_choice(change, phase, mon
         assert (read(key) or {}).get("model") == ("new-model" if change == "model" else None)
     finally:
         gate.release.set()
+        runtime_release.set()
         await asyncio.gather(resolution, return_exceptions=True)
         if runner._executor is not None:
             await asyncio.to_thread(runner._executor.shutdown)
