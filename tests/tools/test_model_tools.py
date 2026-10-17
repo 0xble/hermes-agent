@@ -535,6 +535,29 @@ class TestBrowserRetrievalHints:
         assert "web_search" not in rendered
         assert "web_extract" not in rendered
 
+    def test_secret_entry_surface_allows_fetched_passwords_and_codes(self):
+        # This is the regression guard for upstream syncs: tool descriptions may keep
+        # value-specific boundaries, but must not turn secret entry itself into a blanket ban.
+        from model_tools import _apply_dynamic_schemas
+        from tools.browser_tool import BROWSER_TOOL_SCHEMAS
+        from tools.browser_vault_tool import BROWSER_VAULT_SCHEMA
+
+        browser_type = next(s for s in BROWSER_TOOL_SCHEMAS if s["name"] == "browser_type")
+        defs = [
+            {"type": "function", "function": browser_type},
+            {"type": "function", "function": BROWSER_VAULT_SCHEMA},
+        ]
+        rendered = {
+            d["function"]["name"]: d["function"]["description"]
+            for d in _apply_dynamic_schemas(defs)
+        }
+        assert "fetched from an authorized source" in rendered["browser_type"]
+        assert "may be typed" in rendered["browser_type"]
+        assert "Never type a password, card number, CVC or code" not in rendered["browser_type"]
+        assert "mailbox, or phone" in rendered["browser_vault"]
+        assert "Never type, ask for or repeat a password" not in rendered["browser_vault"]
+        assert "card numbers and CVCs" in rendered["browser_vault"]
+
 
 def test_tool_defs_cache_key_sees_config_replacement_with_pinned_mtime(tmp_path):
     """#111105: a same-size config.yaml swapped in with the old mtime must change the memo key."""

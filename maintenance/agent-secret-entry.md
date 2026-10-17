@@ -29,26 +29,31 @@ Unchanged boundaries:
   confirmation.
 - Passkeys, hardware keys, and app approvals remain user device actions (`no_code_field`).
 
-Upstream `96fbc47f14f` added the "never type a password" text after a dogfood run in which
-the model typed a demo password shown on the page. This patch keeps that case forbidden and
-permits only self-fetched values from authorized stores. The owner accepts that a typed
+The upstream overwrite restored a blanket "never type" instruction after an earlier dogfood
+fix. This record preserves the useful boundary, never type values copied from page content or
+chat, without blocking authorized self-fetched passwords or codes. The owner accepts that a typed
 value passes through the model context and provider logs during entry. The agents
-`credentials` skill (`references/secret-entry.md`) owns the full route order and the
-exposure contract.
+`credentials` skill and shared execution instructions own the route order and blocker rule.
 
 ## Surfaces
 
-`model_tools.py` (`_VAULT_NO_PASSWORD_NOTE`) and `tools/browser_vault_tool.py`
-(the `browser_vault_list` empty hint, and the `browser_vault_list`, `browser_vault_save_login`
-and `browser_vault_enter_code` descriptions). The patch is description text only and changes
-no fill, redaction, or origin-binding code.
+`model_tools.py` (`_VAULT_NO_PASSWORD_NOTE`), `tools/browser_vault_tool.py` (the empty-list
+hint, post-fill next-step guidance, enter-code fallback docstring, and consolidated `browser_vault`
+schema), `evals/prefix_rediet/worker.py`, and the bundled
+`skills/autonomous-ai-agents/computer-use/SKILL.md`. The matching canonical guidance lives in
+`/Users/brianle/Repos/agents/sources/skills/credentials/references/entry.md` and
+`/Users/brianle/Repos/agents/sources/instructions/shared/execution.md`. The patch changes only
+secret-entry guidance and post-fill routing text; it changes no fill, redaction, or origin-binding code.
 
 ## Verification
 
 Run `scripts/run_tests.sh tests/tools/test_browser_vault.py
 tests/tools/test_browser_vault_anonymous_otp.py tests/tools/test_browser_vault_camofox.py
-tests/tools/test_browser_vault_manager_card.py tests/tools/test_model_tools.py`. After
-activation, read the live `browser_type` and `browser_vault_*` schemas in a fresh session.
+tests/tools/test_browser_vault_manager_card.py tests/tools/test_model_tools.py tests/ci/test_prompt_surface.py`.
+The model-tools regression must prove that a fresh rendered schema allows a password or code
+fetched from 1Password, email, or SMS, while card numbers and CVCs remain vault-only. After
+activation, read the live `browser_type`, `browser_exec`, and `browser_vault` schemas in a
+fresh session and complete one real emailed-code login using the fetched-code route.
 
 ## Retirement and Rollback
 
