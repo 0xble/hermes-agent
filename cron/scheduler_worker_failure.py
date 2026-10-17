@@ -7,7 +7,7 @@ logger = logging.getLogger("cron.scheduler")
 
 def record_external_worker_outcome(
     job: dict, *, error=None, adapters=None, loop=None, worker_exited: bool = False,
-    worker_terminated: bool = False,
+    worker_terminated: bool = False, worker_exit_code: int | None = None,
 ) -> bool:
     """Project a detached worker's terminal result onto the job record.
 
@@ -37,8 +37,17 @@ def record_external_worker_outcome(
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
             return True
-        failed = status != "completed" or worker_terminated
-        error = error or execution.get("error") or "Detached cron worker did not complete."
+        nonzero_worker_exit = worker_exit_code not in (None, 0)
+        failed = status != "completed" or worker_terminated or nonzero_worker_exit
+        execution_error = execution.get("error")
+        if status == "failed":
+            # A failed worker records its authoritative failure before exiting. Prefer that
+            # durable cause over the waiter's generic exit-status wrapper.
+            error = execution_error or error or "Detached cron worker did not complete."
+        else:
+            # For unknown outcomes the waiter may have captured the worker's stderr. Keep that
+            # evidence rather than replacing it with the generic dead-owner text.
+            error = error or execution_error or "Detached cron worker did not complete."
         # A watchdog has already terminalized the row and then exits 124. Its
         # durable error marker is the authoritative proof that no worker-owned
         # failure notice was sent. Normal worker failures may already have sent
@@ -53,7 +62,8 @@ def record_external_worker_outcome(
             )
         )
         delivery_error = None
-        if status == "unknown" or watchdog_failure or worker_terminated:
+        post_commit_worker_failure = status == "completed" and nonzero_worker_exit
+        if status == "unknown" or watchdog_failure or worker_terminated or post_commit_worker_failure:
             scheduler.logger.error("Job '%s': %s", job["id"], error)
             scope_tokens = scheduler._install_fire_secret_scope()
             try:
@@ -75,7 +85,8 @@ def record_external_worker_outcome(
 
 
 def record_unknown_worker_outcome(
-    job: dict, *, error=None, adapters=None, loop=None, worker_terminated: bool = False
+    job: dict, *, error=None, adapters=None, loop=None, worker_terminated: bool = False,
+    worker_exit_code: int | None = None,
 ) -> bool:
     """Backward-compatible name for the dead-worker recovery path."""
     return record_external_worker_outcome(
@@ -85,6 +96,7 @@ def record_unknown_worker_outcome(
         loop=loop,
         worker_exited=True,
         worker_terminated=worker_terminated,
+        worker_exit_code=worker_exit_code,
     )
 
 
