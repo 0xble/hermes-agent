@@ -2135,19 +2135,19 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
         raise RuntimeError("current is not a release; remove the obsolete source pointer before updating")
     if current is not None and not _release_is_ready(current, current.name):
         raise RuntimeError("current release is not ready; refusing to activate from an invalid pointer")
-    # Migration metadata and the source plist are captured with the candidate
-    # inside one transaction at activation, not before staging/handoff.
-    # A deferred candidate must be promoted on the next normal update, even
-    # when the remote has not advanced beyond that exact staged commit.
+    # Migration metadata + source plist are captured with the candidate in one activation
+    # transaction; a deferred candidate is promoted on the next update even with no new commit.
     if current is not None and current.name == fetched:
         _catch_up_immutable_release(defer=opts.no_gateway_restart, sha=fetched, source=source)
         _apply_pending_fleet_restart_catchup(defer=opts.no_gateway_restart)
         return
-    # stage_release archives FETCH_HEAD itself, builds web and its own locked
-    # environment in a build-aside directory, then atomically publishes it.
+    from hermes_cli import update_live_guard as live_guard  # refuse dropping live branch commits
+    live_guard.enforce(git_cmd, args, home, current, fetched, source, _windows_gateway_resume)
+    # Archives FETCH_HEAD, builds web + locked env build-aside, then atomically publishes it.
     candidate, _ = stage_release(source, home, sha=fetched)
     if candidate != paths.release(fetched) or not _release_is_ready(candidate, fetched):
         raise RuntimeError("staged release does not match fetched commit")
+    live_guard.record_release_branch(paths.home, fetched, branch)
     _write_fleet_restart_pending_marker(
         expected_sha=fetched,
         runtimes=_pre_update_plan.to_dict().get("runtimes") if _pre_update_plan is not None else None,

@@ -330,6 +330,7 @@ gateway:
     followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
     followup_possible_duplicate_notice: "A message you sent just before the restart may already have been handled. Please resend it only if it wasn't."
     in_progress: "⏳ Перезапуск гейтвея вже виконується..."
+    absorbed_by_update: "⏳ Перезапуск пропущено: {detail}."
     restarting: "♻ Перезапуск гейтвея. Якщо ви не отримаєте сповіщення протягом 60 секунд, перезапустіть із консолі командою `hermes gateway restart`."
   resume:
     db_unavailable: "База даних сеансів недоступна."
@@ -509,6 +510,7 @@ gateway:
     not_git_repo: "✗ Не git-репозиторій — оновлення неможливе."
     hermes_cmd_not_found: "✗ Не вдалося знайти команду `hermes`. Hermes запущено, але команда оновлення не знайшла виконуваний файл у PATH або через поточний інтерпретатор Python. Спробуйте виконати `hermes update` вручну у вашому терміналі."
     start_failed: "✗ Не вдалося запустити оновлення: {error}"
+    coalesced: "☤ Запит на оновлення поставлено в чергу: він приєднується до оновлення, що вже триває або щойно завершилося, тож Hermes перезапуститься один раз з останньою запитаною ціллю. Результат отримає останній, хто надіслав запит."
     starting: "☤ Запуск оновлення Hermes… Я транслюватиму прогрес сюди."
     reply_failed: "✗ Не вдалося надіслати відповідь процесу оновлення: {error}"
     reply_sent: "✓ Надіслано `{label}` процесу оновлення."

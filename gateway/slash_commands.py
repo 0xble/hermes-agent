@@ -153,24 +153,27 @@ def _systemd_scope_wrap_if_supervised(argv: list) -> tuple[list, dict | None]:
         return argv, None
 
 
-def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
+def _spawn_detached_update(hermes_cmd, output_path, exit_code_path, *, update_args=()) -> None:
     """Spawn ``hermes update --gateway`` detached so it survives the gateway restart it may trigger.
     ``--gateway`` enables file-based IPC and the process-exit marker lets the watcher distinguish
-    updater completion from a stale legacy exit file."""
+    updater completion from a stale legacy exit file. ``update_args`` (e.g. ``--branch NAME``) are
+    appended for a coalesced request that carries a branch target."""
     import shutil
     import subprocess
+    extra = [str(arg) for arg in update_args]
     if sys.platform == "win32":
         from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
         subprocess.Popen(
             [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path.parent / ".update_process_exit_code"),
-             *hermes_cmd, "update", "--gateway"],
+             *hermes_cmd, "update", "--gateway", *extra],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
     hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
+    extra_str = "".join(" " + shlex.quote(arg) for arg in extra)
     process_exit = exit_code_path.parent / ".update_process_exit_code"
     process_exit_tmp = shlex.quote(str(process_exit) + ".tmp")
     update_cmd = (
-        f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
+        f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway{extra_str}"
         f" > {shlex.quote(str(output_path))} 2>&1; "
         # Avoid `status=$?`: `status` is read-only in zsh and this template is reused in
         # macOS/zsh operator wrappers, so keep it zsh-safe even though bash runs it here.
@@ -605,6 +608,10 @@ class GatewaySlashCommandsMixin(
         if self._restart_requested or self._draining:
             count = self._running_agent_count()
             return t("gateway.draining", count=count) if count else EphemeralReply(t("gateway.restart.in_progress"))
+        from gateway.update_launcher import restart_absorbed_by_update
+        if absorbed := restart_absorbed_by_update(_hermes_home):
+            # Coalesce: a second restart would cut the same sessions again moments later.
+            return EphemeralReply(t("gateway.restart.absorbed_by_update", detail=absorbed))
 
         async def _write_marker(name: str, build, label: str) -> None:
             try:
@@ -1376,12 +1383,16 @@ class GatewaySlashCommandsMixin(
         # The detached wrapper reports completion only through ``.update_process_exit_code``, so the
         # request must use the same v2 lifecycle as agent-requested updates: a legacy marker would
         # wait on ``.update_exit_code``, which the wrapper deletes.
-        from gateway.update_launcher import launch_native_update
+        from gateway.update_launcher import coalesce_window_seconds, launch_native_update
         try:
             result = launch_native_update(home=_hermes_home, hermes_cmd=hermes_cmd, pending=pending,
-                                          spawn=_spawn_detached_update)
+                                          spawn=_spawn_detached_update, coalesce_window=coalesce_window_seconds())
         except Exception as e:
             return t("gateway.update.start_failed", error=e)
+        if result.get("coalesced"):
+            # Joined a burst: one deferred install (latest target) restarts the gateway once.
+            self._schedule_update_notification_watch()
+            return t("gateway.update.coalesced")
         if not result["started"]:
             return t("gateway.update.start_failed", error="an update is already in progress")
         self._schedule_update_notification_watch()

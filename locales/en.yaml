@@ -334,6 +334,7 @@ gateway:
     followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
     followup_possible_duplicate_notice: "A message you sent just before the restart may already have been handled. Please resend it only if it wasn't."
     in_progress: "⏳ Gateway restart already in progress..."
+    absorbed_by_update: "⏳ Restart skipped: {detail}."
     restarting: "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
   resume:
     db_unavailable: "Session database not available."
@@ -513,6 +514,7 @@ gateway:
     not_git_repo: "✗ Not a git repository — cannot update."
     hermes_cmd_not_found: "✗ Could not locate the `hermes` command. Hermes is running, but the update command could not find the executable on PATH or via the current Python interpreter. Try running `hermes update` manually in your terminal."
     start_failed: "✗ Failed to start update: {error}"
+    coalesced: "☤ Update request queued: it joins the update already running or just finished, so Hermes restarts once with the latest requested target. The outcome is reported to the latest requester."
     starting: "☤ Starting Hermes update… I'll stream progress here."
     reply_failed: "✗ Failed to send response to update process: {error}"
     reply_sent: "✓ Sent `{label}` to the update process."

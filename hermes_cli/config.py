@@ -1174,7 +1174,8 @@ def _validate_quoted_containers(config: dict[str, Any], issues: list[ConfigIssue
 
 def _validate_updates(config: Dict[str, Any], issues: List[ConfigIssue]) -> None:
     import math
-
+    def seconds(v, floor_ok):
+        return not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v) and (v >= 0 if floor_ok else v > 0)
     updates = config.get("updates")
     if updates is None:
         return
@@ -1183,13 +1184,12 @@ def _validate_updates(config: Dict[str, Any], issues: List[ConfigIssue]) -> None
         return
     enabled = updates.get("immutable_releases", False)
     if type(enabled) is not bool:
-        _issue(issues, "error", "updates.immutable_releases must be a boolean",
-               "Use true or false without quotes")
-    timeout = updates.get("release_acknowledgement_timeout_seconds", 180.0)
-    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout) or timeout <= 0):
+        _issue(issues, "error", "updates.immutable_releases must be a boolean", "Use true or false without quotes")
+    if not seconds(updates.get("release_acknowledgement_timeout_seconds", 180.0), False):
         _issue(issues, "error", "updates.release_acknowledgement_timeout_seconds must be a finite positive number",
                "Use an unquoted positive number of seconds")
+    if not seconds(updates.get("coalesce_window_seconds", 120), True):
+        _issue(issues, "error", "updates.coalesce_window_seconds must be a finite number >= 0", "0 disables")
 
 
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:

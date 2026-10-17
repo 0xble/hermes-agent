@@ -366,6 +366,7 @@ gateway:
     followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
     followup_possible_duplicate_notice: "A message you sent just before the restart may already have been handled. Please resend it only if it wasn't."
     in_progress: "⏳ Redémarrage du gateway déjà en cours..."
+    absorbed_by_update: "⏳ Redémarrage ignoré : {detail}."
     restarting: "♻ Redémarrage du gateway. Si vous n'êtes pas notifié dans les 60 secondes, redémarrez depuis la console avec `hermes gateway restart`."
   resume:
     db_unavailable: "Base de données des sessions indisponible."
@@ -583,6 +584,7 @@ gateway:
     not_git_repo: "✗ Pas un dépôt git — impossible de mettre à jour."
     hermes_cmd_not_found: "✗ Impossible de localiser la commande `hermes`. Hermes est en cours d'exécution, mais la commande de mise à jour n'a pas pu trouver l'exécutable dans le PATH ni via l'interpréteur Python actuel. Essayez d'exécuter `hermes update` manuellement dans votre terminal."
     start_failed: "✗ Échec du démarrage de la mise à jour : {error}"
+    coalesced: "☤ Demande de mise à jour mise en file : elle rejoint la mise à jour déjà en cours ou tout juste terminée, Hermes redémarre donc une seule fois avec la cible demandée la plus récente. Le résultat est communiqué au dernier demandeur."
     starting: "☤ Démarrage de la mise à jour Hermes… Je diffuserai la progression ici."
     reply_failed: "✗ Échec de l'envoi de la réponse au processus de mise à jour : {error}"
     reply_sent: "✓ `{label}` envoyé au processus de mise à jour."

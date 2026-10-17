@@ -4830,17 +4830,17 @@ def _start_gateway_housekeeping(
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
     chores: list[tuple[int, str, Any, bool]] = [
-        # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
-        # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
-        # PID alive — the thread (or a chore blocked on the loop) wedged (#113372). Runs first so a
-        # wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
+        # First every tick: re-stamp ``updated_at`` in gateway_state.json (a real heartbeat). Status
+        # warns when it ages past 2x ``interval`` with the PID alive — a wedged thread/chore (#113372).
+        # Runs first so a wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
         (1, "Runtime heartbeat", _write_runtime_status_quiet, False)]
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner), False))
     if runner is not None and loop is not None:
-        chores.append((1, "Update notice retry", lambda: runner._schedule_update_notice_retry(loop), False))
+        from gateway.update_launcher import launch_due_deferred as _due  # one restart per update burst
+        chores += [(1, "Update notice retry", lambda: runner._schedule_update_notice_retry(loop), False), (1, "Coalesced update launch", lambda: _due(runner, loop), False)]  # noqa: E501
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop), False),
         (60, "Media cache cleanup", _housekeeping_media_caches, False),

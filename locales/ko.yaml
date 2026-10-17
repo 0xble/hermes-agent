@@ -330,6 +330,7 @@ gateway:
     followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
     followup_possible_duplicate_notice: "A message you sent just before the restart may already have been handled. Please resend it only if it wasn't."
     in_progress: "⏳ 게이트웨이 재시작이 이미 진행 중입니다..."
+    absorbed_by_update: "⏳ 재시작을 건너뛰었습니다: {detail}."
     restarting: "♻ 게이트웨이를 재시작 중입니다. 60초 이내에 알림이 오지 않으면 콘솔에서 `hermes gateway restart`로 재시작하세요."
   resume:
     db_unavailable: "세션 데이터베이스를 사용할 수 없습니다."
@@ -509,6 +510,7 @@ gateway:
     not_git_repo: "✗ git 저장소가 아닙니다 — 업데이트할 수 없습니다."
     hermes_cmd_not_found: "✗ `hermes` 명령을 찾을 수 없습니다. Hermes는 실행 중이지만 PATH나 현재 Python 인터프리터를 통해 실행 파일을 찾을 수 없습니다. 터미널에서 `hermes update`를 직접 실행해 보세요."
     start_failed: "✗ 업데이트 시작 실패: {error}"
+    coalesced: "☤ 업데이트 요청이 대기열에 추가되었습니다: 이미 실행 중이거나 방금 끝난 업데이트에 합류하므로 Hermes는 가장 최근에 요청된 대상으로 한 번만 다시 시작합니다. 결과는 마지막 요청자에게 보고됩니다."
     starting: "☤ Hermes 업데이트를 시작합니다… 진행 상황을 여기에 스트리밍하겠습니다."
     reply_failed: "✗ 업데이트 프로세스에 응답을 보내지 못했어요: {error}"
     reply_sent: "✓ 업데이트 프로세스에 `{label}`을(를) 보냈어요."

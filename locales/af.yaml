@@ -330,6 +330,7 @@ gateway:
     followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
     followup_possible_duplicate_notice: "A message you sent just before the restart may already have been handled. Please resend it only if it wasn't."
     in_progress: "⏳ Gateway-herbegin reeds aan die gang..."
+    absorbed_by_update: "⏳ Herbegin oorgeslaan: {detail}."
     restarting: "♻ Herbegin van gateway. As jy nie binne 60 sekondes in kennis gestel word nie, herbegin vanaf die konsole met `hermes gateway restart`."
   resume:
     db_unavailable: "Sessie-databasis is nie beskikbaar nie."
@@ -509,6 +510,7 @@ gateway:
     not_git_repo: "✗ Nie 'n git-bewaarplek nie — kan nie opdateer nie."
     hermes_cmd_not_found: "✗ Kon nie die `hermes`-opdrag vind nie. Hermes loop, maar die opdateeropdrag kon nie die uitvoerbare lêer op PATH of via die huidige Python-vertolker vind nie. Probeer `hermes update` met die hand in jou terminale uitvoer."
     start_failed: "✗ Kon nie opdatering begin nie: {error}"
+    coalesced: "☤ Bywerkversoek in die tou: dit sluit aan by die bywerking wat reeds loop of pas klaar is, sodat Hermes een keer herbegin met die nuutste versoekte teiken. Die uitslag word aan die laaste versoeker gerapporteer."
     starting: "☤ Begin Hermes-opdatering… Ek sal vordering hier stroom."
     reply_failed: "✗ Kon nie antwoord na die opdateerproses stuur nie: {error}"
     reply_sent: "✓ `{label}` na die opdateerproses gestuur."
