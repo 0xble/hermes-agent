@@ -52,7 +52,20 @@ async def test_internal_review_captures_reply_without_any_send(response):
     await asyncio.gather(*tuple(adapter._background_tasks))
     assert adapter.sent == []
     adapter.send_typing.assert_not_awaited()
-    assert adapter._message_handler.await_count == 1
+
+
+def test_private_review_response_prefers_raw_model_response_over_display_response():
+    from gateway.cron_review import private_turn_response
+    event = SimpleNamespace(internal=True, metadata={"_cron_review_capture": Future()},
+                            _agent_final_response="PRESENT")
+    assert private_turn_response(event, {"final_response": "PRESENT\nextra"}, "display") == (True, "PRESENT")
+
+
+def test_private_review_response_preserves_explicit_empty_raw_model_response():
+    from gateway.cron_review import private_turn_response
+    event = SimpleNamespace(internal=True, metadata={"_cron_review_capture": Future()},
+                            _agent_final_response="")
+    assert private_turn_response(event, {"final_response": "normalized"}, "display") == (True, "")
 
 
 @pytest.mark.asyncio

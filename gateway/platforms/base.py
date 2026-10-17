@@ -5260,7 +5260,7 @@ class BasePlatformAdapter(ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
-            response = review_capture.capture_reply(response)
+            response = review_capture.capture_reply(response, event)
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:

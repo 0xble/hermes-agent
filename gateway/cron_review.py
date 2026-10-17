@@ -36,10 +36,16 @@ def fail_busy_review(event) -> bool:
     return True
 
 
-def private_turn_response(event, agent_result):
+def private_turn_response(event, agent_result, response=None):
     from gateway.warning_notifications import diagnostic_wake_muted
     if is_review_event(event):
-        return True, str(agent_result.get("final_response") or "")
+        _missing = object()
+        captured = getattr(event, "_agent_final_response", _missing)
+        if captured is _missing:
+            captured = agent_result.get("final_response")
+        if captured is None:
+            captured = response
+        return True, str(captured or "")
     return diagnostic_wake_muted(event), None
 
 
@@ -70,9 +76,17 @@ class ReviewCapture:
         else:
             self.future.set_exception(error)
 
-    def capture_reply(self, response):
+    def capture_reply(self, response, event=None):
         if self.future is None:
             return response
+        # Streaming turns return None after the stream consumer has delivered the
+        # final text. The event retains that exact final payload for the invisible
+        # review caller, so capture it instead of treating a successful review as
+        # empty.
+        if not response and event is not None:
+            streamed = getattr(event, "_streamed_final_response", None)
+            if isinstance(streamed, str):
+                response = streamed
         self.finish(response)
         return None
 
