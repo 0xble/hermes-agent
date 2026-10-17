@@ -752,6 +752,23 @@ def test_promote_is_atomic_and_rollback_round_trip(tmp_path):
     assert (home / "previous").resolve() == b.resolve()
 
 
+def test_plugin_smoke_validates_portable_packages_without_python_import(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    plugin = home / "plugins" / "portable"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.json").write_text(json.dumps({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": "portable",
+        "version": "1.0.0",
+        "description": "test",
+        "author": {"name": "Test"},
+        "keywords": [],
+    }), encoding="utf-8")
+    (home / "config.yaml").write_text("plugins:\n  enabled:\n    - portable\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    releases._smoke_imports()
+
+
 def test_failed_plugin_smoke_does_not_flip_pointer(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     a, b = home / "releases" / "a", home / "releases" / "b"

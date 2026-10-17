@@ -372,7 +372,7 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
 
 
 def _smoke_imports() -> None:
-    """Import enabled directory plugins without invoking their register() methods."""
+    """Import enabled Python plugins and validate portable packages without invoking register()."""
     from hermes_cli.config import load_config
     from hermes_cli.plugins import get_plugin_manager
     from hermes_cli.plugins_discovery import (
@@ -385,7 +385,8 @@ def _smoke_imports() -> None:
     enabled = set(enabled) if enabled is not None else None
     disabled = set(plugin_config.get("disabled") or ())
     manager = get_plugin_manager()
-    manifests = scan_directory(Path(os.environ["HERMES_HOME"]) / "plugins", "user")
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    manifests = scan_directory(hermes_home / "plugins", "user")
     directory_keys = {manifest_key(m) for m in manifests}
     manifests.extend(m for m in discover_entrypoint_manifests()
                      if manifest_key(m) not in directory_keys)
@@ -405,6 +406,13 @@ def _smoke_imports() -> None:
                 raise RuntimeError(f"enabled plugin {manifest.name}: {gate.error}")
             continue
         if gate.action not in {"load", "load_now"}:
+            continue
+        if manifest.portable:
+            from hermes_cli.agent_plugins import load_agent_plugin
+            if not manifest.path:
+                raise RuntimeError(f"portable plugin {manifest.name} has no directory")
+            load_agent_plugin(Path(manifest.path),
+                              hermes_home / "plugin-data" / (manifest.skill_namespace or manifest_key(manifest)))
             continue
         if manifest.source == "entrypoint":
             manager._load_entrypoint_module(manifest)
