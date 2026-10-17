@@ -1827,9 +1827,8 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
                         from agent.usage_anchor import set_usage_anchor
 
                         set_usage_anchor(agent, None)
-                    # The next request drops every item before this checkpoint, so a repeat
-                    # read must serve content again, not an "unchanged" stub (#32106), and
-                    # the loop guardrail must not count it as a repeat.
+                    # The next request drops every item before this checkpoint, so a repeat read must serve
+                    # content again, not an "unchanged" stub (#32106), or count as a repeat in the loop guardrail.
                     # Without a task id, resetting read caches could clear every task's state.
                     from agent.conversation_compression_boundary import mark_context_loss_boundary
 

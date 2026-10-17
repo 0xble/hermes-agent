@@ -794,7 +794,8 @@ def _rewind_active_session_history(
     """Rewind one canonical user turn while retaining carrier scaffolding. Caller holds ``history_lock``. Persistent
     sessions go through ``SessionDB.rewind_user_turn`` (the durable transcript is the authority; memory is installed
     only after the commit); a session without a key rewinds the warm history alone."""
-    from agent.context_compressor import history_before_user_originated_turn, retryable_user_text, user_originated_turn_view
+    from agent.context_compressor import history_before_user_originated_turn, user_originated_turn_view
+    from agent.context_compressor_retry import retryable_user_text
 
     history = _history_without_ephemeral_scaffolding(session.get("history", []))
     user_indices = [i for i, m in enumerate(history) if user_originated_turn_view(m) is not None]
