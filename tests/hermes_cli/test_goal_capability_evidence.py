@@ -68,8 +68,7 @@ def test_skill_load_outcome_reaches_judge(skill_goal, monkeypatch, variant):
     loaded = json.loads(output)
     assert loaded["success"] is success
     first_id = _record(db, sid, "skill_view", args, output, "load")
-    source = str(skill / file_path)
-    citation = source if success else args["name"]
+    citation = ("Installed capability" if file_path == "SKILL.md" else "Installed guide") if success else args["name"]
     if variant == "dedup":
         # Real repeat stub omits the body; the earlier concrete load remains
         # citable outside the recent ledger and after compaction.
@@ -93,7 +92,7 @@ def test_skill_load_outcome_reaches_judge(skill_goal, monkeypatch, variant):
     assert str(first_id) in citations["evidence_ids"]
     assert "skill_view result #" in prompts[0]
     if success:
-        assert source in prompts[0]
+        assert citation in prompts[0]
         assert decision["status"] == "done" and not decision["should_continue"]
     else:
         assert '"success": false' in prompts[0]
