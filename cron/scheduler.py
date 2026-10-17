@@ -2892,7 +2892,9 @@ def run_one_job(
         if handed_off:
             from cron.scheduler_worker_failure import record_external_worker_outcome
 
-            record_external_worker_outcome(job, adapters=adapters, loop=loop)
+            record_external_worker_outcome(
+                job, adapters=adapters, loop=loop, worker_exited=True
+            )
             return True
     if extra_prompt is None:
         # Gateway-forwarded manual run stamps its prompt on the job via trigger_job; the fire that
@@ -3832,7 +3834,14 @@ def _wait_for_external_cron_worker(
     if claim_key is not None:
         with _running_lock:
             claim_owner = _running_registration_owners.get(claim_key)
-            wait_for_process_exit = _external_worker_modes.get(claim_key) in {"scoped", "detached"}
+            worker_mode = _external_worker_modes.get(claim_key)
+            # Once this waiter is attached to a scheduler-owned external worker,
+            # including degraded dispatch, a terminal ledger row is only an
+            # intermediate commit. Return the exit proof to run_one_job by waiting
+            # for the process rather than projecting the row while it delivers.
+            wait_for_process_exit = claim_owner is not None or worker_mode in {
+                "scoped", "detached", "degraded"
+            }
         claim_home = _inflight_home_path(claim_key[0])
     try:
         return _wait_for_external_cron_worker_body(

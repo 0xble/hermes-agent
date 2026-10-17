@@ -6,22 +6,28 @@ logger = logging.getLogger("cron.scheduler")
 
 
 def record_external_worker_outcome(
-    job: dict, *, error=None, adapters=None, loop=None
+    job: dict, *, error=None, adapters=None, loop=None, worker_exited: bool = False
 ) -> bool:
     """Project a detached worker's terminal result onto the job record.
 
     The worker owns the execution ledger, but the gateway waiter owns the durable
-    job-level claim. A hard-wall watchdog can therefore finish the ledger as
-    ``failed`` and kill the worker before it reaches ``mark_job_run``. Likewise,
-    a dead worker can leave ``unknown``. Fence the normal notice and job update
-    together so recovery cannot overwrite a newer fire or duplicate a notice the
-    worker already recorded.
+    job-level claim. A terminal ledger row is not enough while the worker is still
+    alive: it commits before delivery and before its final job bookkeeping. The
+    scheduler waiter therefore passes ``worker_exited`` only after the process has
+    been reaped. Watchdog failures and unknown outcomes are the only rows whose
+    failure notice is known to be unsent; ordinary worker results are projected
+    without sending a second crash notice.
     """
     from cron import scheduler
     from cron.unreachable_retry import is_retry_run
 
     execution = scheduler.get_execution(str(job["execution_id"]))
-    if not execution or execution.get("status") not in ("completed", "failed", "unknown"):
+    status = execution.get("status") if execution else None
+    if not execution or status not in ("completed", "failed", "unknown"):
+        return False
+    if status in ("completed", "failed") and not worker_exited:
+        # A terminal row can precede delivery in a live worker. Never race it
+        # from a direct recovery call; the waiter will reconcile after exit.
         return False
     claim = job.get("fire_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -30,10 +36,21 @@ def record_external_worker_outcome(
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
             return True
-        failed = execution.get("status") != "completed"
+        failed = status != "completed"
         error = error or execution.get("error") or "Detached cron worker did not complete."
+        # A watchdog has already terminalized the row and then exits 124. Its
+        # durable error marker is the authoritative proof that no worker-owned
+        # failure notice was sent. Normal worker failures may already have sent
+        # their own notice (and can carry a delivered queue status), so never
+        # synthesize a crash notice for them.
+        watchdog_failure = (
+            status == "failed"
+            and str(execution.get("error") or "").startswith(
+                "Detached cron run exceeded hard wall-clock timeout ("
+            )
+        )
         delivery_error = None
-        if failed:
+        if status == "unknown" or watchdog_failure:
             scheduler.logger.error("Job '%s': %s", job["id"], error)
             scope_tokens = scheduler._install_fire_secret_scope()
             try:
@@ -58,7 +75,9 @@ def record_unknown_worker_outcome(
     job: dict, *, error=None, adapters=None, loop=None
 ) -> bool:
     """Backward-compatible name for the dead-worker recovery path."""
-    return record_external_worker_outcome(job, error=error, adapters=adapters, loop=loop)
+    return record_external_worker_outcome(
+        job, error=error, adapters=adapters, loop=loop, worker_exited=True
+    )
 
 
 def external_worker_exited_reason(returncode: int | None) -> str:
