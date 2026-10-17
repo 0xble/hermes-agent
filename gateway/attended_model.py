@@ -88,13 +88,26 @@ def friendly_model_name(model: str) -> str:
     return raw
 
 
-def format_attended_switch_notice(model: str, effort: str) -> str:
-    """Render the one-shot attended switch-in status card."""
-    return t(
+def format_attended_switch_notice(
+    model: str, effort: str, *, idle_model: str = "", idle_minutes: float = 0,
+) -> str:
+    """Render the one-shot attended switch-in status card.
+
+    The second line names the model the topic returns to, because switching back is silent.
+    """
+    card = t(
         "gateway.model.attended_switched",
         model=friendly_model_name(model),
         effort=effort or "none",
     )
+    if idle_model and idle_model != model and idle_minutes > 0:
+        minutes = int(idle_minutes) if float(idle_minutes).is_integer() else idle_minutes
+        card += "\n" + t(
+            "gateway.model.attended_switch_back",
+            model=friendly_model_name(idle_model),
+            minutes=minutes,
+        )
+    return card
 
 
 @dataclass(frozen=True)
@@ -116,6 +129,7 @@ class AttendedResolution:
     reasoning_effort: str
     reason: str
     active: bool = False
+    idle_model: str = ""  # route used once the attended window lapses; display only
 
     @property
     def decision_key(self) -> tuple[str, str, str, str, bool]:
@@ -266,7 +280,9 @@ def resolve_attended_model(
         model = cfg.model or channel_model or default_model
         provider = cfg.provider or channel_provider or default_provider
         effort = str(explicit_reasoning or cfg.reasoning_effort or get("attended_reasoning") or default_reasoning)
-        return AttendedResolution(model, provider, effort, "attended", True)
+        return AttendedResolution(
+            model, provider, effort, "attended", True, idle_model=channel_model or default_model,
+        )
 
     return AttendedResolution(
         channel_model or default_model, baseline_provider,

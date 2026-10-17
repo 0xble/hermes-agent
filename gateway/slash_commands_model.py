@@ -699,7 +699,10 @@ class GatewayModelCommandsMixin:
             if session_key in running:
                 pending.add(session_key)
             await self._persist_session_model_override(session_key, None, scope="session")
-            if session_key not in running:
+            if session_key in running:
+                # Clear the persisted pick without touching the in-flight agent's reasoning.
+                self._set_session_reasoning_override(session_key, None, scope="session")
+            else:
                 self._set_reasoning_override(session_key, None, scope="session")
             with contextlib.suppress(Exception):
                 state = self._peek_session_state(session_key)

@@ -108,8 +108,27 @@ def test_attended_switch_notice_uses_card_style_and_friendly_name():
     assert friendly_model_name("claude-3-opus-20240229") == "3 Opus"
     assert friendly_model_name("gpt-6-astra") == "GPT-6 Astra"
     assert format_attended_switch_notice("claude-opus-5-5", "high") == (
-        "🤖 Model switched to `Opus 5.5` · high"
+        "⚙️ Switched to **Opus 5.5** · high"
     )
+    assert format_attended_switch_notice(
+        "claude-opus-5-5", "high", idle_model="gpt-6-astra", idle_minutes=15,
+    ) == "⚙️ Switched to **Opus 5.5** · high\nBack to GPT-6 Astra after 15m idle"
+    # No return line when the idle route is the same model.
+    assert format_attended_switch_notice(
+        "claude-opus-5-5", "high", idle_model="claude-opus-5-5", idle_minutes=15,
+    ) == "⚙️ Switched to **Opus 5.5** · high"
+
+
+def test_attended_resolution_names_idle_return_model():
+    cfg = _cfg(attended={"model": "attended", "provider": "attended-provider"})
+    active = resolve_attended_model(
+        {"default_model": "default", "default_provider": "p", "last_user_activity_at": 1000}, 1001, cfg,
+    )
+    assert active.idle_model == "default"
+    channel = resolve_attended_model(
+        {"default_model": "default", "channel_model": "channel", "last_user_activity_at": 1000}, 1001, cfg,
+    )
+    assert channel.idle_model == "channel"
 
 
 def test_unknown_claude_id_keeps_raw_display_value():

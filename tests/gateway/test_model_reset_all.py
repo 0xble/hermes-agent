@@ -42,6 +42,10 @@ def _runner_for_bulk_reset(keys, *, running=()):
         setattr(states[key].conversation, "reasoning_override", value),
         runner._session_reasoning_overrides.pop(key, None),
     ))
+    runner._set_session_reasoning_override = Mock(side_effect=lambda key, value, **_kwargs: (
+        setattr(states[key].conversation, "reasoning_override", value),
+        runner._session_reasoning_overrides.pop(key, None),
+    ))
     runner._evict_cached_agent = Mock()
     return runner, states
 
@@ -55,6 +59,9 @@ async def test_reset_all_clears_memory_and_persistence_and_defers_running_route(
     assert count == 3
     assert runner.async_session_store.set_model_override.await_count == 3
     assert runner._evict_cached_agent.call_count == 2
+    # The running session's persisted reasoning is cleared without touching its live agent.
+    runner._set_session_reasoning_override.assert_called_once_with("running", None, scope="session")
+    assert {c.args[0] for c in runner._set_reasoning_override.call_args_list} == {"idle-a", "reasoning-only"}
     assert runner._bulk_reset_pending_sessions == {"running"}
     assert all(state.conversation.model_override is None for state in states.values())
     assert all(state.conversation.reasoning_override is None for state in states.values())
@@ -102,3 +109,15 @@ def test_reset_all_dm_fallback_uses_adapter_config_extra_allowlist(monkeypatch):
 
     group_source = SessionSource(platform=Platform.TELEGRAM, user_id="owner", chat_id="group", chat_type="group")
     assert GatewayModelCommandsMixin._model_reset_all_is_authorized(runner, group_source) is False
+
+
+def test_turn_release_drains_pending_bulk_reset():
+    runner, _states = _runner_for_bulk_reset({"running"}, running={"running"})
+    runner._bulk_reset_pending_sessions = {"running"}
+    runner._persist_active_agents = Mock()
+    runner._is_session_run_current = lambda *_args: True
+    turn = SimpleNamespace(lease=None, clear=Mock())
+    runner._peek_session_state = lambda _key: SimpleNamespace(turn=turn)
+
+    assert runner._release_running_agent_state("running") is True
+    assert runner._bulk_reset_pending_sessions == set()

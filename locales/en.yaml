@@ -54,7 +54,8 @@ gateway:
   model:
     error_prefix: "Error: {error}"
     switched: "Model switched to `{model}`"
-    attended_switched: "🤖 Model switched to `{model}` · {effort}"
+    attended_switched: "⚙️ Switched to **{model}** · {effort}"
+    attended_switch_back: "Back to {model} after {minutes}m idle"
     provider_label: "Provider: {provider}"
     context_label: "Context: {tokens} tokens"
     max_output_label: "Max output: {tokens} tokens"

@@ -1490,7 +1490,11 @@ class TurnRunner:
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
                 emit_status = getattr(agent, "_emit_diagnostic_status", None)
                 if callable(emit_status):
-                    emit_status(format_attended_switch_notice(model, effort))
+                    from gateway.attended_model import parse_attended_config
+                    emit_status(format_attended_switch_notice(
+                        model, effort, idle_model=decision.idle_model,
+                        idle_minutes=parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
+                    ))
             if ctx.session_key:
                 handoff = getattr(runner, "_handoff_attended_state", None)
                 if callable(handoff):

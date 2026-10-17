@@ -375,7 +375,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             self._handoff_attended_state(
                 session_key,
                 conversation={
-                    "pending_attended_notice": format_attended_switch_notice(target_model, effort),
+                    "pending_attended_notice": format_attended_switch_notice(
+                        target_model, effort, idle_model=decision.idle_model,
+                        idle_minutes=cfg.idle_revert_minutes,
+                    ),
                 },
             )
         return route

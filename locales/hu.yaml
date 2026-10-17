@@ -51,7 +51,8 @@ gateway:
   model:
     error_prefix: "Hiba: {error}"
     switched: "Modell átváltva: `{model}`"
-    attended_switched: "🤖 Model switched to `{model}` · {effort}"
+    attended_switched: "⚙️ Switched to **{model}** · {effort}"
+    attended_switch_back: "Back to {model} after {minutes}m idle"
     provider_label: "Szolgáltató: {provider}"
     context_label: "Kontextus: {tokens} token"
     max_output_label: "Max. kimenet: {tokens} token"

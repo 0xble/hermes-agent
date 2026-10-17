@@ -435,6 +435,10 @@ class GatewayAgentCacheMixin:
             # One structured reset instead of a drifting pop-list. Turn-lease tokens are deliberately NOT
             # cleared here — _release_turn_lease owns them.
             state.turn.clear()
+        # A bulk reset deferred only this turn's live route; persistence was cleared already.
+        pending = getattr(self, "_bulk_reset_pending_sessions", None)
+        if isinstance(pending, set):
+            pending.discard(session_key)
         # Turn boundary: a running-agent slot was just released; persist the new (lower) in-flight count
         # so the dashboard readout stays current. Preserves gateway_state (see _persist_active_agents).
         self._persist_active_agents()

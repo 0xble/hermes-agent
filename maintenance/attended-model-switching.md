@@ -40,10 +40,15 @@ default route. With slash-admin gating disabled, the fallback authorization is
 limited to a configured owner's direct message; group messages are denied.
 
 The attended switch-in card is rendered by one helper in
-`gateway/attended_model.py`, using the same leading-icon/title/backticked-model
-style as the ordinary `gateway.model.switched` card and lifecycle diagnostics.
-For example, `claude-opus-5-5` at `high` renders as
-`🤖 Model switched to `Opus 5.5` · high`.
+`gateway/attended_model.py`. It follows the native settings-card shape (setting
+icon, bold value) and adds a second line naming the idle-return model, because
+switching back is silent. For example, `claude-opus-5-5` at `high` with a
+`gpt-6-astra` default and a 15 minute window renders as:
+
+```text
+⚙️ Switched to **Opus 5.5** · high
+Back to GPT-6 Astra after 15m idle
+```
 
 ## Provenance and patch
 

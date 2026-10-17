@@ -51,7 +51,8 @@ gateway:
   model:
     error_prefix: "خطأ: {error}"
     switched: "تم التبديل إلى النموذج `{model}`"
-    attended_switched: "🤖 Model switched to `{model}` · {effort}"
+    attended_switched: "⚙️ Switched to **{model}** · {effort}"
+    attended_switch_back: "Back to {model} after {minutes}m idle"
     provider_label: "المزوّد: {provider}"
     context_label: "السياق: {tokens} رمزًا"
     max_output_label: "أقصى خرج: {tokens} رمزًا"

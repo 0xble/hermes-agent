@@ -51,7 +51,8 @@ gateway:
   model:
     error_prefix: "エラー: {error}"
     switched: "モデルを `{model}` に切り替えました"
-    attended_switched: "🤖 Model switched to `{model}` · {effort}"
+    attended_switched: "⚙️ Switched to **{model}** · {effort}"
+    attended_switch_back: "Back to {model} after {minutes}m idle"
     provider_label: "プロバイダー: {provider}"
     context_label: "コンテキスト: {tokens} トークン"
     max_output_label: "最大出力: {tokens} トークン"
