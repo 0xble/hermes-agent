@@ -2865,6 +2865,7 @@ def run_one_job(
                         adapters=adapters,
                         loop=loop,
                         worker_terminated=getattr(handoff_error, "worker_terminated", False),
+                        worker_exit_code=getattr(handoff_error, "worker_exit_code", None),
                     ):
                         return True
                 else:
@@ -3749,16 +3750,31 @@ def _wait_for_external_cron_worker_body(
                             "exit grace period; execution was not projected.",
                             worker_terminated=True,
                         )
-                    raise _ExternalWorkerExitTimeout(
-                        "Restart-safe cron worker was terminated after its terminal "
-                        "exit grace period; delivery outcome is unknown.",
-                        worker_terminated=True,
-                    )
+                    if returncode < 0:
+                        raise _ExternalWorkerExitTimeout(
+                            "Restart-safe cron worker was terminated after its terminal "
+                            "exit grace period; delivery outcome is unknown.",
+                            worker_terminated=True,
+                            worker_exit_code=returncode,
+                        )
+                    if returncode != 0:
+                        raise _ExternalWorkerExitTimeout(
+                            f"Restart-safe cron worker exited with status {returncode} "
+                            "after its terminal exit grace period.",
+                            worker_exit_code=returncode,
+                        )
+                    return True
                 if returncode is None:
                     from cron.scheduler_detached_worker import reap_terminal_worker_in_background
 
                     reap_terminal_worker_in_background(process)
                     return True
+                if returncode != 0:
+                    raise _ExternalWorkerExitTimeout(
+                        f"Restart-safe cron worker exited with status {returncode} "
+                        "after its terminal exit grace period.",
+                        worker_exit_code=returncode,
+                    )
                 return True
             timeout = min(timeout, max(0.001, remaining))
         try:
@@ -3775,6 +3791,12 @@ def _wait_for_external_cron_worker_body(
                 terminal_deadline = terminal_base + max(0.0, float(terminal_exit_grace_seconds))
             returncode = process.poll()
             if returncode is not None:
+                if returncode != 0:
+                    raise _ExternalWorkerExitTimeout(
+                        f"Restart-safe cron worker exited with status {returncode} "
+                        "after terminalizing its execution.",
+                        worker_exit_code=returncode,
+                    )
                 return True
             if not wait_for_process_exit:
                 from cron.scheduler_detached_worker import reap_terminal_worker_in_background
@@ -3792,7 +3814,15 @@ def _wait_for_external_cron_worker_body(
             if returncode is not None and returncode < 0 and wait_for_process_exit:
                 raise _ExternalWorkerExitTimeout(
                     f"Restart-safe cron worker was terminated with status {returncode} "
-                    "after its terminal exit grace period."
+                    "after its terminal exit grace period.",
+                    worker_terminated=True,
+                    worker_exit_code=returncode,
+                )
+            if returncode not in (None, 0):
+                raise _ExternalWorkerExitTimeout(
+                    f"Restart-safe cron worker exited with status {returncode} "
+                    "after terminalizing its execution.",
+                    worker_exit_code=returncode,
                 )
             return True
         # If the adopted worker died without terminalizing, its owner is
@@ -3839,10 +3869,35 @@ def _cleanup_external_worker_state(
         return True
 
 
+def _reconcile_deferred_external_worker_outcome(
+    job_id: str, home: Path, process: subprocess.Popen, error: str, *, worker_terminated: bool,
+) -> None:
+    """Project a terminal worker result after a bounded waiter returned early."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from cron.jobs import get_job, use_cron_store
+    from cron.scheduler_worker_failure import record_external_worker_outcome
+
+    home_token = set_hermes_home_override(home)
+    try:
+        with use_cron_store(home):
+            deferred_job = get_job(job_id)
+            if deferred_job is not None:
+                record_external_worker_outcome(
+                    deferred_job,
+                    error=error,
+                    worker_exited=True,
+                    worker_terminated=worker_terminated,
+                    worker_exit_code=process.poll(),
+                )
+    finally:
+        reset_hermes_home_override(home_token)
+
+
 def _defer_external_worker_claim_release(
     job_id: str, home: Path, owner, process: subprocess.Popen,
+    *, outcome_error: Optional[str] = None, worker_terminated: bool = False,
 ) -> None:
-    """Reap a live restart-safe worker and release its fenced gateway claim."""
+    """Reconcile a live restart-safe worker after exit, then release its fenced claim."""
     key = _inflight_key(job_id, home)
     token = (key, id(owner))
     with _running_lock:
@@ -3863,6 +3918,21 @@ def _defer_external_worker_claim_release(
                 except Exception:
                     time.sleep(1.0)
         finally:
+            if outcome_error is not None:
+                try:
+                    _reconcile_deferred_external_worker_outcome(
+                        job_id,
+                        home,
+                        process,
+                        outcome_error,
+                        worker_terminated=worker_terminated,
+                    )
+                except Exception:
+                    logger.error(
+                        "Failed to reconcile external worker outcome for job %s after exit",
+                        job_id,
+                        exc_info=True,
+                    )
             release_running_job(job_id, home=home, owner=owner, force=True)
             with _running_lock:
                 _external_worker_reapers.discard(token)
@@ -3879,18 +3949,25 @@ def _defer_external_worker_claim_release(
 class _ExternalWorkerPostHandoffError(RuntimeError):
     """The waiter failed after the worker was spawned and may own the execution."""
 
-    def __init__(self, message: str, *, worker_exited: bool = True, worker_terminated: bool = False):
+    def __init__(
+        self, message: str, *, worker_exited: bool = True, worker_terminated: bool = False,
+        worker_exit_code: int | None = None,
+    ):
         super().__init__(message)
         self.worker_exited = worker_exited
         self.worker_terminated = worker_terminated
+        self.worker_exit_code = worker_exit_code
 
 
 class _ExternalWorkerExitTimeout(RuntimeError):
     """A terminal worker did not exit within the bounded parent-side grace period."""
 
-    def __init__(self, message: str, *, worker_terminated: bool = False):
+    def __init__(
+        self, message: str, *, worker_terminated: bool = False, worker_exit_code: int | None = None,
+    ):
         super().__init__(message)
         self.worker_terminated = worker_terminated
+        self.worker_exit_code = worker_exit_code
 
 def _wait_for_external_cron_worker(
     process: subprocess.Popen,
@@ -3918,6 +3995,8 @@ def _wait_for_external_cron_worker(
                 "scoped", "detached", "degraded"
             }
         claim_home = _inflight_home_path(claim_key[0])
+    deferred_outcome_error = None
+    deferred_worker_terminated = False
     try:
         return _wait_for_external_cron_worker_body(
             process,
@@ -3933,10 +4012,14 @@ def _wait_for_external_cron_worker(
         worker_exited = True
         with contextlib.suppress(Exception):
             worker_exited = process.poll() is not None
+        if not worker_exited and claim_owner is not None and claim_home is not None:
+            deferred_outcome_error = str(wait_error)
+            deferred_worker_terminated = getattr(wait_error, "worker_terminated", False)
         raise _ExternalWorkerPostHandoffError(
             str(wait_error),
             worker_exited=worker_exited,
             worker_terminated=getattr(wait_error, "worker_terminated", False),
+            worker_exit_code=getattr(wait_error, "worker_exit_code", None),
         ) from wait_error
     finally:
         worker_exited = False
@@ -3952,7 +4035,13 @@ def _wait_for_external_cron_worker(
                 and claim_home is not None
             ):
                 _defer_external_worker_claim_release(
-                    job_id, claim_home, claim_owner, process)
+                    job_id,
+                    claim_home,
+                    claim_owner,
+                    process,
+                    outcome_error=deferred_outcome_error,
+                    worker_terminated=deferred_worker_terminated,
+                )
             else:
                 _cleanup_external_worker_state(
                     job_id,
