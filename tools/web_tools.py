@@ -299,7 +299,7 @@ def _finish_debug(call_name: str, debug_call_data: dict, error_msg: Optional[str
     return None if error_msg is None else tool_error(error_msg)
 
 
-def web_search_tool(query: str, limit: int = 5) -> str:
+def web_search_tool(query: str, limit: int = 5, session_id: Optional[str] = None) -> str:
     """Search the web via the configured backend.
 
     Returns a JSON string ``{"success": bool, "data": {"web": [{"title", "url", "description", "position"},
@@ -336,7 +336,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             response_data = {"success": False, "error": _no_provider_error("search", fallback)}
         else:
             logger.info("Web search via %s: '%s' (limit: %d)", provider.name, query, limit)
-            response_data = _memoized_search(provider, query, limit)
+            response_data = _memoized_search(provider, query, limit, session_id=session_id)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -347,45 +347,128 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         return _finish_debug("web_search_tool", debug_call_data, f"Error searching web: {str(e)}")
 
 
-def _memoized_search(provider, query: str, limit: int) -> dict:
-    """TTL memo + single-flight around the paid vendor call (tools/web_result_cache.py); sits after every
-    safety/config check. The provider is asked for the BUCKETED count so near-identical limits share an entry;
-    the caller's count is sliced out. Only successful, non-rescued responses are cached — caching a rescue
-    would make the one-shot ring fallback sticky for a whole TTL."""
-    from tools.web_result_cache import bucket_limit, search_memo, slice_search_response
+def _search_cache_identity(provider) -> tuple[str, dict]:
+    """Return the backend route and dimensions that must not share a search result."""
+    name = getattr(provider, "name", "") or "unknown"
+    identity = {
+        "endpoint": getattr(provider, "SEARCH_ENDPOINT", "search") or "search",
+        "search_type": getattr(provider, "SEARCH_TYPE", "default") or "default",
+        "freshness_class": getattr(provider, "FRESHNESS_CLASS", "default") or "default",
+    }
+    route = "default"
+    if name in {"exa", "parallel", "firecrawl", "keenable", "tavily"}:
+        from tools.web_tools_rescue import _ring_vendor_keyless
+        route = "keyless" if _ring_vendor_keyless(name) else "keyed"
+    if name == "parallel" and route == "keyed":
+        mode = os.getenv("PARALLEL_SEARCH_MODE", "agentic").lower().strip()
+        identity["search_type"] = mode if mode in {"agentic", "fast", "one-shot"} else "agentic"
+    if name == "perplexity":
+        # The managed gateway sends search_type=fast, while direct Perplexity
+        # requests omit search_type. Keep those routes separate even though the
+        # public provider name is the same.
+        from agent.web_search_provider import get_provider_env
+        direct = bool(get_provider_env("PERPLEXITY_API_KEY"))
+        managed = not direct and _managed_web_search()
+        identity["search_type"] = "direct" if direct else "fast" if managed else "default"
+        route = "direct" if direct else "managed" if managed else "default"
+    return f"{name}:{route}", identity
 
-    def _paid_search() -> tuple[dict, bool]:
-        fetch_limit = bucket_limit(limit)
-        try:
-            resp = provider.search(query, fetch_limit)
-        except Exception as exc:  # noqa: BLE001 — candidate for fallback / rescue
-            served = _served_after_failure(str(exc), fetch_limit)
-            if served is None:
-                raise
-            return served, True
-        if not resp.get("success"):
-            served = _served_after_failure(str(resp.get("error", "")), fetch_limit)
-            if served is not None:
-                return served, True
-        return resp, False
 
-    def _served_after_failure(error: str, fetch_limit: int) -> Optional[dict]:
-        """Managed Firecrawl for a failed managed Perplexity call, else the one-shot keyless rescue when
-        eligible; None means the vendor's own failure stands."""
-        fallback = _managed_search_fallback(provider, error, query, fetch_limit)
-        if fallback is not None:
-            return fallback
-        return _rescue_search(provider.name, error, query, fetch_limit) if _rescue_eligible(provider) else None
+def _served_after_failure(provider, error: str, query: str, fetch_limit: int, session_id: Optional[str] = None) -> tuple[Optional[dict], Optional[str]]:
+    """Use an eligible managed or keyless rescue after a provider failure."""
+    fallback, budget_warning = _managed_search_fallback(provider, error, query, fetch_limit, session_id)
+    if fallback is not None:
+        return fallback, budget_warning
+    rescue = _rescue_search(provider.name, error, query, fetch_limit) if _rescue_eligible(provider) else None
+    return rescue, budget_warning
 
-    response_data = search_memo.lookup(provider.name, query, limit)
-    if response_data is None:
-        with search_memo.flight_lock(provider.name, query, limit):
-            # Re-check inside the lock: a concurrent identical call may have stored.
-            response_data = search_memo.lookup(provider.name, query, limit)
-            if response_data is None:
-                response_data, was_rescued = _paid_search()
-                if not was_rescued:
-                    search_memo.store(provider.name, query, limit, response_data)
+
+def _paid_search(provider, query: str, limit: int, session_id: Optional[str]) -> tuple[dict, bool, Optional[str]]:
+    """Make one remote search attempt, retaining the warning and rescue outcome."""
+    from tools.web_result_cache import bucket_limit, search_budget
+
+    fetch_limit = bucket_limit(limit)
+    budget_warning = search_budget.record(session_id, provider.name)
+    try:
+        response = provider.search(query, fetch_limit)
+    except Exception as exc:  # health: allow BLE001 -- provider adapters expose heterogeneous failures; rescue must catch all
+        served, fallback_warning = _served_after_failure(provider, str(exc), query, fetch_limit, session_id)
+        if served is not None:
+            return served, True, budget_warning or fallback_warning
+        return {"success": False, "error": f"Error searching web: {exc}"}, True, budget_warning
+    if not response.get("success"):
+        served, fallback_warning = _served_after_failure(
+            provider, str(response.get("error", "")), query, fetch_limit, session_id
+        )
+        if served is not None:
+            return served, True, budget_warning or fallback_warning
+    return response, False, budget_warning
+
+
+def _search_with_cache(
+    provider,
+    query: str,
+    limit: int,
+    session_id: Optional[str],
+    cache_provider: str,
+    cache_identity: dict,
+) -> tuple[dict, Optional[str]]:
+    """Read or populate the shared search cache, coalescing concurrent misses."""
+    from tools.web_result_cache import cache_enabled, search_memo
+
+    def lookup() -> Optional[dict]:
+        return search_memo.lookup(cache_provider, query, limit, **cache_identity)
+
+    def store(response: dict) -> None:
+        search_memo.store(cache_provider, query, limit, response, **cache_identity)
+
+    def flight_lock():
+        return search_memo.flight_lock(cache_provider, query, limit, **cache_identity)
+
+    def process_lock():
+        return search_memo.process_lock(cache_provider, query, limit, **cache_identity)
+
+    response_data = lookup()
+    if response_data is not None:
+        return response_data, None
+    with flight_lock():
+        response_data = lookup()
+        if response_data is not None:
+            return response_data, None
+        if not cache_enabled():
+            response_data, _, budget_warning = _paid_search(provider, query, limit, session_id)
+            return response_data, budget_warning
+        with process_lock():
+            response_data = lookup()
+            if response_data is not None:
+                return response_data, None
+            response_data, was_rescued, budget_warning = _paid_search(provider, query, limit, session_id)
+            if not was_rescued:
+                store(response_data)
+            return response_data, budget_warning
+
+
+def _memoized_search(provider, query: str, limit: int, session_id: Optional[str] = None) -> dict:
+    """TTL memo + cross-process coalescing around the remote vendor call.
+
+    The cache is after provider/safety resolution and stores only successful,
+    non-rescued responses. Search identity includes endpoint, backend, search
+    type, and freshness class even though the current public tool exposes only
+    the default values for the latter two.
+    """
+    from tools.web_result_cache import slice_search_response
+
+    cache_provider, cache_identity = _search_cache_identity(provider)
+    response_data, budget_warning = _search_with_cache(
+        provider, query, limit, session_id, cache_provider, cache_identity
+    )
+
+    if budget_warning:
+        response_data = json.loads(json.dumps(response_data))
+        warnings = response_data.setdefault("warnings", [])
+        if not isinstance(warnings, list):
+            warnings = response_data["warnings"] = [str(warnings)]
+        warnings.append(budget_warning)
     return slice_search_response(response_data, limit)
 
 
@@ -558,7 +641,9 @@ WEB_EXTRACT_SCHEMA = {
 
 registry.register(
     name="web_search", toolset="web", schema=WEB_SEARCH_SCHEMA,
-    handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
+    handler=lambda args, **kw: web_search_tool(
+        args.get("query", ""), limit=args.get("limit", 5), session_id=kw.get("session_id")
+    ),
     check_fn=check_web_api_key, requires_env=_web_requires_env(), emoji="🔍",
     max_result_size_chars=100_000,
 )

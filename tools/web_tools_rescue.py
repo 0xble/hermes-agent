@@ -14,6 +14,7 @@ logger = logging.getLogger("tools.web_tools")
 _RING_KEY_VARS = {
     "exa": "EXA_API_KEY", "parallel": "PARALLEL_API_KEY",
     "firecrawl": "FIRECRAWL_API_KEY", "keenable": "KEENABLE_API_KEY",
+    "tavily": "TAVILY_API_KEY",
 }
 
 
@@ -47,15 +48,19 @@ def _ring_vendor_keyless(name: str) -> bool:
     return use_keyless(name, get_provider_env(key_var) if key_var else "")
 
 
-def _managed_search_fallback(provider, original_error: str, query: str, limit: int):
-    """Try managed Firecrawl for this call only; None leaves the original error for keyless rescue.
-    Managed Firecrawl is billed, so a caller on free fast search alone never reaches it."""
+def _managed_search_fallback(provider, original_error: str, query: str, limit: int, session_id=None):
+    """Return ``(response, budget_warning)`` for this billed fallback, or ``(None, warning)`` on failure.
+
+    A caller on free fast search alone never reaches this managed fallback.
+    """
     from agent.web_search_provider import get_provider_env
     from tools import web_tools as _wt
     if (getattr(provider, "name", "") != "perplexity"
             or get_provider_env("PERPLEXITY_API_KEY") or not _wt._managed_web_search() or not _wt._is_tool_gateway_ready()):
-        return None
+        return None, None
     logger.warning("web_search managed Perplexity failed (%s); serving this call from managed Firecrawl", (original_error or "")[:200])
+    from tools.web_result_cache import search_budget
+    budget_warning = search_budget.record(session_id, "firecrawl")
     try:
         from agent.web_search_registry import get_provider
         resp = get_provider("firecrawl").search(query, limit)
@@ -63,13 +68,13 @@ def _managed_search_fallback(provider, original_error: str, query: str, limit: i
         resp = {"success": False, "error": str(exc)}
     if not resp.get("success"):
         logger.warning("managed Firecrawl fallback failed too: %s", str(resp.get("error", ""))[:200])
-        return None
+        return None, budget_warning
     resp.setdefault("data", {}).update(
         fallback_from="managed_primary",
         backend_error=f"Primary managed search failed this call ({(original_error or 'unknown error')[:300]}); "
                       "result served by the managed fallback. The next call will use the primary again.",
     )
-    return resp
+    return resp, budget_warning
 
 
 def _rescue_eligible(provider) -> bool:

@@ -401,6 +401,15 @@ Fork patch identity: `internal-followup-retirement`.
 - **Focused regression:** `uv run --offline --group dev pytest -q -p no:cacheprovider tests/gateway/test_restart_recovery_outcomes.py tests/gateway/test_restart_resume_admission_identity.py tests/gateway/test_restart_resume_pending.py tests/gateway/test_restart_resume_policy.py tests/gateway/test_restart_resume_real_adapter.py tests/gateway/test_shutdown_followup_restart.py`.
 - **Rollback:** Revert the commit carrying `Fork-Patch: internal-followup-retirement`.
 
+Fork-Patch: web-search-cost-controls.
+
+- **Patch identity:** `web-search-cost-controls`.
+- **Behavior:** Deduplicate successful paid web searches across concurrent Hermes processes with route-aware cache identity, keep rescued or failed responses out of the cache, and surface warn-only per-session request thresholds. Keyed and keyless ring routes, opt-in Tavily tiers, Parallel search modes, and direct and managed Perplexity routes remain isolated. Billed managed Firecrawl fallback attempts count toward the same session warning budget.
+- **Source surfaces:** `tools/web_tools.py`, `tools/web_result_cache.py`, `tools/web_tools_rescue.py`, and focused web-tool tests.
+- **Focused regression:** `scripts/run_tests.sh tests/tools/test_web_result_cache.py tests/tools/test_web_keyless_rescue.py tests/tools/test_web_providers.py`.
+- **Retirement:** Remove when released upstream provides equivalent cross-process paid-search deduplication, route-aware cache identity, and visible warning behavior.
+- **Rollback:** Revert the commit carrying `Fork-Patch: web-search-cost-controls`.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement

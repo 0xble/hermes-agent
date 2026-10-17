@@ -83,6 +83,29 @@ class TestPerCapabilityBackendSelection:
         assert web_tools._get_search_backend() == "keenable"
 
 
+    def test_perplexity_cache_identity_separates_direct_and_managed_routes(self, monkeypatch):
+        from tools import web_tools
+
+        class _Perplexity:
+            name = "perplexity"
+
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env",
+            lambda name: "direct-key" if name == "PERPLEXITY_API_KEY" else "",
+        )
+        monkeypatch.setattr(web_tools, "_managed_web_search", lambda: True)
+        direct_provider, direct = web_tools._search_cache_identity(_Perplexity())
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env", lambda name: ""
+        )
+        managed_provider, managed = web_tools._search_cache_identity(_Perplexity())
+        assert direct_provider == "perplexity:direct"
+        assert managed_provider == "perplexity:managed"
+        assert direct["search_type"] == "direct"
+        assert managed["search_type"] == "fast"
+        assert direct["freshness_class"] == managed["freshness_class"] == "default"
+
+
     def test_fully_backward_compatible_with_web_backend_only(self, monkeypatch):
         from tools import web_tools
 
@@ -93,6 +116,50 @@ class TestPerCapabilityBackendSelection:
         # No search_backend or extract_backend set — both fall through
         assert web_tools._get_search_backend() == "keenable"
         assert web_tools._get_extract_backend() == "keenable"
+
+
+    def test_ring_cache_identity_separates_keyed_and_keyless_routes(self, monkeypatch):
+        from tools import web_tools
+
+        class _Exa:
+            name = "exa"
+
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env",
+            lambda name: "exa-key" if name == "EXA_API_KEY" else "",
+        )
+        monkeypatch.setattr("plugins.web.keyless_mcp.provider_tier", lambda name: "auto")
+        keyed_provider, _ = web_tools._search_cache_identity(_Exa())
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env", lambda name: ""
+        )
+        keyless_provider, _ = web_tools._search_cache_identity(_Exa())
+        assert keyed_provider == "exa:keyed"
+        assert keyless_provider == "exa:keyless"
+
+    def test_parallel_mode_and_tavily_tier_are_cache_identity_dimensions(self, monkeypatch):
+        from tools import web_tools
+
+        class _Parallel:
+            name = "parallel"
+
+        class _Tavily:
+            name = "tavily"
+
+        monkeypatch.setattr("tools.web_tools_rescue._ring_vendor_keyless", lambda name: False)
+        monkeypatch.setenv("PARALLEL_SEARCH_MODE", "fast")
+        _, fast = web_tools._search_cache_identity(_Parallel())
+        monkeypatch.setenv("PARALLEL_SEARCH_MODE", "agentic")
+        _, agentic = web_tools._search_cache_identity(_Parallel())
+        assert fast["search_type"] == "fast"
+        assert agentic["search_type"] == "agentic"
+
+        monkeypatch.setattr("tools.web_tools_rescue._ring_vendor_keyless", lambda name: name == "tavily")
+        keyless_tavily, _ = web_tools._search_cache_identity(_Tavily())
+        monkeypatch.setattr("tools.web_tools_rescue._ring_vendor_keyless", lambda name: False)
+        keyed_tavily, _ = web_tools._search_cache_identity(_Tavily())
+        assert keyless_tavily == "tavily:keyless"
+        assert keyed_tavily == "tavily:keyed"
 
 
 # ---------------------------------------------------------------------------
