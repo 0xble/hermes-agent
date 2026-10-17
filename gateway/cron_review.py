@@ -39,10 +39,11 @@ def fail_busy_review(event) -> bool:
 def private_turn_response(event, agent_result, response=None):
     from gateway.warning_notifications import diagnostic_wake_muted
     if is_review_event(event):
-        captured = agent_result.get("final_response")
-        if not captured:
-            captured = getattr(event, "_agent_final_response", "")
-        if not captured:
+        _missing = object()
+        captured = getattr(event, "_agent_final_response", _missing)
+        if captured is _missing:
+            captured = agent_result.get("final_response")
+        if captured is None:
             captured = response
         return True, str(captured or "")
     return diagnostic_wake_muted(event), None
