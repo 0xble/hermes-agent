@@ -208,7 +208,11 @@ class GatewayConfigLoadersMixin:
             try:
                 from gateway.run import _load_gateway_config
                 from gateway.attended_model import parse_attended_config
-                user_config = _load_gateway_config()
+                user_config = (
+                    _load_gateway_config()
+                    if profile_home is None
+                    else _load_gateway_config(profile_home / "config.yaml")
+                )
                 attended_cfg = parse_attended_config(user_config)
                 attended_baseline = {}
                 if attended_cfg.model:
