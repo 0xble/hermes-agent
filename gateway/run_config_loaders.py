@@ -148,17 +148,20 @@ class GatewayConfigLoadersMixin:
         return self._load_ephemeral_system_prompt()
 
     @staticmethod
-    def _load_reasoning_config(model: str = "") -> dict | None:
-        """Reasoning effort from config.yaml via :func:`hermes_constants.resolve_reasoning_config`.
+    def _load_reasoning_config(model: str = "", *, profile_home=None) -> dict | None:
+        """Reasoning effort from the owning profile's config.yaml via
+        :func:`hermes_constants.resolve_reasoning_config`.
 
         Per-model override > global ``agent.reasoning_effort``; YAML False = disabled. Empty
-        ``model`` uses ``model.default``.
+        ``model`` uses ``model.default``. ``profile_home`` is supplied by multiplexed callers so
+        readback never falls through to the launch profile's config.
 
         Closes #21256.
         """
         from gateway.run import _load_gateway_config
         from hermes_constants import resolve_reasoning_config
-        return resolve_reasoning_config(_load_gateway_config(), model)
+        config_path = None if profile_home is None else profile_home / "config.yaml"
+        return resolve_reasoning_config(_load_gateway_config(config_path), model)
 
     @staticmethod
     def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:
@@ -187,7 +190,12 @@ class GatewayConfigLoadersMixin:
         override = self._session_reasoning_override(resolved_session_key)
         if override is not None:
             return override
-        return self._load_reasoning_config(model)
+        profile_home = None
+        resolve_profile_home = getattr(self, "_resolve_profile_home_for_source", None)
+        if (getattr(getattr(self, "config", None), "multiplex_profiles", False)
+                and source is not None and callable(resolve_profile_home)):
+            profile_home = resolve_profile_home(source)
+        return self._load_reasoning_config(model, profile_home=profile_home)
 
     def _session_reasoning_override(self, session_key: Optional[str]) -> dict | None:
         """The session's explicit ``/reasoning`` pick, or ``None`` when it runs on config."""

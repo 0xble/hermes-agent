@@ -82,7 +82,7 @@ def _runner(home, adapter, *, auto_icons=False):
     runner._agent_cache, runner._agent_cache_lock = {}, None
     runner._session_model_overrides = {}
     runner._pending_model_notes = {}
-    runner._load_reasoning_config = lambda model="": {"enabled": True, "effort": "medium"}
+    runner._load_reasoning_config = lambda model="", **_kwargs: {"enabled": True, "effort": "medium"}
     runner._delivery_adapter_for = lambda source: adapter
     runner._record_switch_metrics = MagicMock()
     runner._perform_model_switch = AsyncMock(return_value=(_model_result(), None))
@@ -565,6 +565,32 @@ async def test_edit_refuses_a_model_change_only_when_typed_commit_is_used(home):
     with pytest.raises(TopicRequestError, match="General"):
         await edit_topic_session(runner, _source(), "1", TopicSpec(name="x"))
     assert adapter.renamed == []
+
+
+def test_reasoning_readback_uses_the_routed_profile_config(monkeypatch, tmp_path):
+    """A topic result must report the secondary profile's default, not the launch profile's."""
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+
+    secondary = tmp_path / "profiles" / "secondary"
+    secondary.mkdir(parents=True)
+    loaded_paths = []
+
+    def load_config(path=None):
+        loaded_paths.append(path)
+        return {"agent": {"reasoning_effort": "high"}}
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._resolve_session_key_or_none = lambda source, session_key: session_key or "topic-key"
+    runner._session_reasoning_override = lambda session_key: None
+    runner._resolve_profile_home_for_source = lambda source: secondary
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", load_config)
+
+    result = runner._resolve_session_reasoning_config(source=_source(thread_id="4242"), model="gpt-test")
+
+    assert result == {"enabled": True, "effort": "high"}
+    assert loaded_paths == [secondary / "config.yaml"]
 
 
 def test_tool_survives_schemas_built_before_telegram_connects(monkeypatch):
