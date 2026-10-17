@@ -779,13 +779,13 @@ class GatewayModelCommandsMixin:
         if self._live_agent_for_session_control(session_key) is None:
             self._evict_cached_agent(session_key)
 
-    def _set_reasoning_override(self, session_key: str, value) -> None:
+    def _set_reasoning_override(self, session_key: str, value, source=None) -> None:
         """Apply a session override to the live tool loop's next model request."""
         self._set_session_reasoning_override(session_key, value)
         agent = self._live_agent_for_session_control(session_key)
         if agent is not None:
             effective = value if value is not None else self._resolve_session_reasoning_config(
-                session_key=session_key, model=getattr(agent, "model", ""),
+                source=source, session_key=session_key, model=getattr(agent, "model", ""),
             )
             agent.reasoning_config = dict(effective) if isinstance(effective, dict) else effective
             agent.reasoning_override = None if value is None else dict(value)

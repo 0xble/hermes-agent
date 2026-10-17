@@ -198,7 +198,7 @@ async def _apply_session_settings(
         previous = runner._session_reasoning_override(entry.session_key)
         selected = None if reasoning_reset else effort
         if previous != selected:
-            await asyncio.to_thread(runner._set_reasoning_override, entry.session_key, selected)
+            await asyncio.to_thread(runner._set_reasoning_override, entry.session_key, selected, dest)
             reasoning_status = "applied"
             reasoning_effective_when = (
                 "next_request" if runner._is_session_running(entry.session_key) else "next_turn"
@@ -320,16 +320,25 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
             raise TopicRequestError(
                 f"Topic {thread_id} and session {entry.session_id} are set up, but the opening brief "
                 f"was not delivered: {exc}. Send it with relay to {relay}.") from exc
+    profile_home = None
     effective_model = getattr(model[1], "new_model", None) if model else None
     effective_provider = getattr(model[1], "target_provider", None) if model else None
-    if not effective_model:
+    if model:
+        profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
+    else:
+        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
+                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
+            profile_home = runner._resolve_profile_home_for_source(dest)
         with_context = getattr(runner, "_model_switch_context", None)
         if callable(with_context):
-            effective = with_context(dest, entry.session_key, persist_global=False)
+            effective = with_context(
+                dest, entry.session_key, profile_home=profile_home, persist_global=False,
+            )
             effective_model = effective.current_model
             effective_provider = effective.current_provider
     effective_config = runner._resolve_session_reasoning_config(
         source=dest, session_key=entry.session_key, model=effective_model or "",
+        profile_home=profile_home,
     )
     return {
         "action": "create", "thread_id": str(thread_id), "session_id": entry.session_id,
@@ -388,14 +397,23 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
             runner, dest, entry, model, effort, reasoning_reset=reasoning_reset,
         )
         warnings = settings["warnings"]
+    profile_home = None
     effective_model = getattr(model[1], "new_model", None) if model else None
     effective_provider = getattr(model[1], "target_provider", None) if model else None
-    if not effective_model:
-        effective_ctx = runner._model_switch_context(dest, entry.session_key, persist_global=False)
+    if model:
+        profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
+    else:
+        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
+                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
+            profile_home = runner._resolve_profile_home_for_source(dest)
+        effective_ctx = runner._model_switch_context(
+            dest, entry.session_key, profile_home=profile_home, persist_global=False,
+        )
         effective_model = effective_ctx.current_model
         effective_provider = effective_ctx.current_provider
     effective_config = runner._resolve_session_reasoning_config(
         source=dest, session_key=entry.session_key, model=effective_model or "",
+        profile_home=profile_home,
     )
     return {
         "action": "edit", "thread_id": thread_id, "session_id": entry.session_id,
