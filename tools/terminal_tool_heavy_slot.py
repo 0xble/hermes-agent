@@ -20,8 +20,10 @@ runner (``grep pytest``, quoted strings, comments, heredoc bodies), and
 targeted runs of 1-10 explicit test files with only single-run options.
 Foreground local commands pass ``HEAVY_SLOT_MAX_WAIT`` derived from their
 terminal timeout, so a busy queue fails before the terminal deadline; background
-commands omit it and retain the helper's unbounded wait. The environment-variable
-transport is backwards-compatible with helpers that predate ``--max-wait``.
+commands omit it and retain the helper's unbounded wait. A single simple heavy
+command that reaches this bound can be promoted to a tracked background process
+without re-running a compound shell command. The environment-variable transport
+is backwards-compatible with helpers that predate ``--max-wait``.
 """
 
 from __future__ import annotations
@@ -346,6 +348,24 @@ def _heavy_positions(command: str) -> list[tuple[int, str]]:
         if label and insert is not None:
             found.append((segment[insert][0], label))
     return found
+
+
+def can_promote_expired_wait(
+    command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Whether an expired foreground wait can be safely resumed in the background.
+
+    Re-running a compound shell command could repeat earlier side effects. Restrict
+    promotion to one top-level simple command with one recognized heavy process;
+    callers with chains keep the existing not-started result and explicit retry
+    guidance instead.
+    """
+    if env_type != "local" or not command:
+        return False
+    effective = dict(os.environ)
+    if environment:
+        effective.update(environment)
+    return heavy_slot_enabled(effective) and len(_simple_commands(command)) == 1 and len(_heavy_positions(command)) == 1
 
 
 def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
