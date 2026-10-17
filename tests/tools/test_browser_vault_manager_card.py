@@ -283,6 +283,7 @@ def test_card_prompt_refusal_blocks_retries_on_same_origin_but_not_other_origin(
     assert first["error_type"] == expected
     assert second["error_type"] == "payment_retry_refused"
     assert "fresh approval" in second["error"]
+    assert "route around" in second["error"]
     assert third["error_type"] == expected
     assert len(prompts) == 2 and not writes
 
@@ -317,6 +318,7 @@ def test_card_fill_that_cannot_pay_never_prompts(controls):
     raw, prompts, secret_exprs = _run_fill("https://shop.test/checkout", controls=controls)
     out = json.loads(raw)
     assert out["success"] is False and out["error_type"] == "no_payment_fields"
+    assert "exact charge" in out["error"] and "routed card" in out["error"]
     assert prompts == [] and secret_exprs == []
 
 
