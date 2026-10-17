@@ -54,15 +54,17 @@ async def test_internal_review_captures_reply_without_any_send(response):
     adapter.send_typing.assert_not_awaited()
 
 
-def test_review_capture_uses_streamed_final_response_when_delivery_returns_none():
-    capture = Future()
-    event = SimpleNamespace(internal=True,
-                            metadata={"_cron_review_capture": capture},
-                            _streamed_final_response="PRESENT")
-    from gateway.cron_review import ReviewCapture
-    assert ReviewCapture(event).capture_reply(None, event) is None
-    assert capture.result(timeout=0) == "PRESENT"
+def test_private_review_response_uses_authoritative_agent_final_response():
+    from gateway.cron_review import private_turn_response
+    event = SimpleNamespace(internal=True, metadata={"_cron_review_capture": Future()},
+                            _agent_final_response="PRESENT")
+    assert private_turn_response(event, {"final_response": ""}) == (True, "PRESENT")
 
+
+def test_private_review_response_falls_back_to_display_response():
+    from gateway.cron_review import private_turn_response
+    event = SimpleNamespace(internal=True, metadata={"_cron_review_capture": Future()})
+    assert private_turn_response(event, {"final_response": ""}, "PRESENT") == (True, "PRESENT")
 
 
 @pytest.mark.asyncio
