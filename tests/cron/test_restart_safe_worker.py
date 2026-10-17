@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -1044,6 +1045,109 @@ def test_terminal_worker_exit_wait_is_bounded(monkeypatch):
         )
     process.terminate.assert_called_once_with()
     process.kill.assert_called_once_with()
+
+
+def test_terminal_worker_termination_is_reported_as_unknown(monkeypatch):
+    """A successful parent-side terminate must not be projected as a clean success."""
+    from cron import scheduler
+
+    state: dict[str, int | None] = {"returncode": None}
+    process = Mock()
+
+    def poll():
+        return state["returncode"]
+
+    def wait(timeout=None):
+        if state["returncode"] is None:
+            raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout or 0.0)
+        return state["returncode"]
+
+    def terminate():
+        state["returncode"] = -15
+
+    process.poll.side_effect = poll
+    process.wait.side_effect = wait
+    process.terminate.side_effect = terminate
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        lambda _execution_id: {"id": "exec-1", "status": "completed"},
+    )
+
+    with pytest.raises(scheduler._ExternalWorkerExitTimeout, match="was terminated") as raised:
+        scheduler._wait_for_external_cron_worker_body(
+            process,
+            execution_id="exec-1",
+            wait_for_process_exit=True,
+            terminal_exit_grace_seconds=0.01,
+        )
+    assert raised.value.worker_terminated is True
+    process.terminate.assert_called_once_with()
+    process.kill.assert_not_called()
+
+
+def test_terminal_worker_within_hard_wall_budget_is_not_killed(monkeypatch):
+    """Delivery may outlive the fixed grace while the worker still owns its lifetime budget."""
+    from cron import scheduler
+
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        lambda _execution_id: {"id": "exec-1", "status": "completed"},
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(1.0)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 1.5
+        assert scheduler._wait_for_external_cron_worker_body(
+            process,
+            execution_id="exec-1",
+            wait_for_process_exit=True,
+            terminal_exit_grace_seconds=0.01,
+            worker_hard_wall_deadline=deadline,
+        ) is True
+        assert process.returncode == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_terminated_terminal_worker_is_not_projected_ok(monkeypatch):
+    """A completed ledger row is still an unknown delivery when the parent killed its worker."""
+    from cron import scheduler
+    from cron.scheduler_worker_failure import record_external_worker_outcome
+
+    job = {
+        "id": "job-1",
+        "execution_id": "exec-1",
+        "fire_claim": {"by": "owner-1"},
+    }
+    mark_job_run = Mock()
+    deliver_crash = Mock(return_value=("notice delivery failed", None))
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        lambda _execution_id: {"id": "exec-1", "status": "completed", "output": "ok"},
+    )
+    monkeypatch.setattr(scheduler, "fire_claim_fence", lambda *args, **kwargs: nullcontext(True))
+    monkeypatch.setattr(scheduler, "mark_job_run", mark_job_run)
+    monkeypatch.setattr(scheduler, "_install_fire_secret_scope", lambda: object())
+    monkeypatch.setattr(scheduler, "_reset_fire_secret_scope", lambda _tokens: None)
+    monkeypatch.setattr(scheduler, "_deliver_crash_failure", deliver_crash)
+
+    assert record_external_worker_outcome(
+        job,
+        error="Restart-safe cron worker was terminated after its terminal exit grace period",
+        worker_exited=True,
+        worker_terminated=True,
+    ) is True
+    assert mark_job_run.call_args.kwargs["success"] is False
+    assert mark_job_run.call_args.kwargs["error"].startswith("Restart-safe cron worker was terminated")
+    deliver_crash.assert_called_once()
 
 
 def test_launch_external_worker_stays_in_process_outside_managed_gateway(

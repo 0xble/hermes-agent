@@ -6,7 +6,8 @@ logger = logging.getLogger("cron.scheduler")
 
 
 def record_external_worker_outcome(
-    job: dict, *, error=None, adapters=None, loop=None, worker_exited: bool = False
+    job: dict, *, error=None, adapters=None, loop=None, worker_exited: bool = False,
+    worker_terminated: bool = False,
 ) -> bool:
     """Project a detached worker's terminal result onto the job record.
 
@@ -36,21 +37,23 @@ def record_external_worker_outcome(
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
             return True
-        failed = status != "completed"
+        failed = status != "completed" or worker_terminated
         error = error or execution.get("error") or "Detached cron worker did not complete."
         # A watchdog has already terminalized the row and then exits 124. Its
         # durable error marker is the authoritative proof that no worker-owned
         # failure notice was sent. Normal worker failures may already have sent
         # their own notice (and can carry a delivered queue status), so never
         # synthesize a crash notice for them.
+        from cron.scheduler_detached_worker import HARD_WALL_TIMEOUT_ERROR_PREFIX
+
         watchdog_failure = (
             status == "failed"
             and str(execution.get("error") or "").startswith(
-                "Detached cron run exceeded hard wall-clock timeout ("
+                HARD_WALL_TIMEOUT_ERROR_PREFIX
             )
         )
         delivery_error = None
-        if status == "unknown" or watchdog_failure:
+        if status == "unknown" or watchdog_failure or worker_terminated:
             scheduler.logger.error("Job '%s': %s", job["id"], error)
             scope_tokens = scheduler._install_fire_secret_scope()
             try:
@@ -72,11 +75,16 @@ def record_external_worker_outcome(
 
 
 def record_unknown_worker_outcome(
-    job: dict, *, error=None, adapters=None, loop=None
+    job: dict, *, error=None, adapters=None, loop=None, worker_terminated: bool = False
 ) -> bool:
     """Backward-compatible name for the dead-worker recovery path."""
     return record_external_worker_outcome(
-        job, error=error, adapters=adapters, loop=loop, worker_exited=True
+        job,
+        error=error,
+        adapters=adapters,
+        loop=loop,
+        worker_exited=True,
+        worker_terminated=worker_terminated,
     )
 
 
