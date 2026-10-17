@@ -66,6 +66,7 @@ gateway:
     usage_switch_model: "`/model <name>` — cambia modello"
     usage_switch_provider: "`/model <name> --provider <slug>` — cambia provider"
     usage_persist: "`/model <name> --global` — rendi permanente"
+    reset_done: "✓ Model override reset."
     err_skew: "Questo gateway esegue il codice di {boot_rev}, ma il checkout su disco è ora {disk_rev}. Cambiare modello rischierebbe un crash per moduli obsoleti — riavvia il gateway per caricare il nuovo codice: hermes gateway restart"
     err_switch_failed: "Passaggio al modello {model} non riuscito ({error}); resto su {current}."
     err_config_not_updated: "config.yaml non aggiornato ({error})"

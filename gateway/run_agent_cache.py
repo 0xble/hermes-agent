@@ -146,6 +146,12 @@ class GatewayAgentCacheMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.model_override if state else None
 
+    def _session_model_override_scope(self, session_key: str) -> str:
+        state = self._peek_session_state(session_key)
+        if state:
+            return getattr(state.conversation, "model_override_scope", "session")
+        return "session"
+
     def _session_model_override_epoch(self, session_key: str) -> int:
         return self._session_state(session_key).persistent.model_override_epoch
 
@@ -159,15 +165,26 @@ class GatewayAgentCacheMixin:
             locks = self._session_model_override_locks = {}
         return locks.setdefault(session_key, asyncio.Lock())
 
-    async def _persist_session_model_override(self, session_key: str, override: Optional[dict]) -> None:
+    async def _persist_session_model_override(
+        self, session_key: str, override: Optional[dict], *, scope: Optional[str] = None,
+    ) -> None:
         async with self._session_model_override_lock(session_key):
-            await self._persist_session_model_override_locked(session_key, override)
+            await self._persist_session_model_override_locked(session_key, override, scope=scope)
 
-    async def _persist_session_model_override_locked(self, session_key: str, override: Optional[dict]) -> None:
+    async def _persist_session_model_override_locked(
+        self, session_key: str, override: Optional[dict], *, scope: Optional[str] = None,
+    ) -> None:
         """Caller holds the route lock; publish memory only after successful persistence."""
         self._bump_session_model_override_epoch(session_key)
         epoch = self._session_model_override_epoch(session_key)
-        write = asyncio.create_task(self.async_session_store.set_model_override(session_key, override))
+        resolved_scope = scope or self._session_model_override_scope(session_key)
+        if override is not None and resolved_scope != "session":
+            write = asyncio.create_task(
+                self.async_session_store.set_model_override(session_key, override, scope=resolved_scope)
+            )
+        else:
+            # Keep the historical call shape for existing callers/tests and for old SessionStore adapters.
+            write = asyncio.create_task(self.async_session_store.set_model_override(session_key, override))
         cancelled = None
         try:
             while not write.done():
@@ -183,18 +200,24 @@ class GatewayAgentCacheMixin:
                     and self._session_model_override_epoch(session_key) == epoch):
                 if override is None:
                     self._session_model_overrides.pop(session_key, None)
+                    self._session_state(session_key).conversation.model_override_scope = "session"
                 else:
                     self._session_model_overrides[session_key] = dict(override)
+                    self._session_state(session_key).conversation.model_override_scope = resolved_scope
             self._bump_session_model_override_epoch(session_key)
         if cancelled is not None:
             raise cancelled
 
-    def _commit_session_model_override(self, session_key: str, override: Optional[dict], epoch: int) -> None:
+    def _commit_session_model_override(
+        self, session_key: str, loaded: tuple[Optional[dict], str], epoch: int,
+    ) -> None:
         """On-loop CAS: an override edit or boundary invalidates the worker's snapshot."""
+        override, scope = loaded
         if (override is None or self._session_model_override_epoch(session_key) != epoch
                 or self._session_model_override(session_key) is not None):
             return
         self._session_model_overrides[session_key] = override
+        self._session_state(session_key).conversation.model_override_scope = scope
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), override.get("provider") or "",
@@ -223,19 +246,20 @@ class GatewayAgentCacheMixin:
             return
         self._commit_session_model_override(session_key, loaded, epoch)
 
-    def _load_session_model_override(self, session_key: str) -> Optional[dict]:
-        """Load non-secret persisted fields and resolve credentials; never mutate runner state."""
+    def _load_session_model_override(self, session_key: str) -> tuple[Optional[dict], str]:
+        """Load non-secret persisted fields, scope, and credentials; never mutate runner state."""
         from gateway.run import _resolve_runtime_agent_kwargs_for_provider
         store = getattr(self, "session_store", None)
         if store is None:
-            return None
+            return None, "session"
         try:
             persisted = store.get_model_override(session_key)
+            scope = store.get_model_override_scope(session_key)
         except Exception:
             logger.debug("Failed to read persisted session model override", exc_info=True)
-            return
+            return None, "session"
         if not persisted:
-            return
+            return None, scope
         override: dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
         provider = persisted.get("provider")
         from hermes_cli.runtime_provider import is_foreign_provider_endpoint
@@ -265,7 +289,7 @@ class GatewayAgentCacheMixin:
                     "Credential re-resolution failed for persisted override "
                     "(provider=%s); using credential-less override", provider, exc_info=True,
                 )
-        return override
+        return override, scope
 
     def _apply_session_model_override(self, session_key: str, model: str, runtime_kwargs: dict) -> tuple:
         """Apply /model session overrides (precedence over config.yaml defaults; ``None`` fields skipped
@@ -325,10 +349,13 @@ class GatewayAgentCacheMixin:
 
     def _is_intentional_model_switch(self, session_key: str, agent: Any, config_model: str) -> bool:
         """True when *agent* running a model other than *config_model* is deliberate: a /model session
-        override names that model, or the Nous gateway moved the session off the ``nous/welcome``
-        alias that *config_model* still carries (``anon_auth.apply_model_switch``)."""
+        override names that model, an attended route selected that model, or the Nous gateway moved the
+        session off the ``nous/welcome`` alias that *config_model* still carries (``anon_auth.apply_model_switch``)."""
         override = self._session_model_override(session_key)
         if override is not None and override.get("model") == agent.model:
+            return True
+        decision = getattr(agent, "_gateway_attended_decision", None)
+        if getattr(decision, "reason", None) == "attended" and getattr(decision, "model", None) == agent.model:
             return True
         # Exactly the recorded move (alias -> backing): a later fallback onto some other model is
         # ordinary drift and still evicts.
@@ -342,7 +369,10 @@ class GatewayAgentCacheMixin:
         from gateway.run import _resolve_gateway_model
         primary = getattr(agent, "_primary_runtime", None) or {}
         provider = primary.get("provider", getattr(agent, "provider", "")) or ""
-        # An override whose provider was unavailable this turn ran on the default route instead.
+        decision = getattr(agent, "_gateway_attended_decision", None)
+        decision_model = getattr(decision, "model", None)
+        if getattr(decision, "reason", None) == "attended" and decision_model:
+            return decision_model
         override = self._session_model_override(session_key) or {}
         if override.get("model") and override.get("provider") in (None, "", provider):
             model = override["model"]

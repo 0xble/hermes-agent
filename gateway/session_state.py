@@ -43,12 +43,18 @@ class ConversationState:
     """State scoped to one conversation (survives turns, not boundaries)."""
 
     model_override: Optional[dict[str, Any]] = None  # /model per-session override
+    model_override_scope: str = "session"  # session, temporary, or once
     one_turn_restore: Optional[dict[str, Any]] = None  # /model --once snapshot
     reasoning_override: Optional[dict[str, Any]] = None  # /reasoning override
+    reasoning_override_scope: str = "session"  # session or temporary
     service_tier_override: Any = _UNSET_TIER  # /fast: "priority" or None; _UNSET_TIER = absent
     service_tier_override_expires_at: float = 0.0  # wall-clock deadline; 0 = no expiry
     service_tier_override_expiry_seconds: float = 0.0  # duration used in the one-shot notice
     last_resolved_model: str = ""  # last successfully-resolved non-empty model
+    last_user_activity_at: Optional[float] = None  # durable mirror lives on SessionEntry
+    pending_attended_notice: Optional[str] = None  # one switching-in line for this turn
+    last_attended_decision: Any = None  # route precedence decision for this session's current turn
+    pre_agent_fallback_notice: Optional[str] = None  # one-shot fallback notice for this session
     queued_events: list[Any] = field(default_factory=list)  # /queue overflow FIFO (head in adapter)
     sidecar_notes: list[str] = field(default_factory=list)  # one-shot must-deliver notes
     ephemeral_pin: Optional[tuple[Any, ...]] = None  # pinned session-context (change_key, text, redact_pii)

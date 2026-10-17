@@ -148,7 +148,9 @@ class GatewayConfigLoadersMixin:
         return self._load_ephemeral_system_prompt()
 
     @staticmethod
-    def _load_reasoning_config(model: str = "", *, profile_home=None) -> dict | None:
+    def _load_reasoning_config(
+        model: str = "", *, profile_home: Path | None = None, config: Optional[dict] = None,
+    ) -> dict | None:
         """Reasoning effort from the owning profile's config.yaml via
         :func:`hermes_constants.resolve_reasoning_config`.
 
@@ -160,8 +162,9 @@ class GatewayConfigLoadersMixin:
         """
         from gateway.run import _load_gateway_config
         from hermes_constants import resolve_reasoning_config
-        config = (_load_gateway_config() if profile_home is None
-                  else _load_gateway_config(profile_home / "config.yaml"))
+        if config is None:
+            config = (_load_gateway_config() if profile_home is None
+                      else _load_gateway_config(profile_home / "config.yaml"))
         return resolve_reasoning_config(config, model)
 
     @staticmethod
@@ -175,7 +178,7 @@ class GatewayConfigLoadersMixin:
             tokens = shlex.split(text)
         except ValueError:
             tokens = text.split()
-        value = " ".join(token for token in tokens if token != "--global")
+        value = " ".join(token for token in tokens if token not in {"--global", "--session"})
         return value.strip().lower(), "--global" in tokens
 
     def _resolve_session_reasoning_config(
@@ -196,9 +199,55 @@ class GatewayConfigLoadersMixin:
                 and getattr(getattr(self, "config", None), "multiplex_profiles", False)
                 and source is not None and callable(resolve_profile_home)):
             profile_home = resolve_profile_home(source)
-        if profile_home is None:
-            return self._load_reasoning_config(model)
-        return self._load_reasoning_config(model, profile_home=profile_home)
+        loader = getattr(self, "_load_reasoning_config")
+        native_loader = getattr(type(self), "_load_reasoning_config", None)
+        native_loader = getattr(native_loader, "__func__", native_loader)
+        loader_func = getattr(loader, "__func__", loader)
+        user_config = None
+        if loader_func is native_loader:
+            from gateway.run import _load_gateway_config
+            user_config = (
+                _load_gateway_config()
+                if profile_home is None
+                else _load_gateway_config(profile_home / "config.yaml")
+            )
+            baseline = loader(model, profile_home=profile_home, config=user_config) or {}
+        else:
+            # Tests and integrations replace this loader with small lambdas. Preserve their
+            # calling convention and, more importantly, the old single-call disabled path.
+            baseline = (
+                loader(model)
+                if profile_home is None
+                else loader(model, profile_home=profile_home)
+            ) or {}
+        # Attended routing is resolved in one place. Do not independently inspect
+        # activity here: the runtime and reasoning paths must make the same choice.
+        resolver = getattr(self, "_attended_resolution_for_session", None)
+        if callable(resolver) and resolved_session_key and user_config is not None:
+            try:
+                from gateway.attended_model import parse_attended_config
+                attended_cfg = parse_attended_config(user_config)
+                if not attended_cfg.enabled:
+                    return baseline
+                attended_baseline = {}
+                if attended_cfg.model:
+                    attended_baseline = (
+                        loader(attended_cfg.model, profile_home=profile_home, config=user_config)
+                    ) or {}
+                decision = resolver(
+                    source=source, session_key=resolved_session_key,
+                    user_config=user_config,
+                    override=self._session_model_override(resolved_session_key),
+                    default_reasoning=baseline or {},
+                    attended_reasoning=attended_baseline,
+                )
+                effort = getattr(decision, "reasoning_effort", "") if decision is not None else ""
+                if effort:
+                    from hermes_constants import parse_reasoning_effort
+                    return parse_reasoning_effort(effort)
+            except Exception:
+                logger.debug("attended reasoning resolution failed", exc_info=True)
+        return baseline
 
     def _session_reasoning_override(self, session_key: Optional[str]) -> dict | None:
         """The session's explicit ``/reasoning`` pick, or ``None`` when it runs on config."""
@@ -220,24 +269,34 @@ class GatewayConfigLoadersMixin:
             return None
         if not persisted:
             return None
-        self._session_state(session_key).conversation.reasoning_override = dict(persisted)
+        conversation = self._session_state(session_key).conversation
+        conversation.reasoning_override = dict(persisted)
+        with suppress(Exception):
+            conversation.reasoning_override_scope = store.get_reasoning_override_scope(session_key)
         logger.info("Rehydrated persisted /reasoning override for session=%s: %s", session_key, persisted)
-        return self._session_state(session_key).conversation.reasoning_override
+        return conversation.reasoning_override
 
-    def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:
+    def _set_session_reasoning_override(
+        self, session_key: str, reasoning_config: Optional[dict], *, scope: Optional[str] = None,
+    ) -> None:
         """Set or clear the session-scoped reasoning override, writing it through to the session
         store so the pick survives a gateway restart."""
         if not session_key:
             return
         # Per-session field write: a lazy ``_session_reasoning_overrides = {}`` init replaced the
         # WHOLE dict, racing concurrent sessions; a SessionState field reset cannot cross sessions.
-        self._session_state(session_key).conversation.reasoning_override = (
+        conversation = self._session_state(session_key).conversation
+        conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
         )
+        conversation.reasoning_override_scope = scope if scope in ("session", "temporary") else "session"
         store = getattr(self, "session_store", None)
         if store is not None:
             try:
-                store.set_reasoning_override(session_key, reasoning_config)
+                if reasoning_config is not None and conversation.reasoning_override_scope != "session":
+                    store.set_reasoning_override(session_key, reasoning_config, scope=conversation.reasoning_override_scope)
+                else:
+                    store.set_reasoning_override(session_key, reasoning_config)
             except Exception:
                 logger.debug("Failed to persist session reasoning override", exc_info=True)
 

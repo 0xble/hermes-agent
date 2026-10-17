@@ -16,7 +16,24 @@ All settings are stored in the `~/.hermes/` directory for easy access.
 Run `hermes setup --portal` — one OAuth gets you a model provider and all four Tool Gateway tools without hand-editing YAML. Portal subscribers also get 10% off token-billed providers. See [Nous Portal](../integrations/nous-portal.md).
 :::
 
-## Directory Structure
+## Attended model switching (optional)
+
+Configure this only when the main gateway session should use a stronger model while Brian is actively messaging in a topic:
+
+```yaml
+model:
+  attended:
+    model: claude-opus-5-5
+    provider: custom:claude-proxy
+    reasoning_effort: medium
+  idle_revert_minutes: 15
+  compact_before_switch_tokens: 80000
+```
+
+All keys are opt-in; omitting them preserves existing routing. The attended route applies only to the main gateway session agent, not subagents, cron jobs, or auxiliary tasks. Activity is a genuine user message; relays, reactions, edits, process notifications, goal/loop wakeups, and other internal events do not reset the timer. After the idle window, Hermes returns to the configured default (including a channel override). A plain `/model` or `/reasoning` pick is temporary when this feature is configured; use `--session` to pin it, or `/model reset` and `/reasoning reset` to clear picks. `--global` still updates the profile default.
+
+`compact_before_switch_tokens` controls when Hermes attempts compaction before a route change. A compaction failure does not block switching. Switching in emits one `↻ model · effort` notice; switching out is silent.
+
 
 ```text
 ~/.hermes/
