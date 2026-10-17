@@ -1684,6 +1684,9 @@ def _run_conversation_turn(
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
         _run_phase(prepare_iteration, agent, s)
+        before_api_call = getattr(agent, "_gateway_before_api_call", None)
+        if callable(before_api_call):
+            before_api_call(s)
         _run_phase(assemble_api_request, agent, s)
         _pg = _run_phase(run_preflight_gate, agent, s)
         if _pg.action == "return":

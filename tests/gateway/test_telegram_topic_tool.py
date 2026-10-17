@@ -593,6 +593,48 @@ def test_reasoning_readback_uses_the_routed_profile_config(monkeypatch, tmp_path
     assert loaded_paths == [secondary / "config.yaml"]
 
 
+def test_attended_reasoning_readback_uses_one_fresh_routed_config_read(monkeypatch, tmp_path):
+    """A fresh runner must resolve attended reasoning without prior turn resolution or a second read."""
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+
+    secondary = tmp_path / "profiles" / "secondary"
+    secondary.mkdir(parents=True)
+    loaded_paths = []
+
+    def load_config(path=None):
+        loaded_paths.append(path)
+        return {
+            "model": {
+                "default": "gpt-test",
+                "attended": {"model": "claude-opus-5-5", "reasoning_effort": "high"},
+            },
+            "agent": {
+                "reasoning_effort": "low",
+                "reasoning_overrides": {"claude-opus-5-5": "high"},
+            },
+        }
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._resolve_session_key_or_none = lambda source, session_key: session_key or "topic-key"
+    runner._session_reasoning_override = lambda session_key: None
+    runner._session_model_override = lambda session_key: None
+    runner._resolve_profile_home_for_source = lambda source: secondary
+    def resolve_attended(**kwargs):
+        assert kwargs["default_reasoning"] == {"enabled": True, "effort": "low"}
+        assert kwargs["attended_reasoning"] == {"enabled": True, "effort": "high"}
+        return SimpleNamespace(reasoning_effort="high")
+
+    runner._attended_resolution_for_session = resolve_attended
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", load_config)
+
+    result = runner._resolve_session_reasoning_config(source=_source(thread_id="4242"), model="gpt-test")
+
+    assert result == {"enabled": True, "effort": "high"}
+    assert loaded_paths == [secondary / "config.yaml"]
+
+
 def test_tool_survives_schemas_built_before_telegram_connects(monkeypatch):
     """The boot warm-up and the first turns build tool schemas before the Telegram adapter connects,
     and ``get_tool_definitions`` memoizes by toolset selection. The tool must be in those schemas,

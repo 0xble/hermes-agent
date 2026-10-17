@@ -35,6 +35,7 @@ from gateway.run_inbound_unauthorized import (
     UnauthorizedOwnerNotifier, pairing_code_reply, pairing_profile_arg, pairing_rate_limited_reply,
     unauthorized_owner_hint,
 )
+from gateway.attended_model import is_genuine_user_message
 from gateway.session import (
     SessionSource, build_session_context, is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
@@ -1608,6 +1609,33 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
             return event, source, is_internal
 
+    async def _mark_attended_user_activity(self, event, source, session_key: str | None = None) -> bool:
+        """Persist genuine Brian activity only for an existing session when attended routing is enabled."""
+        if not is_genuine_user_message(event):
+            return False
+        try:
+            from gateway.run import _load_gateway_config
+            from gateway.attended_model import parse_attended_config
+            enabled = await asyncio.to_thread(
+                lambda: parse_attended_config(_load_gateway_config()).enabled,
+            )
+            if not enabled:
+                return False
+            if not session_key:
+                session_key = self._session_key_for_source(source)
+            if not session_key:
+                return False
+            entry = await self.async_session_store.lookup_by_session_key(session_key)
+            if entry is None:
+                return False
+            await self.async_session_store.mark_user_activity(entry.session_key)
+            stamp = time.time()
+            self._session_state(session_key).conversation.last_user_activity_at = stamp
+            return True
+        except Exception:
+            logger.debug("attended-model activity stamp failed", exc_info=True)
+            return False
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         from gateway.outbox import scoped_turn_entry, restore_turn, store_for
         token = scoped_turn_entry()
@@ -1645,6 +1673,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         alias_text = self._quick_command_alias_text(event)
         if alias_text is not None:
             event.text = alias_text
+        _attended_activity_marked = False
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)
@@ -1664,9 +1693,19 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if _busy_result is not _NOT_HANDLED:
             return _busy_result
 
+        # Dispatch idle commands before the attended activity bookkeeping.  The disabled path must
+        # retain the pre-feature command latency: checking the opt-in config here would otherwise add
+        # a worker hop before every /command and can miss the adapter's bounded response window.
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
+            # Activity bookkeeping is telemetry for an already-dispatched command.  Do not hold the
+            # adapter's bounded command response on the opt-in config/store worker hop.
+            asyncio.create_task(self._mark_attended_user_activity(event, source, _quick_key))
             return _result
+
+        # Non-command messages are stamped after the session slot is claimed, immediately before
+        # model resolution. Awaiting the store lookup before the claim reopens the duplicate-agent
+        # race that the pending sentinel is designed to close.
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
@@ -1727,6 +1766,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
         try:
+            # Mark genuine user activity inside the claimed turn, before resolving the model. This
+            # preserves the attended route's same-turn semantics without delaying the sentinel claim.
+            _attended_activity_marked = await self._mark_attended_user_activity(event, source, _quick_key)
+            if _attended_activity_marked:
+                setattr(event, "_attended_activity_marked", True)
             if not is_internal:  # fail-open plugin consume, inside the claimed slot (#129958)
                 from gateway.run_inbound_consumer import run_post_admission_hook
                 _consumed, _consumer_reply = await run_post_admission_hook(self, event, source, _quick_key)

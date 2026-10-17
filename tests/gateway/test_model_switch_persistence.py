@@ -164,6 +164,28 @@ class TestIsIntentionalModelSwitch:
         agent = SimpleNamespace(model="fallback/model")
         assert runner._is_intentional_model_switch(sk, agent, "primary/model") is False
 
+    def test_attended_route_is_the_fallback_baseline_and_keeps_cache(self):
+        from gateway.attended_model import AttendedResolution
+        from gateway.turn_context import TurnContext
+
+        runner = _make_runner()
+        runner._evict_cached_agent = MagicMock()
+        source = _make_source()
+        key = build_session_key(source)
+        runner._session_state(key).conversation.last_attended_decision = AttendedResolution(
+            "opus", "anthropic", "medium", "attended", True,
+        )
+        ctx = TurnContext(source=source, session_key=key)
+        ctx.agent_holder[0] = SimpleNamespace(
+            model="opus", provider="anthropic", _gateway_attended_decision=
+            runner._session_state(key).conversation.last_attended_decision,
+        )
+        ctx.result_holder[0] = {"final_response": "ok"}
+
+        runner._run_agent_evict_on_fallback(ctx)
+
+        runner._evict_cached_agent.assert_not_called()
+
 
 class TestFallbackEvictionHonorsChannelOverrides:
     """A ``channel_overrides`` model is the configured model for that chat, so an agent still running it

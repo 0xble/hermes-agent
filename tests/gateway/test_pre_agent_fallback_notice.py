@@ -116,3 +116,22 @@ def test_model_override_fast_path_clears_stale_notice():
         model, runtime = runner._resolve_session_agent_runtime(session_key="test-session-key")
     assert (model, runtime["provider"]) == ("claude-sonnet-5", "anthropic")
     assert runner._pre_agent_fallback_notice is None
+
+
+def test_pre_agent_fallback_notice_isolated_between_sessions():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    for key in ("session-a", "session-b"):
+        runner._session_state(key)
+
+    runner._commit_session_agent_runtime(
+        "session-a", ("model-a", {}, "notice-a", False),
+    )
+    runner._commit_session_agent_runtime(
+        "session-b", ("model-b", {}, "notice-b", False),
+    )
+
+    assert runner._consume_pre_agent_fallback_notice("session-a") == "notice-a"
+    assert runner._consume_pre_agent_fallback_notice("session-b") == "notice-b"
+    assert runner._consume_pre_agent_fallback_notice("session-a") is None
