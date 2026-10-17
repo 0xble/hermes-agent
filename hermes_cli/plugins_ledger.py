@@ -189,14 +189,15 @@ class PluginLedgerMixin:
                 handle.dispose()
 
     def _register_fallback_hook(self, context: Any, hook_source: Optional[tuple], hook_name: str,
-                                callback: Callable) -> PluginRegistration:
+                                callback: Callable, *, tools: Any = None) -> PluginRegistration:
         """Register ``callback`` unless the same source is already live through general discovery, in
         which case return an inert handle so the provider keeps its disposable-handle contract."""
         if hook_source is None:
-            return context.register_hook(hook_name, callback)
+            return context.register_hook(hook_name, callback, tools=tools)
         owned = any(loaded.enabled and _hook_source_of(loaded.manifest.name, loaded.module) == hook_source
                     for loaded in self._plugins.values())
-        handle = context._track("hook", hook_name, lambda: None) if owned else context.register_hook(hook_name, callback)
+        handle = (context._track("hook", hook_name, lambda: None) if owned
+                  else context.register_hook(hook_name, callback, tools=tools))
         self._memory_hook_registrations.setdefault(hook_source, []).append(handle)
         return handle
 

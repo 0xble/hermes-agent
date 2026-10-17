@@ -234,6 +234,33 @@ class LoadedPlugin:
     deferred: bool = False
 
 
+def _build_hook_tool_matcher(tools: Any) -> Optional[Callable[[Optional[str]], bool]]:
+    """Normalize a Python hook's optional tool declaration to a dispatcher predicate."""
+    if tools is None:
+        return None
+    if callable(tools):
+        return lambda tool_name: bool(tools(tool_name))
+    if isinstance(tools, (str, bytes)):
+        raise TypeError("register_hook(tools=...) expects an iterable of tool names or a predicate")
+    try:
+        names = frozenset(tools)
+    except TypeError as exc:
+        raise TypeError("register_hook(tools=...) expects an iterable of tool names or a predicate") from exc
+    if not all(isinstance(name, str) for name in names):
+        raise TypeError("register_hook(tools=...) tool names must be strings")
+    return lambda tool_name: tool_name in names
+
+
+def _wrap_hook_with_tool_matcher(callback: Callable, matcher: Callable[[Optional[str]], bool]) -> Callable:
+    """Keep matcher metadata with a callback while preserving its public signature."""
+    @wraps(callback)
+    def matched_callback(*args: Any, **kwargs: Any) -> Any:
+        return callback(*args, **kwargs)
+
+    setattr(matched_callback, "hermes_tool_matcher", matcher)
+    return matched_callback
+
+
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
@@ -937,8 +964,24 @@ class PluginContext:
                 logger.warning("Plugin '%s' locale file %s skipped: %s", self.manifest.name, file, exc)
         return handles
 
-    def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
-        """Register a lifecycle hook callback (unknown names warn but are still stored)."""
+    def register_hook(
+        self, hook_name: str, callback: Callable, *,
+        tools: Optional[Union[Set[str], List[str], Tuple[str, ...], Callable[[Optional[str]], bool]]] = None,
+    ) -> PluginRegistration:
+        """Register a lifecycle hook callback.
+
+        Only ``pre_tool_call``, ``post_tool_call`` and ``transform_tool_result`` carry ``tool_name``
+        and accept ``tools``: exact names (set form preferred) or a predicate. Predicates run on
+        the caller thread outside callback timeouts and must be cheap, pure and non-blocking.
+        Non-matching callbacks skip timeout/suppression handling. Omitting ``tools`` keeps the
+        callback's all-tools behavior; other hooks reject a declaration with ``ValueError``.
+        """
+        if tools is not None and hook_name not in {"pre_tool_call", "post_tool_call", "transform_tool_result"}:
+            raise ValueError("register_hook(tools=...) requires a hook carrying tool_name: "
+                             "pre_tool_call, post_tool_call or transform_tool_result")
+        matcher = _build_hook_tool_matcher(tools)
+        if matcher is not None:
+            callback = _wrap_hook_with_tool_matcher(callback, matcher)
         return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
 
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
