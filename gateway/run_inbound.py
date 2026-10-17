@@ -1693,14 +1693,19 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if _busy_result is not _NOT_HANDLED:
             return _busy_result
 
+        # Dispatch idle commands before the attended activity bookkeeping.  The disabled path must
+        # retain the pre-feature command latency: checking the opt-in config here would otherwise add
+        # a worker hop before every /command and can miss the adapter's bounded response window.
+        _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
+        if _handled:
+            await self._mark_attended_user_activity(event, source, _quick_key)
+            return _result
+
+        # Non-command messages need their activity stamp before a running/new turn resolves its
+        # model.  This remains after the estop/busy gates and is a no-op when attended is disabled.
         _attended_activity_marked = await self._mark_attended_user_activity(event, source, _quick_key)
         if _attended_activity_marked:
             setattr(event, "_attended_activity_marked", True)
-        _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
-        if _handled:
-            if not _attended_activity_marked:
-                await self._mark_attended_user_activity(event, source, _quick_key)
-            return _result
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 

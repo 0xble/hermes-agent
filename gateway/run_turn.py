@@ -365,12 +365,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         target_model = cfg.model or decision.model
         session_last_model = last_model or conversation.last_resolved_model or ""
         if not session_last_model or session_last_model != target_model:
-            effort = decision.reasoning_effort
-            if not effort:
-                with suppress(Exception):
-                    loader = getattr(self, "_load_reasoning_config")
-                    effort = (loader(target_model) or {}).get("effort", "")
-            effort = effort or "none"
+            # Async resolution supplies config-derived reasoning in the detached snapshot.  Do not
+            # fall back to _load_reasoning_config here: this method runs on the gateway loop.
+            effort = decision.reasoning_effort or (
+                (attended_reasoning if target_model == cfg.model else default_reasoning) or {}
+            ).get("effort", "") or "none"
             self._handoff_attended_state(
                 session_key,
                 conversation={"pending_attended_notice": f"↻ {target_model} · {effort}"},
@@ -393,7 +392,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 stamp = activity_stamp
             else:
                 stamp = self._load_attended_activity_stamp(session_key)
-            conversation.last_user_activity_at = stamp
+            self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
         if is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
             return
         if conversation.model_override is not None and conversation.model_override_scope == "temporary":
@@ -483,7 +482,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         model, runtime, notice, cache_model = resolved
         # Worker resolution normally never writes session state; an unavailable attended route must
         # consume the staged switch-in line so the one fallback notice is the only notice for this turn.
-        self._pre_agent_fallback_notice = notice  # legacy, not read by turn execution
+        self._handoff_attended_state(None, runner={"_pre_agent_fallback_notice": notice})
         if skey:
             fields = {"pre_agent_fallback_notice": notice}
             if notice:
