@@ -387,9 +387,8 @@ def format_goal_authoring_warning(findings: list[GoalAuthoringFinding]) -> str:
     if not findings:
         return ""
     return "⚠ Goal authoring warning:\n" + "\n".join(f"- {finding.render()}" for finding in findings)
-# Legacy config key ``goals.min_continuation_gap_seconds``. The no-progress ladder now owns all
-# automatic pacing, so the evaluator never creates a separate gap wait. Old rows that still carry
-# a gap wait are recognised by ``is_continuation_gap_wait`` and lift normally.
+# ``goals.min_continuation_gap_seconds`` remains the configured lower bound between
+# automatic continuations. The no-progress ladder adds its own escalating waits on top.
 DEFAULT_MIN_CONTINUATION_GAP_SECONDS = 15 * 60
 _MIN_CONTINUATION_GAP_REASON = "minimum gap between autonomous goal continuations"
 
@@ -1083,6 +1082,10 @@ class GoalState:
     # Escalation level for backoff parks within the current no-progress streak. Old rows default 0.
     backoff_level: int = 0
     last_progress_fingerprint: Optional[str] = None
+    # Wall-clock timestamp of the last automatic continuation admitted for this goal. This is
+    # separate from ``last_turn_at`` because user and external-event turns are allowed to pierce
+    # the floor without turning the goal into a sub-minute automatic poller.
+    last_automatic_continuation_at: float = 0.0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -1095,7 +1098,8 @@ class GoalState:
             "turns_used", "consecutive_parse_failures", "consecutive_transport_failures",
             "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress", "backoff_level")}
         floats = {k: float(data.get(k) or 0.0) for k in (
-            "created_at", "last_turn_at", "waiting_until", "waiting_since")}
+            "created_at", "last_turn_at", "waiting_until", "waiting_since",
+            "last_automatic_continuation_at")}
         return cls(
             goal=data.get("goal", ""),
             mutation_id=str(data.get("mutation_id") or ""),
@@ -1492,11 +1496,32 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _async_delegation_completion_pending(session_id: str) -> bool:
+    """True when a terminal async delegation still has an undelivered completion event."""
+    try:
+        from tools.async_delegation import get_durable_delegation
+
+        row = get_durable_delegation(str(session_id))
+        return bool(row and row.get("delivery_state") == "pending")
+    except Exception:
+        return False
+
+
 def _session_waiting(session_id: str) -> bool:
     """True while the process_registry session is running and its trigger hasn't fired. Fail-safe:
     any import/registry error yields False so a stale barrier can never wedge the loop."""
     if not session_id:
         return False
+    try:
+        from tools.async_delegation import _LIVE_STATES, _records, _records_lock
+
+        with _records_lock:
+            delegation = _records.get(str(session_id))
+        if delegation is not None:
+            return (delegation.get("status") in _LIVE_STATES
+                    or _async_delegation_completion_pending(str(session_id)))
+    except Exception:
+        pass
     try:
         from tools.process_registry import process_registry
 
@@ -1508,6 +1533,18 @@ def _session_waiting(session_id: str) -> bool:
 def _process_outcome(session_id: str) -> Optional[Dict[str, Any]]:
     """Terminal facts for a process_registry session: the live registry first, then the durable
     receipt under ``logs/process-results``. None when neither knows it (outcome unknown)."""
+    try:
+        from tools.async_delegation import _LIVE_STATES, _records, _records_lock
+
+        with _records_lock:
+            delegation = _records.get(str(session_id))
+        if delegation is not None:
+            if (delegation.get("status") in _LIVE_STATES
+                    or _async_delegation_completion_pending(str(session_id))):
+                return {"running": True, "delegation": True}
+            return {"delegation": True, "state": delegation.get("status")}
+    except Exception:
+        pass
     try:
         from tools.process_registry import process_registry
 
@@ -3464,6 +3501,7 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
 
         state.turns_used += 1
         state.last_turn_at = time.time()
+        gap_floor = max(float(self.min_continuation_gap_seconds), float(DEFAULT_MIN_CONTINUATION_GAP_SECONDS))
 
         # Gates run BEFORE the judge: a failing gate is deterministic evidence the goal is not done,
         # so the judge is skipped and the gate's output drives the next turn (same turn budget).
@@ -3471,6 +3509,15 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
         if gate_decision is not None:
             if gate_decision.get("should_continue") and state.max_turns > 0 and state.turns_used >= state.max_turns:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
+            if gate_decision.get("should_continue"):
+                if not user_initiated and not external_event:
+                    previous = float(state.last_automatic_continuation_at or 0.0)
+                    remaining = gap_floor - (time.time() - previous) if previous else 0.0
+                    if remaining > 0:
+                        self.wait_for_seconds(max(1, math.ceil(remaining)), reason=_MIN_CONTINUATION_GAP_REASON)
+                        return self._wait_notice_decision(state, verdict="waiting", message="", notify=False)
+                state.last_automatic_continuation_at = time.time()
+                self._save()
             return gate_decision
 
         # Keep the judge-facing ledger bounded even though progress classification needs the
@@ -3529,12 +3576,13 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
 
         # Automatic no-progress waits already provide the sole pacing ladder. Fresh evidence
-        # bypasses it by resetting backoff_level above.
-        gap_floor = 0
+        # bypasses it by resetting backoff_level above; the hard floor still applies to the
+        # resulting continuation.
         if verdict == "wait" and wait_directive:
             parked = self._apply_wait_directive(
                 wait_directive, reason, active_delegations=active_delegations,
-                automatic=not user_initiated and not external_event, min_seconds=gap_floor,
+                automatic=not user_initiated and not external_event,
+                min_seconds=(gap_floor if not user_initiated and not external_event else 0),
             )
             if parked is not None:
                 return parked
@@ -3570,11 +3618,23 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
                 decision["message"] = outage_notice
             return decision
 
-        # Every automatic no-progress CONTINUE parks on the shared quiet ladder immediately.
-        # This is the sole pacing rule: no separate continuation-gap threshold or clear breaker.
+        # Every automatic no-progress CONTINUE parks on the shared quiet ladder immediately. The
+        # per-goal floor below also covers fresh-but-routine automatic evidence; visible silence
+        # remains eligible for evidence-based completion on a silent recheck.
         if verdict == "continue" and automatic_read_only:
             return _with_outage(self._no_progress_wait(
                 state, reason, active_delegations=active_delegations, min_seconds=gap_floor))
+
+        # Fresh evidence does not make a goal exempt from the per-goal automatic-chain floor.
+        # User messages and trusted external events remain immediate wake sources, but the
+        # continuation they produce becomes the next automatic-chain anchor.
+        if verdict == "continue" and not user_initiated and not external_event:
+            previous = float(state.last_automatic_continuation_at or 0.0)
+            remaining = gap_floor - (time.time() - previous) if previous else 0.0
+            if remaining > 0:
+                self.wait_for_seconds(max(1, math.ceil(remaining)), reason=_MIN_CONTINUATION_GAP_REASON)
+                return _with_outage(self._wait_notice_decision(
+                    state, verdict="waiting", message="", notify=False))
 
         if state.max_turns > 0 and state.turns_used >= state.max_turns:
             return self._budget_pause(state, "continue", reason)
@@ -3600,6 +3660,7 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
             notice = outage_notice
         elif transport_failed or parse_failed:
             notice = ""
+        state.last_automatic_continuation_at = time.time()
         self._save()
         return _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,

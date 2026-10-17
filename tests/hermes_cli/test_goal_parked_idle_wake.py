@@ -91,6 +91,37 @@ def test_barrier_that_still_holds_yields_no_prompt(hermes_home, monkeypatch):
     assert mgr.lifted_barrier_prompt() is None
 
 
+def test_live_async_delegation_keeps_goal_wait(hermes_home, monkeypatch):
+    """An in-flight async delegation is not an untracked process and must not lift its goal wait."""
+    from tools import async_delegation
+
+    delegation_id = "deleg_live0000"
+    record = {"delegation_id": delegation_id, "status": "running"}
+    with async_delegation._records_lock:
+        previous = async_delegation._records.get(delegation_id)
+        async_delegation._records[delegation_id] = record
+    try:
+        mgr = _park_on_session("s-delegation-live", delegation_id)
+        assert mgr.is_waiting()
+        assert mgr.lifted_barrier_prompt() is None
+
+        # Finalization publishes the event before the in-memory row becomes terminal. The durable
+        # pending delivery must keep the barrier in place during that race as well.
+        record["status"] = "completed"
+        monkeypatch.setattr(
+            async_delegation, "get_durable_delegation",
+            lambda _id: {"state": "completed", "delivery_state": "pending"},
+        )
+        assert mgr.is_waiting()
+        assert mgr.lifted_barrier_prompt() is None
+    finally:
+        with async_delegation._records_lock:
+            if previous is None:
+                async_delegation._records.pop(delegation_id, None)
+            else:
+                async_delegation._records[delegation_id] = previous
+
+
 def test_elapsed_timed_wait_lifts_without_a_note(hermes_home):
     mgr = goals.GoalManager("s-timer")
     mgr.set("poll again later")

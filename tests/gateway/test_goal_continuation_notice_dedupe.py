@@ -96,7 +96,7 @@ async def test_same_reason_after_wait_lift_and_reload_is_not_reposted(hermes_hom
     _, adapter, entry, _, key = harness
     with patch.object(goals, "judge_goal", return_value=("continue", REASON, False, None, False)):
         mgr = await _turn(harness, "A partial result is ready.", user=True)
-        assert len(adapter.sent) == 1 and REASON in adapter.sent[0]
+        assert adapter.sent == []  # continuing notices are now log-only
         original_key = mgr.state.last_continuation_notice_key
         if lift == "session-evaluator":
             mgr.wait_on_session("completed-watcher", reason="wait for validation")
@@ -122,12 +122,15 @@ async def test_same_reason_after_wait_lift_and_reload_is_not_reposted(hermes_hom
                  entry.session_id, original_key],
                 check=True, capture_output=True, text=True,
             )
-        # The post-lift automatic turn does real work, so it continues rather than parking on the ladder.
+        # This test exercises notice identity, not pacing; place the synthetic wake beyond the
+        # hard automatic-continuation floor.
+        mgr.state.last_automatic_continuation_at = time.time() - goals.DEFAULT_MIN_CONTINUATION_GAP_SECONDS - 1
+        mgr._save()
         with patch.object(goals, "_session_waiting", return_value=False), patch.object(goals, "_pid_alive", return_value=False), \
                 patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
             patch.object(goals, "_goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
             mgr = await _turn(harness, "The release is still awaiting live validation.")
-    assert len(adapter.sent) == 1, "unchanged reason was sent again after the barrier lift"
+    assert adapter.sent == []  # unchanged continuing notices remain log-only
     assert mgr.state.last_continuation_notice_key == original_key
     assert not mgr.is_parked()
     assert key in adapter._pending_messages
@@ -149,8 +152,7 @@ async def test_new_reason_after_silent_turn_is_deliverable(hermes_home):
             patch.object(goals, "_goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
             await _turn(harness, "The canary found a delivery failure.")
         await _turn(harness, "The correction is in progress.", user=True)
-    assert len(adapter.sent) == 2
-    assert REASON in adapter.sent[0] and new_reason in adapter.sent[1]
+    assert adapter.sent == []  # routine continuing notices are log-only
     assert GoalManager(entry.session_id).state.last_continuation_notice_key.endswith(new_reason)
 
 
@@ -182,7 +184,7 @@ async def test_explicit_goal_controls_still_confirm_and_reset_notice_identity(he
             assert word in confirmation.lower()
         assert GoalManager(entry.session_id).state.last_continuation_notice_key is None
         await _turn(harness, "A newly requested retry.", user=True)
-    assert len(adapter.sent) == 2 and all(REASON in notice for notice in adapter.sent)
+    assert adapter.sent == []  # explicit controls still work, but continuing notices stay quiet
 
 
 @pytest.mark.asyncio
@@ -234,5 +236,5 @@ async def test_silent_continue_repark_keeps_notice_identity_after_db_reload(herm
         with patch.object(goals, "judge_goal", return_value=("continue", new_reason, False, None, False)):
             mgr = await _turn(harness, "What is the review blocker?", user=True)
         # A user turn pierces the park, resets the ladder, and reports the new reason.
-        assert len(adapter.sent) == 1 and new_reason in adapter.sent[0]
+        assert adapter.sent == []  # user-triggered continuation status is also log-only
         assert mgr.state.backoff_level == 0 and not mgr.is_parked()

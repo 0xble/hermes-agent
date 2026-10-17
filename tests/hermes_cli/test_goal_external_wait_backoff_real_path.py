@@ -346,8 +346,12 @@ def test_real_write_survives_eight_read_only_results_per_automatic_turn(
 
     sid, db, manager = _new_goal()
     _stub_judge(monkeypatch, {"verdict": "continue", "reason": "keep working"})
+    clock = [time.time()]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
 
     for turn in range(4):
+        if turn:
+            clock[0] += goals.DEFAULT_MIN_CONTINUATION_GAP_SECONDS + 1
         _record_tool_result(db, sid, "write_file", {"path": f"turn-{turn}.txt", "content": "changed"},
                             "wrote file", turn)
         for read in range(9):

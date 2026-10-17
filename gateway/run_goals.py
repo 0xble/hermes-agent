@@ -39,6 +39,8 @@ def _goal_notice_kind(message: str) -> str:
     """Stable warning label for the user-visible goal state a notice represents."""
     text = str(message or "")
     lowered = text.lower()
+    if text.startswith("⚠ Goal judge unavailable"):
+        return "failed"
     if text.startswith("⏳"):
         return "parked"
     if text.startswith("↻"):
@@ -621,9 +623,15 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             ),
         )
         msg = decision.get("message") or ""
-        # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
+        # Routine parked/continuing/wait-age text remains durable bookkeeping and log output, but
+        # never consumes chat budget. Outcome/control notices still follow the visible path.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            notice_kind = _goal_notice_kind(msg)
+            if notice_kind in {"achieved", "blocked", "paused", "failed", "resumed"}:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
+            else:
+                logger.info("goal continuation: routine status notice suppressed kind=%s message=%s",
+                            notice_kind, msg)
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
             return
