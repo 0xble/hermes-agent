@@ -139,15 +139,19 @@ def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False
     from pm.runtime_stage import stage_runtime
     from pm.environments import record_install_use
     from hermes_cli.runtime_state import runtime_lock
+    from pm.paths import repo_root
 
+    # PM's dependency project is pm/, but its install state belongs to the
+    # checkout. Recovery, permissions, and GC all fence that checkout's key.
+    install_project = repo_root()
     project = project or Path(__file__).resolve().parent
     identity = _inputs(project, python)
     env = runtime_environment()
-    with runtime_lock(project, timeout=None) as held:
+    with runtime_lock(install_project, timeout=None) as held:
         if not held:
             raise InstallError("pm-runtime", "dependency install state is busy")
         root.mkdir(parents=True, exist_ok=True)
-        record_install_use(project)
+        record_install_use(install_project)
         with (root / ".prepare.lock").open("a+b") as lock:
             lock_fd(lock.fileno(), wait=True)
             selected = root / "selected.json"
