@@ -487,20 +487,6 @@ class GatewayAuthorizationMixin:
             return False
         extra = _adapter_config_extra(adapter)
         adapter_allow = extra.get("group_allow_from" if is_group else "allow_from")
-        if adapter_allow is None and not is_group:
-            # Plugin/platform adapters sometimes preserve the authored spelling in config.extra,
-            # while core adapters may expose the already-resolved list as an instance attribute.
-            for key in ("allowFrom", "allowedUsers"):
-                if extra.get(key) is not None:
-                    adapter_allow = extra[key]
-                    break
-            if adapter_allow is None:
-                for attr in ("_allow_from", "allow_from", "_allowed_user_ids", "allowed_user_ids"):
-                    with contextlib.suppress(Exception):
-                        value = getattr(adapter, attr, None)
-                        if value is not None:
-                            adapter_allow = value
-                            break
         if not adapter_allow:
             # Plugin platforms (Buzz, DingTalk) spell their env allowlist as ``extra.allowed_users``;
             # under multiplex only the default profile's list reaches the env (first-writer-wins

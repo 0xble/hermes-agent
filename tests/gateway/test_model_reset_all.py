@@ -96,5 +96,9 @@ def test_reset_all_dm_fallback_uses_adapter_config_extra_allowlist(monkeypatch):
 
     assert GatewayModelCommandsMixin._model_reset_all_is_authorized(runner, source) is True
 
+    adapter.config.extra = {}
+    adapter._allow_from = {"owner"}
+    assert GatewayModelCommandsMixin._model_reset_all_is_authorized(runner, source) is True
+
     group_source = SessionSource(platform=Platform.TELEGRAM, user_id="owner", chat_id="group", chat_type="group")
     assert GatewayModelCommandsMixin._model_reset_all_is_authorized(runner, group_source) is False

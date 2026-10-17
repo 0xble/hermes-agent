@@ -658,13 +658,28 @@ class GatewayModelCommandsMixin:
         chat_type = str(getattr(source, "chat_type", "") or "").lower()
         if chat_type not in {"dm", "direct", "private"}:
             return False
-        # Reuse the gateway's canonical adapter/config authorization source. Some adapters (notably
-        # Telegram) keep the operator list in ``config.extra.allow_from`` rather than exposing it on
-        # the adapter itself. This is intentionally DM-only; group traffic stays denied above.
-        authorize_from_extra = getattr(self, "_adapter_extra_allowlist_authorizes", None)
-        return callable(authorize_from_extra) and bool(
-            authorize_from_extra(source, getattr(source, "user_id", ""), False)
-        )
+        # This check is intentionally local to the destructive reset command. Do not widen the
+        # shared inbound-chat authorization path with adapter implementation details.
+        adapter = self._delivery_adapter_for(source)
+        extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+        raw_allow = extra.get("allow_from")
+        if raw_allow is None:
+            for attr in ("_allow_from", "allow_from", "_allowed_user_ids", "allowed_user_ids"):
+                with contextlib.suppress(Exception):
+                    raw_allow = getattr(adapter, attr, None)
+                    if raw_allow is not None:
+                        break
+        if raw_allow is None:
+            return False
+        if isinstance(raw_allow, (list, tuple, set, frozenset)):
+            allowed = {str(item).strip() for item in raw_allow if str(item).strip()}
+        else:
+            allowed = {item.strip() for item in str(raw_allow).split(",") if item.strip()}
+        normalize = getattr(adapter, "normalize_user_id", None)
+        if callable(normalize):
+            allowed = {normalize(item) or item for item in allowed}
+        user_id = getattr(source, "user_id", "")
+        return "*" in allowed or user_id in allowed
 
     async def _reset_all_session_overrides(self) -> int:
         """Clear persisted and in-memory model/reasoning picks without changing a live turn's route."""
@@ -684,7 +699,8 @@ class GatewayModelCommandsMixin:
             if session_key in running:
                 pending.add(session_key)
             await self._persist_session_model_override(session_key, None, scope="session")
-            self._set_reasoning_override(session_key, None, scope="session")
+            if session_key not in running:
+                self._set_reasoning_override(session_key, None, scope="session")
             with contextlib.suppress(Exception):
                 state = self._peek_session_state(session_key)
                 if state is not None:
