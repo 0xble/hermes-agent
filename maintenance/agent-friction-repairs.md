@@ -6,9 +6,28 @@ Fork patch identity: `agent-friction-repairs`.
 
 This unit owns small, evidence-backed fixes where runtime bookkeeping makes the
 model repeat work or misread execution state. It covers context-pruning dedupe,
-skill_view reload-marker preservation across compaction and tail demotion, local
-execute_code session-kernel eviction reporting, terminal retry hints, and
-execute_code sandbox file-tool failures.
+skill_view reload-marker preservation across compaction and tail demotion, the
+idempotent-read guardrail at content-loss boundaries, local execute_code session-kernel
+eviction reporting, terminal retry hints, and execute_code sandbox file-tool failures.
+
+## Idempotent-read guardrail at content-loss boundaries
+
+When compaction, committed tool-result pruning, micro-compaction, or a provider
+checkpoint removes earlier read results from model-visible context, the next
+`skill_view` or `read_file` call is a recovery read. The boundary hook re-arms
+read deduplication and clears only successful-read repeat state, including stale
+read halt decisions. Failed-call counters, mutation progress, and same-turn
+loop caps remain unchanged.
+
+Focused proof includes `tests/agent/test_tool_guardrails.py` and
+`tests/agent/test_read_dedup_rewrite_boundaries.py`. A same-turn 5-call
+`skill_view` loop still blocks, while the first read after a content-loss
+boundary is allowed and serves full content.
+
+Related prior art is upstream issue [#109683](https://github.com/NousResearch/hermes-agent/issues/109683)
+and commit [`f7e565d`](https://github.com/eventh0riz0n/hermes-agent/commit/f7e565d887722458b7666627a405f0f525f907a7).
+This fork keeps the smallest fixed behavior: boundary resets apply to successful-read state only,
+without adding a user-facing mode switch.
 
 ## Terminal retry hints
 
