@@ -111,11 +111,23 @@ async def _create_icon(adapter, emoji: str) -> tuple[Optional[str], list[str]]:
 def _parse_reasoning(effort: str) -> Optional[dict]:
     if not effort:
         return None
+    normalized = effort.strip().lower()
+    if normalized in {"default", "reset"}:
+        return None
     from hermes_constants import parse_reasoning_effort
-    parsed = parse_reasoning_effort(effort.strip().lower())
+    parsed = parse_reasoning_effort(normalized)
     if parsed is None:
         raise TopicRequestError(f"Unknown reasoning effort {effort!r}.")
     return parsed
+
+
+def _reasoning_effort(config: Optional[dict]) -> Optional[str]:
+    """Return the user-facing effort represented by a resolved reasoning config."""
+    if not isinstance(config, dict):
+        return None
+    if config.get("enabled") is False:
+        return "none"
+    return config.get("effort") or "medium"
 
 
 async def _resolve_model(runner, source: SessionSource, spec: TopicSpec, session_key: str = ""):
@@ -158,27 +170,46 @@ async def set_topic_appearance(
         await _record_manual_icon(runner, source, thread_id, icon_emoji, icon_id)
 
 
-async def _apply_session_settings(runner, dest: SessionSource, entry, model, effort: Optional[dict],
-                                  *, announce: bool = True) -> list:
-    """Commit a resolved model and a parsed reasoning pick as ``dest``'s session overrides, through
-    the same commits as ``/model --session`` and ``/reasoning``. Returns model warnings."""
+async def _apply_session_settings(
+    runner, dest: SessionSource, entry, model, effort: Optional[dict], *, reasoning_reset: bool = False,
+    announce: bool = True,
+) -> dict:
+    """Commit topic settings through the slash-command paths and report their effective timing."""
     warnings = []
+    model_status = "unchanged"
+    reasoning_status = "unchanged"
+    model_effective_when = "unchanged"
+    reasoning_effective_when = "unchanged"
     # A stale route can come back flagged for auto-reset, whose cleanup on the next turn would wipe
     # the overrides set here; ``/model`` consumes the flag for the same reason (#48031).
     entry.was_auto_reset = False
     if model is not None:
         ctx, result = model
-        error = await runner.commit_session_model_selection(ctx, result, dest, announce=announce)
+        error, model_status = await runner.commit_session_model_selection_with_status(
+            ctx, result, dest, announce=announce,
+        )
         if error is not None:
             raise TopicRequestError(error)
+        model_effective_when = "next_turn"
         if getattr(result, "warning_message", ""):
             warnings.append(result.warning_message)
-    if effort is not None:
-        # Persists through the session store, whose lock is held across a state.db write. The session
-        # state is created on the loop first so the worker never races its get-or-create.
+    if effort is not None or reasoning_reset:
         runner._session_state(entry.session_key)
-        await asyncio.to_thread(runner._set_reasoning_override, entry.session_key, effort)
-    return warnings
+        previous = runner._session_reasoning_override(entry.session_key)
+        selected = None if reasoning_reset else effort
+        if previous != selected:
+            await asyncio.to_thread(runner._set_reasoning_override, entry.session_key, selected)
+            reasoning_status = "applied"
+            reasoning_effective_when = (
+                "next_request" if runner._is_session_running(entry.session_key) else "next_turn"
+            )
+    return {
+        "warnings": warnings,
+        "model_status": model_status,
+        "reasoning_status": reasoning_status,
+        "model_effective_when": model_effective_when,
+        "reasoning_effective_when": reasoning_effective_when,
+    }
 
 
 async def _deliver_brief(adapter, dest: SessionSource, brief: str) -> None:
@@ -254,6 +285,10 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
     if not thread_id:
         raise TopicRequestError("Telegram did not create the topic; the gateway log has the reason.")
     dest = replace_source(root, thread_id=str(thread_id))
+    settings = {
+        "warnings": [], "model_status": "unchanged", "reasoning_status": "unchanged",
+        "model_effective_when": "unchanged", "reasoning_effective_when": "unchanged",
+    }
     try:
         entry = await runner.async_session_store.get_or_create_session(dest)
         title = name
@@ -262,7 +297,12 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
         await asyncio.to_thread(runner._record_telegram_topic_binding, dest, entry)
         if icon_id:
             await _record_manual_icon(runner, dest, str(thread_id), spec.icon, icon_id)
-        warnings.extend(await _apply_session_settings(runner, dest, entry, model, effort, announce=False))
+        settings = await _apply_session_settings(
+            runner, dest, entry, model, effort,
+            reasoning_reset=spec.reasoning.strip().lower() in {"default", "reset"},
+            announce=False,
+        )
+        warnings.extend(settings["warnings"])
     except Exception as exc:
         retry = " ".join(f"{field}={value!r}" for field, value in (
             ("name", name), ("icon", spec.icon), ("model", spec.model), ("provider", spec.provider),
@@ -280,12 +320,28 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
             raise TopicRequestError(
                 f"Topic {thread_id} and session {entry.session_id} are set up, but the opening brief "
                 f"was not delivered: {exc}. Send it with relay to {relay}.") from exc
+    effective_model = getattr(model[1], "new_model", None) if model else None
+    effective_provider = getattr(model[1], "target_provider", None) if model else None
+    if not effective_model:
+        with_context = getattr(runner, "_model_switch_context", None)
+        if callable(with_context):
+            effective = with_context(dest, entry.session_key, persist_global=False)
+            effective_model = effective.current_model
+            effective_provider = effective.current_provider
+    effective_config = runner._resolve_session_reasoning_config(
+        source=dest, session_key=entry.session_key, model=effective_model or "",
+    )
     return {
         "action": "create", "thread_id": str(thread_id), "session_id": entry.session_id,
         "relay": relay, "title": title,
-        "icon": spec.icon if icon_id else None, "model": getattr(model[1], "new_model", None) if model else None,
-        "provider": getattr(model[1], "target_provider", None) if model else None,
+        "icon": spec.icon if icon_id else None, "model": effective_model,
+        "provider": effective_provider,
         "reasoning": effort, "brief_delivered": bool(brief), "warnings": warnings,
+        "model_status": settings["model_status"], "reasoning_status": settings["reasoning_status"],
+        "effective_model": effective_model, "effective_provider": effective_provider,
+        "effective_effort": _reasoning_effort(effective_config),
+        "model_effective_when": settings["model_effective_when"],
+        "reasoning_effective_when": settings["reasoning_effective_when"],
     }
 
 
@@ -300,27 +356,22 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
     session_key = runner._session_key_for_source(dest)
     name = _clean_name(runner, spec.name) if spec.name else None
     icon_id = await topic_icon_id(_adapter(runner, source, "rename_dm_topic"), spec.icon) if spec.icon else None
+    reasoning_reset = spec.reasoning.strip().lower() in {"default", "reset"}
     effort = _parse_reasoning(spec.reasoning)
     model = None
-    if spec.model or spec.provider:
-        # Resolved before the binding heal below, on purpose: the running-turn slot and the model
-        # and reasoning overrides belong to the topic's route (session_key), and the heal's
-        # switch_session carries both overrides onto the bound session, so this reads the state the
-        # heal leaves. Resolving first keeps an invalid pick from switching or binding anything.
-        if runner._is_session_running(session_key):
-            raise TopicRequestError(
-                "That topic's session is mid-turn, so its model cannot change now. "
-                "Retry when it is idle, or use /model in the topic.")
-        model = await _resolve_model(runner, dest, spec, session_key=session_key)
-
-    if name or icon_id:
-        await set_topic_appearance(runner, dest, thread_id, name=name, icon_emoji=spec.icon, icon_id=icon_id)
-    elif not await _topic_exists(runner, dest, thread_id):
+    if not (name or icon_id) and not await _topic_exists(runner, dest, thread_id):
         # A settings-only edit never calls Telegram, so a mistyped thread_id would otherwise get
         # a routing entry, a session and a binding for a topic that does not exist.
         raise TopicRequestError(
             f"No topic {thread_id} in this chat is known to Hermes. Check thread_id, or give name or "
             f"icon so Telegram confirms the topic.")
+    if spec.model or spec.provider:
+        # Resolution can block for seconds, but commit_session_model_selection_with_status re-checks
+        # the running slot under the model lock and queues rather than swapping a live client.
+        model = await _resolve_model(runner, dest, spec, session_key=session_key)
+
+    if name or icon_id:
+        await set_topic_appearance(runner, dest, thread_id, name=name, icon_emoji=spec.icon, icon_id=icon_id)
     # The topic's own session, bound as a turn there binds it: it finishes a create whose setup
     # failed after Telegram made the topic, and never repoints a bound topic.
     entry = await _topic_session(runner, dest, session_key)
@@ -328,13 +379,34 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
     if name and runner._session_db is not None:
         title = await runner._session_db.set_session_title_in_lineage(entry.session_id, name)
     warnings = []
-    if model is not None or effort is not None:
-        warnings = await _apply_session_settings(runner, dest, entry, model, effort)
+    settings = {
+        "model_status": "unchanged", "reasoning_status": "unchanged",
+        "model_effective_when": "unchanged", "reasoning_effective_when": "unchanged",
+    }
+    if model is not None or effort is not None or reasoning_reset:
+        settings = await _apply_session_settings(
+            runner, dest, entry, model, effort, reasoning_reset=reasoning_reset,
+        )
+        warnings = settings["warnings"]
+    effective_model = getattr(model[1], "new_model", None) if model else None
+    effective_provider = getattr(model[1], "target_provider", None) if model else None
+    if not effective_model:
+        effective_ctx = runner._model_switch_context(dest, entry.session_key, persist_global=False)
+        effective_model = effective_ctx.current_model
+        effective_provider = effective_ctx.current_provider
+    effective_config = runner._resolve_session_reasoning_config(
+        source=dest, session_key=entry.session_key, model=effective_model or "",
+    )
     return {
         "action": "edit", "thread_id": thread_id, "session_id": entry.session_id,
         "relay": relay_address(runner, source, entry.session_id), "name": name, "title": title,
         "icon": spec.icon if icon_id else None,
-        "model": getattr(model[1], "new_model", None) if model else None,
-        "provider": getattr(model[1], "target_provider", None) if model else None,
+        "model": effective_model,
+        "provider": effective_provider,
         "reasoning": effort, "warnings": warnings,
+        "model_status": settings["model_status"], "reasoning_status": settings["reasoning_status"],
+        "effective_model": effective_model, "effective_provider": effective_provider,
+        "effective_effort": _reasoning_effort(effective_config),
+        "model_effective_when": settings["model_effective_when"],
+        "reasoning_effective_when": settings["reasoning_effective_when"],
     }
