@@ -1270,6 +1270,37 @@ def test_external_worker_outcome_uses_explicit_execution_id_for_reloaded_job(mon
     assert mark_job_run.call_args.kwargs["success"] is True
 
 
+def test_deferred_outcome_uses_original_fire_owner(monkeypatch):
+    """A reloaded job cannot let a newer fire claim the old worker's outcome."""
+    from cron import scheduler
+    from cron.scheduler_worker_failure import record_external_worker_outcome
+
+    job = {"id": "job-1", "fire_claim": {"by": "new-owner"}}
+    mark_job_run = Mock()
+    deliver_crash = Mock()
+    fence = Mock(return_value=nullcontext(False))
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        lambda _execution_id: {"id": "exec-1", "status": "failed", "error": "worker failed"},
+    )
+    monkeypatch.setattr(scheduler, "fire_claim_fence", fence)
+    monkeypatch.setattr(scheduler, "mark_job_run", mark_job_run)
+    monkeypatch.setattr(scheduler, "_deliver_crash_failure", deliver_crash)
+
+    assert record_external_worker_outcome(
+        job,
+        error="stale worker result",
+        worker_exited=True,
+        execution_id="exec-1",
+        expected_fire_owner="old-owner",
+    ) is True
+    assert fence.call_args.kwargs["expected_owner"] == "old-owner"
+    mark_job_run.assert_not_called()
+    deliver_crash.assert_not_called()
+
+
+
 def test_deferred_worker_reaper_reconciles_outcome_before_release(monkeypatch, tmp_path):
     """A bounded early return still settles the durable job outcome after worker exit."""
     from cron import scheduler
@@ -1288,11 +1319,16 @@ def test_deferred_worker_reaper_reconciles_outcome_before_release(monkeypatch, t
 
     process.wait.side_effect = wait
     reconciled = threading.Event()
+    reconciled_kwargs = {}
     released = threading.Event()
+
+    def capture_reconciliation(*args, **kwargs):
+        reconciled_kwargs.update(kwargs)
+        reconciled.set()
     monkeypatch.setattr(
         scheduler,
         "_reconcile_deferred_external_worker_outcome",
-        lambda *args, **kwargs: reconciled.set(),
+        capture_reconciliation,
     )
     monkeypatch.setattr(
         scheduler,
@@ -1309,10 +1345,12 @@ def test_deferred_worker_reaper_reconciles_outcome_before_release(monkeypatch, t
             owner,
             process,
             execution_id="exec-deferred",
+            expected_fire_owner="old-owner",
             outcome_error="worker remained alive after bounded exit wait",
             worker_terminated=True,
         )
         assert reconciled.wait(2.0)
+        assert reconciled_kwargs["expected_fire_owner"] == "old-owner"
         assert released.wait(2.0)
     finally:
         with scheduler._running_lock:

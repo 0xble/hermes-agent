@@ -8,7 +8,7 @@ logger = logging.getLogger("cron.scheduler")
 def record_external_worker_outcome(
     job: dict, *, error=None, adapters=None, loop=None, worker_exited: bool = False,
     worker_terminated: bool = False, worker_exit_code: int | None = None,
-    execution_id: str | None = None,
+    execution_id: str | None = None, expected_fire_owner: str | None = None,
 ) -> bool:
     """Project a detached worker's terminal result onto the job record.
 
@@ -36,7 +36,9 @@ def record_external_worker_outcome(
         # from a direct recovery call; the waiter will reconcile after exit.
         return False
     claim = job.get("fire_claim")
-    owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    owner = expected_fire_owner if expected_fire_owner is not None else (
+        str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    )
     if not owner:
         return False
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:

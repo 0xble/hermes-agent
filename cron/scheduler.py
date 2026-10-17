@@ -3871,7 +3871,7 @@ def _cleanup_external_worker_state(
 
 def _reconcile_deferred_external_worker_outcome(
     job_id: str, home: Path, process: subprocess.Popen, error: str, *, execution_id: str,
-    worker_terminated: bool,
+    worker_terminated: bool, expected_fire_owner: Optional[str] = None,
 ) -> None:
     """Project a terminal worker result after a bounded waiter returned early."""
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -3890,6 +3890,7 @@ def _reconcile_deferred_external_worker_outcome(
                     worker_terminated=worker_terminated,
                     worker_exit_code=process.poll(),
                     execution_id=execution_id,
+                    expected_fire_owner=expected_fire_owner,
                 )
     finally:
         reset_hermes_home_override(home_token)
@@ -3897,7 +3898,8 @@ def _reconcile_deferred_external_worker_outcome(
 
 def _defer_external_worker_claim_release(
     job_id: str, home: Path, owner, process: subprocess.Popen,
-    *, execution_id: str, outcome_error: Optional[str] = None, worker_terminated: bool = False,
+    *, execution_id: str, expected_fire_owner: Optional[str] = None,
+    outcome_error: Optional[str] = None, worker_terminated: bool = False,
 ) -> None:
     """Reconcile a live restart-safe worker after exit, then release its fenced claim."""
     key = _inflight_key(job_id, home)
@@ -3928,6 +3930,7 @@ def _defer_external_worker_claim_release(
                         process,
                         outcome_error,
                         execution_id=execution_id,
+                        expected_fire_owner=expected_fire_owner,
                         worker_terminated=worker_terminated,
                     )
                 except Exception:
@@ -3979,6 +3982,7 @@ def _wait_for_external_cron_worker(
     job_id: Optional[str] = None,
     handoff_files: tuple[Path, ...] = (),
     stderr_path: Optional[Path] = None,
+    expected_fire_owner: Optional[str] = None,
     terminal_exit_grace_seconds: float = _EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS,
     worker_hard_wall_deadline: Optional[float] = None,
 ) -> bool:
@@ -4043,6 +4047,7 @@ def _wait_for_external_cron_worker(
                     claim_owner,
                     process,
                     execution_id=execution_id,
+                    expected_fire_owner=expected_fire_owner,
                     outcome_error=deferred_outcome_error,
                     worker_terminated=deferred_worker_terminated,
                 )
@@ -4081,6 +4086,8 @@ def _launch_external_cron_worker(job: dict) -> bool:
     """
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])
+    claim = job.get("fire_claim")
+    expected_fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
     from cron.scheduler_detached_worker import (
         hard_wall_timeout_seconds,
         hard_wall_watchdog_grace_seconds,
@@ -4242,6 +4249,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     job_id=job_id,
                     handoff_files=(payload_path, stderr_path),
                     stderr_path=stderr_path,
+                    expected_fire_owner=expected_fire_owner,
                     terminal_exit_grace_seconds=terminal_exit_grace_seconds,
                     worker_hard_wall_deadline=worker_hard_wall_deadline,
                 )
@@ -4262,6 +4270,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     job_id=job_id,
                     handoff_files=(payload_path, stderr_path),
                     stderr_path=stderr_path,
+                    expected_fire_owner=expected_fire_owner,
                     terminal_exit_grace_seconds=terminal_exit_grace_seconds,
                     worker_hard_wall_deadline=worker_hard_wall_deadline,
                 )
@@ -4298,6 +4307,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                 job_id=job_id,
                 handoff_files=(payload_path, stderr_path),
                 stderr_path=stderr_path,
+                expected_fire_owner=expected_fire_owner,
                 terminal_exit_grace_seconds=terminal_exit_grace_seconds,
                 worker_hard_wall_deadline=worker_hard_wall_deadline,
             )
