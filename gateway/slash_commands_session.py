@@ -497,11 +497,13 @@ class GatewaySessionCommandsMixin:
         """Profile-scoping wrapper around manual /compress: multiplexed gateways resolve credentials
         through the fail-closed per-profile secret scope, which slash dispatch (unlike ``_run_agent``)
         does not install — unscoped, /compress would raise ``UnscopedSecretError``."""
+        profile_home = None
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._handle_compress_command_inner(event)
+        profile_home = self._resolve_profile_home_for_source(event.source)
         from gateway.run import _profile_runtime_scope
-        with _profile_runtime_scope(self._resolve_profile_home_for_source(event.source)):
-            return await self._handle_compress_command_inner(event)
+        with _profile_runtime_scope(profile_home):
+            return await self._handle_compress_command_inner(event, profile_home=profile_home)
 
     async def _compress_codex_app_server_session(self, session_key: str, session_id: str) -> str:
         """Manual /compress for codex_app_server sessions: compacts the LIVE cached agent's
@@ -526,7 +528,7 @@ class GatewaySessionCommandsMixin:
             return t("gateway.compress.codex_compacted")
         return t("gateway.compress.codex_incomplete")
 
-    async def _handle_compress_command_inner(self, event: MessageEvent) -> str:
+    async def _handle_compress_command_inner(self, event: MessageEvent, *, profile_home=None) -> str:
         """Handle /compress -- manually compress conversation context; ``/compress <focus>`` tells
         the summariser what to preserve. Flags/positional forms are parsed by the shared core."""
         from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
@@ -547,12 +549,16 @@ class GatewaySessionCommandsMixin:
             return _compress_preview_reply(history, request.partial, request.keep_last, request.focus_topic, _agg_note,
                                            request.level)
         try:
-            return await self._run_manual_compression(source, session_entry, history, request)
+            return await self._run_manual_compression(
+                source, session_entry, history, request, profile_home=profile_home,
+            )
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
 
-    async def _run_manual_compression(self, source, session_entry, history: list, request) -> str:
+    async def _run_manual_compression(
+        self, source, session_entry, history: list, request, *, profile_home=None,
+    ) -> str:
         """Build a temporary agent, run the shared compress core, persist, and describe the outcome."""
         from agent.conversation_compression import finalize_context_engine_compression_notification
         from agent.conversation_compression_manual import compress_now, render_compress_result
@@ -579,7 +585,9 @@ class GatewaySessionCommandsMixin:
         runtime_kwargs["gateway_session_key"] = session_key
         # Same reasoning setting as a live turn (session ``/reasoning`` > per-model > global): without it
         # the transport applies its default effort — a 400 on non-reasoning models.
-        runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(source=source, model=model)
+        runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(
+            source=source, model=model, profile_home=profile_home,
+        )
 
         tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
         try:

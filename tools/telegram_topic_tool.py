@@ -23,7 +23,11 @@ TELEGRAM_TOPIC_SCHEMA = {
         "and reasoning effort, and an optional opening brief that the new session receives as its "
         "first message and starts working on. It returns the topic's thread_id, session_id and relay "
         "address. action=edit changes an existing topic's name or icon and its session's model or "
-        "reasoning; it defaults to the current topic. Settings persist across gateway restarts. "
+        "reasoning; it defaults to the current topic, so an agent can change its own session or another "
+        "topic's session. A busy target's model pick is queued for its next turn (the current turn is never "
+        "swapped); reasoning changes apply to the next model request. Use reasoning=default (or reset) "
+        "to clear a session override. Results report applied, queued or unchanged status plus effective "
+        "model, provider, effort and when each takes effect. Settings persist across gateway restarts. "
         "Only available in a Telegram DM session."
     ),
     "parameters": {
@@ -38,7 +42,7 @@ TELEGRAM_TOPIC_SCHEMA = {
             "model": {"type": "string", "description": "Model for the topic's session, as accepted by /model."},
             "provider": {"type": "string", "description": "Provider for that model, as accepted by /model --provider."},
             "reasoning": {"type": "string",
-                          "description": "Reasoning effort for the topic's session: none, minimal, low, medium, high or xhigh."},
+                          "description": "Reasoning effort for the topic's session: none, minimal, low, medium, high or xhigh; use default (or reset) to clear the session override."},
             "message": {"type": "string",
                         "description": "create only: opening brief the new session receives as its first message."},
             "thread_id": {"type": "string", "description": "edit only: the topic to edit. Defaults to the current topic."},

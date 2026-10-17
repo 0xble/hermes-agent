@@ -82,7 +82,7 @@ def _runner(home, adapter, *, auto_icons=False):
     runner._agent_cache, runner._agent_cache_lock = {}, None
     runner._session_model_overrides = {}
     runner._pending_model_notes = {}
-    runner._load_reasoning_config = lambda model="": {"enabled": True, "effort": "medium"}
+    runner._load_reasoning_config = lambda model="", **_kwargs: {"enabled": True, "effort": "medium"}
     runner._delivery_adapter_for = lambda source: adapter
     runner._record_switch_metrics = MagicMock()
     runner._perform_model_switch = AsyncMock(return_value=(_model_result(), None))
@@ -391,19 +391,18 @@ async def test_a_settings_only_edit_of_an_unknown_topic_is_refused(home):
 
 
 @pytest.mark.asyncio
-async def test_a_model_commit_rechecks_that_the_session_is_still_idle(home):
+async def test_a_model_commit_queues_when_the_session_becomes_busy(home):
     """Resolving can block for seconds; a turn that starts meanwhile must not get its client
-    swapped. The commit re-checks under the /model lock."""
+    swapped. The topic commit re-checks under the /model lock and queues the override."""
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
     await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡"))
-    checks = iter([False, True])  # idle when the edit starts, running by commit time
-    runner._is_session_running = lambda key: next(checks)
+    runner._is_session_running = lambda key: True
 
-    with pytest.raises(TopicRequestError, match="started a turn"):
-        await edit_topic_session(runner, _source(), "4242", TopicSpec(model="gpt-test"))
+    result = await edit_topic_session(runner, _source(), "4242", TopicSpec(model="gpt-test"))
+    assert result["model_status"] == "queued"
     key = runner._session_key_for_source(_source(thread_id="4242"))
-    assert runner._session_model_override(key) is None
+    assert runner._session_model_override(key)["model"] == "gpt-test"
 
 
 @pytest.mark.asyncio
@@ -474,16 +473,124 @@ async def test_edit_icon_only_keeps_the_visible_name(home):
 
 
 @pytest.mark.asyncio
-async def test_edit_refuses_a_model_change_mid_turn_and_the_general_topic(home):
+async def test_a_model_edit_queues_during_a_turn_and_does_not_swap_the_live_agent(home):
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡"))
+    key = runner._session_key_for_source(_source(thread_id="4242"))
+    runner._is_session_running = lambda session_key: session_key == key
+    runner._switch_cached_agent_model = MagicMock(side_effect=AssertionError("running agent was swapped"))
+
+    result = await edit_topic_session(runner, _source(), "4242", TopicSpec(model="gpt-test"))
+
+    assert result["model_status"] == "queued"
+    assert result["model_effective_when"] == "next_turn"
+    assert result["effective_model"] == "gpt-test"
+    assert runner._session_model_override(key)["model"] == "gpt-test"
+    assert runner.session_store.get_model_override(key)["model"] == "gpt-test"
+
+
+@pytest.mark.asyncio
+async def test_a_model_edit_applies_when_idle_and_reports_effective_route(home):
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡"))
+    runner._is_session_running = lambda key: False
+
+    result = await edit_topic_session(runner, _source(), "4242", TopicSpec(model="gpt-test"))
+
+    assert result["model_status"] == "applied"
+    assert result["reasoning_status"] == "unchanged"
+    assert result["effective_model"] == "gpt-test"
+    assert result["effective_provider"] == "openai-codex"
+    assert result["model_effective_when"] == "next_turn"
+
+
+@pytest.mark.asyncio
+async def test_a_model_edit_on_a_running_self_target_queues(home):
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡"))
+    key = runner._session_key_for_source(_source(thread_id="4242"))
+    runner._is_session_running = lambda session_key: session_key == key
+
+    result = await edit_topic_session(runner, _source(thread_id="4242"), "", TopicSpec(model="gpt-test"))
+
+    assert result["model_status"] == "queued"
+    assert result["model_effective_when"] == "next_turn"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_edit_is_live_on_a_running_agent_and_default_clears(home):
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", reasoning="high"))
+    key = runner._session_key_for_source(_source(thread_id="4242"))
+    runner._is_session_running = lambda session_key: session_key == key
+
+    result = await edit_topic_session(runner, _source(), "4242", TopicSpec(reasoning="low"))
+    assert result["reasoning_status"] == "applied"
+    assert result["reasoning_effective_when"] == "next_request"
+    assert runner.session_store.get_reasoning_override(key)["effort"] == "low"
+
+    runner._is_session_running = lambda _session_key: False
+    result = await edit_topic_session(runner, _source(), "4242", TopicSpec(reasoning="default"))
+    assert result["reasoning_status"] == "applied"
+    assert result["effective_effort"] == "medium"
+    assert runner.session_store.get_reasoning_override(key) is None
+
+
+@pytest.mark.asyncio
+async def test_edit_reasoning_without_a_change_reports_unchanged(home):
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", reasoning="low"))
+
+    result = await edit_topic_session(runner, _source(), "4242", TopicSpec(reasoning="low"))
+
+    assert result["reasoning_status"] == "unchanged"
+    assert result["reasoning_effective_when"] == "unchanged"
+
+
+@pytest.mark.asyncio
+async def test_edit_refuses_a_model_change_only_when_typed_commit_is_used(home):
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
     runner._is_session_running = lambda key: True
-
-    with pytest.raises(TopicRequestError, match="mid-turn"):
-        await edit_topic_session(runner, _source(), "4242", TopicSpec(model="gpt-test"))
+    ctx, model, error = await runner.resolve_session_model_selection(
+        _source(thread_id="4242"), "gpt-test", session_key="telegram:test")
+    assert error is None
+    error = await runner.commit_session_model_selection(ctx, model, _source(thread_id="4242"))
+    assert "started a turn" in error
     with pytest.raises(TopicRequestError, match="General"):
         await edit_topic_session(runner, _source(), "1", TopicSpec(name="x"))
     assert adapter.renamed == []
+
+
+def test_reasoning_readback_uses_the_routed_profile_config(monkeypatch, tmp_path):
+    """A topic result must report the secondary profile's default, not the launch profile's."""
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+
+    secondary = tmp_path / "profiles" / "secondary"
+    secondary.mkdir(parents=True)
+    loaded_paths = []
+
+    def load_config(path=None):
+        loaded_paths.append(path)
+        return {"agent": {"reasoning_effort": "high"}}
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._resolve_session_key_or_none = lambda source, session_key: session_key or "topic-key"
+    runner._session_reasoning_override = lambda session_key: None
+    runner._resolve_profile_home_for_source = lambda source: secondary
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", load_config)
+
+    result = runner._resolve_session_reasoning_config(source=_source(thread_id="4242"), model="gpt-test")
+
+    assert result == {"enabled": True, "effort": "high"}
+    assert loaded_paths == [secondary / "config.yaml"]
 
 
 def test_tool_survives_schemas_built_before_telegram_connects(monkeypatch):
