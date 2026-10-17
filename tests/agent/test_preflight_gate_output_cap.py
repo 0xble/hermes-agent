@@ -28,7 +28,7 @@ def _compressor(**over):
 
 def _agent(**over):
     a = SimpleNamespace(
-        api_mode="chat_completions", provider="openrouter", model="test/model", tools=None,
+        api_mode="chat_completions", provider="openrouter", model="test/model", reasoning_config=None, tools=None,
         _ollama_num_ctx=None, compression_enabled=True, context_compressor=_compressor(),
         _preflight_output_ceiling=None, _ephemeral_max_output_tokens=None,
         _request_pressure_anchored=True, session_id="s1", log_prefix="", _api_call_count=1,
