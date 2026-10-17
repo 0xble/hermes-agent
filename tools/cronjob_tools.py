@@ -747,6 +747,7 @@ def _action_create(a: dict[str, Any]) -> str:
             reasoning_effort=a["reasoning_effort"], job_timezone=a["job_timezone"], interpreter=a["interpreter"], pinned=bool(a["pinned"]),
             hard_wall_timeout_seconds=a["hard_wall_timeout_seconds"],
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+            keep_pinned_lane=bool(a["keep_pinned_lane"]) if a["keep_pinned_lane"] is not None else False,
             review=_review_value(a["review_json"], clear=bool(a["clear_review"])),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
@@ -903,6 +904,8 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
                 return bot_chat_error
             _norm_fd = _resolve_cron_context_deliver(_norm_fd)
         updates["failure_deliver"] = _norm_fd
+    if a["keep_pinned_lane"] is not None:
+        updates["keep_pinned_lane"] = bool(a["keep_pinned_lane"])
     if skills is not None or skill is not None:
         canonical_skills = _canonical_skills(skill, skills)
         updates["skills"] = canonical_skills
@@ -1081,6 +1084,7 @@ def cronjob(
     reasoning_effort: Optional[str] = None,
     job_timezone: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
+    keep_pinned_lane: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
     paused: bool = False,
@@ -1182,6 +1186,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": "Optional override target for FAILURE notices only (same grammar as deliver). When set, engine failure/interruption notices go here instead of the deliver target; 'local' suppresses them entirely (state still recorded in cron list/run history). Use for jobs delivering into shared channels where failure noise is unwanted. Omit = failures follow deliver (default). On update, '' clears."
             },
+            "keep_pinned_lane": {
+                "type": "boolean",
+                "description": "For create/update: set true when the user asked for this job's output in a specific chat or topic, so the lane converter leaves that fixed delivery lane unchanged. Default false."
+            },
             "review_json": {
                 "type": "string",
                 "description": "CLI/operator lane: JSON with contract, subject, optional deadline_minutes (default 10), rerun_deadline_minutes (default 20) and max_reruns (0 or 1, default 1). Requires deliver=local."
@@ -1256,7 +1264,7 @@ def check_cronjob_requirements() -> bool:
 # create/edit --model`, hand-edited jobs) — the agent must not point unattended spend at a
 # different model. Programmatic callers of cronjob() itself retain the parameters.
 _HANDLER_FORWARDED_ARGS = (
-    "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
+    "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "keep_pinned_lane", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
     "paused_reason", "pinned", "allow_shrink", "review_json", "clear_review")
 
