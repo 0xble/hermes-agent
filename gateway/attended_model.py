@@ -62,6 +62,16 @@ class AttendedResolution:
     reason: str
     active: bool = False
 
+    @property
+    def decision_key(self) -> tuple[str, str, str, str, bool]:
+        """Stable desired-route identity; never compare it with the live agent model.
+
+        The gateway uses this key to distinguish a real attended decision change from
+        fallback activation, which is deliberately allowed to change ``agent.model``
+        without changing the desired route for the current turn.
+        """
+        return (self.model, self.provider, self.reasoning_effort, self.reason, self.active)
+
 
 def _as_model_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
     value = (config or {}).get("model", {}) if isinstance(config, Mapping) else {}
@@ -166,6 +176,8 @@ def resolve_attended_model(
     default_model = str(get("default_model", "") or "")
     default_provider = str(get("default_provider", "") or "")
     channel_model = str(get("channel_model", "") or "")
+    channel_provider = str(get("channel_provider", "") or "")
+    default_reasoning = str(get("default_reasoning", "") or "")
     now_value = time.time() if now is None else float(now)
     active = cfg.enabled and is_active(
         get("last_user_activity_at"), now=now_value, idle_revert_minutes=cfg.idle_revert_minutes
@@ -175,26 +187,35 @@ def resolve_attended_model(
         get("once_model") or get("session_model") or
         get("temporary_model") or get("model_override")
     )
-    explicit_provider = get("once_provider") or get("session_provider") or get("temporary_provider") or ""
+    explicit_provider = (
+        get("once_provider") or get("session_provider") or
+        get("temporary_provider") or get("model_override_provider") or ""
+    )
     explicit_reasoning = (
         get("once_reasoning") or get("session_reasoning") or
         get("temporary_reasoning") or get("reasoning_override")
     )
+    # A plain /model X is an explicit model pick, but it must use X's normal
+    # reasoning setting rather than inheriting attended's effort.
+    explicit_model_reasoning = str(
+        get("explicit_model_reasoning") or get("model_reasoning") or default_reasoning or ""
+    )
+    baseline_provider = channel_provider or default_provider
     if explicit_model:
         return AttendedResolution(
-            str(explicit_model), str(explicit_provider or default_provider),
-            str(explicit_reasoning or ""), "explicit", active,
+            str(explicit_model), str(explicit_provider or baseline_provider),
+            str(explicit_reasoning or explicit_model_reasoning), "explicit", active,
         )
 
     if active:
         model = cfg.model or channel_model or default_model
-        provider = cfg.provider or default_provider
-        effort = cfg.reasoning_effort or str(get("default_reasoning", "") or "")
+        provider = cfg.provider or channel_provider or default_provider
+        effort = str(explicit_reasoning or cfg.reasoning_effort or get("attended_reasoning") or default_reasoning)
         return AttendedResolution(model, provider, effort, "attended", True)
 
     return AttendedResolution(
-        channel_model or default_model, default_provider,
-        str(explicit_reasoning or get("default_reasoning", "") or ""), "default", False,
+        channel_model or default_model, baseline_provider,
+        str(explicit_reasoning or default_reasoning), "default", False,
     )
 
 

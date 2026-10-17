@@ -28,7 +28,6 @@ from gateway.restart import (
 )
 from gateway.session import SessionSource
 from gateway.session_state import SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET
-from gateway.attended_model import is_active, parse_attended_config
 from hermes_cli.config import cfg_get, resolve_ephemeral_system_prompt_from_config
 from hermes_cli.fallback_config import get_fallback_chain
 from utils import is_truthy_value
@@ -192,41 +191,53 @@ class GatewayConfigLoadersMixin:
         override = self._session_reasoning_override(resolved_session_key)
         if override is not None:
             return override
-        # Explicit session picks, including Telegram topic-tool model edits, win over
-        # attended reasoning. The topic tool commits through the same session override
-        # store as ``/model --session`` and therefore reaches this branch before the
-        # active attended fallback.
-        attended = self._attended_reasoning_config(resolved_session_key)
-        if attended is not None:
-            return attended
         resolve_profile_home = getattr(self, "_resolve_profile_home_for_source", None)
         if (profile_home is None
                 and getattr(getattr(self, "config", None), "multiplex_profiles", False)
                 and source is not None and callable(resolve_profile_home)):
             profile_home = resolve_profile_home(source)
-        if profile_home is None:
-            return self._load_reasoning_config(model)
-        return self._load_reasoning_config(model, profile_home=profile_home)
+        baseline = (
+            self._load_reasoning_config(model)
+            if profile_home is None
+            else self._load_reasoning_config(model, profile_home=profile_home)
+        )
+        # Attended routing is resolved in one place. Do not independently inspect
+        # activity here: the runtime and reasoning paths must make the same choice.
+        resolver = getattr(self, "_attended_resolution_for_session", None)
+        if callable(resolver) and resolved_session_key:
+            try:
+                from gateway.run import _load_gateway_config
+                decision = resolver(
+                    source=source, session_key=resolved_session_key,
+                    user_config=_load_gateway_config(),
+                    override=self._session_model_override(resolved_session_key),
+                )
+                effort = getattr(decision, "reasoning_effort", "") if decision is not None else ""
+                if effort:
+                    from hermes_constants import parse_reasoning_effort
+                    return parse_reasoning_effort(effort)
+            except Exception:
+                logger.debug("attended reasoning resolution failed", exc_info=True)
+        return baseline
 
     def _attended_reasoning_config(self, session_key: Optional[str]) -> Optional[dict]:
-        """Return the active attended effort, if configured and the lane is still active."""
+        """Compatibility wrapper around the single attended route resolver."""
         if not session_key:
             return None
-        from gateway.run import _load_gateway_config
-        cfg = _load_gateway_config()
-        attended = parse_attended_config(cfg)
-        if not attended.enabled or not attended.reasoning_effort:
+        try:
+            from gateway.run import _load_gateway_config
+            resolver = getattr(self, "_attended_resolution_for_session", None)
+            decision = resolver(
+                source=None, session_key=session_key, user_config=_load_gateway_config(),
+                override=self._session_model_override(session_key),
+            ) if callable(resolver) else None
+            if decision is None or decision.reason != "attended" or not decision.reasoning_effort:
+                return None
+            from hermes_constants import parse_reasoning_effort
+            return parse_reasoning_effort(decision.reasoning_effort)
+        except Exception:
+            logger.debug("attended reasoning compatibility resolution failed", exc_info=True)
             return None
-        state = self._peek_session_state(session_key)
-        stamp = getattr(getattr(state, "conversation", None), "last_user_activity_at", None) if state else None
-        if stamp is None:
-            store = getattr(self, "session_store", None)
-            with suppress(Exception):
-                stamp = store.get_last_user_activity_at(session_key) if store else None
-        if not is_active(stamp, now=time.time(), idle_revert_minutes=attended.idle_revert_minutes):
-            return None
-        from hermes_constants import parse_reasoning_effort
-        return parse_reasoning_effort(attended.reasoning_effort)
 
     def _session_reasoning_override(self, session_key: Optional[str]) -> dict | None:
         """The session's explicit ``/reasoning`` pick, or ``None`` when it runs on config."""

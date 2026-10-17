@@ -166,6 +166,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         Priority (highest first): session ``/model`` → ``channel_overrides`` → global config/env
         (``_resolve_gateway_model(user_config)`` and default provider resolution)."""
         skey = self._resolve_session_key_or_none(source, session_key)
+        self._last_attended_decision = None
         self._pre_agent_fallback_notice = None
         if skey:
             self._rehydrate_session_model_override(skey)
@@ -181,8 +182,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         )
         return self._commit_session_agent_runtime(skey, resolved)
 
-    def _attended_route_for_session(self, *, source, session_key, user_config, override, last_model):
-        """Build the detached attended route and stage its one-line notice on the session."""
+    def _attended_resolution_for_session(self, *, source, session_key, user_config=None, override=None):
+        """Return the one authoritative desired route decision for a gateway session."""
         if not session_key:
             return None
         from gateway.run import _get_channel_override, _resolve_gateway_model
@@ -199,6 +200,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 stamp = stamp.timestamp()
             conversation.last_user_activity_at = stamp
         channel_model = ""
+        channel_provider = ""
         if source is not None:
             with suppress(Exception):
                 ch = _get_channel_override(
@@ -207,29 +209,77 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
                 )
                 channel_model = getattr(ch, "model", "") or ""
+                channel_provider = getattr(ch, "provider", "") or ""
+        default_model = _resolve_gateway_model(user_config)
+        model_value = (override or {}).get("model") if override else None
+        model_provider = (override or {}).get("provider") if override else None
+        loader = getattr(self, "_load_reasoning_config", lambda _model: {})
+        default_reasoning = ""
+        with suppress(Exception):
+            reasoning_model = str(model_value or default_model or "")
+            default_reasoning = (loader(reasoning_model) or {}).get("effort", "")
+        attended_reasoning = ""
+        with suppress(Exception):
+            if cfg.model:
+                attended_reasoning = (loader(cfg.model) or {}).get("effort", "")
+        model_scope = getattr(conversation, "model_override_scope", "session")
+        reasoning_scope = getattr(conversation, "reasoning_override_scope", "session")
+        reasoning_value = conversation.reasoning_override
+        if reasoning_value is None:
+            with suppress(Exception):
+                reasoning_value = self._session_reasoning_override(session_key)
+                reasoning_scope = getattr(conversation, "reasoning_override_scope", reasoning_scope)
         decision = resolve_attended_model(
             {
-                "model_override": (override or {}).get("model") if override else None,
-                "default_model": _resolve_gateway_model(user_config),
+                "model_override": model_value if model_scope not in ("session", "temporary", "once") else None,
+                "once_model": model_value if model_scope == "once" else None,
+                "session_model": model_value if model_scope == "session" else None,
+                "temporary_model": model_value if model_scope == "temporary" else None,
+                "model_override_provider": model_provider,
+                "default_model": default_model,
                 "default_provider": (user_config or {}).get("model", {}).get("provider", "")
                 if isinstance((user_config or {}).get("model"), dict) else "",
                 "channel_model": channel_model,
+                "channel_provider": channel_provider,
                 "last_user_activity_at": stamp,
-                "default_reasoning": "",
+                "default_reasoning": default_reasoning,
+                "explicit_model_reasoning": default_reasoning,
+                "attended_reasoning": attended_reasoning,
+                "session_reasoning": reasoning_value if reasoning_scope == "session" else None,
+                "temporary_reasoning": reasoning_value if reasoning_scope == "temporary" else None,
             },
             time.time(), user_config or {},
         )
+        self._last_attended_decision = decision
+        return decision
+
+    def _attended_route_for_session(self, *, source, session_key, user_config, override, last_model):
+        """Build the detached attended route and stage its one-line notice on the session."""
+        decision = self._attended_resolution_for_session(
+            source=source, session_key=session_key, user_config=user_config, override=override,
+        )
+        if decision is None:
+            return None
         if decision.reason != "attended":
             return None
+        conversation = self._session_state(session_key).conversation
+        cfg = parse_attended_config(user_config or {})
         route = {
             "active": True,
             "model": cfg.model,
             "provider": cfg.provider,
             "reasoning_effort": cfg.reasoning_effort,
+            "decision_key": decision.decision_key,
         }
         target_model = cfg.model or decision.model
-        if not last_model or last_model != target_model:
-            effort = cfg.reasoning_effort or "medium"
+        session_last_model = conversation.last_resolved_model or ""
+        if not session_last_model or session_last_model != target_model:
+            effort = decision.reasoning_effort
+            if not effort:
+                with suppress(Exception):
+                    loader = getattr(self, "_load_reasoning_config")
+                    effort = (loader(target_model) or {}).get("effort", "")
+            effort = effort or "none"
             conversation.pending_attended_notice = f"↻ {target_model} · {effort}"
         return route
 
@@ -269,8 +319,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
 
     def _commit_session_agent_runtime(self, skey, resolved):
         model, runtime, notice, cache_model = resolved
-        # Worker resolution never writes session state or the shared notice stash.
+        # Worker resolution normally never writes session state; an unavailable attended route must
+        # consume the staged switch-in line so the one fallback notice is the only notice for this turn.
         self._pre_agent_fallback_notice = notice
+        if notice and skey:
+            state = self._peek_session_state(skey)
+            if state is not None:
+                state.conversation.pending_attended_notice = None
         if cache_model:
             if skey:
                 self._session_state(skey).conversation.last_resolved_model = model
