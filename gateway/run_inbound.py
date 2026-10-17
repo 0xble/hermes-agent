@@ -1703,11 +1703,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             asyncio.create_task(self._mark_attended_user_activity(event, source, _quick_key))
             return _result
 
-        # Non-command messages need their activity stamp before a running/new turn resolves its
-        # model.  This remains after the estop/busy gates and is a no-op when attended is disabled.
-        _attended_activity_marked = await self._mark_attended_user_activity(event, source, _quick_key)
-        if _attended_activity_marked:
-            setattr(event, "_attended_activity_marked", True)
+        # Non-command messages are stamped after the session slot is claimed, immediately before
+        # model resolution. Awaiting the store lookup before the claim reopens the duplicate-agent
+        # race that the pending sentinel is designed to close.
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
@@ -1768,6 +1766,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
         try:
+            # Mark genuine user activity inside the claimed turn, before resolving the model. This
+            # preserves the attended route's same-turn semantics without delaying the sentinel claim.
+            _attended_activity_marked = await self._mark_attended_user_activity(event, source, _quick_key)
+            if _attended_activity_marked:
+                setattr(event, "_attended_activity_marked", True)
             if not is_internal:  # fail-open plugin consume, inside the claimed slot (#129958)
                 from gateway.run_inbound_consumer import run_post_admission_hook
                 _consumed, _consumer_reply = await run_post_admission_hook(self, event, source, _quick_key)

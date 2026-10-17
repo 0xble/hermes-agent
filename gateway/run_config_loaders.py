@@ -207,10 +207,22 @@ class GatewayConfigLoadersMixin:
         if callable(resolver) and resolved_session_key:
             try:
                 from gateway.run import _load_gateway_config
+                from gateway.attended_model import parse_attended_config
+                user_config = _load_gateway_config()
+                attended_cfg = parse_attended_config(user_config)
+                attended_baseline = {}
+                if attended_cfg.model:
+                    attended_baseline = (
+                        self._load_reasoning_config(attended_cfg.model)
+                        if profile_home is None
+                        else self._load_reasoning_config(attended_cfg.model, profile_home=profile_home)
+                    ) or {}
                 decision = resolver(
                     source=source, session_key=resolved_session_key,
-                    user_config=_load_gateway_config(),
+                    user_config=user_config,
                     override=self._session_model_override(resolved_session_key),
+                    default_reasoning=baseline or {},
+                    attended_reasoning=attended_baseline,
                 )
                 effort = getattr(decision, "reasoning_effort", "") if decision is not None else ""
                 if effort:
