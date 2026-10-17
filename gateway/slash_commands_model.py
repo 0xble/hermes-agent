@@ -492,22 +492,44 @@ class GatewayModelCommandsMixin:
         ``/model --session`` commit (cached agent, state.db, write-through for restarts) without its
         reply or switch-away metrics. Error text or None.
 
-        Refused when the session started a turn after the caller's idle check: resolving can block
-        for seconds, and swapping a running agent's client mid-turn is what the check exists to
-        stop. ``announce=False`` drops the next-turn switch note for a session that never ran on
-        another model (a just-created topic)."""
+        This remains the typed ``/model`` contract: a target that started a turn is refused instead
+        of swapping its client mid-turn. Agent-facing topic edits use
+        :meth:`commit_session_model_selection_with_status`, which records the same override but
+        queues a busy target for its next turn."""
+        error, _status = await self._commit_session_model_selection(
+            ctx, result, source, announce=announce, queue_if_running=False,
+        )
+        return error
+
+    async def commit_session_model_selection_with_status(
+        self, ctx: _ModelSwitchContext, result, source, *, announce: bool = True,
+    ) -> tuple[Optional[str], str]:
+        """Commit a topic-tool model pick and report whether it applied now or queued for next turn.
+
+        The running agent is never swapped. The durable session override changes immediately, while
+        the cache signature forces the next turn to build the selected route after the current turn
+        releases its agent."""
+        return await self._commit_session_model_selection(
+            ctx, result, source, announce=announce, queue_if_running=True,
+        )
+
+    async def _commit_session_model_selection(
+        self, ctx: _ModelSwitchContext, result, source, *, announce: bool, queue_if_running: bool,
+    ) -> tuple[Optional[str], str]:
         ctx = dataclasses.replace(ctx, session_key=self._session_key_for_source(source), source=source)
         async with self._model_switch_lock():
-            if self._is_session_running(ctx.session_key):
+            running = self._is_session_running(ctx.session_key)
+            if running and not queue_if_running:
                 return ("That session started a turn, so its model cannot change now. "
-                        "Retry when it is idle, or use /model there.")
-            error = self._switch_cached_agent_model(result, ctx, False)
-            if error is not None:
-                return error
+                        "Retry when it is idle, or use /model there."), "unchanged"
+            if not running:
+                error = self._switch_cached_agent_model(result, ctx, False)
+                if error is not None:
+                    return error, "unchanged"
             await self._record_model_switch(result, ctx, source=source, one_turn=False, picker=False)
             if not announce:
                 (getattr(self, "_pending_model_notes", None) or {}).pop(ctx.session_key, None)
-        return None
+        return None, "queued" if running else "applied"
 
     async def _send_model_picker(self, event: MessageEvent, source, adapter, session_key: str, listing_kwargs: dict, on_model_selected) -> bool:
         """Send the interactive /model picker; False when nothing was sent (text fallback). *source*
@@ -757,13 +779,13 @@ class GatewayModelCommandsMixin:
         if self._live_agent_for_session_control(session_key) is None:
             self._evict_cached_agent(session_key)
 
-    def _set_reasoning_override(self, session_key: str, value) -> None:
+    def _set_reasoning_override(self, session_key: str, value, source=None) -> None:
         """Apply a session override to the live tool loop's next model request."""
         self._set_session_reasoning_override(session_key, value)
         agent = self._live_agent_for_session_control(session_key)
         if agent is not None:
             effective = value if value is not None else self._resolve_session_reasoning_config(
-                session_key=session_key, model=getattr(agent, "model", ""),
+                source=source, session_key=session_key, model=getattr(agent, "model", ""),
             )
             agent.reasoning_config = dict(effective) if isinstance(effective, dict) else effective
             agent.reasoning_override = None if value is None else dict(value)
