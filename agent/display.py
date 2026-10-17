@@ -321,6 +321,30 @@ def _luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
+_BROWSER_EXEC_PAN_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_BROWSER_EXEC_FILL_NUMERIC_RE = re.compile(
+    r"(?P<prefix>\bfill_input\s*\([^()\n]*?(?:,\s*|\b(?:text|value|value_text)\s*=\s*))"
+    r"(?P<quote>['\"])(?P<digits>\d{3,4})(?P=quote)"
+)
+_SHORT_NUMERIC_CONTEXT_RE = re.compile(
+    r"(?i)\b(?:type|typed|typing|input|value|secret|cvc|cvv|security(?:\s+code)?)\b"
+    r"[^0-9]{0,32}(?<![\w])(?P<digits>\d{3,4})(?!\d)"
+)
+
+
+def _redact_browser_exec_code(code: str) -> str:
+    """Mask PANs and fill_input CVC-shaped literals in browser_exec display args."""
+    def redact_pan(match: re.Match[str]) -> str:
+        compact = re.sub(r"[ -]", "", match.group(0))
+        return "[REDACTED]" if _luhn_valid(compact) else match.group(0)
+
+    redacted = _BROWSER_EXEC_PAN_RE.sub(redact_pan, code)
+    return _BROWSER_EXEC_FILL_NUMERIC_RE.sub(
+        lambda match: f'{match.group("prefix")}{match.group("quote")}[REDACTED]{match.group("quote")}',
+        redacted,
+    )
+
+
 def _redact_browser_typed_value(typed_text: Any) -> str:
     """Redact ordinary secret patterns plus numeric OTP/CVC/PAN values."""
     needle = "" if typed_text is None else str(typed_text)
@@ -331,8 +355,32 @@ def _redact_browser_typed_value(typed_text: Any) -> str:
     return redacted
 
 
+def _redact_short_numeric_mentions(value: Any, needle: str) -> Any:
+    """Redact short numeric input only in typed fields or secret-like error context."""
+    if isinstance(value, str):
+        if value == needle:
+            return "[REDACTED]"
+        return _SHORT_NUMERIC_CONTEXT_RE.sub(
+            lambda match: match.group(0)[: match.group(0).rfind(match.group("digits"))] + "[REDACTED]",
+            value,
+        )
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key == "typed" and isinstance(item, str) and item == needle:
+                out[key] = "[REDACTED]"
+            else:
+                out[key] = _redact_short_numeric_mentions(item, needle)
+        return out
+    if isinstance(value, list):
+        return [_redact_short_numeric_mentions(item, needle) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_short_numeric_mentions(item, needle) for item in value)
+    return value
+
+
 def redact_browser_typed_text_for_display(value: Any, typed_text: Any) -> Any:
-    """Replace every occurrence of a secret-looking browser_type value with its redacted form.
+    """Replace echoed browser_type secrets without corrupting unrelated numeric text.
 
     Backends echo the attempted input in error strings/metadata, so it is swapped before
     reaching logs, callbacks, the model, or chat history. Forced regardless of
@@ -342,6 +390,9 @@ def redact_browser_typed_text_for_display(value: Any, typed_text: Any) -> Any:
     redacted = _redact_browser_typed_value(typed_text)
     if redacted == needle:
         return value
+    compact = re.sub(r"[ -]", "", needle)
+    if compact.isdigit() and len(compact) in {3, 4}:
+        return _redact_short_numeric_mentions(value, needle)
     if isinstance(value, str):
         return value.replace(needle, redacted)
     if isinstance(value, dict):
@@ -354,11 +405,13 @@ def redact_browser_typed_text_for_display(value: Any, typed_text: Any) -> Any:
 
 
 def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | None:
-    """Return a copy of tool args safe for logs/progress UI (masks ``browser_type`` secrets)."""
+    """Return a copy of tool args safe for logs/progress UI."""
     if not isinstance(args, dict):
         return args
     if tool_name == "browser_type" and isinstance(args.get("text"), str):
         return {**args, "text": _redact_browser_typed_value(args["text"])}
+    if tool_name == "browser_exec" and isinstance(args.get("code"), str):
+        return {**args, "code": _redact_browser_exec_code(args["code"])}
     return args
 
 

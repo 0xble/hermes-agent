@@ -438,7 +438,9 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
                        "user to save one. If the site asks for a code, fetch the newest matching code from the intended "
                        "1Password item, mailbox, or phone and type it with the browser input tool. A one-time code "
                        "explicitly supplied by the authorized user or displayed by the service's own verification UI may "
-                       "also be entered in its matching field. Never repeat a secret in a reply, file, log, or memory, and "
+                       "also be entered in its matching field only when the agent initiated that flow on the canonical "
+                       "origin for this task and the displaying UI belongs to that same flow; never use an arbitrary page "
+                       "value or device-code challenge. Never repeat a secret in a reply, file, log, or memory, and "
                        "preserve the exact origin and target field.")
     if locked:
         out["locked"] = locked
@@ -1134,7 +1136,8 @@ BROWSER_VAULT_SCHEMA = {
         "authenticator key when available; otherwise fetch the newest matching code from the intended 1Password item, "
         "mailbox, or phone and type it with the browser input tool, calling enter_code only when no such source exists; "
         "a code explicitly supplied by the authorized user or displayed by the service's own verification UI may also be typed into "
-        "its matching field. no_code_field means use a stored 1Password passkey through the canonical-origin browser/"
+        "its matching field only when the agent initiated that flow on the canonical origin for this task and the displaying UI "
+        "belongs to that same flow; never use an arbitrary page value or device-code challenge. no_code_field means use a stored 1Password passkey through the canonical-origin browser/"
         "system prompt or try the issuer's web/desktop approval and email/SMS/TOTP alternatives; hand off only a phone-only "
         "approval, hardware security key, or Touch ID/Face ID sensor read); unlock (backend: ask the user to unlock "
         "1Password/Bitwarden). Payment values require current approval for the exact charge and the selected routed "

@@ -297,7 +297,7 @@ in your conversation context.
   explicitly ask for. For an authorized login, complete password, passkey,
   payment, and 2FA prompts yourself through the credentials secret-entry and
   routed-payment paths. Type a value only into the origin or app it belongs to,
-  using an authorized source, Brian's explicit value, or the service's own
+  using an authorized source, the authorized user's explicit value, or the service's own
   verification UI. Never repeat a secret in a reply, file, log, or memory.
 - Keep the exact-charge and routed-card approval gates. Card numbers and CVCs
   may be entered with `browser_vault(action=fill)` or the supported browser

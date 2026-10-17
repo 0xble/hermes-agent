@@ -11,6 +11,7 @@ from agent.display import (
     get_cute_tool_message,
     prepare_tool_preview,
     redact_tool_args_for_display,
+    redact_browser_typed_text_for_display,
     set_tool_preview_max_len,
     _summarize_rendered_diff_sections,
     render_edit_diff_with_delta,
@@ -86,11 +87,29 @@ class TestBuildToolPreview:
         assert pan_args is not None and pan_args["text"] == "[REDACTED]"
         assert cvc_args is not None and cvc_args["text"] == "[REDACTED]"
 
+    def test_browser_exec_display_redacts_pan_and_fill_input_cvc(self):
+        pan = "4242424242424242"
+        cvc = "123"
+        args = {"code": f"fill_input('#cardnumber', '{pan}')\nfill_input('#cvc', '{cvc}')"}
+        safe_args = redact_tool_args_for_display("browser_exec", args)
+        assert safe_args is not None
+        assert pan not in safe_args["code"]
+        assert cvc not in safe_args["code"]
+        assert safe_args["code"].count("[REDACTED]") == 2
+        preview = build_tool_preview("browser_exec", args, max_len=0)
+        assert preview is not None
+        assert pan not in preview and cvc not in preview
 
-
-
-
-
+    def test_short_numeric_redaction_does_not_corrupt_refs_or_timeout_text(self):
+        response = {
+            "typed": "123",
+            "error": "Failed to type into @e123: timeout 123ms, backend failed while typing 123",
+        }
+        safe = redact_browser_typed_text_for_display(response, "123")
+        assert safe["typed"] == "[REDACTED]"
+        assert "@e123" in safe["error"]
+        assert "timeout 123ms" in safe["error"]
+        assert "while typing [REDACTED]" in safe["error"]
 
 
 
