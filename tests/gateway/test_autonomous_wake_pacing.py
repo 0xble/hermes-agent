@@ -178,6 +178,31 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
 
 
 @pytest.mark.asyncio
+async def test_successive_automatic_continuations_obey_hard_gap_floor(hermes_home, monkeypatch):
+    """A new result must not turn the goal into a sub-minute automatic poller."""
+    runner, adapter, entry, src = _goal_runner()
+    clock = [30_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = goals.GoalManager(entry.session_id)
+    mgr.set("ship the release")
+    continuation = mgr.next_continuation_prompt()
+    progress = iter(["evidence-1", "evidence-2"])
+
+    with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)), \
+            patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", side_effect=lambda _e: next(progress)):
+        await _after_turn(runner, src, "please ship it", internal=False)
+        adapter._pending_messages.clear()
+
+        # The user turn admitted the first automatic continuation at t=30_000. A fresh-but-routine
+        # automatic result 20s later must be held for the remaining floor.
+        clock[0] += 20
+        await _after_turn(runner, src, continuation, internal=False)
+        assert _queued_continuations(adapter) == 0
+        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 880)
+
+
+@pytest.mark.asyncio
 async def test_idle_ticker_releases_ladder_hold_once_and_silently(hermes_home, monkeypatch):
     runner, adapter, entry, src = _goal_runner()
     clock = [20_000.0]

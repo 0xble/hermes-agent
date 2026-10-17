@@ -27,6 +27,14 @@ async def _control_event(runner, record):
 
 async def _post_turn_event(runner):
     # Exercise the actual judge/manager and shared constructor, not a hand-built event.
+    from hermes_cli.goals import GoalManager
+
+    manager = GoalManager(runner.target.session_id)
+    if manager.state is not None:
+        # This identity suite is not a pacing test; ensure a fresh synthetic goal turn is admitted
+        # even when the fixture session was reused after a prior continuation.
+        manager.state.last_automatic_continuation_at = 0.0
+        manager._save()
     runner._session_key_for_source = lambda source: runner.target.session_key
     runner._enqueue_fifo = lambda key, event, adapter: adapter._pending_messages.update({key: event})
     runner._goal_max_turns_from_config = lambda: 50
@@ -846,6 +854,9 @@ async def test_post_turn_judges_the_terminal_queued_turn_not_the_chain_head(stat
     runner._final_text_for_post_turn_hooks = lambda result, event=None: "progress on the new objective"
     runner._post_turn_loop_completion = AsyncMock()
     before = load_goal("target").turns_used
+    manager = GoalManager("target")
+    manager.state.last_automatic_continuation_at = 0.0
+    manager._save()
     with patch("hermes_cli.goals.judge_goal",
                return_value=("continue", "work remains", False, None, False)) as judged, \
             patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
