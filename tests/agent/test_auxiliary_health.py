@@ -278,6 +278,31 @@ def test_expired_route_keeps_health_after_probe_claim_until_successful_clear(sta
     assert health.claim_probe(identity, ttl=30) is False
 
 
+def test_probe_owner_clears_after_outliving_its_claim(state_path, monkeypatch):
+    identity = _identity()
+    now = [100.0]
+    monkeypatch.setattr(health.time, "time", lambda: now[0])
+    health.mark_unhealthy(identity, ttl=0, reason="rate limit")
+    assert health.claim_probe(identity, ttl=30) is True
+
+    now[0] = 400.0
+
+    assert health.clear_health_after_probe(identity) is True
+    assert health.claim_probe(identity) is None
+
+
+def test_default_probe_claim_outlasts_a_slow_auxiliary_call(state_path, monkeypatch):
+    identity = _identity()
+    now = [100.0]
+    monkeypatch.setattr(health.time, "time", lambda: now[0])
+    health.mark_unhealthy(identity, ttl=0, reason="rate limit")
+    assert health.claim_probe(identity) is True
+
+    now[0] = 100.0 + 180.0
+
+    assert health.claim_probe(identity) is False
+
+
 def test_failed_state_write_preserves_previous_health_record(state_path, monkeypatch):
     identity = _identity()
     health.mark_unhealthy(identity, ttl=30, reason="payment error")

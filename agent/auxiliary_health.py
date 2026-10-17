@@ -95,17 +95,24 @@ def _unhealthy_cache_key(
 
 
 def _custom_health_base_url(provider: str, explicit_base_url: Optional[str] = None) -> str:
-    """Return the concrete custom endpoint used to scope health and failed-route checks."""
+    """Return the concrete custom endpoint used to scope health and failed-route checks.
+
+    Only custom routes are endpoint-scoped. Known providers stay provider-wide so the
+    discovery, api-key and fallback walks, which check without a URL, see the same record
+    that a failure on the concrete client URL wrote.
+    """
     explicit = str(explicit_base_url or "").strip()
     from agent.auxiliary_client import _normalize_chain_label
     label = _normalize_chain_label(provider)
-    if explicit:
-        return explicit
     if label == "local/custom":
+        if explicit:
+            return explicit
         with contextlib.suppress(Exception):
             from agent.auxiliary_client import _current_custom_base_url
             return str(_current_custom_base_url() or "").strip()
         return ""
+    if label.startswith("custom:") and explicit:
+        return explicit
     with contextlib.suppress(ImportError):
         from hermes_cli.runtime_provider import _get_named_custom_provider, _resolves_to_custom
         if _resolves_to_custom(label):
@@ -288,7 +295,12 @@ def mark_unhealthy(
     return AuxiliaryHealthRecord(expiry, lane, reason, epoch)
 
 
-def claim_probe(identity: AuxiliaryRouteIdentity, *, ttl: float = 30.0) -> Optional[bool]:
+# Long enough to cover the compression timeout floor, so one slow probe is not joined by a
+# second concurrent probe before it can report.
+_PROBE_CLAIM_SECONDS = 300.0
+
+
+def claim_probe(identity: AuxiliaryRouteIdentity, *, ttl: float = _PROBE_CLAIM_SECONDS) -> Optional[bool]:
     """Claim the sole recovery probe for an expired, recently-held route.
 
     Returns None when no route record exists, True for the caller that owns the probe,
@@ -335,7 +347,11 @@ def claim_notice(identity: AuxiliaryRouteIdentity, epoch: int) -> bool:
 
 
 def clear_health_after_probe(identity: AuxiliaryRouteIdentity) -> bool:
-    """Clear only an expired record whose recovery probe is still owned by this route."""
+    """Clear an expired record only for the caller that owns its recovery probe.
+
+    Ownership, not the claim window, decides: a probe that outlives its claim still clears
+    on success unless another caller has since claimed or the route was marked again.
+    """
     now = time.time()
     with _locked_state() as (path, state):
         _prune(state, now)
@@ -345,12 +361,6 @@ def clear_health_after_probe(identity: AuxiliaryRouteIdentity) -> bool:
             return False
         expiry = _raw_expiry(record.get("expires_at"), now)
         if expiry is None or expiry > now:
-            return False
-        try:
-            probe_until = float(record.get("probe_until", 0.0))
-        except (TypeError, ValueError):
-            return False
-        if probe_until <= now:
             return False
         if record.get("probe_owner") != _probe_owner():
             return False
