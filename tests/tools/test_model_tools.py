@@ -540,23 +540,20 @@ class TestBrowserRetrievalHints:
         # value-specific boundaries, but must not turn secret entry itself into a blanket ban.
         from model_tools import _apply_dynamic_schemas
         from tools.browser_tool import BROWSER_TOOL_SCHEMAS
-        from tools.browser_use_cli import BROWSER_EXEC_SCHEMA
         from tools.browser_vault_tool import BROWSER_VAULT_SCHEMA
 
         browser_type = next(s for s in BROWSER_TOOL_SCHEMAS if s["name"] == "browser_type")
         defs = [
             {"type": "function", "function": browser_type},
-            {"type": "function", "function": BROWSER_EXEC_SCHEMA},
             {"type": "function", "function": BROWSER_VAULT_SCHEMA},
         ]
         rendered = {
             d["function"]["name"]: d["function"]["description"]
             for d in _apply_dynamic_schemas(defs)
         }
-        for name in ("browser_type", "browser_exec"):
-            assert "fetched from an authorized source" in rendered[name]
-            assert "may be typed" in rendered[name]
-            assert "Never type a password, card number, CVC or code" not in rendered[name]
+        assert "fetched from an authorized source" in rendered["browser_type"]
+        assert "may be typed" in rendered["browser_type"]
+        assert "Never type a password, card number, CVC or code" not in rendered["browser_type"]
         assert "mailbox, or phone" in rendered["browser_vault"]
         assert "Never type, ask for or repeat a password" not in rendered["browser_vault"]
         assert "card numbers and CVCs" in rendered["browser_vault"]
