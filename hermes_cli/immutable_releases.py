@@ -404,6 +404,14 @@ def _smoke_imports() -> None:
             if enabled and (manifest.name in enabled or manifest.key in enabled):
                 raise RuntimeError(f"enabled plugin {manifest.name}: {gate.error}")
             continue
+        # Portable Agent Plugins and language packs are manifest-only: the real
+        # loader validates/registers them without importing a directory module.
+        # Keep this probe on that same path so a missing __init__.py is not a
+        # false candidate failure.
+        if manifest.portable or manager._is_manifest_only_language_pack(manifest):
+            if gate.action in {"load", "load_now"}:
+                manager._load_plugin(manifest)
+            continue
         if gate.action not in {"load", "load_now"}:
             continue
         if manifest.source == "entrypoint":
