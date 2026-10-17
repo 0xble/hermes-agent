@@ -1362,6 +1362,36 @@ class TurnRunner:
         agent.request_overrides = overrides
         agent._gateway_turn_request_overrides = turn_overrides
 
+    def _apply_attended_before_api_call(self, agent, next_kwargs):
+        """Re-resolve the main gateway route immediately before each provider call.
+
+        This is safe because it uses the same in-place ``switch_model`` path as fallback activation;
+        no API request is active yet and the request's model field is rewritten before middleware.
+        """
+        runner = self._runner
+        ctx = self._ctx
+        if getattr(agent, "is_subagent", False) or getattr(agent, "_is_auxiliary", False):
+            return next_kwargs
+        try:
+            model, runtime = runner._resolve_session_agent_runtime(
+                source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+            )
+            if model and model != getattr(agent, "model", ""):
+                from agent.agent_runtime_helpers import switch_model
+                switch_model(
+                    agent, model, runtime.get("provider", agent.provider), runtime.get("api_key", ""),
+                    runtime.get("base_url", ""), runtime.get("api_mode", ""),
+                    runtime.get("capabilities"),
+                )
+                effort = runtime.get("reasoning_effort") or getattr(agent, "reasoning_config", None)
+                agent._emit_diagnostic_status(f"↻ {model} · {effort.get('effort', effort) if isinstance(effort, dict) else effort}")
+                next_api_kwargs = dict(next_kwargs)
+                next_api_kwargs["model"] = agent.model
+                return next_api_kwargs
+        except Exception:
+            logger.debug("attended model refresh before API call failed", exc_info=True)
+        return next_kwargs
+
     def _wire_turn_agent_callbacks(self, agent, turn_route, reasoning_config,
                                    stream_delta_cb, interim_assistant_cb, want_interim_messages):
         """Per-message state (callbacks, reasoning, voice route) — never baked into the cached agent."""
@@ -1397,6 +1427,7 @@ class TurnRunner:
         set_gateway_fast_expiry_state(agent, expiry_at, runner._service_tier)
         agent._pre_fallback_reasoning_override = None  # a live pick supersedes a set-aside one
         self._merge_turn_request_overrides(agent, turn_route)
+        agent._gateway_before_api_call = lambda next_kwargs: self._apply_attended_before_api_call(agent, next_kwargs)
         # Must-deliver notes for THIS turn ride the current user message (api_content sidecar), never
         # the system prompt. Assigned unconditionally so a reused agent never replays a stale note.
         agent._gateway_turn_context_notes = "\n\n".join(runner._consume_pending_turn_sidecar_notes(ctx.session_key))
@@ -2077,6 +2108,12 @@ class TurnRunner:
         if pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
+        state = runner._session_state(ctx.session_key) if ctx.session_key else None
+        attended_notice = getattr(getattr(state, "conversation", None), "pending_attended_notice", None)
+        if attended_notice:
+            agent._emit_diagnostic_status(attended_notice)
+            if state is not None:
+                state.conversation.pending_attended_notice = None
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)

@@ -41,6 +41,7 @@ from gateway.session import (
     build_session_context,
 )
 from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
+from gateway.attended_model import is_active, parse_attended_config, resolve_attended_model
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
@@ -168,12 +169,94 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         self._pre_agent_fallback_notice = None
         if skey:
             self._rehydrate_session_model_override(skey)
+            self._expire_attended_temporary_picks(skey, user_config)
         override, last_model, _ = self._snapshot_session_runtime_state(skey)
+        attended_route = self._attended_route_for_session(
+            source=source, session_key=skey, user_config=user_config, override=override,
+            last_model=last_model,
+        )
         resolved = self._load_session_agent_runtime(
             source=source, skey=skey, user_config=user_config, config=getattr(self, "config", None),
-            override=override, last_model=last_model,
+            override=override, last_model=last_model, attended_route=attended_route,
         )
         return self._commit_session_agent_runtime(skey, resolved)
+
+    def _attended_route_for_session(self, *, source, session_key, user_config, override, last_model):
+        """Build the detached attended route and stage its one-line notice on the session."""
+        if not session_key:
+            return None
+        from gateway.run import _get_channel_override, _resolve_gateway_model
+        cfg = parse_attended_config(user_config or {})
+        if not cfg.enabled:
+            return None
+        state = self._session_state(session_key)
+        conversation = state.conversation
+        stamp = conversation.last_user_activity_at
+        if stamp is None:
+            with suppress(Exception):
+                stamp = self.session_store.get_last_user_activity_at(session_key)
+            if stamp is not None and hasattr(stamp, "timestamp"):
+                stamp = stamp.timestamp()
+            conversation.last_user_activity_at = stamp
+        channel_model = ""
+        if source is not None:
+            with suppress(Exception):
+                ch = _get_channel_override(
+                    user_config or {}, source.platform, str(source.chat_id) if source.chat_id else "",
+                    thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
+                    parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
+                )
+                channel_model = getattr(ch, "model", "") or ""
+        decision = resolve_attended_model(
+            {
+                "model_override": (override or {}).get("model") if override else None,
+                "default_model": _resolve_gateway_model(user_config),
+                "default_provider": (user_config or {}).get("model", {}).get("provider", "")
+                if isinstance((user_config or {}).get("model"), dict) else "",
+                "channel_model": channel_model,
+                "last_user_activity_at": stamp,
+                "default_reasoning": "",
+            },
+            time.time(), user_config or {},
+        )
+        if decision.reason != "attended":
+            return None
+        route = {
+            "active": True,
+            "model": cfg.model,
+            "provider": cfg.provider,
+            "reasoning_effort": cfg.reasoning_effort,
+        }
+        target_model = cfg.model or decision.model
+        if not last_model or last_model != target_model:
+            effort = cfg.reasoning_effort or "medium"
+            conversation.pending_attended_notice = f"↻ {target_model} · {effort}"
+        return route
+
+    def _expire_attended_temporary_picks(self, session_key: str, user_config: Optional[dict]) -> None:
+        """Clear only plain picks after an idle window; --session remains pinned."""
+        cfg = parse_attended_config(user_config or {})
+        if not cfg.enabled:
+            return
+        state = self._session_state(session_key)
+        conversation = state.conversation
+        stamp = conversation.last_user_activity_at
+        if stamp is None:
+            with suppress(Exception):
+                stamp = self.session_store.get_last_user_activity_at(session_key)
+            if stamp is not None and hasattr(stamp, "timestamp"):
+                stamp = stamp.timestamp()
+            conversation.last_user_activity_at = stamp
+        if is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
+            return
+        if conversation.model_override is not None and conversation.model_override_scope == "temporary":
+            conversation.model_override = None
+            self._session_model_overrides.pop(session_key, None)
+            with suppress(Exception):
+                self.session_store.set_model_override(session_key, None)
+            self._evict_cached_agent(session_key)
+        if conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary":
+            self._set_session_reasoning_override(session_key, None)
 
     def _snapshot_session_runtime_state(self, skey):
         override = self._session_model_override(skey) if skey else None
@@ -195,7 +278,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         return model, runtime
 
     @staticmethod
-    def _load_session_agent_runtime(*, source, skey, user_config, config, override, last_model):
+    def _load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route=None):
         """Resolve a detached snapshot off-loop; all runner-state commits belong to the caller."""
         from gateway.run import (
             _credential_pool_for_provider, _get_channel_override, _resolve_gateway_model,
@@ -272,6 +355,24 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     if ch_runtime_model and not ch.model:
                         model = ch_runtime_model
 
+        if attended_route and attended_route.get("active"):
+            attended_model = attended_route.get("model") or model
+            attended_provider = attended_route.get("provider") or ""
+            if attended_provider:
+                try:
+                    runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                        attended_provider, target_model=attended_model or None,
+                    )
+                    provider_model = runtime_kwargs.pop("model", None)
+                    if provider_model and not attended_route.get("model"):
+                        attended_model = provider_model
+                    model = attended_model
+                except Exception as exc:
+                    logger.warning("Attended route %s unavailable: %s", attended_provider, exc)
+                    notice = f"⚠️ Attended model unavailable; staying on {model}."
+            else:
+                model = attended_model
+
         if override and skey:
             model, runtime_kwargs = GatewayAgentCacheMixin._apply_model_override(override, model, runtime_kwargs)
 
@@ -315,9 +416,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     self._commit_session_model_override(skey, hydrated, epoch)
         while True:
             override, last_model, epoch = self._snapshot_session_runtime_state(skey)
+            attended_route = self._attended_route_for_session(
+                source=source, session_key=skey, user_config=user_config, override=override,
+                last_model=last_model,
+            )
             resolved = await asyncio.to_thread(
                 self._load_session_agent_runtime, source=source, skey=skey, user_config=user_config,
                 config=getattr(self, "config", None), override=override, last_model=last_model,
+                attended_route=attended_route,
             )
             # Credential resolution can also yield to /model or a boundary. Retry
             # against live memory, not disk, so a pending durable clear cannot revive it.

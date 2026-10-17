@@ -35,6 +35,7 @@ from gateway.run_inbound_unauthorized import (
     UnauthorizedOwnerNotifier, pairing_code_reply, pairing_profile_arg, pairing_rate_limited_reply,
     unauthorized_owner_hint,
 )
+from gateway.attended_model import is_genuine_user_message
 from gateway.session import (
     SessionSource, build_session_context, is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
@@ -1608,6 +1609,20 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
             return event, source, is_internal
 
+    async def _mark_attended_user_activity(self, event, source, session_key: str) -> None:
+        """Persist genuine Brian activity; relays, edits, wakeups, and internal notices are inert."""
+        if not is_genuine_user_message(event) or not session_key:
+            return
+        try:
+            entry = await self.async_session_store.get_or_create_session(source, touch_activity=False)
+            await self.async_session_store.mark_user_activity(entry.session_key)
+            stamp = time.time()
+            self._session_state(session_key).conversation.last_user_activity_at = stamp
+            if entry.session_key != session_key:
+                self._session_state(entry.session_key).conversation.last_user_activity_at = stamp
+        except Exception:
+            logger.debug("attended-model activity stamp failed", exc_info=True)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         from gateway.outbox import scoped_turn_entry, restore_turn, store_for
         token = scoped_turn_entry()
@@ -1645,6 +1660,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         alias_text = self._quick_command_alias_text(event)
         if alias_text is not None:
             event.text = alias_text
+        await self._mark_attended_user_activity(event, source, self._session_key_for_source(source))
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)

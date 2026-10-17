@@ -85,6 +85,14 @@ def perform_api_call(
 
     _use_streaming = _should_stream(agent)
 
+    before_api_call = getattr(agent, "_gateway_before_api_call", None)
+    if callable(before_api_call):
+        try:
+            api_kwargs = before_api_call(api_kwargs) or api_kwargs
+            _original_api_kwargs = dict(api_kwargs)
+        except Exception:
+            logger.debug("pre-API attended model refresh failed", exc_info=True)
+
     def _perform_api_call(next_api_kwargs):
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(

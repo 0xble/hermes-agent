@@ -146,6 +146,12 @@ class GatewayAgentCacheMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.model_override if state else None
 
+    def _session_model_override_scope(self, session_key: str) -> str:
+        state = self._peek_session_state(session_key)
+        if state:
+            return getattr(state.conversation, "model_override_scope", "session")
+        return "session"
+
     def _session_model_override_epoch(self, session_key: str) -> int:
         return self._session_state(session_key).persistent.model_override_epoch
 
@@ -159,15 +165,26 @@ class GatewayAgentCacheMixin:
             locks = self._session_model_override_locks = {}
         return locks.setdefault(session_key, asyncio.Lock())
 
-    async def _persist_session_model_override(self, session_key: str, override: Optional[dict]) -> None:
+    async def _persist_session_model_override(
+        self, session_key: str, override: Optional[dict], *, scope: Optional[str] = None,
+    ) -> None:
         async with self._session_model_override_lock(session_key):
-            await self._persist_session_model_override_locked(session_key, override)
+            await self._persist_session_model_override_locked(session_key, override, scope=scope)
 
-    async def _persist_session_model_override_locked(self, session_key: str, override: Optional[dict]) -> None:
+    async def _persist_session_model_override_locked(
+        self, session_key: str, override: Optional[dict], *, scope: Optional[str] = None,
+    ) -> None:
         """Caller holds the route lock; publish memory only after successful persistence."""
         self._bump_session_model_override_epoch(session_key)
         epoch = self._session_model_override_epoch(session_key)
-        write = asyncio.create_task(self.async_session_store.set_model_override(session_key, override))
+        resolved_scope = scope or self._session_model_override_scope(session_key)
+        if override is not None and resolved_scope != "session":
+            write = asyncio.create_task(
+                self.async_session_store.set_model_override(session_key, override, scope=resolved_scope)
+            )
+        else:
+            # Keep the historical call shape for existing callers/tests and for old SessionStore adapters.
+            write = asyncio.create_task(self.async_session_store.set_model_override(session_key, override))
         cancelled = None
         try:
             while not write.done():
@@ -183,8 +200,10 @@ class GatewayAgentCacheMixin:
                     and self._session_model_override_epoch(session_key) == epoch):
                 if override is None:
                     self._session_model_overrides.pop(session_key, None)
+                    self._session_state(session_key).conversation.model_override_scope = "session"
                 else:
                     self._session_model_overrides[session_key] = dict(override)
+                    self._session_state(session_key).conversation.model_override_scope = resolved_scope
             self._bump_session_model_override_epoch(session_key)
         if cancelled is not None:
             raise cancelled
@@ -195,6 +214,10 @@ class GatewayAgentCacheMixin:
                 or self._session_model_override(session_key) is not None):
             return
         self._session_model_overrides[session_key] = override
+        self._session_state(session_key).conversation.model_override_scope = (
+            getattr(self.session_store, "get_model_override_scope", lambda _key: "session")(session_key)
+            if getattr(self, "session_store", None) is not None else "session"
+        )
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), override.get("provider") or "",
