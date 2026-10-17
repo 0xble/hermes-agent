@@ -12,7 +12,9 @@ import json
 import logging
 import math
 import os
+import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -64,6 +66,12 @@ _STATE_NAME = "auxiliary_route_health.json"
 _LOCK_NAME = ".auxiliary_route_health.lock"
 _MAX_RECORD_SECONDS = 31 * 86_400
 _STALE_GRACE_SECONDS = 600.0
+_PROBE_NONCE = uuid.uuid4().hex
+
+
+def _probe_owner() -> str:
+    """Return a process/thread-specific owner token for recovery probes."""
+    return f"{os.getpid()}:{threading.get_ident()}:{_PROBE_NONCE}"
 
 
 def _state_path() -> Path:
@@ -91,13 +99,13 @@ def _custom_health_base_url(provider: str, explicit_base_url: Optional[str] = No
     explicit = str(explicit_base_url or "").strip()
     from agent.auxiliary_client import _normalize_chain_label
     label = _normalize_chain_label(provider)
+    if explicit:
+        return explicit
     if label == "local/custom":
         with contextlib.suppress(Exception):
             from agent.auxiliary_client import _current_custom_base_url
-            return explicit or str(_current_custom_base_url() or "").strip()
-        return explicit
-    if label.startswith("custom:") and explicit:
-        return explicit
+            return str(_current_custom_base_url() or "").strip()
+        return ""
     with contextlib.suppress(ImportError):
         from hermes_cli.runtime_provider import _get_named_custom_provider, _resolves_to_custom
         if _resolves_to_custom(label):
@@ -305,6 +313,7 @@ def claim_probe(identity: AuxiliaryRouteIdentity, *, ttl: float = 30.0) -> Optio
         if probe_until > now:
             return False
         record["probe_until"] = now + max(0.1, float(ttl))
+        record["probe_owner"] = _probe_owner()
         state["routes"][raw_key] = record
         _write_state(path, state)
         return True
@@ -342,6 +351,8 @@ def clear_health_after_probe(identity: AuxiliaryRouteIdentity) -> bool:
         except (TypeError, ValueError):
             return False
         if probe_until <= now:
+            return False
+        if record.get("probe_owner") != _probe_owner():
             return False
         del state["routes"][raw_key]
         _write_state(path, state)

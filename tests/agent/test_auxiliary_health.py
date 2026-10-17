@@ -215,3 +215,93 @@ def test_auxiliary_health_does_not_touch_main_primary_cooldown(state_path, tmp_p
     assert primary.read_cooldown(route) is not None
     assert not state_path.exists()
 
+
+def _claim_probe_in_child(state_path_text: str, result_path_text: str) -> None:
+    from agent import auxiliary_health as child_health
+
+    path = Path(state_path_text)
+    child_health._state_path = lambda: path
+    child_health._lock_path = lambda: path.with_name(".auxiliary_route_health.lock")
+    result = child_health.claim_probe(_identity(), ttl=30)
+    Path(result_path_text).write_text("true" if result is True else "false", encoding="utf-8")
+
+
+def test_probe_claim_is_deduplicated_across_processes(state_path, tmp_path):
+    identity = _identity()
+    health.mark_unhealthy(identity, ttl=0, reason="rate limit")
+    ctx = multiprocessing.get_context("spawn")
+    paths = [tmp_path / f"probe-{index}.txt" for index in range(4)]
+    processes = [
+        ctx.Process(target=_claim_probe_in_child, args=(str(state_path), str(path)))
+        for path in paths
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(10)
+        assert process.exitcode == 0
+    assert sum(path.read_text(encoding="utf-8") == "true" for path in paths) == 1
+
+
+def _clear_probe_in_child(state_path_text: str, result_path_text: str) -> None:
+    from agent import auxiliary_health as child_health
+
+    path = Path(state_path_text)
+    child_health._state_path = lambda: path
+    child_health._lock_path = lambda: path.with_name(".auxiliary_route_health.lock")
+    result = child_health.clear_health_after_probe(_identity())
+    Path(result_path_text).write_text("true" if result else "false", encoding="utf-8")
+
+
+def test_non_owner_cannot_clear_an_active_probe(state_path, tmp_path):
+    identity = _identity()
+    health.mark_unhealthy(identity, ttl=0, reason="rate limit")
+    assert health.claim_probe(identity, ttl=30) is True
+
+    result_path = tmp_path / "clear-probe.txt"
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(target=_clear_probe_in_child, args=(str(state_path), str(result_path)))
+    process.start()
+    process.join(10)
+    assert process.exitcode == 0
+    assert result_path.read_text(encoding="utf-8") == "false"
+
+    assert health.clear_health_after_probe(identity) is True
+
+
+def test_expired_route_keeps_health_after_probe_claim_until_successful_clear(state_path):
+    identity = _identity()
+    health.mark_unhealthy(identity, ttl=0, reason="rate limit")
+
+    assert health.claim_probe(identity, ttl=30) is True
+    assert health.read_health(identity) is None
+    assert health.claim_probe(identity, ttl=30) is False
+
+
+def test_failed_state_write_preserves_previous_health_record(state_path, monkeypatch):
+    identity = _identity()
+    health.mark_unhealthy(identity, ttl=30, reason="payment error")
+    before = state_path.read_text(encoding="utf-8")
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(health, "atomic_write_text", fail_write)
+
+    with pytest.raises(OSError, match="disk full"):
+        health.mark_unhealthy(identity, ttl=30, reason="rate limit")
+
+    assert state_path.read_text(encoding="utf-8") == before
+    assert health.read_health(identity).lane is health.AuxiliaryHealthLane.QUOTA
+
+
+def test_auxiliary_health_store_is_independent_of_compression_state(state_path):
+    compression_path = state_path.with_name("compression_failure_state.json")
+    compression_path.parent.mkdir(parents=True, exist_ok=True)
+    compression_path.write_text('{"cooldown_until": 123}', encoding="utf-8")
+
+    health.mark_unhealthy(_identity(), ttl=30, reason="payment error")
+    health.reset_health_state()
+
+    assert compression_path.read_text(encoding="utf-8") == '{"cooldown_until": 123}'
+    assert not state_path.exists()
+

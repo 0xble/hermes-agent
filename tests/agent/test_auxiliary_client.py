@@ -9,6 +9,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
+import agent.auxiliary_client as aux
 from agent.auxiliary_client import (
     _NOUS_MODEL,
     CodexAuxiliaryClient,
@@ -86,6 +87,39 @@ def _clean_env(monkeypatch):
     yield
     _aux_mod._aux_unhealthy_until.clear()
     _aux_mod._aux_unhealthy_logged_at.clear()
+
+
+def test_mark_provider_unhealthy_does_not_poison_cache_when_persist_fails(monkeypatch):
+    key = aux._unhealthy_cache_key("openrouter", "https://example.test/v1")
+    aux._aux_unhealthy_until[key] = 123.0
+    aux._aux_unhealthy_reason[key] = "existing"
+    monkeypatch.setattr(
+        aux,
+        "_mark_auxiliary_health",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    aux._mark_provider_unhealthy(
+        "openrouter", base_url="https://example.test/v1", reason="payment error",
+    )
+
+    assert aux._aux_unhealthy_until[key] == 123.0
+    assert aux._aux_unhealthy_reason[key] == "existing"
+
+
+def test_log_skip_unhealthy_deduplicates_same_epoch_and_reopens_on_new_lane(caplog):
+    aux._mark_provider_unhealthy("openrouter", reason="payment error")
+    with caplog.at_level(logging.INFO):
+        aux._log_skip_unhealthy("openrouter")
+        aux._aux_unhealthy_logged_at.clear()
+        aux._mark_provider_unhealthy("openrouter", reason="payment error")
+        aux._log_skip_unhealthy("openrouter")
+        aux._aux_unhealthy_logged_at.clear()
+        aux._mark_provider_unhealthy("openrouter", reason="rate limit")
+        aux._log_skip_unhealthy("openrouter")
+
+    messages = [record.getMessage() for record in caplog.records if "skipping openrouter" in record.getMessage()]
+    assert len(messages) == 2
 
 
 class TestResolveTaskProviderModel:
@@ -4633,7 +4667,7 @@ class TestAuxUnhealthyCache:
                 messages=[{"role": "user", "content": "hi"}],
             )
             # After the 402, OpenRouter is in the unhealthy cache.
-            assert _is_provider_unhealthy("openrouter") is True
+            assert _is_provider_unhealthy("openrouter", primary_client.base_url) is True
 
     def test_custom_billing_failure_keeps_distinct_endpoint_eligible(self):
         """A hosted custom endpoint's billing state must not quarantine a local custom endpoint."""

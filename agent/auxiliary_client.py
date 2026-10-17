@@ -3192,17 +3192,22 @@ def _mark_provider_unhealthy(
         return
     key = _unhealthy_cache_key(label, base_url)
     ttl = _AUX_UNHEALTHY_TTL_SECONDS if ttl is None else ttl
-    expires_at = time.time() + ttl
-    _aux_unhealthy_until[key] = expires_at
-    _aux_unhealthy_reason[key] = reason
-    _mark_auxiliary_health(
-        _auxiliary_route_identity(label, base_url), ttl=ttl, reason=reason,
-    )
+    try:
+        record = _mark_auxiliary_health(
+            _auxiliary_route_identity(label, base_url), ttl=ttl, reason=reason,
+        )
+    except OSError as exc:
+        logger.warning("Auxiliary: could not persist unhealthy state for %s: %s", label, exc)
+        return
+    if record is None:
+        return
+    _aux_unhealthy_until[key] = record.expires_at
+    _aux_unhealthy_reason[key] = record.reason
     logger.log(
         level,
         "Auxiliary: marking %s unhealthy for %ds (%s). "
         "Subsequent auxiliary calls will skip it until %s.",
-        label, int(ttl), reason, time.strftime("%H:%M:%S", time.localtime(expires_at)),
+        label, int(ttl), reason, time.strftime("%H:%M:%S", time.localtime(record.expires_at)),
     )
 
 
