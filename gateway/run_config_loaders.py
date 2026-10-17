@@ -220,25 +220,6 @@ class GatewayConfigLoadersMixin:
                 logger.debug("attended reasoning resolution failed", exc_info=True)
         return baseline
 
-    def _attended_reasoning_config(self, session_key: Optional[str]) -> Optional[dict]:
-        """Compatibility wrapper around the single attended route resolver."""
-        if not session_key:
-            return None
-        try:
-            from gateway.run import _load_gateway_config
-            resolver = getattr(self, "_attended_resolution_for_session", None)
-            decision = resolver(
-                source=None, session_key=session_key, user_config=_load_gateway_config(),
-                override=self._session_model_override(session_key),
-            ) if callable(resolver) else None
-            if decision is None or decision.reason != "attended" or not decision.reasoning_effort:
-                return None
-            from hermes_constants import parse_reasoning_effort
-            return parse_reasoning_effort(decision.reasoning_effort)
-        except Exception:
-            logger.debug("attended reasoning compatibility resolution failed", exc_info=True)
-            return None
-
     def _session_reasoning_override(self, session_key: Optional[str]) -> dict | None:
         """The session's explicit ``/reasoning`` pick, or ``None`` when it runs on config."""
         if not session_key:

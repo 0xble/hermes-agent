@@ -1284,13 +1284,16 @@ class SessionStore(
         """Persist the last genuine user message without treating relays/wakeups as activity."""
         stamp = when or _now()
 
-        def _apply(entry: SessionEntry) -> bool:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
             changed = entry.last_user_activity_at != stamp
             entry.last_user_activity_at = stamp
             entry.updated_at = stamp
+            if changed:
+                self._save_entry(session_key, entry_data=entry.to_dict(), lock_held=True)
             return changed
-
-        return self._update_entry(session_key, _apply)
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""

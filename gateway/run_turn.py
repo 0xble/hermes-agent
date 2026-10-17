@@ -59,6 +59,7 @@ logger = logging.getLogger("gateway.run")
 
 _tool_call_logger_lock = threading.Lock()
 _NO_ATTENDED_ACTIVITY_STAMP = object()
+_attended_notice_lock = threading.RLock()
 
 
 def _tool_call_logger() -> logging.Logger:
@@ -196,9 +197,63 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             return stamp
         return None
 
+    def _load_attended_resolution_snapshot(
+        self, session_key: str, model: str, attended_model: str, user_config: Optional[dict] = None,
+    ) -> dict:
+        """Read durable attended state and config-derived reasoning off the gateway loop."""
+        if user_config is not None:
+            with suppress(Exception):
+                from gateway.run import _resolve_gateway_model
+                model = model or _resolve_gateway_model(user_config)
+        stamp = self._load_attended_activity_stamp(session_key)
+        reasoning_override = None
+        reasoning_scope = "session"
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            with suppress(Exception):
+                from gateway.session import sanitize_reasoning_override
+                reasoning_override = sanitize_reasoning_override(store.get_reasoning_override(session_key))
+                reasoning_scope = store.get_reasoning_override_scope(session_key)
+        default_reasoning = {}
+        attended_reasoning = {}
+        with suppress(Exception):
+            default_reasoning = self._load_reasoning_config(model) or {}
+        if attended_model:
+            with suppress(Exception):
+                attended_reasoning = self._load_reasoning_config(attended_model) or {}
+        return {
+            "activity_stamp": stamp,
+            "reasoning_override": reasoning_override,
+            "reasoning_scope": reasoning_scope,
+            "default_reasoning": default_reasoning,
+            "attended_reasoning": attended_reasoning,
+        }
+
+    def _handoff_attended_state(self, session_key: Optional[str], *, conversation=None, runner=None) -> None:
+        """Publish worker-thread attended bookkeeping on the owning gateway loop."""
+        def apply() -> None:
+            if session_key and conversation:
+                state = self._session_state(session_key)
+                for name, value in conversation.items():
+                    setattr(state.conversation, name, value)
+            if runner:
+                for name, value in runner.items():
+                    setattr(self, name, value)
+
+        loop = getattr(self, "_gateway_loop", None)
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if loop is not None and loop.is_running() and current is not loop:
+            loop.call_soon_threadsafe(apply)
+        else:
+            apply()
+
     def _attended_resolution_for_session(
         self, *, source, session_key, user_config=None, override=None,
-        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP,
+        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
+        reasoning_scope=None, default_reasoning=None, attended_reasoning=None,
     ):
         """Return the one authoritative desired route decision for a gateway session."""
         if not session_key:
@@ -215,7 +270,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 stamp = activity_stamp
             else:
                 stamp = self._load_attended_activity_stamp(session_key)
-            conversation.last_user_activity_at = stamp
+            self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
         channel_model = ""
         channel_provider = ""
         if source is not None:
@@ -231,21 +286,29 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         model_value = (override or {}).get("model") if override else None
         model_provider = (override or {}).get("provider") if override else None
         loader = getattr(self, "_load_reasoning_config", lambda _model: {})
-        default_reasoning = ""
-        with suppress(Exception):
-            reasoning_model = str(model_value or default_model or "")
-            default_reasoning = (loader(reasoning_model) or {}).get("effort", "")
-        attended_reasoning = ""
-        with suppress(Exception):
-            if cfg.model:
-                attended_reasoning = (loader(cfg.model) or {}).get("effort", "")
+        if default_reasoning is None:
+            default_reasoning = {}
+            with suppress(Exception):
+                reasoning_model = str(model_value or default_model or "")
+                default_reasoning = loader(reasoning_model) or {}
+        if attended_reasoning is None:
+            attended_reasoning = {}
+            with suppress(Exception):
+                if cfg.model:
+                    attended_reasoning = loader(cfg.model) or {}
         model_scope = getattr(conversation, "model_override_scope", "session")
-        reasoning_scope = getattr(conversation, "reasoning_override_scope", "session")
-        reasoning_value = conversation.reasoning_override
-        if reasoning_value is None:
+        if reasoning_scope is None:
+            reasoning_scope = getattr(conversation, "reasoning_override_scope", "session")
+        if conversation.reasoning_override is not None:
+            reasoning_value = conversation.reasoning_override
+            reasoning_scope = getattr(conversation, "reasoning_override_scope", reasoning_scope)
+        elif reasoning_override is _NO_ATTENDED_ACTIVITY_STAMP:
+            reasoning_value = None
             with suppress(Exception):
                 reasoning_value = self._session_reasoning_override(session_key)
                 reasoning_scope = getattr(conversation, "reasoning_override_scope", reasoning_scope)
+        else:
+            reasoning_value = reasoning_override
         decision = resolve_attended_model(
             {
                 "model_override": model_value if model_scope not in ("session", "temporary", "once") else None,
@@ -259,26 +322,32 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 "channel_model": channel_model,
                 "channel_provider": channel_provider,
                 "last_user_activity_at": stamp,
-                "default_reasoning": default_reasoning,
-                "explicit_model_reasoning": default_reasoning,
-                "attended_reasoning": attended_reasoning,
+                "default_reasoning": (default_reasoning or {}).get("effort", ""),
+                "explicit_model_reasoning": (default_reasoning or {}).get("effort", ""),
+                "attended_reasoning": (attended_reasoning or {}).get("effort", ""),
                 "session_reasoning": reasoning_value if reasoning_scope == "session" else None,
                 "temporary_reasoning": reasoning_value if reasoning_scope == "temporary" else None,
             },
             time.time(), user_config or {},
         )
-        conversation.last_attended_decision = decision
-        self._last_attended_decision = decision  # legacy, read-only compatibility for older callers
+        self._handoff_attended_state(
+            session_key,
+            conversation={"last_attended_decision": decision},
+            runner={"_last_attended_decision": decision},
+        )
         return decision
 
     def _attended_route_for_session(
         self, *, source, session_key, user_config, override, last_model,
-        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP,
+        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
+        reasoning_scope=None, default_reasoning=None, attended_reasoning=None,
     ):
         """Build the detached attended route and stage its one-line notice on the session."""
         decision = self._attended_resolution_for_session(
             source=source, session_key=session_key, user_config=user_config, override=override,
-            activity_stamp=activity_stamp,
+            activity_stamp=activity_stamp, reasoning_override=reasoning_override,
+            reasoning_scope=reasoning_scope, default_reasoning=default_reasoning,
+            attended_reasoning=attended_reasoning,
         )
         if decision is None:
             return None
@@ -294,7 +363,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             "decision_key": decision.decision_key,
         }
         target_model = cfg.model or decision.model
-        session_last_model = conversation.last_resolved_model or ""
+        session_last_model = last_model or conversation.last_resolved_model or ""
         if not session_last_model or session_last_model != target_model:
             effort = decision.reasoning_effort
             if not effort:
@@ -302,7 +371,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     loader = getattr(self, "_load_reasoning_config")
                     effort = (loader(target_model) or {}).get("effort", "")
             effort = effort or "none"
-            conversation.pending_attended_notice = f"↻ {target_model} · {effort}"
+            self._handoff_attended_state(
+                session_key,
+                conversation={"pending_attended_notice": f"↻ {target_model} · {effort}"},
+            )
         return route
 
     def _expire_attended_temporary_picks(
@@ -345,7 +417,29 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             else:
                 logger.debug("Skipping synchronous attended expiry on the gateway loop")
         if conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary":
+            self._clear_attended_reasoning_override_threadsafe(session_key)
+
+    def _clear_attended_reasoning_override_threadsafe(self, session_key: str) -> None:
+        loop = getattr(self, "_gateway_loop", None)
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if loop is not None and loop.is_running() and current is not loop:
+            asyncio.run_coroutine_threadsafe(
+                self._clear_attended_reasoning_override_async(session_key), loop,
+            ).result()
+        else:
             self._set_session_reasoning_override(session_key, None)
+
+    async def _clear_attended_reasoning_override_async(self, session_key: str) -> None:
+        """Clear a temporary reasoning pick with loop-owned state and off-loop persistence."""
+        state = self._session_state(session_key)
+        state.conversation.reasoning_override = None
+        state.conversation.reasoning_override_scope = "session"
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            await asyncio.to_thread(store.set_reasoning_override, session_key, None)
 
     async def _expire_attended_temporary_picks_async(
         self, session_key: str, user_config: Optional[dict],
@@ -363,7 +457,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 stamp = await asyncio.to_thread(self._load_attended_activity_stamp, session_key)
             else:
                 stamp = activity_stamp
-            conversation.last_user_activity_at = stamp
+            self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
         if is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
             return
         if conversation.model_override is not None and conversation.model_override_scope == "temporary":
@@ -374,7 +468,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             else:
                 self._evict_cached_agent(session_key)
         if conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary":
-            await asyncio.to_thread(self._set_session_reasoning_override, session_key, None)
+            await self._clear_attended_reasoning_override_async(session_key)
 
     def _snapshot_session_runtime_state(self, skey):
         override = self._session_model_override(skey) if skey else None
@@ -391,20 +485,37 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         # consume the staged switch-in line so the one fallback notice is the only notice for this turn.
         self._pre_agent_fallback_notice = notice  # legacy, not read by turn execution
         if skey:
-            state = self._peek_session_state(skey)
-            if state is not None:
-                state.conversation.pre_agent_fallback_notice = notice
-                if notice:
-                    state.conversation.pending_attended_notice = None
+            fields = {"pre_agent_fallback_notice": notice}
+            if notice:
+                fields["pending_attended_notice"] = None
+            self._handoff_attended_state(skey, conversation=fields)
+            with _attended_notice_lock:
+                notices = getattr(self, "_pre_agent_fallback_notices", None)
+                if notices is None:
+                    notices = self._pre_agent_fallback_notices = {}
+                notices[skey] = notice
         if cache_model:
-            if skey:
-                self._session_state(skey).conversation.last_resolved_model = model
-            self._session_state("*").conversation.last_resolved_model = model
+            self._handoff_attended_state(
+                skey,
+                conversation={"last_resolved_model": model} if skey else None,
+                runner=None,
+            )
+            self._handoff_attended_state(
+                "*", conversation={"last_resolved_model": model},
+            )
         return model, runtime
 
     def _consume_pre_agent_fallback_notice(self, session_key: Optional[str]):
         """Consume the fallback notice for one session without crossing session boundaries."""
         if session_key:
+            with _attended_notice_lock:
+                notices = getattr(self, "_pre_agent_fallback_notices", None)
+                if notices is not None and session_key in notices:
+                    notice = notices.pop(session_key)
+                    state = self._peek_session_state(session_key)
+                    if state is not None:
+                        state.conversation.pre_agent_fallback_notice = None
+                    return notice
             state = self._peek_session_state(session_key)
             if state is not None:
                 notice = state.conversation.pre_agent_fallback_notice
@@ -546,6 +657,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         skey = self._resolve_session_key_or_none(source, session_key)
         self._pre_agent_fallback_notice = None
         activity_stamp = _NO_ATTENDED_ACTIVITY_STAMP
+        attended_snapshot = {}
         if skey:
             state = self._session_state(skey)
             attended_enabled = parse_attended_config(user_config or {}).enabled
@@ -557,18 +669,32 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     epoch = self._session_model_override_epoch(skey)
                     hydrated = await asyncio.to_thread(self._load_session_model_override, skey)
                     self._commit_session_model_override(skey, hydrated, epoch)
-            if attended_enabled and state.conversation.last_user_activity_at is None:
-                activity_stamp = await asyncio.to_thread(self._load_attended_activity_stamp, skey)
-                state.conversation.last_user_activity_at = activity_stamp
             if attended_enabled:
+                current_override = self._session_model_override(skey) or {}
+                attended_cfg = parse_attended_config(user_config or {})
+                attended_snapshot = await asyncio.to_thread(
+                    self._load_attended_resolution_snapshot,
+                    skey, str(current_override.get("model") or ""), attended_cfg.model, user_config,
+                )
+                activity_stamp = attended_snapshot.get("activity_stamp")
+                if state.conversation.last_user_activity_at is None:
+                    state.conversation.last_user_activity_at = activity_stamp
                 await self._expire_attended_temporary_picks_async(
                     skey, user_config, activity_stamp=activity_stamp,
                 )
+                if state.conversation.reasoning_override is None:
+                    attended_snapshot["reasoning_override"] = None
+                    attended_snapshot["reasoning_scope"] = "session"
         while True:
             override, last_model, epoch = self._snapshot_session_runtime_state(skey)
             attended_route = self._attended_route_for_session(
                 source=source, session_key=skey, user_config=user_config, override=override,
                 last_model=last_model, activity_stamp=activity_stamp,
+                reasoning_override=(attended_snapshot.get("reasoning_override", _NO_ATTENDED_ACTIVITY_STAMP)
+                                    if attended_snapshot else _NO_ATTENDED_ACTIVITY_STAMP),
+                reasoning_scope=attended_snapshot.get("reasoning_scope") if attended_snapshot else None,
+                default_reasoning=attended_snapshot.get("default_reasoning") if attended_snapshot else None,
+                attended_reasoning=attended_snapshot.get("attended_reasoning") if attended_snapshot else None,
             )
             resolved = await asyncio.to_thread(
                 self._load_session_agent_runtime, source=source, skey=skey, user_config=user_config,

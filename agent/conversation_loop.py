@@ -1528,7 +1528,6 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
 
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
-    route_checked = False
     while s.retry_count < s.max_retries:
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
@@ -1536,11 +1535,6 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
         if _ng.action == "break":
             return None
         try:
-            if not route_checked:
-                before_api_call = getattr(agent, "_gateway_before_api_call", None)
-                if callable(before_api_call):
-                    before_api_call(s)
-                route_checked = True
             _run_phase(build_api_request, agent, s)
             if _run_phase(perform_api_call, agent, s).action == "break":
                 return None
@@ -1690,6 +1684,9 @@ def _run_conversation_turn(
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
         _run_phase(prepare_iteration, agent, s)
+        before_api_call = getattr(agent, "_gateway_before_api_call", None)
+        if callable(before_api_call):
+            before_api_call(s)
         _run_phase(assemble_api_request, agent, s)
         _pg = _run_phase(run_preflight_gate, agent, s)
         if _pg.action == "return":

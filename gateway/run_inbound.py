@@ -1616,7 +1616,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         try:
             from gateway.run import _load_gateway_config
             from gateway.attended_model import parse_attended_config
-            if not parse_attended_config(_load_gateway_config()).enabled:
+            enabled = await asyncio.to_thread(
+                lambda: parse_attended_config(_load_gateway_config()).enabled,
+            )
+            if not enabled:
                 return False
             if not session_key:
                 session_key = self._session_key_for_source(source)
@@ -1670,9 +1673,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         alias_text = self._quick_command_alias_text(event)
         if alias_text is not None:
             event.text = alias_text
-        _attended_activity_marked = await self._mark_attended_user_activity(event, source)
-        if _attended_activity_marked:
-            setattr(event, "_attended_activity_marked", True)
+        _attended_activity_marked = False
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)
@@ -1692,6 +1693,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if _busy_result is not _NOT_HANDLED:
             return _busy_result
 
+        _attended_activity_marked = await self._mark_attended_user_activity(event, source, _quick_key)
+        if _attended_activity_marked:
+            setattr(event, "_attended_activity_marked", True)
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
             if not _attended_activity_marked:

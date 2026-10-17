@@ -208,16 +208,16 @@ class GatewayAgentCacheMixin:
         if cancelled is not None:
             raise cancelled
 
-    def _commit_session_model_override(self, session_key: str, override: Optional[dict], epoch: int) -> None:
+    def _commit_session_model_override(
+        self, session_key: str, loaded: tuple[Optional[dict], str], epoch: int,
+    ) -> None:
         """On-loop CAS: an override edit or boundary invalidates the worker's snapshot."""
+        override, scope = loaded
         if (override is None or self._session_model_override_epoch(session_key) != epoch
                 or self._session_model_override(session_key) is not None):
             return
         self._session_model_overrides[session_key] = override
-        self._session_state(session_key).conversation.model_override_scope = (
-            getattr(self.session_store, "get_model_override_scope", lambda _key: "session")(session_key)
-            if getattr(self, "session_store", None) is not None else "session"
-        )
+        self._session_state(session_key).conversation.model_override_scope = scope
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), override.get("provider") or "",
@@ -246,19 +246,20 @@ class GatewayAgentCacheMixin:
             return
         self._commit_session_model_override(session_key, loaded, epoch)
 
-    def _load_session_model_override(self, session_key: str) -> Optional[dict]:
-        """Load non-secret persisted fields and resolve credentials; never mutate runner state."""
+    def _load_session_model_override(self, session_key: str) -> tuple[Optional[dict], str]:
+        """Load non-secret persisted fields, scope, and credentials; never mutate runner state."""
         from gateway.run import _resolve_runtime_agent_kwargs_for_provider
         store = getattr(self, "session_store", None)
         if store is None:
-            return None
+            return None, "session"
         try:
             persisted = store.get_model_override(session_key)
+            scope = store.get_model_override_scope(session_key)
         except Exception:
             logger.debug("Failed to read persisted session model override", exc_info=True)
-            return
+            return None, "session"
         if not persisted:
-            return
+            return None, scope
         override: dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
         provider = persisted.get("provider")
         from hermes_cli.runtime_provider import is_foreign_provider_endpoint
@@ -288,7 +289,7 @@ class GatewayAgentCacheMixin:
                     "Credential re-resolution failed for persisted override "
                     "(provider=%s); using credential-less override", provider, exc_info=True,
                 )
-        return override
+        return override, scope
 
     def _apply_session_model_override(self, session_key: str, model: str, runtime_kwargs: dict) -> tuple:
         """Apply /model session overrides (precedence over config.yaml defaults; ``None`` fields skipped

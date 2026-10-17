@@ -938,7 +938,10 @@ class GatewayModelCommandsMixin:
         scope = t("gateway.reasoning.scope_session") if has_session_override else t("gateway.reasoning.scope_global")
 
         async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
-            return await self._apply_reasoning_selection_off_loop(session_key, platform_key, value)
+            return await self._apply_reasoning_selection_off_loop(
+                session_key, platform_key, value,
+                scope="temporary" if attended_enabled else None,
+            )
 
         picker_sent = await self._try_send_choice_picker(
             event,

@@ -1475,17 +1475,25 @@ class TurnRunner:
             )
             agent._gateway_attended_decision_key = desired_key
             if ctx.session_key:
-                route_state = runner._session_state(ctx.session_key)
-                route_state.conversation.last_resolved_model = model
+                handoff = getattr(runner, "_handoff_attended_state", None)
+                if callable(handoff):
+                    handoff(ctx.session_key, conversation={"last_resolved_model": model})
+                else:
+                    route_state = runner._session_state(ctx.session_key)
+                    route_state.conversation.last_resolved_model = model
             if decision.reason == "attended" and not unavailable_emitted and not (previous_key and previous_key[-1]):
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
                 emit_status = getattr(agent, "_emit_diagnostic_status", None)
                 if callable(emit_status):
                     emit_status(f"↻ {model} · {effort}")
             if ctx.session_key:
-                state = runner._peek_session_state(ctx.session_key)
-                if state is not None:
-                    state.conversation.pending_attended_notice = None
+                handoff = getattr(runner, "_handoff_attended_state", None)
+                if callable(handoff):
+                    handoff(ctx.session_key, conversation={"pending_attended_notice": None})
+                else:
+                    state = runner._peek_session_state(ctx.session_key)
+                    if state is not None:
+                        state.conversation.pending_attended_notice = None
         except Exception:
             logger.warning("attended model refresh before API call failed; keeping current route", exc_info=True)
 
