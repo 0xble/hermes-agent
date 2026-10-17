@@ -160,8 +160,9 @@ class GatewayConfigLoadersMixin:
         """
         from gateway.run import _load_gateway_config
         from hermes_constants import resolve_reasoning_config
-        config_path = None if profile_home is None else profile_home / "config.yaml"
-        return resolve_reasoning_config(_load_gateway_config(config_path), model)
+        config = (_load_gateway_config() if profile_home is None
+                  else _load_gateway_config(profile_home / "config.yaml"))
+        return resolve_reasoning_config(config, model)
 
     @staticmethod
     def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:
@@ -195,6 +196,8 @@ class GatewayConfigLoadersMixin:
         if (getattr(getattr(self, "config", None), "multiplex_profiles", False)
                 and source is not None and callable(resolve_profile_home)):
             profile_home = resolve_profile_home(source)
+        if profile_home is None:
+            return self._load_reasoning_config(model)
         return self._load_reasoning_config(model, profile_home=profile_home)
 
     def _session_reasoning_override(self, session_key: Optional[str]) -> dict | None:
