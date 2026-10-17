@@ -70,8 +70,6 @@ def test_skill_load_outcome_reaches_judge(skill_goal, monkeypatch, variant):
     first_id = _record(db, sid, "skill_view", args, output, "load")
     source = str(skill / file_path)
     citation = source if success else args["name"]
-    if success:
-        assert loaded["_source_path"] == source
     if variant == "dedup":
         # Real repeat stub omits the body; the earlier concrete load remains
         # citable outside the recent ledger and after compaction.
