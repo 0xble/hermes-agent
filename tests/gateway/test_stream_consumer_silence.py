@@ -44,6 +44,13 @@ def test_partial_predicate_agrees_with_exact_on_full_markers():
         assert is_intentional_silence_response(marker) is True
 
 
+def test_partial_predicate_holds_through_a_trailing_loop_complete_line():
+    for text in ("[SILENT]\nLOOP", "[SILENT]\nLOOP_COMPLETE", "NO_REPLY\nLOOP_COMPLETE\n"):
+        assert is_partial_silence_marker(text) is True
+    for text in ("[SILENT]\nLOOP is done", "Queue is 2.\nLOOP_COMPLETE", "\nLOOP"):
+        assert is_partial_silence_marker(text) is False
+
+
 # --------------------------------------------------------------------------
 # GatewayStreamConsumer — end-to-end suppression through run()
 # --------------------------------------------------------------------------
@@ -96,6 +103,22 @@ class TestStreamedSilenceSuppression:
         # Delivery flags stay False so the gateway does not treat the marker
         # as a delivered reply (its whole-response filter then drops it too).
         assert consumer.final_response_sent is False
+        assert consumer.final_content_delivered is False
+        assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
+    async def test_silence_marker_followed_by_loop_complete_never_flashes(self):
+        """Both control lines are hidden, including when the stream arrives as one delta."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta("[SILENT]" + chr(10) + "LOOP_COMPLETE")
+        consumer.finish()
+        await consumer.run()
+
+        assert all("[SILENT]" not in text and "LOOP_COMPLETE" not in text for text in _sent_and_edited(adapter))
         assert consumer.final_content_delivered is False
         assert consumer.already_sent is False
 
