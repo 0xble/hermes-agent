@@ -1517,9 +1517,10 @@ def _session_waiting(session_id: str) -> bool:
 
         with _records_lock:
             delegation = _records.get(str(session_id))
-        if delegation is not None:
-            return (delegation.get("status") in _LIVE_STATES
-                    or _async_delegation_completion_pending(str(session_id)))
+        if delegation is not None and delegation.get("status") in _LIVE_STATES:
+            return True
+        if _async_delegation_completion_pending(str(session_id)):
+            return True
     except Exception:
         pass
     try:
