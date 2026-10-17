@@ -214,6 +214,24 @@ def _idle_compaction(
         out.current_turn_user_idx = _reanchor(agent, out.messages, user_message)
 
 
+def _defer_preflight_to_real_usage(compressor: Any, rough_tokens: int) -> bool:
+    """Whether a rough preflight estimate must wait for a real provider reading.
+
+    A missing hook means do not defer. MagicMock and other doubles return a
+    truthy Mock unless the test configured one; only a real bool may skip
+    compression. Production engines return bool.
+    """
+    defer = getattr(compressor, "should_defer_preflight_to_real_usage", None)
+    if not callable(defer):
+        return False
+    try:
+        decision = defer(rough_tokens)
+    except Exception:
+        logger.debug("should_defer_preflight_to_real_usage raised; not deferring", exc_info=True)
+        return False
+    return decision if isinstance(decision, bool) else False
+
+
 def _codex_native_auto_compaction(agent: Any) -> bool:
     """Codex app-server threads are compacted by the codex agent itself; Hermes only
     initiates compaction in "hermes" mode."""
@@ -259,10 +277,19 @@ def _preflight_compression(
         # snapshot may arm the interrupted-turn rollback.
         if isinstance(_snapshot_val, int) and not isinstance(_snapshot_val, bool):
             agent._turn_preflight_display_snapshot = _snapshot_val
-    # An anchored figure is real usage + delta: never deferred.
-    _preflight_deferred = not getattr(agent, "_request_pressure_anchored", False) and getattr(
-        _compressor, "should_defer_preflight_to_real_usage", lambda _tokens: False
-    )(_preflight_tokens)
+    _awaiting_real_usage = getattr(_compressor, "awaiting_real_usage_after_compression", False)
+    _preflight_deferred = (
+        (
+            _awaiting_real_usage
+            if isinstance(_awaiting_real_usage, bool)
+            else False
+        )
+        and not getattr(agent, "_request_pressure_anchored", False)
+        or (
+            not getattr(agent, "_request_pressure_anchored", False)
+            and _defer_preflight_to_real_usage(_compressor, _preflight_tokens)
+        )
+    )
     _codex_native_auto = _codex_native_auto_compaction(agent)
 
     if not _preflight_deferred:
@@ -279,11 +306,19 @@ def _preflight_compression(
     _should_compress_now = False
     _compress_block_reason = None
     if _preflight_deferred:
+        # MagicMock and plugin engines omit the real-usage ledger; a missing or
+        # non-numeric reading is "none", not a crash in the diagnostic log.
+        _last_real = getattr(_compressor, "last_real_prompt_tokens", 0)
+        _last_real_text = (
+            f"{_last_real:,}"
+            if isinstance(_last_real, int) and not isinstance(_last_real, bool)
+            else "none"
+        )
         logger.info(
             "Skipping preflight compression: rough estimate ~%s >= %s is not anchored on "
             "real usage (last real provider prompt %s); deferring to the next response",
             f"{_preflight_tokens:,}", f"{_compressor.threshold_tokens:,}",
-            f"{_compressor.last_real_prompt_tokens:,}",
+            _last_real_text,
         )
     elif _compression_cooldown:
         logger.info(

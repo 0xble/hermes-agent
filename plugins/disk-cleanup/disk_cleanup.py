@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -24,17 +25,45 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 _LARGE_FILE_BYTES = 500 * 1024 * 1024
+# Longest wait for the tracking lock while no other holder commits a tracked.json write,
+# and the hard ceiling on one acquisition however much other writers progress.
+_LOCK_STALL_SECONDS = 2.0
+_LOCK_CEILING_SECONDS = 30.0
+
+
+def _tracked_stamp() -> Optional[Tuple[int, int, int]]:
+    try:
+        st = _state_file("tracked.json").stat()
+    except OSError:
+        return None
+    return st.st_ino, st.st_mtime_ns, st.st_ctime_ns
 
 
 @contextlib.contextmanager
 def _tracking_lock():
-    """Serialize tracking transactions without holding the lock during cleanup I/O."""
+    """Serialize tracking transactions without holding the lock during cleanup I/O.
+
+    The lock is not fair: a busy writer can reacquire it ahead of a polling
+    waiter many times in a row. The deadline therefore bounds a stalled
+    holder, not a busy queue. Each wait window that sees another holder commit
+    tracked.json restarts it, so concurrent writers make progress instead of
+    failing with an untracked file. A window with no commit, or the overall
+    ceiling, fails loudly.
+    """
     from hermes_cli.active_sessions import _FileLock
-    lock = _FileLock(_state_file("tracked.lock"), timeout=2.0)
-    try:
-        lock.__enter__()
-    except RuntimeError as exc:
-        raise RuntimeError("disk-cleanup tracking lock unavailable") from exc
+    ceiling = time.monotonic() + _LOCK_CEILING_SECONDS
+    seen = _tracked_stamp()
+    while True:
+        window = min(_LOCK_STALL_SECONDS, ceiling - time.monotonic())
+        lock = _FileLock(_state_file("tracked.lock"), timeout=max(window, 0.0))
+        try:
+            lock.__enter__()
+            break
+        except RuntimeError as exc:
+            current = _tracked_stamp()
+            if current == seen or time.monotonic() >= ceiling:
+                raise RuntimeError("disk-cleanup tracking lock unavailable") from exc
+            seen = current
     try:
         yield
     finally:

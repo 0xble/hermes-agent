@@ -561,3 +561,73 @@ async def test_retry_sweep_and_delivery_keep_secondary_profile_ledger_isolated(t
     finally:
         reset_hermes_home_override(token)
     assert get_hermes_home() == root
+
+
+def _accepted_notice(did):
+    """A retry notice the parent's adapter accepted, carrying the claim its wake was stamped with."""
+    _failed_row(did, "rate_limit")
+    dr.schedule_retry(did, now=1_800_000_060.0)
+    due = dr.retry_status(did)["retry_due_at"]
+    (action,) = dr.sweep_retries(now=due + 1)
+    runner = _runner()
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    return runner, action, due
+
+
+@pytest.mark.asyncio
+async def test_retry_notice_wake_is_stamped_with_its_ledger_claim():
+    runner, action, _ = _accepted_notice("deleg_stamp")
+    await runner._deliver_delegation_retry_action(action)
+    (_text, evt), _ = runner._inject_watch_notification.await_args
+    assert evt["retry_notice_claim"] == action["claim"]
+    assert dr.retry_status("deleg_stamp")["retry_state"] == "notified"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["delegate_stop", "session_stop"])
+async def test_queued_retry_notice_is_dropped_once_its_retry_is_cancelled(stop):
+    """R-RETRY-NOTICE-AFTER-CANCEL: on 2026-10-13 notices were admitted behind a busy parent
+    turn, the units were stopped (retry_state=cancelled), and the queued notices still ran."""
+    from types import SimpleNamespace
+    from gateway.run_turn import GatewayTurnMixin
+    from hermes_cli.session_controls import (
+        RETRY_WAKE_METADATA_KEY, internal_wake_is_current, is_gateway_wake)
+
+    runner, action, due = _accepted_notice("deleg_cut")
+    await runner._deliver_delegation_retry_action(action)
+    event = SimpleNamespace(text=action["text"], metadata={
+        RETRY_WAKE_METADATA_KEY: {"delegation_id": "deleg_cut", "claim": action["claim"]}})
+    assert is_gateway_wake(event)
+    assert internal_wake_is_current(event)  # still owed: the queued notice runs
+
+    if stop == "delegate_stop":
+        assert dr.cancel_pending_retries(delegation_id="deleg_cut") == {"deleg_cut"}
+    else:
+        assert dr.cancel_pending_retries(parent_session_id="parent-1") == {"deleg_cut"}
+    assert dr.retry_status("deleg_cut")["retry_state"] == "cancelled"
+    assert not internal_wake_is_current(event)  # admission, busy-queue and pin fences drop it
+
+    async def _in_executor(func, *args):
+        return func(*args)
+    turn = SimpleNamespace(_run_in_executor_with_context=_in_executor)
+    assert await GatewayTurnMixin._internal_wake_input_at_execution(
+        turn, event, "parent-1", event.text) is None  # the model-boundary fence drops it too
+    assert dr.sweep_retries(now=due + dr.NOTICE_GRACE_S * 3) == []  # and no reminder follows
+
+
+def test_retry_notice_wake_is_superseded_by_a_newer_claim():
+    from types import SimpleNamespace
+    from hermes_cli.session_controls import RETRY_WAKE_METADATA_KEY, internal_wake_is_current
+
+    _failed_row("deleg_old_claim", "rate_limit")
+    dr.schedule_retry("deleg_old_claim", now=1_800_000_060.0)
+    due = dr.retry_status("deleg_old_claim")["retry_due_at"]
+    (first,) = dr.sweep_retries(now=due + 1)
+    assert dr.mark_notice_accepted("deleg_old_claim", first["claim"], now=due + 1)
+    (reminder,) = dr.sweep_retries(now=due + 1 + dr.NOTICE_GRACE_S + 1)
+    stale = SimpleNamespace(text="", metadata={
+        RETRY_WAKE_METADATA_KEY: {"delegation_id": "deleg_old_claim", "claim": first["claim"]}})
+    current = SimpleNamespace(text="", metadata={
+        RETRY_WAKE_METADATA_KEY: {"delegation_id": "deleg_old_claim", "claim": reminder["claim"]}})
+    assert not internal_wake_is_current(stale)
+    assert internal_wake_is_current(current)

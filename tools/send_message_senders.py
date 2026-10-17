@@ -3,6 +3,7 @@
 from pm import install_hint
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import re
@@ -303,27 +304,109 @@ async def _send_telegram_copy_document(token, chat_id, message, thread_id=None):
     return _success("telegram", chat_id, [], message_id=str(getattr(msg, "message_id", "")))
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False,
-                   copy_block=False):
-    """One-shot Telegram Bot API send; parse failures fall back to plain text."""
+def _telegram_rich_adapter(message, bot, rich_messages, allow_cjk_rich_messages=False):
+    """Return a lightweight adapter carrying the live rich eligibility rules."""
     try:
+        from gateway.config import _coerce_bool, normalize_telegram_rich_messages
+        mode = normalize_telegram_rich_messages(rich_messages)
+        if mode == "never" or not inspect.iscoroutinefunction(getattr(bot, "do_api_request", None)):
+            return None
+        from plugins.platforms.telegram.adapter import TelegramAdapter, _normalize_dollar_entities
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter._rich_message_mode = mode
+        adapter._rich_messages_enabled = True
+        adapter._allow_cjk_rich_messages = _coerce_bool(allow_cjk_rich_messages, default=False)
+        adapter._rich_send_disabled = False
+        adapter._bot = bot
+        return adapter if adapter._should_attempt_rich(_normalize_dollar_entities(message)) else None
+    except Exception as error:  # health: allow BLE001 -- Optional rich setup has not sent anything; legacy delivery remains safe.
+        logger.warning("Telegram rich adapter unavailable, falling back to legacy: %s", _sanitize_error_text(error))
+        return None
+
+
+async def _send_telegram_rich(bot, chat_id, message, thread_kwargs, *, disable_link_previews, adapter):
+    """Send one Rich Message, or return ``None`` for a safe legacy fallback.
+
+    A thread-not-found response is a permanent routing failure, so it mirrors
+    the legacy sender by retrying once without ``message_thread_id``. Unknown or
+    transient failures return an error without a second legacy send: the rich
+    request may already have reached Telegram.
+    """
+    adapter._disable_link_previews = disable_link_previews
+    payload = {**adapter._rich_payload_base(chat_id, message), **thread_kwargs}
+    flood_retried = False
+
+    while True:
+        try:
+            response = await bot.do_api_request("sendRichMessage", api_kwargs=dict(payload))
+            break
+        except Exception as error:  # health: allow BLE001 -- Bot API boundary returns sanitized errors; only definite rejection permits resend.
+            if not flood_retried and getattr(error, "retry_after", None) is not None:
+                delay = _telegram_retry_delay(error, 0)
+                if delay is not None:
+                    flood_retried = True
+                    logger.warning("Telegram rich send rate-limited, retrying once in %.1fs: %s",
+                                   delay, _sanitize_error_text(error))
+                    await asyncio.sleep(delay)
+                    continue
+            if _is_telegram_thread_not_found(error) and payload.get("message_thread_id") is not None:
+                logger.warning("Thread %s not found in rich Telegram send, retrying without message_thread_id",
+                               payload.pop("message_thread_id"))
+                thread_kwargs.pop("message_thread_id", None)
+                continue
+            if adapter._is_rich_fallback_error(error):
+                logger.warning("Telegram rich send rejected, falling back to legacy: %s", _sanitize_error_text(error))
+                return None
+            logger.warning("Telegram rich send failed (no legacy resend): %s", _sanitize_error_text(error))
+            return _error(f"Telegram rich send failed: {error}")
+
+    if isinstance(response, dict):
+        message_id = response.get("message_id")
+        if message_id is None:
+            message_id = (response.get("result") or {}).get("message_id")
+    else:
+        message_id = getattr(response, "message_id", None)
+    return _success("telegram", chat_id, [], message_id=str(message_id) if message_id is not None else None)
+
+
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False,
+                   copy_block=False, rich_messages=None, allow_cjk_rich_messages=False):
+    """One-shot Telegram Bot API send; Rich Messages precede the legacy text path."""
+    try:
+        media_files = media_files or []
         if copy_block:
             from gateway.platforms.base import utf16_len
             if utf16_len(message) > 4096 and not media_files:
                 # One paste-ready body never splits: send it intact as a .txt document,
                 # matching the live adapter.
                 return await _send_telegram_copy_document(token, chat_id, message, thread_id)
-            formatted, send_parse_mode, _has_html = message, None, False
-        else:
-            formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
         from gateway.platforms.base import BasePlatformAdapter, utf16_len
         # Telegram accepts a numeric chat_id OR an @username string; never force-int.
         # See #13206.
         int_chat_id = normalize_telegram_chat_id(chat_id)
-        media_files = media_files or []
         thread_kwargs = _telegram_thread_kwargs(thread_id)
+
+        # Rich Messages are text-only. Eligibility, normalization, and the 32,768-character
+        # cap intentionally mirror TelegramAdapter._should_attempt_rich().
+        if not media_files and not copy_block:
+            rich_adapter = _telegram_rich_adapter(
+                message, bot, rich_messages, allow_cjk_rich_messages=allow_cjk_rich_messages)
+            if rich_adapter is not None:
+                from plugins.platforms.telegram.adapter import _normalize_dollar_entities
+                rich_content = _normalize_dollar_entities(message)
+                rich_result = await _send_telegram_rich(
+                    bot, chat_id, rich_content, thread_kwargs,
+                    disable_link_previews=disable_link_previews, adapter=rich_adapter)
+                if rich_result is not None:
+                    return rich_result
+                # Permanent/capability rejection leaves the existing MarkdownV2 path in charge.
+
+        if copy_block:
+            formatted, send_parse_mode, _has_html = message, None, False
+        else:
+            formatted, send_parse_mode, _has_html = _telegram_format(message)
         # disable_web_page_preview is only valid for send_message, not media sends.
         text_kwargs = {**thread_kwargs, **({"disable_web_page_preview": True} if disable_link_previews else {})}
         last_msg, warnings, _tg_caption = None, [], None

@@ -1103,7 +1103,7 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
             "compression exhaustion", block if isinstance(block, str) else "unknown guard", session,
         )
         _final = (
-            "Context compression is temporarily paused after a recent failed attempt. Please retry "
+            "⏸️ Context compression is temporarily paused after a recent failed attempt. Please retry "
             "in a moment — compression will resume automatically (or run /compress to force a retry now)."
         )
     else:
@@ -1113,7 +1113,7 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
             "counting as compression exhaustion", session, holder if isinstance(holder, str) else "unconfirmed",
         )
         _final = (
-            "Context compression is already running for this session. Please retry in a moment — "
+            "⏳ Context compression is already running for this session. Please retry in a moment — "
             "your next message will be processed once the concurrent compression finishes."
         )
     try:
@@ -1124,6 +1124,24 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
         _final, messages, api_call_count,
         failed=False, compression_deferred=True, session_id=agent.session_id,
     )
+
+
+def _preflight_hard_window_result(
+    agent, messages: List[Dict], conversation_history, api_call_count: int,
+) -> Dict[str, Any]:
+    """Typed fail-closed result for a wire-sized request that still cannot fit.
+
+    This is distinct from compression timeout/exhaustion: the accepted input and
+    session remain retryable, and the gateway must not rotate the session.
+    """
+    from agent.turn_failure_copy import retained_input_result
+
+    result = retained_input_result(
+        messages, api_call_count, provider_calls_made=api_call_count > 0,
+        compression_enabled=bool(getattr(agent, "compression_enabled", True)),
+    )
+    agent._persist_session(messages, conversation_history)
+    return result
 
 
 def _provider_overflow_exhausted_result(
@@ -1195,6 +1213,12 @@ def _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry):
         agent, api_messages, active_system_prompt)
     _retry.primary_recovery_attempted = False
     _retry.restart_with_rebuilt_messages = True
+    # The previous route's usage no longer describes the rebuilt request. A
+    # compaction latch armed before the switch must not defer the new route's
+    # first preflight; its first usage reading rearms the latch if needed.
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        compressor.awaiting_real_usage_after_compression = False
     return active_system_prompt
 
 
@@ -1581,7 +1605,11 @@ def _run_conversation_turn(
         )
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
-    # in-place boundary would make a later uncompressed result look compacted.
+    # in-place boundary would make a later uncompressed result look compacted. A shrink
+    # arms the one-shot ephemeral cap beside the ceiling; an exception before the request
+    # builder consumes it must not silently cap the next turn.
+    from agent.turn_preflight_gate import _clear_preflight_output_state
+    _clear_preflight_output_state(agent)
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
     begin_fast_mode_turn(agent, conversation_history)
@@ -1655,6 +1683,9 @@ def _run_conversation_turn(
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
         _run_phase(prepare_iteration, agent, s)
+        before_api_call = getattr(agent, "_gateway_before_api_call", None)
+        if callable(before_api_call):
+            before_api_call(s)
         _run_phase(assemble_api_request, agent, s)
         _pg = _run_phase(run_preflight_gate, agent, s)
         if _pg.action == "return":
@@ -1763,6 +1794,8 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+            from agent.turn_preflight_gate import _clear_preflight_output_state
+            _clear_preflight_output_state(agent)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

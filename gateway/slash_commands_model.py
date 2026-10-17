@@ -78,6 +78,7 @@ class _ModelSwitchContext:
     persist_global: bool
     one_turn: bool = False
     reasoning_effort: str = ""  # `--reasoning <level>` riding with the pick (typed path only)
+    model_override_scope: str = "session"  # session, temporary, or once
     restore_snapshot: Optional[dict] = None
     current_model: str = ""
     current_provider: str = "openrouter"
@@ -261,6 +262,9 @@ class GatewayModelCommandsMixin:
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.runtime_capabilities or {}),
         }
+        self._session_state(ctx.session_key).conversation.model_override_scope = (
+            "once" if one_turn else getattr(ctx, "model_override_scope", "session")
+        )
         if one_turn:
             # A repeated --once before the turn runs must keep the EARLIEST snapshot: the later
             # command's snapshot is the first temporary model, not the user's standing override.
@@ -301,7 +305,8 @@ class GatewayModelCommandsMixin:
         elif not one_turn:
             try:
                 await self._persist_session_model_override_locked(
-                    ctx.session_key, self._session_model_overrides[ctx.session_key]
+                    ctx.session_key, self._session_model_overrides[ctx.session_key],
+                    scope=getattr(ctx, "model_override_scope", "session"),
                 )
             except Exception:
                 logger.debug("Failed to persist session model override", exc_info=True)
@@ -434,9 +439,14 @@ class GatewayModelCommandsMixin:
             # `/model X --reasoning <level>`: same applier as /reasoning, same scope as the pick.
             # The record step already evicted the cached agent, so the pin lands on the rebuild.
             from gateway.run import _platform_config_key
-            reply += "\n" + await self._apply_reasoning_selection_off_loop(
-                ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
-                persist_global=ctx.persist_global and global_error is None)
+            if ctx.model_override_scope == "temporary":
+                reply += "\n" + await self._apply_reasoning_selection_off_loop(
+                    ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
+                    persist_global=ctx.persist_global and global_error is None, scope="temporary")
+            else:
+                reply += "\n" + await self._apply_reasoning_selection_off_loop(
+                    ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
+                    persist_global=ctx.persist_global and global_error is None)
         return reply
 
     def _model_switch_context(
@@ -492,22 +502,44 @@ class GatewayModelCommandsMixin:
         ``/model --session`` commit (cached agent, state.db, write-through for restarts) without its
         reply or switch-away metrics. Error text or None.
 
-        Refused when the session started a turn after the caller's idle check: resolving can block
-        for seconds, and swapping a running agent's client mid-turn is what the check exists to
-        stop. ``announce=False`` drops the next-turn switch note for a session that never ran on
-        another model (a just-created topic)."""
+        This remains the typed ``/model`` contract: a target that started a turn is refused instead
+        of swapping its client mid-turn. Agent-facing topic edits use
+        :meth:`commit_session_model_selection_with_status`, which records the same override but
+        queues a busy target for its next turn."""
+        error, _status = await self._commit_session_model_selection(
+            ctx, result, source, announce=announce, queue_if_running=False,
+        )
+        return error
+
+    async def commit_session_model_selection_with_status(
+        self, ctx: _ModelSwitchContext, result, source, *, announce: bool = True,
+    ) -> tuple[Optional[str], str]:
+        """Commit a topic-tool model pick and report whether it applied now or queued for next turn.
+
+        The running agent is never swapped. The durable session override changes immediately, while
+        the cache signature forces the next turn to build the selected route after the current turn
+        releases its agent."""
+        return await self._commit_session_model_selection(
+            ctx, result, source, announce=announce, queue_if_running=True,
+        )
+
+    async def _commit_session_model_selection(
+        self, ctx: _ModelSwitchContext, result, source, *, announce: bool, queue_if_running: bool,
+    ) -> tuple[Optional[str], str]:
         ctx = dataclasses.replace(ctx, session_key=self._session_key_for_source(source), source=source)
         async with self._model_switch_lock():
-            if self._is_session_running(ctx.session_key):
+            running = self._is_session_running(ctx.session_key)
+            if running and not queue_if_running:
                 return ("That session started a turn, so its model cannot change now. "
-                        "Retry when it is idle, or use /model there.")
-            error = self._switch_cached_agent_model(result, ctx, False)
-            if error is not None:
-                return error
+                        "Retry when it is idle, or use /model there."), "unchanged"
+            if not running:
+                error = self._switch_cached_agent_model(result, ctx, False)
+                if error is not None:
+                    return error, "unchanged"
             await self._record_model_switch(result, ctx, source=source, one_turn=False, picker=False)
             if not announce:
                 (getattr(self, "_pending_model_notes", None) or {}).pop(ctx.session_key, None)
-        return None
+        return None, "queued" if running else "applied"
 
     async def _send_model_picker(self, event: MessageEvent, source, adapter, session_key: str, listing_kwargs: dict, on_model_selected) -> bool:
         """Send the interactive /model picker; False when nothing was sent (text fallback). *source*
@@ -625,6 +657,8 @@ class GatewayModelCommandsMixin:
     async def _handle_model_command_locked(self, event: MessageEvent) -> Optional[str]:
         from gateway.run import _hermes_home
         from hermes_cli.model_switch import parse_model_switch_args, resolve_persist_behavior
+        from gateway.attended_model import parse_attended_config
+        from gateway.run import _load_gateway_config
 
         profile_home = None
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
@@ -641,14 +675,32 @@ class GatewayModelCommandsMixin:
         # Check for session override. See #30479.
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(source)
+        attended_enabled = parse_attended_config(_load_gateway_config()).enabled
+        if attended_enabled and request.target.strip().lower() == "reset" and not request.explicit_provider:
+            async with self._session_model_override_lock(session_key):
+                await self._persist_session_model_override_locked(session_key, None)
+            self._session_model_overrides.pop(session_key, None)
+            self._session_state(session_key).conversation.model_override_scope = "session"
+            self._evict_cached_agent(session_key)
+            return t("gateway.model.reset_done")
+        requested_global = request.is_global
+        effective_global = resolve_persist_behavior(
+            request.is_global, request.is_session, is_once=request.is_once,
+            explicit_provider=request.explicit_provider,
+        )
+        if attended_enabled and not request.is_global and not request.is_session and not request.is_once:
+            effective_global = False
+        model_scope = (
+            "once" if request.is_once else
+            "session" if request.is_session or requested_global or effective_global else
+            "temporary" if attended_enabled else "session"
+        )
         ctx = self._model_switch_context(
             source, session_key, profile_home=profile_home,
-            persist_global=resolve_persist_behavior(
-                request.is_global, request.is_session, is_once=request.is_once,
-                explicit_provider=request.explicit_provider,
-            ),
+            persist_global=effective_global,
             one_turn=request.is_once,
             reasoning_effort=request.reasoning_effort,
+            model_override_scope=model_scope,
             restore_snapshot=self._snapshot_session_model_override(session_key) if request.is_once else None,
         )
         if not request.target and not request.explicit_provider:
@@ -757,13 +809,13 @@ class GatewayModelCommandsMixin:
         if self._live_agent_for_session_control(session_key) is None:
             self._evict_cached_agent(session_key)
 
-    def _set_reasoning_override(self, session_key: str, value) -> None:
+    def _set_reasoning_override(self, session_key: str, value, source=None, *, scope: Optional[str] = None) -> None:
         """Apply a session override to the live tool loop's next model request."""
-        self._set_session_reasoning_override(session_key, value)
+        self._set_session_reasoning_override(session_key, value, scope=scope)
         agent = self._live_agent_for_session_control(session_key)
         if agent is not None:
             effective = value if value is not None else self._resolve_session_reasoning_config(
-                session_key=session_key, model=getattr(agent, "model", ""),
+                source=source, session_key=session_key, model=getattr(agent, "model", ""),
             )
             agent.reasoning_config = dict(effective) if isinstance(effective, dict) else effective
             agent.reasoning_override = None if value is None else dict(value)
@@ -772,15 +824,14 @@ class GatewayModelCommandsMixin:
             self._evict_idle_agent_after_session_control(session_key)
 
     async def _apply_reasoning_selection_off_loop(self, session_key: str, *args, **kwargs) -> str:
-        """``_apply_reasoning_selection`` off the loop: it persists through the session store, whose
-        lock is held across a state.db write. The session state is created here, on the loop, so the
-        worker never races the loop's get-or-create for the same key."""
+        """Apply /reasoning off-loop while preserving the existing session-state write order."""
         if session_key:
             self._session_state(session_key)
         return await asyncio.to_thread(self._apply_reasoning_selection, session_key, *args, **kwargs)
 
     def _apply_reasoning_selection(
         self, session_key: str, platform_key: str, value: str, persist_global: bool = False,
+        scope: Optional[str] = None,
     ) -> str:
         """Apply a /reasoning argument (typed or picked) and return the reply."""
         from hermes_constants import parse_reasoning_effort
@@ -809,7 +860,7 @@ class GatewayModelCommandsMixin:
                 return t("gateway.reasoning.set_global", effort=value)
             self._set_reasoning_override(session_key, parsed)
             return t("gateway.reasoning.set_global_save_failed", effort=value)
-        self._set_reasoning_override(session_key, parsed)
+        self._set_reasoning_override(session_key, parsed, scope=scope)
         return t("gateway.reasoning.set_session", effort=value)
 
     async def _try_send_choice_picker(
@@ -837,7 +888,13 @@ class GatewayModelCommandsMixin:
 
         raw_args = event.get_command_args().strip()
         args, persist_global = self._parse_reasoning_command_args(raw_args)
-        # Normalize (Telegram DM topic recovery) so the override key matches the next turn's.
+        reasoning_session_scope = "--session" in raw_args.replace("—", "--").split()
+        attended_enabled = False
+        with contextlib.suppress(Exception):
+            from gateway.attended_model import parse_attended_config
+            from gateway.run import _load_gateway_config
+            attended_enabled = parse_attended_config(_load_gateway_config()).enabled
+
         # See #30479.
         _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(_reasoning_source)
@@ -852,7 +909,8 @@ class GatewayModelCommandsMixin:
         platform_key = _platform_config_key(event.source.platform)
         if raw_args:  # typed path — same applier the picker uses
             return await self._apply_reasoning_selection_off_loop(
-                session_key, platform_key, args, persist_global=persist_global)
+                session_key, platform_key, args, persist_global=persist_global,
+                scope="session" if reasoning_session_scope else ("temporary" if attended_enabled else None))
         rc = self._reasoning_config
         # Labels tell the truth about the route: a Hermes-internal step (``ultra``) that the wire
         # clamps is shown as "ultra (sends max on this route)" instead of a distinct level (#61634).
@@ -880,7 +938,10 @@ class GatewayModelCommandsMixin:
         scope = t("gateway.reasoning.scope_session") if has_session_override else t("gateway.reasoning.scope_global")
 
         async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
-            return await self._apply_reasoning_selection_off_loop(session_key, platform_key, value)
+            return await self._apply_reasoning_selection_off_loop(
+                session_key, platform_key, value,
+                scope="temporary" if attended_enabled else None,
+            )
 
         picker_sent = await self._try_send_choice_picker(
             event,

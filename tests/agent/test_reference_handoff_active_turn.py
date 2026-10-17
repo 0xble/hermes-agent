@@ -26,10 +26,10 @@ from agent.context_compressor import (
     is_compaction_summary_message,
     is_user_originated_turn,
     reference_handoff_would_drive_next_model_call,
-    retryable_user_text,
     split_user_originated_turn,
     user_originated_turn_view,
 )
+from agent.context_compressor_retry import retryable_user_text
 from agent.conversation_loop import (
     _should_skip_model_call_for_reference_handoff,
 )

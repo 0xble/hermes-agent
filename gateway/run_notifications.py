@@ -1729,6 +1729,11 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 metadata["gateway_proven_session_id"] = proven_session_id
             if completion_ids := evt.get("completion_ids"):
                 metadata["gateway_completion_ids"] = list(completion_ids)
+            if retry_claim := str(evt.get("retry_notice_claim") or "").strip():
+                # Lets every later wake fence drop this notice once its retry is cancelled.
+                from hermes_cli.session_controls import RETRY_WAKE_METADATA_KEY
+                metadata[RETRY_WAKE_METADATA_KEY] = {
+                    "delegation_id": str(evt.get("delegation_id") or ""), "claim": retry_claim}
             # The queued event's ``message_id`` is the message that STARTED the process, and the
             # persisted origin carries the same stale id. A synthetic completion is not a reply to
             # it: by delivery time the user has often continued elsewhere, and an event anchored
@@ -2643,7 +2648,8 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 _, authorized = await self._authorized_completion_notice_target(action, check_delivery_ready=True)
                 suppressed = authorized is None
                 if authorized is True:
-                    accepted = await self._inject_watch_notification(action["text"], action) is True
+                    accepted = await self._inject_watch_notification(
+                        action["text"], {**action, "retry_notice_claim": claim}) is True
             except Exception:
                 logger.debug("Delegation %s: retry notice injection failed", delegation_id, exc_info=True)
             settle = (dr.suppress_retry_notice if suppressed else

@@ -6,7 +6,7 @@ When a running gateway turn receives canonical `/reasoning` or `/fast` (includin
 
 ## Provenance and patch
 
-Fork patch identity: `gateway-live-inference-controls`.
+Fork patch identities: `gateway-live-inference-controls`, `live-inference-controls`.
 
 Adapted from archived HERMES-094 (historical subject `feat(gateway): apply inference controls mid-turn`), whose previous gateway cache and command interfaces differ from the current release fork. On base `c8e3342595ea5021c920ba707e70926d20f1f9f2`, the busy command is dispatched, but `slash_commands_model.py::_set_reasoning_override` and `_apply_fast_selection` update session intent and evict the cached agent without updating the running one. Its second model call retains stale `reasoning_config` and `request_overrides`. The invariant regression failed with `agent.reasoning_config` still `low` after selecting `high`.
 

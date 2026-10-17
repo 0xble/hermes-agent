@@ -714,8 +714,8 @@ class CLISessionMixin:
             print(t("cli.session.retry_no_messages"))
             return None
 
-        from agent.context_compressor import (
-            history_before_user_originated_turn, retryable_user_text)
+        from agent.context_compressor import history_before_user_originated_turn
+        from agent.context_compressor_retry import retryable_user_text
         from agent.memory_manager import sanitize_context
 
         warm_history = list(self.conversation_history)

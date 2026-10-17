@@ -574,6 +574,12 @@ class SessionEntry:
     # retain the predecessor token so recovery can adopt only that exact chained row. Appended to
     # preserve older positional SessionEntry construction.
     resume_predecessor_turn_id: Optional[str] = None
+    # Durable clock for attended-model activity.  Internal/relay events deliberately do not update it.
+    last_user_activity_at: Optional[datetime] = None
+    # Explicit picks are pinned by --session; plain picks become temporary only when attended switching
+    # is configured.  Existing rows omit these keys and retain the historical session-scoped behavior.
+    model_override_scope: str = "session"
+    reasoning_override_scope: str = "session"
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -613,6 +619,8 @@ class SessionEntry:
         result["last_resume_marked_at"] = _iso(self.last_resume_marked_at)
         result["active_turn_token"] = self.active_turn_token
         result["active_turn_started_at"] = _iso(self.active_turn_started_at)
+        if self.last_user_activity_at is not None:
+            result["last_user_activity_at"] = _iso(self.last_user_activity_at)
         if self.active_turn_token and self.active_turn_owner_pid and self.active_turn_owner_slot:
             result["active_turn_owner_pid"] = self.active_turn_owner_pid
             result["active_turn_owner_slot"] = self.active_turn_owner_slot
@@ -622,6 +630,10 @@ class SessionEntry:
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.reasoning_override:
             result["reasoning_override"] = sanitize_reasoning_override(self.reasoning_override)
+        if self.model_override and self.model_override_scope != "session":
+            result["model_override_scope"] = self.model_override_scope
+        if self.reasoning_override and self.reasoning_override_scope != "session":
+            result["reasoning_override_scope"] = self.reasoning_override_scope
         if self.prompt_pin:
             # Same defence-in-depth: routing JSON must never preserve malformed pin state.
             if pin := sanitize_prompt_pin(self.prompt_pin):
@@ -697,6 +709,11 @@ class SessionEntry:
             active_turn_owner_pid=owner_pid, active_turn_owner_slot=owner_slot,
             model_override=sanitize_model_override(data.get("model_override")),
             reasoning_override=sanitize_reasoning_override(data.get("reasoning_override")),
+            last_user_activity_at=_parse_iso(data.get("last_user_activity_at")),
+            model_override_scope=data.get("model_override_scope", "session")
+            if data.get("model_override_scope") in ("session", "temporary", "once") else "session",
+            reasoning_override_scope=data.get("reasoning_override_scope", "session")
+            if data.get("reasoning_override_scope") in ("session", "temporary") else "session",
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
             **plain,
@@ -1175,23 +1192,33 @@ class SessionStore(
         """
         return self._update_entry(session_key, lambda e: e.metadata.__setitem__(key, value))
 
-    def set_model_override(self, session_key: str, override: Optional[dict[str, Any]]) -> None:
+    def set_model_override(
+        self, session_key: str, override: Optional[dict[str, Any]], *, scope: Optional[str] = None,
+    ) -> None:
         """Persist (or clear, with ``None``) the /model override; non-secret keys only."""
         from dataclasses import replace
 
         cleaned = sanitize_model_override(override)
+        resolved_scope = scope if scope in ("session", "temporary", "once") else "session"
 
         with self._lock:
             entry = self._entry_locked(session_key)
-            if entry is None or entry.model_override == cleaned:
+            if entry is None or (
+                entry.model_override == cleaned and
+                (cleaned is None or entry.model_override_scope == resolved_scope)
+            ):
                 return
             # Publish only after persistence so a failed clear remains retryable.
             data, generation = self._snapshot_routing_locked()
             # Snapshot reconciliation may replace the entry after database recovery.
             entry = self._entries[session_key]
-            data[session_key] = replace(entry, model_override=cleaned).to_dict()
+            data[session_key] = replace(
+                entry, model_override=cleaned,
+                model_override_scope=resolved_scope if cleaned else "session",
+            ).to_dict()
             self._persist_routing_data(data, generation)
             entry.model_override = cleaned
+            entry.model_override_scope = resolved_scope if cleaned else "session"
 
     def set_session_yolo(self, session_key: str, enabled: bool) -> bool:
         """Persist the lane's ``/yolo`` bypass; False when the key has no entry yet or it is unchanged."""
@@ -1207,26 +1234,66 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             return dict(entry.model_override) if entry and entry.model_override else None
 
-    def set_reasoning_override(self, session_key: str, override: Optional[Dict[str, Any]]) -> None:
+    def get_model_override_scope(self, session_key: str) -> str:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return getattr(entry, "model_override_scope", "session") if entry else "session"
+
+    def set_reasoning_override(
+        self, session_key: str, override: Optional[Dict[str, Any]], *, scope: Optional[str] = None,
+    ) -> None:
         """Persist (or clear, with ``None``) the session's /reasoning pick."""
         from dataclasses import replace
 
         cleaned = sanitize_reasoning_override(override)
+        resolved_scope = scope if scope in ("session", "temporary") else "session"
         with self._lock:
             entry = self._entry_locked(session_key)
-            if entry is None or entry.reasoning_override == cleaned:
+            if entry is None or (
+                entry.reasoning_override == cleaned and
+                (cleaned is None or entry.reasoning_override_scope == resolved_scope)
+            ):
                 return
             data, generation = self._snapshot_routing_locked()
             entry = self._entries[session_key]
-            data[session_key] = replace(entry, reasoning_override=cleaned).to_dict()
+            data[session_key] = replace(
+                entry, reasoning_override=cleaned,
+                reasoning_override_scope=resolved_scope if cleaned else "session",
+            ).to_dict()
             self._persist_routing_data(data, generation)
             entry.reasoning_override = cleaned
+            entry.reasoning_override_scope = resolved_scope if cleaned else "session"
 
     def get_reasoning_override(self, session_key: str) -> Optional[Dict[str, Any]]:
         """Return the persisted /reasoning pick for *session_key*, if any."""
         with self._lock:
             entry = self._entry_locked(session_key)
             return dict(entry.reasoning_override) if entry and entry.reasoning_override else None
+
+    def get_reasoning_override_scope(self, session_key: str) -> str:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return getattr(entry, "reasoning_override_scope", "session") if entry else "session"
+
+    def get_last_user_activity_at(self, session_key: str) -> Optional[datetime]:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return getattr(entry, "last_user_activity_at", None) if entry else None
+
+    def mark_user_activity(self, session_key: str, when: Optional[datetime] = None) -> bool:
+        """Persist the last genuine user message without treating relays/wakeups as activity."""
+        stamp = when or _now()
+
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            changed = entry.last_user_activity_at != stamp
+            entry.last_user_activity_at = stamp
+            entry.updated_at = stamp
+            if changed:
+                self._save_entry(session_key, entry_data=entry.to_dict(), lock_held=True)
+            return changed
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""

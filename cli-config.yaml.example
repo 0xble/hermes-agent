@@ -10,8 +10,18 @@
 _config_version: 50
 
 # =============================================================================
-# Database Configuration
+# Attended model switching (optional)
 # =============================================================================
+# While a human is active in a topic, route the main gateway agent to this model/provider.
+# Omit the whole block to preserve existing model and /model behavior.
+# model:
+#   attended:
+#     model: claude-opus-5-5
+#     provider: custom:claude-proxy
+#     reasoning_effort: medium
+#   idle_revert_minutes: 15
+#   compact_before_switch_tokens: 80000
+
 # WAL is the normal default. Hermes automatically falls back to DELETE when
 # SQLite reports that WAL is incompatible with the filesystem. Set this to
 # "delete" explicitly for deployments whose backing filesystem is not WAL

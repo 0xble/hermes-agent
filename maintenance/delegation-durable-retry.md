@@ -93,6 +93,11 @@ authorization settles the obligation without delivery.
   Gateway shutdown/lifecycle cuts preserve retry obligations, including legacy
   phase-specific reasons and unplanned shutdowns. Original completion/outbox
   delivery remains separate; its stale automatic-retry promise is recomputed.
+- An accepted retry notice can wait queued behind a busy parent turn after the stop
+  commits. Its wake carries `delegation_retry_notice` metadata (delegation id and
+  notice claim), and every gateway-wake fence (admission, busy queue, strict pin,
+  model boundary) drops it unless the row is still `noticing`/`notified` under that
+  claim. A cancel or a newer notice claim retires the queued wake.
 - Rows written before this unit (`retry_state='none'`) keep the legacy one-shot
   resume and boot notice. Boot notices skip retry-owned rows.
 - Retention: `_RETENTION_OWED_SQL` exempts `armed/scheduled/noticing/notified/dispatching/

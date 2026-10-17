@@ -866,6 +866,7 @@ def _cmd_retry(rid, params, session, name, arg):
     if busy := _busy_error(rid, session, "retry"):
         return busy
     cc = _tools_mod("agent.context_compressor")
+    from agent.context_compressor_retry import retryable_user_text
     with session["history_lock"]:
         if busy := _busy_error(rid, session, "retry"):
             return busy
@@ -876,14 +877,15 @@ def _cmd_retry(rid, params, session, name, arg):
             return err
         _prefix, live_view = cc.history_before_user_originated_turn(history, user_indices[-1])
         try:
-            content = cc.retryable_user_text(live_view.get("content"))
+            content = retryable_user_text(live_view.get("content"))
         except ValueError as exc:
             return _err(rid, 4018, str(exc))
         rewound, err = _rewind_or_err(
             rid, session, len(user_indices) - 1, (4018, ""), "retry: failed to persist history: ", require_retryable=True)
         if err:
             return err
-        content = cc.retryable_user_text(rewound[1].get("content"))
+        assert rewound is not None
+        content = retryable_user_text(rewound[1].get("content"))
     _tui_model_friction("retry", session)
     return _ok(rid, {"type": "send", "message": content})
 

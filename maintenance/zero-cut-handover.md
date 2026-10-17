@@ -2,6 +2,8 @@
 
 Patch identity: `zero-cut-handover`.
 
+Published commit `c016f92bbbca7b37162d17ac3384df47d181ae29` (PR #630) omitted its `Fork-Patch` trailer during squash merge. This exact stable patch ID classifies only that published content, so `main` is not rewritten.
+
 Fork-Patch-Backfill: adf8f9ace4f2f1c05c2230edef450a41edf71d06; zero-cut-handover
 
 **Status:** design only. The flag remains disabled; this document does not start or

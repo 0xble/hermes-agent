@@ -390,6 +390,7 @@ def boosted_output_cap(agent: Any, requested_cap: Optional[int], n: int, base: O
     """
     if base is None:
         base = agent.max_tokens or requested_cap or 4096
+    agent._ephemeral_output_cap_is_retry_boost = True
     anchor = requested_cap or base
     limit = _model_output_limit(agent)
     if limit and anchor >= limit:

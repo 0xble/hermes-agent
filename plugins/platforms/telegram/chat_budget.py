@@ -273,9 +273,14 @@ class MeteredBot:
         endpoint = "doApiRequest" if name == "do_api_request" else _camel_endpoint(name)
 
         async def metered(*args: Any, **kwargs: Any) -> Any:
+            # Raw Bot API calls carry routing inside api_kwargs, not at the
+            # top level. Rich standalone sends must spend the same chat budget.
+            raw_request = name == "do_api_request"
+            request_endpoint = (args[0] if args else kwargs.get("endpoint", endpoint)) if raw_request else endpoint
+            data = kwargs.get("api_kwargs", {}) if raw_request else kwargs
             return await limiter.process_request(
-                callback=lambda: attr(*args, **kwargs), args=(), kwargs={}, endpoint=endpoint,
-                data=kwargs, rate_limit_args=None)
+                callback=lambda: attr(*args, **kwargs), args=(), kwargs={}, endpoint=request_endpoint,
+                data=data, rate_limit_args=None)
 
         return metered
 

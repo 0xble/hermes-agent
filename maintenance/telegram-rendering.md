@@ -81,6 +81,61 @@ literal. It runs on send, finalized edit,
 and draft, and is idempotent. Verified against live `sendRichMessage` output on
 2026-09-30.
 
+## Standalone CLI and cron delivery
+
+Fork patch identity: `telegram-standalone-rich`.
+
+Based on fork `main` `487aa7910ec01764310411ca0fb3d6feeac35375`.
+
+`hermes send` and `send_message`'s standalone Telegram route receive the resolved
+platform's `extra.rich_messages` and `allow_cjk_rich_messages`. Text without
+media or `copy_block` uses the adapter's `_should_attempt_rich` policy, raw-Markdown
+`_rich_payload_base`, and shared `rich_delivery.py` shaping/classification. Thus
+`always` sends every safe eligible message; `auto` selects tables, tasks,
+`<details>`, or display math, not ordinary headings or prose. Raw and normalized
+payload limits, Desktop guards, General-topic mapping, and link-preview settings
+remain unchanged. Oversized messages, media, and paste-ready copy blocks stay on
+their previous legacy paths.
+
+A permanent/capability refusal falls back to MarkdownV2. A transient or unknown
+failure returns an error without legacy-resending, because acceptance is
+ambiguous. Thread-not-found retries rich once without `message_thread_id`; any
+subsequent legacy fallback also keeps that stale routing removed. The sender
+preserves the existing success/error receipt shape and chat-id spelling.
+
+`MeteredBot` unwraps the raw endpoint and `api_kwargs` before passing a
+`do_api_request` through the existing chat budget. Rich attempts, stale-thread
+retries, and MarkdownV2 fallback all spend the same slots (45/min private,
+15/min group per process, including other metered traffic). There is no new
+limiter or producer cadence; the only retry addition is a single bounded inline
+retry after a short `RetryAfter`. Durable penalty deadlines remain shared across
+processes; the slot clock itself remains process-local, an existing limitation.
+A usual brief now spends one rich request instead of multiple chunk requests.
+Flood refusals spend no fallback request.
+
+**Verification:** `tests/tools/test_send_message_tool.py::TestStandaloneTelegramRichMessages`
+drives the resolved-config dispatcher and standalone Bot API boundary with
+mocked bots only. It covers all three modes, permanent versus ambiguous errors,
+length and Desktop guards, topic routing, preview policy, media and copy blocks.
+`test_standalone_rich_send_spends_chat_budget_and_honors_flood_penalty` in
+`tests/gateway/test_telegram_chat_outbound_budget.py` drives a real `MeteredBot`
+with mocked Telegram I/O for both private and group IDs. The dispatcher rich
+regression fails on the base (a legacy receipt instead of a rich receipt).
+
+**Upstream design preflight:** inspected upstream `main`
+`4e745c539893422cc5509b167350049702e948ee`, its guidance, sender, and rich
+adapter. Related [upstream PR 45327](https://github.com/NousResearch/hermes-agent/pull/45327)
+is open and only preserves table source during legacy formatting; closed
+duplicate [45387](https://github.com/NousResearch/hermes-agent/pull/45387)
+uses the same approach. Neither calls `sendRichMessage` in the standalone lane,
+so neither satisfies this delivery contract. The selected correction reuses the
+native policy and payload, not a new flag or renderer. No new upstream PR was
+opened; this is an upstreamable, fork-first consumer fix.
+
+**Retirement:** remove the adaptation when a released upstream standalone sender
+passes the same mode, routing, no-duplicate, and budget regressions.
+**Rollback:** revert this patch; no config or data migration is required.
+
 ## Provenance and adoption
 
 Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
