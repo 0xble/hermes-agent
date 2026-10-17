@@ -3,6 +3,7 @@
 The scheduler owns the review state machine; this module owns the small, pure
 contract checker and the durable JSONL receipt writer.
 """
+
 from __future__ import annotations
 
 import json
@@ -22,7 +23,13 @@ RECEIPT_NAME = "review-receipts.jsonl"
 MAX_RECEIPT_BYTES = 2 * 1024 * 1024
 _receipt_lock = threading.RLock()
 _receipt_lock_holder = threading.local()
-_DEFAULT_SILENCE_MARKERS = ("[SILENT]", "SILENT", "NO_REPLY", "NO REPLY", "[CRON_FAILURE]")
+_DEFAULT_SILENCE_MARKERS = (
+    "[SILENT]",
+    "SILENT",
+    "NO_REPLY",
+    "NO REPLY",
+    "[CRON_FAILURE]",
+)
 
 
 def receipt_path() -> Path:
@@ -39,11 +46,15 @@ def load_contract(contract_ref: str) -> dict[str, Any]:
     if not ref:
         raise ValueError("review.contract is required")
     candidate = Path(ref).expanduser()
-    choices = [candidate] if candidate.is_absolute() else [
-        get_hermes_home().resolve() / "cron" / "contracts" / candidate,
-        Path(__file__).resolve().parent / "contracts" / candidate,
-        get_hermes_home().resolve() / candidate,
-    ]
+    choices = (
+        [candidate]
+        if candidate.is_absolute()
+        else [
+            get_hermes_home().resolve() / "cron" / "contracts" / candidate,
+            Path(__file__).resolve().parent / "contracts" / candidate,
+            get_hermes_home().resolve() / candidate,
+        ]
+    )
     path = next((p for p in choices if p.is_file()), None)
     if path is None:
         raise FileNotFoundError(f"review contract not found: {ref}")
@@ -62,7 +73,11 @@ def _contract_lines(text: str):
     for line in text.splitlines():
         previous = fence
         fence = _next_fence(fence, line)
-        if previous is None and fence is None and not re.match(r"^(?: {4}| {0,3}\t)", line):
+        if (
+            previous is None
+            and fence is None
+            and not re.match(r"^(?: {4}| {0,3}\t)", line)
+        ):
             yield line
 
 
@@ -102,7 +117,9 @@ def _title_matches(actual: Optional[str], expected: str) -> bool:
         return False
     if actual == expected:
         return True
-    return actual.startswith(expected) and bool(_DATED_TITLE.fullmatch(actual[len(expected):]))
+    return actual.startswith(expected) and bool(
+        _DATED_TITLE.fullmatch(actual[len(expected) :])
+    )
 
 
 def _word_count(text: str) -> int:
@@ -115,7 +132,13 @@ def check_contract(text: str, contract: dict[str, Any]) -> dict[str, Any]:
     markers = tuple(contract.get("silence_markers") or _DEFAULT_SILENCE_MARKERS)
     nonempty = [line.strip() for line in text.splitlines() if line.strip()]
     if len(nonempty) == 1 and nonempty[0] in markers:
-        return {"passed": True, "violations": [], "words": 0, "sections": [], "silent": True}
+        return {
+            "passed": True,
+            "violations": [],
+            "words": 0,
+            "sections": [],
+            "silent": True,
+        }
 
     violations: list[str] = []
     expected_title = str(contract.get("title") or "").strip()
@@ -123,18 +146,26 @@ def check_contract(text: str, contract: dict[str, Any]) -> dict[str, Any]:
         violations.append(f"title must be {expected_title!r}")
     # The title is the only top-level heading a contract allows; a second H1
     # would let a rewrite smuggle an undeclared section past the H2 checks.
-    top_level = [line for line in _contract_lines(text) if re.match(r"^ {0,3}#\s+\S", line)]
+    top_level = [
+        line for line in _contract_lines(text) if re.match(r"^ {0,3}#\s+\S", line)
+    ]
     if len(top_level) > 1:
         violations.append("contains an extra top-level heading")
 
     required_lines = contract.get("required_lines") or []
     for required in required_lines:
-        if not any(line.strip().startswith(str(required)) for line in _contract_lines(text)):
+        if not any(
+            line.strip().startswith(str(required)) for line in _contract_lines(text)
+        ):
             violations.append(f"missing required line {required!r}")
 
     sections = _sections(text)
-    required_sections = [str(s).strip() for s in (contract.get("required_sections") or [])]
-    optional_sections = [str(s).strip() for s in (contract.get("optional_sections") or [])]
+    required_sections = [
+        str(s).strip() for s in (contract.get("required_sections") or [])
+    ]
+    optional_sections = [
+        str(s).strip() for s in (contract.get("optional_sections") or [])
+    ]
     allowed = required_sections + optional_sections
     if any(section not in allowed for section in sections):
         violations.append("contains an undeclared section")
@@ -150,8 +181,13 @@ def check_contract(text: str, contract: dict[str, Any]) -> dict[str, Any]:
     cap = contract.get("word_cap")
     if cap is not None and words > int(cap):
         violations.append(f"word cap exceeded ({words} > {int(cap)})")
-    return {"passed": not violations, "violations": violations, "words": words,
-            "sections": sections, "silent": False}
+    return {
+        "passed": not violations,
+        "violations": violations,
+        "words": words,
+        "sections": sections,
+        "silent": False,
+    }
 
 
 def parse_decision(reply: str) -> tuple[str, str]:
@@ -163,7 +199,9 @@ def parse_decision(reply: str) -> tuple[str, str]:
         return "FIX", "\n".join(lines[1:]).strip()
     if len(lines) == 2 and lines[0] == "RERUN" and lines[1].strip():
         return "RERUN", lines[1].strip()
-    raise ValueError("review reply must be exactly PRESENT, FIX + report, or RERUN + one-line reason")
+    raise ValueError(
+        "review reply must be exactly PRESENT, FIX + report, or RERUN + one-line reason"
+    )
 
 
 def append_receipt(record: dict[str, Any]) -> None:
@@ -172,9 +210,18 @@ def append_receipt(record: dict[str, Any]) -> None:
     payload = dict(record)
     payload.setdefault("recorded_at", time.time())
     path = receipt_path()
-    line = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-    with _receipt_lock, _file_lock(path.with_suffix(".lock"), _receipt_lock_holder, 10,
-                                   "Timed out waiting for cron review receipts"):
+    line = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    with (
+        _receipt_lock,
+        _file_lock(
+            path.with_suffix(".lock"),
+            _receipt_lock_holder,
+            10,
+            "Timed out waiting for cron review receipts",
+        ),
+    ):
         if path.exists() and path.stat().st_size + len(line) > MAX_RECEIPT_BYTES:
             path.replace(path.with_name(path.name + ".1"))
         with path.open("ab") as stream:
@@ -201,8 +248,13 @@ def normalize_review(value: Any) -> Optional[dict[str, Any]]:
     max_reruns = value.get("max_reruns", 1)
     if type(max_reruns) is not int or max_reruns not in (0, 1):
         raise ValueError("review.max_reruns must be 0 or 1")
-    return {"contract": contract, "subject": subject, "deadline_minutes": deadline,
-            "rerun_deadline_minutes": rerun_deadline, "max_reruns": max_reruns}
+    return {
+        "contract": contract,
+        "subject": subject,
+        "deadline_minutes": deadline,
+        "rerun_deadline_minutes": rerun_deadline,
+        "max_reruns": max_reruns,
+    }
 
 
 def validate_review_delivery(review, deliver):
