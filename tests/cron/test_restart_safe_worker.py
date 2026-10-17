@@ -308,6 +308,7 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
             encoding="utf-8",
         )
         worker = FakeProcess()
+        kwargs["_test_process"] = worker
         processes.append(worker)
         return worker
 
@@ -1021,6 +1022,30 @@ def test_terminal_early_return_reaps_a_real_worker_process(monkeypatch):
     assert process.returncode == 0
 
 
+def test_terminal_worker_exit_wait_is_bounded(monkeypatch):
+    """A terminal row must not wedge the gateway if the worker ignores teardown."""
+    from cron import scheduler
+
+    process = Mock()
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired(cmd="worker", timeout=0.01)
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        lambda _execution_id: {"id": "exec-1", "status": "completed"},
+    )
+
+    with pytest.raises(RuntimeError, match="stayed alive after its terminal exit grace period"):
+        scheduler._wait_for_external_cron_worker_body(
+            process,
+            execution_id="exec-1",
+            wait_for_process_exit=True,
+            terminal_exit_grace_seconds=0.01,
+        )
+    process.terminate.assert_called_once_with()
+    process.kill.assert_called_once_with()
+
+
 def test_launch_external_worker_stays_in_process_outside_managed_gateway(
     monkeypatch,
 ):
@@ -1091,7 +1116,11 @@ def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
     )
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "user-libs"))
     spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
-    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    def terminal_execution(_execution_id):
+        spawned[0][1]["_test_process"].returncode = 0
+        return {"id": "exec-1", "status": "completed"}
+
+    get.side_effect = terminal_execution
     monkeypatch.setattr(
         "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
         lambda _process: None,
@@ -1117,7 +1146,11 @@ def test_external_worker_keeps_loaded_tree_after_current_moves(tmp_path, monkeyp
     monkeypatch.setattr("tools.process_registry.restart_safe_gateway_child_argv",
                         lambda command, **_: GatewayChildDispatch("degraded", command))
     spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
-    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    def terminal_execution(_execution_id):
+        spawned[0][1]["_test_process"].returncode = 0
+        return {"id": "exec-1", "status": "completed"}
+
+    get.side_effect = terminal_execution
     monkeypatch.setattr(
         "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
         lambda _process: None,
@@ -1153,7 +1186,11 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
                      "PYTHONPATH": str(tmp_path / "kept-by-sanitizer")},
     )
     spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
-    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    def terminal_execution(_execution_id):
+        spawned[0][1]["_test_process"].returncode = 0
+        return {"id": "exec-1", "status": "completed"}
+
+    get.side_effect = terminal_execution
     monkeypatch.setattr(
         "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
         lambda _process: None,
