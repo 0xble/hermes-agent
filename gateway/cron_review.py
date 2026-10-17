@@ -70,9 +70,17 @@ class ReviewCapture:
         else:
             self.future.set_exception(error)
 
-    def capture_reply(self, response):
+    def capture_reply(self, response, event=None):
         if self.future is None:
             return response
+        # Streaming turns return None after the stream consumer has delivered the
+        # final text. The event retains that exact final payload for the invisible
+        # review caller, so capture it instead of treating a successful review as
+        # empty.
+        if not response and event is not None:
+            streamed = getattr(event, "_streamed_final_response", None)
+            if isinstance(streamed, str):
+                response = streamed
         self.finish(response)
         return None
 

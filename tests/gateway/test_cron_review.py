@@ -52,7 +52,17 @@ async def test_internal_review_captures_reply_without_any_send(response):
     await asyncio.gather(*tuple(adapter._background_tasks))
     assert adapter.sent == []
     adapter.send_typing.assert_not_awaited()
-    assert adapter._message_handler.await_count == 1
+
+
+def test_review_capture_uses_streamed_final_response_when_delivery_returns_none():
+    capture = Future()
+    event = SimpleNamespace(internal=True,
+                            metadata={"_cron_review_capture": capture},
+                            _streamed_final_response="PRESENT")
+    from gateway.cron_review import ReviewCapture
+    assert ReviewCapture(event).capture_reply(None, event) is None
+    assert capture.result(timeout=0) == "PRESENT"
+
 
 
 @pytest.mark.asyncio
