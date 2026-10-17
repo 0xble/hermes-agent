@@ -648,8 +648,8 @@ def _extra_key(name: str) -> str:
 def _still_declared(package, recorded: list[str]) -> list[str]:
     """The recorded extras this tree still declares.
 
-    An extra the source removed (``hindsight``) would otherwise ride the ledger
-    into every later ``uv sync`` and fail it with "Extra is not defined". Only
+    An extra the source removed would otherwise ride the ledger into every
+    later ``uv sync`` and fail it with "Extra is not defined". Only
     recorded extras are pruned; an explicitly requested unknown extra still fails.
     Membership uses PEP 685 names (uv matches ``foo_bar`` to ``foo-bar``); the
     recorded spelling is what reaches uv.
