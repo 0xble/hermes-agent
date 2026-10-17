@@ -348,10 +348,13 @@ class GatewayAgentCacheMixin:
 
     def _is_intentional_model_switch(self, session_key: str, agent: Any, config_model: str) -> bool:
         """True when *agent* running a model other than *config_model* is deliberate: a /model session
-        override names that model, or the Nous gateway moved the session off the ``nous/welcome``
-        alias that *config_model* still carries (``anon_auth.apply_model_switch``)."""
+        override names that model, an attended route selected that model, or the Nous gateway moved the
+        session off the ``nous/welcome`` alias that *config_model* still carries (``anon_auth.apply_model_switch``)."""
         override = self._session_model_override(session_key)
         if override is not None and override.get("model") == agent.model:
+            return True
+        decision = getattr(agent, "_gateway_attended_decision", None)
+        if getattr(decision, "reason", None) == "attended" and getattr(decision, "model", None) == agent.model:
             return True
         # Exactly the recorded move (alias -> backing): a later fallback onto some other model is
         # ordinary drift and still evicts.
@@ -365,7 +368,10 @@ class GatewayAgentCacheMixin:
         from gateway.run import _resolve_gateway_model
         primary = getattr(agent, "_primary_runtime", None) or {}
         provider = primary.get("provider", getattr(agent, "provider", "")) or ""
-        # An override whose provider was unavailable this turn ran on the default route instead.
+        decision = getattr(agent, "_gateway_attended_decision", None)
+        decision_model = getattr(decision, "model", None)
+        if getattr(decision, "reason", None) == "attended" and decision_model:
+            return decision_model
         override = self._session_model_override(session_key) or {}
         if override.get("model") and override.get("provider") in (None, "", provider):
             model = override["model"]

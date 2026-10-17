@@ -58,6 +58,7 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 _tool_call_logger_lock = threading.Lock()
+_NO_ATTENDED_ACTIVITY_STAMP = object()
 
 
 def _tool_call_logger() -> logging.Logger:
@@ -171,6 +172,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if skey:
             self._rehydrate_session_model_override(skey)
             self._expire_attended_temporary_picks(skey, user_config)
+            if parse_attended_config(user_config or {}).enabled:
+                state = self._session_state(skey)
+                state.conversation.last_attended_decision = None
+                state.conversation.pre_agent_fallback_notice = None
         override, last_model, _ = self._snapshot_session_runtime_state(skey)
         attended_route = self._attended_route_for_session(
             source=source, session_key=skey, user_config=user_config, override=override,
@@ -182,7 +187,19 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         )
         return self._commit_session_agent_runtime(skey, resolved)
 
-    def _attended_resolution_for_session(self, *, source, session_key, user_config=None, override=None):
+    def _load_attended_activity_stamp(self, session_key: str):
+        """Read the durable activity stamp without changing live session state."""
+        with suppress(Exception):
+            stamp = self.session_store.get_last_user_activity_at(session_key)
+            if stamp is not None and hasattr(stamp, "timestamp"):
+                stamp = stamp.timestamp()
+            return stamp
+        return None
+
+    def _attended_resolution_for_session(
+        self, *, source, session_key, user_config=None, override=None,
+        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP,
+    ):
         """Return the one authoritative desired route decision for a gateway session."""
         if not session_key:
             return None
@@ -194,10 +211,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         conversation = state.conversation
         stamp = conversation.last_user_activity_at
         if stamp is None:
-            with suppress(Exception):
-                stamp = self.session_store.get_last_user_activity_at(session_key)
-            if stamp is not None and hasattr(stamp, "timestamp"):
-                stamp = stamp.timestamp()
+            if activity_stamp is not _NO_ATTENDED_ACTIVITY_STAMP:
+                stamp = activity_stamp
+            else:
+                stamp = self._load_attended_activity_stamp(session_key)
             conversation.last_user_activity_at = stamp
         channel_model = ""
         channel_provider = ""
@@ -250,13 +267,18 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             },
             time.time(), user_config or {},
         )
-        self._last_attended_decision = decision
+        conversation.last_attended_decision = decision
+        self._last_attended_decision = decision  # legacy, read-only compatibility for older callers
         return decision
 
-    def _attended_route_for_session(self, *, source, session_key, user_config, override, last_model):
+    def _attended_route_for_session(
+        self, *, source, session_key, user_config, override, last_model,
+        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP,
+    ):
         """Build the detached attended route and stage its one-line notice on the session."""
         decision = self._attended_resolution_for_session(
             source=source, session_key=session_key, user_config=user_config, override=override,
+            activity_stamp=activity_stamp,
         )
         if decision is None:
             return None
@@ -283,7 +305,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             conversation.pending_attended_notice = f"↻ {target_model} · {effort}"
         return route
 
-    def _expire_attended_temporary_picks(self, session_key: str, user_config: Optional[dict]) -> None:
+    def _expire_attended_temporary_picks(
+        self, session_key: str, user_config: Optional[dict],
+        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP,
+    ) -> None:
         """Clear only plain picks after an idle window; --session remains pinned."""
         cfg = parse_attended_config(user_config or {})
         if not cfg.enabled:
@@ -292,21 +317,64 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         conversation = state.conversation
         stamp = conversation.last_user_activity_at
         if stamp is None:
-            with suppress(Exception):
-                stamp = self.session_store.get_last_user_activity_at(session_key)
-            if stamp is not None and hasattr(stamp, "timestamp"):
-                stamp = stamp.timestamp()
+            if activity_stamp is not _NO_ATTENDED_ACTIVITY_STAMP:
+                stamp = activity_stamp
+            else:
+                stamp = self._load_attended_activity_stamp(session_key)
             conversation.last_user_activity_at = stamp
         if is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
             return
         if conversation.model_override is not None and conversation.model_override_scope == "temporary":
-            conversation.model_override = None
-            self._session_model_overrides.pop(session_key, None)
-            with suppress(Exception):
-                self.session_store.set_model_override(session_key, None)
-            self._evict_cached_agent(session_key)
+            persist = self._persist_session_model_override
+            loop = getattr(self, "_gateway_loop", None)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    if loop is not None and loop.is_running():
+                        future = asyncio.run_coroutine_threadsafe(
+                            persist(session_key, None, scope="session"), loop,
+                        )
+                        future.result()
+                    else:
+                        asyncio.run(persist(session_key, None, scope="session"))
+                except Exception:
+                    logger.debug("Failed to expire temporary attended model pick", exc_info=True)
+                else:
+                    self._evict_cached_agent(session_key)
+            else:
+                logger.debug("Skipping synchronous attended expiry on the gateway loop")
         if conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary":
             self._set_session_reasoning_override(session_key, None)
+
+    async def _expire_attended_temporary_picks_async(
+        self, session_key: str, user_config: Optional[dict],
+        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP,
+    ) -> None:
+        """Async-loop-safe expiry for the first route resolution after restart."""
+        cfg = parse_attended_config(user_config or {})
+        if not cfg.enabled:
+            return
+        state = self._session_state(session_key)
+        conversation = state.conversation
+        stamp = conversation.last_user_activity_at
+        if stamp is None:
+            if activity_stamp is _NO_ATTENDED_ACTIVITY_STAMP:
+                stamp = await asyncio.to_thread(self._load_attended_activity_stamp, session_key)
+            else:
+                stamp = activity_stamp
+            conversation.last_user_activity_at = stamp
+        if is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
+            return
+        if conversation.model_override is not None and conversation.model_override_scope == "temporary":
+            try:
+                await self._persist_session_model_override(session_key, None, scope="session")
+            except Exception:
+                logger.debug("Failed to expire temporary attended model pick", exc_info=True)
+            else:
+                self._evict_cached_agent(session_key)
+        if conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary":
+            await asyncio.to_thread(self._set_session_reasoning_override, session_key, None)
 
     def _snapshot_session_runtime_state(self, skey):
         override = self._session_model_override(skey) if skey else None
@@ -321,16 +389,30 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         model, runtime, notice, cache_model = resolved
         # Worker resolution normally never writes session state; an unavailable attended route must
         # consume the staged switch-in line so the one fallback notice is the only notice for this turn.
-        self._pre_agent_fallback_notice = notice
-        if notice and skey:
+        self._pre_agent_fallback_notice = notice  # legacy, not read by turn execution
+        if skey:
             state = self._peek_session_state(skey)
             if state is not None:
-                state.conversation.pending_attended_notice = None
+                state.conversation.pre_agent_fallback_notice = notice
+                if notice:
+                    state.conversation.pending_attended_notice = None
         if cache_model:
             if skey:
                 self._session_state(skey).conversation.last_resolved_model = model
             self._session_state("*").conversation.last_resolved_model = model
         return model, runtime
+
+    def _consume_pre_agent_fallback_notice(self, session_key: Optional[str]):
+        """Consume the fallback notice for one session without crossing session boundaries."""
+        if session_key:
+            state = self._peek_session_state(session_key)
+            if state is not None:
+                notice = state.conversation.pre_agent_fallback_notice
+                state.conversation.pre_agent_fallback_notice = None
+                return notice
+        notice = getattr(self, "_pre_agent_fallback_notice", None)
+        self._pre_agent_fallback_notice = None
+        return notice
 
     @staticmethod
     def _load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route=None):
@@ -463,17 +545,30 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         """Off-loop reads/credentials, on-loop snapshots and compare-and-set commits."""
         skey = self._resolve_session_key_or_none(source, session_key)
         self._pre_agent_fallback_notice = None
+        activity_stamp = _NO_ATTENDED_ACTIVITY_STAMP
         if skey:
+            state = self._session_state(skey)
+            attended_enabled = parse_attended_config(user_config or {}).enabled
+            if attended_enabled:
+                state.conversation.last_attended_decision = None
+                state.conversation.pre_agent_fallback_notice = None
             async with self._session_model_override_lock(skey):
                 if self._session_model_override(skey) is None:
                     epoch = self._session_model_override_epoch(skey)
                     hydrated = await asyncio.to_thread(self._load_session_model_override, skey)
                     self._commit_session_model_override(skey, hydrated, epoch)
+            if attended_enabled and state.conversation.last_user_activity_at is None:
+                activity_stamp = await asyncio.to_thread(self._load_attended_activity_stamp, skey)
+                state.conversation.last_user_activity_at = activity_stamp
+            if attended_enabled:
+                await self._expire_attended_temporary_picks_async(
+                    skey, user_config, activity_stamp=activity_stamp,
+                )
         while True:
             override, last_model, epoch = self._snapshot_session_runtime_state(skey)
             attended_route = self._attended_route_for_session(
                 source=source, session_key=skey, user_config=user_config, override=override,
-                last_model=last_model,
+                last_model=last_model, activity_stamp=activity_stamp,
             )
             resolved = await asyncio.to_thread(
                 self._load_session_agent_runtime, source=source, skey=skey, user_config=user_config,

@@ -675,13 +675,14 @@ class GatewayModelCommandsMixin:
         # Check for session override. See #30479.
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(source)
-        if request.target.strip().lower() == "reset" and not request.explicit_provider:
-            await self._persist_session_model_override_locked(session_key, None)
+        attended_enabled = parse_attended_config(_load_gateway_config()).enabled
+        if attended_enabled and request.target.strip().lower() == "reset" and not request.explicit_provider:
+            async with self._session_model_override_lock(session_key):
+                await self._persist_session_model_override_locked(session_key, None)
             self._session_model_overrides.pop(session_key, None)
             self._session_state(session_key).conversation.model_override_scope = "session"
             self._evict_cached_agent(session_key)
-            return "✓ Model override reset."
-        attended_enabled = parse_attended_config(_load_gateway_config()).enabled
+            return t("gateway.model.reset_done")
         requested_global = request.is_global
         effective_global = resolve_persist_behavior(
             request.is_global, request.is_session, is_once=request.is_once,

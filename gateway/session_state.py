@@ -53,6 +53,8 @@ class ConversationState:
     last_resolved_model: str = ""  # last successfully-resolved non-empty model
     last_user_activity_at: Optional[float] = None  # durable mirror lives on SessionEntry
     pending_attended_notice: Optional[str] = None  # one switching-in line for this turn
+    last_attended_decision: Any = None  # route precedence decision for this session's current turn
+    pre_agent_fallback_notice: Optional[str] = None  # one-shot fallback notice for this session
     queued_events: list[Any] = field(default_factory=list)  # /queue overflow FIFO (head in adapter)
     sidecar_notes: list[str] = field(default_factory=list)  # one-shot must-deliver notes
     ephemeral_pin: Optional[tuple[Any, ...]] = None  # pinned session-context (change_key, text, redact_pii)
