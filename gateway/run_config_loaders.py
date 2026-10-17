@@ -180,7 +180,7 @@ class GatewayConfigLoadersMixin:
 
     def _resolve_session_reasoning_config(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
-        model: str = "",
+        model: str = "", profile_home=None,
     ) -> dict | None:
         """Session ``/reasoning --session`` > per-model ``agent.reasoning_overrides`` > global.
 
@@ -191,9 +191,9 @@ class GatewayConfigLoadersMixin:
         override = self._session_reasoning_override(resolved_session_key)
         if override is not None:
             return override
-        profile_home = None
         resolve_profile_home = getattr(self, "_resolve_profile_home_for_source", None)
-        if (getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        if (profile_home is None
+                and getattr(getattr(self, "config", None), "multiplex_profiles", False)
                 and source is not None and callable(resolve_profile_home)):
             profile_home = resolve_profile_home(source)
         if profile_home is None:
