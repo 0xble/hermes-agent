@@ -1505,6 +1505,23 @@ def test_candidate_import_smoke_accepts_enabled_manifest_only_language_pack(tmp_
     releases.smoke_plugins(source, home)
 
 
+def test_candidate_import_smoke_rejects_enabled_portable_plugin_load_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "portable-test"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [portable-test]\n", encoding="utf-8")
+    (plugin / "plugin.json").write_text(json.dumps({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": "portable-test",
+        "extensions": {"com.nousresearch.hermes": {"servers": {"worker": {}}}},
+    }), encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    with pytest.raises(RuntimeError, match="no matching mcp.json server"):
+        releases.smoke_plugins(source, home)
+
+
 def test_candidate_import_smoke_rejects_disabled_enabled_portable_plugin(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"

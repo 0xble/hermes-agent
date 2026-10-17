@@ -411,6 +411,10 @@ def _smoke_imports() -> None:
         if manifest.portable or manager._is_manifest_only_language_pack(manifest):
             if gate.action in {"load", "load_now"}:
                 manager._load_plugin(manifest)
+                loaded = manager._plugins.get(manifest_key(manifest))
+                if loaded is None or not loaded.enabled:
+                    detail = getattr(loaded, "error", None) or "plugin did not load"
+                    raise RuntimeError(f"enabled plugin {manifest.name}: {detail}")
             continue
         if gate.action not in {"load", "load_now"}:
             continue
