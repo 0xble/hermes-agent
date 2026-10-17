@@ -482,7 +482,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         model, runtime, notice, cache_model = resolved
         # Worker resolution normally never writes session state; an unavailable attended route must
         # consume the staged switch-in line so the one fallback notice is the only notice for this turn.
-        self._handoff_attended_state(None, runner={"_pre_agent_fallback_notice": notice})
+        handoff = getattr(self, "_handoff_attended_state", None)
+        if callable(handoff) and getattr(handoff, "__self__", None) is self:
+            handoff(None, runner={"_pre_agent_fallback_notice": notice})
+        else:
+            # Test doubles and legacy bound runners do not expose the handoff helper; retain the
+            # synchronous compatibility field for those callers.
+            self._pre_agent_fallback_notice = notice
         if skey:
             fields = {"pre_agent_fallback_notice": notice}
             if notice:

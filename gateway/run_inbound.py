@@ -1698,7 +1698,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         # a worker hop before every /command and can miss the adapter's bounded response window.
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
-            await self._mark_attended_user_activity(event, source, _quick_key)
+            # Activity bookkeeping is telemetry for an already-dispatched command.  Do not hold the
+            # adapter's bounded command response on the opt-in config/store worker hop.
+            asyncio.create_task(self._mark_attended_user_activity(event, source, _quick_key))
             return _result
 
         # Non-command messages need their activity stamp before a running/new turn resolves its
