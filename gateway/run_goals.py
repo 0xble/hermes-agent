@@ -1182,6 +1182,20 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         except WakeNotAccepted:
             logger.info("goal wakeup: continuation for session %s not admitted; barrier kept for retry", sid)
             return
+        # The lifted-barrier path dispatches before the continuation turn's evaluator runs. Stamp
+        # this accepted wake now so a CONTINUE result cannot immediately dispatch a second one.
+        # Admission may rebind the continuation to a compression successor, so stamp the live
+        # destination from the event metadata rather than the pre-admission manager.
+        accepted_sid = str(event.metadata.get("goal_continuation_session_id") or sid)
+        anchor_mgr = mgr if accepted_sid == sid else GoalManager(
+            session_id=accepted_sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
+        )
+        await self._run_in_executor_with_context(
+            lambda: anchor_mgr.mark_automatic_continuation_dispatched(
+                expected_instance=event.metadata.get("goal_continuation_instance"),
+                expected_fingerprint=event.metadata.get("goal_continuation_fingerprint"),
+            )
+        )
         # Resuming is silent: the continuation turn itself is the visible signal.
         await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
 

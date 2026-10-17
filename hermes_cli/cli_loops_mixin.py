@@ -609,7 +609,9 @@ class CLILoopsMixin:
                 from cli import _DIM, _RST, _cprint
                 _cprint(f"  {_DIM}{t('cli.goal.barrier_lifted')}{_RST}")
                 since = mgr.state.waiting_since
+                instance = mgr.state.created_at
                 self._pending_input.put(prompt)
+                mgr.mark_automatic_continuation_dispatched(expected_instance=instance)
                 mgr.clear_lifted_wait(since)
         except Exception as exc:
             logging.debug("parked-goal resume check failed: %s", exc)

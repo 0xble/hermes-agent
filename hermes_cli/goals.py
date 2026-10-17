@@ -3179,6 +3179,54 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
         return self._mutate_current(_apply)
 
     @snapshot_control
+    def mark_automatic_continuation_dispatched(
+        self, dispatched_at: Optional[float] = None, *,
+        expected_instance: Optional[float] = None,
+        expected_fingerprint: Optional[str] = None,
+    ) -> bool:
+        """Stamp an accepted idle-watcher continuation when its admission is accepted.
+
+        The post-turn evaluator stamps continuations it decides to emit, but the lifted-barrier
+        watcher dispatches before that evaluator runs. Recording the admission here makes that wake
+        the automatic-chain anchor too. Expected identity fields prevent a stale wake from pacing a
+        replacement goal, and a compressed successor is followed only when it carries the same goal
+        instance."""
+        stamp = time.time() if dispatched_at is None else float(dispatched_at)
+        expected_created_at = None if expected_instance is None else float(expected_instance)
+
+        def _apply(state):
+            if state is None or state.status != "active":
+                return False
+            if expected_created_at is not None and state.created_at != expected_created_at:
+                return False
+            if expected_fingerprint is not None:
+                from hermes_cli.session_controls import _definition_fingerprint
+                if _definition_fingerprint("goal", state.to_json()) != expected_fingerprint:
+                    return False
+            state.last_automatic_continuation_at = max(
+                float(state.last_automatic_continuation_at or 0.0), stamp,
+            )
+            return True
+
+        marked = self._mutate_current(_apply)
+        if marked or expected_created_at is None:
+            return bool(marked)
+
+        # Compression can archive the original row after admission but before this mutation. Follow
+        # the validated successor and preserve the same instance fence instead of stamping a stale
+        # parent or an unrelated replacement.
+        from hermes_cli.session_controls import migrated_successor
+        successor = migrated_successor("goal", self.session_id or "")
+        moved = load_goal(successor) if successor else None
+        if moved is None or moved.created_at != expected_created_at:
+            return False
+        self.session_id = successor
+        return self.mark_automatic_continuation_dispatched(
+            dispatched_at=stamp, expected_instance=expected_created_at,
+            expected_fingerprint=expected_fingerprint,
+        )
+
+    @snapshot_control
     def clear_lifted_wait(self, waiting_since: float) -> bool:
         """Clear the barrier an idle surface just resumed, only if it is still that same wait
         (matched by ``waiting_since`` on the durable row). The resumed turn may already have finished
