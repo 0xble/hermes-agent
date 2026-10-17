@@ -32,7 +32,7 @@ attended/default resolver to run again.
 Fork patch identities: `attended-model-switching` and
 `gateway-telegram-topic-tool`.
 
-The attended feature adds per-topic attended routing, idle expiry, persisted activity timestamps, and turn-boundary model resolution. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly. The topic tool commits through the gateway's existing model and reasoning persistence paths rather than adding a second store.
+The attended feature adds per-topic attended routing, idle expiry, persisted activity timestamps, and route re-evaluation before every API call. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly. The topic tool commits through the gateway's existing model and reasoning persistence paths rather than adding a second store.
 
 The combined resolution is implemented in `gateway/run_turn.py` and
 `gateway/run_config_loaders.py`; the topic commit path is
