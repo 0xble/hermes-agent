@@ -1103,7 +1103,7 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
             "compression exhaustion", block if isinstance(block, str) else "unknown guard", session,
         )
         _final = (
-            "Context compression is temporarily paused after a recent failed attempt. Please retry "
+            "⏸️ Context compression is temporarily paused after a recent failed attempt. Please retry "
             "in a moment — compression will resume automatically (or run /compress to force a retry now)."
         )
     else:
@@ -1113,7 +1113,7 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
             "counting as compression exhaustion", session, holder if isinstance(holder, str) else "unconfirmed",
         )
         _final = (
-            "Context compression is already running for this session. Please retry in a moment — "
+            "⏳ Context compression is already running for this session. Please retry in a moment — "
             "your next message will be processed once the concurrent compression finishes."
         )
     try:

@@ -38,6 +38,11 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   in every locale, plus the ACP queue, steer-fallback and busy-queue replies. Upstream
   still renders the bare text. Retire by upstreaming the locale change.
 
+- Patch identity: `compression-defer-emoji`. The soft compression-deferred turn reply leads
+  with ⏳ when another path holds the compression lock and ⏸️ when compression is transiently
+  paused, matching the other busy and retry cards (`agent/conversation_loop.py`
+  `_compression_deferred_result`). Upstream still renders the bare text. Retire by upstreaming.
+
 ## Verification
 
 `tests/gateway/test_telegram_voice_v0_regressions.py` asserts the ⏳ queue reply.
