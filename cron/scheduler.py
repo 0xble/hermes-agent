@@ -3870,7 +3870,8 @@ def _cleanup_external_worker_state(
 
 
 def _reconcile_deferred_external_worker_outcome(
-    job_id: str, home: Path, process: subprocess.Popen, error: str, *, worker_terminated: bool,
+    job_id: str, home: Path, process: subprocess.Popen, error: str, *, execution_id: str,
+    worker_terminated: bool,
 ) -> None:
     """Project a terminal worker result after a bounded waiter returned early."""
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -3888,6 +3889,7 @@ def _reconcile_deferred_external_worker_outcome(
                     worker_exited=True,
                     worker_terminated=worker_terminated,
                     worker_exit_code=process.poll(),
+                    execution_id=execution_id,
                 )
     finally:
         reset_hermes_home_override(home_token)
@@ -3895,7 +3897,7 @@ def _reconcile_deferred_external_worker_outcome(
 
 def _defer_external_worker_claim_release(
     job_id: str, home: Path, owner, process: subprocess.Popen,
-    *, outcome_error: Optional[str] = None, worker_terminated: bool = False,
+    *, execution_id: str, outcome_error: Optional[str] = None, worker_terminated: bool = False,
 ) -> None:
     """Reconcile a live restart-safe worker after exit, then release its fenced claim."""
     key = _inflight_key(job_id, home)
@@ -3925,6 +3927,7 @@ def _defer_external_worker_claim_release(
                         home,
                         process,
                         outcome_error,
+                        execution_id=execution_id,
                         worker_terminated=worker_terminated,
                     )
                 except Exception:
@@ -4039,6 +4042,7 @@ def _wait_for_external_cron_worker(
                     claim_home,
                     claim_owner,
                     process,
+                    execution_id=execution_id,
                     outcome_error=deferred_outcome_error,
                     worker_terminated=deferred_worker_terminated,
                 )

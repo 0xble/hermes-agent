@@ -8,6 +8,7 @@ logger = logging.getLogger("cron.scheduler")
 def record_external_worker_outcome(
     job: dict, *, error=None, adapters=None, loop=None, worker_exited: bool = False,
     worker_terminated: bool = False, worker_exit_code: int | None = None,
+    execution_id: str | None = None,
 ) -> bool:
     """Project a detached worker's terminal result onto the job record.
 
@@ -22,7 +23,11 @@ def record_external_worker_outcome(
     from cron import scheduler
     from cron.unreachable_retry import is_retry_run
 
-    execution = scheduler.get_execution(str(job["execution_id"]))
+    execution_key = execution_id or job.get("execution_id")
+    if not execution_key:
+        logger.error("Job '%s': cannot reconcile worker outcome without execution id", job.get("id"))
+        return False
+    execution = scheduler.get_execution(str(execution_key))
     status = execution.get("status") if execution else None
     if not execution or status not in ("completed", "failed", "unknown"):
         return False

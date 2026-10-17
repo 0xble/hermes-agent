@@ -1243,6 +1243,33 @@ def test_nonzero_terminal_worker_projects_post_commit_failure(monkeypatch):
     deliver_crash.assert_called_once()
 
 
+def test_external_worker_outcome_uses_explicit_execution_id_for_reloaded_job(monkeypatch):
+    """Deferred reconciliation must not depend on a transient job field."""
+    from cron import scheduler
+    from cron.scheduler_worker_failure import record_external_worker_outcome
+
+    job = {"id": "job-1", "fire_claim": {"by": "owner-1"}}
+    mark_job_run = Mock()
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        lambda execution_id: {
+            "id": execution_id,
+            "status": "completed",
+            "output": "ok",
+        },
+    )
+    monkeypatch.setattr(scheduler, "fire_claim_fence", lambda *args, **kwargs: nullcontext(True))
+    monkeypatch.setattr(scheduler, "mark_job_run", mark_job_run)
+
+    assert record_external_worker_outcome(
+        job,
+        worker_exited=True,
+        execution_id="exec-1",
+    ) is True
+    assert mark_job_run.call_args.kwargs["success"] is True
+
+
 def test_deferred_worker_reaper_reconciles_outcome_before_release(monkeypatch, tmp_path):
     """A bounded early return still settles the durable job outcome after worker exit."""
     from cron import scheduler
@@ -1281,6 +1308,7 @@ def test_deferred_worker_reaper_reconciles_outcome_before_release(monkeypatch, t
             home,
             owner,
             process,
+            execution_id="exec-deferred",
             outcome_error="worker remained alive after bounded exit wait",
             worker_terminated=True,
         )
