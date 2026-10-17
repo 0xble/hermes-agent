@@ -66,6 +66,7 @@ gateway:
     usage_switch_model: "`/model <name>` — змінити модель"
     usage_switch_provider: "`/model <name> --provider <slug>` — змінити провайдера"
     usage_persist: "`/model <name> --global` — зберегти назавжди"
+    reset_done: "✓ Model override reset."
     err_skew: "Цей шлюз виконує код із {boot_rev}, але робоча копія на диску вже {disk_rev}. Перемикання моделі може призвести до збою через застарілі модулі — перезапустіть шлюз, щоб завантажити новий код: hermes gateway restart"
     err_switch_failed: "Не вдалося перемкнути модель на {model} ({error}); залишаємось на {current}."
     err_config_not_updated: "config.yaml не оновлено ({error})"

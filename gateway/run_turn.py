@@ -2718,6 +2718,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        if not getattr(event, "_attended_activity_marked", False):
+            mark_activity = getattr(self, "_mark_attended_user_activity", None)
+            if callable(mark_activity):
+                activity_result = mark_activity(event, source, session_key)
+                if inspect.isawaitable(activity_result):
+                    await activity_result
         from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY
         if (
             isinstance(getattr(event, "metadata", None), dict)

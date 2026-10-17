@@ -1448,8 +1448,9 @@ class TurnRunner:
             unavailable_emitted = False
             if decision.reason == "attended" and destination_route == current_route:
                 unavailable = getattr(runner, "_pre_agent_fallback_notice", None)
-                if unavailable:
-                    agent._emit_diagnostic_status(unavailable)
+                emit_status = getattr(agent, "_emit_diagnostic_status", None)
+                if unavailable and callable(emit_status):
+                    emit_status(unavailable)
                     unavailable_emitted = True
             if destination_route != current_route:
                 if loop_state is not None:
@@ -1468,7 +1469,9 @@ class TurnRunner:
                 route_state.conversation.last_resolved_model = model
             if decision.reason == "attended" and not unavailable_emitted and not (previous_key and previous_key[-1]):
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
-                agent._emit_diagnostic_status(f"↻ {model} · {effort}")
+                emit_status = getattr(agent, "_emit_diagnostic_status", None)
+                if callable(emit_status):
+                    emit_status(f"↻ {model} · {effort}")
             if ctx.session_key:
                 state = runner._peek_session_state(ctx.session_key)
                 if state is not None:
@@ -2198,7 +2201,9 @@ class TurnRunner:
         state = runner._session_state(ctx.session_key) if ctx.session_key else None
         attended_notice = getattr(getattr(state, "conversation", None), "pending_attended_notice", None)
         if attended_notice:
-            agent._emit_diagnostic_status(attended_notice)
+            emit_status = getattr(agent, "_emit_diagnostic_status", None)
+            if callable(emit_status):
+                emit_status(attended_notice)
             if state is not None:
                 state.conversation.pending_attended_notice = None
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)

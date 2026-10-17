@@ -263,7 +263,7 @@ class GatewayModelCommandsMixin:
             "capabilities": dict(result.runtime_capabilities or {}),
         }
         self._session_state(ctx.session_key).conversation.model_override_scope = (
-            "once" if one_turn else ctx.model_override_scope
+            "once" if one_turn else getattr(ctx, "model_override_scope", "session")
         )
         if one_turn:
             # A repeated --once before the turn runs must keep the EARLIEST snapshot: the later
@@ -306,7 +306,7 @@ class GatewayModelCommandsMixin:
             try:
                 await self._persist_session_model_override_locked(
                     ctx.session_key, self._session_model_overrides[ctx.session_key],
-                    scope=ctx.model_override_scope,
+                    scope=getattr(ctx, "model_override_scope", "session"),
                 )
             except Exception:
                 logger.debug("Failed to persist session model override", exc_info=True)
@@ -439,10 +439,14 @@ class GatewayModelCommandsMixin:
             # `/model X --reasoning <level>`: same applier as /reasoning, same scope as the pick.
             # The record step already evicted the cached agent, so the pin lands on the rebuild.
             from gateway.run import _platform_config_key
-            reply += "\n" + await self._apply_reasoning_selection_off_loop(
-                ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
-                persist_global=ctx.persist_global and global_error is None,
-                scope=ctx.model_override_scope if ctx.model_override_scope == "temporary" else None)
+            if ctx.model_override_scope == "temporary":
+                reply += "\n" + await self._apply_reasoning_selection_off_loop(
+                    ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
+                    persist_global=ctx.persist_global and global_error is None, scope="temporary")
+            else:
+                reply += "\n" + await self._apply_reasoning_selection_off_loop(
+                    ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
+                    persist_global=ctx.persist_global and global_error is None)
         return reply
 
     def _model_switch_context(

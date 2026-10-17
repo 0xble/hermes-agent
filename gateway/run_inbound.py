@@ -1609,19 +1609,29 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
             return event, source, is_internal
 
-    async def _mark_attended_user_activity(self, event, source, session_key: str) -> None:
-        """Persist genuine Brian activity; relays, edits, wakeups, and internal notices are inert."""
-        if not is_genuine_user_message(event) or not session_key:
-            return
+    async def _mark_attended_user_activity(self, event, source, session_key: str | None = None) -> bool:
+        """Persist genuine Brian activity only for an existing session when attended routing is enabled."""
+        if not is_genuine_user_message(event):
+            return False
         try:
-            entry = await self.async_session_store.get_or_create_session(source, touch_activity=False)
+            from gateway.run import _load_gateway_config
+            from gateway.attended_model import parse_attended_config
+            if not parse_attended_config(_load_gateway_config()).enabled:
+                return False
+            if not session_key:
+                session_key = self._session_key_for_source(source)
+            if not session_key:
+                return False
+            entry = await self.async_session_store.lookup_by_session_key(session_key)
+            if entry is None:
+                return False
             await self.async_session_store.mark_user_activity(entry.session_key)
             stamp = time.time()
             self._session_state(session_key).conversation.last_user_activity_at = stamp
-            if entry.session_key != session_key:
-                self._session_state(entry.session_key).conversation.last_user_activity_at = stamp
+            return True
         except Exception:
             logger.debug("attended-model activity stamp failed", exc_info=True)
+            return False
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         from gateway.outbox import scoped_turn_entry, restore_turn, store_for
@@ -1660,7 +1670,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         alias_text = self._quick_command_alias_text(event)
         if alias_text is not None:
             event.text = alias_text
-        await self._mark_attended_user_activity(event, source, self._session_key_for_source(source))
+        _attended_activity_marked = await self._mark_attended_user_activity(event, source)
+        if _attended_activity_marked:
+            setattr(event, "_attended_activity_marked", True)
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)
@@ -1682,6 +1694,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
+            if not _attended_activity_marked:
+                await self._mark_attended_user_activity(event, source, _quick_key)
             return _result
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
