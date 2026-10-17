@@ -195,6 +195,7 @@ _MEDIA_KIND_KEYS = {
 
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.rich_messages import project_rich_message
+from plugins.platforms.telegram.rich_delivery import is_rich_capability_error, is_rich_fallback_error, rich_message_payload
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
@@ -1848,40 +1849,16 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         return self.RICH_MESSAGE_MAX_CHARS if self._rich_transport_available() else None
 
     def _rich_message_payload(self, content: str, *, skip_entity_detection: bool = False) -> Dict[str, Any]:
-        """``InputRichMessage`` from RAW markdown — never ``format_message(content)``, whose MarkdownV2
-        escaping destroys table pipes. Block-start ``#89``-style references are escaped first because
-        Telegram's rich parser accepts them as headings without the whitespace standard Markdown requires
-        (``escape_literal_hash_prefixes``); adjacent footnote references get a superscript comma so
-        ``[^2][^3]`` does not read as "23" and footnote definitions are split from a preceding list so the
-        first one is not dropped (``normalize_footnotes``); currency pairs are then backticked so they cannot
-        pair into inline LaTeX (``_protect_rich_currency``)."""
-        from .rich_markdown import escape_literal_hash_prefixes, normalize_footnotes
-
-        markdown = normalize_footnotes(escape_literal_hash_prefixes(_degrade_unsupported_markdown_links(content)))
-        payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(_protect_rich_currency(markdown))}
-        if skip_entity_detection:
-            payload["skip_entity_detection"] = True
-        return payload
+        """Return the shared raw-Markdown Rich Message payload."""
+        return rich_message_payload(content, skip_entity_detection=skip_entity_detection)
 
     def _is_rich_capability_error(self, exc: Exception) -> bool:
-        """True ⇒ the rich endpoint itself is unavailable (old PTB/server); latches rich off.
-        Per-message BadRequests (parser/limit) are NOT capability errors."""
-        if exc.__class__.__name__.lower() in {"endpointnotfound", "invalidtoken"}:
-            return True
-        if isinstance(exc, (AttributeError, TypeError, NotImplementedError)) or getattr(exc, "error_code", None) == 404:
-            return True
-        s = str(exc).lower()
-        if ("method" in s or "endpoint" in s) and ("not found" in s or "does not exist" in s):
-            return True
-        return "no such method" in s
+        """True when the rich endpoint itself is unavailable."""
+        return is_rich_capability_error(exc)
 
     def _is_rich_fallback_error(self, exc: Exception) -> bool:
-        """True ⇒ permanent/capability error ⇒ safe to fall back to legacy. Conservative: anything not
-        clearly permanent is transient — the rich request may have reached Telegram (duplicate risk)."""
-        if self._is_bad_request_error(exc) or self._is_rich_capability_error(exc):
-            return True
-        s = str(exc).lower()
-        return "unsupported" in s or "not implemented" in s
+        """True when it is safe to fall back to legacy MarkdownV2."""
+        return is_rich_fallback_error(exc)
 
     def _chunk_reply_routing(
         self, chat_id: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]], thread_id: Optional[str], index: int) -> tuple:
@@ -8928,11 +8905,12 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     if not token:
         from agent.secret_scope import get_secret  # profile-scoped: never borrow another profile's token
         token = get_secret("TELEGRAM_BOT_TOKEN", "") or ""
-    disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+    extra = getattr(pconfig, "extra", None) or {}
     from tools.send_message_tool import _send_telegram
     return await _send_telegram(
         token, chat_id, message, media_files=media_files, thread_id=thread_id,
-        disable_link_previews=disable_link_previews, force_document=force_document)
+        disable_link_previews=bool(extra.get("disable_link_previews")), force_document=force_document,
+        rich_messages=extra.get("rich_messages"), allow_cjk_rich_messages=extra.get("allow_cjk_rich_messages", False))
 
 
 def interactive_setup() -> None:
