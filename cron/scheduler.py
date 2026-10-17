@@ -2890,9 +2890,9 @@ def run_one_job(
                     delivery_outcome=delivery_outcome)
             return True
         if handed_off:
-            from cron.scheduler_worker_failure import record_unknown_worker_outcome
+            from cron.scheduler_worker_failure import record_external_worker_outcome
 
-            record_unknown_worker_outcome(job, adapters=adapters, loop=loop)
+            record_external_worker_outcome(job, adapters=adapters, loop=loop)
             return True
     if extra_prompt is None:
         # Gateway-forwarded manual run stamps its prompt on the job via trigger_job; the fire that

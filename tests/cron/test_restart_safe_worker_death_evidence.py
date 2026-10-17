@@ -112,6 +112,7 @@ else:
             "state": row["status"],
             "claim_released": record.get("fire_claim") is None,
             "job_error": record.get("last_error"),
+            "job_status": record.get("last_status"),
             "ledger_error": row.get("error"),
             "notice_calls": len(delivered),
         }
@@ -120,6 +121,7 @@ else:
         if death != "concurrent_recovery" and not death.startswith("timeout_"):
             assert "Scheduler restarted" not in row["error"]
         assert result["claim_released"], result
+        assert result["job_status"] == "error", result
         assert "worker-probe-startup-sentinel" in (result["job_error"] or ""), result
         assert len(delivered) == 1, result
         assert len(executions.list_executions()) <= executions.MAX_TERMINAL_EXECUTIONS
@@ -133,6 +135,43 @@ else:
         record_unknown_worker_outcome(claimed)
         assert get_job(job["id"])["fire_claim"] == replacement
         assert len(delivered) == 1
+
+
+def test_hard_wall_terminal_failure_projects_job_failure_and_notice(tmp_path, monkeypatch):
+    """A watchdog-failed ledger row must not leave the job's status at its prior value."""
+    import cron.executions as executions
+    import cron.scheduler as scheduler
+    from cron.jobs import claim_job_for_fire, create_job, get_job, use_cron_store
+    from cron.scheduler_worker_failure import record_external_worker_outcome
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", home / "cron" / "executions.db")
+    notices = []
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_crash_failure",
+        lambda *args, **kwargs: notices.append(args[1]) or (None, "failed"),
+    )
+
+    with use_cron_store(home):
+        job = create_job("hard wall probe", "every 1h", deliver="local")
+        claimed = claim_job_for_fire(job["id"], manual=True, return_job=True)
+        execution = executions.create_execution(job["id"], source="builtin")
+        executions.finish_execution(
+            execution["id"],
+            success=False,
+            error="Detached cron run exceeded hard wall-clock timeout (3s).",
+        )
+        claimed["execution_id"] = execution["id"]
+
+        assert record_external_worker_outcome(claimed)
+        record = get_job(job["id"])
+        assert record["last_status"] == "error"
+        assert "hard wall-clock timeout (3s)" in record["last_error"]
+        assert record.get("fire_claim") is None
+        assert notices == [record["last_error"]]
 
 
 def test_terminalizer_refuses_an_attempt_whose_worker_is_still_alive(
