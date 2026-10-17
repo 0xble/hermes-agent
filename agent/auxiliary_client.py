@@ -124,8 +124,12 @@ from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_lengt
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
 from agent.auxiliary_health import (
-    _custom_health_base_url, _unhealthy_cache_key, fallback_candidate_quarantine_ttl,
-    fallback_candidate_unavailable_reason,
+    AuxiliaryRouteIdentity, _custom_health_base_url, _unhealthy_cache_key,
+    claim_notice as _claim_auxiliary_notice, claim_probe as _claim_auxiliary_probe,
+    clear_health_after_probe as _clear_auxiliary_health_after_probe,
+    fallback_candidate_quarantine_ttl,
+    fallback_candidate_unavailable_reason, mark_unhealthy as _mark_auxiliary_health,
+    read_health as _read_auxiliary_health, reset_health_state as _reset_auxiliary_health,
 )
 from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
@@ -3172,13 +3176,17 @@ def _normalize_chain_label(provider: str) -> str:
 _AUX_UNHEALTHY_PAYMENT_REASON = "payment / credit error"
 
 
+def _auxiliary_route_identity(label: str, base_url: Optional[str] = None) -> AuxiliaryRouteIdentity:
+    """Build the non-secret identity shared by auxiliary callers."""
+    key = _unhealthy_cache_key(label, base_url)
+    return AuxiliaryRouteIdentity(*key)
+
+
 def _mark_provider_unhealthy(
     provider: str, ttl: Optional[float] = None, *, base_url: Optional[str] = None,
     reason: str = _AUX_UNHEALTHY_PAYMENT_REASON, level: int = logging.WARNING,
 ) -> None:
-    """Hide one provider endpoint until the TTL expires. ``reason`` is what the log says and what the
-    skip line echoes: absent credentials are an expected state (DEBUG), a confirmed 402 is a fault
-    (WARNING) — the old fixed payment wording sent local-only users chasing billing (#64144)."""
+    """Hide one auxiliary route in the compatibility cache and typed store."""
     label = _normalize_chain_label(provider)
     if not label:
         return
@@ -3187,6 +3195,9 @@ def _mark_provider_unhealthy(
     expires_at = time.time() + ttl
     _aux_unhealthy_until[key] = expires_at
     _aux_unhealthy_reason[key] = reason
+    _mark_auxiliary_health(
+        _auxiliary_route_identity(label, base_url), ttl=ttl, reason=reason,
+    )
     logger.log(
         level,
         "Auxiliary: marking %s unhealthy for %ds (%s). "
@@ -3195,29 +3206,50 @@ def _mark_provider_unhealthy(
     )
 
 
-def _is_provider_unhealthy(label: str, base_url: Optional[str] = None) -> bool:
-    """True iff this provider endpoint is unhealthy and unexpired; lazily evicts expired entries."""
+def _clear_provider_health(provider: str, base_url: Optional[str] = None) -> None:
+    label = _normalize_chain_label(provider)
     if not label:
-        return False
+        return
     key = _unhealthy_cache_key(label, base_url)
-    expires_at = _aux_unhealthy_until.get(key)
-    if expires_at is None:
-        return False
-    if time.time() >= expires_at:
+    identity = _auxiliary_route_identity(label, base_url)
+    cleared = _clear_auxiliary_health_after_probe(identity)
+    if cleared or _read_auxiliary_health(identity) is None:
         _aux_unhealthy_until.pop(key, None)
         _aux_unhealthy_logged_at.pop(key, None)
         _aux_unhealthy_reason.pop(key, None)
+
+
+def _is_provider_unhealthy(label: str, base_url: Optional[str] = None) -> bool:
+    """True iff this auxiliary route is unhealthy and unexpired."""
+    if not label:
         return False
-    return True
+    key = _unhealthy_cache_key(label, base_url)
+    record = _read_auxiliary_health(_auxiliary_route_identity(label, base_url))
+    if record is not None:
+        _aux_unhealthy_until[key] = record.expires_at
+        _aux_unhealthy_reason[key] = record.reason
+        return True
+    # Typed state is authoritative. Clear stale compatibility entries so a recovery
+    # in another process is visible to this caller too.
+    _aux_unhealthy_until.pop(key, None)
+    _aux_unhealthy_logged_at.pop(key, None)
+    _aux_unhealthy_reason.pop(key, None)
+    probe = _claim_auxiliary_probe(_auxiliary_route_identity(label, base_url))
+    return probe is False
 
 
 def _log_skip_unhealthy(
     label: str, task: Optional[str] = None, *, base_url: Optional[str] = None,
 ) -> None:
-    """Log a skipped unhealthy provider at most once per minute per label."""
+    """Log a skipped unhealthy provider at most once per minute per route."""
     now = time.time()
     key = _unhealthy_cache_key(label, base_url)
     if now - _aux_unhealthy_logged_at.get(key, 0.0) >= 60:
+        record = _read_auxiliary_health(_auxiliary_route_identity(label, base_url))
+        if record is not None and not _claim_auxiliary_notice(
+            _auxiliary_route_identity(label, base_url), record.epoch,
+        ):
+            return
         _aux_unhealthy_logged_at[key] = now
         expires_at = _aux_unhealthy_until.get(key, now)
         logger.info(
@@ -3227,11 +3259,27 @@ def _log_skip_unhealthy(
         )
 
 
+def _warn_auxiliary_route_once(route: Any, reason: str, error: BaseException) -> None:
+    label = _normalize_chain_label(route.resolved_provider or "")
+    base_url = route.base_info
+    record = _read_auxiliary_health(_auxiliary_route_identity(label, base_url)) if label else None
+    if record is not None and not _claim_auxiliary_notice(
+        _auxiliary_route_identity(label, base_url), record.epoch,
+    ):
+        return
+    logger.warning(
+        "Auxiliary %s%s: %s on %s and all fallbacks exhausted "
+        "(fallback_chain + main agent model). Raising the primary error.",
+        route.task or "call", route.tag, reason, route.resolved_provider,
+    )
+
+
 def _reset_aux_unhealthy_cache() -> None:
-    """Clear the unhealthy cache (tests / explicit user reset)."""
+    """Clear auxiliary health state (tests / explicit user reset)."""
     _aux_unhealthy_until.clear()
     _aux_unhealthy_logged_at.clear()
     _aux_unhealthy_reason.clear()
+    _reset_auxiliary_health()
 
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
@@ -3391,8 +3439,13 @@ def _is_auth_unavailable_error(exc: Exception) -> bool:
 
 
 def _is_server_error(exc: Exception) -> bool:
-    """HTTP 5xx/408 failures may retry once, then must move to a configured fallback."""
+    """HTTP 5xx/408 failures may retry once, then must move to a configured fallback.
+
+    A 408 that reports a timeout stays with the timeout rung, which names it as one.
+    """
     status = _exc_http_status(exc)
+    if status == 408 and _is_timeout_error(exc):
+        return False
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 
@@ -4214,7 +4267,9 @@ def _call_fallback_candidate_sync(
         return send_with_parameter_rungs(
             lambda c, kw: _send(c, kw, dest), client, request_kwargs, task=task)
     try:
-        return _send_recovering(fb_client, fb_kwargs, destination)
+        result = _send_recovering(fb_client, fb_kwargs, destination)
+        _clear_provider_health(destination.provider, destination.base_url)
+        return result
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             capacity = fallback_candidate_unavailable_reason(fb_err)
@@ -4230,7 +4285,9 @@ def _call_fallback_candidate_sync(
         if retry is not None:
             failed_destination = retry[2]
             try:
-                return _send_recovering(*retry)
+                result = _send_recovering(*retry)
+                _clear_provider_health(failed_destination.provider, failed_destination.base_url)
+                return result
             except Exception as retry_err:
                 if not _is_auth_error(retry_err) and fallback_candidate_unavailable_reason(retry_err) is None:
                     raise
@@ -4264,7 +4321,9 @@ async def _call_fallback_candidate_async(
         return await send_with_parameter_rungs_async(
             lambda c, kw: _send(c, kw, dest), client, request_kwargs, task=task)
     try:
-        return await _send_recovering(fb_client, fb_kwargs, destination)
+        result = await _send_recovering(fb_client, fb_kwargs, destination)
+        _clear_provider_health(destination.provider, destination.base_url)
+        return result
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             capacity = fallback_candidate_unavailable_reason(fb_err)
@@ -4280,7 +4339,9 @@ async def _call_fallback_candidate_async(
         if retry is not None:
             failed_destination = retry[2]
             try:
-                return await _send_recovering(*retry)
+                result = await _send_recovering(*retry)
+                _clear_provider_health(failed_destination.provider, failed_destination.base_url)
+                return result
             except Exception as retry_err:
                 if not _is_auth_error(retry_err) and fallback_candidate_unavailable_reason(retry_err) is None:
                     raise
@@ -7920,12 +7981,15 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     )
     if reason is None or not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
         return None
-    if reason == "payment error":
-        # Mark the concrete backend (not the "auto" label) unhealthy so later aux calls skip
-        # it instead of paying another doomed RTT.
+    # Capacity/auth failures quarantine the concrete auxiliary route across callers/processes.
+    if reason in {"payment error", "auth error", "rate limit"}:
         _mark_provider_unhealthy(
             _recoverable_pool_provider(resolved_provider, route.client, main_runtime=route.main_runtime)
-            or resolved_provider, base_url=route.base_info)
+            or resolved_provider,
+            base_url=route.base_info,
+            reason=reason,
+        )
+        logger.debug("Auxiliary route failure quarantined via route health", exc_info=False)
     if reason == "request timed out":
         # WARNING, naming the endpoint, the budget and the knob: the only other trace of a slow
         # local model is the fallback provider's complaint about a model it never had (#89445).
@@ -7980,13 +8044,8 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
             task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
             task_chain_only=explicit_auth_with_task_chain)
-    # All fallback layers exhausted — one user-visible warning, then re-raise.
-    logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
-                   # All fallback layers exhausted — emit a single user-visible warning so the operator
-                   # knows aux task is about to fail. (#26882) The error itself is re-raised below.
-                   # (#26882)
-                   "(fallback_chain + main agent model). Raising the primary error.",
-                   task or "call", tag, reason, resolved_provider)
+    # All fallback layers exhausted — emit one user-visible warning for this route-health epoch.
+    _warn_auxiliary_route_once(route, reason, first_err)
     return None
 
 
@@ -8260,7 +8319,7 @@ def _call_llm_impl(
         # (default 2 retries → 3 total attempts); a second/third failure or any non-transient error falls
         # through to ``first_err`` and the existing fallback handling unchanged. Unified home for the
         # transient retry every auxiliary task shares. (PR #16587)
-        return _validate_llm_response(
+        response = _validate_llm_response(
             _relay_sync_completion(
                 client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
                 create=lambda request: _create_with_progress(
@@ -8271,6 +8330,8 @@ def _call_llm_impl(
             ),
             task, **validate_kw,
         )
+        _clear_provider_health(request_provider, req.base_info)
+        return response
     try:
         # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for
         # transient blips before escalating to fallback — a dropped connection shouldn't
@@ -8299,9 +8360,13 @@ def _call_llm_impl(
         def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
-                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
+                response = _validate_llm_response(_relay_sync_completion(*args, **kw), task)
+                _clear_provider_health(req.resolved_provider, req.base_info)
+                return response
             if kind == "retry":
-                return _retry_same_provider_sync(**kw)
+                response = _retry_same_provider_sync(**kw)
+                _clear_provider_health(req.resolved_provider, req.base_info)
+                return response
             return _call_fallback_candidate_sync(*args, **kw)
         return _drive_ladder(
             _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
@@ -8427,11 +8492,13 @@ async def _async_call_llm_impl(
             return await _acreate_with_progress(client, _kwargs, task, force_stream=_force_stream_async)
 
         async def _primary(**validate_kw: Any) -> Any:
-            return _validate_llm_response(
+            response = _validate_llm_response(
                 await _relay_async_completion(
                     client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
                     create=_acreate),
                 task, **validate_kw)
+            _clear_provider_health(request_provider, req.base_info)
+            return response
         try:
             return await _primary(provider=request_provider, base_url=req.base_info)
         except Exception as transient_err:
@@ -8445,9 +8512,13 @@ async def _async_call_llm_impl(
         async def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
-                return _validate_llm_response(await _relay_async_completion(*args, **kw), task)
+                response = _validate_llm_response(await _relay_async_completion(*args, **kw), task)
+                _clear_provider_health(req.resolved_provider, req.base_info)
+                return response
             if kind == "retry":
-                return await _retry_same_provider_async(**kw)
+                response = await _retry_same_provider_async(**kw)
+                _clear_provider_health(req.resolved_provider, req.base_info)
+                return response
             fb_client, fb_model, fb_label = args
             fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=(task == "vision"))
             return await _call_fallback_candidate_async(fb_client, fb_model, fb_label, **kw)
