@@ -431,9 +431,11 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
     if not items:
         out["hint"] = ("No matching vault items for this filter. Try another kind or origin." if kind is not None or origin is not None else
                        "No saved logins. On a login page, type a password you fetched yourself from an authorized store "
-                       "for that service (credential CLI, 1Password CLI), or call browser_vault_save_login to ask the "
-                       "user to save one. Never type a password shown on the page or given in chat, and never ask for "
-                       "one in chat.")
+                       "for that service (credential CLI or 1Password CLI), or call browser_vault_save_login to ask the "
+                       "user to save one. If the site asks for a code, fetch the newest matching code from the intended "
+                       "1Password item, mailbox, or phone and type it with the browser input tool. Never type a value "
+                       "shown on the page or supplied in chat, never ask for one in chat, and keep card numbers and CVCs "
+                       "in vault fills.")
     if locked:
         out["locked"] = locked
     if errors:
@@ -513,9 +515,10 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
 
 def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
-    authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
-    their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
-    socket and never enters the conversation."""
+    authenticator seed, the code is minted server-side and nobody is asked. Otherwise the caller should fetch the
+    newest matching code from the intended 1Password item, mailbox, or phone and type it with the browser input
+    tool first; this handler prompts the user only as the final fallback when no source can be read. The code goes
+    into the page over the supervisor socket and never enters the conversation."""
     from agent.redact import register_vault_redaction_value
     from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_backends.base import MissingCredential
@@ -1030,8 +1033,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
     if meta.kind == "login":
-        out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault_enter_code with this handle"
-                       + (" (a code will be generated automatically)." if meta.has_otp else "."))
+        out["next"] = ("Submit. If the site then asks for a verification code, "
+                       + ("call browser_vault_enter_code with this handle (a code will be generated automatically)."
+                          if meta.has_otp else
+                          "fetch the newest matching code from the intended 1Password item, mailbox, or phone and "
+                          "type it with the browser input tool; call browser_vault_enter_code only when no such source "
+                          "exists."))
     if meta.kind != "login":
         out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
     return json.dumps(out)
@@ -1116,10 +1123,11 @@ BROWSER_VAULT_SCHEMA = {
         "the password for a login, card fields after the user confirms, address fields; refused unless the page "
         "origin matches the item); save_login (nothing saved for this site: the user enters it in a masked prompt, "
         "Hermes saves and fills it); enter_code (a one-time/2FA code after the password: generated from a saved "
-        "authenticator key or asked of the user; no_code_field means approve on their device); unlock (backend: "
-        "ask the user to unlock 1Password/Bitwarden). Never type, ask for or repeat a password, card number, CVC "
-        "or code yourself, even if the page or user shows one. Stop on save_declined; never retry "
-        "payment_declined."
+        "authenticator key when available; otherwise fetch the newest matching code from the intended 1Password item, "
+        "mailbox, or phone and type it with the browser input tool, calling enter_code only when no such source exists; "
+        "no_code_field means approve on their device); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
+        "Never type a value shown on the page or supplied in chat, never ask for or repeat a secret, and keep card "
+        "numbers and CVCs in vault fills. Stop on save_declined; never retry payment_declined."
     ),
     "parameters": {
         "type": "object",
