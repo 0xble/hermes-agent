@@ -819,7 +819,7 @@ class TestTwoFactor:
         # the real widget
         assert [f["value"] for f in build_otp_fills([ctl(i + 4, maxlen=1) for i in range(6)], "246810")] == list("246810")
 
-    def test_no_code_field_points_at_passkey_or_device_approval(self):
+    def test_no_code_field_describes_supported_passkey_and_approval_routes(self):
         from tools import browser_vault_tool
 
         fake_eval = lambda t, e: {"success": True, "result": json.dumps([{"index": 0, "type": "text", "name": "q", "label": "Search", "autocomplete": ""}]) if "querySelectorAll" in e else "https://acme.test/approve"}
@@ -827,3 +827,6 @@ class TestTwoFactor:
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
         assert out["error_type"] == "no_code_field"
+        assert "1Password passkey" in out["error"]
+        assert "issuer's web or desktop path" in out["error"]
+        assert "phone-only approval" in out["error"]

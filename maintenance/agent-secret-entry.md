@@ -5,8 +5,9 @@ Fork patch identity: `agent-secret-entry`.
 ## Behavior
 
 The vault tool descriptions and the vault note appended to the browser input tools
-(`browser_type`, `fill_input` inside `browser_exec`) let the agent type a password or
-one-time code it fetched itself from an authorized store for that service. Authorized stores
+(`browser_type`, `fill_input` inside `browser_exec`) let the agent type a password, payment
+value, or one-time code for the exact service field. Values may come from an authorized
+store, Brian's explicit instruction, or the service's own verification UI. Authorized stores
 are the `credential` CLI, the 1Password CLI including its TOTP field, and the newest
 verification email or SMS from the expected sender in the intended mailbox or phone. Order:
 
@@ -21,17 +22,19 @@ verification email or SMS from the expected sender in the intended mailbox or ph
 
 Unchanged boundaries:
 
-- A value shown on the page, appearing incidentally in unrelated tool output, or given by
-  the user in chat is never a source. Only a value deliberately fetched from an authorized
-  store for that service counts. The agent never asks for or accepts a secret in chat and never repeats
-  one in a reply.
-- Card numbers and CVCs go only through `browser_vault_fill`, with its per-fill
-  confirmation.
-- Passkeys, hardware keys, and app approvals remain user device actions (`no_code_field`).
+- A value appearing incidentally in unrelated tool output is never a source. A value explicitly
+  supplied by Brian or displayed by the service's own verification UI is usable only in its
+  matching field. The agent never repeats a secret in a reply, file, log, or memory.
+- Card numbers and CVCs may use `browser_vault_fill` with its per-fill purchase confirmation,
+  or the supported browser input route when the matching processor field is exposed. The exact
+  charge and routed-card gates remain mandatory.
+- A passkey stored in 1Password uses the canonical-origin browser/system prompt. App approval
+  prefers the issuer's web or desktop path, then email/SMS or 1Password TOTP/passkey alternatives.
+  A phone-only approval, hardware key, or Touch ID/Face ID sensor read remains a physical handoff.
 
 The upstream overwrite restored a blanket "never type" instruction after an earlier dogfood
-fix. This record preserves the useful boundary, never type values copied from page content or
-chat, without blocking authorized self-fetched passwords or codes. The owner accepts that a typed
+fix. This record preserves origin, exact-target, purchase-approval, and no-repeat boundaries
+without blocking authorized payment values, passwords, passkeys, or codes. The owner accepts that a typed
 value passes through the model context and provider logs during entry. The agents
 `credentials` skill and shared execution instructions own the route order and blocker rule.
 
@@ -50,10 +53,11 @@ secret-entry guidance and post-fill routing text; it changes no fill, redaction,
 Run `scripts/run_tests.sh tests/tools/test_browser_vault.py
 tests/tools/test_browser_vault_anonymous_otp.py tests/tools/test_browser_vault_camofox.py
 tests/tools/test_browser_vault_manager_card.py tests/tools/test_model_tools.py tests/ci/test_prompt_surface.py`.
-The model-tools regression must prove that a fresh rendered schema allows a password or code
-fetched from 1Password, email, or SMS, while card numbers and CVCs remain vault-only. After
-activation, read the live `browser_type`, `browser_exec`, and `browser_vault` schemas in a
-fresh session and complete one real emailed-code login using the fetched-code route.
+The model-tools regression must prove that a fresh rendered schema allows passwords, card numbers,
+CVCs, and codes from 1Password, email, SMS, Brian's explicit value, or the service verification UI,
+while preserving no-repeat, origin, exact-charge, and routed-card boundaries. After activation, read
+the live `browser_type`, `browser_exec`, and `browser_vault` schemas in a fresh session and complete
+one real passkey login and one real code-based login when available.
 
 ## Retirement and Rollback
 

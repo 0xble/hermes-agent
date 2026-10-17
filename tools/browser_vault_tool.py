@@ -436,9 +436,10 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
                        "No saved logins. On a login page, type a password you fetched yourself from an authorized store "
                        "for that service (credential CLI or 1Password CLI), or call browser_vault_save_login to ask the "
                        "user to save one. If the site asks for a code, fetch the newest matching code from the intended "
-                       "1Password item, mailbox, or phone and type it with the browser input tool. Never type a value "
-                       "shown on the page or supplied in chat, never ask for one in chat, and keep card numbers and CVCs "
-                       "in vault fills.")
+                       "1Password item, mailbox, or phone and type it with the browser input tool. A value explicitly "
+                       "supplied by Brian or displayed by the service's own verification UI may also be entered in its "
+                       "matching field. Never repeat a secret in a reply, file, log, or memory, and preserve the exact "
+                       "origin and target field.")
     if locked:
         out["locked"] = locked
     if errors:
@@ -599,8 +600,11 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     otp_controls = classify_otp_controls([LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)])
     if not otp_controls:
         return json.dumps({"success": False, "error_type": "no_code_field",
-                           "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or "
-                                     "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
+                           "error": ("No one-time-code field on the current page. If the site wants a passkey, use a "
+                                     "stored 1Password passkey through the canonical-origin browser/system prompt. For an "
+                                     "approval, try the issuer's web or desktop path, then an email/SMS code or a 1Password "
+                                     "TOTP or passkey. A phone-only approval, Touch ID or Face ID sensor read, or hardware "
+                                     "security key remains a physical handoff.")})
 
     # Inspection and alias consent can race navigation. Refuse before minting
     # a code, and retain the checked origin in the atomic in-page write guard.
@@ -833,7 +837,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     if retry_key is not None and _payment_retry_blocked(retry_key):
         _discard_fill_metadata()
         return json.dumps({"success": False, "error_type": "payment_retry_refused",
-                           "error": "Card confirmation was declined or unanswered on this origin. Do not retry; hand card entry to the user."})
+                           "error": "Card confirmation was declined or unanswered on this origin. Do not retry without reconciling the payment state or obtaining fresh approval."})
 
     # ── Inspect + classify page controls ────────────────────────────────────
     def _inspect_page() -> tuple[str, list[ClassifiedLoginControl]] | str:
@@ -867,9 +871,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 # A checkout whose billing-address inputs are on the page but whose card number sits in a
                 # processor frame lands here too: without a card-number target the fill cannot pay.
                 return json.dumps({"success": False, "error_type": "no_payment_fields", "error": (
-                    "No card number field was found on the current page. Card inputs inside a payment "
-                    "processor's embedded frame cannot be filled by the vault; do not retry, hand the card "
-                    "entry to the user instead.")})
+                    "No card number field was found on the current page. Card inputs may be inside a payment "
+                    "processor's embedded frame. Inspect the frame with the supported browser input tools or use "
+                    "the named saved-wallet route; do not treat this vault-inspection result as a card-entry handoff.")})
             return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
         return nonce, classified
 
@@ -900,7 +904,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                                "error_type": "payment_declined" if decision == "decline" else "payment_prompt_unanswered",
                                "error": ("The user declined this payment card." if decision == "decline" else
                                          "The payment card prompt went unanswered.") +
-                                        " Do not retry; hand card entry to the user."})
+                                        " Do not retry without fresh approval and payment-state reconciliation."})
         inspected = _inspect_page()
         if isinstance(inspected, str):
             _discard_fill_metadata()
@@ -1128,9 +1132,12 @@ BROWSER_VAULT_SCHEMA = {
         "Hermes saves and fills it); enter_code (a one-time/2FA code after the password: generated from a saved "
         "authenticator key when available; otherwise fetch the newest matching code from the intended 1Password item, "
         "mailbox, or phone and type it with the browser input tool, calling enter_code only when no such source exists; "
-        "no_code_field means approve on their device); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
-        "Never type a value shown on the page or supplied in chat, never ask for or repeat a secret, and keep card "
-        "numbers and CVCs in vault fills. Stop on save_declined; never retry payment_declined."
+        "a code explicitly supplied by Brian or displayed by the service's own verification UI may also be typed into "
+        "its matching field. no_code_field means use a stored 1Password passkey through the canonical-origin browser/"
+        "system prompt or try the issuer's web/desktop approval and email/SMS/TOTP alternatives; hand off only a phone-only "
+        "approval, hardware security key, or Touch ID/Face ID sensor read); unlock (backend: ask the user to unlock "
+        "1Password/Bitwarden). Never repeat a secret in a reply, file, log, or memory. Stop on save_declined; never "
+        "retry payment_declined."
     ),
     "parameters": {
         "type": "object",

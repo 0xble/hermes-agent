@@ -282,7 +282,7 @@ def test_card_prompt_refusal_blocks_retries_on_same_origin_but_not_other_origin(
         third = json.loads(vault.browser_vault_fill("mg:card", task_id="task-a"))
     assert first["error_type"] == expected
     assert second["error_type"] == "payment_retry_refused"
-    assert "user" in second["error"].lower()
+    assert "fresh approval" in second["error"]
     assert third["error_type"] == expected
     assert len(prompts) == 2 and not writes
 
