@@ -740,6 +740,16 @@ def retry_action_is_current(action: Dict[str, Any]) -> bool:
     return bool(record and record["retry_state"] == expected and record["retry_claim"] == action["claim"])
 
 
+def retry_notice_is_current(delegation_id: str, claim: str) -> bool:
+    """An admitted notice may still run while its row holds the notice's claim.
+
+    Admission moves ``noticing`` to ``notified`` under the same claim. A cancel clears the
+    claim, and a dispatch or a later notice takes a new one, so either retires this wake."""
+    record = retry_status(delegation_id)
+    return bool(record and record["retry_state"] in (RETRY_NOTICING, RETRY_NOTIFIED)
+                and record["retry_claim"] == claim)
+
+
 def classify_outcome(record: Dict[str, Any]) -> Tuple[str, str]:
     """``(verdict, reason)`` with verdict ``none`` | ``retry`` | ``terminal``. Pure; no I/O."""
     state = record["state"]

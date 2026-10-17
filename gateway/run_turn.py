@@ -588,6 +588,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 )
         if not current:
             return None
+        from hermes_cli.session_controls import retry_wake_is_current
+        if not await self._run_in_executor_with_context(retry_wake_is_current, metadata):
+            # A queued retry notice whose retry was cancelled (/stop, delegate_task stop) or
+            # superseded while it waited behind the running turn.
+            return None
         fence = getattr(event, "_gateway_loop_execution_fence", None)
         rebound_sid = metadata.get("loop_wakeup_session_id")
         if fence is not None and rebound_sid and fence[0] != rebound_sid:

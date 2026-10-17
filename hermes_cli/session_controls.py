@@ -703,6 +703,7 @@ def goal_continuation_is_current(metadata: Any, session_id: str = "", *, cursor=
 
 
 LOOP_WAKE_METADATA_KEY = "loop_wakeup"
+RETRY_WAKE_METADATA_KEY = "delegation_retry_notice"
 
 
 def loop_wake_metadata(session_id: str, state: Any, *, command: bool = False) -> Dict[str, Any]:
@@ -788,18 +789,42 @@ def _loop_wake_matches(metadata: Dict[str, Any], sid: str, *, cursor=None, requi
 
 
 def is_gateway_wake(event: Any) -> bool:
-    """A goal continuation or loop tick, recognized by its stamp (or legacy continuation text)."""
+    """A goal continuation, loop tick or delegation retry notice, recognized by its stamp
+    (or legacy continuation text)."""
     from gateway.platforms.event import is_goal_continuation_event
     metadata = getattr(event, "metadata", None)
     return bool(is_goal_continuation_event(event)
-                or (isinstance(metadata, dict) and metadata.get(LOOP_WAKE_METADATA_KEY)))
+                or (isinstance(metadata, dict) and (metadata.get(LOOP_WAKE_METADATA_KEY)
+                                                    or metadata.get(RETRY_WAKE_METADATA_KEY))))
+
+
+def retry_wake_is_current(metadata: Any) -> bool:
+    """True unless this is a retry notice whose ledger claim was cancelled or superseded.
+
+    The notice is queued behind a busy parent turn and can run minutes after ``/stop`` or
+    ``delegate_task(action='stop')`` cancelled its retry. Only the row still holding this
+    notice's claim may wake the parent. An unreadable ledger admits the wake: every cancel is
+    a committed write there."""
+    stamp = metadata.get(RETRY_WAKE_METADATA_KEY) if isinstance(metadata, dict) else None
+    if not stamp:
+        return True
+    if not isinstance(stamp, dict) or not stamp.get("delegation_id") or not stamp.get("claim"):
+        return False
+    try:
+        from tools.delegation_resume import retry_notice_is_current
+        return retry_notice_is_current(str(stamp["delegation_id"]), str(stamp["claim"]))
+    except Exception:
+        logger.debug("retry notice currency check could not read the ledger", exc_info=True)
+        return True
 
 
 def internal_wake_is_current(event: Any, session_id: str = "") -> bool:
-    """One fence for gateway-authored wakes: goal continuations and loop ticks."""
+    """One fence for gateway-authored wakes: goal continuations, loop ticks and retry notices."""
     from gateway.platforms.event import is_goal_continuation_event
     metadata = getattr(event, "metadata", None)
     if is_goal_continuation_event(event) and not goal_continuation_is_current(metadata, session_id):
+        return False
+    if not retry_wake_is_current(metadata):
         return False
     return loop_wake_is_current(metadata, session_id)
 
