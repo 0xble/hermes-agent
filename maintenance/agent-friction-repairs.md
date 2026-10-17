@@ -6,7 +6,8 @@ Fork patch identity: `agent-friction-repairs`.
 
 This unit owns small, evidence-backed fixes where runtime bookkeeping makes the
 model repeat work or misread execution state. It covers context-pruning dedupe,
-local execute_code session-kernel eviction reporting, terminal retry hints, and
+skill_view reload-marker preservation across compaction and tail demotion, local
+execute_code session-kernel eviction reporting, terminal retry hints, and
 execute_code sandbox file-tool failures.
 
 ## Terminal retry hints
@@ -26,6 +27,10 @@ found` 181 times. Focused verification: `scripts/run_tests.sh tests/tools/test_b
 ## Proof surface
 
 - `tests/agent/test_context_compressor.py::TestSummarizeToolResultRefusals::test_dedupe_does_not_stub_unread_pending_results`
+- `tests/agent/test_context_compressor_tail.py`
+- `tests/agent/test_ghost_skill_pruning.py`
+- `tests/tools/test_skill_view_dedup.py`
+- `tests/tools/test_skill_view_dedup.py::TestSkillViewDedupRaces`
 - `tests/tools/test_code_kernel.py::TestKernelOwnershipAndLifecycle::test_lru_eviction_reports_state_reset`
 - `tests/tools/test_code_execution_file_rpc.py::test_generated_tool_errors_raise_and_block_empty_fallback`
 - `tests/agent/test_protected_tail_pressure.py`
@@ -39,8 +44,11 @@ lifecycle behavior passing, and make the file tools (`read_file`, `write_file`,
 UDS and file-based transports so failed reads cannot feed empty fallback content
 into a later write. UDS is proven end to end; the file transport is proven by
 the shared `_parse_tool_result` path, which also rejects a `read_file` result
-that omits its content via the dedup stub. Sandbox RPC reads bypass normal
-read-result deduplication so a script always receives real file content.
+that omits its content via the dedup stub. Skill-view coverage must prove that
+compaction and tail demotion retain reload markers for all served skill bodies,
+failed views do not create reload obligations, and byte-identical repeat views
+are the only ones that return `content_returned: false`. Sandbox RPC reads bypass
+normal read-result deduplication so a script always receives real file content.
 
 A sandbox `read_file` not-found result is a backend-namespace failure, not a
 successful empty read: project-mode execute_code and its RPC file tools use the
