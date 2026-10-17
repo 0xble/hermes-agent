@@ -239,6 +239,9 @@ def _fan_in_runner(*, window=300.0, last_turn_age=10.0):
     runner._completion_delivery_retention = 2048
     runner._background_tasks = set()
     runner._completion_notification_batch_window = window
+    # Production __init__ creates the batch maps. The watcher creates them lazily only after
+    # sending the receipt, so a test reading them right after the receipt would race on a slow runner.
+    runner._ensure_completion_batch_state()
     runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value={"ended_at": None}))
     if last_turn_age is not None:
         runner._session_state(ROUTE["session_key"]).conversation.last_turn_started_at = time.time() - last_turn_age
