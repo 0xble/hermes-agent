@@ -2858,7 +2858,25 @@ def run_one_job(
             if post_handoff:
                 from cron.scheduler_worker_failure import record_unknown_worker_outcome
 
-                if record_unknown_worker_outcome(job, error=str(handoff_error), adapters=adapters, loop=loop):
+                if getattr(handoff_error, "worker_exited", True):
+                    if record_unknown_worker_outcome(
+                        job,
+                        error=str(handoff_error),
+                        adapters=adapters,
+                        loop=loop,
+                        worker_terminated=getattr(handoff_error, "worker_terminated", False),
+                        worker_exit_code=getattr(handoff_error, "worker_exit_code", None),
+                    ):
+                        return True
+                else:
+                    # A terminal row is not enough proof when the parent could
+                    # not reap the exact worker handle. Keep the fenced claim;
+                    # projecting failure here would race a still-live worker.
+                    logger.error(
+                        "Job '%s': restart-safe worker remains live after bounded "
+                        "exit wait; deferring projection",
+                        job["id"],
+                    )
                     return True
             logger.error("Job '%s': %s", job["id"], error)
             claim = job.get("fire_claim")
@@ -2890,9 +2908,11 @@ def run_one_job(
                     delivery_outcome=delivery_outcome)
             return True
         if handed_off:
-            from cron.scheduler_worker_failure import record_unknown_worker_outcome
+            from cron.scheduler_worker_failure import record_external_worker_outcome
 
-            record_unknown_worker_outcome(job, adapters=adapters, loop=loop)
+            record_external_worker_outcome(
+                job, adapters=adapters, loop=loop, worker_exited=True
+            )
             return True
     if extra_prompt is None:
         # Gateway-forwarded manual run stamps its prompt on the job via trigger_job; the fire that
@@ -3666,12 +3686,21 @@ def _run_one_job_body(
             reset_terminal_scope(_terminal_scope_token)
 
 
+# A terminal execution row is committed before a restart-safe worker finishes its
+# final delivery/teardown.  Do not turn that ordering into an unbounded gateway
+# wait: the worker's own hard-wall watchdog has a bounded post-commit allowance,
+# and this is the matching upper bound for the parent-side exit proof.
+_EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS = 60.0
+
+
 def _wait_for_external_cron_worker_body(
     process: subprocess.Popen,
     *,
     execution_id: str,
     stderr_path: Optional[Path] = None,
     wait_for_process_exit: bool = False,
+    terminal_exit_grace_seconds: float = _EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS,
+    worker_hard_wall_deadline: Optional[float] = None,
 ) -> bool:
     """Preserve ``run_one_job``'s synchronous contract after handoff.
 
@@ -3681,61 +3710,125 @@ def _wait_for_external_cron_worker_body(
     A gateway replacement may kill this waiter; it does not kill the scoped
     worker or change its ledger ownership. The legacy early-return mode is kept
     for diagnostic callers that only need to observe a terminal ledger row.
+
+    Once the ledger is terminal, the worker has only bounded teardown work left.
+    If it ignores that allowance, terminate the exact ``Popen`` child and wait
+    again with bounded timeouts. Never project a terminal row from a live worker.
     """
     def _is_terminal() -> bool:
         current = get_execution(execution_id)
         return bool(current and current.get("status") in _TERMINAL_STATES)
 
+    terminal_deadline = None
     # The worker commits its terminal row before its process exits, so exit is
-    # the correct wakeup.  Each ledger read opens a connection and re-runs
-    # schema init; polling it at 50ms for an hours-long agent run is ~72k
-    # opens/hour of pure contention with the worker's own writes.
+    # the correct wakeup. Each ledger read opens a connection and re-runs schema
+    # init; polling it at 50ms for an hours-long agent run is needless contention.
     while True:
-        try:
-            returncode = process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            if not _is_terminal():
-                continue
-            # Recovery can win between the timeout and this ledger read. If
-            # the worker has since exited, consume its diagnostics below before
-            # cleanup; only a still-live terminal worker needs background reaping.
-            returncode = process.poll()
-            if returncode is not None and wait_for_process_exit:
-                return True
-            if returncode is None:
-                if not wait_for_process_exit:
+        timeout = 1.0
+        if terminal_deadline is not None:
+            remaining = terminal_deadline - time.monotonic()
+            if remaining <= 0:
+                returncode = process.poll()
+                if returncode is None and wait_for_process_exit:
+                    # A terminal worker is no longer allowed to hold the gateway
+                    # forever. This is the same worker handle we spawned, so a
+                    # PID reuse cannot make this kill an unrelated process.
+                    for stop in (process.terminate, process.kill):
+                        try:
+                            stop()
+                        except (OSError, ProcessLookupError):
+                            pass
+                        try:
+                            returncode = process.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            returncode = process.poll()
+                        if returncode is not None:
+                            break
+                    if returncode is None:
+                        raise _ExternalWorkerExitTimeout(
+                            "Restart-safe cron worker stayed alive after its terminal "
+                            "exit grace period; execution was not projected.",
+                            worker_terminated=True,
+                        )
+                    if returncode < 0:
+                        raise _ExternalWorkerExitTimeout(
+                            "Restart-safe cron worker was terminated after its terminal "
+                            "exit grace period; delivery outcome is unknown.",
+                            worker_terminated=True,
+                            worker_exit_code=returncode,
+                        )
+                    if returncode != 0:
+                        raise _ExternalWorkerExitTimeout(
+                            f"Restart-safe cron worker exited with status {returncode} "
+                            "after its terminal exit grace period.",
+                            worker_exit_code=returncode,
+                        )
+                    return True
+                if returncode is None:
                     from cron.scheduler_detached_worker import reap_terminal_worker_in_background
 
                     reap_terminal_worker_in_background(process)
                     return True
-                # A scheduler-owned claim must outlive a terminal ledger row while the
-                # detached process is still alive.  The worker can still be finishing
-                # delivery/teardown, and releasing here would permit a concurrent fire.
-                while returncode is None:
-                    try:
-                        returncode = process.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        returncode = process.poll()
-                if wait_for_process_exit:
-                    return True
+                if returncode != 0:
+                    raise _ExternalWorkerExitTimeout(
+                        f"Restart-safe cron worker exited with status {returncode} "
+                        "after its terminal exit grace period.",
+                        worker_exit_code=returncode,
+                    )
+                return True
+            timeout = min(timeout, max(0.001, remaining))
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if not _is_terminal():
+                continue
+            if terminal_deadline is None:
+                terminal_base = (
+                    max(time.monotonic(), worker_hard_wall_deadline)
+                    if worker_hard_wall_deadline is not None
+                    else time.monotonic()
+                )
+                terminal_deadline = terminal_base + max(0.0, float(terminal_exit_grace_seconds))
+            returncode = process.poll()
+            if returncode is not None:
+                if returncode != 0:
+                    raise _ExternalWorkerExitTimeout(
+                        f"Restart-safe cron worker exited with status {returncode} "
+                        "after terminalizing its execution.",
+                        worker_exit_code=returncode,
+                    )
+                return True
+            if not wait_for_process_exit:
+                from cron.scheduler_detached_worker import reap_terminal_worker_in_background
+
+                reap_terminal_worker_in_background(process)
+                return True
+            continue
         # The worker can commit its terminal row and exit between the first
-        # read and wait(). Re-read the exact attempt before declaring that
-        # it died without terminalizing.
+        # read and wait(). Re-read the exact attempt before declaring that it
+        # died without terminalizing.
         current = get_execution(execution_id)
         if current and current.get("status") in ("completed", "failed"):
+            # A worker-owned failure may already have delivered its notice. A
+            # parent-side termination is different and is projected below.
+            if returncode is not None and returncode < 0 and wait_for_process_exit:
+                raise _ExternalWorkerExitTimeout(
+                    f"Restart-safe cron worker was terminated with status {returncode} "
+                    "after its terminal exit grace period.",
+                    worker_terminated=True,
+                    worker_exit_code=returncode,
+                )
+            if returncode not in (None, 0):
+                raise _ExternalWorkerExitTimeout(
+                    f"Restart-safe cron worker exited with status {returncode} "
+                    "after terminalizing its execution.",
+                    worker_exit_code=returncode,
+                )
             return True
         # If the adopted worker died without terminalizing, its owner is
         # now provably gone. Recover to ``unknown`` rather than routing the
         # exception through the pre-handoff dispatch-failure path, which
         # would falsely assert that no side effect could have happened.
-        #
-        # Record the cause THIS waiter observed instead of letting the blanket
-        # sweep stamp "Scheduler restarted ...", and then RAISE: the sweep leaves
-        # the row terminal, so returning success here made run_one_job skip
-        # mark_job_run entirely and the job's fire claim outlived its lost
-        # execution, refusing the next manual fire with "Job is already being
-        # fired" (#128509). Raising routes the existing post-handoff bookkeeping
-        # instead: retire the claim and report the uncertain run, not a pre-dispatch failure.
         from cron.scheduler_worker_failure import external_worker_exited_reason
 
         reason = external_worker_exited_reason(returncode)
@@ -3776,10 +3869,35 @@ def _cleanup_external_worker_state(
         return True
 
 
+def _reconcile_deferred_external_worker_outcome(
+    job_id: str, home: Path, process: subprocess.Popen, error: str, *, worker_terminated: bool,
+) -> None:
+    """Project a terminal worker result after a bounded waiter returned early."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from cron.jobs import get_job, use_cron_store
+    from cron.scheduler_worker_failure import record_external_worker_outcome
+
+    home_token = set_hermes_home_override(home)
+    try:
+        with use_cron_store(home):
+            deferred_job = get_job(job_id)
+            if deferred_job is not None:
+                record_external_worker_outcome(
+                    deferred_job,
+                    error=error,
+                    worker_exited=True,
+                    worker_terminated=worker_terminated,
+                    worker_exit_code=process.poll(),
+                )
+    finally:
+        reset_hermes_home_override(home_token)
+
+
 def _defer_external_worker_claim_release(
     job_id: str, home: Path, owner, process: subprocess.Popen,
+    *, outcome_error: Optional[str] = None, worker_terminated: bool = False,
 ) -> None:
-    """Reap a live restart-safe worker and release its fenced gateway claim."""
+    """Reconcile a live restart-safe worker after exit, then release its fenced claim."""
     key = _inflight_key(job_id, home)
     token = (key, id(owner))
     with _running_lock:
@@ -3800,6 +3918,21 @@ def _defer_external_worker_claim_release(
                 except Exception:
                     time.sleep(1.0)
         finally:
+            if outcome_error is not None:
+                try:
+                    _reconcile_deferred_external_worker_outcome(
+                        job_id,
+                        home,
+                        process,
+                        outcome_error,
+                        worker_terminated=worker_terminated,
+                    )
+                except Exception:
+                    logger.error(
+                        "Failed to reconcile external worker outcome for job %s after exit",
+                        job_id,
+                        exc_info=True,
+                    )
             release_running_job(job_id, home=home, owner=owner, force=True)
             with _running_lock:
                 _external_worker_reapers.discard(token)
@@ -3816,6 +3949,25 @@ def _defer_external_worker_claim_release(
 class _ExternalWorkerPostHandoffError(RuntimeError):
     """The waiter failed after the worker was spawned and may own the execution."""
 
+    def __init__(
+        self, message: str, *, worker_exited: bool = True, worker_terminated: bool = False,
+        worker_exit_code: int | None = None,
+    ):
+        super().__init__(message)
+        self.worker_exited = worker_exited
+        self.worker_terminated = worker_terminated
+        self.worker_exit_code = worker_exit_code
+
+
+class _ExternalWorkerExitTimeout(RuntimeError):
+    """A terminal worker did not exit within the bounded parent-side grace period."""
+
+    def __init__(
+        self, message: str, *, worker_terminated: bool = False, worker_exit_code: int | None = None,
+    ):
+        super().__init__(message)
+        self.worker_terminated = worker_terminated
+        self.worker_exit_code = worker_exit_code
 
 def _wait_for_external_cron_worker(
     process: subprocess.Popen,
@@ -3824,6 +3976,8 @@ def _wait_for_external_cron_worker(
     job_id: Optional[str] = None,
     handoff_files: tuple[Path, ...] = (),
     stderr_path: Optional[Path] = None,
+    terminal_exit_grace_seconds: float = _EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS,
+    worker_hard_wall_deadline: Optional[float] = None,
 ) -> bool:
     claim_key = _inflight_key(job_id) if job_id is not None else None
     claim_owner = None
@@ -3832,8 +3986,17 @@ def _wait_for_external_cron_worker(
     if claim_key is not None:
         with _running_lock:
             claim_owner = _running_registration_owners.get(claim_key)
-            wait_for_process_exit = _external_worker_modes.get(claim_key) in {"scoped", "detached"}
+            worker_mode = _external_worker_modes.get(claim_key)
+            # Once this waiter is attached to a scheduler-owned external worker,
+            # including degraded dispatch, a terminal ledger row is only an
+            # intermediate commit. Return the exit proof to run_one_job by waiting
+            # for the process rather than projecting the row while it delivers.
+            wait_for_process_exit = claim_owner is not None or worker_mode in {
+                "scoped", "detached", "degraded"
+            }
         claim_home = _inflight_home_path(claim_key[0])
+    deferred_outcome_error = None
+    deferred_worker_terminated = False
     try:
         return _wait_for_external_cron_worker_body(
             process,
@@ -3842,9 +4005,22 @@ def _wait_for_external_cron_worker(
             # A scheduler-owned claim is released by the waiter only after the
             # detached process exits, not when its durable row becomes terminal.
             wait_for_process_exit=wait_for_process_exit,
+            terminal_exit_grace_seconds=terminal_exit_grace_seconds,
+            worker_hard_wall_deadline=worker_hard_wall_deadline,
         )
     except Exception as wait_error:
-        raise _ExternalWorkerPostHandoffError(str(wait_error)) from wait_error
+        worker_exited = True
+        with contextlib.suppress(Exception):
+            worker_exited = process.poll() is not None
+        if not worker_exited and claim_owner is not None and claim_home is not None:
+            deferred_outcome_error = str(wait_error)
+            deferred_worker_terminated = getattr(wait_error, "worker_terminated", False)
+        raise _ExternalWorkerPostHandoffError(
+            str(wait_error),
+            worker_exited=worker_exited,
+            worker_terminated=getattr(wait_error, "worker_terminated", False),
+            worker_exit_code=getattr(wait_error, "worker_exit_code", None),
+        ) from wait_error
     finally:
         worker_exited = False
         with contextlib.suppress(Exception):
@@ -3859,7 +4035,13 @@ def _wait_for_external_cron_worker(
                 and claim_home is not None
             ):
                 _defer_external_worker_claim_release(
-                    job_id, claim_home, claim_owner, process)
+                    job_id,
+                    claim_home,
+                    claim_owner,
+                    process,
+                    outcome_error=deferred_outcome_error,
+                    worker_terminated=deferred_worker_terminated,
+                )
             else:
                 _cleanup_external_worker_state(
                     job_id,
@@ -3895,6 +4077,13 @@ def _launch_external_cron_worker(job: dict) -> bool:
     """
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])
+    from cron.scheduler_detached_worker import (
+        hard_wall_timeout_seconds,
+        hard_wall_watchdog_grace_seconds,
+    )
+
+    hard_wall_seconds = hard_wall_timeout_seconds(job)
+    terminal_exit_grace_seconds = hard_wall_watchdog_grace_seconds(hard_wall_seconds)
     handoff_dir = _get_hermes_home() / "cron" / "external-workers"
     payload_path = handoff_dir / f"{execution_id}.json"
     ack_path = handoff_dir / f"{execution_id}.ready"
@@ -4016,6 +4205,12 @@ def _launch_external_cron_worker(job: dict) -> bool:
         stderr_path.unlink(missing_ok=True)
         raise
 
+    # The worker arms its watchdog before publishing the acknowledgement. This
+    # fallback covers an adoption race where the acknowledgement is unreadable or
+    # never arrives; a valid acknowledgement below refreshes the deadline from
+    # the handoff observation, never shortening the worker's own lifetime.
+    worker_hard_wall_deadline = time.monotonic() + hard_wall_seconds
+
     # Until the worker acknowledges, the gateway still owns an uncertain handoff and
     # shutdown must count it as active. Record the dispatch mode before waiting for
     # acknowledgement: degraded workers remain inside the gateway cgroup and must
@@ -4043,6 +4238,8 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     job_id=job_id,
                     handoff_files=(payload_path, stderr_path),
                     stderr_path=stderr_path,
+                    terminal_exit_grace_seconds=terminal_exit_grace_seconds,
+                    worker_hard_wall_deadline=worker_hard_wall_deadline,
                 )
             finally:
                 ack_path.unlink(missing_ok=True)
@@ -4061,7 +4258,19 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     job_id=job_id,
                     handoff_files=(payload_path, stderr_path),
                     stderr_path=stderr_path,
+                    terminal_exit_grace_seconds=terminal_exit_grace_seconds,
+                    worker_hard_wall_deadline=worker_hard_wall_deadline,
                 )
+            worker_hard_wall_deadline = time.monotonic() + hard_wall_seconds
+            acknowledged_deadline_value = acknowledgement.get("hard_wall_deadline")
+            if isinstance(acknowledged_deadline_value, (int, float)):
+                acknowledged_deadline = float(acknowledged_deadline_value)
+            else:
+                acknowledged_deadline = worker_hard_wall_deadline
+            # The watchdog arms before publishing this acknowledgement. Use its
+            # same monotonic deadline so the parent never extends the worker's
+            # lifetime merely because startup/ack polling took time.
+            worker_hard_wall_deadline = acknowledged_deadline
             logger.info(
                 "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
                 job_id,
@@ -4085,6 +4294,8 @@ def _launch_external_cron_worker(job: dict) -> bool:
                 job_id=job_id,
                 handoff_files=(payload_path, stderr_path),
                 stderr_path=stderr_path,
+                terminal_exit_grace_seconds=terminal_exit_grace_seconds,
+                worker_hard_wall_deadline=worker_hard_wall_deadline,
             )
         returncode = process.poll()
         if returncode is not None:
@@ -4128,6 +4339,8 @@ def _launch_external_cron_worker(job: dict) -> bool:
         job_id=job_id,
         handoff_files=(payload_path, ack_path, stderr_path),
         stderr_path=stderr_path,
+        terminal_exit_grace_seconds=terminal_exit_grace_seconds,
+        worker_hard_wall_deadline=worker_hard_wall_deadline,
     )
 
 
@@ -4212,7 +4425,11 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 fd = os.open(ack_tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as ack_file:
-                        json.dump({"pid": os.getpid(), "execution_id": execution_id}, ack_file)
+                        json.dump({
+                            "pid": os.getpid(),
+                            "execution_id": execution_id,
+                            "hard_wall_deadline": watchdog_stop.deadline,
+                        }, ack_file)
                         ack_file.flush()
                         os.fsync(ack_file.fileno())
                     os.replace(ack_tmp_path, ack_path)
