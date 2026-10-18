@@ -35,7 +35,7 @@ pytestmark = pytest.mark.usefixtures("isolated_source_completion")
 
 
 def _make_up_to_date_side_effect(sha="abc123"):
-    """Simulate git commands where origin is already at HEAD."""
+    """Simulate git commands where origin/main resolves to the live HEAD."""
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
@@ -43,8 +43,14 @@ def _make_up_to_date_side_effect(sha="abc123"):
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
 
+        if "rev-parse" in joined and "--verify" in joined:
+            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
+
         if "rev-list" in joined:
-            return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+            # The guard's ancestry probes have no commits to enumerate; retain the
+            # count used by the ordinary update-plan probe.
+            stdout = "0\n" if "--count" in joined else ""
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
         if joined.endswith("rev-parse HEAD"):
             return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
@@ -72,10 +78,20 @@ def _make_head_moved_side_effect(pre_sha=PRE_SHA, post_sha=POST_SHA):
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
 
         if "rev-list" in joined:
-            return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
+            # The guard compares the fetched target against the pre-update live
+            # commit and must see an empty dropped-commit set. Keep the ordinary
+            # update-plan count probe at three commits.
+            stdout = "3\n" if "--count" in joined else ""
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
         if "rev-parse -q --verify" in joined:  # the pull's resolved target
             return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+
+        if "rev-parse" in joined and "--verify" in joined:
+            # origin/main (the target and comparison ref) is the post-pull tip;
+            # the live ref is the pre-pull HEAD and is an ancestor of it.
+            sha = pre_sha if pre_sha in joined else post_sha
+            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
 
         if joined.endswith("rev-parse HEAD"):
             return SimpleNamespace(returncode=0, stdout=f"{post_sha if advanced else pre_sha}\n", stderr="")
