@@ -2426,6 +2426,7 @@ DEFAULT_CONFIG = {
         # Observation-only wait after launchd reports a deferred reload. A timeout leaves
         # release-txn.json pending and never submits a second reload.
         "release_acknowledgement_timeout_seconds": 180.0,
+        "coalesce_window_seconds": 120,  # burst of update requests -> one restart (MAINTENANCE.md); 0 = off
         # Passive version/banner checks only; explicit `hermes update --check` remains enabled.
         "check": True,
         # Pre-update backup. quick = snapshot small critical state (pairing JSONs, cron jobs,
@@ -2434,9 +2435,7 @@ DEFAULT_CONFIG = {
         # <HERMES_HOME>/backups/ (``hermes import`` restores; slow on large homes; ``--backup``
         # forces once). off = none (``--no-backup`` forces once). Legacy booleans: true -> full,
         # false -> off.
-        # Pre-update safety backup — ONE consolidated mechanism, three modes: Files over 1 GiB (e.g. a
-        # bloated state.db) are skipped with a warning so the snapshot stays fast. This is the #48200
-        # (wrong-path wipe) safety net.
+        # Files over 1 GiB are skipped so the snapshot stays fast; the #48200 (wrong-path wipe) net.
         "pre_update_backup": "quick",
         # Full backup zips to retain (older pruned after each success; floored to 1 so the newest is
         # always kept). The quick snapshot always keeps exactly 1.
