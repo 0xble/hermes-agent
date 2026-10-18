@@ -191,6 +191,64 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_script_subprocess_env_drops_session_identity(self, cron_env, monkeypatch):
+        """A sessionless cron worker must not pass its launcher's stale session mirror to a script."""
+        import gateway.session_context as session_context
+        from cron.scheduler_script import _run_job_script
+
+        saved_context = {var: var.get() for var in session_context._VAR_MAP.values()}
+        monkeypatch.setattr(session_context, "_session_context_engaged", False)
+        for var in session_context._VAR_MAP.values():
+            var.set(session_context._UNSET)
+        for name, value in {
+            "HERMES_SESSION_ID": "unrelated-session",
+            "HERMES_SESSION_KEY": "unrelated-key",
+            "HERMES_SESSION_CHAT_ID": "123",
+            "HERMES_UI_SESSION_ID": "unrelated-ui-session",
+            "HERMES_CRON_SESSION": "1",
+            "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "456",
+        }.items():
+            monkeypatch.setenv(name, value)
+
+        script = cron_env / "scripts" / "session_probe.py"
+        script.write_text(
+            "import json, os\n"
+            "names = [name for name in os.environ if name.startswith(\"HERMES_SESSION_\") "
+            "or name.startswith(\"HERMES_UI_SESSION_\") or name.startswith(\"HERMES_CRON_AUTO_DELIVER_\") "
+            "or name == \"HERMES_CRON_SESSION\"]\n"
+            "print(json.dumps({name: os.environ[name] for name in sorted(names)}))\n"
+        )
+
+        try:
+            success, output = _run_job_script("session_probe.py")
+        finally:
+            for var, value in saved_context.items():
+                var.set(value)
+        assert success is True
+        assert output == "{}"
+
+    def test_script_subprocess_env_uses_job_identity(self, cron_env, monkeypatch):
+        """Cron scripts get their own stable sender, not the gateway's ambient session."""
+        from cron.scheduler_script import _run_job_script
+
+        monkeypatch.setenv("HERMES_SESSION_ID", "unrelated-session")
+        monkeypatch.setenv("HERMES_SESSION_KEY", "unrelated-key")
+        script = cron_env / "scripts" / "sender_probe.py"
+        script.write_text(
+            "import json, os\n"
+            "print(json.dumps({name: os.environ.get(name) for name in "
+            "('HERMES_SESSION_ID', 'HERMES_SESSION_KEY', 'HERMES_SESSION_PROFILE')}))\n"
+        )
+
+        success, output = _run_job_script("sender_probe.py", cron_job_id="fleet-checker")
+
+        assert success is True
+        assert json.loads(output) == {
+            "HERMES_SESSION_ID": "cron_fleet-checker",
+            "HERMES_SESSION_KEY": None,
+            "HERMES_SESSION_PROFILE": "default",
+        }
+
     @pytest.mark.platforms("windows")
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         # Windows-only: the fake ``sys.platform`` could not reproduce the

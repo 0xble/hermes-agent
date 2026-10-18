@@ -259,6 +259,33 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+def strip_session_context_env(env: dict[str, str]) -> None:
+    """Remove per-session routing metadata before spawning a sessionless child.
+
+    A cron worker is not itself a conversation, so its process environment may contain
+    the gateway's last-writer-wins session mirror without a bound ContextVar to correct it.
+    Removing the canonical session names prevents a no-agent script from attributing an
+    outbound relay to an unrelated live session.
+    """
+    try:
+        from gateway.session_context import _VAR_MAP
+        names = _VAR_MAP
+    except Exception:
+        names = {
+            "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
+            "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID",
+            "HERMES_SESSION_USER_ID", "HERMES_SESSION_USER_ID_ALT", "HERMES_SESSION_USER_NAME",
+            "HERMES_SESSION_SCOPE_ID", "HERMES_SESSION_KEY", "HERMES_SESSION_ID",
+            "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_SESSION_PROFILE",
+            "HERMES_BROWSER_CONTROL_PRINCIPAL", "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
+            "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID",
+            "HERMES_CRON_AUTO_DELIVER_PLATFORM", "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+            "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        }
+    for name in names:
+        env.pop(name, None)
+
+
 def _filter_secret_env(
     items: Mapping[str, str], out: dict, *, unwrap_force: bool,
     plugin_strip: frozenset = frozenset()) -> None:
