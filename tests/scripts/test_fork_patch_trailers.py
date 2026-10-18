@@ -180,6 +180,21 @@ def test_merge_commits_need_no_trailer(tmp_path, monkeypatch):
     assert checker.check_trailers(base) == []
 
 
+def test_release_merge_ignores_unowned_second_parent_history(tmp_path, monkeypatch):
+    """A source check over the common baseline must not classify upstream merge history as fork patches."""
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "fork")
+    git("commit", "--allow-empty", "-qm", "fork patch\n\nFork-Patch: fixture")
+    git("checkout", "-qb", "release", base)
+    git("commit", "--allow-empty", "-qm", "upstream commit without fork metadata")
+    git("checkout", "-q", "fork")
+    git("merge", "--no-ff", "-m", "adopt release", "release")
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.check_trailers(base) == []
+
+
 def test_immutable_home_checks_promoted_history_not_stale_checkout(tmp_path, monkeypatch, capsys):
     git = _repo(tmp_path)
     base = git("rev-parse", "HEAD")
