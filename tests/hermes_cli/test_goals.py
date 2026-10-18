@@ -464,6 +464,24 @@ class TestGoalManager:
                        subgoals=manager.state.subgoals)
         judge_prompt = call_llm.call_args.kwargs["messages"][1]["content"]
         assert "design note exists" in judge_prompt
+        assert (
+            "When the goal's boundaries or constraints forbid demonstrating a case live, recorded "
+            "test evidence for that case satisfies the criterion if the tool output names the tests and "
+            "includes a pass count."
+        ) in judge_prompt
+
+    def test_continuation_prompt_silences_unchanged_release_rechecks(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager(session_id="unchanged-release-recheck")
+        manager.set("keep the finished result")
+        prompt = manager.next_continuation_prompt()
+        assert prompt is not None
+        assert (
+            "A restart, update, or new release by itself is not news, and re-running a check that returns "
+            "the same result as your last visible report counts as unchanged; reply with exactly [SILENT] "
+            "and nothing else."
+        ) in prompt
 
     def test_continuation_prompts_share_silence_rule_but_gate_failure_does_not(self, hermes_home):
         from hermes_cli import goals
