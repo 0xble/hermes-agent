@@ -3363,6 +3363,20 @@ def _log_skip_unhealthy(
         )
 
 
+def _candidate_is_unhealthy(
+    label: str, *, task: Optional[str] = None, base_url: Optional[str] = None,
+    model: Optional[str] = None,
+) -> bool:
+    """Check route health before building a candidate and clear Nous-only state on a late skip."""
+    if not _is_provider_unhealthy(label, base_url, model):
+        return False
+    global auxiliary_is_nous
+    if _normalize_chain_label(label) == "nous":
+        auxiliary_is_nous = False
+    _log_skip_unhealthy(label, task, base_url=base_url, model=model)
+    return True
+
+
 def _warn_auxiliary_route_once(route: Any, reason: str, error: BaseException) -> None:
     provider = _effective_provider_for_client(route.client, route.resolved_provider)
     if provider in {"", "auto"}:
@@ -4485,14 +4499,17 @@ def _try_payment_fallback(
     tried = []
     for label, try_fn in _get_provider_chain():
         candidate_base_url = _custom_health_base_url(label)
+        candidate_model = _get_aux_model_for_provider(label) or None
         if (not failed_base_url and label in skip_chain_labels) or skip_backend(
                 label, None, candidate_base_url):
             continue
+        if _candidate_is_unhealthy(label, task=task, base_url=candidate_base_url, model=candidate_model):
+            tried.append(f"{label} (unhealthy)")
+            continue
         client, model = try_fn()
         if client is not None:
-            candidate_model = model or _get_aux_model_for_provider(label) or None
-            if _is_provider_unhealthy(label, candidate_base_url, candidate_model):
-                _log_skip_unhealthy(label, task, base_url=candidate_base_url, model=candidate_model)
+            candidate_model = model or candidate_model
+            if _candidate_is_unhealthy(label, task=task, base_url=candidate_base_url, model=candidate_model):
                 tried.append(f"{label} (unhealthy)")
                 continue
             logger.info("Auxiliary %s: %s on %s — falling back to %s (%s)",
@@ -4554,8 +4571,7 @@ def _try_main_agent_model_fallback(
             failure_scope=failure_scope)(main_provider, main_model, main_base_url):
         return None, None, ""
     health_model = _normalize_resolved_model(main_model, main_provider) or main_model
-    if _is_provider_unhealthy(main_provider, main_base_url, health_model):
-        _log_skip_unhealthy(main_provider, task, base_url=main_base_url, model=health_model)
+    if _candidate_is_unhealthy(main_provider, task=task, base_url=main_base_url, model=health_model):
         return None, None, ""
     try:
         client, resolved_model = resolve_provider_client(provider=main_provider, model=main_model)
@@ -4652,14 +4668,16 @@ def _try_configured_fallback_chain(
             continue
         fb_model = fb_model_raw or None
         label = f"fallback_chain[{i}]({fb_provider})"
+        if _candidate_is_unhealthy(fb_provider, task=task, base_url=fb_base_url, model=fb_model):
+            tried.append(f"fallback_chain[{i}]({fb_provider}) (unhealthy)")
+            continue
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception:
             fb_client, resolved_model = None, None
         if fb_client is not None:
             health_model = resolved_model or fb_model
-            if _is_provider_unhealthy(fb_provider, fb_base_url, health_model):
-                _log_skip_unhealthy(fb_provider, task, base_url=fb_base_url, model=health_model)
+            if _candidate_is_unhealthy(fb_provider, task=task, base_url=fb_base_url, model=health_model):
                 tried.append(f"fallback_chain[{i}]({fb_provider}) (unhealthy)")
                 continue
             too_small = _context_too_small(
@@ -4744,6 +4762,9 @@ def _try_main_fallback_chain(
         if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
             tried.append(f"{label} (skipped)")
             continue
+        if _candidate_is_unhealthy(fb_norm, task=task, base_url=fb_base_url, model=fb_model):
+            tried.append(f"{label} (unhealthy)")
+            continue
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception as exc:
@@ -4751,8 +4772,7 @@ def _try_main_fallback_chain(
             fb_client, resolved_model = None, None
         if fb_client is not None:
             health_model = resolved_model or fb_model
-            if _is_provider_unhealthy(fb_norm, fb_base_url, health_model):
-                _log_skip_unhealthy(fb_norm, task, base_url=fb_base_url, model=health_model)
+            if _candidate_is_unhealthy(fb_norm, task=task, base_url=fb_base_url, model=health_model):
                 tried.append(f"{label} (unhealthy)")
                 continue
             too_small = _context_too_small(
@@ -4854,8 +4874,8 @@ def _try_main_provider_route(
     # Skip if the main provider was recently 402'd (unhealthy TTL bounds the bypass).
     main_chain_label = _normalize_chain_label(resolved_provider)
     health_model = _normalize_resolved_model(main_model, resolved_provider) or main_model
-    if main_chain_label and _is_provider_unhealthy(main_chain_label, health_base_url, health_model):
-        _log_skip_unhealthy(main_chain_label, base_url=health_base_url, model=health_model)
+    if main_chain_label and _candidate_is_unhealthy(
+            main_chain_label, base_url=health_base_url, model=health_model):
         return None
     client, resolved = resolve_provider_client(
         resolved_provider, main_model, explicit_base_url=explicit_base_url,
@@ -4887,11 +4907,14 @@ def _try_discovery_chain() -> tuple[Optional[OpenAI], Optional[str], str]:
     tried = []
     for label, try_fn in _get_provider_chain():
         candidate_base_url = _custom_health_base_url(label)
+        candidate_model = _get_aux_model_for_provider(label) or None
+        if _candidate_is_unhealthy(label, base_url=candidate_base_url, model=candidate_model):
+            tried.append(f"{label} (unhealthy)")
+            continue
         client, model = try_fn()
         if client is not None:
-            candidate_model = model or _get_aux_model_for_provider(label) or None
-            if _is_provider_unhealthy(label, candidate_base_url, candidate_model):
-                _log_skip_unhealthy(label, base_url=candidate_base_url, model=candidate_model)
+            candidate_model = model or candidate_model
+            if _candidate_is_unhealthy(label, base_url=candidate_base_url, model=candidate_model):
                 tried.append(f"{label} (unhealthy)")
                 continue
             if tried:
@@ -4943,6 +4966,21 @@ def _effective_provider_for_client(client: Any, fallback: str) -> str:
     if isinstance(effective_provider, str) and effective_provider:
         return _fallback_provider_from_label(effective_provider)
     return _fallback_provider_from_label(str(fallback or ""))
+
+
+def _health_provider_for_route(
+    resolved_provider: str, client: Any, main_runtime: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return the provider label whose health record subsequent route walks will read."""
+    pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
+    if pool_provider:
+        return pool_provider
+    effective_provider = _effective_provider_for_client(client, resolved_provider)
+    if effective_provider not in {"", "auto"}:
+        return effective_provider
+    if str(getattr(client, "base_url", "") or "").strip():
+        return "local/custom"
+    return effective_provider or resolved_provider
 
 
 # Centralized Provider Router: resolve_provider_client() is the single entry point for building a configured
@@ -8100,8 +8138,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     # Capacity/auth failures quarantine the concrete auxiliary route across callers/processes.
     if reason in {"payment error", "auth error", "rate limit"}:
         _mark_provider_unhealthy(
-            _recoverable_pool_provider(resolved_provider, route.client, main_runtime=route.main_runtime)
-            or resolved_provider,
+            _health_provider_for_route(resolved_provider, route.client, main_runtime=route.main_runtime),
             ttl=fallback_candidate_quarantine_ttl(reason),
             base_url=route.base_info,
             model=route.final_model if reason not in {"auth error", "payment error"} else None,
@@ -8407,11 +8444,11 @@ def _call_llm_impl(
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
                 response = _validate_llm_response(_relay_sync_completion(*args, **kw), task)
-                _clear_provider_health(req.resolved_provider, req.base_info, req.final_model)
+                _clear_provider_health(req.request_provider, req.base_info, req.final_model)
                 return response
             if kind == "retry":
                 response = _retry_same_provider_sync(**kw)
-                _clear_provider_health(req.resolved_provider, req.base_info, req.final_model)
+                _clear_provider_health(req.request_provider, req.base_info, req.final_model)
                 return response
             return _call_fallback_candidate_sync(*args, **kw)
         return _drive_ladder(
@@ -8621,11 +8658,11 @@ async def _async_call_llm_impl(
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
                 response = _validate_llm_response(await _relay_async_completion(*args, **kw), task)
-                _clear_provider_health(req.resolved_provider, req.base_info, req.final_model)
+                _clear_provider_health(req.request_provider, req.base_info, req.final_model)
                 return response
             if kind == "retry":
                 response = await _retry_same_provider_async(**kw)
-                _clear_provider_health(req.resolved_provider, req.base_info, req.final_model)
+                _clear_provider_health(req.request_provider, req.base_info, req.final_model)
                 return response
             fb_client, fb_model, fb_label = args
             fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=(task == "vision"))

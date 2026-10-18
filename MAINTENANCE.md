@@ -440,8 +440,10 @@ records, not patches. This contract's own patch identity: `maintenance-contract`
 rebases can rewrite the floor SHA; the checker requires the floor to be an ancestor of HEAD,
 locates a rewritten default floor by its exact subject, and fails clearly if that is gone.
 A maintenance unit may repair missing published metadata with an explicit
-`Fork-Patch-Backfill: <stable-patch-id>; <owned-identity>` line. This covers only
-the reviewed patch content without rewriting shared history or advancing the floor.
+`Fork-Patch-Backfill: <stable-patch-id>; <owned-identity>` line. This covers only the
+reviewed patch content without rewriting shared history or advancing the floor.
+Fork-Patch-Backfill: dd8b51a7f52d926fc084cd7e84bc8b72a651ff0f; evidence
+Published upstream maintenance merge `c8d3ae60f4f6` arrived without a trailer.
 New commits still require trailers, including the final squash merge message.
 A trailer proves classification, not functional coverage. Retire a patch only after its
 regression passes on the selected upstream release without the local implementation.

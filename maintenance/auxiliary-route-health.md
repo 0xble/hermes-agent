@@ -6,6 +6,8 @@ Load this unit when changing auxiliary unhealthy-route marking, recovery probes,
 
 Auxiliary callers in one Hermes home share typed route health through `$HERMES_HOME/state/auxiliary_route_health.json`. A route is identified by home, provider label, normalized endpoint, and model. The client must pass that full identity through every mark, read, skip, notice, recovery, and clear path. Custom routes are scoped by their concrete endpoint, so one depleted custom endpoint never hides another. Known providers stay provider-wide, so a failure recorded against the client URL is seen by the discovery, api-key and fallback walks that check without one.
 
+Fallback and discovery walks check route health before constructing a candidate. A recovered auto-routed request clears the concrete request provider, and Nous-only request tags are set only for a healthy Nous candidate.
+
 Each record carries a lane (`auth`, `quota`, `rate_limit`, `endpoint_outage`, `model`), an expiry, and an epoch. Rate limits, connection errors and garbled responses use the short candidate hold; payment and auth failures keep the long default. Parser and malformed-response failures are never shared, but still quarantine locally so the ordered fallback walk advances. Writes hold an exclusive file lock and use atomic replacement with mode `0600`. Unreadable state is quarantined to a `.corrupt-*` file instead of pinning a route.
 
 The typed record is persisted before the in-process compatibility cache changes. A failed write leaves the shared file unchanged but keeps a local quarantine so the ordered fallback walk still advances. Every store read, claim, clear and reset fails open: a read-only or full state directory never fails an auxiliary call or discards a successful response.
@@ -25,6 +27,10 @@ Fork-only. No upstream proposal yet.
 ## Verification
 
 `scripts/run_tests.sh tests/agent/test_auxiliary_health.py tests/agent/test_auxiliary_client.py tests/agent/test_auxiliary_fallback_multihop.py tests/agent/test_auxiliary_concurrency.py tests/agent/test_auxiliary_error_classification.py`
+
+## Review convergence
+
+Before the fourth exact-head review, the preceding rounds were treated as one design issue rather than independent nits: route health was checked after candidate construction at some walks, auto-routed failures could be recorded under the abstract `auto` label, and recovery clears could use the requested provider instead of the selected route. The chosen redesign is to centralize the pre-construction check, derive a concrete route label at the ladder boundary, and clear with the prepared request provider. This keeps the existing ordered fallback contract and makes the three failure classes explicit in regression tests.
 
 ## Retirement and rollback
 

@@ -236,3 +236,114 @@ def test_exhaustion_warning_uses_the_effective_provider_identity(caplog):
     ac._warn_auxiliary_route_once(route, "provider unavailable", RuntimeError("offline"))
 
     assert any("all fallbacks exhausted" in record.getMessage() for record in caplog.records)
+
+
+def test_discovery_checks_route_health_before_constructing_candidate(monkeypatch):
+    """An unhealthy Nous route must not run its constructor and leak Nous-only request tags."""
+    nous = _client("https://inference-api.nousresearch.com/v1", MagicMock())
+    fallback = _client("https://custom.example/v1", MagicMock())
+    constructed = []
+
+    def construct_nous():
+        constructed.append("nous")
+        ac.auxiliary_is_nous = True
+        return nous, "nous-model"
+
+    monkeypatch.setattr(ac, "_get_provider_chain", lambda: [
+        ("nous", construct_nous),
+        ("local/custom", lambda: (fallback, "custom-model")),
+    ])
+    monkeypatch.setattr(ac, "_is_provider_unhealthy", lambda label, *args, **kwargs: label == "nous")
+    ac.auxiliary_is_nous = False
+
+    client, model, label = ac._try_discovery_chain()
+
+    assert client is fallback
+    assert model == "custom-model"
+    assert label == "local/custom"
+    assert constructed == []
+    assert ac.auxiliary_is_nous is False
+
+
+def test_auto_custom_failure_quarantines_concrete_custom_route(monkeypatch):
+    """An auto-routed custom endpoint must not be persisted under the abstract ``auto`` label."""
+    base_url = "https://custom.example/v1"
+    route = ac._LadderRoute(
+        client=_client(base_url, MagicMock()), task="compression", tag="", async_mode=False,
+        base_info=base_url, resolved_provider="auto", resolved_model="model",
+        resolved_base_url=base_url, resolved_api_key=None, resolved_api_mode=None,
+        final_model="model", main_runtime=None, route_info=None, timeout=30.0,
+    )
+    mark = MagicMock()
+    monkeypatch.setattr(ac, "_mark_provider_unhealthy", mark)
+    monkeypatch.setattr(ac, "_try_configured_fallback_chain", lambda *args, **kwargs: (None, None, ""))
+    monkeypatch.setattr(ac, "_try_main_fallback_chain", lambda *args, **kwargs: (None, None, ""))
+    monkeypatch.setattr(ac, "_try_payment_fallback", lambda *args, **kwargs: (None, None, ""))
+
+    list(ac._ladder_provider_fallback(_payment_402("custom"), route))
+
+    mark.assert_called_once()
+    assert mark.call_args.args[0] == "local/custom"
+    assert mark.call_args.kwargs["base_url"] == base_url
+
+
+def _prepared_auto_custom_request():
+    base_url = "https://custom.example/v1"
+    client = _client(base_url, MagicMock())
+    req = ac._PreparedAuxRequest(
+        client=client, final_model="model", kwargs={"model": "model"},
+        resolved_provider="auto", request_provider="local/custom", resolved_model="model",
+        resolved_base_url=base_url, resolved_api_key=None, resolved_api_mode=None,
+        effective_timeout=30.0, effective_extra_body={}, base_info=base_url,
+    )
+    return req, base_url
+
+
+def test_sync_recovery_clears_concrete_request_provider(monkeypatch):
+    """A recovered auto route clears the concrete route record, not the abstract ``auto`` record."""
+    req, base_url = _prepared_auto_custom_request()
+    clear = MagicMock()
+    response = _ok_response("OK")
+    first_error = _payment_402("custom")
+
+    def ladder(*args, **kwargs):
+        result = yield ac._LadderStep("call", (req.client, req.kwargs))
+        return result
+
+    monkeypatch.setattr(ac, "_plan_aux_call", lambda *args, **kwargs: (req, {"max_tokens": None, "main_runtime": None}, {}))
+    monkeypatch.setattr(ac, "_relay_sync_completion", MagicMock(side_effect=[first_error, response]))
+    monkeypatch.setattr(ac, "_validate_llm_response", lambda value, *args, **kwargs: value)
+    monkeypatch.setattr(ac, "_should_retry_same_provider", lambda *args, **kwargs: False)
+    monkeypatch.setattr(ac, "_start_recovery_ladder", ladder)
+    monkeypatch.setattr(ac, "_clear_provider_health", clear)
+
+    result = ac._call_llm_impl(task="compression", messages=[])
+
+    assert result is response
+    clear.assert_called_once_with("local/custom", base_url, "model")
+
+
+@pytest.mark.asyncio
+async def test_async_recovery_clears_concrete_request_provider(monkeypatch):
+    """The async recovery driver uses the same concrete route identity as the sync driver."""
+    req, base_url = _prepared_auto_custom_request()
+    clear = MagicMock()
+    response = _ok_response("OK")
+    first_error = _payment_402("custom")
+
+    def ladder(*args, **kwargs):
+        result = yield ac._LadderStep("call", (req.client, req.kwargs))
+        return result
+
+    async_relay = AsyncMock(side_effect=[first_error, response])
+    monkeypatch.setattr(ac, "_plan_aux_call", lambda *args, **kwargs: (req, {"max_tokens": None, "main_runtime": None}, {}))
+    monkeypatch.setattr(ac, "_relay_async_completion", async_relay)
+    monkeypatch.setattr(ac, "_validate_llm_response", lambda value, *args, **kwargs: value)
+    monkeypatch.setattr(ac, "_should_retry_same_provider", lambda *args, **kwargs: False)
+    monkeypatch.setattr(ac, "_start_recovery_ladder", ladder)
+    monkeypatch.setattr(ac, "_clear_provider_health", clear)
+
+    result = await ac._async_call_llm_impl(task="compression", messages=[])
+
+    assert result is response
+    clear.assert_called_once_with("local/custom", base_url, "model")
