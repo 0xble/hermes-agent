@@ -104,7 +104,7 @@ def _goal_runner():
     return runner, adapter, entry, src
 
 
-def _turn_event(src, text, *, internal, origin=None, loop_wake=False):
+def _turn_event(src, text, *, internal, origin=None, loop_wake=False, terminal_identity=None, goal_instance=None):
     metadata = {"notification_origin": origin} if origin else {}
     if loop_wake:
         from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
@@ -112,7 +112,12 @@ def _turn_event(src, text, *, internal, origin=None, loop_wake=False):
     if goals.is_goal_continuation_text(text):
         # The gateway marks the continuations it enqueues; classification reads that provenance.
         metadata[GOAL_CONTINUATION_METADATA_KEY] = True
-    return MessageEvent(text=text, message_type=MessageType.TEXT, source=src, internal=internal, metadata=metadata)
+        if goal_instance is not None:
+            metadata["goal_continuation_instance"] = goal_instance
+    event = MessageEvent(text=text, message_type=MessageType.TEXT, source=src, internal=internal, metadata=metadata)
+    if terminal_identity is not None:
+        event._post_turn_goal_identity = terminal_identity
+    return event
 
 
 def _queued_continuations(adapter) -> int:
@@ -169,7 +174,10 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
         # ...but a completion drained behind a continuation head (the follow-up chain copies its
         # origin onto the head event, which is not internal) still counts as fresh evidence.
         clock[0] += 20
-        await _after_turn(runner, src, continuation, internal=False, origin="process_registry_synthetic")
+        await _after_turn(
+            runner, src, continuation, internal=False, origin="process_registry_synthetic",
+            terminal_identity={"user_turn": False, "goal_instance": None, "loop_tick": None},
+        )
         assert _queued_continuations(adapter) == 1
 
     # Nothing about the routine pacing hold reached the chat; only the first continue notice.
@@ -200,6 +208,41 @@ async def test_successive_automatic_continuations_obey_hard_gap_floor(hermes_hom
         await _after_turn(runner, src, continuation, internal=False)
         assert _queued_continuations(adapter) == 0
         assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 880)
+
+
+@pytest.mark.asyncio
+async def test_event_woken_continuation_does_not_reclassify_chain_tail_as_new_event(hermes_home, monkeypatch):
+    """The event that pierced a wait may anchor one immediate continuation only."""
+    runner, adapter, entry, src = _goal_runner()
+    clock = [35_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = goals.GoalManager(entry.session_id, min_continuation_gap_seconds=900)
+    mgr.set("ship the release")
+    continuation = mgr.next_continuation_prompt()
+
+    with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)), \
+            patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", return_value="new-evidence"):
+        await _after_turn(runner, src, "please ship it", internal=False)
+        adapter._pending_messages.clear()
+
+        # A real event may pierce the floor and dispatch exactly one immediate continuation.
+        clock[0] += 20
+        await _after_turn(
+            runner, src, "[delegation done]", internal=True, origin="delegation_result",
+        )
+        assert _queued_continuations(adapter) == 1
+        adapter._pending_messages.clear()
+
+        # A continuation-chain tail may still carry the event origin on its head metadata, but it
+        # did not receive a new event. It must wait for the remaining floor.
+        clock[0] += 20
+        await _after_turn(
+            runner, src, continuation, internal=False, origin="delegation_result",
+            goal_instance=mgr.state.created_at,
+        )
+        assert _queued_continuations(adapter) == 0
+        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 900)
 
 
 @pytest.mark.asyncio
