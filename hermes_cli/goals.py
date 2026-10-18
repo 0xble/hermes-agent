@@ -3253,6 +3253,17 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
         return bool(s is not None and s.status == "active" and (
             s.waiting_on_pid is not None or s.waiting_on_session is not None or getattr(s, "waiting_on_user_message", False) or s.waiting_until))
 
+    def automatic_continuation_floor_remaining(self) -> float:
+        """Return the remaining automatic-chain floor for a possible idle-watcher wake."""
+        state = self._state
+        if state is None or state.status != "active":
+            return 0.0
+        previous = float(state.last_automatic_continuation_at or 0.0)
+        if previous <= 0:
+            return 0.0
+        floor = max(float(self.min_continuation_gap_seconds), float(DEFAULT_MIN_CONTINUATION_GAP_SECONDS))
+        return max(0.0, floor - (time.time() - previous))
+
     def _barrier_holds(self) -> bool:
         """Pure check: True iff a barrier is set AND not yet satisfied (never mutates state)."""
         s = self._state
@@ -3306,6 +3317,15 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
         if not self.is_parked():
             return None
         if self._barrier_holds():
+            return None
+        # A timed wait requested by a user or external event may be shorter than the automatic
+        # continuation floor. Keep the expired timer quiet until that floor elapses; pid/session
+        # lifts and delegation completions remain immediate event wakes.
+        state = self._state
+        if (state is not None and state.waiting_until
+                and state.waiting_on_pid is None and state.waiting_on_session is None
+                and not state.waiting_on_user_message and not state.waiting_on_delegations
+                and self.automatic_continuation_floor_remaining() > 0):
             return None
         if self._state.waiting_on_session and _completion_notice_pending(self._state.waiting_on_session):
             return None

@@ -153,12 +153,14 @@ def test_real_repeated_judge_waits_use_idle_lift_backoff_and_one_notice(
     """P1 red path: repeated timed WAITs must back off instead of re-polling every minute."""
     from hermes_cli import goals
 
-    sid, _db, manager = _new_goal()
+    _sid, _db, manager = _new_goal()
     cli = _cli(manager, user_initiated=False)
     _stub_judge(
         monkeypatch,
         {"verdict": "wait", "wait_for_seconds": 30, "reason": "external consolidation"},
     )
+    clock = [10_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
 
     waits = []
     notices = []
@@ -170,12 +172,16 @@ def test_real_repeated_judge_waits_use_idle_lift_backoff_and_one_notice(
             notices.append(decision["message"])
 
             # Exercise the real CLI idle lift between automatic judge turns.
-            manager.state.waiting_until = time.time() - 1
+            manager.state.waiting_until = clock[0] - 1
             manager._save()
             cli._last_goal_barrier_check = 0.0
             cli._maybe_resume_parked_goal()
             assert not cli._pending_input.empty(), cycle
             cli._pending_input.get_nowait()
+            if cycle < 3:
+                # The resumed continuation is now the automatic-chain anchor. Advance past the
+                # 15-minute floor before exercising the next idle lift.
+                clock[0] += 900
 
     # Automatic judge WAITs are floored at the current no-progress rung and advance it.
     assert waits == list(goals._NO_PROGRESS_BACKOFF_S)
