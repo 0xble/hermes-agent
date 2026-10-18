@@ -1,7 +1,5 @@
 # State.db prune lock batching
 
-Fork-Patch-Backfill: dd8b51a7f52d926fc084cd7e84bc8b72a651ff0f; state-prune-lock-batching
-
 ## Scope
 
 Automatic session retention pruning is destructive background maintenance. It must not spend its daily throttle on a daytime run or hold SQLite's WAL write lock while deleting an unbounded session/message/FTS set.
