@@ -188,7 +188,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 ## Active patch record: state.db prune lock batching
 
 - **Patch identity:** `state-prune-lock-batching`.
-- **Behavior:** Automatic session retention pruning waits for the configured deletion window, deletes sessions and their FTS-triggered messages in short idempotent transactions with guard-safe compression lineage handling, and reports long write-lock holds with callback and pid. Non-Linux lock diagnostics no longer claim a holder released just before the deadline when `/proc/locks` is unavailable.
+- **Behavior:** Automatic session retention pruning enforces the configured deletion window inside the maintenance function and at its long-lived callers, so stale or alternate Hermes entrypoints cannot trigger a daytime prune. Inside the window, it deletes sessions and their FTS-triggered messages in short idempotent transactions with guard-safe compression lineage handling, and reports long write-lock holds with callback and pid. Non-Linux lock diagnostics no longer claim a holder released just before the deadline when `/proc/locks` is unavailable.
 - **Source surfaces:** `gateway/run.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_lockowners.py`, and focused state/gateway/CLI tests.
 - **Upstream status:** No equivalent upstream fix for the combined daytime gate, bounded prune transactions, and macOS diagnostic correction.
 - **Focused regression:** `uv run --with pytest --with pytest-asyncio pytest -q tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py`.
