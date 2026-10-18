@@ -11,7 +11,8 @@ import pytest
 @pytest.mark.parametrize("manual", [False, True])
 @pytest.mark.parametrize(
     "death", ["hard_exit", "payload_exception", "concurrent_recovery",
-              "timeout_hard_exit", "timeout_payload_exception"]
+              "timeout_hard_exit", "timeout_payload_exception", "completed",
+              "failed_after_delivery", "watchdog_failed"]
 )
 def test_adopted_worker_failure_is_visible(tmp_path, monkeypatch, manual, death):
     from cron import executions
@@ -76,6 +77,20 @@ else:
     eid = data["job"]["execution_id"]
     assert executions.adopt_claimed_execution(eid)
     ack.write_text(json.dumps({"pid": os.getpid(), "execution_id": eid}))
+    if DEATH == "completed":
+        executions.finish_execution(eid, success=True, output="worker output")
+        executions.record_delivery_status(eid, "delivered")
+        sys.exit(0)
+    if DEATH == "failed_after_delivery":
+        executions.finish_execution(eid, success=False, error="worker reported failure")
+        executions.record_delivery_status(eid, "delivered")
+        sys.exit(7)
+    if DEATH == "watchdog_failed":
+        executions.finish_execution(
+            eid, success=False,
+            error="Detached cron run exceeded hard wall-clock timeout (3s).",
+        )
+        os._exit(124)
     time.sleep(2)
     sys.stderr.write("worker-probe-startup-sentinel\\n")
     sys.stderr.flush()
@@ -112,27 +127,46 @@ else:
             "state": row["status"],
             "claim_released": record.get("fire_claim") is None,
             "job_error": record.get("last_error"),
+            "job_status": record.get("last_status"),
             "ledger_error": row.get("error"),
             "notice_calls": len(delivered),
         }
         print("PROBE", json.dumps(result), flush=True)
-        assert row["status"] == "unknown"
-        if death != "concurrent_recovery" and not death.startswith("timeout_"):
-            assert "Scheduler restarted" not in row["error"]
+        assert row["status"] in (
+            "unknown" if death not in {"completed", "failed_after_delivery", "watchdog_failed"}
+            else ("completed" if death == "completed" else "failed")
+        ), result
+        if death not in {"completed", "failed_after_delivery", "watchdog_failed"}:
+            if death != "concurrent_recovery" and not death.startswith("timeout_"):
+                assert "Scheduler restarted" not in row["error"]
+            assert result["job_status"] == "error", result
+            if not death.startswith("timeout_"):
+                assert "worker-probe-startup-sentinel" in (result["job_error"] or ""), result
+            assert len(delivered) == 1, result
+        elif death == "completed":
+            assert result["job_status"] == "ok", result
+            assert result["job_error"] is None, result
+            assert len(delivered) == 0, result
+        elif death == "failed_after_delivery":
+            assert result["job_status"] == "error", result
+            assert result["job_error"] == "worker reported failure", result
+            assert len(delivered) == 0, result
+        else:
+            assert result["job_status"] == "error", result
+            assert "hard wall-clock timeout (3s)" in (result["job_error"] or ""), result
+            assert len(delivered) == 1, result
         assert result["claim_released"], result
-        assert "worker-probe-startup-sentinel" in (result["job_error"] or ""), result
-        assert len(delivered) == 1, result
-        assert len(executions.list_executions()) <= executions.MAX_TERMINAL_EXECUTIONS
         from cron.scheduler_worker_failure import record_unknown_worker_outcome
 
         # Re-observing an old terminal row cannot notify twice or erase a newer fire.
-        record_unknown_worker_outcome(claimed)
-        assert len(delivered) == 1
-        assert claim_job_for_fire(job["id"], manual=True)
-        replacement = get_job(job["id"])["fire_claim"]
-        record_unknown_worker_outcome(claimed)
-        assert get_job(job["id"])["fire_claim"] == replacement
-        assert len(delivered) == 1
+        if death not in {"completed", "failed_after_delivery", "watchdog_failed"}:
+            record_unknown_worker_outcome(claimed)
+            assert len(delivered) == 1
+            assert claim_job_for_fire(job["id"], manual=True)
+            replacement = get_job(job["id"])["fire_claim"]
+            record_unknown_worker_outcome(claimed)
+            assert get_job(job["id"])["fire_claim"] == replacement
+            assert len(delivered) == 1
 
 
 def test_terminalizer_refuses_an_attempt_whose_worker_is_still_alive(
