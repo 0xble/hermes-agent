@@ -37,6 +37,10 @@ class MainDropCheckError(RuntimeError):
     """The ancestry check could not be completed safely."""
 
 
+class MainDropCheckSkipped(RuntimeError):
+    """The comparison ref was unavailable, so the advisory check was recorded as skipped."""
+
+
 def find_main_drop(
     run_git: Callable[..., object],
     target_ref: str,
@@ -62,16 +66,12 @@ def find_main_drop(
     live = output(["rev-parse", "--verify", f"{live_ref}^{{commit}}"])
     try:
         main = output(["rev-parse", "--verify", f"{main_ref}^{{commit}}"])
-    except MainDropCheckError:
-        # A checkout may not have a remote-tracking main ref (for example a
-        # tag-only install). The updater's explicit main fetch normally fills
-        # it; when a caller's fetch seam does not, preserve legacy behavior.
-        return None
-    if not target or not live or not main:
-        # Test and embedded callers may provide only the older update Git
-        # surface, which has no remote-tracking main output. Skip this
-        # advisory check rather than changing their update semantics.
-        return None
+    except MainDropCheckError as exc:
+        raise MainDropCheckSkipped(str(exc)) from exc
+    if not target or not live:
+        raise MainDropCheckError("the selected target or live release resolved to an empty SHA")
+    if not main:
+        raise MainDropCheckSkipped(f"git rev-parse {main_ref} returned an empty SHA")
 
     live_only = output(["rev-list", f"{target}..{live}"]).splitlines()
     if not live_only:

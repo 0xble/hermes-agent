@@ -35,7 +35,7 @@ from hermes_cli import update_cmd_commit as _commit
 from hermes_cli import update_cmd_posix_pause as _posix_pause
 from hermes_cli.update_cmd_pause_gate import _checkout_move, _moves_for
 from hermes_cli import update_cmd_check as _check
-from hermes_cli.forward_only_guard import (  # noqa: F401
+from hermes_cli.forward_only_guard import (
     leftover_forward_only_state, refuse_if_forward_only_leftovers,
 )
 
@@ -534,12 +534,6 @@ def _live_release_sha(git_cmd) -> str | None:
     head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
     if head:
         return head
-    # Keep the guard independent of the update's existing custody probe: callers
-    # may use that probe to exercise recovery behavior without making the live
-    # revision unknowable to this safety check.
-    with suppress(Exception):
-        result = _git_run(git_cmd, ["rev-parse", "HEAD"], cwd=_m().PROJECT_ROOT, check=True)
-        return (result.stdout or "").strip() or None
     return None
 
 
@@ -564,44 +558,47 @@ def _guard_against_main_drop(
     if not live_sha:
         message = "✗ Refusing update: could not determine the currently live release safely. No update was applied."
         _record_update_step("main_drop_guard", False, message)
+        _record_stop("main_drop_check")
         with suppress(Exception):
             from hermes_cli.update_receipt import finalize_update_receipt
             finalize_update_receipt("refused", stop_reason="main_drop_check")
         resume()
         print(message)
-        raise SystemExit(1)
+        raise SystemExit(2)
 
-    from hermes_cli.update_main_guard import MainDropCheckError, find_main_drop
+    from hermes_cli.update_main_guard import MainDropCheckError, MainDropCheckSkipped, find_main_drop
     try:
         finding = find_main_drop(
             lambda command, **kwargs: _git_run(git_cmd, command, cwd=_m().PROJECT_ROOT, **kwargs),
             target_ref,
             live_sha,
         )
+    except MainDropCheckSkipped as exc:
+        _record_update_step("main_drop_check_skipped", True, str(exc))
+        return
     except MainDropCheckError as exc:
         message = f"✗ Refusing update: could not verify origin/main safely ({exc}). No update was applied."
         _record_update_step("main_drop_guard", False, message)
+        _record_stop("main_drop_check")
         with suppress(Exception):
             from hermes_cli.update_receipt import finalize_update_receipt
             finalize_update_receipt("refused", stop_reason="main_drop_check")
         resume()
         print(message)
-        raise SystemExit(1)
+        raise SystemExit(2)
     if finding is None:
         return
 
     message = finding.message
     _record_update_step("main_drop_guard", False, message)
+    _record_stop("main_drop")
     with suppress(Exception):
         from hermes_cli.update_receipt import record_fact, finalize_update_receipt
         record_fact("main_drop", {"count": finding.count, "commits": [sha for sha, _ in finding.commits]})
         finalize_update_receipt("refused", stop_reason="main_drop")
     resume()
     print(message)
-    raise SystemExit(1)
-
-
-# cannot have invalidated it.
+    raise SystemExit(2)
 
 
 def _validate_python_files_syntax(
@@ -2262,7 +2259,6 @@ def _apply_pulled_update(
 _POST_SWAP_FORWARDED_FLAGS = (
     ("gateway", "--gateway"), ("no_backup", "--no-backup"), ("backup", "--backup"),
     ("yes", "--yes"), ("keep_stash", "--keep-stash"), ("switch_branch", "--switch-branch"),
-    ("allow_drop_main", "--allow-drop-main"),
     ("force", "--force"), ("force_venv", "--force-venv"),
     ("no_gateway_restart", "--no-gateway-restart"),
 )
@@ -2389,8 +2385,6 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
         _resolve_update_options(args, gateway_mode),
         pre_update_version=payload.get("pre_update_version"))
     had_desktop_app_before_update = bool(payload.get("had_desktop_app_before_update"))
-    desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
-
     try:
         if payload.get("swap") == "immutable":
             from hermes_cli.immutable_releases import ReleasePaths
@@ -2701,8 +2695,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             fetch_args = None
         elif release_sha:
             fetch_args = ["fetch", "--no-tags", "origin", target_ref]
-            # Stable/rollback targets still need a fresh origin/main for the drop guard.
-            fetch_args.append("+refs/heads/main:refs/remotes/origin/main")
         else:
             fetch_args = ["fetch", "origin", _check.tracking_refspec("origin", branch)]
             if branch != "main":
@@ -2726,11 +2718,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                          if "No space left on device" in (fetch_result.stderr or "") else "fetch_failed")
             sys.exit(1)
 
-        _guard_against_main_drop(
-            args, git_cmd, target_ref, target_is_head=target_is_head,
-            skip=isinstance(release_sha, str),
-            resume_gateways=lambda: _m()._resume_windows_gateways_after_update(_windows_gateway_resume),
-        )
+        if not isinstance(release_sha, str):
+            _guard_against_main_drop(
+                args, git_cmd, target_ref, target_is_head=target_is_head,
+                resume_gateways=lambda: _resume_windows_gateways_after_update(_windows_gateway_resume),
+            )
 
         if _immutable_release_enabled():
             _apply_fetched_immutable_update(
