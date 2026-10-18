@@ -3322,11 +3322,18 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
         # continuation floor. Keep the expired timer quiet until that floor elapses; pid/session
         # lifts and delegation completions remain immediate event wakes.
         state = self._state
-        if (state is not None and state.waiting_until
-                and state.waiting_on_pid is None and state.waiting_on_session is None
-                and not state.waiting_on_user_message and not state.waiting_on_delegations
-                and self.automatic_continuation_floor_remaining() > 0):
-            return None
+        if state is not None and state.waiting_until \
+                and state.waiting_on_pid is None and state.waiting_on_session is None \
+                and not state.waiting_on_user_message:
+            if state.waiting_on_delegations:
+                # A delegation completion is an event wake, but timer expiry while the same batch
+                # remains live is still an automatic continuation and must obey the floor.
+                delegation_count = count_active_delegations(self.session_id)
+                if delegation_count >= state.waiting_on_delegations \
+                        and self.automatic_continuation_floor_remaining() > 0:
+                    return None
+            elif self.automatic_continuation_floor_remaining() > 0:
+                return None
         if self._state.waiting_on_session and _completion_notice_pending(self._state.waiting_on_session):
             return None
         prompt = self.next_continuation_prompt()
