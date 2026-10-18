@@ -1113,11 +1113,16 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             session_entry.was_auto_reset = False
 
         _is_fresh_reset = getattr(session_entry, "is_fresh_reset", False)
+        attended_start_new_sessions = False
+        with suppress(Exception):
+            from gateway.run import _load_gateway_config
+            _attended_cfg = parse_attended_config(_load_gateway_config())
+            attended_start_new_sessions = _attended_cfg.enabled and _attended_cfg.start_new_sessions
         attended_new_session = getattr(
             self._session_state(session_key).conversation, "attended_new_session", False,
         )
         _is_new_session = (
-            attended_new_session
+            (attended_start_new_sessions and attended_new_session)
             or session_entry.created_at == session_entry.updated_at
             or _was_auto_reset
             or _is_fresh_reset
@@ -1127,7 +1132,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             # See #6508.
             session_entry.is_fresh_reset = False
         if _is_new_session:
-            self._session_state(session_key).conversation.attended_new_session = True
+            if attended_start_new_sessions:
+                self._session_state(session_key).conversation.attended_new_session = True
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,

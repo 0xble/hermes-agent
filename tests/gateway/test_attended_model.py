@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from gateway import run as gateway_run
 from gateway.attended_model import (
     AttendedResolution,
     format_attended_switch_back_notice,
@@ -352,7 +353,7 @@ def test_first_user_message_preserves_new_session_boundary_before_activity_stamp
     event = SimpleNamespace(text="hello", internal=False, metadata={})
     source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), user_id="u")
 
-    with patch("gateway.run._load_gateway_config", return_value=cfg):
+    with patch.object(gateway_run, "_load_gateway_config", return_value=cfg):
         assert asyncio.run(
             GatewayInboundMixin._mark_attended_user_activity(inbound, event, source, "k")
         ) is True
@@ -366,13 +367,14 @@ def test_first_user_message_preserves_new_session_boundary_before_activity_stamp
         _evict_cached_agent=lambda _key: None,
         hooks=SimpleNamespace(emit=AsyncMock()),
     )
-    was_auto_reset, is_new_session = asyncio.run(
-        GatewayTurnMixin._hmwa_open_session(turn, entry, "k", source)
-    )
+    with patch.object(gateway_run, "_load_gateway_config", return_value=cfg):
+        was_auto_reset, is_new_session = asyncio.run(
+            GatewayTurnMixin._hmwa_open_session(turn, entry, "k", source)
+        )
     assert (was_auto_reset, is_new_session) == (False, True)
 
     route_runner = _attended_route_runner(state)
-    with patch("gateway.run._resolve_gateway_model", return_value="gpt-6.1-sol"):
+    with patch.object(gateway_run, "_resolve_gateway_model", return_value="gpt-6.1-sol"):
         route = GatewayTurnMixin._attended_route_for_session(
             route_runner, source=None, session_key="k", user_config=cfg,
             override=None, last_model="",
@@ -396,7 +398,7 @@ def test_pre_turn_idle_expiry_stages_switch_back_notice_once():
         reasoning_override=None, reasoning_override_scope="session",
     ))
     route_runner = _attended_route_runner(state)
-    with patch("gateway.run._resolve_gateway_model", return_value="gpt-6.1-sol"):
+    with patch.object(gateway_run, "_resolve_gateway_model", return_value="gpt-6.1-sol"):
         route = GatewayTurnMixin._attended_route_for_session(
             route_runner, source=None, session_key="k", user_config=cfg,
             override=None, last_model="claude-opus-5-5",
@@ -405,3 +407,28 @@ def test_pre_turn_idle_expiry_stages_switch_back_notice_once():
     assert state.conversation.pending_attended_notice == format_attended_switch_back_notice(
         "gpt-6.1-sol", 15,
     )
+
+
+def test_disabled_attended_routing_does_not_reopen_existing_sessions():
+    state = SimpleNamespace(conversation=SimpleNamespace(attended_new_session=False))
+    entry = SimpleNamespace(
+        session_id="sid", created_at="created", updated_at="created",
+        was_auto_reset=False, is_fresh_reset=False,
+    )
+    runner = SimpleNamespace(
+        _session_state=lambda _key: state,
+        _clear_conversation_scope=lambda _key, reason: None,
+        _evict_cached_agent=lambda _key: None,
+        hooks=SimpleNamespace(emit=AsyncMock()),
+    )
+    source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), user_id="u")
+
+    with patch.object(gateway_run, "_load_gateway_config", return_value={"model": {}}):
+        first = asyncio.run(GatewayTurnMixin._hmwa_open_session(runner, entry, "k", source))
+        entry.updated_at = "updated"
+        second = asyncio.run(GatewayTurnMixin._hmwa_open_session(runner, entry, "k", source))
+
+    assert first == (False, True)
+    assert second == (False, False)
+    assert state.conversation.attended_new_session is False
+    assert runner.hooks.emit.await_count == 1
