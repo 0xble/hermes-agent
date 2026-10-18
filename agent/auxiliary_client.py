@@ -4972,6 +4972,12 @@ def _health_provider_for_route(
     resolved_provider: str, client: Any, main_runtime: Optional[dict[str, Any]] = None,
 ) -> str:
     """Return the provider label whose health record subsequent route walks will read."""
+    raw_provider = str(resolved_provider or "").strip().lower()
+    # A custom route owns its endpoint even when that endpoint uses a hostname also known to a
+    # credential pool (for example a task-specific custom proxy at openrouter.ai). Never infer a
+    # provider-wide pool from the URL in that case.
+    if raw_provider.startswith("custom:") or _normalize_aux_provider(raw_provider) == "custom":
+        return "local/custom"
     pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
     if pool_provider:
         return pool_provider

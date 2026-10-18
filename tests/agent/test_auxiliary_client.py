@@ -4725,7 +4725,7 @@ class TestAuxUnhealthyCache:
         """A hosted custom endpoint's billing state must not quarantine a local custom endpoint."""
         from agent.auxiliary_client import call_llm, _is_provider_unhealthy
 
-        hosted_url = "https://hosted.example/v1"
+        hosted_url = "https://openrouter.ai/api/v1"
         local_url = "http://127.0.0.1:8080/v1"
         payment_error = Exception("Payment Required: weekly usage limit")
         payment_error.status_code = 402
@@ -4759,6 +4759,7 @@ class TestAuxUnhealthyCache:
 
         assert response.choices[0].message.content == "local-ok"
         assert _is_provider_unhealthy("custom", hosted_url) is True
+        assert _is_provider_unhealthy("openrouter") is False
         assert _is_provider_unhealthy("custom", local_url) is False
         assert hosted_client.chat.completions.create.call_count == 1
         assert local_client.chat.completions.create.call_count == 1

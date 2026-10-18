@@ -4,7 +4,7 @@ Load this unit when changing auxiliary unhealthy-route marking, recovery probes,
 
 ## Required behavior
 
-Auxiliary callers in one Hermes home share typed route health through `$HERMES_HOME/state/auxiliary_route_health.json`. A route is identified by home, provider label, normalized endpoint, and model. The client must pass that full identity through every mark, read, skip, notice, recovery, and clear path. Custom routes are scoped by their concrete endpoint, so one depleted custom endpoint never hides another. Known providers stay provider-wide, so a failure recorded against the client URL is seen by the discovery, api-key and fallback walks that check without one.
+Auxiliary callers in one Hermes home share typed route health through `$HERMES_HOME/state/auxiliary_route_health.json`. A route is identified by home, provider label, normalized endpoint, and model. The client must pass that full identity through every mark, read, skip, notice, recovery, and clear path. Custom routes are scoped by their concrete endpoint, including when a custom proxy uses a hostname associated with a known provider, so one depleted custom endpoint never hides another. Known providers stay provider-wide, so a failure recorded against the client URL is seen by the discovery, api-key and fallback walks that check without one.
 
 Fallback and discovery walks check route health before constructing a candidate. A recovered auto-routed request clears the concrete request provider, and Nous-only request tags are set only for a healthy Nous candidate.
 
