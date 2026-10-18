@@ -2350,13 +2350,16 @@ class _CronRunScope:
     parallel jobs don't clobber each other). Construct before the try, ``enter()`` as its first
     statement, ``exit()`` in the finally — every setter here has a matching reset there.
 
-    HERMES_SESSION_* are deliberately NOT seeded from job["origin"]: it is delivery metadata, not
-    a sender, and terminal/tts/skills/send_message tools would act as if the origin user were
-    driving the agent. Delivery reads job["origin"] / HERMES_CRON_AUTO_DELIVER_* directly.
+    HERMES_SESSION_ID is seeded only with the truthful synthetic cron sender identity
+    ``cron_<job_id>``. The remaining HERMES_SESSION_* routing fields stay empty: job["origin"]
+    is delivery metadata, not a sender, and terminal/tts/skills/send_message tools must not act
+    as if the origin user were driving the agent. Delivery reads job["origin"] /
+    HERMES_CRON_AUTO_DELIVER_* directly.
     """
 
     def __init__(self, job: dict, job_id: str, execution_id: Optional[str]):
         from gateway.session_context import set_session_vars, _VAR_MAP
+        from hermes_cli.profiles import current_profile_name
         from tools.terminal_tool import record_session_cwd, register_run_scoped_task
 
         self._var_map = _VAR_MAP
@@ -2366,6 +2369,8 @@ class _CronRunScope:
             platform="",
             chat_id="",
             chat_name="",
+            session_id=f"cron_{job_id}",
+            profile=current_profile_name("default") or "default",
             # Cron can't receive completions after its turn; async delegation output could
             # otherwise route to an unrelated chat via the ambient session key => inline delegation.
             # We clear the HERMES_SESSION_* routing keys just below, so an async delegation's completion
