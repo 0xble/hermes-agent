@@ -147,6 +147,8 @@ except ImportError:
         DEFAULT_TYPE = Any
     ContextTypes = _MockContextTypes
 
+_APPROVE_BUTTON_STYLE = "success"
+
 import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
@@ -5372,7 +5374,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             default_hint = t("platform.telegram.prompt.default_hint", default=default) if default else ""
             text = self.format_message(f"☤ *{t('platform.telegram.prompt.update_header')}*\n\n{prompt}{default_hint}")
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton(t("platform.telegram.prompt.affirm"), callback_data="update_prompt:y"),
+                InlineKeyboardButton(t("platform.telegram.prompt.affirm"), callback_data="update_prompt:y", style=_APPROVE_BUTTON_STYLE),
                 InlineKeyboardButton(t("platform.telegram.prompt.negate"), callback_data="update_prompt:n")]])
             return text, keyboard, None
         return await self._send_prompt(
@@ -5385,7 +5387,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         """Render a durable session-control approval request with Approve/Deny buttons."""
         def build():
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("Approve", callback_data=f"ctl:a:{request_id}"),
+                InlineKeyboardButton("Approve", callback_data=f"ctl:a:{request_id}", style=_APPROVE_BUTTON_STYLE),
                 InlineKeyboardButton("Deny", callback_data=f"ctl:d:{request_id}"),
             ]])
             return self.format_message(text), keyboard, None
@@ -5439,7 +5441,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             if not hasattr(self, "_approval_counter"):
                 self._approval_counter = itertools.count(1)
             approval_id = next(self._approval_counter)
-            buttons = [InlineKeyboardButton(label, callback_data=f"ea:{choice}:{approval_id}")
+            buttons = [InlineKeyboardButton(
+                label, callback_data=f"ea:{choice}:{approval_id}",
+                **({"style": _APPROVE_BUTTON_STYLE} if choice in {"once", "session", "always"} else {}))
                        for label, choice, _ in prompt.actions]
             return prompt.text, InlineKeyboardMarkup(self._rows_of_two(buttons)), (
                 lambda msg: self._approval_state.__setitem__(approval_id, prompt.session_key))
@@ -5454,8 +5458,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         def build():
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton(t("platform.telegram.slash_confirm.approve_once"), callback_data=f"sc:once:{confirm_id}"),
-                    InlineKeyboardButton(t("platform.telegram.slash_confirm.always_approve"), callback_data=f"sc:always:{confirm_id}")],
+                    InlineKeyboardButton(t("platform.telegram.slash_confirm.approve_once"), callback_data=f"sc:once:{confirm_id}", style=_APPROVE_BUTTON_STYLE),
+                    InlineKeyboardButton(t("platform.telegram.slash_confirm.always_approve"), callback_data=f"sc:always:{confirm_id}", style=_APPROVE_BUTTON_STYLE)],
                 [InlineKeyboardButton(t("platform.telegram.slash_confirm.cancel"), callback_data=f"sc:cancel:{confirm_id}")],
            ])
             # Budget the MarkdownV2 rendering (escaping expands text), not the raw message.
