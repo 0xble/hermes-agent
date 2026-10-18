@@ -23,6 +23,13 @@ def clean_git_env():
 
 
 class PortableGateTests(unittest.TestCase):
+    def test_fork_history_email_scan_stays_on_first_parent(self):
+        with patch.object(ci, 'git', return_value='fork@example.invalid\n') as git:
+            self.assertEqual(ci.fork_commit_emails('base', 'release'), ['fork@example.invalid'])
+        git.assert_called_once_with(
+            'log', '--first-parent', 'base..HEAD', '^release', '--format=%ae', '--no-merges',
+        )
+
     def test_shards_cover_every_ordinary_python_and_safe_e2e_file_once(self):
         from scripts.run_tests_parallel import _discover_files
 
