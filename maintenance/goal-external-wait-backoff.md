@@ -4,6 +4,8 @@
 
 This maintenance unit owns the fork patch identity `goal-external-wait-backoff`.
 
+Fork-Patch-Backfill: 64b91fe87498d069db8ac2a7cf70c068a10330ec; goal-external-wait-backoff
+
 ## Required behavior
 
 A standing goal parks when its next progress depends on work outside the current
