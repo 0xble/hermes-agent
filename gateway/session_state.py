@@ -52,6 +52,7 @@ class ConversationState:
     service_tier_override_expiry_seconds: float = 0.0  # duration used in the one-shot notice
     last_resolved_model: str = ""  # last successfully-resolved non-empty model
     last_user_activity_at: Optional[float] = None  # durable mirror lives on SessionEntry
+    last_api_call_at: Optional[float] = None  # process-local quiet-window guard; absent after restart means quiet
     pending_attended_notice: Optional[str] = None  # one switching-in line for this turn
     last_attended_decision: Any = None  # route precedence decision for this session's current turn
     attended_new_session: bool = False  # consumed by the first attended route resolution or turn finalization

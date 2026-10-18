@@ -1695,6 +1695,13 @@ def _run_conversation_turn(
             break
         if _pg.action == "continue":
             continue
+        after_preflight = getattr(agent, "_gateway_after_preflight", None)
+        if callable(after_preflight):
+            before_route = (agent.model, agent.provider, getattr(agent, "api_mode", ""))
+            after_preflight(s)
+            after_route = (agent.model, agent.provider, getattr(agent, "api_mode", ""))
+            if after_route != before_route:
+                _run_phase(assemble_api_request, agent, s)
         _run_phase(announce_api_call, agent, s)
 
         s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries

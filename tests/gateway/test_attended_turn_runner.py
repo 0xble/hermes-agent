@@ -76,7 +76,9 @@ def test_mid_turn_idle_expiry_switches_back_once_with_one_notice():
     previous = AttendedResolution(
         "claude-opus-5-5", "anthropic", "medium", "attended", True, idle_model="gpt-6.1-sol",
     )
-    decision = AttendedResolution("gpt-6.1-sol", "nous", "xhigh", "default", False)
+    decision = AttendedResolution(
+        "gpt-6.1-sol", "nous", "xhigh", "default", False, switched_back=True,
+    )
     turn, _, state = _runner(
         decision, runtime=("gpt-6.1-sol", {"provider": "nous", "api_mode": "codex_responses"}),
     )
@@ -102,63 +104,45 @@ def test_mid_turn_idle_expiry_switches_back_once_with_one_notice():
     assert state.conversation.last_resolved_model == "gpt-6.1-sol"
 
 
-def test_compaction_reanchors_current_user_index():
-    from unittest.mock import patch
-
-    turn = TurnRunner.__new__(TurnRunner)
-    turn._ctx = _ctx({
-        "model": {
-            "attended": {"model": "opus", "provider": "anthropic"},
-            "compact_before_switch_tokens": 10,
-        }
-    })
-    compressor = SimpleNamespace(last_prompt_tokens=100, context_length=1000)
-    compressed = [
-        {"role": "user", "content": "older"},
-        {"role": "user", "content": "current"},
-    ]
+def test_oversized_default_context_keeps_attended_route_without_compaction():
+    previous = AttendedResolution(
+        "claude-opus-5-5", "anthropic", "medium", "attended", True, idle_model="gpt-6.1-sol",
+    )
+    decision = AttendedResolution(
+        "gpt-6.1-sol", "nous", "xhigh", "default", False, switched_back=True,
+    )
+    turn, _, state = _runner(
+        decision, runtime=("gpt-6.1-sol", {"provider": "nous", "api_mode": "codex_responses", "context_length": 272000}),
+    )
+    state.conversation.last_attended_decision = previous
+    notices = []
+    compressed = []
+    compressor = SimpleNamespace(
+        preview_threshold_tokens=lambda *_args: 204000,
+    )
     agent = SimpleNamespace(
-        context_compressor=compressor, compression_enabled=True, tools=[],
-        _compress_context=lambda *args, **kwargs: (compressed, ""),
+        model="claude-opus-5-5", provider="anthropic", api_mode="anthropic_messages",
+        _gateway_attended_decision=previous,
+        _gateway_attended_decision_key=previous.decision_key,
+        _fallback_activated=False, _provider_fallback_active=False,
+        reasoning_config={"enabled": True, "effort": "medium"},
+        _emit_diagnostic_status=notices.append,
+        context_compressor=compressor,
+        _compress_context=lambda *_args, **_kwargs: compressed.append(True),
     )
-    loop_state = SimpleNamespace(
-        messages=[{"role": "user", "content": "current"}], active_system_prompt="",
-        system_message="", effective_task_id="task", conversation_history=[],
-        user_message="current", current_turn_user_idx=0,
-    )
+    loop_state = SimpleNamespace(request_pressure_tokens=204000, messages=[])
 
-    with patch("agent.conversation_compression.conversation_history_after_compression", return_value=[]):
-        turn._compact_before_attended_switch(
-            agent, loop_state, model="opus", runtime={"provider": "anthropic", "context_length": 1000},
-        )
+    with patch("agent.agent_runtime_helpers.switch_model") as switch:
+        turn._apply_attended_before_api_call(agent, loop_state)
 
-    assert loop_state.current_turn_user_idx == 1
-    assert agent._persist_user_message_idx == 1
+    switch.assert_not_called()
+    assert notices == []
+    assert compressed == []
+    assert state.conversation.last_attended_decision is previous
 
 
-def test_compaction_failure_does_not_block_a_switch():
-    turn = TurnRunner.__new__(TurnRunner)
-    turn._ctx = _ctx({
-        "model": {
-            "attended": {"model": "opus", "provider": "anthropic"},
-            "compact_before_switch_tokens": 10,
-        }
-    })
-    compressor = SimpleNamespace(last_prompt_tokens=100, context_length=1000)
-    agent = SimpleNamespace(
-        context_compressor=compressor, compression_enabled=True, tools=[],
-        _compress_context=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("compress failed")),
-    )
-    loop_state = SimpleNamespace(
-        messages=[{"role": "user", "content": "large"}], active_system_prompt="",
-        system_message="", effective_task_id="task", conversation_history=[],
-    )
-
-    # The method is intentionally fail-open: an exception is logged and the caller can switch.
-    turn._compact_before_attended_switch(
-        agent, loop_state, model="opus", runtime={"provider": "anthropic", "context_length": 1000},
-    )
-    assert loop_state.messages == [{"role": "user", "content": "large"}]
+def test_switch_only_compaction_path_was_removed():
+    assert not hasattr(TurnRunner, "_compact_before_attended_switch")
 
 
 def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
