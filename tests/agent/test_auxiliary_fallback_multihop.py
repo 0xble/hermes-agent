@@ -137,3 +137,72 @@ def test_candidate_quarantine_ttl_is_short_for_transient_429_and_long_for_paymen
     assert _quarantine_remaining("http://127.0.0.1:3/v1", "modelC") > 60
     marks = [r.getMessage() for r in caplog.records if "marking local/custom unhealthy" in r.getMessage()]
     assert marks and "payment" not in marks[0] and "rate limit" in marks[0]
+
+
+def test_discovery_rewalk_uses_the_resolved_model_when_openrouter_is_quarantined(monkeypatch):
+    """A failed OpenRouter hop must not be selected again just because its model was resolved late."""
+    openrouter = _client("https://openrouter.ai/api/v1", MagicMock())
+    nous = _client("https://inference-api.nousresearch.com/v1", MagicMock())
+    monkeypatch.setattr(ac, "_read_main_provider", lambda: "auto")
+    monkeypatch.setattr(ac, "_get_provider_chain", lambda: [
+        ("openrouter", lambda: (openrouter, "openrouter/model")),
+        ("nous", lambda: (nous, "nous-model")),
+    ])
+    ac._mark_provider_unhealthy("openrouter", model="openrouter/model", reason="rate limit")
+
+    client, model, label = ac._try_payment_fallback(
+        "primary", task="compression", reason="provider unavailable",
+    )
+
+    assert client is nous
+    assert model == "nous-model"
+    assert label == "nous"
+
+
+def test_configured_auxiliary_fallback_can_resolve_a_default_model(monkeypatch):
+    """Task fallback entries may omit model and use the provider router's default."""
+    client = _client("https://openrouter.ai/api/v1", MagicMock())
+    monkeypatch.setattr(ac, "_get_auxiliary_task_config", lambda task: {
+        "fallback_chain": [{"provider": "openrouter"}],
+    })
+    monkeypatch.setattr(ac, "resolve_provider_client", lambda provider, **kwargs: (client, "resolved/default"))
+
+    resolved, model, label = ac._try_configured_fallback_chain(
+        "title_generation", "primary", reason="provider unavailable",
+    )
+
+    assert resolved is client
+    assert model == "resolved/default"
+    assert label == "fallback_chain[0](openrouter)"
+
+
+def test_payment_quarantine_is_provider_wide_for_the_main_route(monkeypatch):
+    """A provider-wide payment record must skip the main route even when the call has a model."""
+    resolve = MagicMock(return_value=(_client("https://openrouter.ai/api/v1", MagicMock()), "model"))
+    monkeypatch.setattr(ac, "resolve_provider_client", resolve)
+    ac._mark_provider_unhealthy("openrouter", model=None, reason="payment / credit error")
+
+    result = ac._try_main_provider_route("openrouter", "model", "", "", "")
+
+    assert result is None
+    resolve.assert_not_called()
+
+
+def test_exhaustion_warning_uses_the_effective_provider_identity(caplog):
+    """The final warning must still fire for an auto route whose client resolved to OpenRouter."""
+    caplog.set_level("WARNING", logger="agent.auxiliary_client")
+    client = _client("https://openrouter.ai/api/v1", MagicMock())
+    client._hermes_aux_effective_provider = "openrouter"
+    route = MagicMock(
+        client=client,
+        resolved_provider="auto",
+        base_info="https://openrouter.ai/api/v1",
+        final_model="openrouter/model",
+        resolved_model="openrouter/model",
+        task="compression",
+        tag="",
+    )
+
+    ac._warn_auxiliary_route_once(route, "provider unavailable", RuntimeError("offline"))
+
+    assert any("all fallbacks exhausted" in record.getMessage() for record in caplog.records)
