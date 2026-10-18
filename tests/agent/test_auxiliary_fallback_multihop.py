@@ -192,6 +192,24 @@ def test_configured_auxiliary_fallback_can_resolve_a_default_model(monkeypatch):
     assert label == "fallback_chain[0](openrouter)"
 
 
+def test_expired_fallback_route_owner_survives_post_construction_health_check(monkeypatch):
+    """The caller that claims an expired recovery probe must not reject its own candidate."""
+    base_url = "https://proxy.example/v1"
+    client = _client(base_url, MagicMock())
+    entry = {"provider": "custom", "model": "model", "base_url": base_url}
+    monkeypatch.setattr(ac, "_get_auxiliary_task_config", lambda task: {"fallback_chain": [entry]})
+    monkeypatch.setattr(ac, "_resolve_fallback_entry", lambda value: (client, "model"))
+    ac._mark_provider_unhealthy("custom", base_url=base_url, model="model", ttl=0, reason="rate limit")
+
+    resolved, model, label = ac._try_configured_fallback_chain(
+        "title_generation", "primary", reason="provider unavailable",
+    )
+
+    assert resolved is client
+    assert model == "model"
+    assert label == "fallback_chain[0](custom)"
+
+
 def test_fallback_label_is_unwrapped_before_recovery_clear():
     """Recovery of a main fallback route must clear the concrete provider record."""
     ac._mark_provider_unhealthy("openrouter", model="model", ttl=0, reason="rate limit")
@@ -267,9 +285,11 @@ def test_discovery_checks_route_health_before_constructing_candidate(monkeypatch
 
 def test_auto_custom_failure_quarantines_concrete_custom_route(monkeypatch):
     """An auto-routed custom endpoint must not be persisted under the abstract ``auto`` label."""
-    base_url = "https://custom.example/v1"
+    base_url = "https://openrouter.ai/api/v1"
+    client = _client(base_url, MagicMock())
+    client._hermes_aux_effective_provider = "custom"
     route = ac._LadderRoute(
-        client=_client(base_url, MagicMock()), task="compression", tag="", async_mode=False,
+        client=client, task="compression", tag="", async_mode=False,
         base_info=base_url, resolved_provider="auto", resolved_model="model",
         resolved_base_url=base_url, resolved_api_key=None, resolved_api_mode=None,
         final_model="model", main_runtime=None, route_info=None, timeout=30.0,
@@ -285,6 +305,17 @@ def test_auto_custom_failure_quarantines_concrete_custom_route(monkeypatch):
     mark.assert_called_once()
     assert mark.call_args.args[0] == "local/custom"
     assert mark.call_args.kwargs["base_url"] == base_url
+
+
+def test_named_custom_route_uses_one_endpoint_scoped_health_identity():
+    """Named custom routes use local/custom consistently through mark, read and clear."""
+    base_url = "https://proxy.example/v1"
+    ac._mark_provider_unhealthy("custom:foo", base_url=base_url, model="model", ttl=0, reason="rate limit")
+
+    assert not ac._is_provider_unhealthy("custom:foo", base_url, "model")
+    assert ac._candidate_is_unhealthy("custom:foo", base_url=base_url, model="model") is False
+    ac._clear_provider_health("custom:foo", base_url, "model")
+    assert not ac._is_provider_unhealthy("local/custom", base_url, "model")
 
 
 def _prepared_auto_custom_request():

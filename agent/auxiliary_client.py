@@ -3180,10 +3180,13 @@ def _normalize_chain_label(provider: str) -> str:
     if not provider:
         return ""
     p = str(provider).strip().lower()
+    if p.startswith("custom:"):
+        return "local/custom"
     return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
 
 
 _AUX_UNHEALTHY_PAYMENT_REASON = "payment / credit error"
+_HEALTH_STORE_UNAVAILABLE = object()
 
 
 def _auxiliary_route_identity(
@@ -3302,10 +3305,9 @@ def _is_provider_unhealthy(
         local_until = _aux_unhealthy_until.get(key)
         if local_until is not None and now < local_until:
             return True
-        try:
-            record = _read_auxiliary_health(identity)
-        except OSError as exc:
-            logger.warning("Auxiliary route health: could not read route: %s", exc)
+        record = _health_store_call("read route", _read_auxiliary_health, identity,
+                                    default=_HEALTH_STORE_UNAVAILABLE)
+        if record is _HEALTH_STORE_UNAVAILABLE:
             if local_until is not None:
                 _clear_local_health(key)
             return False
@@ -3315,14 +3317,43 @@ def _is_provider_unhealthy(
             return True
         if local_until is not None:
             _clear_local_health(key)
-
-    # Claim the recovery probe on the same exact-or-wildcard route that was checked.
-    # A missing exact record returns None, allowing the provider-wide record to decide.
-    for _candidate_model, _key, identity in candidates:
-        probe = _health_store_call("claim recovery probe", _claim_auxiliary_probe, identity)
-        if probe is not None:
-            return probe is False
     return False
+
+def _claim_recovery_probe(
+    label: str, base_url: Optional[str] = None, model: Optional[str] = None,
+) -> Optional[bool]:
+    """Claim the recovery probe after a read-only health check found no active hold."""
+    if not label:
+        return None
+    # A missing exact record returns None, allowing the provider-wide record to decide.
+    # The caller that claims the probe is allowed through its later post-construction check.
+    for _candidate_model, _key, identity in _health_route_candidates(label, base_url, model):
+        probe = _health_store_call("claim recovery probe", _claim_auxiliary_probe, identity,
+                                   default=_HEALTH_STORE_UNAVAILABLE)
+        if probe is _HEALTH_STORE_UNAVAILABLE:
+            return None
+        if probe is not None:
+            return bool(probe)
+    return None
+
+
+def _candidate_is_unhealthy(
+    label: str, *, task: Optional[str] = None, base_url: Optional[str] = None,
+    model: Optional[str] = None, claim_probe: bool = True,
+) -> bool:
+    """Check route health and, before construction, claim one expired-route recovery probe."""
+    if _is_provider_unhealthy(label, base_url, model):
+        unhealthy = True
+    else:
+        probe = _claim_recovery_probe(label, base_url, model) if claim_probe else None
+        unhealthy = probe is False
+    if not unhealthy:
+        return False
+    global auxiliary_is_nous
+    if _normalize_chain_label(label) == "nous":
+        auxiliary_is_nous = False
+    _log_skip_unhealthy(label, task, base_url=base_url, model=model)
+    return True
 
 
 def _claim_notice_for(
@@ -3331,11 +3362,20 @@ def _claim_notice_for(
     """True when this caller should log the route's notice; one claim per health epoch."""
     for candidate_model, key, identity in _health_route_candidates(label, base_url, model):
         known_locally = key in _aux_unhealthy_until or key in _aux_unhealthy_reason
-        record = _health_store_call("read route", _read_auxiliary_health, identity, default=None)
+        record = _health_store_call("read route", _read_auxiliary_health, identity,
+                                    default=_HEALTH_STORE_UNAVAILABLE)
+        if record is _HEALTH_STORE_UNAVAILABLE:
+            return allow_missing
         if not known_locally and record is None:
             continue
-        return bool(_health_store_call(
-            "claim notice", _claim_auxiliary_notice, identity, default=False))
+        claimed = _health_store_call(
+            "claim notice", _claim_auxiliary_notice, identity, default=_HEALTH_STORE_UNAVAILABLE)
+        if claimed is _HEALTH_STORE_UNAVAILABLE:
+            return allow_missing
+        if claimed:
+            return True
+        if record is None:
+            return allow_missing
     return allow_missing
 
 
@@ -3361,20 +3401,6 @@ def _log_skip_unhealthy(
             task or "call", label, _aux_unhealthy_reason.get(key, _AUX_UNHEALTHY_PAYMENT_REASON),
             max(0, int(expires_at - now)),
         )
-
-
-def _candidate_is_unhealthy(
-    label: str, *, task: Optional[str] = None, base_url: Optional[str] = None,
-    model: Optional[str] = None,
-) -> bool:
-    """Check route health before building a candidate and clear Nous-only state on a late skip."""
-    if not _is_provider_unhealthy(label, base_url, model):
-        return False
-    global auxiliary_is_nous
-    if _normalize_chain_label(label) == "nous":
-        auxiliary_is_nous = False
-    _log_skip_unhealthy(label, task, base_url=base_url, model=model)
-    return True
 
 
 def _warn_auxiliary_route_once(route: Any, reason: str, error: BaseException) -> None:
@@ -4509,7 +4535,8 @@ def _try_payment_fallback(
         client, model = try_fn()
         if client is not None:
             candidate_model = model or candidate_model
-            if _candidate_is_unhealthy(label, task=task, base_url=candidate_base_url, model=candidate_model):
+            if _candidate_is_unhealthy(label, task=task, base_url=candidate_base_url,
+                                       model=candidate_model, claim_probe=False):
                 tried.append(f"{label} (unhealthy)")
                 continue
             logger.info("Auxiliary %s: %s on %s — falling back to %s (%s)",
@@ -4677,7 +4704,8 @@ def _try_configured_fallback_chain(
             fb_client, resolved_model = None, None
         if fb_client is not None:
             health_model = resolved_model or fb_model
-            if _candidate_is_unhealthy(fb_provider, task=task, base_url=fb_base_url, model=health_model):
+            if _candidate_is_unhealthy(fb_provider, task=task, base_url=fb_base_url,
+                                       model=health_model, claim_probe=False):
                 tried.append(f"fallback_chain[{i}]({fb_provider}) (unhealthy)")
                 continue
             too_small = _context_too_small(
@@ -4772,7 +4800,8 @@ def _try_main_fallback_chain(
             fb_client, resolved_model = None, None
         if fb_client is not None:
             health_model = resolved_model or fb_model
-            if _candidate_is_unhealthy(fb_norm, task=task, base_url=fb_base_url, model=health_model):
+            if _candidate_is_unhealthy(fb_norm, task=task, base_url=fb_base_url,
+                                       model=health_model, claim_probe=False):
                 tried.append(f"{label} (unhealthy)")
                 continue
             too_small = _context_too_small(
@@ -4914,7 +4943,8 @@ def _try_discovery_chain() -> tuple[Optional[OpenAI], Optional[str], str]:
         client, model = try_fn()
         if client is not None:
             candidate_model = model or candidate_model
-            if _candidate_is_unhealthy(label, base_url=candidate_base_url, model=candidate_model):
+            if _candidate_is_unhealthy(label, base_url=candidate_base_url,
+                                       model=candidate_model, claim_probe=False):
                 tried.append(f"{label} (unhealthy)")
                 continue
             if tried:
@@ -4973,15 +5003,21 @@ def _health_provider_for_route(
 ) -> str:
     """Return the provider label whose health record subsequent route walks will read."""
     raw_provider = str(resolved_provider or "").strip().lower()
+    effective_provider = _effective_provider_for_client(client, resolved_provider)
+    effective_raw = str(effective_provider or "").strip().lower()
     # A custom route owns its endpoint even when that endpoint uses a hostname also known to a
     # credential pool (for example a task-specific custom proxy at openrouter.ai). Never infer a
     # provider-wide pool from the URL in that case.
-    if raw_provider.startswith("custom:") or _normalize_aux_provider(raw_provider) == "custom":
+    if (
+        raw_provider.startswith("custom:")
+        or _normalize_aux_provider(raw_provider) == "custom"
+        or effective_raw.startswith("custom:")
+        or _normalize_aux_provider(effective_raw) == "custom"
+    ):
         return "local/custom"
     pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
     if pool_provider:
         return pool_provider
-    effective_provider = _effective_provider_for_client(client, resolved_provider)
     if effective_provider not in {"", "auto"}:
         return effective_provider
     if str(getattr(client, "base_url", "") or "").strip():

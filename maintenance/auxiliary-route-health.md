@@ -32,6 +32,8 @@ Fork-only. No upstream proposal yet.
 
 Before the fourth exact-head review, the preceding rounds were treated as one design issue rather than independent nits: route health was checked after candidate construction at some walks, auto-routed failures could be recorded under the abstract `auto` label, and recovery clears could use the requested provider instead of the selected route. The chosen redesign is to centralize the pre-construction check, derive a concrete route label at the ladder boundary, and clear with the prepared request provider. This keeps the existing ordered fallback contract and makes the three failure classes explicit in regression tests.
 
+Round 5 found the remaining recovery-probe side effect in that design: the health predicate both read state and claimed the probe, so post-construction checks rejected the caller that had just claimed it. The correction separates read-only health checks from pre-construction claims, makes post-construction checks read-only, normalizes all named custom routes to `local/custom` plus endpoint, and lets exhaustion warnings fail open when the shared store is unavailable. The round-5 regressions cover probe-owner progress across expiry, store-failure warnings, named custom mark/read/clear identity, and auto-routed custom endpoints on known provider hosts.
+
 ## Retirement and rollback
 
 Retire when upstream ships equivalent cross-process auxiliary route health with endpoint-scoped identity, single-probe recovery, and epoch-deduplicated notices. Roll back by reverting the commit carrying `Fork-Patch: auxiliary-route-health` and deleting `$HERMES_HOME/state/auxiliary_route_health.json`; the in-process unhealthy cache then resumes sole ownership.

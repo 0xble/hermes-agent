@@ -162,6 +162,31 @@ def test_route_health_store_errors_fail_open(monkeypatch):
     aux._reset_aux_unhealthy_cache()
 
 
+def test_exhaustion_warning_is_not_suppressed_when_route_health_store_fails(monkeypatch, caplog):
+    """A local-only quarantine still emits its exhaustion warning when shared state is unavailable."""
+    def unavailable(*args, **kwargs):
+        raise OSError("read-only state directory")
+
+    for name in ("_read_auxiliary_health", "_claim_auxiliary_notice"):
+        monkeypatch.setattr(aux, name, unavailable)
+    caplog.set_level(logging.WARNING, logger="agent.auxiliary_client")
+    route = MagicMock(
+        client=MagicMock(base_url="https://proxy.example/v1"),
+        resolved_provider="custom",
+        base_info="https://proxy.example/v1",
+        final_model="model",
+        resolved_model="model",
+        task="compression",
+        tag="",
+    )
+    key = aux._unhealthy_cache_key("custom", route.base_info, "model")
+    aux._aux_unhealthy_reason[key] = "invalid provider response"
+
+    aux._warn_auxiliary_route_once(route, "provider unavailable", RuntimeError("offline"))
+
+    assert any("all fallbacks exhausted" in record.getMessage() for record in caplog.records)
+
+
 def test_primary_rate_limit_uses_short_lane_hold(monkeypatch):
     marks = []
     monkeypatch.setattr(aux, "_mark_provider_unhealthy", lambda *a, **kw: marks.append(kw))

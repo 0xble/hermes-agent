@@ -171,7 +171,8 @@ def test_expired_route_allows_one_probe_then_recovery_clears_shared_state(state_
 
     now[0] = 111.0
     assert aux._is_provider_unhealthy("openrouter") is False
-    assert aux._is_provider_unhealthy("openrouter") is True
+    assert aux._candidate_is_unhealthy("openrouter") is False
+    assert aux._candidate_is_unhealthy("openrouter") is True
 
     aux._clear_provider_health("openrouter")
     assert health.read_health(identity) is None
