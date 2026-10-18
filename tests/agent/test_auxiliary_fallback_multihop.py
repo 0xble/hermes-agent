@@ -44,8 +44,8 @@ def _payment_402(lane: str) -> Exception:
     return exc
 
 
-def _quarantine_remaining(base_url: str) -> float:
-    key = ac._unhealthy_cache_key("custom", base_url)
+def _quarantine_remaining(base_url: str, model: str) -> float:
+    key = ac._unhealthy_cache_key("custom", base_url, model)
     return ac._aux_unhealthy_until[key] - time.time()
 
 
@@ -92,8 +92,8 @@ def test_sync_walk_advances_past_quota_limited_candidate_to_next_configured_entr
     assert lane_b.chat.completions.create.call_count == 1
     assert lane_c.chat.completions.create.call_count == 1
     # The quota-limited candidate is really quarantined (per endpoint) so the ordered re-walk skips it.
-    assert ac._is_provider_unhealthy("custom", "http://127.0.0.1:2/v1")
-    assert not ac._is_provider_unhealthy("custom", "http://127.0.0.1:3/v1")
+    assert ac._is_provider_unhealthy("custom", "http://127.0.0.1:2/v1", "modelB")
+    assert not ac._is_provider_unhealthy("custom", "http://127.0.0.1:3/v1", "modelC")
 
 
 @pytest.mark.asyncio
@@ -133,7 +133,7 @@ def test_candidate_quarantine_ttl_is_short_for_transient_429_and_long_for_paymen
         result = call_llm(task="title_generation", messages=[{"role": "user", "content": "Reply OK"}])
 
     assert result.choices[0].message.content == "OK"
-    assert 0 < _quarantine_remaining("http://127.0.0.1:2/v1") <= 60
-    assert _quarantine_remaining("http://127.0.0.1:3/v1") > 60
+    assert 0 < _quarantine_remaining("http://127.0.0.1:2/v1", "modelB") <= 60
+    assert _quarantine_remaining("http://127.0.0.1:3/v1", "modelC") > 60
     marks = [r.getMessage() for r in caplog.records if "marking local/custom unhealthy" in r.getMessage()]
     assert marks and "payment" not in marks[0] and "rate limit" in marks[0]
