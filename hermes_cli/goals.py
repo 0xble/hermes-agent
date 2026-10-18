@@ -3458,7 +3458,7 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
                 remaining = floor - (time.time() - previous) if previous else floor
                 seconds = max(1, math.ceil(remaining))
                 logger.info("goal judge: wait_on_pid %s is not alive on this host; using %ss floor wait", pid, seconds)
-                self.wait_for_seconds(seconds, reason=reason)
+                self.wait_for_seconds(seconds, reason=_MIN_CONTINUATION_GAP_REASON)
                 tgt = f"pid {pid} (stale; {seconds}s floor)"
         elif wait_directive.get("until"):
             raw_until = wait_directive["until"]
