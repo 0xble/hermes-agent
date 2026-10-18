@@ -107,6 +107,25 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
     return runner
 
 
+def test_control_card_leads_with_decision_and_nonblocking_note():
+    from gateway.run_session_controls import GatewaySessionControlsMixin
+
+    text = GatewaySessionControlsMixin._control_text({
+        "kind": "goal", "action": "replace", "target_session_id": "target",
+        "requester_session_id": "requester", "target_title": "Target session",
+        "requester_title": "Requester session", "reason": "new outcome",
+        "affected_text": "Current goal: old objective -> new objective",
+        "payload": {"goal": "new objective", "contract": {"verification": "green"}, "max_turns": 8},
+    })
+    assert text.startswith("Approval needed\nChange: Goal Replace\n")
+    assert "Session: Target session (target)" in text
+    assert "Requested by: Requester session (requester)" in text
+    assert "Proposed goal: new objective" in text
+    assert "Proposed contract (replaces the current one):" in text
+    assert "The requesting session continues while this is pending." in text
+    assert "Session control request" not in text
+
+
 @pytest.mark.asyncio
 async def test_watcher_posts_pending_once_with_topic_metadata_and_skips_unrouted(state):
     from hermes_cli.session_controls import request_control, pending_outbox
@@ -767,7 +786,7 @@ def test_long_goals_keep_cards_and_notices_within_one_telegram_message(state, st
     for text in (runner._control_text(record), runner._control_notice(record),
                  runner._requester_notice(record)):
         assert len(text) <= 4096
-    assert runner._control_text(record).endswith("…")
+    assert "…" in runner._control_text(record)
 
 
 def test_replace_card_shows_the_whole_proposal_when_the_current_goal_is_long():

@@ -109,7 +109,7 @@ async def test_button_resolves_in_the_profile_that_owns_the_chat(two_homes):
         _async_profile_scope_for_source=lambda source: _async_scope(secondary_home))
     query = SimpleNamespace(
         from_user=SimpleNamespace(id=99, first_name="Brian"), answer=AsyncMock(),
-        message=SimpleNamespace(text="Session control request"),
+        message=SimpleNamespace(text="Approval needed\nChange: Goal Pause"),
     )
     cb = {"chat_id": "secondary-target", "chat_type": "private", "thread_id": None, "user_name": "Brian"}
     await adapter._handle_session_control_callback(query, f"ctl:a:{request['id']}", cb)

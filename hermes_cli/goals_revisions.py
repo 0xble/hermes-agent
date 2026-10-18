@@ -225,7 +225,7 @@ class GoalRevisionsMixin:
             authority = _CURRENT_AUTHORITY.get() or {}
         except Exception:
             authority = {}
-        approved = authority.get("via") in {"quote", "button"}
+        approved = authority.get("via") in {"quote", "button", "session"}
 
         def snapshot() -> Dict[str, Any]:
             return {"goal": state.goal, "max_turns": state.max_turns, "contract": state.contract.to_dict(),

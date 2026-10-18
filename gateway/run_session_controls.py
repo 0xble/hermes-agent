@@ -38,21 +38,24 @@ class GatewaySessionControlsMixin:
 
     @classmethod
     def _control_text(cls, record: dict) -> str:
-        # Every free-text field is bounded: the card is one message with buttons (Telegram caps a
-        # message at 4096 chars), and an oversized card would fail and strand the request.
+        # Keep the card scannable on mobile: decision first, then the affected session, the actor,
+        # the exact change and the reason. Every free-text field remains bounded so one Telegram
+        # message can carry the complete proposal with its buttons.
         kind, action = record.get("kind", ""), record.get("action", "")
         target = record.get("target_session_id", "")
         requester = record.get("requester_session_id", "")
         requester_title = cls._clip(record.get("requester_title") or "Untitled session", 120)
         target_title = cls._clip(record.get("target_title") or "Untitled session", 120)
         reason = cls._clip(record.get("reason") or "session-control", 600)
+        label = f"{kind.title()} {action.title()}"
         return (
-            "Session control request\n"
-            f"Requester: {requester_title} ({requester})\n"
-            f"Target: {target_title} ({target})\n"
-            f"Action: {kind} {action}\n"
+            "Approval needed\n"
+            f"Change: {label}\n"
+            f"Session: {target_title} ({target})\n"
+            f"Requested by: {requester_title} ({requester})\n"
             f"Reason: {reason}\n"
-            f"{cls._change_text(record)}"
+            f"{cls._change_text(record)}\n\n"
+            "The requesting session continues while this is pending."
         )
 
     @classmethod
