@@ -51,6 +51,8 @@ gateway:
   model:
     error_prefix: "错误：{error}"
     switched: "已切换模型为 `{model}`"
+    attended_switched: "⚙️ Switched to **{model}** · {effort}"
+    attended_switch_back: "Back to {model} after {minutes}m idle"
     provider_label: "提供方：{provider}"
     context_label: "上下文：{tokens} tokens"
     max_output_label: "最大输出：{tokens} tokens"
@@ -67,6 +69,9 @@ gateway:
     usage_switch_provider: "`/model <name> --provider <slug>` — 切换提供方"
     usage_persist: "`/model <name> --global` — 永久保存"
     reset_done: "✓ Model override reset."
+    reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    reset_all_usage: "Usage: `/model reset --all`"
+    reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "此网关运行的是 {boot_rev} 的代码，但磁盘上的检出版本已是 {disk_rev}。此时切换模型可能因模块过期而崩溃——请重启网关以加载新代码：hermes gateway restart"
     err_switch_failed: "切换到模型 {model} 失败（{error}）；继续使用 {current}。"
     err_config_not_updated: "config.yaml 未更新（{error}）"

@@ -51,6 +51,8 @@ gateway:
   model:
     error_prefix: "Earráid: {error}"
     switched: "Athraíodh an tsamhail go `{model}`"
+    attended_switched: "⚙️ Switched to **{model}** · {effort}"
+    attended_switch_back: "Back to {model} after {minutes}m idle"
     provider_label: "Soláthraí: {provider}"
     context_label: "Comhthéacs: {tokens} comhartha"
     max_output_label: "Aschur uasta: {tokens} comhartha"
@@ -67,6 +69,9 @@ gateway:
     usage_switch_provider: "`/model <name> --provider <slug>` — athraigh an soláthraí"
     usage_persist: "`/model <name> --global` — coinnigh"
     reset_done: "✓ Model override reset."
+    reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    reset_all_usage: "Usage: `/model reset --all`"
+    reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "Tá an gateway seo ag rith cód ó {boot_rev} ach is {disk_rev} atá sa seiceáil amach ar an diosca anois. D'fhéadfadh athrú samhla tuairt modúil sheanchaite a tharraingt — atosaigh an gateway chun an cód nua a lódáil: hermes gateway restart"
     err_switch_failed: "Theip ar athrú go dtí an tsamhail {model} ({error}); ag fanacht ar {current}."
     err_config_not_updated: "níor nuashonraíodh config.yaml ({error})"

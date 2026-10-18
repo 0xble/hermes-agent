@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
+from agent.i18n import t
+
 logger = logging.getLogger("gateway.attended_model")
 
 _RELAY_HEADER_RE = re.compile(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]")
@@ -42,6 +44,72 @@ _AUTOMATION_KINDS = {
 }
 
 
+_KNOWN_MODEL_FAMILIES = {"claude", "gemini", "gpt", "llama", "mistral", "qwen", "deepseek", "glm"}
+_CLAUDE_DISPLAY_RE = re.compile(
+    r"^claude-(?:(?P<version>\d+(?:-\d+)?)-)?(?P<family>opus|sonnet|haiku)"
+    r"(?:-(?P<family_version>\d{1,2}(?:-\d{1,2})?))?(?:-(?P<date>\d{8}))?$",
+    re.IGNORECASE,
+)
+
+
+def friendly_model_name(model: str) -> str:
+    """Return a short card label for a model id, preserving unknown ids verbatim."""
+    raw = str(model or "").strip()
+    if not raw:
+        return raw
+    candidate = raw.rsplit("/", 1)[-1]
+    if ":" in candidate:
+        prefix, suffix = candidate.split(":", 1)
+        if prefix.lower() in _KNOWN_MODEL_FAMILIES or prefix.lower().startswith("custom"):
+            candidate = suffix
+    lower = candidate.lower()
+    if lower.startswith("claude-"):
+        match = _CLAUDE_DISPLAY_RE.fullmatch(candidate)
+        if match:
+            version = match.group("version") or ""
+            family = match.group("family").capitalize()
+            family_version = match.group("family_version") or ""
+            if family_version:
+                family_version = family_version.replace("-", ".")
+                family = f"{family} {family_version}"
+            if version:
+                version = version.replace("-", ".")
+                return f"{version} {family}"
+            return family
+    if lower.startswith("gpt-"):
+        parts = candidate.split("-")[1:]
+        if parts:
+            first = f"GPT-{parts.pop(0)}"
+            return " ".join([first, *(part.capitalize() for part in parts)])
+    if lower.startswith("gemini-"):
+        return "Gemini " + " ".join(part.capitalize() for part in candidate.split("-")[1:])
+    if lower in {"opus", "sonnet", "haiku"}:
+        return candidate.capitalize()
+    return raw
+
+
+def format_attended_switch_notice(
+    model: str, effort: str, *, idle_model: str = "", idle_minutes: float = 0,
+) -> str:
+    """Render the one-shot attended switch-in status card.
+
+    The second line names the model the topic returns to, because switching back is silent.
+    """
+    card = t(
+        "gateway.model.attended_switched",
+        model=friendly_model_name(model),
+        effort=effort or "none",
+    )
+    if idle_model and idle_model != model and idle_minutes > 0:
+        minutes = int(idle_minutes) if float(idle_minutes).is_integer() else idle_minutes
+        card += "\n" + t(
+            "gateway.model.attended_switch_back",
+            model=friendly_model_name(idle_model),
+            minutes=minutes,
+        )
+    return card
+
+
 @dataclass(frozen=True)
 class AttendedConfig:
     """Validated feature configuration. ``enabled`` is false when all new keys are unset."""
@@ -61,6 +129,7 @@ class AttendedResolution:
     reasoning_effort: str
     reason: str
     active: bool = False
+    idle_model: str = ""  # route used once the attended window lapses; display only
 
     @property
     def decision_key(self) -> tuple[str, str, str, str, bool]:
@@ -211,7 +280,9 @@ def resolve_attended_model(
         model = cfg.model or channel_model or default_model
         provider = cfg.provider or channel_provider or default_provider
         effort = str(explicit_reasoning or cfg.reasoning_effort or get("attended_reasoning") or default_reasoning)
-        return AttendedResolution(model, provider, effort, "attended", True)
+        return AttendedResolution(
+            model, provider, effort, "attended", True, idle_model=channel_model or default_model,
+        )
 
     return AttendedResolution(
         channel_model or default_model, baseline_provider,

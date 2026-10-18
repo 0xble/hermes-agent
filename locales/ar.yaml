@@ -51,6 +51,8 @@ gateway:
   model:
     error_prefix: "خطأ: {error}"
     switched: "تم التبديل إلى النموذج `{model}`"
+    attended_switched: "⚙️ Switched to **{model}** · {effort}"
+    attended_switch_back: "Back to {model} after {minutes}m idle"
     provider_label: "المزوّد: {provider}"
     context_label: "السياق: {tokens} رمزًا"
     max_output_label: "أقصى خرج: {tokens} رمزًا"
@@ -67,6 +69,9 @@ gateway:
     usage_switch_provider: "`/model <name> --provider <slug>` — تبديل المزوّد"
     usage_persist: "`/model <name> --global` — حفظ دائم"
     reset_done: "✓ Model override reset."
+    reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    reset_all_usage: "Usage: `/model reset --all`"
+    reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "هذه البوّابة تعمل بكود من {boot_rev} بينما أصبحت النسخة على القرص {disk_rev}. تبديل النموذج الآن قد يسبّب انهيارًا بسبب وحدات قديمة — أعد تشغيل البوّابة لتحميل الكود الجديد: hermes gateway restart"
     err_switch_failed: "فشل التبديل إلى النموذج {model} ({error})؛ سنبقى على {current}."
     err_config_not_updated: "لم يُحدَّث config.yaml ({error})"

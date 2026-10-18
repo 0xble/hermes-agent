@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from agent.i18n import t
 from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import canonicalize_replay_history
+from gateway.attended_model import format_attended_switch_notice
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
@@ -1427,6 +1428,10 @@ class TurnRunner:
         ctx = self._ctx
         if getattr(agent, "is_subagent", False) or getattr(agent, "_is_auxiliary", False):
             return
+        if ctx.session_key in (getattr(runner, "_bulk_reset_pending_sessions", set()) or set()):
+            # A bulk reset clears persistence immediately, but the current agent keeps its route
+            # until this turn ends; the next turn resolves from defaults.
+            return
         try:
             decision = runner._attended_resolution_for_session(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
@@ -1485,7 +1490,11 @@ class TurnRunner:
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
                 emit_status = getattr(agent, "_emit_diagnostic_status", None)
                 if callable(emit_status):
-                    emit_status(f"↻ {model} · {effort}")
+                    from gateway.attended_model import parse_attended_config
+                    emit_status(format_attended_switch_notice(
+                        model, effort, idle_model=decision.idle_model,
+                        idle_minutes=parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
+                    ))
             if ctx.session_key:
                 handoff = getattr(runner, "_handoff_attended_state", None)
                 if callable(handoff):

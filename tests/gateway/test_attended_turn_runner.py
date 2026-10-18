@@ -50,7 +50,7 @@ def test_fallback_is_not_undone_when_desired_route_changes_mid_turn():
 
 def test_mid_turn_activation_switches_once_and_posts_one_notice():
     decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
-    turn, runner, state = _runner(decision)
+    turn, _, state = _runner(decision)
     notices = []
     agent = SimpleNamespace(
         model="default", provider="nous", api_mode="codex_responses",
@@ -68,7 +68,7 @@ def test_mid_turn_activation_switches_once_and_posts_one_notice():
     switch.assert_called_once_with(
         agent, "opus", "anthropic", "", "", "anthropic_messages", None,
     )
-    assert notices == ["↻ opus · medium"]
+    assert notices == ["⚙️ Switched to **Opus** · medium"]
     assert state.conversation.last_resolved_model == "opus"
 
 
@@ -134,7 +134,7 @@ def test_compaction_failure_does_not_block_a_switch():
 def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
     state = SimpleNamespace(
         conversation=SimpleNamespace(
-            pending_attended_notice="↻ opus · medium",
+            pending_attended_notice="⚙️ Switched to **Opus** · medium",
             last_attended_decision=None,
         )
     )
@@ -179,5 +179,5 @@ def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
     with patch.dict(sys.modules, {"gateway.run": SimpleNamespace(_current_max_iterations=lambda: 1)}):
         turn.run_sync()
 
-    assert notices == ["↻ opus · medium"]
+    assert notices == ["⚙️ Switched to **Opus** · medium"]
     assert state.conversation.pending_attended_notice is None

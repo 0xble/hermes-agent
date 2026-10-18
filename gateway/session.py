@@ -972,6 +972,15 @@ class SessionStore(
 
 
 
+    def override_session_keys(self) -> set[str]:
+        """Return every routing key with a persisted model or reasoning pick."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return {
+                key for key, entry in self._entries.items()
+                if entry.model_override is not None or entry.reasoning_override is not None
+            }
+
     def has_any_sessions(self) -> bool:
         """Whether any session has ever been created. SQLite is the source of truth (ended sessions
         count); the current session is already in the DB when this runs, hence ``> 1``."""

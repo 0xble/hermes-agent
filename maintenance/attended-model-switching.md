@@ -27,6 +27,29 @@ before the attended reasoning fallback. A topic edit's explicit reasoning pick
 therefore also remains pinned; `default` and `reset` clear it and allow the
 attended/default resolver to run again.
 
+## Administrative reset
+
+`/model reset --all` is an explicit gateway-admin operation. It clears every
+session's persisted and in-memory model override and reasoning override through
+the locked SessionStore/model persistence paths, including the `gateway_routing`
+state in `state.db` and the `sessions.json` mirror. It is available regardless
+of whether attended switching is enabled and reports the number of sessions
+that had an explicit pick. A session with an active turn is persisted as reset
+but its current agent route is left alone; the next turn resolves from the
+default route. With slash-admin gating disabled, the fallback authorization is
+limited to a configured owner's direct message; group messages are denied.
+
+The attended switch-in card is rendered by one helper in
+`gateway/attended_model.py`. It follows the native settings-card shape (setting
+icon, bold value) and adds a second line naming the idle-return model, because
+switching back is silent. For example, `claude-opus-5-5` at `high` with a
+`gpt-6-astra` default and a 15 minute window renders as:
+
+```text
+⚙️ Switched to **Opus 5.5** · high
+Back to GPT-6 Astra after 15m idle
+```
+
 ## Provenance and patch
 
 Fork patch identities: `attended-model-switching` and
