@@ -699,9 +699,22 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 or str(getattr(event, "_outbox_admission_id", "") or "").startswith("resume:")
             )
             external_event = (
-                metadata.get("notification_origin") in {
-                    "process_registry_synthetic", "delegation_result", "cron_delivery", "relay_delivery",
-                }
+                (
+                    metadata.get("notification_origin") in {
+                        "process_registry_synthetic", "delegation_result", "cron_delivery", "relay_delivery",
+                    }
+                    # A continuation may inherit the head event's notification metadata when a
+                    # follow-up chain is drained. It is still only the continuation anchor unless
+                    # the chain explicitly reports a different terminal event identity (the
+                    # completion-drained-behind-continuation case).
+                    and (
+                        not self._is_goal_continuation_event(event)
+                        or (
+                            isinstance(getattr(event, "_post_turn_goal_identity", None), dict)
+                            and identity.get("goal_instance") is None
+                        )
+                    )
+                )
                 or (
                     is_internal
                     and event is not None
