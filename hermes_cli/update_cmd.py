@@ -507,8 +507,8 @@ def _heal_stale_shallow_checkout(repo_root: Path, branch: str) -> None:
         print(f"  ⚠ Could not fetch the missing commit history ({detail[0]}); a very stale install may time out")
 
 
-def _capture_head_sha(git_cmd, cwd) -> str | None:
-    """Return the current HEAD SHA, or None if it can't be resolved."""
+def _read_head_sha(git_cmd, cwd) -> str | None:
+    """Read a checkout's current HEAD without applying rescue-specific hooks."""
     try:
         from hermes_cli.update_custody import run_git
 
@@ -524,6 +524,11 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
         return None
 
 
+def _capture_head_sha(git_cmd, cwd) -> str | None:
+    """Return the current HEAD SHA for the pre-update rescue path, or None if unresolved."""
+    return _read_head_sha(git_cmd, cwd)
+
+
 def _live_release_sha(git_cmd) -> str | None:
     """Return the revision currently serving Hermes before this update moves anything."""
     with suppress(Exception):
@@ -531,7 +536,7 @@ def _live_release_sha(git_cmd) -> str | None:
         release = resolved_release(get_hermes_home())
         if release is not None and re.fullmatch(r"[0-9a-fA-F]{40}", release.name):
             return release.name
-    head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+    head = _read_head_sha(git_cmd, _m().PROJECT_ROOT)
     if head:
         return head
     return None
