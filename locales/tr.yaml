@@ -51,8 +51,8 @@ gateway:
   model:
     error_prefix: "Hata: {error}"
     switched: "Model `{model}` olarak değiştirildi"
-    attended_switched: "⚙️ Switched to **{model}** · {effort}"
-    attended_switch_back: "Back to {model} after {minutes}m idle"
+    attended_switched: "⇄ Switched to {model} while you're active."
+    attended_switched_until_idle: "⇄ Switched to {model} while you're active. Back to {idle_model} after {minutes}m idle."
     provider_label: "Sağlayıcı: {provider}"
     context_label: "Bağlam: {tokens} token"
     max_output_label: "Maks. çıktı: {tokens} token"

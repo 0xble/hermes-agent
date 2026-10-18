@@ -68,7 +68,7 @@ def test_mid_turn_activation_switches_once_and_posts_one_notice():
     switch.assert_called_once_with(
         agent, "opus", "anthropic", "", "", "anthropic_messages", None,
     )
-    assert notices == ["⚙️ Switched to **Opus** · medium"]
+    assert notices == ["⇄ Switched to Opus while you're active."]
     assert state.conversation.last_resolved_model == "opus"
 
 
@@ -134,7 +134,7 @@ def test_compaction_failure_does_not_block_a_switch():
 def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
     state = SimpleNamespace(
         conversation=SimpleNamespace(
-            pending_attended_notice="⚙️ Switched to **Opus** · medium",
+            pending_attended_notice="⇄ Switched to Opus while you're active.",
             last_attended_decision=None,
         )
     )
@@ -179,5 +179,5 @@ def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
     with patch.dict(sys.modules, {"gateway.run": SimpleNamespace(_current_max_iterations=lambda: 1)}):
         turn.run_sync()
 
-    assert notices == ["⚙️ Switched to **Opus** · medium"]
+    assert notices == ["⇄ Switched to Opus while you're active."]
     assert state.conversation.pending_attended_notice is None

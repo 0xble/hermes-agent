@@ -51,8 +51,8 @@ gateway:
   model:
     error_prefix: "錯誤：{error}"
     switched: "已切換模型為 `{model}`"
-    attended_switched: "⚙️ Switched to **{model}** · {effort}"
-    attended_switch_back: "Back to {model} after {minutes}m idle"
+    attended_switched: "⇄ Switched to {model} while you're active."
+    attended_switched_until_idle: "⇄ Switched to {model} while you're active. Back to {idle_model} after {minutes}m idle."
     provider_label: "提供方：{provider}"
     context_label: "上下文：{tokens} tokens"
     max_output_label: "最大輸出：{tokens} tokens"

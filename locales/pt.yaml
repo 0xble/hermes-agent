@@ -51,8 +51,8 @@ gateway:
   model:
     error_prefix: "Erro: {error}"
     switched: "Modelo alterado para `{model}`"
-    attended_switched: "⚙️ Switched to **{model}** · {effort}"
-    attended_switch_back: "Back to {model} after {minutes}m idle"
+    attended_switched: "⇄ Switched to {model} while you're active."
+    attended_switched_until_idle: "⇄ Switched to {model} while you're active. Back to {idle_model} after {minutes}m idle."
     provider_label: "Fornecedor: {provider}"
     context_label: "Contexto: {tokens} tokens"
     max_output_label: "Saída máxima: {tokens} tokens"
