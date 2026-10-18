@@ -6,7 +6,7 @@ Automatic session retention pruning is destructive background maintenance. It mu
 
 ## Contract
 
-- Gateway and CLI automatic pruning run only when `maintenance.deletion_window` is open. Outside the window they return before touching the state database or its throttle markers.
+- The automatic-prune function itself and its gateway/CLI callers run only when `maintenance.deletion_window` is open. Outside the window they return before touching the state database or spending throttle markers, so alternate entrypoints cannot bypass the gate.
 - Retention pruning selects candidates read-only, then rechecks each bounded batch inside its own idempotent write transaction. Active write guards protect the complete compression-descendant lineage, not only the rows in the current batch.
 - Each batch commits before the next batch begins and yields briefly so foreground writers can acquire the lock. Unreferenced system prompts are also removed in bounded transactions.
 - `_execute_write_marked` emits a warning when one callback-plus-commit holds the lock for several seconds, including the callback name and process id. On macOS, the lock-owner diagnostic says `/proc/locks` is unavailable rather than claiming that a holder released just before the deadline.

@@ -1418,7 +1418,7 @@ class TestPruneSessions:
         db._conn.execute("UPDATE sessions SET started_at = ?", (old,))
         db._conn.commit()
         # A real live lease, so both the victim recheck and the read-only descendant probe see it.
-        assert db.try_acquire_session_turn_lease(child, "host:pid=%d:turn" % os.getpid(), ttl_seconds=300)
+        assert db.try_acquire_session_turn_lease(child, f"host:pid={os.getpid()}:turn", ttl_seconds=300)
 
         assert db.prune_sessions(older_than_days=90, exclude_active_write_guards=True) == 24
         assert db.get_session(root) is not None
@@ -1443,7 +1443,7 @@ class TestPruneSessions:
         db.create_session(parent, source="cli")
         db.end_session(parent, end_reason="done")
         db.create_session(child, source="cli", parent_session_id=parent)
-        holder = "host:pid=%d:turn" % os.getpid()
+        holder = f"host:pid={os.getpid()}:turn"
         assert db.try_acquire_session_turn_lease(child, holder, ttl_seconds=60)
         assert db.try_acquire_compression_lock(child, holder, ttl_seconds=60)
         expired = time.time() - 60
@@ -2270,7 +2270,7 @@ class TestAsyncDelegationsSchemaAgreement:
             "retry_root_started_at",
             "retry_replacement",
         ):
-            legacy_sql = re.sub(rf"^ +{column} [^\n]*\n", "", legacy_sql, flags=re.M)
+            legacy_sql = re.sub(rf"^ +{column} [^\n]*\n", "", legacy_sql, flags=re.MULTILINE)
         legacy_sql = legacy_sql.replace(
             "    delivery_claimed_at REAL,\n",
             "    delivery_claimed_at REAL\n",
@@ -4128,6 +4128,30 @@ class TestOptimizeFts:
 
 
 class TestAutoMaintenance:
+    def test_auto_maintenance_outside_window_leaves_throttle_unspent(self, db, monkeypatch):
+        import hermes_cli.maintenance_window
+        import hermes_state_repair
+
+        prune_calls = []
+        acquire_calls = []
+        set_meta_calls = []
+        monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: False)
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: prune_calls.append(True))
+        monkeypatch.setattr(
+            hermes_state_repair,
+            "_try_acquire_auto_maintenance_lock",
+            lambda _db_path: acquire_calls.append(True),
+        )
+        monkeypatch.setattr(db, "set_meta", lambda *args: set_meta_calls.append(args))
+
+        result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+
+        assert result == {"skipped": True, "pruned": 0, "closed": 0, "vacuumed": False}
+        assert acquire_calls == []
+        assert prune_calls == []
+        assert set_meta_calls == []
+        assert db.get_meta("last_auto_prune") is None
+
     def _make_old_ended(self, db, sid: str, days_old: int = 100):
         """Create a session that is ended and was started `days_old` days ago."""
         db.create_session(session_id=sid, source="cli")
