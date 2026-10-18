@@ -10,7 +10,7 @@ import { $sessionStates } from '@/store/session-states'
 import { useSlashCommand } from './slash'
 import { captureSubmissionDestination } from './submission-destination'
 import { useSubmitPrompt } from './submit'
-import type { GatewayRequest } from './utils'
+import type { GatewayRequest, SubmitTextResult } from './utils'
 
 const wire = vi.hoisted(() => ({ request: vi.fn(), release: vi.fn() }))
 vi.mock('@/store/gateway', async original => ({
@@ -431,7 +431,7 @@ describe('submission intent destinations', () => {
     const gate = deferred<{ sessionId: string; attachments: [] }>()
     deps.syncAttachmentsForSubmit.mockImplementation(() => gate.promise)
     const { result } = renderHook(() => useSubmitPrompt(deps))
-    let pending!: Promise<boolean>
+    let pending!: Promise<SubmitTextResult>
     act(() => {
       pending = result.current('private text')
     })
@@ -538,7 +538,7 @@ describe('submission intent destinations', () => {
       })
     )
 
-    let pending!: Promise<boolean>
+    let pending!: Promise<SubmitTextResult>
     await act(async () => {
       pending = result.current('/private-skill')
     })

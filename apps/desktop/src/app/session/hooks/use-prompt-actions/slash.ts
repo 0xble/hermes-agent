@@ -217,7 +217,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
       const initialSelectedId = selectedStoredSessionIdRef.current
       const initialRoutedId = getRoutedStoredSessionId()
 
-      let submitted = true
+      let submitted: SubmitTextResult = true
 
       const initialStoredId =
         options?.storedSessionId ??

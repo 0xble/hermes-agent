@@ -362,7 +362,7 @@ describe('terminal receipt settlement', () => {
 
     let handle: HarnessHandle | null = null
     await actRender(<Harness onReady={h => (handle = h)} rawAdmissionReceipts refreshSessions={async () => undefined} requestGateway={requestGateway} />)
-    let pending!: Promise<boolean>
+    let pending!: Promise<SubmitTextResult>
     act(() => { pending = handle!.submitTextRaw('old retry', { submission_id: 'old-terminal' }) })
     await waitFor(() => expect(finish).toBeTypeOf('function'))
     handle!.handleEvent({ type: 'message.start', session_id: RUNTIME_SESSION_ID, authority_epoch: 1, execution_generation: 2, payload: {} })

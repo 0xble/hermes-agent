@@ -9,7 +9,7 @@ import { $sessions, resolveComposerSessionKey } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
 
 import type { SubmissionDestination } from './submission-destination'
-import { type GatewayRequest, isTargetSessionBusy, type SubmitTextOptions } from './utils'
+import { type GatewayRequest, isTargetSessionBusy, type SubmitTextOptions, type SubmitTextResult } from './utils'
 
 // Typed /undo, /retry, /steer and /queue: one behaviour per command on every surface, mirroring the
 // Ink TUI on the same shared gateway (ui-tui/src/app/slash/commands/core.ts +
@@ -47,7 +47,7 @@ export interface SessionCommandEnv<C extends { arg: string }> {
   requestGateway: GatewayRequest
   /** Legacy (non-owner) gateways still serve these through the slash worker. */
   runExec: (ctx: C) => Promise<void>
-  submitPromptText: (rawText: string, options?: SubmitTextOptions) => Promise<boolean>
+  submitPromptText: (rawText: string, options?: SubmitTextOptions) => Promise<SubmitTextResult>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
@@ -182,7 +182,7 @@ export function sessionCommandHandlers<C extends { arg: string }>(env: SessionCo
     const { sessionId, storedSessionId } = out
 
     if (serverOwnsComposerQueue(storedSessionId ?? sessionId)) {
-      return submitPromptText(text, { destination, fromQueue: true, sessionId, storedSessionId })
+      return (await submitPromptText(text, { destination, fromQueue: true, sessionId, storedSessionId })) === true
     }
 
     return Boolean(enqueueQueuedPrompt(queueKeyFor(out), { attachments: [], text }))

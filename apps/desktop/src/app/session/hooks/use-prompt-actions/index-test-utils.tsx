@@ -10,7 +10,7 @@ import type { SessionInfo } from '@/types/hermes'
 
 import { useMessageStream } from '../use-message-stream'
 
-import type { SubmitTextOptions } from './utils'
+import type { SubmitTextOptions, SubmitTextResult } from './utils'
 
 import { usePromptActions } from '.'
 
@@ -68,8 +68,8 @@ export interface HarnessHandle {
   redirectPrompt: (text: string) => Promise<boolean>
   /** @deprecated Use `redirectPrompt`. */
   steerPrompt: (text: string) => Promise<boolean>
-  submitTextRaw: (text: string, options?: SubmitTextOptions) => Promise<boolean>
-  submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean>
+  submitTextRaw: (text: string, options?: SubmitTextOptions) => Promise<SubmitTextResult>
+  submitText: (text: string, options?: SubmitTextOptions) => Promise<SubmitTextResult>
 }
 
 export function Harness({
@@ -238,7 +238,7 @@ export function Harness({
         act(async () => actions.steerPrompt(...args)) as Promise<boolean>,
       submitTextRaw: actions.submitText,
       submitText: (...args: Parameters<typeof actions.submitText>) =>
-        act(async () => actions.submitText(...args)) as Promise<boolean>
+        act(async () => actions.submitText(...args)) as Promise<SubmitTextResult>
     })
   }, [
     actions.cancelRun,

@@ -158,6 +158,8 @@ export function rebindPaneToResumedRuntime({
 /** Canonical admission receipt; `user_row_id` binds the optimistic bubble to its durable row. */
 type SubmitReceipt = Pick<PromptSubmitResult, 'user_row_id'> & {
   admission_id?: string
+  message?: string
+  reason?: string
   submission_id?: string
   session_id?: string
   status?: string
@@ -1175,12 +1177,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             { alsoTimeout: true }
           )
 
-          if (submitted.result?.status === 'dropped' && submitted.result.reason === 'deferred_moa_unavailable') {
+          if (result?.status === 'dropped' && result.reason === 'deferred_moa_unavailable') {
             dropOptimistic(sessionId)
             releaseBusy()
 
             if (!options?.fromQueue && targetIsCurrentView()) {
-              notify({ message: submitted.result.message || 'Deferred MoA request was cancelled; prompt dropped.' })
+              notify({ message: result.message || 'Deferred MoA request was cancelled; prompt dropped.' })
             }
 
             return options?.fromQueue ? ('dropped' as const) : false
