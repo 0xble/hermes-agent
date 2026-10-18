@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -212,11 +212,74 @@ async def _apply_session_settings(
     }
 
 
-async def _deliver_brief(adapter, dest: SessionSource, brief: str) -> None:
-    """Show the brief in the topic, then admit it as the session's first turn. The turn is internal
-    (the calling session already holds the user's authority) and never a gateway command, so a
-    brief starting with ``/`` is read as text. A brief that could not be shown is not admitted, so
-    the session never works from a brief the user cannot see; the caller reports the failure.
+async def _origin_line(runner, adapter, source: SessionSource) -> str:
+    """Build the caller-owned origin line for a topic opening brief.
+
+    The source session is deliberately read without creating or switching a session: a tool call
+    must not change the caller's routing state just to describe its origin. Telegram renders the
+    returned Markdown link through the adapter's normal text path, so it remains a real clickable
+    link instead of literal Markdown.
+    """
+    thread_id = str(source.thread_id or "")
+    if not thread_id or thread_id in runner._TELEGRAM_GENERAL_TOPIC_IDS:
+        return "Split from the main chat"
+
+    title = None
+    icon = None
+    db = getattr(runner, "_session_db", None)
+    try:
+        session_id = runner.session_store.peek_session_id(runner._session_key_for_source(source))
+        if db is not None:
+            if not session_id:
+                binding = await db.get_telegram_topic_binding(
+                    chat_id=str(source.chat_id), thread_id=thread_id,
+                    profile_name=runner._telegram_topic_profile_name(source),
+                )
+                session_id = binding.get("session_id") if binding else None
+            if session_id:
+                title = await db.get_session_title(session_id)
+            state = await db.get_telegram_topic_icon_state(
+                str(source.chat_id), thread_id, runner._telegram_topic_profile_name(source)
+            )
+            icon = str(state.get("emoji") or "").strip() if state else None
+    except Exception:
+        # Origin decoration must never prevent a topic from being created.
+        logger.debug("Failed to read Telegram topic origin metadata", exc_info=True)
+
+    label = str(title or "the calling topic").strip() or "the calling topic"
+    if icon:
+        label = f"{icon} {label}"
+    # The adapter's Markdown link parser intentionally accepts simple, balanced labels only. A
+    # session title may contain a bracket; keep the link clickable rather than shipping malformed
+    # Markdown, and retain the icon when one is known.
+    if "[" in label or "]" in label:
+        label = f"{icon} the calling topic" if icon else "the calling topic"
+
+    # The adapter refreshes from Bot.get_me() when this cache is stale. Test doubles and older
+    # adapters may only expose the cached bot object, so use those as a graceful fallback.
+    refresh = getattr(adapter, "_refresh_bot_identity", None)
+    if callable(refresh):
+        try:
+            await cast(Any, refresh)()
+        except Exception:
+            logger.debug("Failed to refresh Telegram bot identity for topic origin", exc_info=True)
+    username_reader = getattr(adapter, "_current_bot_username", None)
+    username = str(username_reader() or "") if callable(username_reader) else ""
+    if not username:
+        username = str(getattr(getattr(adapter, "_bot", None), "username", "") or "")
+    username = username.lstrip("@").strip()
+    if not username:
+        return f"Split from {label}"
+    link = f"https://t.me/{username}/{thread_id}/{thread_id}"
+    return f"Split from [{label}]({link})"
+
+
+async def _deliver_brief(adapter, dest: SessionSource, brief: str, origin_line: str = "") -> None:
+    """Show the origin and brief in the topic, then admit the same text as the session's first turn.
+    The turn is internal (the calling session already holds the user's authority) and never a
+    gateway command, so a brief starting with ``/`` is read as text. A brief that could not be
+    shown is not admitted, so the session never works from a brief the user cannot see; the caller
+    reports the failure.
 
     Internal events skip the ``hermes pause`` gate, so it is checked here: a paused Hermes starts
     no new work, and the brief would start a new session's first turn."""
@@ -225,14 +288,15 @@ async def _deliver_brief(adapter, dest: SessionSource, brief: str) -> None:
     paused = paused_reply()
     if paused is not None:
         raise RuntimeError(paused)
-    sent = await adapter.send(str(dest.chat_id), brief,
+    shown_brief = f"{origin_line}\n\n{brief}" if origin_line else brief
+    sent = await adapter.send(str(dest.chat_id), shown_brief,
                               metadata={"thread_id": str(dest.thread_id)})
     if not getattr(sent, "success", False):
         raise RuntimeError(getattr(sent, "error", None) or "Telegram did not accept the message")
     # Anchor the turn on the shown brief, as a typed message anchors its own turn, so the session's
     # replies thread under it instead of relying on the anchor-less synthetic-send fallback.
     anchor = str(sent.message_id) if getattr(sent, "message_id", None) else None
-    event = MessageEvent(text=brief, message_type=MessageType.TEXT, source=replace_source(dest, message_id=anchor),
+    event = MessageEvent(text=shown_brief, message_type=MessageType.TEXT, source=replace_source(dest, message_id=anchor),
                          message_id=anchor, internal=True, allow_gateway_control=False,
                          metadata={"notification_category": "result"})
     await admit_internal_event(adapter, event)
@@ -314,7 +378,8 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
     brief = spec.message.strip()
     if brief:
         try:
-            await _deliver_brief(adapter, dest, brief)
+            origin_line = await _origin_line(runner, adapter, source)
+            await _deliver_brief(adapter, dest, brief, origin_line)
         except Exception as exc:
             logger.warning("Opening brief for topic %s was not delivered", thread_id, exc_info=True)
             raise TopicRequestError(
