@@ -89,25 +89,24 @@ def friendly_model_name(model: str) -> str:
 
 
 def format_attended_switch_notice(
-    model: str, effort: str, *, idle_model: str = "", idle_minutes: float = 0,
+    model: str, effort: Any = "", *, idle_model: str = "", idle_minutes: float = 0,
 ) -> str:
-    """Render the one-shot attended switch-in status card.
+    """Render the one-shot attended switch-in status line.
 
-    The second line names the model the topic returns to, because switching back is silent.
+    One sentence-style line like Hermes' other automatic-change notices (for example the /fast
+    expiry). It names the model the topic returns to, because switching back is silent. ``effort``
+    is accepted for callers but not shown.
     """
-    card = t(
-        "gateway.model.attended_switched",
-        model=friendly_model_name(model),
-        effort=effort or "none",
-    )
+    del effort
     if idle_model and idle_model != model and idle_minutes > 0:
         minutes = int(idle_minutes) if float(idle_minutes).is_integer() else idle_minutes
-        card += "\n" + t(
-            "gateway.model.attended_switch_back",
-            model=friendly_model_name(idle_model),
+        return t(
+            "gateway.model.attended_switched_until_idle",
+            model=friendly_model_name(model),
+            idle_model=friendly_model_name(idle_model),
             minutes=minutes,
         )
-    return card
+    return t("gateway.model.attended_switched", model=friendly_model_name(model))
 
 
 @dataclass(frozen=True)
@@ -227,6 +226,22 @@ def is_active(last_user_activity_at: Any, *, now: Optional[float], idle_revert_m
     return 0 <= clock - stamp < idle_revert_minutes * 60.0
 
 
+def _effort_label(value: Any) -> str:
+    """Reduce a stored ``/reasoning`` pick to its effort name.
+
+    Overrides persist as ``{"enabled": bool, "effort": str}``. Callers parse the label back with
+    ``parse_reasoning_effort`` and render it in the switch card, so a dict must never be
+    stringified: ``"{'enabled': True, ...}"`` parses to ``None`` and silently drops the pick.
+    """
+    if not value:
+        return ""
+    if isinstance(value, Mapping):
+        if value.get("enabled", True) is False:
+            return "none"
+        return str(value.get("effort") or "").strip().lower()
+    return str(value).strip().lower()
+
+
 def resolve_attended_model(
     session_state: Mapping[str, Any] | Any,
     now: Optional[float],
@@ -246,7 +261,7 @@ def resolve_attended_model(
     default_provider = str(get("default_provider", "") or "")
     channel_model = str(get("channel_model", "") or "")
     channel_provider = str(get("channel_provider", "") or "")
-    default_reasoning = str(get("default_reasoning", "") or "")
+    default_reasoning = _effort_label(get("default_reasoning"))
     now_value = time.time() if now is None else float(now)
     active = cfg.enabled and is_active(
         get("last_user_activity_at"), now=now_value, idle_revert_minutes=cfg.idle_revert_minutes
@@ -260,14 +275,14 @@ def resolve_attended_model(
         get("once_provider") or get("session_provider") or
         get("temporary_provider") or get("model_override_provider") or ""
     )
-    explicit_reasoning = (
+    explicit_reasoning = _effort_label(
         get("once_reasoning") or get("session_reasoning") or
         get("temporary_reasoning") or get("reasoning_override")
     )
     # A plain /model X is an explicit model pick, but it must use X's normal
     # reasoning setting rather than inheriting attended's effort.
-    explicit_model_reasoning = str(
-        get("explicit_model_reasoning") or get("model_reasoning") or default_reasoning or ""
+    explicit_model_reasoning = _effort_label(
+        get("explicit_model_reasoning") or get("model_reasoning") or default_reasoning
     )
     baseline_provider = channel_provider or default_provider
     if explicit_model:
@@ -279,14 +294,16 @@ def resolve_attended_model(
     if active:
         model = cfg.model or channel_model or default_model
         provider = cfg.provider or channel_provider or default_provider
-        effort = str(explicit_reasoning or cfg.reasoning_effort or get("attended_reasoning") or default_reasoning)
+        effort = _effort_label(
+            explicit_reasoning or cfg.reasoning_effort or get("attended_reasoning") or default_reasoning
+        )
         return AttendedResolution(
             model, provider, effort, "attended", True, idle_model=channel_model or default_model,
         )
 
     return AttendedResolution(
         channel_model or default_model, baseline_provider,
-        str(explicit_reasoning or default_reasoning), "default", False,
+        _effort_label(explicit_reasoning or default_reasoning), "default", False
     )
 
 
