@@ -32,6 +32,11 @@ except ImportError:
 from pathlib import Path
 from typing import Any, Callable, Optional
 from cron.scheduler_cancel import _CancelEventLike, _CombinedCancelEvent
+from cron.scheduler_worker_exit import (
+    ExternalWorkerExitTimeout as _ExternalWorkerExitTimeout,
+    TERMINAL_EXIT_GRACE_SECONDS as _EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS,
+    wait_external_worker_body as _wait_for_external_cron_worker_body,
+)
 
 # Freeze the physical code root at module import. Resolving `__file__` during a
 # later dispatch would follow a moved `current` symlink into the next release.
@@ -3686,167 +3691,6 @@ def _run_one_job_body(
             reset_terminal_scope(_terminal_scope_token)
 
 
-# A terminal execution row is committed before a restart-safe worker finishes its
-# final delivery/teardown.  Do not turn that ordering into an unbounded gateway
-# wait: the worker's own hard-wall watchdog has a bounded post-commit allowance,
-# and this is the matching upper bound for the parent-side exit proof.
-_EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS = 60.0
-
-
-def _wait_for_external_cron_worker_body(
-    process: subprocess.Popen,
-    *,
-    execution_id: str,
-    stderr_path: Optional[Path] = None,
-    wait_for_process_exit: bool = False,
-    terminal_exit_grace_seconds: float = _EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS,
-    worker_hard_wall_deadline: Optional[float] = None,
-) -> bool:
-    """Preserve ``run_one_job``'s synchronous contract after handoff.
-
-    The worker owns the durable execution and survives this gateway process.
-    The caller nevertheless waits while it remains alive so manual/background
-    callers do not release their in-process guard or report stale job state.
-    A gateway replacement may kill this waiter; it does not kill the scoped
-    worker or change its ledger ownership. The legacy early-return mode is kept
-    for diagnostic callers that only need to observe a terminal ledger row.
-
-    Once the ledger is terminal, the worker has only bounded teardown work left.
-    If it ignores that allowance, terminate the exact ``Popen`` child and wait
-    again with bounded timeouts. Never project a terminal row from a live worker.
-    """
-    def _is_terminal() -> bool:
-        current = get_execution(execution_id)
-        return bool(current and current.get("status") in _TERMINAL_STATES)
-
-    terminal_deadline = None
-    # The worker commits its terminal row before its process exits, so exit is
-    # the correct wakeup. Each ledger read opens a connection and re-runs schema
-    # init; polling it at 50ms for an hours-long agent run is needless contention.
-    while True:
-        timeout = 1.0
-        if terminal_deadline is not None:
-            remaining = terminal_deadline - time.monotonic()
-            if remaining <= 0:
-                returncode = process.poll()
-                if returncode is None and wait_for_process_exit:
-                    # A terminal worker is no longer allowed to hold the gateway
-                    # forever. This is the same worker handle we spawned, so a
-                    # PID reuse cannot make this kill an unrelated process.
-                    for stop in (process.terminate, process.kill):
-                        try:
-                            stop()
-                        except (OSError, ProcessLookupError):
-                            pass
-                        try:
-                            returncode = process.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            returncode = process.poll()
-                        if returncode is not None:
-                            break
-                    if returncode is None:
-                        raise _ExternalWorkerExitTimeout(
-                            "Restart-safe cron worker stayed alive after its terminal "
-                            "exit grace period; execution was not projected.",
-                            worker_terminated=True,
-                        )
-                    if returncode < 0:
-                        raise _ExternalWorkerExitTimeout(
-                            "Restart-safe cron worker was terminated after its terminal "
-                            "exit grace period; delivery outcome is unknown.",
-                            worker_terminated=True,
-                            worker_exit_code=returncode,
-                        )
-                    if returncode != 0:
-                        raise _ExternalWorkerExitTimeout(
-                            f"Restart-safe cron worker exited with status {returncode} "
-                            "after its terminal exit grace period.",
-                            worker_exit_code=returncode,
-                        )
-                    return True
-                if returncode is None:
-                    from cron.scheduler_detached_worker import reap_terminal_worker_in_background
-
-                    reap_terminal_worker_in_background(process)
-                    return True
-                if returncode != 0:
-                    raise _ExternalWorkerExitTimeout(
-                        f"Restart-safe cron worker exited with status {returncode} "
-                        "after its terminal exit grace period.",
-                        worker_exit_code=returncode,
-                    )
-                return True
-            timeout = min(timeout, max(0.001, remaining))
-        try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            if not _is_terminal():
-                continue
-            if terminal_deadline is None:
-                terminal_base = (
-                    max(time.monotonic(), worker_hard_wall_deadline)
-                    if worker_hard_wall_deadline is not None
-                    else time.monotonic()
-                )
-                terminal_deadline = terminal_base + max(0.0, float(terminal_exit_grace_seconds))
-            returncode = process.poll()
-            if returncode is not None:
-                if returncode != 0:
-                    raise _ExternalWorkerExitTimeout(
-                        f"Restart-safe cron worker exited with status {returncode} "
-                        "after terminalizing its execution.",
-                        worker_exit_code=returncode,
-                    )
-                return True
-            if not wait_for_process_exit:
-                from cron.scheduler_detached_worker import reap_terminal_worker_in_background
-
-                reap_terminal_worker_in_background(process)
-                return True
-            continue
-        # The worker can commit its terminal row and exit between the first
-        # read and wait(). Re-read the exact attempt before declaring that it
-        # died without terminalizing.
-        current = get_execution(execution_id)
-        if current and current.get("status") in ("completed", "failed"):
-            # A worker-owned failure may already have delivered its notice. A
-            # parent-side termination is different and is projected below.
-            if returncode is not None and returncode < 0 and wait_for_process_exit:
-                raise _ExternalWorkerExitTimeout(
-                    f"Restart-safe cron worker was terminated with status {returncode} "
-                    "after its terminal exit grace period.",
-                    worker_terminated=True,
-                    worker_exit_code=returncode,
-                )
-            if returncode not in (None, 0):
-                raise _ExternalWorkerExitTimeout(
-                    f"Restart-safe cron worker exited with status {returncode} "
-                    "after terminalizing its execution.",
-                    worker_exit_code=returncode,
-                )
-            return True
-        # If the adopted worker died without terminalizing, its owner is
-        # now provably gone. Recover to ``unknown`` rather than routing the
-        # exception through the pre-handoff dispatch-failure path, which
-        # would falsely assert that no side effect could have happened.
-        from cron.scheduler_worker_failure import external_worker_exited_reason
-
-        reason = external_worker_exited_reason(returncode)
-        if not terminalize_dead_owner(execution_id, reason=reason):
-            recover_interrupted_executions()
-            # A concurrent sweep may have won the unknown transition. Still
-            # surface this waiter's exit code and stderr instead of discarding them.
-            current = get_execution(execution_id)
-            if current and current.get("status") in ("completed", "failed"):
-                return True
-        stderr_tail = ""
-        if stderr_path is not None:
-            from cron.scheduler_diagnostics import external_worker_stderr_tail
-
-            stderr_tail = external_worker_stderr_tail(stderr_path)
-        raise RuntimeError(f"{reason}{stderr_tail}")
-
-
 def _cleanup_external_worker_state(
     job_id: str, *, owner=None, process=None, worker_exited: bool = False,
 ) -> bool:
@@ -3964,16 +3808,6 @@ class _ExternalWorkerPostHandoffError(RuntimeError):
         self.worker_terminated = worker_terminated
         self.worker_exit_code = worker_exit_code
 
-
-class _ExternalWorkerExitTimeout(RuntimeError):
-    """A terminal worker did not exit within the bounded parent-side grace period."""
-
-    def __init__(
-        self, message: str, *, worker_terminated: bool = False, worker_exit_code: int | None = None,
-    ):
-        super().__init__(message)
-        self.worker_terminated = worker_terminated
-        self.worker_exit_code = worker_exit_code
 
 def _wait_for_external_cron_worker(
     process: subprocess.Popen,
@@ -4353,6 +4187,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
         job_id=job_id,
         handoff_files=(payload_path, ack_path, stderr_path),
         stderr_path=stderr_path,
+        expected_fire_owner=expected_fire_owner,
         terminal_exit_grace_seconds=terminal_exit_grace_seconds,
         worker_hard_wall_deadline=worker_hard_wall_deadline,
     )
