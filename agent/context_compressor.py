@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from agent.image_eviction_policy import outbound_image_retire_count
+from agent.image_eviction_policy import images_all_within_many_image_limit, latched_retire_count, outbound_image_retire_count, outbound_retired_image_ids
 from agent.compression_marker import (
     ELISION_MARKER_MAX_LEN,
     _elision_marker,
@@ -35,6 +35,7 @@ from agent.context_compressor_prellm import PreLlmSkipMixin
 from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.context_compressor_retry import retryable_user_text  # noqa: F401 — public re-export
 from agent.context_compressor_tail import demote_stale_tail_tools, is_demoted_stub, skill_view_names_by_call_id
+from agent.context_compressor_retry import retryable_user_text
 from agent.context_compressor_telemetry import CompressionTelemetryMixin
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.micro_compaction import MicroCompactionMixin
@@ -1484,33 +1485,32 @@ def _retire_stale_tool_result_images(
     return pruned
 
 
-def _image_payload(msg: dict[str, Any]) -> tuple[int, int]:
-    """``(blocks, bytes)`` of image payload in a message.
+def _image_payload(msg: dict[str, Any]) -> list[str]:
+    """Data URL / base64 string of each image block in a message (``""`` when unmeasurable).
 
-    The provider counts BLOCKS: one ``tool_result`` carrying three screenshots is three against
-    the per-request limit. Bytes are the data-URL / base64 length — the payload is ASCII and the
-    JSON framing around it is noise against a 24 MB budget, so no per-request re-serialization.
+    The provider counts BLOCKS (one ``tool_result`` with three screenshots is three), so the
+    block count is the list length. Bytes are the summed string lengths: the payload is ASCII and
+    the JSON framing around it is noise against a 24 MB budget. The strings also let the caller
+    read dimensions from headers only, without a second walk or a full decode.
     """
     parts = _tool_result_parts(msg.get("content"))
     if not isinstance(parts, list):
-        return 0, 0
-    blocks = payload = 0
+        return []
+    sources: list[str] = []
     for p in parts:
         if not _is_image_part(p):
             continue
-        blocks += 1
         image_url = p.get("image_url")
         source = p.get("source")
         data = (
             (image_url.get("url") if isinstance(image_url, dict) else image_url)
             or (source.get("data") if isinstance(source, dict) else None)
-            or ""
         )
-        payload += len(data) if isinstance(data, str) else 0
-    return blocks, payload
+        sources.append(data if isinstance(data, str) else "")
+    return sources
 
 
-def evict_stale_outbound_tool_images(api_messages: list[dict[str, Any]]) -> int:
+def evict_stale_outbound_tool_images(api_messages: list[dict[str, Any]], retired_ids: Optional[set[str]] = None) -> int:
     """Drop stale screenshot/vision payloads from the per-call API copy.
 
     Compression's keep-newest pass only runs when prune/compress fires, and the Anthropic
@@ -1520,29 +1520,28 @@ def evict_stale_outbound_tool_images(api_messages: list[dict[str, Any]]) -> int:
     sanitization (#89296). Do not pass persisted history — the rewrite is send-path only.
 
     Eviction is driven by the provider limit, counted in image BLOCKS, with user uploads
-    reserved against the ceiling but never rewritten — policy and rationale in
-    :mod:`agent.image_eviction_policy`. Returns the number of messages rewritten.
+    reserved against the ceiling but never rewritten; the block ceiling depends on the
+    request's image dimensions — policy and rationale in :mod:`agent.image_eviction_policy`.
+    Returns the number of messages rewritten.
+    ``retired_ids`` latches the frontier per session: see :func:`latched_retire_count`.
     """
-    carriers: list[tuple[int, tuple[int, int]]] = []
-    reserved_blocks = reserved_bytes = 0
+    carriers: list[tuple[int, list[str]]] = []  # (index, image sources), newest first
+    reserved: list[str] = []
     for i in range(len(api_messages) - 1, -1, -1):
         msg = api_messages[i]
-        if not isinstance(msg, dict):
-            continue
-        blocks, size = _image_payload(msg)
-        if not blocks:
-            continue
-        if msg.get("role") == "tool":
-            carriers.append((i, (blocks, size)))
+        sources = _image_payload(msg) if isinstance(msg, dict) else []
+        if sources and msg.get("role") == "tool":
+            carriers.append((i, sources))
         else:
-            reserved_blocks += blocks
-            reserved_bytes += size
+            reserved.extend(sources)
     retire = outbound_image_retire_count(
-        [blocks for _, (blocks, _) in carriers],
-        reserved_blocks,
-        carrier_bytes_newest_first=[size for _, (_, size) in carriers],
-        reserved_bytes=reserved_bytes,
+        [len(sources) for _, sources in carriers],
+        len(reserved),
+        carrier_bytes_newest_first=[sum(map(len, sources)) for _, sources in carriers],
+        reserved_bytes=sum(map(len, reserved)),
+        many_image_safe=images_all_within_many_image_limit([*reserved, *(x for _, ss in carriers for x in ss)]),
     )
+    retire = latched_retire_count(retire, [api_messages[i].get("tool_call_id") for i, _ in carriers], retired_ids)
     pruned = 0
     for i, _ in carriers[len(carriers) - retire:]:
         new_msg = _strip_images_from_tool_msg(api_messages[i])
@@ -2300,6 +2299,7 @@ class ContextCompressor(
         self._ineffective_compression_count = 0
         # Wall-clock probe deadline; 0.0 = unarmed (durable copy re-read via _load_anti_thrash_recovery_deadline).
         self._anti_thrash_recovery_deadline = self._structural_no_op_backoff_until = 0.0
+        self._structural_no_op_len = 0
         # Observability only; never feeds the strike latch or the fallback streak.
         self._prellm_skip_count = 0
         # Only a healthy completed summary resets this; ordinary fitting responses do not.
@@ -2498,11 +2498,14 @@ class ContextCompressor(
         self._ineffective_compression_count = count
         self._persist_ineffective_compression_count()
 
-    def _record_structural_no_op(self, reason: str) -> None:
+    def _record_structural_no_op(self, reason: str, n_messages: int = 0) -> None:
         """Defer retries after a structural no-op WITHOUT striking the anti-thrash breaker.
         Nothing eligible existed, so nothing was "ineffective"; striking would permanently disarm
-        auto-compaction on short sessions. The backoff still stops per-turn re-scans."""
+        auto-compaction on short sessions. The backoff still stops per-turn re-scans. It is a
+        verdict about THIS transcript shape: a serving process that keeps the compressor across
+        turns (the gateway daemon) lifts it as soon as the transcript has grown (``compress``)."""
         self._structural_no_op_backoff_until = time.monotonic() + self._STRUCTURAL_NO_OP_BACKOFF_SECONDS
+        self._structural_no_op_len = int(n_messages or 0)
         if not self.quiet_mode:
             logger.warning(
                 "Compression skipped (%s): retrying in %.0fs (structural no-op backoff)", reason,
@@ -4916,8 +4919,7 @@ Write only the summary body. Do not include any preamble or prefix."""
 
         last_visible_role = _last_template_visible_role(compressed)
         if self._has_merged_inflight_replay(inflight):
-            # Never copy a summary carrier (metadata would mark the replay
-            # synthetic): restate as a plain user row.
+            # Never copy a summary carrier (its metadata marks it synthetic): restate as a plain user row.
             replay = {"role": "user", "content": task_text}
         else:
             replay = _fresh_compaction_message_copy(inflight)
@@ -4944,7 +4946,8 @@ Write only the summary body. Do not include any preamble or prefix."""
         # occurrence of it. When the original survived in the protected head,
         # retaining it gives the durable transcript two active rows with the
         # same message_uid and renders the request twice after reload.
-        from agent.message_metadata import MESSAGE_UID, message_uid_or_none, record_absorbed_message
+        from agent.message_metadata import MESSAGE_UID, mark_inflight_restatement, message_uid_or_none, record_absorbed_message
+        mark_inflight_restatement(replay)  # only the standalone row: the merged layout is already a summary
 
         if replay_uid := message_uid_or_none(replay):
             before = len(compressed)
@@ -5273,11 +5276,17 @@ Write only the summary body. Do not include any preamble or prefix."""
             self._structural_no_op_backoff_until = 0.0
         return telemetry
 
-    def _structural_no_op_result(self, telemetry: dict[str, Any], failure_class: str, reason: str) -> None:
+    def _structural_no_op_result(self, telemetry: dict[str, Any], failure_class: str, reason: str,
+                                 n_messages: int = 0) -> None:
         """Nothing eligible to compress: transient backoff (#93022), never an ineffectiveness strike."""
         telemetry["failure_class"] = failure_class
         self._last_compression_savings_pct = 0.0
-        self._record_structural_no_op(reason)
+        self._record_structural_no_op(reason, n_messages)
+
+    def lift_structural_backoff_if_grown(self, n_messages: int) -> None:
+        """A structural no-op said "nothing eligible among N messages"; more messages is new evidence."""
+        if self._structural_no_op_backoff_until and n_messages > getattr(self, "_structural_no_op_len", 0):
+            self._structural_no_op_backoff_until = 0.0
 
     def _drop_blank_echoes(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Remove blank platform echoes trailing the latest actionable user turn."""
@@ -5558,6 +5567,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         if n_messages <= _min_for_compress:
             self._structural_no_op_result(
                 telemetry, "insufficient_messages", f"only {n_messages} messages (need > {_min_for_compress})",
+                n_messages,
             )
             return messages
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
@@ -5582,6 +5592,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             self._structural_no_op_result(
                 telemetry, "no_compressible_window",
                 f"compress_start ({compress_start}) >= compress_end ({compress_end}) - transcript fits within tail budget",
+                n_messages,
             )
             return canonical_messages
         turns_to_summarize = messages[compress_start:compress_end]
@@ -5600,6 +5611,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             self._structural_no_op_result(
                 telemetry, "empty_post_handoff_window",
                 f"window {compress_start}-{compress_end} holds only already-summarized handoffs",
+                n_messages,
             )
             return canonical_messages
         if not self.quiet_mode:

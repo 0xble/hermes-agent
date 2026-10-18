@@ -3422,6 +3422,20 @@ def _start_owned_run(job: dict, execution_id: str) -> Optional[contextvars.Token
     return enter_cron_execution(job, execution_id, record or {})
 
 
+def _apply_agent_failure_marker(job: dict, success: bool, error, final_response):
+    """An agent can finish its own turn after a delegated child has failed. Let it explicitly
+    declare that semantic failure so the existing failure path updates status, streaks, ledger,
+    and notification routing instead of recording a false healthy result.
+
+    Returns ``(success, error, agent_declared)``.
+    """
+    if success and not job.get("no_agent"):
+        marker_error = _cron_failure_marker_error(final_response)
+        if marker_error is not None:
+            return False, marker_error, True
+    return success, error, False
+
+
 def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,

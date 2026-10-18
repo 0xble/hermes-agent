@@ -221,6 +221,11 @@ def _patch_launchd_env(
     monkeypatch.setattr(
         gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: ancestor
     )
+    # The gateway under test is never this updater's ancestor; a real ancestry walk would make it one
+    # whenever a fake pid (4242) happens to be a live ancestor of the worker on the host.
+    monkeypatch.setattr(
+        gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: False
+    )
 
     calls = {"restart": 0, "verify": 0, "label": None}
 
