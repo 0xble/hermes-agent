@@ -379,7 +379,7 @@ def test_randomized_capacity_stress_never_exceeds_slot_cap():
     for thread in threads:
         thread.join(timeout=15)
     assert all(not thread.is_alive() for thread in threads)
-    for index, handle in list(handles):
+    for index, handle in handles:
         if index in cancel_indexes and handle["status"] == "queued":
             ad.interrupt_delegation(handle["delegation_id"], reason="stress cancel")
     release.set()
@@ -549,6 +549,28 @@ def test_queued_delegation_controls_follow_compression_lineage(tmp_path):
         release.set()
         assert _drain_for(first["delegation_id"]) is not None
         db.close()
+
+
+
+def test_session_fence_rejects_new_dispatches_until_session_reopens():
+    token = ("default", "closing-session")
+    ad.refuse_for_session(token, session_key="closing-route", parent_session_ids=("closing-parent",))
+    rejected = ad.dispatch_async_delegation(
+        goal="must not start", context=None, toolsets=None, role="leaf", model="m",
+        session_key="closing-route", parent_session_id="closing-parent",
+        runner=lambda: {"status": "completed"},
+    )
+    assert rejected["status"] == "rejected"
+    assert "session is ending" in rejected["error"]
+
+    ad.allow_for_session(token)
+    accepted = ad.dispatch_async_delegation(
+        goal="can start after attach", context=None, toolsets=None, role="leaf", model="m",
+        session_key="closing-route", parent_session_id="closing-parent",
+        runner=lambda: {"status": "completed"},
+    )
+    assert accepted["status"] == "dispatched"
+    assert _drain_for(accepted["delegation_id"]) is not None
 
 
 def test_pending_queue_overflow_rejects_without_starting():

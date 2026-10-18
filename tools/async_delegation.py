@@ -43,6 +43,11 @@ _executor_max_workers: int = 0
 _records_lock = threading.RLock()
 # delegation_id -> record dict; kept for the run plus a short completed tail.
 _records: dict[str, dict[str, Any]] = {}
+# A closing session's token -> the (field, value) selectors a new dispatch is refused for (``refuse_for_session``),
+# and each selector -> the tokens refusing it, so a dispatch checks its own selectors, not every fence.
+_refused: dict[Any, frozenset] = {}
+_refused_by: dict[tuple, set] = {}
+_FENCED_FIELDS = ("session_key", "parent_session_id")
 
 # Durable and in-memory lifecycle states.  ``finalizing`` is an in-memory claim
 # only: the ledger remains in the expected prior state until the conditional
@@ -59,7 +64,7 @@ _TRANSITIONS = {
 }
 
 
-def _transition_memory_locked(record: Dict[str, Any], new: str, *, expected: Optional[str] = None) -> str:
+def _transition_memory_locked(record: dict[str, Any], new: str, *, expected: Optional[str] = None) -> str:
     """Apply one in-memory lifecycle transition; caller holds ``_records_lock``."""
     old = str(record.get("status") or "")
     if expected is not None and old != expected:
@@ -226,7 +231,7 @@ def _capture_routing_origin() -> dict[str, Any]:
         return {}
 
 
-def _persist_dispatch(record: Dict[str, Any]) -> None:
+def _persist_dispatch(record: dict[str, Any]) -> None:
     """Insert a new record exactly once, in durable ``queued`` state.
 
     This is intentionally not ``INSERT OR REPLACE``: replacing a row can erase
@@ -292,7 +297,7 @@ def _persist_transition(delegation_id: str, expected: str, new: str) -> int:
         ).rowcount
 
 
-def _persist_transition_group(delegation_ids: List[str], expected: str, new: str) -> bool:
+def _persist_transition_group(delegation_ids: list[str], expected: str, new: str) -> bool:
     """Persist one lifecycle transition for every sibling in one transaction.
 
     A queued completion-unit group is one admission decision: either every
@@ -317,7 +322,7 @@ def _persist_transition_group(delegation_ids: List[str], expected: str, new: str
     return True
 
 
-def _durable_state(delegation_id: str) -> Optional[Dict[str, Any]]:
+def _durable_state(delegation_id: str) -> Optional[dict[str, Any]]:
     """Read the authoritative lifecycle row for an explicit reconcile path."""
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
@@ -334,7 +339,7 @@ def _durable_state(delegation_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _log_pruned_ids(kind: str, ids: List[str]) -> None:
+def _log_pruned_ids(kind: str, ids: list[str]) -> None:
     """Make retention decisions auditable without dumping a whole high-churn ledger."""
     if ids:
         shown = ids[:_PRUNE_ID_LOG_LIMIT]
@@ -431,7 +436,7 @@ def _prune_durable_records() -> None:
 
 
 def _persist_completion(
-    event: Dict[str, Any], result: Dict[str, Any], delivery_state: str = "pending",
+    event: dict[str, Any], result: dict[str, Any], delivery_state: str = "pending",
     *, expected_state: Optional[str] = None,
 ) -> bool:
     """Conditionally persist a terminal payload without replacing the row."""
@@ -452,7 +457,7 @@ def _persist_completion(
     return True
 
 
-def _attach_retry_note(evt: Dict[str, Any]) -> None:
+def _attach_retry_note(evt: dict[str, Any]) -> None:
     """Classify only an owned terminal event; replay keeps the durable plan visible."""
     if evt.get("type") != "async_delegation" or evt.get("task_failure_notice"):
         return
@@ -474,16 +479,16 @@ def _attach_retry_note(evt: Dict[str, Any]) -> None:
     _stamp_resume_availability(evt)
 
 
-def _stamp_resume_availability(evt: Dict[str, Any], conn=None) -> None:
+def _stamp_resume_availability(evt: dict[str, Any], conn=None) -> None:
     """Off-loop builders and claimers record cut-resume admission; formatters only read it."""
     try:
         from tools.delegation_resume import stamp_resume_availability
         stamp_resume_availability(evt, conn)
-    except Exception:  # noqa: BLE001 - an unimportable resume module offers no resume line
+    except Exception:
         evt["resume_available"] = False
 
 
-def _outbox_event_id(event: Dict[str, Any], event_kind: str) -> str:
+def _outbox_event_id(event: dict[str, Any], event_kind: str) -> str:
     """Stable delivery identity for an event that is not the unit's terminal row."""
     delegation_id = str(event.get("delegation_id") or "")
     if not delegation_id:
@@ -503,7 +508,7 @@ def _outbox_event_id(event: Dict[str, Any], event_kind: str) -> str:
 
 
 def _persist_outbox_event(
-    event: Dict[str, Any], result: Optional[Dict[str, Any]], *, event_kind: str,
+    event: dict[str, Any], result: Optional[dict[str, Any]], *, event_kind: str,
     terminal_status: Optional[str] = None, expected_state: Optional[str] = None,
 ) -> str:
     """Persist one event, conditionally claiming terminal-fallback ownership.
@@ -547,7 +552,7 @@ def _persist_outbox_event(
     return event_id
 
 
-def _terminal_payload_matches(raw: Optional[str], payload: Optional[Dict[str, Any]]) -> bool:
+def _terminal_payload_matches(raw: Optional[str], payload: Optional[dict[str, Any]]) -> bool:
     if raw is None or payload is None:
         return raw is None and payload is None
     try:
@@ -557,8 +562,8 @@ def _terminal_payload_matches(raw: Optional[str], payload: Optional[Dict[str, An
 
 
 def _reconcile_terminal_write(
-    event: Dict[str, Any], result: Dict[str, Any], expected_state: str,
-    lifecycle_payload: Optional[Dict[str, Any]] = None,
+    event: dict[str, Any], result: dict[str, Any], expected_state: str,
+    lifecycle_payload: Optional[dict[str, Any]] = None,
 ) -> str:
     """Classify an ambiguous terminal write without creating a second event.
 
@@ -700,7 +705,7 @@ def _outbox_delivery_rows(conn):
     ).fetchall()
 
 
-def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
+def record_unit_child(delegation_id: str, entry: dict[str, Any]) -> None:
     """Checkpoint one finished child on the running unit's own row. The terminal owner reconciles
     ``result_json`` before claiming completion; abandoned-unit recovery also replays it.
     Best-effort: a failed write costs recovery fidelity, never the live result."""
@@ -1035,10 +1040,10 @@ _TERMINAL_OWNERSHIP_KEY = "_terminal_ownership"
 _OWNERSHIP_RETRY_BASE_S = 5.0
 _OWNERSHIP_RETRY_MAX_S = 300.0
 # (home key, delegation_id) -> unresolved event held off the queue until its retry is due.
-_unresolved: Dict[tuple, Dict[str, Any]] = {}
+_unresolved: dict[tuple, dict[str, Any]] = {}
 
 
-def _hold_unresolved(evt: Dict[str, Any], meta: Dict[str, Any], exc: BaseException) -> None:
+def _hold_unresolved(evt: dict[str, Any], meta: dict[str, Any], exc: BaseException) -> None:
     meta["attempts"] = int(meta.get("attempts") or 0) + 1
     delay = min(_OWNERSHIP_RETRY_BASE_S * 2 ** (meta["attempts"] - 1), _OWNERSHIP_RETRY_MAX_S)
     meta["retry_at"] = time.time() + delay
@@ -1061,7 +1066,7 @@ def reoffer_unresolved_completions(target_queue, *, now: Optional[float] = None)
     return len(events)
 
 
-def _resolve_terminal_ownership(evt: Dict[str, Any], meta: Dict[str, Any]) -> str:
+def _resolve_terminal_ownership(evt: dict[str, Any], meta: dict[str, Any]) -> str:
     """Resolve an unproven terminal event to its durable identity, acquiring the lifecycle row
     through the conditional fallback transaction when no terminal owner exists yet."""
     # The producer's snapshots, not ``evt``: consumers enrich their copy (e.g. gateway routing
@@ -1073,7 +1078,7 @@ def _resolve_terminal_ownership(evt: Dict[str, Any], meta: Dict[str, Any]) -> st
             _persist_outbox_event(event, result, event_kind="terminal_fallback",
                                   terminal_status=meta["terminal_status"], expected_state=expected)
             return "outbox"
-        except Exception as exc:  # noqa: BLE001 — lost the CAS, or committed before raising
+        except Exception as exc:
             logger.error("Async delegation %s: deferred terminal fallback write failed; reconciling: %s",
                          evt.get("delegation_id"), exc)
             disposition = _reconcile_terminal_write(event, result, expected, persisted)
@@ -1082,7 +1087,7 @@ def _resolve_terminal_ownership(evt: Dict[str, Any], meta: Dict[str, Any]) -> st
     return disposition
 
 
-def resolve_event_ownership(evt: Dict[str, Any]) -> bool:
+def resolve_event_ownership(evt: dict[str, Any]) -> bool:
     """True when ``evt`` may be delivered: it carries no unproven terminal ownership, or that
     ownership now resolves to this event. A proven loser remains permanently rejected, including
     on copies/requeues. An event whose ledger is still unreadable is held and re-offered later
@@ -1097,7 +1102,7 @@ def resolve_event_ownership(evt: Dict[str, Any]) -> bool:
     token = set_hermes_home_override(meta["home"])
     try:
         disposition = _resolve_terminal_ownership(evt, meta)
-    except Exception as exc:  # noqa: BLE001 — unavailable ledger: ownership stays unproven
+    except Exception as exc:
         _hold_unresolved(evt, meta, exc)
         return False
     finally:
@@ -1122,7 +1127,7 @@ def resolve_event_ownership(evt: Dict[str, Any]) -> bool:
     return True
 
 
-def is_interim_delegation_event(evt: Dict[str, Any]) -> bool:
+def is_interim_delegation_event(evt: dict[str, Any]) -> bool:
     """An early per-task notice for a batch that is still running.
 
     It has its own durable outbox identity, so claiming or acknowledging it can
@@ -1131,7 +1136,7 @@ def is_interim_delegation_event(evt: Dict[str, Any]) -> bool:
     return evt.get("type") == "async_delegation" and bool(evt.get("task_failure_notice"))
 
 
-def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
+def claim_event_delivery(evt: dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; legacy in-memory notices remain unclaimable.
 
     ``None`` means this copy must not be delivered: another consumer holds it, or its terminal
@@ -1355,7 +1360,7 @@ def active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
 
 
-def active_records() -> List[Dict[str, Any]]:
+def active_records() -> list[dict[str, Any]]:
     """Snapshot live async delegation records for shutdown and observability consumers."""
     with _records_lock:
         return [
@@ -1375,19 +1380,50 @@ def active_task_count() -> int:
             for r in _records.values() if r.get("status") in {"running", "finalizing"})
 
 
-def _session_records(statuses, session_key: str, origin_ui_session_id: str, parent_session_id: str) -> list:
-    """Records in ``statuses`` owned by a session: any non-empty selector claims the
-    record — ``origin_ui_session_id`` (TUI tab), ``session_key`` (routing key at
-    dispatch), or ``parent_session_id`` (spawner's durable id — the right one for
-    gateway chats, whose session_key survives ``/new`` while the session id rotates)."""
-    selectors = [(field, wanted) for field, wanted in (
+def _session_selectors(session_key: str, origin_ui_session_id: str, parent_session_id: Optional[str]) -> frozenset:
+    return frozenset((field, wanted) for field, wanted in (
         ("origin_ui_session_id", origin_ui_session_id), ("session_key", session_key),
-        ("parent_session_id", parent_session_id)) if wanted]
+        ("parent_session_id", parent_session_id)) if wanted)
+
+
+def _session_records(statuses, session_key: str, origin_ui_session_id: str, parent_session_id: str) -> list:
+    """Records in ``statuses`` owned by a session, excluding fenced selectors."""
+    selectors = _session_selectors(session_key, origin_ui_session_id, parent_session_id)
     if not selectors:
         return []
     with _records_lock:
         return [r for r in _records.values() if r.get("status") in statuses
                 and any(str(r.get(field) or "") == wanted for field, wanted in selectors)]
+
+
+def refuse_for_session(token: Any, *, session_key: str = "", parent_session_ids=(), origin_ui_session_id: str = "") -> None:
+    """Refuse new dispatches carrying selectors from one ending session.
+
+    The refusal is installed before the caller interrupts existing work, so a
+    still-running turn cannot dispatch new background work after its session
+    has closed. A later attach removes the same token with ``allow_for_session``.
+    """
+    selectors = set(_session_selectors(session_key, origin_ui_session_id, None))
+    selectors.update(("parent_session_id", parent) for parent in parent_session_ids if parent)
+    with _records_lock:
+        _unfence(token)
+        _refused[token] = frozenset(selectors)
+        for selector in selectors:
+            _refused_by.setdefault(selector, set()).add(token)
+
+
+def allow_for_session(token: Any) -> None:
+    with _records_lock:
+        _unfence(token)
+
+
+def _unfence(token: Any) -> None:
+    """Drop *token*'s refusal; caller holds ``_records_lock``."""
+    for selector in _refused.pop(token, ()):
+        tokens = _refused_by[selector]
+        tokens.discard(token)
+        if not tokens:
+            del _refused_by[selector]
 
 
 def has_live_for_session(session_key: str = "", origin_ui_session_id: str = "", parent_session_id: str = "") -> bool:
@@ -1469,12 +1505,12 @@ def _active_slots_locked() -> set:
     return slots | set(_PENDING_ADMISSION_SLOTS)
 
 
-def _record_context_run(record: Dict[str, Any], fn: Callable, *args):
+def _record_context_run(record: dict[str, Any], fn: Callable, *args):
     ctx = record.get("_context") or contextvars.copy_context()
     return ctx.copy().run(fn, *args)
 
 
-def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[str]:
+def _submit_record(record: dict[str, Any], max_async_children: int) -> Optional[str]:
     """Submit an admitted record and make it running only while a Future exists.
 
     A placeholder Future is attached before invoking the executor.  That keeps
@@ -1497,12 +1533,12 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
     try:
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
         executor = _get_executor(max(max_async_children, live_units))
-    except Exception as exc:  # noqa: BLE001 - admission must settle a failed executor lookup
+    except Exception as exc:
         logger.warning("Async delegation %s could not create an executor: %s", delegation_id, exc)
         return f"Failed to schedule async delegation{label}: {exc}"
 
     def _worker() -> None:
-        result: Dict[str, Any] = {}
+        result: dict[str, Any] = {}
         status = "error"
         with _records_lock:
             rec = _records.get(delegation_id)
@@ -1511,7 +1547,7 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
         try:
             result = record["runner"]() or {}
             status = record["classify"](result)
-        except Exception as exc:  # noqa: BLE001 — must never crash the worker
+        except Exception as exc:
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
             result = record["crash_result"](
                 f"{type(exc).__name__}: {exc}", round(time.time() - record["dispatched_at"], 2)
@@ -1619,7 +1655,7 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
     return None
 
 
-def _queue_selected_locked(selected: List[Dict[str, Any]]) -> None:
+def _queue_selected_locked(selected: list[dict[str, Any]]) -> None:
     """Restore a selected sibling group to queued in memory and FIFO order.
 
     The caller has already durably rolled the group back to ``queued`` (or is
@@ -1643,7 +1679,7 @@ def _queue_selected_locked(selected: List[Dict[str, Any]]) -> None:
 
 
 def _settle_unsubmitted_locked(
-    selected: List[Dict[str, Any]], submitted: List[Dict[str, Any]], error: str,
+    selected: list[dict[str, Any]], submitted: list[dict[str, Any]], error: str,
 ) -> None:
     """Settle selected siblings that do not hold a real Future.
 
@@ -1665,9 +1701,9 @@ def _settle_unsubmitted_locked(
 
     prior_statuses = {item["delegation_id"]: item.get("status") for item in unsettled}
 
-    def settle_group(items: List[Dict[str, Any]], target: str) -> List[Dict[str, Any]]:
+    def settle_group(items: list[dict[str, Any]], target: str) -> list[dict[str, Any]]:
         """Persist and publish one target for groups split by current state."""
-        settled: List[Dict[str, Any]] = []
+        settled: list[dict[str, Any]] = []
         for expected in ("admitted", "running"):
             state_items = [item for item in items if item.get("status") == expected]
             if not state_items:
@@ -1732,7 +1768,7 @@ def _admit_pending() -> None:
     while True:
         with _records_lock:
             active_slots = _active_slots_locked()
-            selected: List[Dict[str, Any]] = []
+            selected: list[dict[str, Any]] = []
             selected_slot = None
             for delegation_id in list(_PENDING_QUEUE):
                 record = _records.get(delegation_id)
@@ -1778,13 +1814,13 @@ def _admit_pending() -> None:
                 item["_slot_reserved"] = True
                 item["_slot_release_done"] = False
 
-            submitted: List[Dict[str, Any]] = []
+            submitted: list[dict[str, Any]] = []
             submission_error: Optional[str] = None
             try:
                 for item in selected:
                     try:
                         error = _record_context_run(item, _submit_record, item, item["max_async_children"])
-                    except Exception as exc:  # noqa: BLE001 - settle every sibling on any submit path
+                    except Exception as exc:
                         logger.exception("Async delegation %s submission raised", item["delegation_id"])
                         error = f"Failed to schedule async delegation: {exc}"
                     if error:
@@ -1808,13 +1844,13 @@ def _dispatch_admitted(
     parent_session_id: Optional[str], runner: Callable[[], dict[str, Any]], origin_ui_session_id: str,
     origin_session_id: str, interrupt_fn: Optional[Callable[[], None]], max_async_children: int,
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
-    task_indexes: Optional[List[int]] = None,
-    task_contexts: Optional[Dict[str, str]] = None,
-    task_transcripts: Optional[Dict[str, str]] = None,
-    cron_execution: Optional[Dict[str, str]] = None,
+    task_indexes: Optional[list[int]] = None,
+    task_contexts: Optional[dict[str, str]] = None,
+    task_transcripts: Optional[dict[str, str]] = None,
+    cron_execution: Optional[dict[str, str]] = None,
     max_queued_delegations: int = _DEFAULT_MAX_QUEUED_DELEGATIONS,
     cancel_fn: Optional[Callable[[str], None]] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Register and submit one async unit without ever running its runner inline.
 
     A full pool places the unit in a bounded FIFO when possible. Only the queue
@@ -1845,7 +1881,11 @@ def _dispatch_admitted(
         "_slot_reserved": False, "_slot_release_done": True,
         "_persisting": True, "_persist_done": threading.Event(),
     }
+    session_selectors = _session_selectors(session_key, origin_ui_session_id, parent_session_id)
     with _records_lock:
+        if any(selector in _refused_by for selector in session_selectors):
+            return {"status": "rejected", "accepted": False,
+                    "error": "session is ending; reconnect to continue"}
         existing = _records.get(delegation_id)
         if existing is not None:
             return {"status": "rejected", "accepted": False,
@@ -1960,8 +2000,8 @@ def dispatch_async_delegation(
     origin_ui_session_id: str = "", origin_session_id: str = "", interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, max_queued_delegations: int = _DEFAULT_MAX_QUEUED_DELEGATIONS,
     progress_fn: Optional[Callable[[], tuple]] = None, delegation_id: Optional[str] = None,
-    cron_execution: Optional[Dict[str, str]] = None, cancel_fn: Optional[Callable[[str], None]] = None,
-) -> Dict[str, Any]:
+    cron_execution: Optional[dict[str, str]] = None, cancel_fn: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
     no contextvars) and route the completion back to the spawning session.
@@ -1992,10 +2032,10 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "", origin_session_id: str = "", interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, max_queued_delegations: int = _DEFAULT_MAX_QUEUED_DELEGATIONS,
     delegation_id: Optional[str] = None, progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
-    task_indexes: Optional[List[int]] = None,
-    task_contexts: Optional[Dict[str, str]] = None,
-    task_transcripts: Optional[Dict[str, str]] = None, cancel_fn: Optional[Callable[[str], None]] = None,
-) -> Dict[str, Any]:
+    task_indexes: Optional[list[int]] = None,
+    task_contexts: Optional[dict[str, str]] = None,
+    task_transcripts: Optional[dict[str, str]] = None, cancel_fn: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
     "total_duration_seconds": N}`` dict. The unit occupies ONE async slot — or joins the slot named
@@ -2055,7 +2095,7 @@ def supersede_delegation(delegation_id: str, replacement_id: str, reason: str = 
     return True
 
 
-def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot: Optional[Dict[str, Any]] = None) -> None:
+def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot: Optional[dict[str, Any]] = None) -> None:
     """Claim one terminal transition and publish its result.
 
     The user-visible terminal state may precede executor completion, but the
@@ -2151,7 +2191,7 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
         try:
             _persist_completion(evt, result, delivery_state="superseded",
                                 expected_state=record.get("_durable_state") or "running")
-        except Exception as exc:  # noqa: BLE001 — the replacement still reports; only the audit row is lost
+        except Exception as exc:
             logger.error("Async delegation %s: superseded completion write failed: %s", record.get("delegation_id"), exc)
         record.update(_terminal_state=durable_status(evt, record.get("_terminal_state") or status), _completion_status=evt["status"])
         logger.info("Async delegation%s %s superseded by %s; completion recorded, not delivered",
@@ -2163,7 +2203,7 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
         persist_evt = dict(evt)
         persist_evt["status"] = terminal_status
         ok = _persist_completion(persist_evt, result, expected_state=expected_state)
-    except Exception as exc:  # noqa: BLE001 — reconcile an ambiguous terminal write
+    except Exception as exc:
         logger.error("Async delegation%s %s: durable terminal row write failed; reconciling fallback ownership: %s",
                      label, record.get("delegation_id"), exc)
         ok = False
@@ -2568,7 +2608,7 @@ def list_async_delegations() -> list[dict[str, Any]]:
     return items
 
 
-def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, msg: str,
+def _interrupt_records(targets: list[dict[str, Any]], caller: str, reason: str, msg: str,
                        affected_ids: Optional[set] = None) -> int:
     """Cancel queued records or signal running records; optionally union affected durable ids."""
     count = 0
@@ -2663,7 +2703,7 @@ def _cancel_pending_retries_safely(caller: str, **selectors: Any) -> set:
         return set()
     try:
         return set(cancel_pending_retries(**selectors, reason=reason))
-    except Exception as exc:  # noqa: BLE001 - live child interruption is the safety path
+    except Exception as exc:
         logger.warning("%s: durable retry cancellation failed: %s", caller, exc, exc_info=True)
         return set()
 
@@ -2723,6 +2763,8 @@ def _reset_for_tests() -> None:
         _records.clear()
         _PENDING_QUEUE.clear()
         _PENDING_ADMISSION_SLOTS.clear()
+        _refused.clear()
+        _refused_by.clear()
     with _orphan_lock:
         _offered.clear()
         _last_orphan_sweep.clear()

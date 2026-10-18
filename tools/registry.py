@@ -14,6 +14,8 @@ import logging
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
@@ -21,6 +23,27 @@ from typing import Callable, Dict, List, Optional, Set
 from hermes_constants import hermes_home_key, normalize_scope
 
 logger = logging.getLogger(__name__)
+
+_session_tool_scope = ContextVar("session_tool_scope", default=None)
+
+
+@contextmanager
+def session_tool_scope(scope):
+    """Execution-owned overlay, additive to the existing profile registry."""
+    token = _session_tool_scope.set(scope)
+    try:
+        yield
+    finally:
+        _session_tool_scope.reset(token)
+
+
+def current_session_tool_scope():
+    return _session_tool_scope.get()
+
+
+def _session_slot_key():
+    """Key the current execution overlay exactly as registration keys profile scopes."""
+    return normalize_scope(_session_tool_scope.get())
 
 # Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
 _MAX_TOOL_ERROR_CHARS = 2048
@@ -198,6 +221,7 @@ class ToolEntry:
     # Plugin-owned tools may opt into the direct model-visible surface. Tool-search config can still
     # explicitly defer an eager tool by name.
     eager: bool = False
+    execution_timeout: float | None = None
 
 
 class _PluginOverridePolicy:
@@ -472,8 +496,11 @@ class ToolRegistry:
             alias: target for alias, target in self._toolset_aliases.items() if target != toolset}
 
     def _merged_tools(self, scope: Optional[str] = None) -> dict[str, ToolEntry]:
-        """Return global tools overlaid with one profile's plugin tools."""
-        return {**self._tools, **self._scoped_tools.get(hermes_home_key(scope), {})}
+        """Return global tools overlaid with one profile and the current execution scope."""
+        entries = {**self._tools, **self._scoped_tools.get(hermes_home_key(scope), {})}
+        if scope is None:
+            entries.update(self._scoped_tools.get(_session_slot_key(), {}))
+        return entries
 
     def _toolset_entries(self, toolset: str, scope: Optional[str]) -> list[ToolEntry]:
         return self._grouped(self._merged_tools(scope).values()).get(toolset, [])
@@ -502,10 +529,20 @@ class ToolRegistry:
     def get_entry(self, name: str, *, scope: Optional[str] = None) -> Optional[ToolEntry]:
         """Active profile's entry by name, falling back to global."""
         with self._lock:
-            return self._lookup(name, scope or self.current_scope_key())
+            if scope is None:
+                return self._lookup(name, self.current_scope_key(), explicit_scope=False)
+            return self._lookup(name, scope)
 
-    def _lookup(self, name: str, scope_key: Optional[str]) -> Optional[ToolEntry]:
-        """``_merged_tools(scope_key).get(name)`` without building the merged dict."""
+    def _lookup(self, name: str, scope_key: Optional[str], *, explicit_scope: bool = True) -> Optional[ToolEntry]:
+        """Look up a tool without building the merged dict.
+
+        An implicit scope also sees the current execution overlay, while an
+        explicit profile lookup stays pinned to the requested profile.
+        """
+        if not explicit_scope:
+            session_scoped = self._scoped_tools.get(_session_slot_key())
+            if session_scoped is not None and name in session_scoped:
+                return session_scoped[name]
         scoped = self._scoped_tools.get(scope_key)
         if scoped is not None and name in scoped:
             return scoped[name]
@@ -671,7 +708,7 @@ class ToolRegistry:
         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: float | None = None,
         dynamic_schema_overrides: Callable | None = None, override: bool = False,
-        scope: Optional[str] = None, eager: bool = False):
+        scope: Optional[str] = None, eager: bool = False, execution_timeout: float | None = None):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
         browser backend); without it, cross-toolset shadowing is rejected."""
@@ -736,7 +773,8 @@ class ToolRegistry:
                 requires_env=requires_env or [], is_async=is_async,
                 description=description or schema.get("description", ""), emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
-                dynamic_schema_overrides=dynamic_schema_overrides, eager=bool(eager))
+                dynamic_schema_overrides=dynamic_schema_overrides, eager=bool(eager),
+                execution_timeout=execution_timeout)
             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
             # longer gates a toolset; it still feeds get_toolset_requirements ->
             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,

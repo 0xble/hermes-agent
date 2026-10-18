@@ -97,15 +97,31 @@ def _detect_supervisor() -> str:
     return "external" if "--external-supervisor" in sys.argv else "manual"
 
 
+def launch_supervisor(identity: dict[str, Any]) -> Optional[str]:
+    """Return the supervisor that launched a gateway from its identify payload.
+
+    ``supervisor: none`` is the protocol's value for manual and desktop
+    launchers, so the explicit ``launch_supervisor`` field carries that
+    provenance. Older gateways without the field remain unknown.
+    """
+    for key in ("launch_supervisor", "supervisor"):
+        value = identity.get(key)
+        if isinstance(value, str) and value and value != "none":
+            return value
+    return None
+
+
 def build_identify_payload() -> dict[str, Any]:
     """Default ``identify`` answer, built from gateway.status primitives."""
     from gateway.status import _build_pid_record, _get_code_identity_fields, _profile_label_for_home, read_runtime_status
     record = _build_pid_record()
+    supervisor = _detect_supervisor()
     payload: dict[str, Any] = {
         "protocol": CONTROL_PROTOCOL_VERSION,
         **{k: record.get(k) for k in ("kind", "pid", "start_time", "hermes_home")},
         "profile": _profile_label_for_home(record.get("hermes_home") or ""),
-        "supervisor": _detect_supervisor(), **_get_code_identity_fields()}
+        "supervisor": supervisor, "launch_supervisor": supervisor,
+        **_get_code_identity_fields()}
     from gateway import zero_cut_standby as zcs
     payload.update({"slot": zcs.readiness()["slot"], "standby": zcs.readiness()["standby"]})
     with contextlib.suppress(Exception):

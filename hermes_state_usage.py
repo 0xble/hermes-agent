@@ -293,23 +293,36 @@ class SessionUsageMixin:
         per-turn route (``voice_chat``): its calls count in the session totals and land in
         ``session_model_usage`` under that task, but never become the session's recorded route."""
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
-        # A provider-billed per-call delta arrives as ``cost_status="actual"`` with the amount in
-        # ``estimated_cost_usd``. The sessions row keeps its existing display bucket (readers use
-        # COALESCE(actual_cost_usd, estimated_cost_usd)); the per-call model row also records the
-        # amount as billed. Neither reader adds the two buckets, so the amount displays once.
         billed_delta = (estimated_cost_usd if (cost_status == "actual" and actual_cost_usd is None
                                                and not absolute) else None)
         if billed_delta is not None:
             usage["actual_cost_usd"] = billed_delta
-        # Ensure the row exists: under concurrent load create_session() may have failed on
-        # locking, and the UPDATE would silently affect 0 rows. When this guard is the first
-        # writer it must carry the agent's real source: the turn lease treats an existing row as
-        # proof the create already happened, so the creator never returns to repair an anonymous
-        # ``unknown`` placeholder and the session stays a phantom for life (#111999).
+        values = dict(locals())
+        values.pop('self')
+        values.pop('session_id')
+        values.pop('source')
+        values.pop('usage')
+        values.pop('billed_delta')
         self._insert_session_row(session_id, source or "unknown", model=model)
+        self._execute_write(lambda conn: self._update_token_counts_in_transaction(
+            conn, session_id, billed_delta=billed_delta, **values))
+
+    def _update_token_counts_in_transaction(
+        self, conn, session_id: str, input_tokens: int=0, output_tokens: int=0, model: str | None=None,
+        cache_read_tokens: int=0, cache_write_tokens: int=0, reasoning_tokens: int=0,
+        estimated_cost_usd: Optional[float]=None, actual_cost_usd: Optional[float]=None,
+        cost_status: Optional[str]=None, cost_source: Optional[str]=None,
+        pricing_version: Optional[str]=None, billing_provider: Optional[str]=None,
+        billing_base_url: Optional[str]=None, billing_mode: Optional[str]=None,
+        api_call_count: int=0, absolute: bool=False, task: str="", billed_delta: Optional[float]=None,
+    ) -> None:
+        """Apply usage counters and attribution inside the caller's write transaction."""
+        usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
+        if billed_delta is not None:
+            usage["actual_cost_usd"] = billed_delta
         sql = _TOKEN_UPDATE_ABSOLUTE_SQL if absolute else _TOKEN_UPDATE_DELTA_SQL
-        has_usage = bool(input_tokens or output_tokens or cache_read_tokens or cache_write_tokens or reasoning_tokens
-                         or api_call_count or estimated_cost_usd)
+        has_usage = bool(input_tokens or output_tokens or cache_read_tokens or cache_write_tokens
+                         or reasoning_tokens or api_call_count or estimated_cost_usd)
         has_accounted_usage = bool(has_usage or actual_cost_usd)
         params = (
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
@@ -318,46 +331,26 @@ class SessionUsageMixin:
             billing_base_url if has_accounted_usage else None,
             billing_mode if has_accounted_usage else None, model if has_accounted_usage else None,
             api_call_count, session_id)
-        # Per-model attribution: the sessions row keeps one (model, provider) pair, so a
-        # mid-session /model switch would attribute every token to the initial model. Only
-        # the incremental path records here — absolute cumulative updates cannot be split
-        # back into routes; Insights reconciles the residual instead.
-        # ``update_token_counts`` is the single chokepoint every per-API-call delta flows through (CLI,
-        # gateway, cron, delegated runs — see conversation_loop / codex_runtime), and each call carries the
-        # model/provider *active at the time of that call*. Recording the per-call delta into
-        # session_model_usage keyed by the live model preserves an accurate per-model breakdown regardless
-        # of how many times the user switches. See #51607.
         record_model_usage = (not absolute) and has_usage
-
-        def _do(conn):
-            row = conn.execute(
-                "SELECT model, billing_provider, api_call_count, actual_cost_usd FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            existing = dict(row) if row is not None else {}
-            run_params = params
-            if billed_delta is not None and existing.get("actual_cost_usd") is not None:
-                # A row that already shows its actual bucket (an explicit legacy actual write)
-                # would hide an estimated_cost_usd-only delta from COALESCE readers; add the
-                # billed amount to the shown bucket too.
-                run_params = params[:6] + (billed_delta, billed_delta) + params[8:]
-            # create_session records the requested route before any API call. If that fails
-            # and fallback succeeds, the first accounted usage is the authoritative route;
-            # after that keep the row as is (one row cannot represent mixed usage).
-            first_accounted_route = (
-                not task and int(existing.get("api_call_count") or 0) == 0 and has_accounted_usage and bool(model)
-                and bool(billing_provider)
-                and (existing.get("model") != model or existing.get("billing_provider") != billing_provider)
-            )
-            if first_accounted_route:
-                conn.execute("""UPDATE sessions
-                       SET model = ?, billing_provider = ?,
-                       billing_base_url = ?, billing_mode = ?
-                       WHERE id = ?""", (model, billing_provider, billing_base_url, billing_mode, session_id))
-            conn.execute(sql, run_params)
-            if record_model_usage:
-                self._record_model_usage(conn, session_id, task=task, **usage)
-        self._execute_write(_do)
+        row = conn.execute(
+            "SELECT model, billing_provider, api_call_count, actual_cost_usd FROM sessions WHERE id = ?", (session_id,),
+        ).fetchone()
+        existing = dict(row) if row is not None else {}
+        run_params = params
+        if billed_delta is not None and existing.get("actual_cost_usd") is not None:
+            run_params = params[:6] + (billed_delta, billed_delta) + params[8:]
+        first_accounted_route = (
+            not task and int(existing.get("api_call_count") or 0) == 0 and has_accounted_usage and bool(model)
+            and bool(billing_provider)
+            and (existing.get("model") != model or existing.get("billing_provider") != billing_provider)
+        )
+        if first_accounted_route:
+            conn.execute("""UPDATE sessions
+                   SET model = ?, billing_provider = ?, billing_base_url = ?, billing_mode = ?
+                   WHERE id = ?""", (model, billing_provider, billing_base_url, billing_mode, session_id))
+        conn.execute(sql, run_params)
+        if record_model_usage:
+            self._record_model_usage(conn, session_id, task=task, **usage)
 
     def _record_model_usage(
         self, conn, session_id: str, *, model: Optional[str]=None, billing_provider: Optional[str]=None,
