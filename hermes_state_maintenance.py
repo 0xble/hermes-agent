@@ -500,6 +500,11 @@ class SessionMaintenanceMixin:
         When *sessions_dir* is provided, on-disk transcript files (``.json`` / ``.jsonl`` /
         ``request_dump_*``) for pruned sessions are removed as part of the same sweep (issue #3015).
         Messaging and UI sources are never touched here. See #54189.
+
+        The active profile's ``maintenance.deletion_window`` is an invariant of
+        automatic pruning, not only a caller convention. Calls outside that
+        window return before acquiring the maintenance lock or spending the
+        24-hour throttle.
         """
         from hermes_state_repair import _release_auto_maintenance_lock, _try_acquire_auto_maintenance_lock
         result: dict[str, Any] = {"skipped": False, "pruned": 0, "closed": 0, "vacuumed": False}
@@ -510,6 +515,11 @@ class SessionMaintenanceMixin:
                 "state.db auto-maintenance skipped: sessions.retention_days=%r is outside the allowed "
                 "range (a whole number of days >= 0); set sessions.auto_prune: false to disable pruning",
                 retention_days)
+            result["skipped"] = True
+            return result
+        from hermes_cli.maintenance_window import deletion_window_open
+        if not deletion_window_open():
+            logger.debug("state.db auto-maintenance skipped: outside maintenance.deletion_window")
             result["skipped"] = True
             return result
         maintenance_lock = _try_acquire_auto_maintenance_lock(self.db_path)
