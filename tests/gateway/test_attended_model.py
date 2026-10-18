@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from gateway.attended_model import (
+    format_attended_switch_back_notice,
     format_attended_switch_notice,
     friendly_model_name,
     is_active,
@@ -118,6 +119,34 @@ def test_attended_switch_notice_uses_card_style_and_friendly_name():
     assert format_attended_switch_notice(
         "claude-opus-5-5", "high", idle_model="claude-opus-5-5", idle_minutes=15,
     ) == "⇄ Switched to Opus 5.5 while you're active."
+
+
+def test_attended_switch_back_notice_uses_idle_model_and_window():
+    assert format_attended_switch_back_notice("gpt-6.1-sol", 15) == (
+        "⇄ Back to GPT-6.1 Sol after 15m idle."
+    )
+
+
+def test_new_session_starts_attended_by_default_without_activity_stamp():
+    cfg = _cfg(
+        default="gpt-6.1-sol", provider="nous",
+        attended={"model": "claude-opus-5-5", "provider": "custom:claude"},
+    )
+    result = resolve_attended_model(
+        {"default_model": "gpt-6.1-sol", "default_provider": "nous", "new_session": True},
+        1001, cfg,
+    )
+    assert (result.model, result.reason, result.active, result.new_session) == (
+        "claude-opus-5-5", "attended", True, True,
+    )
+    disabled = _cfg(
+        default="gpt-6.1-sol", provider="nous",
+        attended={"model": "claude-opus-5-5", "provider": "custom:claude", "start_new_sessions": False},
+    )
+    assert resolve_attended_model(
+        {"default_model": "gpt-6.1-sol", "default_provider": "nous", "new_session": True},
+        1001, disabled,
+    ).reason == "default"
 
 
 def test_attended_resolution_names_idle_return_model():

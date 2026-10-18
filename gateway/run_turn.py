@@ -42,7 +42,8 @@ from gateway.session import (
 )
 from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
 from gateway.attended_model import (
-    format_attended_switch_notice, is_active, parse_attended_config, resolve_attended_model,
+    format_attended_switch_back_notice, format_attended_switch_notice,
+    is_active, parse_attended_config, resolve_attended_model,
 )
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
@@ -177,7 +178,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             self._expire_attended_temporary_picks(skey, user_config)
             if parse_attended_config(user_config or {}).enabled:
                 state = self._session_state(skey)
-                state.conversation.last_attended_decision = None
                 state.conversation.pre_agent_fallback_notice = None
         override, last_model, _ = self._snapshot_session_runtime_state(skey)
         attended_route = self._attended_route_for_session(
@@ -199,6 +199,20 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             return stamp
         return None
 
+    def _ensure_attended_new_session_activity(self, session_key: str, cfg, stamp):
+        """Start the attended window for a newly opened session, including internal first turns."""
+        state = self._peek_session_state(session_key)
+        new_session = bool(
+            state is not None
+            and getattr(state.conversation, "attended_new_session", False)
+            and cfg.start_new_sessions
+        )
+        if new_session and stamp is None:
+            stamp = time.time()
+            with suppress(Exception):
+                self.session_store.mark_user_activity(session_key)
+        return stamp, new_session
+
     def _load_attended_resolution_snapshot(
         self, session_key: str, model: str, attended_model: str, user_config: Optional[dict] = None,
     ) -> dict:
@@ -208,6 +222,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 from gateway.run import _resolve_gateway_model
                 model = model or _resolve_gateway_model(user_config)
         stamp = self._load_attended_activity_stamp(session_key)
+        cfg = parse_attended_config(user_config or {})
+        stamp, new_session = self._ensure_attended_new_session_activity(session_key, cfg, stamp)
         reasoning_override = None
         reasoning_scope = "session"
         store = getattr(self, "session_store", None)
@@ -225,6 +241,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 attended_reasoning = self._load_reasoning_config(attended_model) or {}
         return {
             "activity_stamp": stamp,
+            "new_session": new_session,
             "reasoning_override": reasoning_override,
             "reasoning_scope": reasoning_scope,
             "default_reasoning": default_reasoning,
@@ -254,7 +271,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
 
     def _attended_resolution_for_session(
         self, *, source, session_key, user_config=None, override=None,
-        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
+        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, new_session=False,
+        reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
         reasoning_scope=None, default_reasoning=None, attended_reasoning=None,
     ):
         """Return the one authoritative desired route decision for a gateway session."""
@@ -266,13 +284,20 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             return None
         state = self._session_state(session_key)
         conversation = state.conversation
+        new_session_pending = bool(new_session or getattr(conversation, "attended_new_session", False))
+        new_session = new_session_pending and cfg.start_new_sessions
         stamp = conversation.last_user_activity_at
         if stamp is None:
             if activity_stamp is not _NO_ATTENDED_ACTIVITY_STAMP:
                 stamp = activity_stamp
             else:
                 stamp = self._load_attended_activity_stamp(session_key)
-            self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
+        if new_session:
+            stamp, _ = self._ensure_attended_new_session_activity(session_key, cfg, stamp)
+            self._handoff_attended_state(session_key, conversation={"attended_new_session": False})
+        elif new_session_pending:
+            self._handoff_attended_state(session_key, conversation={"attended_new_session": False})
+        self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
         channel_model = ""
         channel_provider = ""
         if source is not None:
@@ -311,6 +336,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 reasoning_scope = getattr(conversation, "reasoning_override_scope", reasoning_scope)
         else:
             reasoning_value = reasoning_override
+        previous_decision = conversation.last_attended_decision
         decision = resolve_attended_model(
             {
                 "model_override": model_value if model_scope not in ("session", "temporary", "once") else None,
@@ -324,6 +350,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 "channel_model": channel_model,
                 "channel_provider": channel_provider,
                 "last_user_activity_at": stamp,
+                "new_session": new_session,
                 "default_reasoning": (default_reasoning or {}).get("effort", ""),
                 "explicit_model_reasoning": (default_reasoning or {}).get("effort", ""),
                 "attended_reasoning": (attended_reasoning or {}).get("effort", ""),
@@ -332,6 +359,18 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             },
             time.time(), user_config or {},
         )
+        switched_back = bool(
+            decision.reason == "default"
+            and previous_decision is not None
+            and previous_decision.reason == "attended"
+            and previous_decision.active
+            and previous_decision.idle_model
+            and previous_decision.idle_model != previous_decision.model
+        )
+        if new_session or switched_back:
+            decision = dataclasses.replace(
+                decision, new_session=new_session, switched_back=switched_back,
+            )
         self._handoff_attended_state(
             session_key,
             conversation={"last_attended_decision": decision},
@@ -341,22 +380,33 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
 
     def _attended_route_for_session(
         self, *, source, session_key, user_config, override, last_model,
-        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
+        activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, new_session=False,
+        reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
         reasoning_scope=None, default_reasoning=None, attended_reasoning=None,
     ):
         """Build the detached attended route and stage its one-line notice on the session."""
         decision = self._attended_resolution_for_session(
             source=source, session_key=session_key, user_config=user_config, override=override,
-            activity_stamp=activity_stamp, reasoning_override=reasoning_override,
+            activity_stamp=activity_stamp, new_session=new_session,
+            reasoning_override=reasoning_override,
             reasoning_scope=reasoning_scope, default_reasoning=default_reasoning,
             attended_reasoning=attended_reasoning,
         )
         if decision is None:
             return None
-        if decision.reason != "attended":
-            return None
         conversation = self._session_state(session_key).conversation
         cfg = parse_attended_config(user_config or {})
+        if decision.switched_back:
+            self._handoff_attended_state(
+                session_key,
+                conversation={
+                    "pending_attended_notice": format_attended_switch_back_notice(
+                        decision.model, cfg.idle_revert_minutes,
+                    ),
+                },
+            )
+        if decision.reason != "attended":
+            return None
         route = {
             "active": True,
             "model": cfg.model,
@@ -366,7 +416,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         }
         target_model = cfg.model or decision.model
         session_last_model = last_model or conversation.last_resolved_model or ""
-        if not session_last_model or session_last_model != target_model:
+        if not decision.new_session and (not session_last_model or session_last_model != target_model):
             # Async resolution supplies config-derived reasoning in the detached snapshot.  Do not
             # fall back to _load_reasoning_config here: this method runs on the gateway loop.
             effort = decision.reasoning_effort or (
@@ -674,7 +724,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             state = self._session_state(skey)
             attended_enabled = parse_attended_config(user_config or {}).enabled
             if attended_enabled:
-                state.conversation.last_attended_decision = None
                 state.conversation.pre_agent_fallback_notice = None
             async with self._session_model_override_lock(skey):
                 if self._session_model_override(skey) is None:
@@ -702,6 +751,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             attended_route = self._attended_route_for_session(
                 source=source, session_key=skey, user_config=user_config, override=override,
                 last_model=last_model, activity_stamp=activity_stamp,
+                new_session=attended_snapshot.get("new_session", False) if attended_snapshot else False,
                 reasoning_override=(attended_snapshot.get("reasoning_override", _NO_ATTENDED_ACTIVITY_STAMP)
                                     if attended_snapshot else _NO_ATTENDED_ACTIVITY_STAMP),
                 reasoning_scope=attended_snapshot.get("reasoning_scope") if attended_snapshot else None,
@@ -1069,6 +1119,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             # See #6508.
             session_entry.is_fresh_reset = False
         if _is_new_session:
+            self._session_state(session_key).conversation.attended_new_session = True
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,

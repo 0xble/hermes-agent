@@ -109,6 +109,16 @@ def format_attended_switch_notice(
     return t("gateway.model.attended_switched", model=friendly_model_name(model))
 
 
+def format_attended_switch_back_notice(idle_model: str, idle_minutes: float) -> str:
+    """Render the one-shot notice emitted when an attended route expires."""
+    minutes = int(idle_minutes) if float(idle_minutes).is_integer() else idle_minutes
+    return t(
+        "gateway.model.attended_switched_back_idle",
+        idle_model=friendly_model_name(idle_model),
+        minutes=minutes,
+    )
+
+
 @dataclass(frozen=True)
 class AttendedConfig:
     """Validated feature configuration. ``enabled`` is false when all new keys are unset."""
@@ -119,6 +129,7 @@ class AttendedConfig:
     reasoning_effort: str = ""
     idle_revert_minutes: float = 15.0
     compact_before_switch_tokens: int = 80000
+    start_new_sessions: bool = True
 
 
 @dataclass(frozen=True)
@@ -129,6 +140,8 @@ class AttendedResolution:
     reason: str
     active: bool = False
     idle_model: str = ""  # route used once the attended window lapses; display only
+    new_session: bool = False  # fresh sessions may start attended without a switch-in card
+    switched_back: bool = False  # this resolution crossed from attended to the idle route
 
     @property
     def decision_key(self) -> tuple[str, str, str, str, bool]:
@@ -189,6 +202,10 @@ def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
     if effort and effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
         logger.warning("model.attended.reasoning_effort=%r is invalid; ignoring it", effort)
         effort = ""
+    start_new_sessions = attended_raw.get("start_new_sessions", True)
+    if not isinstance(start_new_sessions, bool):
+        logger.warning("model.attended.start_new_sessions=%r must be a boolean; using true", start_new_sessions)
+        start_new_sessions = True
     return AttendedConfig(
         enabled=enabled,
         model=model,
@@ -201,6 +218,7 @@ def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
             model_cfg.get("compact_before_switch_tokens", 80000), default=80000,
             key="compact_before_switch_tokens",
         ),
+        start_new_sessions=start_new_sessions,
     )
 
 
@@ -263,9 +281,10 @@ def resolve_attended_model(
     channel_provider = str(get("channel_provider", "") or "")
     default_reasoning = _effort_label(get("default_reasoning"))
     now_value = time.time() if now is None else float(now)
-    active = cfg.enabled and is_active(
+    new_session = bool(get("new_session", False)) and cfg.start_new_sessions
+    active = cfg.enabled and (new_session or is_active(
         get("last_user_activity_at"), now=now_value, idle_revert_minutes=cfg.idle_revert_minutes
-    )
+    ))
 
     explicit_model = (
         get("once_model") or get("session_model") or
@@ -299,6 +318,7 @@ def resolve_attended_model(
         )
         return AttendedResolution(
             model, provider, effort, "attended", True, idle_model=channel_model or default_model,
+            new_session=new_session,
         )
 
     return AttendedResolution(

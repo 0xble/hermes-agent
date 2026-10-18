@@ -2,7 +2,7 @@
 
 ## Required behavior
 
-When `model.attended` is configured, genuine user activity in a topic may route the next gateway request to the attended model and reasoning effort until the configured idle window expires. Relays, wakeups, reactions, edits, and internal messages do not reset the user-activity clock. Explicit session and one-turn model choices retain their precedence.
+When `model.attended` is configured, genuine user activity in a topic may route the next gateway request to the attended model and reasoning effort until the configured idle window expires. New sessions start on the attended model by default when `model.attended.start_new_sessions` is true; their first route is silent. Relays, wakeups, reactions, edits, and internal messages do not reset the user-activity clock. Explicit session and one-turn model choices retain their precedence. Idle expiry emits one back-to-default status line on the request that switches routes.
 
 When the attended configuration is unset or disabled, all attended activity tracking, route resolution, notices, compaction, and model-switch hooks are no-ops. Existing gateway call shapes and default model behavior remain unchanged.
 
@@ -41,13 +41,12 @@ limited to a configured owner's direct message; group messages are denied.
 
 The attended switch-in card is rendered by one helper in
 `gateway/attended_model.py` as a single sentence-style line, like the `/fast`
-expiry notice. It names the idle-return model because switching back is silent,
-and leads with the `⇄` symbol because Hermes' gear icon already means
-tool-progress settings. For example, with a `gpt-6.1-sol` default and a 15
-minute window:
+expiry notice. A fresh session starts attended without a switch-in card. Idle
+expiry emits a separate back-to-default line and leads with the `⇄` symbol.
+For example, with a `gpt-6.1-sol` default and a 15 minute window:
 
 ```text
-⇄ Switched to Opus 5.5 while you're active. Back to GPT-6.1 Sol after 15m idle.
+⇄ Back to GPT-6.1 Sol after 15m idle.
 ```
 
 ## Provenance and patch
