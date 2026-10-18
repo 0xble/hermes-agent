@@ -68,6 +68,32 @@ def test_health_preserves_same_lane_epoch_and_increments_on_new_lane(state_path)
     assert third.expires_at >= second.expires_at
 
 
+def test_malformed_persisted_epoch_fails_open(state_path):
+    identity = _identity()
+    health.mark_unhealthy(identity, ttl=30, reason="rate limit")
+    raw_key = health._record_key(identity.as_key())
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["routes"][raw_key]["epoch"] = "oops"
+    state["routes"][raw_key]["notice_epoch"] = -1
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    record = health.mark_unhealthy(identity, ttl=30, reason="rate limit")
+
+    assert record is not None
+    assert record.epoch == 0
+    assert health.claim_notice(identity) is True
+
+
+def test_expired_record_notice_is_claimed_once(state_path, monkeypatch):
+    identity = _identity()
+    now = [100.0]
+    monkeypatch.setattr(health.time, "time", lambda: now[0])
+    health.mark_unhealthy(identity, ttl=0, reason="rate limit")
+
+    assert health.claim_notice(identity) is True
+    assert health.claim_notice(identity) is False
+
+
 def test_corrupt_state_is_quarantined_without_pinning_route(state_path):
     state_path.parent.mkdir(parents=True)
     state_path.write_text("not-json", encoding="utf-8")

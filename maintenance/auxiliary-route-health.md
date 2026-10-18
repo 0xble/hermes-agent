@@ -4,7 +4,7 @@ Load this unit when changing auxiliary unhealthy-route marking, recovery probes,
 
 ## Required behavior
 
-Auxiliary callers in one Hermes home share typed route health through `$HERMES_HOME/state/auxiliary_route_health.json`. A route is identified by home, provider label, normalized endpoint, and model. Custom routes are scoped by their concrete endpoint, so one depleted custom endpoint never hides another. Known providers stay provider-wide, so a failure recorded against the client URL is seen by the discovery, api-key and fallback walks that check without one.
+Auxiliary callers in one Hermes home share typed route health through `$HERMES_HOME/state/auxiliary_route_health.json`. A route is identified by home, provider label, normalized endpoint, and model. The client must pass that full identity through every mark, read, skip, notice, recovery, and clear path. Custom routes are scoped by their concrete endpoint, so one depleted custom endpoint never hides another. Known providers stay provider-wide, so a failure recorded against the client URL is seen by the discovery, api-key and fallback walks that check without one.
 
 Each record carries a lane (`auth`, `quota`, `rate_limit`, `endpoint_outage`, `model`), an expiry, and an epoch. Rate limits, connection errors and garbled responses use the short candidate hold; payment and auth failures keep the long default. Parser and malformed-response failures are never shared, but still quarantine locally so the ordered fallback walk advances. Writes hold an exclusive file lock and use atomic replacement with mode `0600`. Unreadable state is quarantined to a `.corrupt-*` file instead of pinning a route.
 

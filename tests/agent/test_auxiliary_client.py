@@ -132,6 +132,15 @@ def test_known_provider_failure_on_client_url_is_seen_by_provider_wide_walks():
     assert aux._is_provider_unhealthy("openrouter", aux._custom_health_base_url("openrouter")) is True
 
 
+def test_model_scoped_failure_does_not_hide_sibling_model():
+    aux._mark_provider_unhealthy(
+        "custom", base_url="https://example.test/v1", model="model-a", reason="rate limit",
+    )
+
+    assert aux._is_provider_unhealthy("custom", "https://example.test/v1", "model-a") is True
+    assert aux._is_provider_unhealthy("custom", "https://example.test/v1", "model-b") is False
+
+
 def test_unshared_failure_still_quarantines_locally():
     aux._mark_provider_unhealthy("nous", ttl=60, reason="invalid provider response")
 
@@ -4788,8 +4797,8 @@ class TestAuxUnhealthyCache:
             )
 
         assert result is None
-        assert _is_provider_unhealthy("custom", hosted_url) is True
-        assert _is_provider_unhealthy("custom", local_url) is False
+        assert _is_provider_unhealthy("custom", hosted_url, "hosted-model") is True
+        assert _is_provider_unhealthy("custom", local_url, "local-model") is False
 
 
 # ── auxiliary_max_tokens_param ──────────────────────────────────────────────

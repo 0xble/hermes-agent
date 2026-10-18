@@ -145,6 +145,13 @@ def _shareable_failure_reason(reason: Optional[str]) -> bool:
     return "invalid provider response" not in lowered and "malformed" not in lowered
 
 
+def _raw_epoch(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _raw_expiry(value: Any, now: float) -> Optional[float]:
     try:
         expiry = float(value)
@@ -262,7 +269,7 @@ def read_health(identity: AuxiliaryRouteIdentity) -> Optional[AuxiliaryHealthRec
             return None
         try:
             lane = AuxiliaryHealthLane(str(raw.get("lane")))
-            epoch = int(raw.get("epoch", 1))
+            epoch = _raw_epoch(raw.get("epoch", 1), default=1)
         except (ValueError, TypeError):
             return None
         return AuxiliaryHealthRecord(expiry, lane, str(raw.get("reason") or ""), epoch)
@@ -282,7 +289,7 @@ def mark_unhealthy(
         previous = state["routes"].get(raw_key)
         previous_expiry = _finite_expiry(previous.get("expires_at"), now) if isinstance(previous, dict) else None
         previous_lane = str(previous.get("lane")) if isinstance(previous, dict) else ""
-        previous_epoch = int(previous.get("epoch", 0)) if isinstance(previous, dict) else 0
+        previous_epoch = _raw_epoch(previous.get("epoch", 0)) if isinstance(previous, dict) else 0
         epoch = previous_epoch if previous_expiry and previous_lane == lane else previous_epoch + 1
         expiry = max(expiry, previous_expiry or 0.0)
         record = {
@@ -331,16 +338,24 @@ def claim_probe(identity: AuxiliaryRouteIdentity, *, ttl: float = _PROBE_CLAIM_S
         return True
 
 
-def claim_notice(identity: AuxiliaryRouteIdentity, epoch: int) -> bool:
-    """Atomically claim one generic notice for a route health epoch."""
+def claim_notice(identity: AuxiliaryRouteIdentity, epoch: Optional[int] = None) -> bool:
+    """Atomically claim one generic notice for a route health epoch.
+
+    When *epoch* is omitted, claim the current persisted epoch even after expiry. The
+    recovery probe keeps that record around long enough for concurrent callers to
+    deduplicate their skip notices before the route is cleared.
+    """
     with _locked_state() as (path, state):
         raw_key = _record_key(identity.as_key())
         record = state["routes"].get(raw_key)
-        if not isinstance(record, dict) or int(record.get("epoch", 0)) != int(epoch):
+        if not isinstance(record, dict):
             return False
-        if int(record.get("notice_epoch", 0)) == int(epoch):
+        current_epoch = _raw_epoch(record.get("epoch", 0))
+        if epoch is not None and current_epoch != _raw_epoch(epoch, default=-1):
             return False
-        record["notice_epoch"] = int(epoch)
+        if _raw_epoch(record.get("notice_epoch", 0)) == current_epoch:
+            return False
+        record["notice_epoch"] = current_epoch
         state["routes"][raw_key] = record
         _write_state(path, state)
         return True
