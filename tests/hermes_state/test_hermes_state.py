@@ -32,13 +32,6 @@ def _activity_snapshot(db, session_id):
     )
 
 
-@pytest.fixture(autouse=True)
-def _open_auto_maintenance_window(monkeypatch):
-    import hermes_cli.maintenance_window
-
-    monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: True)
-
-
 class _NoFtsCursor(sqlite3.Cursor):
     """Simulate a SQLite build without the fts5 module."""
 

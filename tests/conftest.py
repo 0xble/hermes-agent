@@ -48,6 +48,14 @@ def _isolate_camofox_leases(tmp_path, monkeypatch):
         leases._local_claims.clear()
 
 
+@pytest.fixture(autouse=True)
+def _open_auto_maintenance_window(monkeypatch):
+    """Keep auto-maintenance tests deterministic regardless of the wall clock."""
+    import hermes_cli.maintenance_window
+
+    monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: True)
+
+
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
