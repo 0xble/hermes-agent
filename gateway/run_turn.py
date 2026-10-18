@@ -2617,7 +2617,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             from hermes_cli.goal_turn_outcome import model_final_response
             event._agent_final_response = model_final_response(agent_result)
         from gateway.cron_review import private_turn_response
-        private, captured_response = private_turn_response(event, agent_result)
+        private, captured_response = private_turn_response(event, agent_result, response)
         if private:
             return captured_response
         from gateway.response_filters import strip_trailing_loop_complete_marker

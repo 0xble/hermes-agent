@@ -1955,6 +1955,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
+    "keep_pinned_lane": bool,
     "review": normalize_review,
     "interpreter": _normalize_job_optional_text,
     "hard_wall_timeout_seconds": normalize_hard_wall_timeout,
@@ -1970,6 +1971,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "reasoning_effort": _normalize_reasoning_effort,
     "review": normalize_review,
     "hard_wall_timeout_seconds": normalize_hard_wall_timeout,
+    "keep_pinned_lane": bool,
 }
 
 
@@ -2038,6 +2040,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
+    keep_pinned_lane: bool = False,
     review: Optional[Dict[str, Any]] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
@@ -2146,6 +2149,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
+        ("keep_pinned_lane", bool(keep_pinned_lane)),
         ("review", f["review"]), ("output_local_only", True if f["review"] else None),
         ("interpreter", f["interpreter"]),
         ("hard_wall_timeout_seconds", f["hard_wall_timeout_seconds"]),

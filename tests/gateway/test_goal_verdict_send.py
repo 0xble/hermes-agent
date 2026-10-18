@@ -152,9 +152,8 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
         )
         await _drain_until(lambda: adapter.sends and adapter._pending_messages)
 
-    # Status line sent back
-    assert len(adapter.sends) == 1
-    assert "Continuing toward goal" in adapter.sends[0]["content"]
+    # Routine continuing status is log-only; the continuation still proceeds through the FIFO.
+    assert adapter.sends == []
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
 
@@ -356,7 +355,8 @@ async def test_parked_goal_notice_is_deduplicated_and_persisted(hermes_home):
         session_entry=session_entry, source=src, final_response="same result",
     )
 
-    assert len(adapter.callback_registrations) == 1
+    # Parked/wait-age status is durable bookkeeping only, never a chat send.
+    assert adapter.callback_registrations == []
     restored = GoalManager(session_entry.session_id)
     assert restored.state.last_wait_notice_key
 
@@ -364,4 +364,4 @@ async def test_parked_goal_notice_is_deduplicated_and_persisted(hermes_home):
     await runner._post_turn_goal_continuation(
         session_entry=session_entry, source=src, final_response="changed wait",
     )
-    assert len(adapter.callback_registrations) == 2
+    assert adapter.callback_registrations == []

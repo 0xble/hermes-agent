@@ -595,6 +595,66 @@ class TestRegisteredHandlerForwardsAttachToSession:
         assert "attach_to_session" not in formatted
 
 
+class TestRegisteredHandlerForwardsKeepPinnedLane:
+    """The agent-facing cron tool must expose and persist the lane-converter opt-out."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_schema_describes_keep_pinned_lane(self):
+        from tools.cronjob_tools import CRONJOB_SCHEMA
+
+        field = CRONJOB_SCHEMA["parameters"]["properties"]["keep_pinned_lane"]
+        assert field["type"] == "boolean"
+        assert "user asked for this job's output in a specific chat or topic" in field["description"]
+
+    def test_create_and_update_persist_keep_pinned_lane(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(registry.dispatch(
+            "cronjob_manage",
+            {
+                "action": "create",
+                "name": "pinned lane canary",
+                "schedule": "1h",
+                "deliver": "telegram:-100123:456",
+                "keep_pinned_lane": True,
+                "prompt": "Reply exactly: canary",
+            },
+        ))
+        assert created["success"] is True, created
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["keep_pinned_lane"] is True
+        assert json.loads(registry.dispatch("cronjob_manage", {"action": "list"}))["jobs"][0]["keep_pinned_lane"] is True
+
+        updated = json.loads(registry.dispatch(
+            "cronjob_manage",
+            {"action": "update", "job_id": created["job_id"], "keep_pinned_lane": False},
+        ))
+        assert updated["success"] is True, updated
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["keep_pinned_lane"] is False
+
+    def test_create_defaults_keep_pinned_lane_to_false(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(registry.dispatch(
+            "cronjob_manage",
+            {"action": "create", "schedule": "1h", "prompt": "default"},
+        ))
+        assert created["success"] is True, created
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["keep_pinned_lane"] is False
+
+
 class TestLocalDeliveryNotice:
     """#51568 — TUI/CLI cron jobs are local-only; surface that at create time
     so the agent doesn't promise a delivery that never happens."""
