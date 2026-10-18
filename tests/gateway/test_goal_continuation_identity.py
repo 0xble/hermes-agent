@@ -225,6 +225,24 @@ async def test_goal_continuation_rebinds_to_compression_child_after_rotation(sta
 
     assert refresh_goal_continuation(event, "compression-child") == event.text
     assert event.metadata["goal_continuation_session_id"] == "compression-child"
+    child_goal = GoalManager("compression-child")
+    dispatched_at = child_goal.state.last_automatic_continuation_at + 1.0
+    assert child_goal.mark_automatic_continuation_dispatched(dispatched_at=dispatched_at)
+    assert GoalManager("compression-child").state.last_automatic_continuation_at == dispatched_at
+
+
+def test_dispatch_anchor_rejects_replaced_goal(state):
+    from hermes_cli.goals import GoalManager
+
+    manager = GoalManager("target")
+    manager.set("old objective")
+    old_instance = manager.state.created_at
+    manager.clear()
+    manager.set("replacement objective")
+
+    live = GoalManager("target")
+    assert not live.mark_automatic_continuation_dispatched(expected_instance=old_instance)
+    assert GoalManager("target").state.last_automatic_continuation_at == 0.0
 
 
 @pytest.mark.asyncio

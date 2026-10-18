@@ -283,6 +283,7 @@ def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> None:
     if not (prompt := mgr.lifted_barrier_prompt()):
         return
     since = mgr.state.waiting_since
+    instance = mgr.state.created_at
     if not _notif_claim_turn(session):
         return  # busy: the running turn's judge re-evaluates the barrier
     started = False
@@ -291,6 +292,7 @@ def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> None:
     except Exception as exc:
         _notif_log_failure("goal resume dispatch failed", exc)
     if started:
+        mgr.mark_automatic_continuation_dispatched(expected_instance=instance)
         mgr.clear_lifted_wait(since)
     else:
         _notif_release_turn(session)

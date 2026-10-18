@@ -204,7 +204,7 @@ async def test_successive_automatic_continuations_obey_hard_gap_floor(hermes_hom
 
 @pytest.mark.asyncio
 async def test_idle_ticker_releases_ladder_hold_once_and_silently(hermes_home, monkeypatch):
-    runner, adapter, entry, src = _goal_runner()
+    runner, adapter, entry, _src = _goal_runner()
     clock = [20_000.0]
     monkeypatch.setattr(goals.time, "time", lambda: clock[0])
     mgr = goals.GoalManager(entry.session_id, min_continuation_gap_seconds=900)
@@ -222,6 +222,7 @@ async def test_idle_ticker_releases_ladder_hold_once_and_silently(hermes_home, m
     assert len(adapter.handled) == 1 and adapter.handled[0].text.startswith("[Continuing toward your standing goal]")
     state = goals.load_goal(entry.session_id)
     assert state.status == "active" and state.waiting_until == 0
+    assert state.last_automatic_continuation_at == pytest.approx(clock[0])
     assert adapter.sends == []  # no "wait ended" notice for routine pacing
 
     await runner._goal_wakeup_fire_one(entry.session_id)
