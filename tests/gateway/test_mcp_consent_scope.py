@@ -36,7 +36,8 @@ def test_gateway_scope_reaches_telegram_and_controls_resolution(monkeypatch, one
     # The gateway test harness may stub the optional Telegram SDK. Keep its
     # value objects observable while exercising the real adapter and callbacks.
     monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardButton",
-                        lambda text, callback_data: SimpleNamespace(text=text, callback_data=callback_data))
+                        lambda text, callback_data, **kwargs: SimpleNamespace(
+                            text=text, callback_data=callback_data, style=kwargs.get("style")))
     monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
                         lambda rows: SimpleNamespace(inline_keyboard=rows))
     adapter: Any = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra={}))
