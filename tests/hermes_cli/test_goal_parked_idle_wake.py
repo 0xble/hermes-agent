@@ -248,6 +248,69 @@ def test_finished_session_at_wait_time_falls_back_to_automatic_floor(hermes_home
     assert mgr.lifted_barrier_prompt() is not None
 
 
+def test_dead_pid_judge_wait_falls_back_to_automatic_floor(hermes_home, monkeypatch):
+    """A dead PID named by WAIT is stale state, not an immediate event wake."""
+    clock = [30_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    monkeypatch.setattr(goals, "_pid_alive", lambda _pid: False)
+    mgr = goals.GoalManager("s-dead-pid")
+    mgr.set("ship the nightly check")
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = clock[0]
+    mgr._save()
+
+    decision = mgr._apply_wait_directive(
+        {"pid": 4242}, "nightly verification running", automatic=True, min_seconds=900,
+    )
+
+    assert decision is not None and decision["verdict"] == "wait"
+    assert mgr.state is not None and mgr.state.waiting_until == clock[0] + 900
+    assert mgr.lifted_barrier_prompt() is None
+    clock[0] += 900
+    assert mgr.lifted_barrier_prompt() is not None
+
+
+def test_live_pid_finishing_after_wait_time_still_lifts_immediately(hermes_home, monkeypatch):
+    """A PID live when parked remains an immediate event wake when it exits later."""
+    live = [True]
+    monkeypatch.setattr(goals, "_pid_alive", lambda _pid: live[0])
+    mgr = goals.GoalManager("s-live-pid-then-exit")
+    mgr.set("ship the nightly check")
+    mgr.wait_on(4242, reason="nightly verification running")
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = time.time()
+    mgr._save()
+    live[0] = False
+
+    assert mgr.state.waiting_on_pid_live_at_park is True
+    assert mgr.lifted_barrier_prompt() is not None
+
+
+def test_legacy_session_wait_without_liveness_uses_automatic_floor(hermes_home, monkeypatch):
+    """Rows written before the liveness marker existed fail closed to the automatic floor."""
+    proc = "proc_legacy_finished"
+    _write_receipt(hermes_home, proc, exit_code=1, completion_reason="exited", termination_source="")
+    clock = [40_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = _park_on_session("s-legacy-floor", proc)
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = clock[0]
+    mgr._save()
+
+    db = goals._get_session_db()
+    assert db is not None
+    raw = db.get_meta(goals._meta_key("s-legacy-floor"))
+    payload = json.loads(raw)
+    payload.pop("waiting_on_session_live_at_park", None)
+    db.set_meta(goals._meta_key("s-legacy-floor"), json.dumps(payload))
+    reloaded = goals.GoalManager("s-legacy-floor")
+
+    assert reloaded.state is not None and reloaded.state.waiting_on_session_live_at_park is None
+    assert reloaded.lifted_barrier_prompt() is None
+    clock[0] += 900
+    assert reloaded.lifted_barrier_prompt() is not None
+
+
 def test_session_finishing_after_wait_time_still_lifts_immediately(hermes_home, monkeypatch):
     """A live target that exits after parking remains an immediate event wake."""
     live = [True]

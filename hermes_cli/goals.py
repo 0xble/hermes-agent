@@ -1053,6 +1053,9 @@ class GoalState:
     # should_continue=False without burning a turn; cleared lazily when satisfied or by unwait/pause/
     # resume/clear. Defaults empty so old state_meta rows load unchanged.
     waiting_on_pid: Optional[int] = None
+    # Whether a PID target was live when this barrier was set. A target that was already
+    # finished (or unknown) is stale state, not a fresh event wake when observed by an idle surface.
+    waiting_on_pid_live_at_park: Optional[bool] = None
     waiting_on_session: Optional[str] = None
     # Whether a session target was live when this barrier was set. A target that was already
     # finished (or unknown) is stale state, not a fresh event wake when observed by an idle surface.
@@ -1113,6 +1116,10 @@ class GoalState:
             paused_reason=data.get("paused_reason"),
             subgoals=contract_items("subgoals", raw_subgoals),
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
+            waiting_on_pid_live_at_park=(
+                bool(data["waiting_on_pid_live_at_park"])
+                if data.get("waiting_on_pid_live_at_park") is not None else None
+            ),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_on_session_live_at_park=(
                 bool(data["waiting_on_session_live_at_park"])
@@ -1169,6 +1176,7 @@ class GoalState:
 
     def clear_wait(self, *, preserve_notice_key: bool = False) -> None:
         self.waiting_on_pid = None
+        self.waiting_on_pid_live_at_park = None
         self.waiting_on_session = None
         self.waiting_on_session_live_at_park = None
         self.waiting_on_user_message = False
@@ -3128,6 +3136,8 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
             state.clear_wait(preserve_notice_key=True)
             for k, v in barrier.items():
                 setattr(state, k, v)
+            if state.waiting_on_pid is not None:
+                state.waiting_on_pid_live_at_park = _pid_alive(state.waiting_on_pid)
             if state.waiting_on_session is not None:
                 state.waiting_on_session_live_at_park = _session_waiting(state.waiting_on_session)
             state.waiting_reason = (reason or "").strip() or None
@@ -3345,7 +3355,11 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
             elif self.automatic_continuation_floor_remaining() > 0:
                 return None
         if state is not None and state.waiting_on_session \
-                and state.waiting_on_session_live_at_park is False \
+                and state.waiting_on_session_live_at_park is not True \
+                and self.automatic_continuation_floor_remaining() > 0:
+            return None
+        if state is not None and state.waiting_on_pid \
+                and state.waiting_on_pid_live_at_park is not True \
                 and self.automatic_continuation_floor_remaining() > 0:
             return None
         if self._state.waiting_on_session and _completion_notice_pending(self._state.waiting_on_session):
@@ -3437,9 +3451,15 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
                 # A remote or already-exited pid is a barrier this host can never observe lifting
                 # (#110826): the judge sees the same pid next turn and would re-park forever.
                 # Catching wait_on's own liveness check (rather than probing first) closes the
-                # window where the pid exits between a pre-check and the park.
-                logger.info("goal judge: wait_on_pid %s is not alive on this host; continuing", pid)
-                return None
+                # window where the pid exits between a pre-check and the park. Treat it as stale
+                # state, not a fresh event, and use the same automatic floor as other stale waits.
+                floor = max(float(self.min_continuation_gap_seconds), float(DEFAULT_MIN_CONTINUATION_GAP_SECONDS))
+                previous = float(state.last_automatic_continuation_at or 0.0)
+                remaining = floor - (time.time() - previous) if previous else floor
+                seconds = max(1, math.ceil(remaining))
+                logger.info("goal judge: wait_on_pid %s is not alive on this host; using %ss floor wait", pid, seconds)
+                self.wait_for_seconds(seconds, reason=reason)
+                tgt = f"pid {pid} (stale; {seconds}s floor)"
         elif wait_directive.get("until"):
             raw_until = wait_directive["until"]
             until = _parse_wait_until(raw_until) if isinstance(raw_until, str) else float(raw_until)
