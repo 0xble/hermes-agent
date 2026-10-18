@@ -22,7 +22,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from agent.i18n import t
 from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import canonicalize_replay_history
-from gateway.attended_model import format_attended_switch_notice
+from gateway.attended_model import (
+    format_attended_switch_back_notice, format_attended_switch_notice, parse_attended_config,
+)
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
@@ -1365,7 +1367,6 @@ class TurnRunner:
 
     def _compact_before_attended_switch(self, agent, loop_state, *, model, runtime) -> None:
         """Compact the live turn before a route switch when either window requires it."""
-        from gateway.attended_model import parse_attended_config
         from agent.model_metadata import estimate_request_tokens_rough, get_model_context_length
 
         cfg = parse_attended_config(self._ctx.user_config or {})
@@ -1439,6 +1440,7 @@ class TurnRunner:
             )
             if decision is None:
                 return
+            previous_decision = getattr(agent, "_gateway_attended_decision", None)
             agent._gateway_attended_decision = decision
             desired_key = decision.decision_key
             previous_key = getattr(agent, "_gateway_attended_decision_key", None)
@@ -1486,11 +1488,26 @@ class TurnRunner:
                 else:
                     route_state = runner._session_state(ctx.session_key)
                     route_state.conversation.last_resolved_model = model
-            if decision.reason == "attended" and not unavailable_emitted and not (previous_key and previous_key[-1]):
+            if (
+                decision.reason == "default"
+                and previous_decision is not None
+                and previous_decision.reason == "attended"
+                and previous_decision.active
+                and previous_decision.idle_model
+                and previous_decision.idle_model != previous_decision.model
+                and previous_key
+                and previous_key[-1]
+                and not unavailable_emitted
+            ):
+                emit_status = getattr(agent, "_emit_diagnostic_status", None)
+                if callable(emit_status):
+                    emit_status(format_attended_switch_back_notice(
+                        model, parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
+                    ))
+            elif decision.reason == "attended" and not unavailable_emitted and not (previous_key and previous_key[-1]):
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
                 emit_status = getattr(agent, "_emit_diagnostic_status", None)
                 if callable(emit_status):
-                    from gateway.attended_model import parse_attended_config
                     emit_status(format_attended_switch_notice(
                         model, effort, idle_model=decision.idle_model,
                         idle_minutes=parse_attended_config(ctx.user_config or {}).idle_revert_minutes,

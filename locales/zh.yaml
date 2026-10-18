@@ -53,6 +53,7 @@ gateway:
     switched: "已切换模型为 `{model}`"
     attended_switched: "⇄ Switched to {model} while you're active."
     attended_switched_until_idle: "⇄ Switched to {model} while you're active. Back to {idle_model} after {minutes}m idle."
+    attended_switched_back_idle: "⇄ Back to {idle_model} after {minutes}m idle."
     provider_label: "提供方：{provider}"
     context_label: "上下文：{tokens} tokens"
     max_output_label: "最大输出：{tokens} tokens"

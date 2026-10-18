@@ -72,6 +72,36 @@ def test_mid_turn_activation_switches_once_and_posts_one_notice():
     assert state.conversation.last_resolved_model == "opus"
 
 
+def test_mid_turn_idle_expiry_switches_back_once_with_one_notice():
+    previous = AttendedResolution(
+        "claude-opus-5-5", "anthropic", "medium", "attended", True, idle_model="gpt-6.1-sol",
+    )
+    decision = AttendedResolution("gpt-6.1-sol", "nous", "xhigh", "default", False)
+    turn, _, state = _runner(
+        decision, runtime=("gpt-6.1-sol", {"provider": "nous", "api_mode": "codex_responses"}),
+    )
+    notices = []
+    agent = SimpleNamespace(
+        model="claude-opus-5-5", provider="anthropic", api_mode="anthropic_messages",
+        _gateway_attended_decision=previous,
+        _gateway_attended_decision_key=previous.decision_key,
+        _fallback_activated=False, _provider_fallback_active=False,
+        reasoning_config={"enabled": True, "effort": "medium"},
+        _emit_diagnostic_status=notices.append,
+        context_compressor=None,
+    )
+
+    with patch("agent.agent_runtime_helpers.switch_model") as switch:
+        turn._apply_attended_before_api_call(agent)
+        turn._apply_attended_before_api_call(agent)
+
+    switch.assert_called_once_with(
+        agent, "gpt-6.1-sol", "nous", "", "", "codex_responses", None,
+    )
+    assert notices == ["⇄ Back to GPT-6.1 Sol after 15m idle."]
+    assert state.conversation.last_resolved_model == "gpt-6.1-sol"
+
+
 def test_compaction_reanchors_current_user_index():
     from unittest.mock import patch
 

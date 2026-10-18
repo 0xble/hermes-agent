@@ -1616,10 +1616,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         try:
             from gateway.run import _load_gateway_config
             from gateway.attended_model import parse_attended_config
-            enabled = await asyncio.to_thread(
-                lambda: parse_attended_config(_load_gateway_config()).enabled,
+            attended_cfg = await asyncio.to_thread(
+                lambda: parse_attended_config(_load_gateway_config()),
             )
-            if not enabled:
+            if not attended_cfg.enabled:
                 return False
             if not session_key:
                 session_key = self._session_key_for_source(source)
@@ -1628,9 +1628,17 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             entry = await self.async_session_store.lookup_by_session_key(session_key)
             if entry is None:
                 return False
+            state = self._session_state(session_key)
+            if attended_cfg.start_new_sessions and (
+                getattr(entry, "created_at", None) == getattr(entry, "updated_at", None)
+                or getattr(entry, "is_fresh_reset", False)
+                or getattr(state.conversation, "attended_new_session", False)
+            ):
+                # Preserve the creation boundary before mark_user_activity updates updated_at.
+                state.conversation.attended_new_session = True
             await self.async_session_store.mark_user_activity(entry.session_key)
             stamp = time.time()
-            self._session_state(session_key).conversation.last_user_activity_at = stamp
+            state.conversation.last_user_activity_at = stamp
             return True
         except Exception:
             logger.debug("attended-model activity stamp failed", exc_info=True)
@@ -1797,6 +1805,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            with suppress(Exception):
+                self._session_state(_quick_key).conversation.attended_new_session = False
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
             # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
