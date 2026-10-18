@@ -2759,6 +2759,8 @@
                     "local_changes_blocked",
                     "local_changes_parked",
                     "lock_held",
+                    "main_drop",
+                    "main_drop_check",
                     "managed_install",
                     "merge_conflict",
                     "none",
