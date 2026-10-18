@@ -102,6 +102,51 @@ def test_tagless_channel_check_apply_is_pinned_not_branch_tip(source, monkeypatc
     assert saved(source)["channel"] == name
 
 
+def test_main_drop_guard_runs_after_fetch_before_checkout_and_skips_release_targets(source, monkeypatch):
+    events = []
+    real_guard = update_cmd._guard_against_main_drop
+    from hermes_cli import gitlock
+    real_fetch = gitlock.fetch_with_partial_clone_recovery
+
+    def fetch(*args, **kwargs):
+        events.append("fetch")
+        return real_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(gitlock, "fetch_with_partial_clone_recovery", fetch)
+    monkeypatch.setattr(update_cmd._check, "select_apply_target",
+                        lambda *args, **kwargs: ("origin/main", None, False, None))
+    monkeypatch.setattr(update_cmd, "_guard_against_main_drop",
+                        lambda *args, **kwargs: events.append("guard"))
+    monkeypatch.setattr(update_cmd, "_current_branch_name", lambda *args, **kwargs: "main")
+    monkeypatch.setattr(update_cmd._commit, "record_run_start", lambda *args: None)
+    monkeypatch.setattr(update_cmd, "_refuse_before_commit_point", lambda *args: None)
+
+    def checkout(*args, **kwargs):
+        events.append("checkout")
+        raise RuntimeError("checkout reached")
+
+    monkeypatch.setattr(update_cmd, "_prepare_checkout_for_update", checkout)
+    args = source.parser.parse_args(["update", "--yes"])
+    with pytest.raises(RuntimeError, match="checkout reached"):
+        update_cmd._cmd_update_impl(args, False)
+    assert events == ["fetch", "guard", "checkout"]
+
+    events.clear()
+    monkeypatch.setattr(update_cmd._check, "select_apply_target",
+                        lambda *args, **kwargs: (source.commits[1], source.commits[1], False, None))
+    with pytest.raises(RuntimeError, match="checkout reached"):
+        update_cmd._cmd_update_impl(args, False)
+    assert events == ["fetch", "checkout"]
+
+    events.clear()
+    monkeypatch.setattr(update_cmd, "_guard_against_main_drop", real_guard)
+    monkeypatch.setattr(update_cmd._check, "select_apply_target",
+                        lambda *args, **kwargs: ("origin/main", None, True, None))
+    with pytest.raises(RuntimeError, match="checkout reached"):
+        update_cmd._cmd_update_impl(args, False)
+    assert events == ["fetch", "checkout"]
+
+
 @pytest.mark.parametrize("outcome", ["success", "failed", "concurrent", "transient", "already-current"])
 def test_retirement_adopts_destination_only_after_success(source, monkeypatch, outcome):
     name = "preview-retiring"

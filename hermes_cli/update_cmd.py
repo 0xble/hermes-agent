@@ -35,7 +35,7 @@ from hermes_cli import update_cmd_commit as _commit
 from hermes_cli import update_cmd_posix_pause as _posix_pause
 from hermes_cli.update_cmd_pause_gate import _checkout_move, _moves_for
 from hermes_cli import update_cmd_check as _check
-from hermes_cli.forward_only_guard import (  # noqa: F401
+from hermes_cli.forward_only_guard import (
     leftover_forward_only_state, refuse_if_forward_only_leftovers,
 )
 
@@ -507,8 +507,8 @@ def _heal_stale_shallow_checkout(repo_root: Path, branch: str) -> None:
         print(f"  ⚠ Could not fetch the missing commit history ({detail[0]}); a very stale install may time out")
 
 
-def _capture_head_sha(git_cmd, cwd) -> str | None:
-    """Return the current HEAD SHA, or None if it can't be resolved."""
+def _read_head_sha(git_cmd, cwd) -> str | None:
+    """Read a checkout's current HEAD without applying rescue-specific hooks."""
     try:
         from hermes_cli.update_custody import run_git
 
@@ -524,8 +524,86 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
         return None
 
 
-# Files that define the editable install. A pull that touches none of them
-# cannot have invalidated it.
+def _capture_head_sha(git_cmd, cwd) -> str | None:
+    """Return the current HEAD SHA for the pre-update rescue path, or None if unresolved."""
+    return _read_head_sha(git_cmd, cwd)
+
+
+def _live_release_sha(git_cmd) -> str | None:
+    """Return the revision currently serving Hermes before this update moves anything."""
+    with suppress(Exception):
+        from hermes_cli.immutable_releases import resolved_release
+        release = resolved_release(get_hermes_home())
+        if release is not None and re.fullmatch(r"[0-9a-fA-F]{40}", release.name):
+            return release.name
+    head = _read_head_sha(git_cmd, _m().PROJECT_ROOT)
+    if head:
+        return head
+    return None
+
+
+def _guard_against_main_drop(
+    args, git_cmd, target_ref: str, *, target_is_head: bool, skip: bool = False, resume_gateways=None,
+) -> None:
+    """Refuse a target that would remove live commits already contained by origin/main."""
+    def resume() -> None:
+        if resume_gateways is not None:
+            with suppress(Exception):
+                resume_gateways()
+
+    if skip or target_is_head:
+        return  # Release channels have their own forward/rollback admission contract.
+    if getattr(args, "allow_drop_main", False):
+        with suppress(Exception):
+            from hermes_cli.update_receipt import record_fact
+            record_fact("allow_drop_main", True)
+        return
+
+    live_sha = _live_release_sha(git_cmd)
+    if not live_sha:
+        message = "✗ Refusing update: could not determine the currently live release safely. No update was applied."
+        _record_update_step("main_drop_guard", False, message)
+        _record_stop("main_drop_check")
+        with suppress(Exception):
+            from hermes_cli.update_receipt import finalize_update_receipt
+            finalize_update_receipt("refused", stop_reason="main_drop_check")
+        resume()
+        print(message)
+        raise SystemExit(2)
+
+    from hermes_cli.update_main_guard import MainDropCheckError, MainDropCheckSkipped, find_main_drop
+    try:
+        finding = find_main_drop(
+            lambda command, **kwargs: _git_run(git_cmd, command, cwd=_m().PROJECT_ROOT, **kwargs),
+            target_ref,
+            live_sha,
+        )
+    except MainDropCheckSkipped as exc:
+        _record_update_step("main_drop_check_skipped", True, str(exc))
+        return
+    except MainDropCheckError as exc:
+        message = f"✗ Refusing update: could not verify origin/main safely ({exc}). No update was applied."
+        _record_update_step("main_drop_guard", False, message)
+        _record_stop("main_drop_check")
+        with suppress(Exception):
+            from hermes_cli.update_receipt import finalize_update_receipt
+            finalize_update_receipt("refused", stop_reason="main_drop_check")
+        resume()
+        print(message)
+        raise SystemExit(2)
+    if finding is None:
+        return
+
+    message = finding.message
+    _record_update_step("main_drop_guard", False, message)
+    _record_stop("main_drop")
+    with suppress(Exception):
+        from hermes_cli.update_receipt import record_fact, finalize_update_receipt
+        record_fact("main_drop", {"count": finding.count, "commits": [sha for sha, _ in finding.commits]})
+        finalize_update_receipt("refused", stop_reason="main_drop")
+    resume()
+    print(message)
+    raise SystemExit(2)
 
 
 def _validate_python_files_syntax(
@@ -2312,8 +2390,6 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
         _resolve_update_options(args, gateway_mode),
         pre_update_version=payload.get("pre_update_version"))
     had_desktop_app_before_update = bool(payload.get("had_desktop_app_before_update"))
-    desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
-
     try:
         if payload.get("swap") == "immutable":
             from hermes_cli.immutable_releases import ReleasePaths
@@ -2626,6 +2702,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             fetch_args = ["fetch", "--no-tags", "origin", target_ref]
         else:
             fetch_args = ["fetch", "origin", _check.tracking_refspec("origin", branch)]
+            if branch != "main":
+                # A side-branch update must refresh the comparison history too.
+                fetch_args.append("+refs/heads/main:refs/remotes/origin/main")
         from hermes_cli.gitlock import fetch_with_partial_clone_recovery, is_partial_clone_pack_objects_crash
         # Marking the unmarked packs clears the git 2.53+ partial-clone pack-objects crash (#124272).
         if fetch_args is None:
@@ -2643,6 +2722,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _record_stop("git_timeout" if fetch_result.returncode == 124 else "disk_full"
                          if "No space left on device" in (fetch_result.stderr or "") else "fetch_failed")
             sys.exit(1)
+
+        if not isinstance(release_sha, str):
+            _guard_against_main_drop(
+                args, git_cmd, target_ref, target_is_head=target_is_head,
+                resume_gateways=lambda: _resume_windows_gateways_after_update(_windows_gateway_resume),
+            )
 
         if _immutable_release_enabled():
             _apply_fetched_immutable_update(

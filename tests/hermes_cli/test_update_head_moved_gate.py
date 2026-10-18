@@ -35,9 +35,14 @@ def _make_head_moved_side_effect(pre_sha=PRE_SHA, post_sha=POST_SHA):
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
         if "rev-list" in joined:
-            return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
-        if "rev-parse -q --verify" in joined:  # the pull's resolved target
-            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+            # The main-drop guard asks for the raw ancestry list; this fixture
+            # models a target that preserves the live commit. The ordinary
+            # update-plan probe still sees three commits via --count.
+            stdout = "3\n" if "--count" in joined else ""
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if "rev-parse" in joined and "--verify" in joined:  # the pull's target and guard refs
+            sha = pre_sha if pre_sha in joined else post_sha
+            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
         if joined.endswith("rev-parse HEAD"):
             sha = post_sha if state["merged"] else pre_sha
             return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
@@ -55,10 +60,14 @@ def _make_head_pinned_side_effect(sha=PRE_SHA, target_sha=POST_SHA):
             return SimpleNamespace(returncode=0, stdout="HEAD\n", stderr="")
 
         if "rev-list" in joined:
-            return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
-
-        if "rev-parse -q --verify" in joined:  # the pull's resolved target
-            return SimpleNamespace(returncode=0, stdout=f"{target_sha}\n", stderr="")
+            # The main-drop guard asks for the raw ancestry list; this fixture
+            # models a target that preserves the live commit. The ordinary
+            # update-plan probe still sees three commits via --count.
+            stdout = "3\n" if "--count" in joined else ""
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if "rev-parse" in joined and "--verify" in joined:  # the pull's target and guard refs
+            live_ref = sha if sha in joined else target_sha
+            return SimpleNamespace(returncode=0, stdout=f"{live_ref}\n", stderr="")
 
         if joined.endswith("rev-parse HEAD"):
             return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
