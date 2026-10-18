@@ -40,14 +40,14 @@ default route. With slash-admin gating disabled, the fallback authorization is
 limited to a configured owner's direct message; group messages are denied.
 
 The attended switch-in card is rendered by one helper in
-`gateway/attended_model.py`. It follows the native settings-card shape (setting
-icon, bold value) and adds a second line naming the idle-return model, because
-switching back is silent. For example, `claude-opus-5-5` at `high` with a
-`gpt-6-astra` default and a 15 minute window renders as:
+`gateway/attended_model.py` as a single sentence-style line, like the `/fast`
+expiry notice. It names the idle-return model because switching back is silent,
+and leads with the `⇄` symbol because Hermes' gear icon already means
+tool-progress settings. For example, with a `gpt-6.1-sol` default and a 15
+minute window:
 
 ```text
-⚙️ Switched to **Opus 5.5** · high
-Back to GPT-6 Astra after 15m idle
+⇄ Switched to Opus 5.5 while you're active. Back to GPT-6.1 Sol after 15m idle.
 ```
 
 ## Provenance and patch

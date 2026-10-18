@@ -108,15 +108,15 @@ def test_attended_switch_notice_uses_card_style_and_friendly_name():
     assert friendly_model_name("claude-3-opus-20240229") == "3 Opus"
     assert friendly_model_name("gpt-6-astra") == "GPT-6 Astra"
     assert format_attended_switch_notice("claude-opus-5-5", "high") == (
-        "⚙️ Switched to **Opus 5.5** · high"
+        "⇄ Switched to Opus 5.5 while you're active."
     )
     assert format_attended_switch_notice(
-        "claude-opus-5-5", "high", idle_model="gpt-6-astra", idle_minutes=15,
-    ) == "⚙️ Switched to **Opus 5.5** · high\nBack to GPT-6 Astra after 15m idle"
-    # No return line when the idle route is the same model.
+        "claude-opus-5-5", "high", idle_model="gpt-6.1-sol", idle_minutes=15,
+    ) == "⇄ Switched to Opus 5.5 while you're active. Back to GPT-6.1 Sol after 15m idle."
+    # No return clause when the idle route is the same model.
     assert format_attended_switch_notice(
         "claude-opus-5-5", "high", idle_model="claude-opus-5-5", idle_minutes=15,
-    ) == "⚙️ Switched to **Opus 5.5** · high"
+    ) == "⇄ Switched to Opus 5.5 while you're active."
 
 
 def test_attended_resolution_names_idle_return_model():
@@ -230,3 +230,35 @@ def test_two_session_state_inputs_remain_independent():
     active = resolve_attended_model({"last_user_activity_at": 1000}, 1001, cfg)
     idle = resolve_attended_model({"last_user_activity_at": 0}, 1001, cfg)
     assert (active.reason, idle.reason) == ("attended", "default")
+
+
+def test_dict_reasoning_override_resolves_to_effort_label():
+    """Persisted /reasoning picks are dicts; the route must carry the bare effort name."""
+    from hermes_constants import parse_reasoning_effort
+
+    cfg = _cfg(attended={"model": "attended", "provider": "attended-provider", "reasoning_effort": "high"})
+    for scope in ("session_reasoning", "temporary_reasoning", "reasoning_override"):
+        decision = resolve_attended_model(
+            {"default_model": "default", "last_user_activity_at": 1000,
+             scope: {"enabled": True, "effort": "xhigh"}},
+            1001, cfg,
+        )
+        assert decision.reasoning_effort == "xhigh"
+        assert parse_reasoning_effort(decision.reasoning_effort) == {"enabled": True, "effort": "xhigh"}
+    cfg_without_effort = _cfg(attended={"model": "attended", "provider": "attended-provider"})
+    for source in ("default_reasoning", "attended_reasoning", "explicit_model_reasoning"):
+        state = {
+            "default_model": "default", "last_user_activity_at": 1000,
+            source: {"enabled": True, "effort": "xhigh"},
+        }
+        if source == "explicit_model_reasoning":
+            state["once_model"] = "manual"
+        decision = resolve_attended_model(state, 1001, cfg_without_effort)
+        assert decision.reasoning_effort == "xhigh"
+
+    disabled = resolve_attended_model(
+        {"default_model": "default", "last_user_activity_at": 1000,
+         "session_reasoning": {"enabled": False}},
+        1001, cfg,
+    )
+    assert disabled.reasoning_effort == "none"
