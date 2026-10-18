@@ -232,6 +232,58 @@ def test_clear_lifted_wait_respects_a_newer_repark_or_pause(hermes_home, monkeyp
     assert goals.load_goal("s-race").status == "paused"
 
 
+def test_finished_session_at_wait_time_falls_back_to_automatic_floor(hermes_home, monkeypatch):
+    """A stale session target is not a fresh event wake."""
+    proc = "proc_already_finished"
+    _write_receipt(hermes_home, proc, exit_code=1, completion_reason="exited", termination_source="")
+    clock = [10_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = _park_on_session("s-stale-floor", proc)
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = clock[0]
+    mgr._save()
+
+    assert mgr.lifted_barrier_prompt() is None
+    clock[0] += 900
+    assert mgr.lifted_barrier_prompt() is not None
+
+
+def test_session_finishing_after_wait_time_still_lifts_immediately(hermes_home, monkeypatch):
+    """A live target that exits after parking remains an immediate event wake."""
+    live = [True]
+    monkeypatch.setattr(goals, "_session_waiting", lambda _session_id: live[0])
+    mgr = _park_on_session("s-live-then-exit", "proc_live_then_exit")
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = time.time()
+    mgr._save()
+    live[0] = False
+
+    assert mgr.lifted_barrier_prompt() is not None
+
+
+def test_reparking_on_same_finished_session_does_not_loop(hermes_home, monkeypatch):
+    """Re-parking on a finished target stays under the automatic floor."""
+    proc = "proc_repeatedly_finished"
+    _write_receipt(hermes_home, proc, exit_code=1, completion_reason="exited", termination_source="")
+    clock = [20_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = _park_on_session("s-repeated-stale", proc)
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = clock[0]
+    mgr._save()
+
+    assert mgr.lifted_barrier_prompt() is None
+    clock[0] += 900
+    assert mgr.state is not None
+    since = mgr.state.waiting_since
+    assert mgr.lifted_barrier_prompt() is not None
+    assert mgr.clear_lifted_wait(since)
+    mgr.mark_automatic_continuation_dispatched(dispatched_at=clock[0])
+    mgr.wait_on_session(proc, reason="same finished target")
+
+    assert mgr.lifted_barrier_prompt() is None
+
+
 def test_competing_writer_cannot_land_inside_the_clear(hermes_home, monkeypatch):
     """Interleave a second writer exactly between the compare and the write: the clear holds the
     SQLite write lock (BEGIN IMMEDIATE), so the competitor is refused and cannot be overwritten."""

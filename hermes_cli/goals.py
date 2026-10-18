@@ -1054,6 +1054,9 @@ class GoalState:
     # resume/clear. Defaults empty so old state_meta rows load unchanged.
     waiting_on_pid: Optional[int] = None
     waiting_on_session: Optional[str] = None
+    # Whether a session target was live when this barrier was set. A target that was already
+    # finished (or unknown) is stale state, not a fresh event wake when observed by an idle surface.
+    waiting_on_session_live_at_park: Optional[bool] = None
     waiting_on_user_message: bool = False
     waiting_until: float = 0.0
     # Live delegation batches when a timed WAIT was set because of them; the barrier lifts as soon
@@ -1111,6 +1114,10 @@ class GoalState:
             subgoals=contract_items("subgoals", raw_subgoals),
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
+            waiting_on_session_live_at_park=(
+                bool(data["waiting_on_session_live_at_park"])
+                if data.get("waiting_on_session_live_at_park") is not None else None
+            ),
             waiting_on_user_message=bool(data.get("waiting_on_user_message")),
             waiting_reason=data.get("waiting_reason"),
             contract=GoalContract.from_dict(data.get("contract")),
@@ -1163,6 +1170,7 @@ class GoalState:
     def clear_wait(self, *, preserve_notice_key: bool = False) -> None:
         self.waiting_on_pid = None
         self.waiting_on_session = None
+        self.waiting_on_session_live_at_park = None
         self.waiting_on_user_message = False
         self.waiting_until = 0.0
         self.waiting_on_delegations = 0
@@ -3120,6 +3128,8 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
             state.clear_wait(preserve_notice_key=True)
             for k, v in barrier.items():
                 setattr(state, k, v)
+            if state.waiting_on_session is not None:
+                state.waiting_on_session_live_at_park = _session_waiting(state.waiting_on_session)
             state.waiting_reason = (reason or "").strip() or None
             state.waiting_since = time.time()
             # A live barrier's first recheck is derived from waiting_since below rather than
@@ -3334,6 +3344,10 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
                     return None
             elif self.automatic_continuation_floor_remaining() > 0:
                 return None
+        if state is not None and state.waiting_on_session \
+                and state.waiting_on_session_live_at_park is False \
+                and self.automatic_continuation_floor_remaining() > 0:
+            return None
         if self._state.waiting_on_session and _completion_notice_pending(self._state.waiting_on_session):
             return None
         prompt = self.next_continuation_prompt()
