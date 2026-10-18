@@ -858,33 +858,47 @@ class TestJudgeDrivenWait:
         import subprocess, sys
         return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
 
-    def test_judge_wait_on_dead_pid_continues_instead_of_parking(self, hermes_home):
-        """#110826: a judge ``wait_on_pid`` naming a pid this host cannot observe (remote, or
-        already exited) must not park — the barrier would lift and re-park every turn."""
+    def test_judge_wait_on_dead_pid_uses_floor_instead_of_pid_park(self, hermes_home, monkeypatch):
+        """#110826: a stale judge ``wait_on_pid`` target gets a timed floor wait, not a
+        forever-reparkable PID barrier."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
+        clock = [10_000.0]
+        monkeypatch.setattr(goals.time, "time", lambda: clock[0])
         mgr = GoalManager(session_id="jw-dead-pid", default_max_turns=10)
         mgr.set("ship the PR")
+        assert mgr.state is not None
+        mgr.state.last_automatic_continuation_at = clock[0]
+        mgr._save()
         with patch.object(goals, "_pid_alive", return_value=False), patch.object(
             goals, "judge_goal",
             return_value=("wait", "remote job still running", False, {"pid": 4242}, False),
         ):
             decision = mgr.evaluate_after_turn("Started the job over ssh (pid 4242).")
-        assert decision["verdict"] == "continue"
-        assert decision["should_continue"] is True
+        floor = max(mgr.min_continuation_gap_seconds, goals.DEFAULT_MIN_CONTINUATION_GAP_SECONDS)
+        assert decision["verdict"] == "wait"
+        assert decision["should_continue"] is False
+        assert decision["reason"] == goals._MIN_CONTINUATION_GAP_REASON
         assert mgr.state.waiting_on_pid is None
-        assert mgr.is_waiting() is False
+        assert mgr.state.waiting_reason == goals._MIN_CONTINUATION_GAP_REASON
+        assert mgr.state.waiting_until > clock[0]
+        assert mgr.state.waiting_until <= clock[0] + floor
+        assert mgr.is_waiting() is True
 
-    def test_judge_wait_on_pid_dying_between_check_and_park_continues(self, hermes_home):
-        """The pid may exit between the judge path's liveness probe and ``wait_on``'s own
-        re-check; that race must land on the same continue decision, not raise out of
-        ``evaluate_after_turn`` (callers swallow the error and the continuation is lost)."""
+    def test_judge_wait_on_pid_dying_between_check_and_park_uses_floor_wait(self, hermes_home, monkeypatch):
+        """If the pid exits between the judge path's liveness probe and ``wait_on``'s re-check,
+        the race gets a timed floor wait rather than a forever PID park."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
+        clock = [20_000.0]
+        monkeypatch.setattr(goals.time, "time", lambda: clock[0])
         mgr = GoalManager(session_id="jw-toctou-pid", default_max_turns=10)
         mgr.set("ship the PR")
+        assert mgr.state is not None
+        mgr.state.last_automatic_continuation_at = clock[0]
+        mgr._save()
         with patch.object(goals, "_pid_alive", return_value=True), patch.object(
             GoalManager, "wait_on", side_effect=ValueError("pid is not alive on this host"),
         ), patch.object(
@@ -892,10 +906,15 @@ class TestJudgeDrivenWait:
             return_value=("wait", "job still running", False, {"pid": 4242}, False),
         ):
             decision = mgr.evaluate_after_turn("Started the job (pid 4242).")
-        assert decision["verdict"] == "continue"
-        assert decision["should_continue"] is True
+        floor = max(mgr.min_continuation_gap_seconds, goals.DEFAULT_MIN_CONTINUATION_GAP_SECONDS)
+        assert decision["verdict"] == "wait"
+        assert decision["should_continue"] is False
+        assert decision["reason"] == goals._MIN_CONTINUATION_GAP_REASON
         assert mgr.state.waiting_on_pid is None
-        assert mgr.is_waiting() is False
+        assert mgr.state.waiting_reason == goals._MIN_CONTINUATION_GAP_REASON
+        assert mgr.state.waiting_until > clock[0]
+        assert mgr.state.waiting_until <= clock[0] + floor
+        assert mgr.is_waiting() is True
 
     def test_judge_repark_on_same_session_dedupes_notice(self, hermes_home):
         from hermes_cli.goals import GoalManager
