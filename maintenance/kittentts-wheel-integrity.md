@@ -10,7 +10,7 @@ The hash protects a direct wheel dependency from silently changing after the sou
 
 Fork patch identity: `kittentts-wheel-integrity`.
 
-Fork-Patch-Backfill: e4daed668e4508ff5eabbe55d7187cc6893111ae; kittentts-wheel-integrity
+Fork-Patch-Backfill: 739ced4676c82324042e5b0b8d7e3ba1ed7bf432; kittentts-wheel-integrity
 
 The source surfaces are `pyproject.toml` and `uv.lock`. The declaration uses the verified SHA-256 for the KittenTTS `0.8.1` wheel and retains the existing platform exclusions. The lock refresh records the same resolved artifact without broadening the extra's availability.
 
