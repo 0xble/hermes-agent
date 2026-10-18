@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -308,6 +309,7 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
             encoding="utf-8",
         )
         worker = FakeProcess()
+        kwargs["_test_process"] = worker
         processes.append(worker)
         return worker
 
@@ -457,8 +459,8 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     assert not (tmp_path / "cron/external-workers/exec-1.json").exists()
 
 
-def test_degraded_worker_remains_active_and_is_marked_interrupted(tmp_path, monkeypatch):
-    """The real external handoff path must not hide a degraded worker from restart drain."""
+def test_degraded_worker_reaps_before_projecting_terminal_row(tmp_path, monkeypatch):
+    """A degraded worker's terminal row does not return until its process exits."""
     import cron.scheduler as scheduler
     from tools.process_registry import GatewayChildDispatch
 
@@ -470,7 +472,6 @@ def test_degraded_worker_remains_active_and_is_marked_interrupted(tmp_path, monk
         lambda command, **_kw: GatewayChildDispatch("degraded", command),
     )
     spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
-    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
     import cron.scheduler_detached_worker as detached_worker
     monkeypatch.setattr(detached_worker, "reap_terminal_worker_in_background", lambda _process: None)
     prior_worker_pids = dict(scheduler._running_worker_pids)
@@ -480,17 +481,14 @@ def test_degraded_worker_remains_active_and_is_marked_interrupted(tmp_path, monk
     try:
         assert scheduler._launch_external_cron_worker(job) is True
         assert scheduler.get_running_job_ids() == frozenset({"job-degraded"})
-        assert scheduler._running_worker_pids.get(key) == 4321
-        assert scheduler.get_running_job_details()[0]["worker_pid"] == 4321
-        assert scheduler.mark_running_jobs_interrupted("gateway restart") == ["job-degraded"]
-        assert scheduler._is_interrupted("job-degraded")
+        assert key not in scheduler._running_worker_pids
         assert spawned
     finally:
-        scheduler.release_running_job("job-degraded")
         with scheduler._running_lock:
+            scheduler._running_job_ids.discard(key)
+            scheduler._running_since.pop(key, None)
             scheduler._running_worker_pids.clear()
             scheduler._running_worker_pids.update(prior_worker_pids)
-            scheduler._interrupted_job_ids.clear()
             scheduler._external_worker_modes.clear()
             scheduler._restart_safe_waiter_job_ids.clear()
             scheduler._restart_safe_external_worker_job_ids.clear()
@@ -647,7 +645,8 @@ def test_detached_worker_exit_releases_its_in_process_claim(monkeypatch, tmp_pat
             scheduler._restart_safe_external_worker_job_ids.discard(key)
 
 
-def test_live_detached_worker_keeps_claim_until_process_exit(monkeypatch, tmp_path):
+@pytest.mark.parametrize("mode", ["scoped", "degraded"])
+def test_live_external_worker_keeps_claim_until_process_exit(monkeypatch, tmp_path, mode):
     import cron.scheduler as scheduler
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
@@ -657,8 +656,7 @@ def test_live_detached_worker_keeps_claim_until_process_exit(monkeypatch, tmp_pa
     with scheduler._running_lock:
         scheduler._running_job_ids.add(key)
         scheduler._running_registration_owners[key] = owner
-        scheduler._external_worker_modes[key] = "scoped"
-
+        scheduler._external_worker_modes[key] = mode
     exited = threading.Event()
     process = Mock()
     process.returncode = None
@@ -1025,6 +1023,7 @@ def test_terminal_early_return_reaps_a_real_worker_process(monkeypatch):
     assert process.returncode == 0
 
 
+
 def test_launch_external_worker_stays_in_process_outside_managed_gateway(
     monkeypatch,
 ):
@@ -1095,7 +1094,11 @@ def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
     )
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "user-libs"))
     spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
-    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    def terminal_execution(_execution_id):
+        spawned[0][1]["_test_process"].returncode = 0
+        return {"id": "exec-1", "status": "completed"}
+
+    get.side_effect = terminal_execution
     monkeypatch.setattr(
         "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
         lambda _process: None,
@@ -1121,7 +1124,11 @@ def test_external_worker_keeps_loaded_tree_after_current_moves(tmp_path, monkeyp
     monkeypatch.setattr("tools.process_registry.restart_safe_gateway_child_argv",
                         lambda command, **_: GatewayChildDispatch("degraded", command))
     spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
-    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    def terminal_execution(_execution_id):
+        spawned[0][1]["_test_process"].returncode = 0
+        return {"id": "exec-1", "status": "completed"}
+
+    get.side_effect = terminal_execution
     monkeypatch.setattr(
         "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
         lambda _process: None,
@@ -1157,7 +1164,11 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
                      "PYTHONPATH": str(tmp_path / "kept-by-sanitizer")},
     )
     spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
-    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    def terminal_execution(_execution_id):
+        spawned[0][1]["_test_process"].returncode = 0
+        return {"id": "exec-1", "status": "completed"}
+
+    get.side_effect = terminal_execution
     monkeypatch.setattr(
         "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
         lambda _process: None,

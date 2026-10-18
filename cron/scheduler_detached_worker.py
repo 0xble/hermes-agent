@@ -14,7 +14,18 @@ import os
 import contextlib
 import subprocess
 import threading
+import time
 from typing import Optional
+
+
+HARD_WALL_TIMEOUT_ERROR_PREFIX = "Detached cron run exceeded hard wall-clock timeout ("
+HARD_WALL_WATCHDOG_GRACE_SECONDS = 60.0
+HARD_WALL_WATCHDOG_MINIMUM_SECONDS = 4.0
+
+
+def hard_wall_watchdog_grace_seconds(seconds: float) -> float:
+    """Bounded post-wall cleanup allowance used by the worker and its waiter."""
+    return min(HARD_WALL_WATCHDOG_GRACE_SECONDS, max(HARD_WALL_WATCHDOG_MINIMUM_SECONDS, seconds))
 
 
 def normalize_hard_wall_timeout(value) -> Optional[float]:
@@ -108,7 +119,8 @@ def _terminate_owned_descendants(
 class HardWallFence:
     """Lifetime timer only; the SQLite execution row is the sole result fence."""
 
-    def __init__(self) -> None:
+    def __init__(self, deadline: float) -> None:
+        self.deadline = deadline
         self.stopped = threading.Event()
 
     def set(self) -> None:
@@ -121,7 +133,7 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
     from cron.executions import _owner_identity, _process_start_time, finish_execution, get_execution
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    fence = HardWallFence()
+    fence = HardWallFence(time.monotonic() + seconds)
     pid = os.getpid()
     fingerprint = _process_start_time(pid)
     if fingerprint is None:
@@ -137,14 +149,14 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
                 if _owner_identity(pid, fingerprint) == "live":
                     timeout_won = finish_execution(
                         execution_id, success=False,
-                        error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
+                        error=f"{HARD_WALL_TIMEOUT_ERROR_PREFIX}{seconds:g}s).",
                         require_running=True,
                     ) is not None
                 # Reserve the final 3s for bounded descendant cleanup. The
                 # post-commit allowance is derived from the configured wall cap,
                 # with enough headroom to include cleanup inside cap+grace.
                 if not timeout_won:
-                    grace = min(60.0, max(4.0, seconds))
+                    grace = hard_wall_watchdog_grace_seconds(seconds)
                     fence.stopped.wait(grace - 3.0)
             finally:
                 try:

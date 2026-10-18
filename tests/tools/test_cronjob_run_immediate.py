@@ -376,7 +376,13 @@ def test_manual_run_keeps_live_detached_claim_after_waiter_error(tmp_path, monke
         with scheduler._running_lock:
             owner = scheduler._running_registration_owners[key]
         owner_holder["owner"] = owner
-        scheduler._defer_external_worker_claim_release(job["id"], tmp_path, owner, process)
+        scheduler._defer_external_worker_claim_release(
+            job["id"],
+            tmp_path,
+            owner,
+            process,
+            execution_id="exec-manual-live",
+        )
         raise RuntimeError("post-handoff waiter error")
 
     try:
