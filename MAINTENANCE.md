@@ -483,6 +483,15 @@ so unreviewed remembered resolutions cannot silently resolve a new release confl
 - **Retirement:** Remove when upstream provides equivalent immediate-parent and lineage-topic coverage for delegated descendants through MCP, plus the cooperative CLI topic-address guard.
 - **Rollback:** Revert the commits carrying `Fork-Patch: child-parent-relay-guard`.
 
+## Active patch record: update main drop guard
+
+- **Patch identity:** `update-main-drop-guard`.
+- **Behavior:** Before a stable update moves the checkout, resolve the currently live release or current checkout head independently from the rescue capture path, then refuse a target that would remove commits already present on both the live release and `origin/main`. Record intentional overrides with `--allow-drop-main`; skip the check only for release channels whose own admission contract applies.
+- **Source surfaces:** `hermes_cli/update_cmd.py`, `hermes_cli/update_main_guard.py`, `tests/hermes_cli/test_update_main_guard.py`, `tests/hermes_cli/test_update_autostash.py`, and update-related integration tests.
+- **Focused regression:** `HERMES_HOME=<isolated test home> .venv/bin/python -m pytest -q tests/hermes_cli/test_update_main_guard.py tests/hermes_cli/test_update_autostash.py tests/hermes_cli/test_update_fleet_restart_pending.py tests/hermes_cli/test_source_channel_integration.py`.
+- **Retirement:** Remove when the maintained upstream update path preserves live `origin/main` commits with equivalent refusal, receipt, override, and orphan-rescue coverage.
+- **Rollback:** Revert the commits carrying `Fork-Patch: update-main-drop-guard`.
+
 ## Eager plugin tools
 
 Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the direct schema surface while explicit user deferral remains authoritative. See [the maintenance unit](maintenance/eager-plugin-tools.md).
