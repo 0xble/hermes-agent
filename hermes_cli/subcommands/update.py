@@ -59,6 +59,10 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "switch to the requested branch first (auto-stashing any "
             "uncommitted changes).")
     update_parser.add_argument(
+        "--allow-drop-main", action="store_true", default=False,
+        help="Allow an intentional rollback that would drop commits already live and on origin/main; record the override in the update receipt.",
+    )
+    update_parser.add_argument(
         "--switch-branch", action="store_true", default=False,
         help="With updates.parked_branch_strategy: update_in_place configured, "
             "override it for this run: switch to the update target and update "
