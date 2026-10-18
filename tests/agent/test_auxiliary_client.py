@@ -90,10 +90,8 @@ def _clean_env(monkeypatch):
     _aux_mod._aux_unhealthy_logged_at.clear()
 
 
-def test_mark_provider_unhealthy_does_not_poison_cache_when_persist_fails(monkeypatch):
+def test_mark_provider_unhealthy_keeps_local_quarantine_when_persist_fails(monkeypatch):
     key = aux._unhealthy_cache_key("openrouter", "https://example.test/v1")
-    aux._aux_unhealthy_until[key] = 123.0
-    aux._aux_unhealthy_reason[key] = "existing"
     monkeypatch.setattr(
         aux,
         "_mark_auxiliary_health",
@@ -104,8 +102,8 @@ def test_mark_provider_unhealthy_does_not_poison_cache_when_persist_fails(monkey
         "openrouter", base_url="https://example.test/v1", reason="payment error",
     )
 
-    assert aux._aux_unhealthy_until[key] == 123.0
-    assert aux._aux_unhealthy_reason[key] == "existing"
+    assert aux._aux_unhealthy_until[key] > time.time()
+    assert aux._aux_unhealthy_reason[key] == "payment error"
 
 
 def test_log_skip_unhealthy_deduplicates_same_epoch_and_reopens_on_new_lane(caplog):

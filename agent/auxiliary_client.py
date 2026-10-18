@@ -3213,9 +3213,10 @@ def _mark_provider_unhealthy(
 ) -> None:
     """Hide one auxiliary route until the TTL expires.
 
-    Shareable failures are persisted first and the compatibility cache adopts the stored
-    record, so a failed write never poisons this process. Task or parser failures the store
-    refuses to share still quarantine locally, so the ordered fallback walk advances.
+    Shareable failures are persisted when possible and the compatibility cache adopts the stored
+    record. A failed write still quarantines this process locally, so the ordered fallback walk
+    advances even when the shared optimization is unavailable. Task or parser failures the store
+    refuses to share are local-only for the same reason.
     """
     label = _normalize_chain_label(provider)
     if not label:
@@ -3227,6 +3228,9 @@ def _mark_provider_unhealthy(
             _auxiliary_route_identity(label, base_url, model), ttl=ttl, reason=reason,
         )
     except OSError as exc:
+        expires_at = time.time() + ttl
+        _aux_unhealthy_until[key] = expires_at
+        _aux_unhealthy_reason[key] = reason
         logger.warning("Auxiliary: could not persist unhealthy state for %s: %s", label, exc)
         return
     if record is None:
@@ -3276,7 +3280,7 @@ def _health_route_candidates(
 def _clear_provider_health(
     provider: str, base_url: Optional[str] = None, model: Optional[str] = None,
 ) -> None:
-    label = _normalize_chain_label(provider)
+    label = _normalize_chain_label(_fallback_provider_from_label(provider))
     if not label:
         return
     for _candidate_model, key, identity in _health_route_candidates(label, base_url, model):
@@ -4937,8 +4941,8 @@ def _effective_provider_for_client(client: Any, fallback: str) -> str:
     """Return the concrete provider selected for an auto-routed client."""
     effective_provider = getattr(client, "_hermes_aux_effective_provider", "")
     if isinstance(effective_provider, str) and effective_provider:
-        return effective_provider
-    return str(fallback or "")
+        return _fallback_provider_from_label(effective_provider)
+    return _fallback_provider_from_label(str(fallback or ""))
 
 
 # Centralized Provider Router: resolve_provider_client() is the single entry point for building a configured

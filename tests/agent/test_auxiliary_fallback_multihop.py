@@ -96,6 +96,22 @@ def test_sync_walk_advances_past_quota_limited_candidate_to_next_configured_entr
     assert not ac._is_provider_unhealthy("custom", "http://127.0.0.1:3/v1", "modelC")
 
 
+def test_sync_walk_advances_when_route_health_persist_fails(monkeypatch):
+    """A full state directory must not stop the in-process fallback walk."""
+    primary = _client("http://127.0.0.1:1/v1", MagicMock(side_effect=_quota_429("A")))
+    lane_b = _client("http://127.0.0.1:2/v1", MagicMock(side_effect=_quota_429("B")))
+    lane_c = _client("http://127.0.0.1:3/v1", MagicMock(return_value=_ok_response("OK")))
+    monkeypatch.setattr(ac, "_mark_auxiliary_health", MagicMock(side_effect=OSError("disk full")))
+
+    patches = _walk_patches(primary, [(lane_b, "modelB", "custom"), (lane_c, "modelC", "custom")])
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        result = call_llm(task="title_generation", messages=[{"role": "user", "content": "Reply OK"}])
+
+    assert result.choices[0].message.content == "OK"
+    assert lane_b.chat.completions.create.call_count == 1
+    assert lane_c.chat.completions.create.call_count == 1
+
+
 @pytest.mark.asyncio
 async def test_async_walk_exhausts_every_configured_lane_once_then_raises_primary_error():
     """T4: primary 429 → fallback[0] 429 → fallback[1] 429 → controlled exhaustion; each lane once;
@@ -174,6 +190,20 @@ def test_configured_auxiliary_fallback_can_resolve_a_default_model(monkeypatch):
     assert resolved is client
     assert model == "resolved/default"
     assert label == "fallback_chain[0](openrouter)"
+
+
+def test_fallback_label_is_unwrapped_before_recovery_clear():
+    """Recovery of a main fallback route must clear the concrete provider record."""
+    ac._mark_provider_unhealthy("openrouter", model="model", ttl=0, reason="rate limit")
+    client = MagicMock()
+    client._hermes_aux_effective_provider = "fallback_providers[0](openrouter)"
+
+    assert ac._effective_provider_for_client(client, "auto") == "openrouter"
+    # The expired record gives this caller ownership of the recovery probe.
+    assert ac._is_provider_unhealthy("openrouter", model="model") is False
+    ac._clear_provider_health("fallback_providers[0](openrouter)", model="model")
+
+    assert not ac._is_provider_unhealthy("openrouter", model="model")
 
 
 def test_payment_quarantine_is_provider_wide_for_the_main_route(monkeypatch):
