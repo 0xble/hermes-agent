@@ -4137,15 +4137,26 @@ class TestOptimizeFts:
 class TestAutoMaintenance:
     def test_auto_maintenance_outside_window_leaves_throttle_unspent(self, db, monkeypatch):
         import hermes_cli.maintenance_window
+        import hermes_state_repair
 
         prune_calls = []
+        acquire_calls = []
+        set_meta_calls = []
         monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: False)
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: prune_calls.append(True))
+        monkeypatch.setattr(
+            hermes_state_repair,
+            "_try_acquire_auto_maintenance_lock",
+            lambda _db_path: acquire_calls.append(True),
+        )
+        monkeypatch.setattr(db, "set_meta", lambda *args: set_meta_calls.append(args))
 
         result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
 
         assert result == {"skipped": True, "pruned": 0, "closed": 0, "vacuumed": False}
+        assert acquire_calls == []
         assert prune_calls == []
+        assert set_meta_calls == []
         assert db.get_meta("last_auto_prune") is None
 
     def _make_old_ended(self, db, sid: str, days_old: int = 100):
