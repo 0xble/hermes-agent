@@ -69,3 +69,44 @@ def test_a_delegation_wait_lifts_when_a_batch_returns_not_only_when_the_timer_ru
     with patch.object(goals, "count_active_delegations", return_value=0):
         assert mgr.is_waiting() is True
     goals._DB_CACHE.clear()
+
+
+def test_expired_delegation_wait_still_obeys_automatic_floor_until_batch_returns(tmp_path, monkeypatch):
+    """Timer expiry with unchanged live delegations must not bypass the 15-minute floor."""
+    from pathlib import Path
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes")); (tmp_path / ".hermes").mkdir()
+    goals._DB_CACHE.clear()
+    monkeypatch.setattr(goals.time, "time", lambda: 10_020.0)
+    mgr = goals.GoalManager(session_id="delegation-floor")
+    mgr.set("integrate the rounds")
+    assert mgr.state is not None
+    with patch.object(goals, "count_active_delegations", return_value=2):
+        mgr.wait_for_seconds(60, reason="waiting on workers", on_delegations=2)
+        mgr.state.waiting_until = 10_019.0
+        mgr.state.last_automatic_continuation_at = 10_000.0
+        mgr._save()
+        assert mgr.lifted_barrier_prompt() is None
+
+
+def test_delegation_count_drop_pierces_automatic_floor(tmp_path, monkeypatch):
+    """A delegation completion remains an immediate wake even inside the floor."""
+    from pathlib import Path
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes")); (tmp_path / ".hermes").mkdir()
+    goals._DB_CACHE.clear()
+    monkeypatch.setattr(goals.time, "time", lambda: 10_020.0)
+    mgr = goals.GoalManager(session_id="delegation-wake")
+    mgr.set("integrate the rounds")
+    assert mgr.state is not None
+    with patch.object(goals, "count_active_delegations", return_value=1):
+        mgr.wait_for_seconds(60, reason="waiting on workers", on_delegations=2)
+        mgr.state.waiting_until = 10_019.0
+        mgr.state.last_automatic_continuation_at = 10_000.0
+        mgr._save()
+        prompt = mgr.lifted_barrier_prompt()
+
+    assert prompt is not None
+    goals._DB_CACHE.clear()

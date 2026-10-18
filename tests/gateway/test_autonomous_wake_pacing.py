@@ -203,6 +203,79 @@ async def test_successive_automatic_continuations_obey_hard_gap_floor(hermes_hom
 
 
 @pytest.mark.asyncio
+async def test_timed_wait_lift_after_external_event_still_obeys_gap_floor(hermes_home, monkeypatch):
+    """A short judge timer from an external wake cannot bypass the automatic floor."""
+    runner, adapter, entry, src = _goal_runner()
+    clock = [40_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = goals.GoalManager(entry.session_id, min_continuation_gap_seconds=900)
+    mgr.set("ship the release")
+
+    with patch.object(
+        goals, "judge_goal",
+        side_effect=[
+            ("continue", "more work", False, None, False),
+            ("wait", "cooldown", False, {"seconds": 60}, False),
+        ],
+    ), patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", side_effect=["evidence-1", "evidence-2"]):
+        # The first user turn anchors the automatic chain immediately.
+        await _after_turn(runner, src, "please ship it", internal=False)
+        adapter._pending_messages.clear()
+
+        # An external wake is allowed to judge immediately, and its short timer is accepted as
+        # requested. The timer's later idle-watcher lift must still wait for the floor.
+        clock[0] += 20
+        await _after_turn(
+            runner, src, "[proc done]", internal=True,
+            origin="process_registry_synthetic",
+        )
+        assert _queued_continuations(adapter) == 0
+        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 60)
+
+        clock[0] += 60
+        await runner._goal_wakeup_fire_one(entry.session_id)
+
+    assert adapter.handled == []
+    state = goals.load_goal(entry.session_id)
+    assert state.waiting_until == pytest.approx(40_080.0)
+
+
+@pytest.mark.asyncio
+async def test_process_exit_lift_pierces_gap_floor(hermes_home, monkeypatch):
+    """A completed process is a real event wake and dispatches without waiting for the floor."""
+    runner, adapter, entry, src = _goal_runner()
+    clock = [50_000.0]
+    process_alive = [True]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    monkeypatch.setattr(goals, "_pid_alive", lambda _pid: process_alive[0])
+    mgr = goals.GoalManager(entry.session_id, min_continuation_gap_seconds=900)
+    mgr.set("ship the release")
+
+    with patch.object(
+        goals, "judge_goal",
+        side_effect=[
+            ("continue", "more work", False, None, False),
+            ("wait", "job", False, {"pid": 4242}, False),
+        ],
+    ), patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", side_effect=["evidence-1", "evidence-2"]):
+        await _after_turn(runner, src, "please ship it", internal=False)
+        adapter._pending_messages.clear()
+
+        clock[0] += 20
+        await _after_turn(
+            runner, src, "job started", internal=True,
+            origin="process_registry_synthetic",
+        )
+        process_alive[0] = False
+        await runner._goal_wakeup_fire_one(entry.session_id)
+
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].text.startswith("[Continuing toward your standing goal]")
+
+
+@pytest.mark.asyncio
 async def test_idle_ticker_releases_ladder_hold_once_and_silently(hermes_home, monkeypatch):
     runner, adapter, entry, _src = _goal_runner()
     clock = [20_000.0]
