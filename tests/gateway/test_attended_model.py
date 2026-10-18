@@ -1,6 +1,9 @@
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from gateway.attended_model import (
+    AttendedResolution,
     format_attended_switch_back_notice,
     format_attended_switch_notice,
     friendly_model_name,
@@ -9,6 +12,8 @@ from gateway.attended_model import (
     parse_attended_config,
     resolve_attended_model,
 )
+from gateway.run_inbound import GatewayInboundMixin
+from gateway.run_turn import GatewayTurnMixin
 
 
 def _cfg(**model):
@@ -292,3 +297,111 @@ def test_dict_reasoning_override_resolves_to_effort_label():
         1001, cfg,
     )
     assert disabled.reasoning_effort == "none"
+
+
+def _attended_route_runner(state):
+    def handoff(_session_key, *, conversation=None, runner=None):
+        del runner
+        for key, value in (conversation or {}).items():
+            setattr(state.conversation, key, value)
+
+    runner = SimpleNamespace(
+        _session_state=lambda _key: state,
+        _peek_session_state=lambda _key: state,
+        _load_attended_activity_stamp=lambda _key: state.conversation.last_user_activity_at,
+        _handoff_attended_state=handoff,
+        _session_reasoning_override=lambda _key: None,
+        _load_reasoning_config=lambda _model: {},
+    )
+    runner._attended_resolution_for_session = lambda **kwargs: (
+        GatewayTurnMixin._attended_resolution_for_session(runner, **kwargs)
+    )
+    runner._ensure_attended_new_session_activity = lambda *args, **kwargs: (
+        GatewayTurnMixin._ensure_attended_new_session_activity(runner, *args, **kwargs)
+    )
+    return runner
+
+
+def test_first_user_message_preserves_new_session_boundary_before_activity_stamp():
+    cfg = _cfg(
+        default="gpt-6.1-sol", provider="nous",
+        attended={"model": "claude-opus-5-5", "provider": "custom:claude"},
+    )
+    state = SimpleNamespace(conversation=SimpleNamespace(
+        attended_new_session=False, last_user_activity_at=None,
+        last_attended_decision=None, last_resolved_model=None, pending_attended_notice=None,
+        model_override=None, model_override_scope="session",
+        reasoning_override=None, reasoning_override_scope="session",
+    ))
+    entry = SimpleNamespace(
+        session_key="k", session_id="sid", created_at="created", updated_at="created",
+        was_auto_reset=False, is_fresh_reset=False,
+    )
+
+    async def mark_activity(_session_key):
+        entry.updated_at = "updated"
+
+    inbound = SimpleNamespace(
+        async_session_store=SimpleNamespace(
+            lookup_by_session_key=AsyncMock(return_value=entry),
+            mark_user_activity=AsyncMock(side_effect=mark_activity),
+        ),
+        _session_state=lambda _key: state,
+        _session_key_for_source=lambda _source: "k",
+    )
+    event = SimpleNamespace(text="hello", internal=False, metadata={})
+    source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), user_id="u")
+
+    with patch("gateway.run._load_gateway_config", return_value=cfg):
+        assert asyncio.run(
+            GatewayInboundMixin._mark_attended_user_activity(inbound, event, source, "k")
+        ) is True
+
+    assert state.conversation.attended_new_session is True
+    assert entry.created_at != entry.updated_at
+
+    turn = SimpleNamespace(
+        _session_state=lambda _key: state,
+        _clear_conversation_scope=lambda _key, reason: None,
+        _evict_cached_agent=lambda _key: None,
+        hooks=SimpleNamespace(emit=AsyncMock()),
+    )
+    was_auto_reset, is_new_session = asyncio.run(
+        GatewayTurnMixin._hmwa_open_session(turn, entry, "k", source)
+    )
+    assert (was_auto_reset, is_new_session) == (False, True)
+
+    route_runner = _attended_route_runner(state)
+    with patch("gateway.run._resolve_gateway_model", return_value="gpt-6.1-sol"):
+        route = GatewayTurnMixin._attended_route_for_session(
+            route_runner, source=None, session_key="k", user_config=cfg,
+            override=None, last_model="",
+        )
+    assert route["model"] == "claude-opus-5-5"
+    assert state.conversation.pending_attended_notice is None
+
+
+def test_pre_turn_idle_expiry_stages_switch_back_notice_once():
+    cfg = _cfg(
+        default="gpt-6.1-sol", provider="nous", idle_revert_minutes=15,
+        attended={"model": "claude-opus-5-5", "provider": "custom:claude"},
+    )
+    state = SimpleNamespace(conversation=SimpleNamespace(
+        attended_new_session=False, last_user_activity_at=0,
+        last_attended_decision=AttendedResolution(
+            "claude-opus-5-5", "custom:claude", "high", "attended", True,
+            idle_model="gpt-6.1-sol",
+        ),
+        pending_attended_notice=None, model_override=None, model_override_scope="session",
+        reasoning_override=None, reasoning_override_scope="session",
+    ))
+    route_runner = _attended_route_runner(state)
+    with patch("gateway.run._resolve_gateway_model", return_value="gpt-6.1-sol"):
+        route = GatewayTurnMixin._attended_route_for_session(
+            route_runner, source=None, session_key="k", user_config=cfg,
+            override=None, last_model="claude-opus-5-5",
+        )
+    assert route is None
+    assert state.conversation.pending_attended_notice == format_attended_switch_back_notice(
+        "gpt-6.1-sol", 15,
+    )

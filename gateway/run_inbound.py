@@ -1628,9 +1628,17 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             entry = await self.async_session_store.lookup_by_session_key(session_key)
             if entry is None:
                 return False
+            state = self._session_state(session_key)
+            if (
+                getattr(entry, "created_at", None) == getattr(entry, "updated_at", None)
+                or getattr(entry, "is_fresh_reset", False)
+                or getattr(state.conversation, "attended_new_session", False)
+            ):
+                # Preserve the creation boundary before mark_user_activity updates updated_at.
+                state.conversation.attended_new_session = True
             await self.async_session_store.mark_user_activity(entry.session_key)
             stamp = time.time()
-            self._session_state(session_key).conversation.last_user_activity_at = stamp
+            state.conversation.last_user_activity_at = stamp
             return True
         except Exception:
             logger.debug("attended-model activity stamp failed", exc_info=True)

@@ -1113,7 +1113,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             session_entry.was_auto_reset = False
 
         _is_fresh_reset = getattr(session_entry, "is_fresh_reset", False)
-        _is_new_session = session_entry.created_at == session_entry.updated_at or _was_auto_reset or _is_fresh_reset
+        attended_new_session = getattr(
+            self._session_state(session_key).conversation, "attended_new_session", False,
+        )
+        _is_new_session = (
+            attended_new_session
+            or session_entry.created_at == session_entry.updated_at
+            or _was_auto_reset
+            or _is_fresh_reset
+        )
         # Consume is_fresh_reset so it doesn't leak onto later messages in the same session.
         if _is_fresh_reset:
             # See #6508.
