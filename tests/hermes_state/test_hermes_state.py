@@ -32,6 +32,13 @@ def _activity_snapshot(db, session_id):
     )
 
 
+@pytest.fixture(autouse=True)
+def _open_auto_maintenance_window(monkeypatch):
+    import hermes_cli.maintenance_window
+
+    monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: True)
+
+
 class _NoFtsCursor(sqlite3.Cursor):
     """Simulate a SQLite build without the fts5 module."""
 
@@ -4128,6 +4135,19 @@ class TestOptimizeFts:
 
 
 class TestAutoMaintenance:
+    def test_auto_maintenance_outside_window_leaves_throttle_unspent(self, db, monkeypatch):
+        import hermes_cli.maintenance_window
+
+        prune_calls = []
+        monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: False)
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: prune_calls.append(True))
+
+        result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+
+        assert result == {"skipped": True, "pruned": 0, "closed": 0, "vacuumed": False}
+        assert prune_calls == []
+        assert db.get_meta("last_auto_prune") is None
+
     def _make_old_ended(self, db, sid: str, days_old: int = 100):
         """Create a session that is ended and was started `days_old` days ago."""
         db.create_session(session_id=sid, source="cli")
