@@ -89,7 +89,7 @@ def friendly_model_name(model: str) -> str:
 
 
 def format_attended_switch_notice(
-    model: str, effort: str = "", *, idle_model: str = "", idle_minutes: float = 0,
+    model: str, effort: Any = "", *, idle_model: str = "", idle_minutes: float = 0,
 ) -> str:
     """Render the one-shot attended switch-in status line.
 

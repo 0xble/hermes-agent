@@ -111,7 +111,8 @@ def test_attended_switch_notice_uses_card_style_and_friendly_name():
         "⇄ Switched to Opus 5.5 while you're active."
     )
     assert format_attended_switch_notice(
-        "claude-opus-5-5", "high", idle_model="gpt-6.1-sol", idle_minutes=15,
+        "claude-opus-5-5", {"enabled": True, "effort": "high"},
+        idle_model="gpt-6.1-sol", idle_minutes=15,
     ) == "⇄ Switched to Opus 5.5 while you're active. Back to GPT-6.1 Sol after 15m idle."
     # No return clause when the idle route is the same model.
     assert format_attended_switch_notice(
