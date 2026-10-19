@@ -1032,6 +1032,10 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
 
     def commit(conn, authority: Dict[str, Any], savepoint: str) -> Dict[str, Any]:
         """Apply and record one immediate control while holding the SessionDB write lock."""
+        if kind == "goal" and action == "replace":
+            failure = _goal_replace_failure(target_sid, cursor=conn)
+            if failure is not None:
+                return failure
         raw = _meta_value(conn, _definition_key(kind, target_sid))
         affected_before = _affected_text(kind, action, raw, payload)
         conn.execute(f"SAVEPOINT {savepoint}")

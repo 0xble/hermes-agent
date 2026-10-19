@@ -125,6 +125,44 @@ def test_cross_session_goal_replace_without_an_active_goal_fails_before_any_requ
     assert self_result["status"] == "failed"
 
 
+def test_cross_session_replace_rechecks_goal_before_recording_failure(state, monkeypatch):
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control, pending_outbox
+
+    GoalManager("target").set("old objective")
+    calls = 0
+
+    def race(target_sid, *, cursor=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return {
+            "ok": False,
+            "status": "failed",
+            "error_code": "no_goal",
+            "error": "there is no active or paused goal to replace",
+            "state": None,
+            "revision": None,
+        }
+
+    monkeypatch.setattr(session_controls, "_goal_replace_failure", race)
+    result = apply_control(
+        "goal", "replace", "target", requester_sid="requester", reason="pivot",
+        payload={"goal": "new objective"},
+    )
+
+    assert calls == 2
+    assert result["error_code"] == "no_goal"
+    assert result["status"] == "failed"
+    assert "record" not in result
+    installed = load_goal("target")
+    assert installed is not None
+    assert installed.goal == "old objective"
+    assert pending_outbox() == []
+
+
 def test_self_goal_change_approval_is_non_blocking_and_second_press_noop(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.session_controls import apply_control, resolve_request
