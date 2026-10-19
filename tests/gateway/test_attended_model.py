@@ -1,7 +1,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from gateway import run as gateway_run
 from gateway.attended_model import (
@@ -435,13 +435,53 @@ def test_idle_switch_back_stays_attended_when_session_recently_called_api():
     assert state.conversation.pending_attended_notice is None
 
 
+def test_automation_opened_session_stays_attended_until_first_user_message():
+    """A split/relay-opened topic never reverts before Brian has spoken in it."""
+    cfg = _cfg(
+        default="gpt-6.1-sol", provider="nous", idle_revert_minutes=15,
+        attended={"model": "claude-opus-5-5", "provider": "custom:claude"},
+    )
+    attended = AttendedResolution(
+        "claude-opus-5-5", "custom:claude", "high", "attended", True,
+        idle_model="gpt-6.1-sol",
+    )
+    state = SimpleNamespace(conversation=SimpleNamespace(
+        attended_new_session=False,
+        # Process-local stamp from the automation-opened first turn, long expired.
+        last_user_activity_at=time.time() - 3600,
+        last_api_call_at=None,
+        last_attended_decision=attended,
+        pending_attended_notice=None, model_override=None, model_override_scope="session",
+        reasoning_override=None, reasoning_override_scope="session",
+    ))
+    durable: dict[str, float | None] = {"stamp": None}
+    route_runner = _attended_route_runner(state)
+    route_runner._load_attended_activity_stamp = lambda _key: durable["stamp"]
+    with patch.object(gateway_run, "_resolve_gateway_model", return_value="gpt-6.1-sol"):
+        held = GatewayTurnMixin._attended_resolution_for_session(
+            route_runner, source=None, session_key="k", user_config=cfg, allow_switch_back=True,
+        )
+        assert held is attended
+        assert held.switched_back is False
+
+        # Brian's first message writes the durable stamp; once that window lapses the
+        # ordinary idle switch-back resumes.
+        durable["stamp"] = time.time() - 3600
+        state.conversation.last_user_activity_at = durable["stamp"]
+        reverted = GatewayTurnMixin._attended_resolution_for_session(
+            route_runner, source=None, session_key="k", user_config=cfg, allow_switch_back=True,
+        )
+    assert reverted.reason == "default"
+    assert reverted.switched_back is True
+
+
 def test_internal_new_session_attended_window_is_ephemeral():
     cfg = _cfg(
         default="gpt-6.1-sol", provider="nous",
         attended={"model": "claude-opus-5-5", "provider": "custom:claude"},
     )
     state = SimpleNamespace(conversation=SimpleNamespace(attended_new_session=True))
-    mark_user_activity = AsyncMock()
+    mark_user_activity = Mock()
     runner = SimpleNamespace(
         _peek_session_state=lambda _key: state,
         session_store=SimpleNamespace(mark_user_activity=mark_user_activity),
@@ -451,7 +491,7 @@ def test_internal_new_session_attended_window_is_ephemeral():
     )
     assert new_session is True
     assert stamp is not None
-    mark_user_activity.assert_not_awaited()
+    mark_user_activity.assert_not_called()
 
 
 def test_disabled_attended_routing_does_not_reopen_existing_sessions():

@@ -379,11 +379,16 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             and previous_decision.idle_model != previous_decision.model
         )
         api_quiet = True
+        awaiting_first_message = False
         if switched_back:
             idle_seconds = cfg.idle_revert_minutes * 60.0
             last_api_at = getattr(conversation, "last_api_call_at", None)
             api_quiet = last_api_at is None or time.time() - float(last_api_at) >= idle_seconds
-            if not allow_switch_back or not api_quiet:
+            # A session opened by automation (a topic split, relay or wakeup) runs on the
+            # attended route from a process-local stamp only. Its idle window has not started
+            # until Brian sends a first genuine message, which writes the durable stamp.
+            awaiting_first_message = self._load_attended_activity_stamp(session_key) is None
+            if not allow_switch_back or not api_quiet or awaiting_first_message:
                 # Route expiry is deferred until the request boundary. A session that has
                 # called the API recently is still busy even when Brian's activity stamp is old.
                 decision = previous_decision
@@ -397,7 +402,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             if callable(log_decision):
                 log_decision(
                     session_key, source, action="defer" if not allow_switch_back else "keep",
-                    reason="session_busy" if not api_quiet else "no_api_call",
+                    reason=(
+                        "awaiting_first_user_message" if awaiting_first_message
+                        else "session_busy" if not api_quiet else "no_api_call"
+                    ),
                 )
         elif not switched_back:
             self._handoff_attended_state(

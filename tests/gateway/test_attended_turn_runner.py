@@ -103,6 +103,8 @@ def test_mid_turn_idle_expiry_switches_back_once_with_one_notice():
     )
     assert notices == ["⇄ Back to GPT-6.1 Sol after 15m idle."]
     assert state.conversation.last_resolved_model == "gpt-6.1-sol"
+    # The reasoning lookup is stubbed to the stale attended effort; the committed decision wins.
+    assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
 
 
 def test_oversized_default_context_keeps_attended_route_without_compaction():

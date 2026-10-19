@@ -1503,9 +1503,16 @@ class TurnRunner:
                     agent, model, runtime.get("provider", agent.provider), runtime.get("api_key", ""),
                     runtime.get("base_url", ""), runtime.get("api_mode", ""), runtime.get("capabilities"),
                 )
-            agent.reasoning_config = runner._resolve_session_reasoning_config(
-                source=ctx.source, session_key=ctx.session_key, model=model,
-            )
+            if decision.switched_back and decision.reasoning_effort:
+                # The committed decision already carries the destination effort. Re-resolving here
+                # would read session state whose handoff to the gateway loop may not have landed yet,
+                # and could pair the default model with the attended route's effort.
+                from hermes_constants import parse_reasoning_effort
+                agent.reasoning_config = parse_reasoning_effort(decision.reasoning_effort)
+            else:
+                agent.reasoning_config = runner._resolve_session_reasoning_config(
+                    source=ctx.source, session_key=ctx.session_key, model=model,
+                )
             agent._gateway_attended_decision_key = desired_key
             if ctx.session_key:
                 _handoff(conversation={"last_resolved_model": model})
