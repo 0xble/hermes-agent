@@ -293,3 +293,17 @@ def test_gateway_replay_prune_still_aborts_after_a_newer_compaction(tmp_path: Pa
     assert result is held
     assert count == 0
     assert [m["content"] for m in db.get_messages_as_conversation(session_id)] == winner
+
+def test_gateway_replay_after_compaction_still_commits_micro_compaction(tmp_path: Path) -> None:
+    """Micro-compaction shares the lease-less summary guard and must also commit after a compaction."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "MICRO_AFTER_COMPACTION"
+    _compacted_session(db, session_id)
+    agent = _build_agent(db, session_id)
+    held = [dict(m) for m in _gateway_replay(db, session_id)]
+
+    committed = agent.context_compressor._sync_micro_compact_to_db(
+        [dict(m) for m in held], held=held, start_watermark=db.get_active_message_watermark(session_id),
+    )
+
+    assert committed is True
