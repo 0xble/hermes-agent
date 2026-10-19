@@ -203,6 +203,25 @@ def test_replay_preserves_summary_metadata_and_does_not_timestamp_summary_rows()
 
 
 
+def test_replay_drops_persistence_metadata_when_content_is_rewritten():
+    from gateway.run import _build_gateway_agent_history
+
+    stored = [{
+        "role": "user", "content": "hello", "message_uid": "u1", "_db_row_snapshot": "snap1",
+        "_db_persisted": True, "_compressed_summary": True, "message_id": "m1", "observed": True,
+        "display_kind": "summary", "display_metadata": {"source": "compression"}, "mirror": True,
+        "mirror_source": "other",
+    }]
+    replayed, _ = _build_gateway_agent_history(stored)
+    entry = replayed[0]
+    assert entry["content"].startswith("[Delivered from other]")
+    assert all(key not in entry for key in (
+        "_db_persisted", "_db_row_snapshot", "_compressed_summary", "message_id", "observed",
+        "platform_message_id", "display_kind", "display_metadata", "effect_disposition",
+    ))
+
+
+
 def test_replay_keeps_the_stored_row_version_only_for_unchanged_content():
     from gateway.run import _build_gateway_agent_history
 

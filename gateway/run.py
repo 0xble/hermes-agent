@@ -1357,6 +1357,9 @@ def _build_gateway_agent_history(
                 entry.pop("api_content", None)  # prefix rewrite: the sidecar no longer matches
             if entry.get("content") != msg.get("content"):
                 entry.pop(DB_ROW_SNAPSHOT, None)  # a rendered view is not the stored row version
+                for field in ("_db_persisted", "_compressed_summary", "message_id", "platform_message_id",
+                              "observed", "display_kind", "display_metadata", "effect_disposition"):
+                    entry.pop(field, None)
             agent_history.append(entry)
 
     # Keep gateway resume byte-identical to the TUI resume and send paths. The
