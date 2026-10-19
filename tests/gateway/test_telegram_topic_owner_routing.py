@@ -138,6 +138,24 @@ async def test_parallel_owner_reuses_its_own_lane(db):
     assert adapter._bot.create_forum_topic.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_named_shared_owner_resolves_canonical_thread(db):
+    _live_session(db, "existing", "Same subject", 10, managed_mode="automation")
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="job:first", topic_name="Same subject")
+    db.set_telegram_topic_owner_active(
+        chat_id="123", owner_key="job:first", thread_id="10", topic_name="Same subject")
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="job:second", topic_name="Same subject")
+    db.set_telegram_topic_owner_shared(
+        chat_id="123", owner_key="job:second", canonical_owner_key="job:first",
+        topic_name="Same subject")
+
+    adapter = _adapter(db)
+    result = await adapter.ensure_dm_topic("123", "Same subject", owner_key="job:second")
+
+    assert result == "10"
+    assert adapter._bot.create_forum_topic.await_count == 0
+
+
 def test_owner_state_survives_restart_and_retired_owner_is_not_active(db, tmp_path):
     db_path = tmp_path / "state.db"
     db.reserve_telegram_topic_owner(chat_id="123", owner_key="job:x", topic_name="X")
@@ -167,6 +185,146 @@ def test_numeric_topic_delivery_claims_existing_live_binding(db):
     owner = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:watcher")
     assert owner["status"] == "active"
     assert owner["thread_id"] == "324637"
+
+
+def test_second_numeric_topic_owner_shares_existing_owner(db):
+    _live_session(db, "existing", "Meridian Gmail Watcher", 324637)
+    adapter = _adapter(db)
+
+    adapter.ensure_existing_telegram_topic_owner("123", "324637", "cron:first")
+    adapter.ensure_existing_telegram_topic_owner("123", "324637", "cron:second")
+
+    first = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:first")
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert first["status"] == "active"
+    assert first["thread_id"] == "324637"
+    assert second["status"] == "active"
+    assert second["thread_id"] is None
+    assert second["canonical_owner_key"] == "cron:first"
+
+
+@pytest.mark.parametrize("stuck_status", ["creating", "conflict", "retired"])
+def test_stuck_numeric_topic_owner_shares_existing_active_owner(db, monkeypatch, stuck_status):
+    _live_session(db, "existing", "Meridian Gmail Watcher", 324637)
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:first", topic_name="X")
+    db.set_telegram_topic_owner_active(
+        chat_id="123", owner_key="cron:first", thread_id="324637", topic_name="X")
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:second", topic_name="X")
+    if stuck_status != "creating":
+        db.set_telegram_topic_owner_state(
+            chat_id="123", owner_key="cron:second", status=stuck_status,
+            canonical_owner_key="cron:first")
+    if stuck_status == "retired":
+        monkeypatch.setattr(db, "get_telegram_topic_owner_for_thread", lambda **_: None)
+
+    _adapter(db).ensure_existing_telegram_topic_owner("123", "324637", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == "active"
+    assert second["thread_id"] is None
+    assert second["canonical_owner_key"] == "cron:first"
+
+
+def test_racing_first_numeric_topic_claim_shares_after_activation_conflict(db, monkeypatch):
+    _live_session(db, "existing", "Meridian Gmail Watcher", 324637)
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:first", topic_name="X")
+    db.set_telegram_topic_owner_active(
+        chat_id="123", owner_key="cron:first", thread_id="324637", topic_name="X")
+    original = db.get_telegram_topic_owner_for_thread
+    calls = 0
+
+    def hide_owner_for_first_race_check(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return original(**kwargs)
+
+    monkeypatch.setattr(db, "get_telegram_topic_owner_for_thread", hide_owner_for_first_race_check)
+    _adapter(db).ensure_existing_telegram_topic_owner("123", "324637", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == "active"
+    assert second["thread_id"] is None
+    assert second["canonical_owner_key"] == "cron:first"
+
+
+def test_conflicting_activation_retires_creating_claim(db):
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:first", topic_name="X")
+    db.set_telegram_topic_owner_active(
+        chat_id="123", owner_key="cron:first", thread_id="324637", topic_name="X")
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:second", topic_name="X")
+
+    with pytest.raises(RuntimeError, match="already owned"):
+        db.set_telegram_topic_owner_active(
+            chat_id="123", owner_key="cron:second", thread_id="324637", topic_name="X")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == "conflict"
+
+
+def _two_owned_threads(db):
+    _live_session(db, "first-session", "First", 100)
+    _live_session(db, "third-session", "Third", 200)
+    for owner_key, thread_id in (("cron:first", "100"), ("cron:third", "200")):
+        db.reserve_telegram_topic_owner(chat_id="123", owner_key=owner_key, topic_name="X")
+        db.set_telegram_topic_owner_active(
+            chat_id="123", owner_key=owner_key, thread_id=thread_id, topic_name="X")
+
+
+def test_shared_owner_is_refused_on_thread_held_by_another_owner(db):
+    _two_owned_threads(db)
+    adapter = _adapter(db)
+    adapter.ensure_existing_telegram_topic_owner("123", "100", "cron:second")
+
+    with pytest.raises(RuntimeError, match="refusing reroute"):
+        adapter.ensure_existing_telegram_topic_owner("123", "200", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["canonical_owner_key"] == "cron:first"
+
+
+@pytest.mark.parametrize("stuck_status", ["conflict", "retired"])
+def test_stuck_owner_is_refused_on_thread_held_by_unrelated_owner(db, stuck_status):
+    _two_owned_threads(db)
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:second", topic_name="X")
+    db.set_telegram_topic_owner_state(
+        chat_id="123", owner_key="cron:second", status=stuck_status,
+        canonical_owner_key="cron:first")
+
+    with pytest.raises(RuntimeError, match="refusing reroute"):
+        _adapter(db).ensure_existing_telegram_topic_owner("123", "200", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == stuck_status
+    assert second["canonical_owner_key"] == "cron:first"
+
+
+@pytest.mark.parametrize("stuck_status", ["conflict", "retired"])
+def test_stuck_owner_without_canonical_is_not_bound_to_thread_owner(db, stuck_status):
+    _two_owned_threads(db)
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:second", topic_name="X")
+    db.set_telegram_topic_owner_state(
+        chat_id="123", owner_key="cron:second", status=stuck_status)
+
+    with pytest.raises(RuntimeError, match="refusing reroute"):
+        _adapter(db).ensure_existing_telegram_topic_owner("123", "200", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == stuck_status
+    assert not second["canonical_owner_key"]
+
+
+def test_creating_reservation_for_another_topic_is_not_shared_onto_owned_thread(db):
+    _two_owned_threads(db)
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:second", topic_name="Other lane")
+
+    with pytest.raises(RuntimeError, match="refusing reroute"):
+        _adapter(db).ensure_existing_telegram_topic_owner("123", "200", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == "creating"
+    assert not second["canonical_owner_key"]
 
 
 def test_numeric_topic_without_binding_fails_closed(db):
