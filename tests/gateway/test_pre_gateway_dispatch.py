@@ -271,7 +271,7 @@ async def test_webhook_delivery_fires_the_hook_once_at_ingress_before_commit():
         return {"action": "rewrite", "text": "rewritten"} if "rewrite" in event.text else None
 
     manager = get_plugin_manager()
-    manager._discovered = True
+    manager._discovered = manager._discovery_complete = True
     manager._hooks.setdefault("pre_gateway_dispatch", []).append(hook)
     adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={"secret": "owned-secret", "routes": {
         "fixture": {"prompt": "{text}"}}}))
@@ -317,7 +317,7 @@ def _rewriting_hook(fired):
         return {"action": "rewrite", "text": "rewritten"} if "rewrite" in event.text else None
 
     manager = get_plugin_manager()
-    manager._discovered = True
+    manager._discovered = manager._discovery_complete = True
     manager._hooks.setdefault("pre_gateway_dispatch", []).append(hook)
 
 
@@ -365,7 +365,7 @@ async def test_a_resend_whose_raw_payload_changed_conflicts_even_when_its_prompt
         return {"action": "rewrite", "text": event.raw_message["detail"].replace("blank", "")}
 
     manager = get_plugin_manager()
-    manager._discovered = True
+    manager._discovered = manager._discovery_complete = True
     manager._hooks.setdefault("pre_gateway_dispatch", []).append(hook)
     adapter, app = _webhook_app(prompt="{action}")
     async with TestClient(TestServer(app)) as client:
@@ -642,7 +642,7 @@ async def test_an_identical_webhook_delivery_waits_for_the_running_hook_and_gets
         return {"action": "rewrite", "text": "rewritten"}
 
     manager = get_plugin_manager()
-    manager._discovered = True
+    manager._discovered = manager._discovery_complete = True
     manager._hooks.setdefault("pre_gateway_dispatch", []).append(hook)
     admit = ingress.admit_producer
 
@@ -713,7 +713,7 @@ async def test_a_relay_media_delivery_no_admission_owns_retains_no_bytes(
         return verdict
 
     manager = get_plugin_manager()
-    manager._discovered = True
+    manager._discovered = manager._discovery_complete = True
     manager._hooks.setdefault(hook_name, []).append(hook)
     admit = ingress.admit_producer
 

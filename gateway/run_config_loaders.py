@@ -14,7 +14,7 @@ import os
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 from gateway.config import Platform
 from gateway.restart import (
@@ -254,10 +254,14 @@ class GatewayConfigLoadersMixin:
         if not session_key:
             return None
         self._apply_pending_bulk_reset_if_idle(session_key)
-        _r_state = self._peek_session_state(session_key)
-        if _r_state is not None and _r_state.conversation.reasoning_override is not None:
-            return _r_state.conversation.reasoning_override
-        # After a gateway restart the in-memory pick is gone; rehydrate it from the routing entry
+        state_loader = getattr(self, "_peek_session_state", None)
+        state = state_loader(session_key) if callable(state_loader) else None
+        conversation = getattr(state, "conversation", None)
+        value = getattr(conversation, "reasoning_override", None)
+        if value is not None:
+            return value
+        return (getattr(self, "_session_reasoning_overrides", None) or {}).get(session_key)
+
         # (written through by _set_session_reasoning_override), the same way /model overrides are.
         store = getattr(self, "session_store", None)
         if store is None:
@@ -340,7 +344,16 @@ class GatewayConfigLoadersMixin:
         conversation.service_tier_override_expiry_seconds = 0.0
         from agent.fast_mode import STATIC_TIERS
         if not clear and service_tier in STATIC_TIERS:
-            seconds = self._load_fast_expiry_seconds() if expiry_seconds is None else expiry_seconds
+            if expiry_seconds is None:
+                loader = getattr(self, "_load_fast_expiry_seconds", None)
+                if not callable(loader):
+                    loader = type(self)._load_fast_expiry_seconds if hasattr(type(self), "_load_fast_expiry_seconds") else None
+                if not callable(loader):
+                    from gateway.run_config_loaders import GatewayConfigLoadersMixin
+                    loader = GatewayConfigLoadersMixin._load_fast_expiry_seconds
+                seconds = float(cast(float, loader()))
+            else:
+                seconds = expiry_seconds
             if seconds > 0:
                 conversation.service_tier_override_expires_at = time.time() + seconds
                 conversation.service_tier_override_expiry_seconds = seconds

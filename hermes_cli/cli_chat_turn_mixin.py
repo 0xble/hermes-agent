@@ -92,9 +92,7 @@ class CLIChatTurnMixin:
         message = self._chat_route_images(message, images)
 
         if isinstance(message, str) and not isinstance(message, TimelineNotification):
-            message, blocked = self._chat_expand_context_references(message)
-            if blocked is not None:
-                return blocked
+            # ``@`` references are expanded once, by the gateway, against this session's cwd.
             # Lone surrogates (rich-text clipboard paste) crash the OpenAI SDK's JSON serialization.
             from agent.message_sanitization import _sanitize_surrogates
             message = _sanitize_surrogates(message)

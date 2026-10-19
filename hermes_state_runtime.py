@@ -674,12 +674,12 @@ def _worker_turn(db, conn, session_id, payload, operation):
     import time
     from hermes_state_compression import _claim_lease_row
     from hermes_state import _compression_lock_holder_process_is_dead
-    allowed = {'holder'} if operation == 'turn.release' else {'holder', 'ttl_seconds'}
+    allowed = {'holder'} if operation in ('turn.release', 'turn.expires') else {'holder', 'ttl_seconds'}
     if set(payload) != allowed:
         raise RuntimeStoreError('invalid_params')
     holder = _text(payload['holder'])
     ttl = payload.get('ttl_seconds', 300)
-    if type(ttl) not in (float, int) or not 0.1 <= ttl <= 3600:
+    if operation not in ('turn.release', 'turn.expires') and (type(ttl) not in (float, int) or not 0.1 <= ttl <= 3600):
         raise RuntimeStoreError('invalid_params')
     key = db._session_turn_lease_key_on_conn(conn, session_id)
     now = time.time()
@@ -690,6 +690,10 @@ def _worker_turn(db, conn, session_id, payload, operation):
     elif operation == 'turn.renew':
         value = conn.execute('UPDATE session_turn_leases SET expires_at=? WHERE conversation_id=? AND holder=?',
                              (now + ttl, key, holder)).rowcount > 0
+    elif operation == 'turn.expires':
+        row = conn.execute('SELECT expires_at FROM session_turn_leases WHERE conversation_id=? AND holder=?',
+                           (key, holder)).fetchone()
+        value = float(row[0]) if row else None
     else:
         conn.execute('DELETE FROM session_turn_leases WHERE conversation_id=? AND holder=?', (key, holder))
         value = None
@@ -752,7 +756,7 @@ def mutate_worker_execution(db, *, epoch, execution_id, session_id, generation,
         'usage.main': _worker_usage,
         'usage.auxiliary': lambda db, conn, sid, p: _worker_usage(db, conn, sid, p, auxiliary=True),
         **{name: (lambda db, conn, sid, p, op=name: _worker_turn(db, conn, sid, p, op))
-           for name in ('turn.acquire', 'turn.renew', 'turn.release')},
+           for name in ('turn.acquire', 'turn.renew', 'turn.release', 'turn.expires')},
     }
     return apply_worker_receipt(db, epoch=epoch, execution_id=execution_id, session_id=session_id,
                                 generation=generation, sequence=sequence, operation=operation,

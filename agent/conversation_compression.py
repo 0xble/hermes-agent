@@ -1020,7 +1020,8 @@ def _run_pinned_compression_retry(
 ) -> Optional[tuple[list, str]]:
     """One bounded re-run of ``worker`` with ``route`` pinned; ``None`` when it produced no compression."""
     deterministic = route.get("deterministic") is True
-    if not deterministic and time.monotonic() >= precommit_deadline_monotonic:
+    if (not deterministic and precommit_deadline_monotonic is not None
+            and time.monotonic() >= precommit_deadline_monotonic):
         logger.info(
             "Skipping compression stall fallback on %s: the shared pre-commit ceiling is spent", route["label"],
         )
@@ -1356,8 +1357,13 @@ def run_compress_context_with_progress_timeout(
             recovered = _retry_compression_on_fallback_chain(
                 worker=fallback_worker or worker, messages=messages, system_prompt_fallback=system_prompt_fallback,
                 idle_timeout_seconds=idle, total_ceiling_seconds=ceiling,
-                # Prompt reading moves the fence deadline after the primary armed it.
-                precommit_deadline_monotonic=fence.deadline_monotonic or precommit_deadline_monotonic,
+                # Prompt reading can extend the fence deadline. A worker-first route abort may
+                # instead leave a deliberately expired fence, which is not the shared retry budget.
+                precommit_deadline_monotonic=(
+                    precommit_deadline_monotonic
+                    if fence.route_deadline_aborted
+                    else (fence.deadline_monotonic or precommit_deadline_monotonic)
+                ),
                 on_commit_overrun=on_commit_overrun,
                 on_timeout_cause=on_timeout_cause, telemetry_agent=telemetry_agent, new_fence=new_fence,
                 escalate_deterministic=escalate_deterministic,
@@ -3431,6 +3437,24 @@ def _warn_summary_or_aux_fallback(agent: Any) -> None:
                 f"ℹ Configured compression model '{_aux_fail_model}' failed, so Hermes summarised "
                 "with your main model instead. Check auxiliary.compression.model in your config."
             )
+
+
+def _reset_read_dedup_caches(task_id: str, *, session_id: str = "") -> None:
+    """Advance the file-read and skill_view repeat-read dedup to a fresh generation after a boundary.
+    The mtime map is kept: the first read of each unchanged key returns full content compaction may have
+    omitted; later reads return stubs, and stub-hit counters restart at the same boundary (#84857).
+    The computer_use screenshot dedup is session-keyed and forgets its last frame for the same reason.
+    """
+    with contextlib.suppress(Exception):
+        from tools.file_tools_read_tracking import reset_file_dedup
+        reset_file_dedup(task_id)
+    if session_id:
+        with contextlib.suppress(Exception):
+            from tools.computer_use.tool import reset_screenshot_dedup
+            reset_screenshot_dedup(session_id)
+    with contextlib.suppress(Exception):
+        from tools.skills_tool import reset_skill_view_dedup
+        reset_skill_view_dedup(task_id)
 
 
 def _finish_compaction_boundary(

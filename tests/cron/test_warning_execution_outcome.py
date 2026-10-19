@@ -5,6 +5,18 @@ from cron import executions, incidents, jobs, scheduler
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 
 
+
+def delivery_queue_rows():
+    """Read durable delivery rows for queue-lane diagnostics."""
+    from cron.delivery_queue import _connect
+
+    conn = _connect()
+    try:
+        return [dict(r) for r in conn.execute("SELECT execution_id, status FROM deliveries")]
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("worker, job_id, adapters, platforms, expected", [
     ("run-1", "run-1", None, ["telegram"], True),
     ("run-1", "run-2", None, ["telegram"], False),

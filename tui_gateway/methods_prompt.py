@@ -1173,13 +1173,7 @@ def _(rid, params: dict) -> dict:
             _PREVIEW_RESTART_HISTORY_NOTE if parent_history else None,
             *_PREVIEW_RESTART_RULES]
         if line)
-    # A malformed client path (embedded NUL, etc.) is "no validated cwd".
-    try:
-        preview_cwd = os.path.abspath(os.path.expanduser(cwd)) if cwd else ""
-        if preview_cwd and not os.path.isdir(preview_cwd):
-            preview_cwd = ""
-    except Exception:
-        preview_cwd = ""
+    preview_cwd = _validated_preview_cwd(cwd)
 
     def body():
         from run_agent import AIAgent
@@ -1351,6 +1345,18 @@ def _final_response_text(result) -> str:
     return render_copy_blocks_inline(text or "")
 
 
+def _validated_preview_cwd(cwd: str) -> str:
+    """The client's cwd as an existing absolute directory, else ``""``. A malformed client path
+    (embedded NUL, a missing dir) is "no validated cwd", never an error."""
+    import os
+
+    try:
+        preview_cwd = os.path.abspath(os.path.expanduser(cwd)) if cwd else ""
+        return preview_cwd if preview_cwd and os.path.isdir(preview_cwd) else ""
+    except (OSError, ValueError):
+        return ""
+
+
 def _spawn_side_agent(
     rid, session, task_id, parent, event, body, *, cwd="", extra=None, cleanup=None):
     """Run ``body()`` on a daemon thread under the session's profile home (the ContextVar
@@ -1418,6 +1424,14 @@ _PREVIEW_RESTART_RULES = (
 _PREVIEW_RESTART_HISTORY_NOTE = (
     "The conversation history above is from the user's main session — including the commands you (the assistant) previously ran to start servers, edit files, or check ports. Use it to figure out exactly which server should be running at this Preview URL. The user did not start a brand new task; recover what they had working."
 )
+
+
+def _preview_restart_prompt(url: str, cwd: str, context: str, has_history: bool) -> str:
+    return "\n".join(line for line in [
+        "The desktop preview pane cannot load a local server URL.", f"Preview URL: {url.strip()}",
+        f"Current working directory: {cwd or '(unknown)'}",
+        f"Preview console:\n{context}" if context else "",
+        _PREVIEW_RESTART_HISTORY_NOTE if has_history else "", *_PREVIEW_RESTART_RULES] if line)
 
 
 # ── batch clarify locks ─────────────────────────────────────────────────────

@@ -21,11 +21,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
 from agent.i18n import t
+from agent.retry_utils import jittered_backoff
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
+from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
 )
@@ -33,6 +35,47 @@ from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixi
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _local_completion_card(evt: dict) -> dict[str, str]:
+    """Build the local async-result card for a completion or liveness notice."""
+    from tools.process_registry_notifications import (
+        PROCESS_COMPLETE_DISPLAY_KIND, async_delegation_display_text, process_completion_display_text)
+    evt_type = evt.get("type", "completion")
+    if evt_type == "completion":
+        return {"display_kind": PROCESS_COMPLETE_DISPLAY_KIND,
+                "display_text": evt.get("_display_text") or process_completion_display_text([evt])}
+    if evt_type == "async_delegation":
+        return {"display_kind": "async_delegation_complete", "display_text": async_delegation_display_text(evt)}
+    if evt_type == "heartbeat":
+        from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
+        from tools.process_registry_notifications import heartbeat_display_text
+        return {"display_kind": INTERNAL_NOTIFICATION_DISPLAY_KIND, "display_text": heartbeat_display_text(evt)}
+    return {}
+
+
+def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
+    """Metadata carried by synthetic watch/completion notifications."""
+    metadata: dict[str, Any] = {"notification_origin": "process_registry_synthetic"}
+    session_key = str(evt.get("session_key") or "").strip()
+    from agent.notification_presentation import diagnostic_process_event
+    if diagnostic_process_event(evt):
+        metadata["notification_category"] = "diagnostic"
+    if session_key.startswith("agent:"):
+        metadata["gateway_session_key"] = session_key
+    parent_session_id = str(evt.get("parent_session_id") or "").strip()
+    if parent_session_id:
+        metadata["gateway_session_id"] = parent_session_id
+    if evt.get("_automation_identities"):
+        metadata["automation_identities"] = evt["_automation_identities"]
+    if source.platform == Platform.LOCAL:
+        metadata.update(_local_completion_card(evt))
+    proven_session_id = str(evt.get("proven_session_id") or "").strip()
+    if proven_session_id:
+        metadata["gateway_proven_session_id"] = proven_session_id
+    if completion_ids := evt.get("completion_ids"):
+        metadata["gateway_completion_ids"] = list(completion_ids)
+    return metadata
 
 # A failed /update leaves the previous version running; the full pip/git log stays on the host
 # (`hermes update` re-runs it in the terminal) and only a short tail is quoted in chat.
@@ -84,6 +127,11 @@ def _bounded_update_notice(text: str) -> str:
     return text[:_UPDATE_MAX_NOTICE_CHARS - 1].rstrip() + "…"
 
 
+def _update_output_tail(output: str, limit: int) -> str:
+    """Last ``limit`` chars of an update log, prefixed with an ellipsis when cut."""
+    return output if len(output) <= limit else "…" + output[-limit:]
+
+
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
     """Notice-dedupe key for one SERVED profile's home channel.
 
@@ -111,11 +159,6 @@ def _safe_delivery_transport(platform, config, adapters, *, profile: Optional[st
         return None
 
 
-def _update_output_tail(output: str, limit: int) -> str:
-    """Last ``limit`` chars of an update log, prefixed with an ellipsis when cut."""
-    return output if len(output) <= limit else "…" + output[-limit:]
-
-
 _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
 # Routing fields copied verbatim from a process watcher onto its synthetic completion event.
 _WATCHER_ROUTE_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id", "user_name")
@@ -123,6 +166,9 @@ _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 # Storage causes that clear on their own (one session's lease/compression, not the store): the
 # home-channel notice appends the operator restart tail for every OTHER cause.
 _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease"})
+# Process-watcher retries of a refused completion: ~5 min at the default 5 s check interval.
+_MAX_COMPLETION_INJECTION_ATTEMPTS = 8
+_COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
 
 INTERNAL_NOTIFICATION_FOOTER = (
     "[INTERNAL NOTIFICATION — generated by the Hermes gateway, not written by a human user. "
@@ -185,7 +231,7 @@ def _media_send_succeeded(result) -> bool:
     return bool(getattr(result, "success", False))
 
 
-class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
+class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
     # Coalescing keys. Both partition by the spawning session (``parent_session_id``): a batch is
@@ -345,41 +391,6 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             tasks.pop(key, None)
         if releases.get(key) is release:
             releases.pop(key, None)
-
-    @dataclasses.dataclass
-    class _UpdatePaths:
-        """Marker files ``hermes update --gateway`` and its watcher exchange under HERMES_HOME."""
-
-        pending: Path
-        claimed: Path
-        output: Path
-        exit_code: Path
-        prompt: Path
-        response: Path
-
-        def any_pending(self) -> bool:
-            return self.pending.exists() or self.claimed.exists()
-
-        def unlink_all(self) -> None:
-            for p in (self.pending, self.claimed, self.output, self.exit_code, self.prompt, self.response):
-                p.unlink(missing_ok=True)
-
-    @dataclasses.dataclass
-    class _UpdateTarget:
-        """Resolved delivery target for update watcher messages."""
-
-        adapter: Any
-        chat_id: Any
-        session_key: Optional[str]
-        metadata: Any
-        platform: Any
-
-        def send_metadata(self):
-            from gateway.run import _non_conversational_metadata
-            return _non_conversational_metadata(self.metadata, platform=self.platform)
-
-        async def send(self, text: str):
-            return await self.adapter.send(self.chat_id, text, metadata=self.send_metadata())
 
     @dataclasses.dataclass
     class _CompletionClaim:
@@ -1575,14 +1586,19 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                     continue
                 if self._load_background_notifications_mode() == "off":
                     continue
-                synth_text = _format_gateway_process_notification(evt)
-                if not synth_text:
-                    continue
-                try:
-                    delivered = await self._inject_watch_notification(synth_text, evt)
-                except Exception:
-                    logger.exception("Watch notification injection error")
-                    delivered = False
+                if evt.get("type") == "heartbeat":
+                    from gateway.session_automation import deliver_heartbeat
+                    delivered = await deliver_heartbeat(self, evt)
+                else:
+                    synth_text = _format_gateway_process_notification(evt)
+                    if not synth_text:
+                        continue
+                    try:
+                        delivered = await self._inject_watch_notification(synth_text, evt)
+                    except Exception:
+                        logger.exception("Watch notification injection error")
+                        delivered = False
+            # The original event: a requeued tick folds again from what is still queued.
             if delivered is False:
                 completion_queue.put(evt)
 
@@ -1727,7 +1743,6 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
             return await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
         try:
-            metadata: dict[str, Any] = {"notification_origin": "process_registry_synthetic"}
             synth_text = _mark_internal_notification(synth_text)
             session_key = str(evt.get("session_key") or "").strip()
             from agent.notification_presentation import diagnostic_process_event
@@ -1787,7 +1802,9 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 return self._preserve_drain_event(self._session_key_for_source(source), synth_event)
             await admit_internal_event(adapter, synth_event)
             return True
-        except WakeNotAccepted:
+        except WakeNotAccepted as exc:
+            logger.warning("Watch notification not admitted for %s chat=%s: %s",
+                           platform_name, source.chat_id, exc)
             # Durable callers refund the claim; ordinary watch callers just requeue.
             if raise_not_accepted:
                 raise
@@ -1822,6 +1839,10 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 task_idx = ((evt.get("results") or [{}])[0] or {}).get("task_index", "")
                 return (evt_type, producer_id, f"task_failure:{task_idx}")
             return (evt_type, producer_id, "")
+        # A liveness tick is one watch event like a match: without an identity the session authority
+        # refuses it and the drain requeues it forever.
+        if evt_type in {"watch_match", "watch_disabled", "heartbeat"} and evt.get("event_id"):
+            return (evt_type, str(evt["session_id"]), str(evt["event_id"]))
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
             started_at = evt.get("started_at")
@@ -1910,7 +1931,11 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             parent_session_id, entry.session_id if entry else "",
         )
         target_session_id = parent_session_id
-        if verdict == "deliver" and parent is not None and parent.get("ended_at"):
+        # A local conversation a viewer closed keeps its own work as a note on its closed tip (#134889 LC-7).
+        closed_tip = await self._closed_local_target(session_db, entry, parent_session_id, parent)
+        if closed_tip:
+            verdict, target_session_id = "deliver", closed_tip
+        elif verdict == "deliver" and parent is not None and parent.get("ended_at"):
             end_reason = str(parent.get("end_reason") or "")
             if end_reason != "compression":
                 # Only a USER-closed session (/new, user_exit, session_switch) is unreachable; idle/timeout
@@ -2128,6 +2153,11 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             claim = await self._preflight_completion_delivery(evt, claim)
             if not claim.proceed:
                 return claim.early_result
+            if getattr(self, 'session_authority', None) is not None:
+                from gateway.session_automation import completion_admission
+                if completion_admission(self, evt) is not None:
+                    accepted = True  # Lost ACK: finish durable claims, never infer again.
+                    return True
             if identity is not None:
                 if self._completion_identity_state(identity, claim=True) != "claimed":
                     return None
@@ -2496,10 +2526,16 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                     outcomes.append(await self._deliver_completion_notification(text, evt))
             return False if False in outcomes else True
         deliverable: list[tuple[dict, str]] = []
+        acknowledged = False
         for evt in group:
             synth_text = _format_gateway_process_notification(evt)
             if not synth_text:
                 continue
+            if getattr(self, 'session_authority', None) is not None:
+                from gateway.session_automation import completion_admission
+                if completion_admission(self, evt) is not None:
+                    acknowledged = await self._deliver_completion_notification(synth_text, evt) is True or acknowledged
+                    continue
             parent = str(evt.get("parent_session_id") or "")
             if parent and await self._classify_completion_target(parent, str(evt.get("session_key") or "")) == "terminal":
                 await self._deliver_completion_notification(synth_text, evt)
@@ -2509,7 +2545,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 continue
             deliverable.append((evt, synth_text))
         if not deliverable:
-            return None
+            return True if acknowledged else None
         if len(deliverable) == 1:
             evt, synth_text = deliverable[0]
             return await self._deliver_completion_notification(synth_text, evt)
@@ -2538,6 +2574,10 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             "response. If a result does not change the current conclusion, absorb it silently.]"
         )
         consolidated = "\n\n".join([header, *blocks])
+        if getattr(self, 'session_authority', None) is not None:
+            from gateway.session_automation import producer_identity
+            primary_evt = dict(primary_evt, _automation_identities=[
+                producer_identity(self, event) for event in [primary_evt, *(e for e, _ in siblings)]])
         delivered = await self._deliver_completion_notification(
             consolidated, primary_evt, sibling_claims=siblings,
         )

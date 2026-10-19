@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import asyncio
 import concurrent.futures
+import dataclasses
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
 from gateway.run_common import _UNSET
 from gateway.run_inbound_media import rehome_inbound_media
+from gateway.run_inbound_hooks import GatewayInboundHooksMixin
 from gateway.run_loop_wake import GatewayLoopWakeMixin, _CommandDispatch, _CommandHandled
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
 from gateway.run_inbound_unauthorized import (
@@ -106,45 +108,38 @@ async def _admit_outbox_event(runner, event, source):
         bind_turn(home, turn_id)
 
 
-class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
+class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
+
+    async def _hm_stop_owner_turn(self, _quick_key: str) -> None:
+        """Messaging /stop and /new act on the authority's turn and drop queued messaging rows."""
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        sid = authority.logical_owner(self.session_store.peek_session_id(_quick_key)) if authority else None
+        if not sid or sid not in authority.sessions:
+            return
+        from gateway.session_contract import Principal, SessionRef
+        from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+        ref = SessionRef(authority.profile_id, sid)
+        actor = Principal('messaging-control', authority.profile_id,
+                          frozenset({'session:submit', 'session:control'}), 'busy-command')
+        rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid)
+        paused = any(row['status'] == 'unknown' for row in rows)
+        for row in [] if paused else rows:
+            if row['status'] == 'queued' and row['principal_id'].startswith('messaging:'):
+                with suppress(RuntimeStoreError):
+                    await authority.cancel_queued(actor, ref, row['admission_id'])
+        handle = authority._handle(ref)
+        if handle.execution_state == 'running':
+            with suppress(RuntimeStoreError):
+                await authority.interrupt(actor, ref, handle.execution_generation)
 
     async def _hm_pre_gateway_dispatch_hook(
         self, event: "MessageEvent", source: SessionSource
     ) -> Optional["MessageEvent"]:
         """Gate ingress before auth: skip drops; rewrite replaces text; allow/None dispatches."""
-        from hermes_cli.plugins import PluginDiscoveryIncomplete
-        try:
-            from hermes_cli.lifecycle import ainvoke_hook as _ainvoke_hook
-            _hook_results = await _ainvoke_hook(
-                "pre_gateway_dispatch", event=event, gateway=self,
-                session_store=getattr(self, "session_store", None),  # bare runners omit __init__
-            )
-        except PluginDiscoveryIncomplete:
-            raise  # A discovery timeout is not an allow decision; leave dispatch unadmitted.
-        except Exception as _hook_exc:
-            logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-            _hook_results = []
-
-        for _result in _hook_results:
-            if not isinstance(_result, dict):
-                continue
-            _action = _result.get("action")
-            if _action == "skip":
-                logger.info(
-                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                    _result.get("reason"), source.platform.value if source.platform else "unknown",
-                    source.chat_id or "unknown",
-                )
-                return None
-            if _action == "rewrite":
-                _new_text = _result.get("text")
-                if isinstance(_new_text, str):
-                    event.text = _new_text
-                break
-            if _action == "allow":
-                break
-        return event
+        from gateway.run_inbound_hooks import GatewayInboundHooksMixin
+        return await GatewayInboundHooksMixin._hm_pre_gateway_dispatch_hook(self, event, source)
 
     async def _hm_offer_pairing_code(self, source: SessionSource) -> None:
         """DM an unauthorized sender a pairing code (rate-limited; groups never reach here)."""
@@ -702,6 +697,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 if _resolved_idle is not None:
                     _stale_idle = _resolved_idle
                     _activity_summary_valid = True
+                    # Host sleep is not idleness: share the turn poll loop's meter (same event loop).
+                    _awake_idle = getattr(_quick_state.turn.ctx, "awake_idle", None)
+                    if _awake_idle is not None:
+                        _stale_idle = _awake_idle.measure(_stale_idle)
                 _stale_detail = (
                     f" | last_activity={_sa_d.get('last_activity_desc', 'unknown')} "
                     f"({_stale_idle:.0f}s ago) "
@@ -1653,6 +1652,59 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             finally:
                 restore_turn(token)
 
+    async def _hm_busy_preempt(self, event: MessageEvent, source: SessionSource, _quick_key: str) -> bool:
+        """busy_input_mode for a follow-up the durable FIFO is about to admit, through main's own busy
+        resolution (voice transcribed into steer/interrupt, steer folded into the turn, busy ack).
+        Returns True when the text already landed inside the running turn (steer / redirect), so it
+        must NOT also be admitted as its own turn; False when the caller should admit it (queue mode,
+        a demotion, or an interrupt — the ended turn lets the FIFO run the follow-up next)."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        mode = self._effective_busy_input_mode(source)
+        state = self._peek_session_state(_quick_key)
+        running_agent = state.turn.agent if state else None
+        adapter = self._delivery_adapter_for(source)
+        if (self._draining or adapter is None or running_agent is None or running_agent is _AGENT_PENDING_SENTINEL
+                or (event.message_type == MessageType.TEXT and mode != "steer"
+                    and self._effective_busy_text_mode(source) == "queue")):
+            return False
+        outcome = await self._resolve_busy_steer_or_redirect(event, _quick_key, mode, running_agent)
+        await self._busy_interrupt_and_ack(event, _quick_key, adapter, state, running_agent, outcome)
+        return bool(outcome.steered or outcome.redirected)
+
+    async def _hm_authority_admission(
+        self, event: MessageEvent, source: SessionSource, _quick_key: str, is_internal: bool,
+    ) -> tuple[bool, Optional[str]]:
+        """``(True, reply)`` when the routed profile's session authority owned this message
+        (preempted, plugin-consumed or admitted to its durable FIFO); ``(False, None)`` to continue
+        on the in-process path. Raises ``RuntimeStoreError('profile_mismatch')`` for a scope this
+        process does not serve."""
+        # The message handler entered the routed profile's scope; its authority owns this turn.
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        if authority is not None and not event.get_command() and not is_internal:
+            from gateway.session_ingress import admit_message, executing_admission
+            if not executing_admission.get():
+                # The durable FIFO only orders turns; busy_input_mode still decides what a follow-up
+                # does to the RUNNING one (steer into it, redirect it, or end it so the FIFO advances).
+                # Without this, ``interrupt`` degrades to ``queue`` behind a turn that may hang for
+                # its whole request timeout.
+                # A bare "yes"/"no" to a blocking dangerous-command approval answers it (#46866):
+                # never an interrupt (read as deny) nor a queued turn (auto-deny deadlock).
+                if self._is_session_running(_quick_key) and (
+                        await self._route_plaintext_approval_while_busy(event, _quick_key)
+                        or await self._hm_busy_preempt(event, source, _quick_key)):
+                    return True, None
+                _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
+                if _consumed:
+                    return True, _consumer_reply
+                return True, await admit_message(authority, event)
+        if (authority is None and not is_internal and not event.get_command()
+                and getattr(self, 'session_authority', None) is not None):
+            # Scoped to a home this process does not serve: never fall back to the launch ledger.
+            from hermes_state_runtime import RuntimeStoreError
+            raise RuntimeStoreError('profile_mismatch')
+        return False, None
+
     async def _handle_admitted_message(self, event: MessageEvent) -> Optional[str]:  # health: allow CC -- this is the single ordered admission boundary for session controls and loop wakes.
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
@@ -1685,6 +1737,15 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply
+
+        # Routed profile authorities own non-command external turns. Busy preemption still
+        # applies before durable FIFO admission; the fork's zero-cut busy path remains below
+        # for in-process ownership.
+        _owned, _authority_reply = await self._hm_authority_admission(
+            event, source, _quick_key, is_internal,
+        )
+        if _owned:
+            return _authority_reply
 
         from gateway.zero_cut_busy import handle_local_busy, queue_foreign_owner, _NOT_HANDLED
         if await queue_foreign_owner(self, event, _quick_key):
@@ -2114,32 +2175,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         self, source: SessionSource, session_key: str, message_text: str
     ) -> Optional[str]:
         """Expand ``@`` context references; returns None when the injection was refused (user notified)."""
-        try:
-            from agent.context_references import preprocess_context_references_async
-
-            try:
-                from tools.terminal_scope import terminal_env as _ts_env
-            except ImportError:
-                _ts_env = os.environ.get
-            _msg_cwd = _ts_env("TERMINAL_CWD", os.path.expanduser("~"))
-            _msg_ctx_len = await self._inbound_model_context_length(source, session_key)
-            _ctx_result = await preprocess_context_references_async(
-                message_text, cwd=_msg_cwd, context_length=_msg_ctx_len, allowed_root=_msg_cwd
-            )
-            if _ctx_result.blocked:
-                _adapter = self._delivery_adapter_for(source)
-                if _adapter:
-                    await _adapter.send(
-                        source.chat_id,
-                        "\n".join(_ctx_result.warnings) or t("gateway.notify.context_injection_refused"),
-                    )
-                return None
-            if _ctx_result.expanded:
-                message_text = _ctx_result.message
-        except Exception as exc:
-            logger.warning("@ context reference expansion failed: %s", exc)
-            logger.debug("@ context reference expansion failure detail", exc_info=True)
-        return message_text
+        from gateway.session_context_refs import inbound_references
+        expanded, refusal = await inbound_references(self, source, session_key, message_text)
+        if refusal is None:
+            return expanded
+        _adapter = self._delivery_adapter_for(source)
+        if _adapter:
+            await _adapter.send(source.chat_id, refusal)
+        return None
 
     async def _prepare_inbound_message_text(
         self, *, event: MessageEvent, source: SessionSource, history: list[dict[str, Any]],
@@ -2166,10 +2209,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
-        if "@" in message_text:
-            message_text = await self._expand_inbound_context_references(source, session_key, message_text)
-            if message_text is None:
-                return None
+        from gateway.session_context_refs import turn_references
+        message_text = await turn_references(self, event, source, session_key, message_text)
+        if message_text is None:
+            return None
         # After expansion: the quoted reply is someone else's text and stays literal — an
         # ``@file:`` inside it must never read a local file on the replier's behalf.
         return self._prepend_inbound_reply_context(event, source, message_text)

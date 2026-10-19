@@ -228,6 +228,12 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be finite and positive")
     home = _overlay_owner_home(Path(_canonical_home(profile_home)))
+    # A served secondary may publish a local startup marker while the host multiplexer is already
+    # ready. Prefer the multiplexer's authoritative roster before treating that stale per-profile
+    # marker as the endpoint's state.
+    served = _served_by_multiplexer(home, timeout=timeout)
+    if served is not None:
+        return served
     try:
         return _endpoint(query_identify(home, timeout=timeout), home)
     except (FileNotFoundError, ConnectionRefusedError):

@@ -241,7 +241,7 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
         short = sha[:12]
         identities = [m.group("identity").strip() for m in _TRAILER.finditer(body)]
         if not identities and backfills:
-            patch = _git("show", "--pretty=format:", "--no-ext-diff", sha)
+            patch = _git("-c", "diff.algorithm=histogram", "show", "--pretty=format:", "--no-ext-diff", sha)
             result = subprocess.run(["git", "patch-id", "--stable"], input=patch,
                                     capture_output=True, text=True, check=True).stdout.split()
             if result and result[0] in backfills:

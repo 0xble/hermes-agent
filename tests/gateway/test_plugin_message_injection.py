@@ -548,3 +548,30 @@ async def test_rebound_requester_outcome_is_refused_at_admission(busy):
     assert not runner._overflow_queue(session_key)
     assert adapter._session_tasks.get(session_key) is None
     adapter._message_handler.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_under_a_session_authority_injection_enters_the_durable_fifo(monkeypatch):
+    """With an authority serving the scope, a plugin turn is committed as a trusted producer
+    admission into the session's FIFO; it never runs on the in-process adapter lane, and a
+    refused admission is reported as not routed instead of falling back to that lane."""
+    import gateway.session_authorities as authorities
+    from hermes_state_runtime import RuntimeStoreError
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+    authority = SimpleNamespace(admit_automation=AsyncMock())
+    monkeypatch.setattr(authorities, "active_authority", lambda _runner: authority)
+
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="check the deployment", plugin_id="notify-plugin") is True
+    adapter.handle_message.assert_not_awaited()
+    admitted_adapter, event, identity = authority.admit_automation.await_args.args
+    assert admitted_adapter is adapter and event.internal is True and event.message_id == identity
+    assert event.metadata == {"gateway_session_key": entry.session_key, "gateway_session_id": entry.session_id}
+    assert event.text == "check the deployment" and "notify-plugin" in identity
+
+    authority.admit_automation.side_effect = RuntimeStoreError("not_found")
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="again", plugin_id="notify-plugin") is False
+    adapter.handle_message.assert_not_awaited()

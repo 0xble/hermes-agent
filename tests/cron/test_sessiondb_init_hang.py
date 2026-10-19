@@ -353,3 +353,26 @@ class TestSessionDbEarlyReturnCleanup:
         mock_db_cls.assert_called_once()
         mock_db_cls.return_value.close.assert_called_once()
         mock_agent_cls.assert_not_called()
+
+
+
+def test_owner_store_failure_never_runs_unpersisted_agent(tmp_path, monkeypatch):
+    """An acquisition failure stops before constructing an unpersisted agent."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    job = {"id": "owner-db", "name": "test", "prompt": "hello"}
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch("hermes_state_registry.acquire", side_effect=OSError("store unavailable")), \
+         patch(
+             "hermes_cli.runtime_provider.resolve_runtime_provider",
+             return_value=_RUNTIME,
+         ), \
+         patch("run_agent.AIAgent") as mock_agent_cls:
+        success, _output, response, error = run_job(job)
+
+    assert success is False
+    assert response == ""
+    assert error and "store unavailable" in error
+    mock_agent_cls.assert_not_called()

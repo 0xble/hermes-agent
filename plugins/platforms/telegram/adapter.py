@@ -16,7 +16,7 @@ import sqlite3
 import tempfile
 import time
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set, cast
 from hermes_cli import setup_platforms
 
@@ -211,6 +211,9 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # machinery (delivery ledger, streaming fallback) owns the wait instead of the coroutine pinning its worker
 # — a 97-minute penalty on the boot path froze inbound on every platform (#91969).
 _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
+# Compatibility name retained from the pre-shared-budget implementation; active pacing is owned by
+# ChatOutboundBudget/ChatBudgetRateLimiter above and uses its configured gap.
+_TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS = 1.0
 # Sentinel: cancel typing re-arms for every topic in a chat (chat-level pause carries no metadata).
 _ALL_TOPICS: Any = object()
 # One quick retry for a keep-typing tick shed by lock contention, a timeout or an error; at a 4.5s

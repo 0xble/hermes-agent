@@ -66,7 +66,7 @@ class RuntimeSessionCompressionMixin:
 
     def archive_and_compact(self, session_id, compacted_messages, model_config_patch=None,
                             watermark=None, lock_holder=None, tail_count=0, carried_messages=None,
-                            covered_ids=None, unresolved_held=None):
+                            covered_ids=None, unresolved_held=None, held_messages=None):
         self._session(session_id)
         # A carried message names an exact durable original (its _row_id) to rewind rather than
         # archive (#118900); the owner resolves identities against its own store. Held-row

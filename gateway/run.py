@@ -42,7 +42,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
 from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, copy_identity_fields
 from agent.turn_context import compression_made_progress
-from agent.session_activity import ActivityProvenance
+from agent.session_activity import ActivityProvenance, AwakeIdleMeter
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
@@ -195,6 +195,15 @@ def hygiene_compaction_recovered(
     return compression_made_progress(msg_count, new_count, approx_tokens, new_tokens)
 
 
+def _hygiene_compression_timeout_message(
+    *, total_exhausted: bool, elapsed: float, idle_timeout: float, progress_observed: bool) -> str:
+    """Describe the host timeout that actually ended hygiene compression. Chat users cannot edit
+    model config, so the copy names /compress, /new and `hermes doctor`, never a config key or the
+    raw second counts (those stay in the gateway log)."""
+    lead = t("gateway.compress.hygiene_timeout")
+    if total_exhausted:
+        return lead
+    return lead + t("gateway.compress.hygiene_timeout_doctor_hint")
 def _cached_agent_for_hygiene(gateway, session_key: str):
     """The cached live AIAgent for ``session_key`` (or the pending sentinel / None), read under the cache lock."""
     cache = getattr(gateway, "_agent_cache", None)
@@ -2766,6 +2775,7 @@ def _watch_gateway_turn_inactivity(
     retain the session turn lease forever because every watchdog poll just skips it.
     """
     activity_origin = time.monotonic()
+    awake_idle = AwakeIdleMeter()  # host sleep is not idleness
     while not worker_done.wait(max(0.01, poll_interval)):
         now = time.monotonic()
         idle_seconds = now - activity_origin
@@ -2774,7 +2784,7 @@ def _watch_gateway_turn_inactivity(
             try:
                 reported_idle = agent.get_activity_summary().get("seconds_since_activity")
                 if reported_idle is not None:
-                    idle_seconds = max(0.0, float(reported_idle))
+                    idle_seconds = awake_idle.measure(max(0.0, float(reported_idle)))
                     # Preserve the most recent usable activity clock as the fallback if
                     # a later provider-side diagnostic read raises or returns None.
                     activity_origin = now - idle_seconds
@@ -2898,7 +2908,7 @@ def _teams_pipeline_plugin_enabled() -> bool:
 def _gateway_config_home() -> Path:
     """Return the Hermes home that gateway config reads should use."""
     override = get_hermes_home_override()
-    return Path(override) if override else _hermes_home
+    return Path(override) if override else get_process_hermes_home()
 
 
 def _load_gateway_config(config_path: Path | None = None) -> dict:
@@ -3397,6 +3407,10 @@ class GatewayRunner(
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
     GatewaySessionControlsMixin, GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
+
+    def _adapter_for_source(self, source):
+        """Return the delivery adapter that owns a session source."""
+        return self._delivery_adapter_for(source)
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
     _busy_input_mode: str = "interrupt"
@@ -4242,6 +4256,11 @@ class GatewayRunner(
         # True keeps CLI/unknown paths working; stateless adapters (api_server) declare False.
         _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        # An admitted API turn carries its session-history provenance and rebound browser-controller
+        # identity in the execution context. Every other platform leaves both undeclared.
+        from gateway.session_api_turn import api_session_vars
+        _api_vars = api_session_vars()
+        _history_delivery = _api_vars.pop("session_history_delivery", None)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -4261,7 +4280,7 @@ class GatewayRunner(
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
-            cron_session="")
+            cron_session="", session_history_delivery=_history_delivery, **_api_vars)
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
@@ -5916,10 +5935,15 @@ async def _start_gateway_shutdown_tail(
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
-                        verbosity: Optional[int] = 0, force: bool = False) -> bool:
-    """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
-    systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
-    deadlocks); ``force`` starts without consulting the host owner at all."""
+                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
+    """Run the maintained bootstrap lifecycle through the public runner facade."""
+    from gateway.run_bootstrap import start_gateway as bootstrap
+    return await bootstrap(config, replace, verbosity, force, idle_exit)
+
+
+async def _start_gateway_impl(config: Optional[GatewayConfig] = None, replace: bool = False,
+                              verbosity: Optional[int] = 0, force: bool = False) -> bool:
+    """Legacy in-module lifecycle retained for compatibility with older direct callers."""
     os.environ["HERMES_EXEC_ASK"] = "1"
 
     configured_cwd = os.environ.get("TERMINAL_CWD", "")

@@ -42,8 +42,10 @@ def current_session_tool_scope():
 
 
 def _session_slot_key():
-    """Key the current execution overlay exactly as registration keys profile scopes."""
+    """The overlay slot key for the current session scope: writes go through ``normalize_scope``
+    (``register``/``deregister``), so reads must key the same way or the overlay is invisible."""
     return normalize_scope(_session_tool_scope.get())
+
 
 # Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
 _MAX_TOOL_ERROR_CHARS = 2048
@@ -121,6 +123,15 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> list[str]:
     per-file AST scan costs ~145 ms over ~100 files, so verdicts are memoized on disk keyed
     by ``(mtime_ns, size)``; a mismatch or corrupt cache re-scans that file. The write is
     best-effort and atomic, so concurrent processes race harmlessly."""
+    from agent.safe_worker_policy import safe_worker_enabled
+    if safe_worker_enabled():
+        # Toolset filtering happens AFTER import. Keep the troubleshooting worker's
+        # import graph closed over reviewed core tools, not plugin-backed wrappers
+        # or a profile-writable discovery cache. Core approval/redaction stay intact.
+        module_names = ["tools.file_tools", "tools.terminal_tool", "tools.process_registry"]
+        for module_name in module_names:
+            importlib.import_module(module_name)
+        return module_names
     tools_path = (Path(tools_dir) if tools_dir is not None else Path(__file__).resolve().parent).resolve()
     cache = _load_discovery_cache()
     fresh_cache: dict[str, list] = {}

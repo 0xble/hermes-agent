@@ -368,6 +368,12 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self._session(session_id)
         return self._apply('turn.renew', {'holder': holder, 'ttl_seconds': ttl_seconds})['value']
 
+    def session_turn_lease_expires_at(self, session_id, holder):
+        if not session_id or not holder:
+            return None
+        self._session(session_id)
+        return self._apply('turn.expires', {'holder': holder})['value']
+
     def release_session_turn_lease(self, session_id, holder):
         # DurableTurnLease retains its admission target across physical rotation.
         self._apply('turn.cleanup', {'target': session_id, 'holder': holder})

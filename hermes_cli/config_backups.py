@@ -54,7 +54,8 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         root.mkdir(parents=True, exist_ok=True)
         _sweep_legacy_siblings(config_path, root)
         existing = list_config_backups(config_path, reason)
-        # Stat-based comparison caches miss same-size edits with preserved mtimes.
+        # Not filecmp.cmp: its process-wide cache keys on (size, mtime), so an equal-size edit
+        # within one mtime tick of an earlier comparison is reported identical and never backed up.
         if existing and config_path.read_bytes() == existing[0].read_bytes():
             return None
         dest = root / f"{config_path.name}.{reason}.{time.strftime('%Y%m%d-%H%M%S')}"

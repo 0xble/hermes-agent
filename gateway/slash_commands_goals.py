@@ -78,10 +78,19 @@ class GatewayGoalCommandsMixin:
         """Enqueue *text* as the next turn through the adapter FIFO (the post-turn judge's path).
 
         A kickoff answers the user's own ``/goal`` message, so it keeps that message's id, channel
-        prompt and reply contract. A resumed or refreshed continuation is gateway-authored like
-        every other goal continuation: it is built by the shared synthetic-prompt constructor so
-        a no-change tick may end on the silence marker. Best-effort: failures only logged.
+        prompt, bound skills, and reply contract. A resumed or refreshed continuation is
+        gateway-authored like every other goal continuation: it is built by the shared
+        synthetic-prompt constructor so a no-change tick may end on the silence marker and reuse
+        the pinned channel inputs. A local ``slash.exec`` returns the turn to the client as its
+        ``send`` directive instead (the client submits it with its own input id). Best-effort:
+        failures only logged.
         """
+        from gateway.session_command_sink import active_sink
+        if (sink := active_sink()) is not None:
+            sink.prompt = text
+            if not kickoff:
+                sink.display = "/goal resume"
+            return
         try:
             adapter, quick_key = self._adapter_and_key_for(event)
             if text and adapter and quick_key:
@@ -92,6 +101,7 @@ class GatewayGoalCommandsMixin:
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        auto_skill=event.auto_skill,
                         reply_expected=event.reply_expected,
                     )
                 else:
@@ -99,6 +109,9 @@ class GatewayGoalCommandsMixin:
                         event.source, text, reply_expected=False, goal_continuation=True,
                         goal_session_id=goal_session_id, goal_state=goal_state,
                     )
+                    # Preserve the upstream pin-reuse contract while retaining the fork's
+                    # stamped synthetic goal-continuation metadata.
+                    turn.inherit_channel_pin = True
                 self._enqueue_fifo(quick_key, turn, adapter)
         except Exception as exc:
             logger.debug("goal %s failed: %s", label, exc)
@@ -302,8 +315,11 @@ class GatewayGoalCommandsMixin:
             route = {}
         def _dispatch():
             # Loop and goal state load and save through the shared SessionDB lock: off the loop.
-            result = dispatch_loop_command(
-                LoopManager(session_id=sid), (event.get_command_args() or "").strip(), route=route)
-            return result.get("output") or ""
+            mgr = LoopManager(session_id=sid)
+            result = dispatch_loop_command(mgr, (event.get_command_args() or "").strip(), route=route)
+            output = result.get("output") or ""
+            if result.get("created") and _quiet_bool(lambda: goal_blocks_loop_tick(mgr.session_id)):
+                output += t("gateway.loop.goal_defers_note")
+            return output
 
         return await self._run_in_executor_with_context(_dispatch)

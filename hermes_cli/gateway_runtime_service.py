@@ -42,9 +42,17 @@ def service_suffix(home: Path) -> str:
     profile name; any other root (Docker, a temp harness) yields a path hash so a
     custom root can never resolve to the production ``hermes-gateway`` unit.
     """
-    from hermes_constants import _get_platform_default_hermes_home
+    from hermes_constants import _platform_default_hermes_home
     from hermes_cli.gateway import _profile_name_from_home
-    default = _get_platform_default_hermes_home().resolve()
+    # ``Path.home()`` follows the isolated HOME used by e2e harnesses. Launchd and
+    # systemd service names are account-wide identities, so their native default
+    # must come from the OS account, not that temporary profile HOME.
+    try:
+        import pwd
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        account_home = Path.home()
+    default = _platform_default_hermes_home(os.environ, lambda: account_home).resolve()
     home = home.resolve()
     if home == default:
         return ""
@@ -190,7 +198,9 @@ def _launchd(home: Path, deadline: float) -> ExistingService | None:
     account = pwd.getpwuid(os.getuid())  # windows-footgun: ok — native launchd only
     account_home = Path(account.pw_dir)
     plist = account_home / "Library/LaunchAgents" / f"{label}.plist"
-    from hermes_cli.gateway_runtime_service_identity import verify_launchd_loaded, verify_launchd_plist, read_definition
+    from hermes_cli.gateway_runtime_service_identity import (
+        ForeignRoot, read_definition, verify_launchd_loaded, verify_launchd_plist,
+    )
     installed = _exists(plist)
     domains = [f"gui/{os.getuid()}", f"user/{os.getuid()}"]  # windows-footgun: ok — native launchd only
     found = []
@@ -208,7 +218,17 @@ def _launchd(home: Path, deadline: float) -> ExistingService | None:
     if len(found) > 1:
         raise RuntimeStartError("service_scope_conflict", "conflict")
     if found:
-        _verify_binding(verify_launchd_loaded, loaded[0], home, uid=os.getuid(), username=account.pw_name)  # windows-footgun: ok — native launchd only
+        try:
+            verify_launchd_loaded(loaded[0], home, uid=os.getuid(), username=account.pw_name)  # windows-footgun: ok — native launchd only
+        except ForeignRoot:
+            # The bare label can belong to another Hermes install when a client runs with
+            # an isolated HOME. It neither serves nor blocks this requested profile.
+            return None
+        except ValueError as exc:
+            reason = str(exc)
+            raise RuntimeStartError(reason if reason in {
+                "profile_mismatch", "service_account_mismatch"
+            } else "service_identity_unverified") from None
         return found[0]
     if installed:
         definition = _verify_binding(plistlib.loads, read_definition(plist))

@@ -31,7 +31,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
-from cron.jobs_invariants import _validate_job_mode_invariants
+from cron.jobs_invariants import NO_AGENT_WITHOUT_SCRIPT_ERROR, _validate_job_mode_invariants
 from cron.scheduler_ownership import _claim_owner_is_dead
 from cron.scheduler_detached_worker import normalize_hard_wall_timeout
 from cron.review import apply_review_update, normalize_review, validate_review_delivery
@@ -169,8 +169,11 @@ def self_removal_delivery_allowed(job_id: str) -> bool:
 def _self_pause_delivery_allowed(job: dict) -> bool:
     """Only the run's exact internal auto-pause may finish its blocked-run alert."""
     marker = _self_removal_delivery.get()
-    return bool(marker and marker.job_id == job.get("id") and marker.paused_at
-                and marker.paused_at == job.get("paused_at") and job.get("state") == "paused")
+    if not marker or marker.job_id != job.get("id") or not marker.paused_at:
+        return False
+    current = next((item for item in load_jobs() if item.get("id") == marker.job_id), None)
+    return bool(current and current.get("state") == "paused"
+                and current.get("paused_at") == marker.paused_at)
 
 # Import-time snapshot so deliberate re-pointing of CRON_DIR/JOBS_FILE/OUTPUT_DIR (the documented
 # escape hatch for tests/embedders) is distinguishable from the constants merely being stale.

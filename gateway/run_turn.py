@@ -19,7 +19,7 @@ import threading
 import time
 from agent.i18n import t
 from agent.error_classifier import is_context_overflow_reason
-from agent.session_activity import format_iteration_progress
+from agent.session_activity import AwakeIdleMeter, format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
@@ -2386,26 +2386,22 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             )
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
             logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
-            async with self._session_model_override_lock(session_key):
-                new_entry = await self.async_session_store.reset_session(session_key)
+            from gateway.session_automation import move_route_wakes, reset_and_rehome_messages
+            new_entry, release_fresh = await reset_and_rehome_messages(self, session_key, session_entry.session_id)
+            try:
+                await move_route_wakes(self, session_key, session_entry.session_id)
                 self._evict_cached_agent(session_key)
-                # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
+                queued = list(self._overflow_queue(session_key) or ())
                 self._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
-            if new_entry is not None:
-                # Re-point the Telegram topic binding at the fresh session, or the binding-heal walk
-                # switches the next message back onto the bloated child and re-triggers exhaustion
-                # forever. No-op on non-topic lanes.
-                # Compression rotated session_entry.session_id to the oversized compressed child earlier
-                # this turn (the agent-result sync above), and that _sync also rewrote the (chat_id,
-                # thread_id) -> bloated-child binding. reset_session swaps in a clean, parentless session,
-                # but without re-syncing the binding the next inbound message in this topic gets
-                # switch_session'd back onto the bloated child by the binding-heal walk, reloads the
-                # oversized transcript, and re-triggers compression exhaustion forever (#35809 — regression
-                # of the #9893/#10063 auto-reset).
-                session_entry = new_entry
-                await asyncio.to_thread(
-                    self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
-                )
+                if queued:
+                    self._session_state(session_key).conversation.queued_events.extend(queued)
+                if new_entry is not None:
+                    session_entry = new_entry
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
+                    )
+            finally:
+                release_fresh()
             response = (response or "") + t("gateway.session.auto_reset_context_exhausted")
         return response, session_entry
 
@@ -4456,7 +4452,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             if worker.agent_timeout is not None:
                 if worker.timeout_fired.is_set():
                     break
-                _idle_secs = self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0)
+                _idle_secs = turn_ctx.awake_idle.measure(self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0))
                 if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
                     _warning_fired = True
                     await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
@@ -4480,12 +4476,21 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if _agent is None or not hasattr(_agent, 'model') or (_result_for_fb and _result_for_fb.get("failed")):
             return
         # A provider fallback is drift even when it serves the configured model name on another endpoint.
-        if getattr(_agent, "_provider_fallback_active", False) is True:
-            self._evict_cached_agent(session_key)
-            return
-        _cfg_model = self._fallback_baseline_model(session_key, turn_ctx.source, _agent)
-        if _agent.model != _cfg_model and not self._is_intentional_model_switch(session_key, _agent, _cfg_model):
-            self._evict_cached_agent(session_key)
+        if getattr(_agent, "_provider_fallback_active", False) is not True:
+            # A LOCAL session runs its frozen launch policy's model, not the gateway's configured one.
+            from gateway.session_authorities import active_authority
+            from gateway.session_policy import policy_for_source
+            policy = policy_for_source(self, turn_ctx.source)
+            _cfg_model = self._fallback_baseline_model(
+                session_key, turn_ctx.source, _agent,
+                policy_model=policy.current_model(active_authority(self)) if policy and policy.model else None,
+            )
+            if _agent.model == _cfg_model or self._is_intentional_model_switch(session_key, _agent, _cfg_model):
+                return
+        # Keep the evicted parent identifiable so its still-running children remain visible to the
+        # replacement session, but only when the fallback eviction actually belongs to this route.
+        _agent._evicted_on_fallback = session_key or True
+        self._evict_cached_agent(session_key)
 
     async def _run_agent_finalize_streaming_tts(self, turn_ctx: TurnContext, adapter: Any) -> None:
         """Finalize the streaming-TTS consumer on the outer event-loop thread (covers early returns

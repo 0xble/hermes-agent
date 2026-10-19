@@ -108,6 +108,7 @@ def connect_private(home: Path, timeout: float) -> socket.socket:
 
 
 def _socket_path(home: Path) -> Path:
+    home = Path(home).expanduser().resolve()
     _private_node(home, kind="directory", home=True)
     direct = home / "gateway.sock"
     if os.path.lexists(direct):

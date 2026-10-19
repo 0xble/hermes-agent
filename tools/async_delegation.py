@@ -27,6 +27,8 @@ from hermes_constants import get_hermes_home, hermes_home_key
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.async_delegation_completion import durable_status, reconcile_checkpoint, recovered_children, sync_completion_payload
 from tools.thread_context import propagate_context_to_thread
+from tools.async_delegation_worker import worker_ledger, require_ledger_owner
+from tools.delegation_redaction import redact_child_result, redact_completion_event
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +134,9 @@ _orphan_lock = threading.Lock()
 # that copy is alive. A consumer that discards its copy with the row still pending hands it back
 # (``return_completion_offer``); the delivery claim stays the only thing that settles the row.
 _offered: set = set()
+# Delegation ids this process first offered from its startup replay. Their copies carry
+# ``startup_replay`` on the sweep's later re-offers too, so a refused one stays gated.
+_startup_replayed: set = set()
 _last_orphan_sweep: dict[str, float] = {}
 
 # ── Stale-delegation detection (progress-based, on by default) ──────────────
@@ -180,6 +185,9 @@ def _db_path():
 
 
 def _connect() -> sqlite3.Connection:
+    from agent.runtime_session_store import WorkerPersistenceError, is_worker_process
+    if is_worker_process():
+        raise WorkerPersistenceError('worker_delegation_ledger_unavailable')
     from hermes_cli.sqlite_util import open_db
     # Same state.db as hermes_state.SessionDB -- reuse its owner-only (0600)
     # hardening so this writer doesn't create/leave the file (and its WAL
@@ -239,6 +247,8 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
     ``_records_lock`` while this commits, so cancellation cannot transition the
     in-memory record until the row exists.
     """
+    if remote := worker_ledger():
+        return remote.dispatch(record)
     now = time.time()
     try:
         from gateway.status import get_process_start_time
@@ -354,6 +364,7 @@ def _prune_durable_records() -> None:
     Restart-cut/retry rows are exempt from the ordinary history cap and have a
     separate hard ceiling; pending completions are bounded last.
     """
+    require_ledger_owner()
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     from tools.delegation_resume import classify_armed
     classify_armed()
@@ -440,6 +451,9 @@ def _persist_completion(
     *, expected_state: Optional[str] = None,
 ) -> bool:
     """Conditionally persist a terminal payload without replacing the row."""
+    event, result = redact_completion_event(event), redact_child_result(result)
+    if remote := worker_ledger():
+        return remote.complete(event, result)
     now = time.time()
     expected_state = expected_state or event.get("expected_state") or "queued"
     with _DB_LOCK, _transaction() as conn:
@@ -709,6 +723,9 @@ def record_unit_child(delegation_id: str, entry: dict[str, Any]) -> None:
     """Checkpoint one finished child on the running unit's own row. The terminal owner reconciles
     ``result_json`` before claiming completion; abandoned-unit recovery also replays it.
     Best-effort: a failed write costs recovery fidelity, never the live result."""
+    entry = redact_child_result(entry)
+    if remote := worker_ledger():
+        return remote.child(delegation_id, entry)
     try:
         with _DB_LOCK, _transaction() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -716,13 +733,23 @@ def record_unit_child(delegation_id: str, entry: dict[str, Any]) -> None:
                                (delegation_id,)).fetchone()
             if row is None:
                 return
-            partial = json.loads(row[0] or "{}") or {}
+            partial = redact_child_result(json.loads(row[0] or "{}") or {})
             results = [r for r in partial.get("results") or [] if r.get("task_index") != entry.get("task_index")]
             results.append(entry)
             conn.execute("UPDATE async_delegations SET result_json=?, updated_at=? WHERE delegation_id=? AND state='running'",
                          (json.dumps({"results": results, "partial": True}), time.time(), delegation_id))
     except Exception:
         logger.warning("Async delegation %s: could not record finished child %s", delegation_id, entry.get("task_index"), exc_info=True)
+
+
+def _recovered_results(task: dict[str, Any], result_json: Optional[str], error: str) -> Optional[list[dict[str, Any]]]:
+    """Per-task results for an abandoned unit: recorded children as they finished, the rest ``unknown``."""
+    partial = json.loads(result_json or "{}") or {}
+    if not (task.get("is_batch") and partial.get("partial") and partial.get("results")):
+        return None
+    recorded = {r["task_index"]: r for r in partial["results"] if isinstance(r.get("task_index"), int)}
+    indexes = task.get("task_indexes") or list(range(len(task.get("goals") or [])))
+    return [recorded.get(i) or {"task_index": i, "status": "unknown", "summary": None, "error": error} for i in indexes]
 
 
 def _owner_liveness() -> Optional[Callable[[Any, Any], bool]]:
@@ -742,6 +769,7 @@ def _owner_liveness() -> Optional[Callable[[Any, Any], bool]]:
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown; children a multi-child unit had already
     recorded (``record_unit_child``) are replayed with their real results."""
+    require_ledger_owner()
     alive = _owner_liveness()
     if alive is None:
         return 0
@@ -853,6 +881,7 @@ def recover_abandoned_delegations() -> int:
                 **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
             result = {"status": "unknown", "summary": None, "error": event["error"], **diagnostics,
                       **({"results": recovered_results} if recovered_results else {})}
+            event, result = redact_completion_event(event), redact_child_result(result)
             conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
                    WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result), delegation_id))
@@ -874,6 +903,11 @@ def restore_undelivered_completions(target_queue) -> int:
     ownership, otherwise a brand-new session adopts a dead session's delegation results seconds after boot
     (#64484).
     """
+    from agent.runtime_session_store import is_worker_process
+    if is_worker_process():
+        # The ordinary owner restores delivery-only results; a compute import
+        # must neither reap that owner's ledger nor steal its delivery queue.
+        return 0
     if not _db_path().exists():
         return 0  # nothing to replay; a replay must not create (or migrate) the ledger (#123265)
     recover_abandoned_delegations()
@@ -883,12 +917,12 @@ def restore_undelivered_completions(target_queue) -> int:
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
-        restored = _replay_pending(conn, rows, target_queue, now)
+        restored = _replay_pending(conn, rows, target_queue, now, startup=True)
         restored += _replay_outbox_pending(conn, _outbox_delivery_rows(conn), target_queue, now)
         return restored
 
 
-def _replay_pending(conn, rows, target_queue, now: float) -> int:
+def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = False) -> int:
     """Put each pending ``(delegation_id, event_json, completed_at, dispatched_at)`` row on ``target_queue``
     stamped ``restored``, or terminally drop it past ``_MAX_COMPLETION_REPLAY_AGE_S``. Records the offer so
     the orphan sweep skips the row until the copy is handed back (``return_completion_offer``)."""
@@ -904,10 +938,22 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
                            "(cap %.1fh); terminally dropping the replay (result remains queryable).",
                            delegation_id, (now - age_basis) / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
             continue
+        with _orphan_lock:
+            if (home, delegation_id) in _offered:
+                # The owner's explicit startup replay and the first-consume replay
+                # (process_registry.restore_completions) may both run: offer once.
+                continue
         evt = json.loads(payload)
         if isinstance(evt, dict):
-            evt["restored"] = True
+            evt = redact_completion_event(evt)
             _stamp_resume_availability(evt, conn)
+        with _orphan_lock:
+            if startup:
+                _startup_replayed.add(delegation_id)
+            if isinstance(evt, dict):
+                evt["restored"] = True
+                if delegation_id in _startup_replayed:
+                    evt["startup_replay"] = True
         target_queue.put(evt)
         with _orphan_lock:
             _offered.add((home, delegation_id))
@@ -1010,6 +1056,7 @@ def _update_delivery(sql: str, params: tuple) -> bool:
 
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
+    require_ledger_owner()
     now = time.time()
     return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
                    delivered_at=?, updated_at=?
@@ -1018,6 +1065,8 @@ def mark_completion_delivered(delegation_id: str) -> bool:
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
+    if remote := worker_ledger():
+        return remote.claim(delegation_id, claim_id)
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
@@ -1157,10 +1206,14 @@ def claim_event_delivery(evt: dict[str, Any], consumer: str) -> Optional[str]:
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Release a failed delivery claim so another consumer may retry."""
+    """Release a failed delivery claim so another consumer may retry. Attempts are
+    counted at claim time; once the budget is exhausted the row converges to
+    terminal ``dropped`` (only pending rows replay on restart)."""
     event_id = _outbox_event_id_from_claim(claim_id)
     if event_id:
         return _update_outbox_delivery(event_id, claim_id, "release")
+    if remote := worker_ledger():
+        return remote.release(delegation_id, claim_id)
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         capped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
@@ -1185,6 +1238,8 @@ def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     event_id = _outbox_event_id_from_claim(claim_id)
     if event_id:
         return _update_outbox_delivery(event_id, claim_id, "defer")
+    if remote := worker_ledger():
+        return remote.defer(delegation_id, claim_id)
     return _update_delivery("""UPDATE async_delegations SET delivery_claim=NULL,
                   delivery_claimed_at=NULL, delivery_attempts=MAX(0, delivery_attempts-1),
                   updated_at=?
@@ -1193,10 +1248,15 @@ def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Terminally drop a claimed completion whose target is permanently gone."""
+    """Terminally drop a claimed completion whose target is permanently gone (the
+    spawning session ended at an explicit user boundary such as /new or reset).
+    ``dropped`` — not ``delivered`` — keeps the ack honest; not ``pending`` keeps
+    restart recovery from replaying it into a fail-closed drop forever."""
     event_id = _outbox_event_id_from_claim(claim_id)
     if event_id:
         return _update_outbox_delivery(event_id, claim_id, "drop")
+    if remote := worker_ledger():
+        return remote.drop(delegation_id, claim_id)
     return _update_delivery("""UPDATE async_delegations SET delivery_state='dropped',
                   updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
@@ -1209,6 +1269,8 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     event_id = _outbox_event_id_from_claim(claim_id)
     if event_id:
         return _update_outbox_delivery(event_id, claim_id, "complete")
+    if remote := worker_ledger():
+        return remote.ack(delegation_id, claim_id)
     now = time.time()
     return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
                   delivered_at=?, updated_at=?, delivery_claim=NULL, delivery_claimed_at=NULL
@@ -1240,6 +1302,8 @@ def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
             return False
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchall()
+        with _orphan_lock:  # an admitted copy already had its consumer: requeue keeps live routing
+            _startup_replayed.discard(delegation_id)
         return _replay_pending(conn, rows, target_queue, now) == 1
 
 
@@ -1273,6 +1337,11 @@ def _event_delivery(fn, evt: dict[str, Any], claim_id: str) -> None:
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[dict[str, Any]]:
+    if remote := worker_ledger():
+        saved = remote.read(delegation_id)
+        if saved is not None and saved.get("result") is not None:
+            return {**saved, "result": redact_child_result(saved["result"])}
+        return saved
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute("""SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
@@ -1280,7 +1349,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[dict[str, Any]]:
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchone()
     return None if row is None else {
         "delegation_id": delegation_id, "origin_session": row[0], "state": row[1], "dispatched_at": row[2],
-        "completed_at": row[3], "result": json.loads(row[4]) if row[4] else None, "delivery_state": row[5],
+        "completed_at": row[3], "result": redact_child_result(json.loads(row[4])) if row[4] else None, "delivery_state": row[5],
         "delivery_attempts": row[6], "origin_session_id": row[7] or ""}
 
 
@@ -1320,7 +1389,7 @@ def failed_delegations_for_session(
             (*(val for _, val in selectors), cutoff, limit)).fetchall()
     failed: list[dict[str, Any]] = []
     for delegation_id, state, dispatched_at, completed_at, task_json, result_json in rows:
-        task, result = _json_object(task_json), _json_object(result_json)
+        task, result = _json_object(task_json), redact_child_result(_json_object(result_json))
         goals = task.get("goals") if isinstance(task.get("goals"), list) and task["goals"] else [task.get("goal") or ""]
         goal_for = dict(zip(task.get("task_indexes") or range(len(goals)), goals))
         tasks = result["results"] if isinstance(result.get("results"), list) else [] if task.get("is_batch") else [result]
@@ -1857,6 +1926,7 @@ def _dispatch_admitted(
     overflow is rejected; callers that can receive detached completions must not
     turn capacity pressure into synchronous work.
     """
+    worker_ledger()  # refuse unbound workers before publishing a live record
     is_batch = goals is not None
     label = " batch" if is_batch else ""
     classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")
@@ -2146,7 +2216,11 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
     """Push a type='async_delegation' event onto the shared completion queue. Batch records
     (``is_batch``) carry the per-task ``results`` list (plus live transcript paths, the
     full-fidelity record of each child's run) instead of a single summary. Best-effort: failure
-    must not crash the worker, but it WOULD mean a silently-lost result, so we log loudly."""
+    must not crash the worker, but it WOULD mean a silently-lost result, so we log loudly.
+
+    The queued event is the parent's in-process copy and honours ``security.redact_secrets: false``;
+    ``_persist_completion`` re-scrubs with force for the durable row (and the worker IPC)."""
+    result = redact_child_result(result, force=False)
     is_batch = bool(record.get("is_batch"))
     cut_reason = record.get("_cut_reason")
     label = " batch" if is_batch else ""
@@ -2271,7 +2345,9 @@ def push_task_failure_notice(delegation_id: str, entry: dict[str, Any], *, n_tas
     arrived: 66 minutes of a dead wave with nothing running. The notice rides the same
     ``type="async_delegation"`` event shape as the batch result (so every drain/route/format path
     treats it identically) with ``task_failure_notice=True`` and a single-entry ``results`` list; the
-    batch record is NOT finalized and its consolidated result still arrives as before."""
+    batch record is NOT finalized and its consolidated result still arrives as before. In-process
+    queue only (never persisted), so the parent's copy honours ``security.redact_secrets: false``."""
+    entry = redact_child_result(entry, force=False)
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None or record.get("status") not in _ACTIVE_STATES:
@@ -2767,5 +2843,6 @@ def _reset_for_tests() -> None:
         _refused_by.clear()
     with _orphan_lock:
         _offered.clear()
+        _startup_replayed.clear()
         _last_orphan_sweep.clear()
         _unresolved.clear()

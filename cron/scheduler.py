@@ -32,6 +32,7 @@ except ImportError:
 from pathlib import Path
 from typing import Any, Callable, Optional
 from cron.scheduler_cancel import _CancelEventLike, _CombinedCancelEvent
+from cron.scheduler_bookkeeping import _classify_delivery_outcome
 from cron.scheduler_worker_exit import (
     ExternalWorkerExitTimeout as _ExternalWorkerExitTimeout,
     TERMINAL_EXIT_GRACE_SECONDS as _EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS,
@@ -1447,15 +1448,19 @@ def drain_delivery_queue(adapters, loop) -> int:
     # open/create entirely until a worker has actually queued something.
     if not _path().exists():
         return 0
-    return drain(
-        lambda queued_job, queued_content, queued_for_failure: _deliver_result(
-            queued_job,
-            queued_content,
-            adapters=adapters,
-            loop=loop,
+    def send(queued_job, queued_content, queued_for_failure):
+        error = _deliver_result(
+            queued_job, queued_content, adapters=adapters, loop=loop,
             for_failure=queued_for_failure,
         )
-    )
+        # The ping left the process: book the incident alerted. A notice every target hid
+        # (warning notifications suppressed) is a durable disposition, not an alert.
+        if (not error and queued_for_failure
+                and not queued_job.get("_notification_all_targets_suppressed")):
+            _mark_incident_alerted(queued_job.get("_failure_incident_id"))
+        return error
+
+    return drain(send)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -1607,7 +1612,7 @@ def _run_no_agent_job(
     script_path = job.get("script")
     # Legacy/hand-edited no_agent job without a script: pause it, or it re-fires every tick.
     if not str(script_path or "").strip():
-        from cron.jobs import NO_AGENT_WITHOUT_SCRIPT_ERROR
+        from cron.jobs_invariants import NO_AGENT_WITHOUT_SCRIPT_ERROR
 
         return _block_and_pause_job(job_id, job_name, NO_AGENT_WITHOUT_SCRIPT_ERROR)
 
@@ -1932,7 +1937,6 @@ def _init_cron_mcp_tools(job_id: str) -> None:
             logger.info("Job '%s': %d MCP tool(s) available", job_id, len(_mcp_tools))
     except Exception as _mcp_exc:
         logger.warning("Job '%s': MCP initialization failed (non-fatal): %s", job_id, _mcp_exc)
-
 
 
 def _raise_inactivity_timeout(agent, job_name: str, limit_s: float) -> None:
@@ -2577,6 +2581,10 @@ def run_job(
     ``extra_prompt``: optional per-run context from ``cronjob(action='run', prompt=...)`` (#57331). Appended
     to the stored prompt for this fire only — never persisted to the job definition.
     """
+    from gateway.session_cron import current_execution
+    owner_execution = current_execution()
+    if owner_execution is not None and owner_execution[2:] != (job['id'], execution_id):
+        owner_execution = None
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
@@ -2586,7 +2594,8 @@ def run_job(
     job.pop("_session_store_unavailable", None)
     prompt = str(job.get("prompt") or "")
 
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = (owner_execution[1] if owner_execution is not None else
+                        f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}")
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
 
     agent = None
@@ -2999,28 +3008,6 @@ def _record_fire_ownership_lost(
             error="Fire claim ownership lost; stale result was discarded.")
 
 
-def _classify_delivery_outcome(
-    *, delivery_error, should_deliver: bool, unresolved_origin: bool,
-    normalized_deliver: str, incident_acked: bool, success: bool,
-    delivery_queued=None, notification_suppressed: bool = False,
-) -> str:
-    if delivery_error:
-        return "failed"
-    if should_deliver and delivery_queued:
-        return "queued"
-    if notification_suppressed:
-        return "suppressed"
-    if should_deliver and unresolved_origin:
-        return "not_configured"
-    if should_deliver and normalized_deliver != "local":
-        return "delivered"
-    if incident_acked and not success:
-        # Failure ping withheld for a known signature: operator acked it, or it was already
-        # alerted inside the reminder cooldown (vs. plain "suppressed").
-        return "suppressed_acked"
-    return "suppressed"
-
-
 def _compose_run_delivery(
     job: dict, *, success: bool, error, final_response: str, output_file,
     agent_declared: bool = False,
@@ -3228,6 +3215,32 @@ def _save_compose_deliver(
         _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)) == "origin"
         and not _resolve_delivery_targets(job, for_failure=not d.success)
     )
+    normalized_deliver = _normalize_deliver_value(
+        _delivery_lane_value(job, for_failure=not d.success))
+    execution_id = job.get("execution_id")
+    queue_delivery = bool(execution_id and not job.get("no_agent")
+                          and not d.unresolved_origin and normalized_deliver != "local")
+    if execution_id and not job.get("no_agent") and (d.unresolved_origin or normalized_deliver == "local"):
+        # A self-paused blocked run may still send its one failure notice directly. Operator pauses,
+        # and origin-less runs without that exact marker, stay fail-closed.
+        from cron.jobs import _self_pause_delivery_allowed
+        if not _self_pause_delivery_allowed(job):
+            return
+    if queue_delivery:
+        from cron.delivery_queue import enqueue
+        queued_job = dict(job)
+        if d.failure_incident_id:
+            queued_job["_failure_incident_id"] = d.failure_incident_id
+        # The queue row IS the send: publish it under the same fence as a direct send, so a claim
+        # stolen after the lost() sample above cannot leave this stale fire's notice queued.
+        with fence.side_effect_fence() as owns_delivery:
+            if not owns_delivery:
+                raise _FireClaimLostDuringSideEffect
+            queued = enqueue(str(execution_id), queued_job, deliver_content, for_failure=not d.success)
+            # The queue owns this send even if subsequent bookkeeping fails.
+            d.delivery_attempted = True
+        job["last_delivery_queued"] = {"canonical": {"status": queued["status"], "execution_id": execution_id}}
+        return
     try:
         with fence.side_effect_fence() as owns_delivery:
             if not owns_delivery:
@@ -3283,11 +3296,29 @@ def _finish_completed_run(
 ) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
     job = d.job
+    if job.get("last_delivery_queued"):
+        # The gateway drain may win the enqueue/bookkeeping race. Reconcile its terminal
+        # writeback before this run projects the stale provisional ``delivery_queued`` state.
+        from cron.jobs import get_job
+        refreshed = get_job(job["id"])
+        if refreshed and not refreshed.get("last_delivery_queued"):
+            terminal_status = refreshed.get("last_status")
+            if terminal_status in {"ok", "delivery_failed", "suppressed"}:
+                job.update({
+                    "last_status": terminal_status,
+                    "last_delivery_error": refreshed.get("last_delivery_error"),
+                    "last_delivery_queued": None,
+                })
+                d.delivery_error = refreshed.get("last_delivery_error")
     if not d.should_deliver and job.get("last_delivery_queued"):
         from cron.jobs import update_job
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    if not job.get("no_agent"):
+        # The delivery queue's terminal write-back is fenced to the canonical
+        # completion id. Preserve that id on the job record before bookkeeping.
+        mark_kwargs["execution_id"] = execution_id
     if not d.success and job.pop("_session_store_unavailable", False):
         mark_kwargs["run_not_started"] = True
     if not d.success and job.pop("_model_unreachable", False):
@@ -3318,6 +3349,11 @@ def _finish_completed_run(
             error="Fire claim ownership lost before terminal completion.")
         return True
     delivery_outcome = _run_delivery_outcome(d)
+    from cron.delivery_outcome import settle_quietly, settled_outcome
+    if delivery_outcome == "queued":
+        # A drain may have won the enqueue/bookkeeping race. Prefer its terminal
+        # receipt over projecting a stale provisional queue outcome.
+        delivery_outcome = settled_outcome(execution_id) or "queued"
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
@@ -3327,6 +3363,10 @@ def _finish_completed_run(
         finish_kwargs: dict = {"output": d.completion_note} if d.completion_note else {}
         finish_execution(
             execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome, **finish_kwargs)
+    if job.get("last_delivery_queued"):
+        # If the drain completed before this run's bookkeeping, now that the
+        # canonical completion id is stored, settle the job record as well.
+        settle_quietly(job["id"], execution_id)
     return True
 
 
@@ -3456,6 +3496,7 @@ def _run_one_job_body(
     if not execution_id:
         execution_id = create_execution(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
+    job = dict(job, execution_id=execution_id)
     delivery_attempted = False
     delivery_error = None
     committed = False
@@ -3526,6 +3567,7 @@ def _run_one_job_body(
             _run_kwargs["cancel_event"] = fence.cancel_event
         try:
             success, output, final_response, error = run_job(job, **_run_kwargs)
+
         except BaseException:
             # run_job hands back the agent even when raising; tear down so a failed run never leaks.
             # BaseException so KeyboardInterrupt/SystemExit mid-run still trigger teardown.
@@ -3537,14 +3579,7 @@ def _run_one_job_body(
             _record_fire_ownership_lost(job, fire_owner, execution_id)
             return True
 
-        # An agent can finish its own turn after a delegated child has failed. Let it explicitly
-        # declare that semantic failure so the existing failure path updates status, streaks,
-        # ledger, and notification routing instead of recording a false healthy result.
-        agent_declared = False
-        if success and not job.get("no_agent"):
-            marker_error = _cron_failure_marker_error(final_response)
-            if marker_error is not None:
-                success, error, agent_declared = False, marker_error, True
+        success, error, agent_declared = _apply_agent_failure_marker(job, success, error, final_response)
 
         if hard_wall_fence is not None:
             # The watchdog may terminalize the execution and kill a script while
@@ -3589,10 +3624,8 @@ def _run_one_job_body(
             _record_fire_ownership_lost(job, fire_owner, execution_id)
             return True
 
-        # Empty final_response is a soft failure so last_status is not "ok".
-        if d.success and not final_response.strip():
-            d.success = False
-            d.error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+        from cron.scheduler_bookkeeping import fail_empty_response
+        fail_empty_response(d, final_response)
 
         if _fire_claim_ownership_lost():
             # A schedule stop cannot undo an acknowledged send. Transport drain remains
@@ -3624,6 +3657,14 @@ def _run_one_job_body(
         return _finish_completed_run(d, fire_owner, execution_id, result_committed=committed)
 
     except BaseException as e:
+        from cron.scheduler_authority import CronExecutionUnknown
+        if isinstance(e, CronExecutionUnknown):
+            from cron.executions import give_up_execution
+            from cron.scheduler_authority import pause_for_unknown
+            pause_for_unknown(job["id"], execution_id, str(e))
+            give_up_execution(execution_id, reason=str(e))
+            logger.error("Cron %s paused with unverified admission: %s", job["id"], e)
+            return False
         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.
         # Without mark_job_run(False) a finite one-shot is wedged: claim_dispatch consumed
         # repeat.completed but last_run_at is never written. Record first, then re-raise
@@ -4825,4 +4866,4 @@ if __name__ == "__main__":
         raise SystemExit(
             0 if _run_external_worker_payload(args.external_worker_file, args.ack_file) else 1
         )
-    tick(verbose=True)
+    tick(verbose=True, headless=True)

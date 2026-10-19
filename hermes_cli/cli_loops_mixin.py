@@ -14,6 +14,15 @@ from agent.i18n import t
 from rich.markup import escape as _escape
 
 
+def _goal_blocks_loop_tick(mgr) -> bool:
+    """``loops.goal_blocks_loop_tick`` for this loop's session: asked of the gateway when the manager
+    is the gateway's (it reads the goal row and its barrier where they live)."""
+    if hasattr(mgr, "goal_blocks_tick"):
+        return mgr.goal_blocks_tick()
+    from hermes_cli.loops import goal_blocks_loop_tick
+    return goal_blocks_loop_tick(mgr.session_id)
+
+
 def _fresh_start() -> str:
     """Banner line printed after /clear — resolved at call time so the active language applies."""
     return f"  {t('cli.session.fresh_start')}\n"
@@ -320,11 +329,14 @@ class CLILoopsMixin:
                 if bundled_count:
                     print(f"  {t('cli.plugins.bundled_available', count=bundled_count)}")
                 return
-            try:  # loaded-plugin details (tools/hooks/commands counts, errors) by name
-                from hermes_cli.plugins import get_plugin_manager
-                loaded = {p["name"]: p for p in get_plugin_manager().list_plugins()}
-            except Exception:
-                loaded = {}
+            from hermes_cli import gateway_plugin_commands
+            loaded = gateway_plugin_commands.loaded(self)  # the gateway's; None off the gateway
+            if loaded is None:
+                try:  # loaded-plugin details (tools/hooks/commands counts, errors) by name
+                    from hermes_cli.plugins import get_plugin_manager
+                    loaded = {p["name"]: p for p in get_plugin_manager().list_plugins()}
+                except Exception:
+                    loaded = {}
             print(t("cli.plugins.user_plugins_header", count=len(user_entries)))
             for name, version, _desc, source, _dir, key in sorted(user_entries):
                 state = _plugin_status(name, enabled, disabled, key=key)
@@ -523,8 +535,34 @@ class CLILoopsMixin:
         setattr(self, attr, mgr)
         return mgr
 
+    def _automation_connection(self):
+        """``(gateway, connection)``: on a gateway session store the managers are the gateway's
+        (``hermes_cli.gateway_automation``), and none exists until the gateway session is open, so this
+        process never opens state.db read-write nor calls the goal judge. Off the gateway (tests, the
+        TUI slash worker's shadow CLI) main's in-process managers apply."""
+        from hermes_cli.gateway_session_store import GatewaySessionStore
+        store = getattr(self, "_session_db", None)
+        if not isinstance(store, GatewaySessionStore):
+            return False, None
+        return True, store.connection if getattr(self, "_gateway_session_open", False) else None
+
+    def _automation_manager(self, attr, label, local, remote):
+        gateway, connection = self._automation_connection()
+        if gateway and connection is None:
+            return None
+        return self._session_bound_manager(
+            attr, label, (lambda: lambda sid: remote(sid, connection)) if gateway else local)
+
     def _get_goal_manager(self):
         """GoalManager bound to the current session_id (see ``_session_bound_manager``)."""
+        def max_turns():
+            from hermes_cli.config import load_config
+            try:
+                goals_cfg = (load_config() or {}).get("goals") or {}
+                return int(goals_cfg.get("max_turns", 20) or 20)
+            except Exception:  # health: allow BLE001 -- main's fallback: an unreadable goals config is the 20-turn default
+                return 20
+
         def load():
             from hermes_cli.goals import GoalManager, normalize_goal_max_turns
             from hermes_cli.config import load_config
@@ -538,21 +576,34 @@ class CLILoopsMixin:
                     max_turns = 20
                 return GoalManager(session_id=sid, default_max_turns=max_turns)
             return make
-        return self._session_bound_manager("_goal_manager", "goal manager", load)
+
+        def remote(sid, connection):
+            from hermes_cli.gateway_automation import GatewayGoalManager
+            return GatewayGoalManager(sid, connection)
+
+        return self._automation_manager("_goal_manager", "goal manager", load, remote)
 
     def _get_heartbeat_manager(self):
         """HeartbeatManager bound to the current session_id (see ``_session_bound_manager``)."""
         def load():
             from hermes_cli.heartbeat import HeartbeatManager
             return lambda sid: HeartbeatManager(session_id=sid)
-        return self._session_bound_manager("_heartbeat_manager", "heartbeat manager", load)
+
+        def remote(sid, connection):
+            from hermes_cli.gateway_automation import GatewayHeartbeatManager
+            return GatewayHeartbeatManager(sid, connection)
+        return self._automation_manager("_heartbeat_manager", "heartbeat manager", load, remote)
 
     def _get_loop_manager(self):
         """LoopManager bound to the current session_id (see ``_session_bound_manager``)."""
         def load():
             from hermes_cli.loops import LoopManager
             return lambda sid: LoopManager(session_id=sid)
-        return self._session_bound_manager("_loop_manager", "loop manager", load)
+
+        def remote(sid, connection):
+            from hermes_cli.gateway_automation import GatewayLoopManager
+            return GatewayLoopManager(sid, connection)
+        return self._automation_manager("_loop_manager", "loop manager", load, remote)
 
     def _start_heartbeat_watchdog(self):
         """Start the idle-poll daemon that injects a due heartbeat prompt into
@@ -645,8 +696,7 @@ class CLILoopsMixin:
         except Exception:
             return
         try:
-            from hermes_cli.loops import goal_blocks_loop_tick
-            if goal_blocks_loop_tick(mgr.session_id):
+            if _goal_blocks_loop_tick(mgr):
                 return
         except Exception:
             pass
@@ -720,10 +770,10 @@ class CLILoopsMixin:
                 pass
             _cprint(f"  {_DIM}{t('cli.loop.paused_interrupted')}{_RST}")
             return
-        response, successful = self._post_turn_response()
-        decision = mgr.complete_tick(response if successful else "")
+        decision = mgr.complete_tick(self._last_assistant_response_text())
+        # With the live-work dock up its loop row carries the countdown; the one-shot line would go stale.
         if (not _print_decision_message(decision) and decision.get("status") == "active"
-                and mgr.state is not None):
+                and mgr.state is not None and getattr(self, "_subagent_monitor", None) is None):
             _cprint(f"  {_DIM}{t('cli.loop.remaining', label=mgr.state.remaining_label())}{_RST}")
 
     def _revive_blocked_goal_for_user_turn(self, message) -> None:

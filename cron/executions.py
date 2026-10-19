@@ -510,6 +510,11 @@ def recover_interrupted_executions() -> int:
             if row["owner_kind"] == "detached" and identity == "live":
                 continue  # Gateway replacement never terminalizes its live worker.
             if identity == "live":
+                # Keep the liveness probe separate from the identity classification. Besides
+                # confirming the owner remains live, this gives a worker that is stamping progress
+                # during the sweep a chance to win the final compare-and-set below.
+                if not _owner_is_live(int(row["pid"]), row["process_started_at"]):
+                    continue
                 # A live owner is normally a legitimately running job. A worker permanently
                 # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
                 # this check, so a claim SILENT for longer than the derived bound is treated
@@ -746,6 +751,16 @@ def record_delivery_status(execution_id: str, status: str) -> None:
     """Delivery can finish after the worker's immutable terminal run result."""
     with _transaction() as conn:
         _project_delivery_statuses(conn, [(status, execution_id)])
+        outcome = {
+            "delivered": "delivered", "failed": "failed", "suppressed": "suppressed",
+            "unknown": "unknown",
+        }.get(status)
+        if outcome is not None:
+            conn.execute(
+                "UPDATE executions SET delivery_outcome=? WHERE id=? "
+                "AND (delivery_outcome IS NULL OR delivery_outcome='queued')",
+                (outcome, str(execution_id)),
+            )
 
 
 def get_execution(execution_id: str) -> Optional[dict[str, Any]]:

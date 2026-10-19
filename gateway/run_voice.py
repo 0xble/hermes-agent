@@ -15,6 +15,7 @@ import time
 import weakref
 from contextlib import suppress
 from difflib import SequenceMatcher
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional
 
@@ -56,9 +57,16 @@ class GatewayVoiceMixin:
             adapter._voice_input_callback = functools.partial(
                 self._handle_voice_channel_input, adapter=adapter)
 
+    def _voice_mode_path(self) -> Path:
+        override = self.__dict__.get("_VOICE_MODE_PATH")
+        if override is not None:
+            return Path(override)
+        from hermes_constants import get_process_hermes_home
+        return get_process_hermes_home() / "gateway_voice_mode.json"
+
     def _load_voice_modes(self) -> dict[str, str]:
         try:
-            data = json.loads(self._VOICE_MODE_PATH.read_text(encoding="utf-8-sig"))
+            data = json.loads(self._voice_mode_path().read_text(encoding="utf-8-sig"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
         if not isinstance(data, dict):
@@ -72,9 +80,10 @@ class GatewayVoiceMixin:
 
     def _save_voice_modes(self) -> None:
         try:
-            self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            path = self._voice_mode_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(self._voice_mode, indent=2)
-            self._VOICE_MODE_PATH.write_text(payload, encoding="utf-8")
+            path.write_text(payload, encoding="utf-8")
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
 

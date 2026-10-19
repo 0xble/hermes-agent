@@ -114,12 +114,19 @@ def _cron_state(t: H.Tenant) -> str:
     return f"{t.name}: requests={H.cron_requests(t)}, marker_age_seconds={markers}, job_state={state}"
 
 
-def _await_cron(tenants: dict[str, H.Tenant], fires: int) -> None:
+def _await_cron(tenants: dict[str, H.Tenant], fires: int, log: Path | None = None) -> None:
     try:
         H.poll(lambda: all(H.cron_requests(t) >= 2 * fires for t in tenants.values()), 150,
                f"cron fire #{fires} in every profile")
     except AssertionError as exc:
-        raise AssertionError(f"{exc}; " + "; ".join(_cron_state(t) for t in tenants.values())) from exc
+        def text(path: Path) -> str:
+            return path.read_text(encoding="utf-8", errors="replace") if path.exists() else "<missing>"
+        state = {n: (H.cron_requests(t), text(t.home / "cron" / "jobs.json")[-1200:])
+                 for n, t in tenants.items()}
+        tail = text(log)[-12000:] if log is not None else ""
+        evidence = "; ".join(_cron_state(t) for t in tenants.values())
+        raise AssertionError(f"{exc}; {evidence}\nper-profile (cron requests, jobs.json tail): {state}\n"
+                             f"--- serve.log tail ---\n{tail}") from None
 
 
 def test_desktop_backend_never_crosses_tenants(fleet, request: pytest.FixtureRequest) -> None:
@@ -138,7 +145,7 @@ def test_desktop_backend_never_crosses_tenants(fleet, request: pytest.FixtureReq
     owners = {sid: name for name, sid in sids.items()}
     for name in ("alpha", "default", "beta", "alpha", "beta"):
         b.turn(sids[name], f"turn for {name}")
-    _await_cron(tenants, 1)
+    _await_cron(tenants, 1, root / "serve.log")
     H.check_isolation(tenants, min_snapshots=2, extra=_rpc_leaks(b, owners, tenants))
 
     # Phase 2: settings writes via RPC touch only the addressed profile.
@@ -181,7 +188,7 @@ def test_desktop_backend_never_crosses_tenants(fleet, request: pytest.FixtureReq
     owners = {sid: name for name, sid in sids.items()}
     for name in ("beta", "default", "alpha"):
         b.turn(sids[name], f"after restart for {name}")
-    _await_cron(tenants, 2)
+    _await_cron(tenants, 2, root / "serve.log")
     H.check_isolation(tenants, min_snapshots=5, extra=_rpc_leaks(b, owners, tenants))
 
     b.close()

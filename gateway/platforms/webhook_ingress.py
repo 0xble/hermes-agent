@@ -52,7 +52,7 @@ async def admit_producer(adapter, event):
         from gateway.run_inbound_consumer import POST_ADMISSION_HOOK
         from hermes_cli.lifecycle import has_hook
         webhook = adapter.platform == Platform.WEBHOOK
-        hooks = [name for name in ('pre_gateway_dispatch', POST_ADMISSION_HOOK) if has_hook(name)]
+        hooks = [name for name in ('pre_gateway_dispatch', POST_ADMISSION_HOOK) if await asyncio.to_thread(has_hook, name)]
         if not (webhook or hooks):
             return await authority.admit_native(event)
         from gateway.session_authority import native_write_started

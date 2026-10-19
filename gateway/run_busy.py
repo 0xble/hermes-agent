@@ -11,6 +11,7 @@ import logging
 from typing import TYPE_CHECKING
 import asyncio
 import contextlib
+import contextvars
 import json
 import os
 import time
@@ -51,6 +52,15 @@ def approval_input_words(input_key: str) -> tuple[str, ...]:
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# A local session's pre-command hook, awaited only after a busy slash command is accepted.
+BUSY_ACCEPTED: contextvars.ContextVar = contextvars.ContextVar("busy_accepted", default=None)
+
+
+async def _busy_accepted() -> None:
+    hook = BUSY_ACCEPTED.get()
+    if hook is not None:
+        await hook()
 
 
 def _strip_slot(text: str, slot: str) -> Optional[str]:
@@ -987,19 +997,134 @@ class GatewayBusySessionMixin:
         ):
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
 
+        await self._busy_interrupt_and_ack(event, session_key, adapter, _busy_state, running_agent, _steer)
+        return True
+
+    def _queue_during_drain_enabled(self, busy_input_mode: Optional[str] = None) -> bool:
+        # "queue"/"steer" mean messages survive a restart (queued for the new process); "interrupt" drops.
+        mode = busy_input_mode or self._busy_input_mode
+        return self._restart_requested and mode in {"queue", "steer"}
+
+    def _defer_past_exhaustion_reset(
+        self, result: Any, adapter: Any, source: SessionSource, session_key: str, pending_event: MessageEvent,
+    ) -> None:
+        """Leave the post-turn drain to the fresh session after a compression-exhausted turn.
+
+        The outer handler owns the reset: the exact queued event goes back in the head slot so the
+        adapter's post-handler drain starts it on the fresh session (never promoted or prepared on the
+        exhausted one). An accepted leftover /steer was already taken out of the agent's buffer, so it
+        keeps its usual place ahead of that event instead of vanishing.
+        """
+        leftover_steer = (result.get("pending_steer") or "").strip()
+        if leftover_steer:
+            steer_prompt, steer_source = self._pinned_channel_inputs(session_key, None, source, internal=True)
+            self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
+            pending_event = MessageEvent(text=leftover_steer, source=steer_source, channel_prompt=steer_prompt)
+        adapter._pending_messages[session_key] = pending_event
+        logger.info("Deferring queued follow-up for session %s until after its compression-exhausted reset", session_key)
+
+    def _merge_leftover_steer(
+        self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str],
+        pending_event: Optional[MessageEvent], pending: Optional[str],
+    ) -> tuple[Optional[MessageEvent], Optional[str]]:
+        """Fold a leftover /steer (arrived after the last tool batch) into the post-turn drain:
+        the next user turn when nothing else is pending, otherwise ahead of / behind it in the FIFO."""
+        leftover_steer = (result.get("pending_steer") or "").strip() if result else None
+        if leftover_steer:
+            if not pending and not pending_event:
+                pending = leftover_steer
+                logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+            elif pending_event and adapter and session_key:
+                # User steered during the turn, but a background event or queued message arrived.
+                # Deliver the user's steer first and restore the pending event to the head of the queue.
+                overflow = self._overflow_queue(session_key)
+                if hasattr(adapter, "_pending_messages") and isinstance(adapter._pending_messages, dict):
+                    promoted = adapter._pending_messages.get(session_key)
+                    if promoted is not None:
+                        if overflow is not None:
+                            overflow.insert(0, promoted)
+                        else:
+                            self._session_state(session_key).conversation.queued_events.insert(0, promoted)
+                    adapter._pending_messages[session_key] = pending_event
+                else:
+                    if overflow is not None:
+                        overflow.insert(0, pending_event)
+                    else:
+                        self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
+                pending_event = None
+                pending = leftover_steer
+                logger.debug(
+                    "Delivering leftover /steer before queued event for session %s: '%s...'",
+                    session_key, pending[:40],
+                )
+            elif pending and not pending_event:
+                from gateway.platforms.base import MessageEvent
+                # A deferred steer continues the active channel context, just like an
+                # eventless follow-up. Reuse its pins without marking the user as internal.
+                steer_prompt, steer_source = self._pinned_channel_inputs(
+                    session_key, None, source, internal=True,
+                )
+                steer_event = MessageEvent(
+                    text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
+                )
+                if session_key:
+                    self._enqueue_fifo(session_key, steer_event, adapter)
+                logger.debug(
+                    "Enqueued leftover /steer behind pending message for session %s: '%s...'",
+                    session_key or "?", leftover_steer[:40],
+                )
+        return pending_event, pending
+
+    def _goal_still_active_for_session(self, session_id: str) -> bool:
+        """Best-effort fresh DB check before running a queued continuation."""
+        if not session_id:
+            return False
+        try:
+            from hermes_cli.goals import GoalManager
+            return GoalManager(session_id=session_id).is_active()
+        except Exception as exc:
+            logger.debug("goal continuation: active-state recheck failed: %s", exc)
+            return False
+
+    async def _send_busy_drain_notice(self, event: MessageEvent, session_key: str, effective_mode: str) -> None:
+        """Busy path while the gateway is restarting/stopping: queue (if allowed) and tell the user."""
+        adapter = self._delivery_adapter_for(event.source)
+        if not adapter:
+            return
+        if self._queue_during_drain_enabled(effective_mode):
+            self._queue_or_replace_pending_event(session_key, event)
+            message = t("gateway.busy.drain_queued", action=self._status_action_gerund())
+        else:
+            message = t("gateway.busy.drain_rejected", action=self._status_action_gerund())
+        await self._send_busy_reply(event, adapter, message)
+
+    async def _busy_interrupt_and_ack(self, event, session_key, adapter, _busy_state, running_agent, _steer) -> None:
+        """Interrupt-mode abort (voice transcribed) and the busy ack, after the steer/redirect resolution.
+        Shared by the in-process busy handler and the session authority's busy preempt."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        effective_mode, redirected = _steer.effective_mode, _steer.redirected
+        is_queue_mode = effective_mode == "queue"
+        is_steer_mode = effective_mode == "steer"
+        is_redirect_mode = effective_mode == "interrupt" and redirected
+        if (
+            effective_mode == "interrupt" and not redirected
+            and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
+        ):
+            await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
+
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.
         if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":
             logger.debug("Busy ack suppressed for session %s", session_key)
-            return True  # input still processed, just no ack sent
+            return  # input still processed, just no ack sent
 
         # Debounce (30s) before the config-heavy display lookup.
         now = time.time()
         if now - (_busy_state.turn.busy_ack_ts if _busy_state else 0) < 30:
-            return True  # interrupt sent (if not queue), ack already delivered recently
+            return  # interrupt sent (if not queue), ack already delivered recently
 
         if is_steer_mode and not self._busy_steer_ack_enabled(event, session_key):
-            return True
+            return
 
         self._session_state(session_key).turn.busy_ack_ts = now
 
@@ -1010,7 +1135,30 @@ class GatewayBusySessionMixin:
             demoted_for_compression=_steer.demoted_for_compression,
         )
         await self._send_busy_ack_reply(event, adapter, message)
-        return True
+
+    def _busy_slash_route(self, cmd_def):
+        """``(kind, target)`` :meth:`_dispatch_busy_slash_command` takes mid-run: ``special`` (the
+        variant's method name), ``plain`` (the normal handler) or ``reject`` (its text key, None for the
+        catch-all). A ``special`` variant may still refuse its arguments: it awaits ``_busy_accepted``
+        only once it accepts."""
+        policy = getattr(cmd_def, "busy_policy", "reject")
+        handler_key = getattr(cmd_def, "busy_handler", None)
+        if handler_key:
+            special = self._BUSY_SPECIAL_HANDLERS.get(handler_key)
+            if special is not None:
+                return "special", special
+            reject_key = self._BUSY_REJECT_TEXT.get(handler_key)
+            if reject_key is not None:
+                return "reject", reject_key
+        if policy in ("dispatch", "interrupt_then_dispatch"):
+            plain = self._gateway_plain_command_handlers().get(cmd_def.name)
+            if plain is not None:
+                return "plain", plain
+            logger.warning(
+                "busy_policy=%s for /%s has no mid-run handler — "
+                "falling back to busy-reject", policy, cmd_def.name,
+            )
+        return "reject", None
 
     # Slash name → handler method is ``_handle_<name>_command`` (``-`` → ``_``) except these.
     _COMMAND_HANDLER_ALIASES = {"bg": "_handle_background_command", "sethome": "_handle_set_home_command"}
@@ -1108,6 +1256,7 @@ class GatewayBusySessionMixin:
         if policy in ("dispatch", "interrupt_then_dispatch"):
             plain = self._gateway_plain_command_handlers().get(name)
             if plain is not None:
+                await _busy_accepted()
                 async with self._async_profile_scope_for_source(source):
                     return await plain(event)
             logger.warning(

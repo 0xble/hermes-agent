@@ -30,6 +30,8 @@ from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
+from gateway.run_turn_progress import GatewayTurnProgressMixin
+from gateway.session_execution import GatewaySessionAgentMixin
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -48,6 +50,72 @@ _CARD_DESTINATION_REFUSALS = {
     "slack task_card requires a thread anchor",
     "slack task_card requires a thread anchor (Slack streams are thread replies)",
 }
+
+
+def _finite_viewer_turn() -> bool:
+    from gateway.session_finite import finite_turn_required
+    return finite_turn_required() is True
+
+
+class _NoStreamConsumer(RuntimeError):
+    """Raised when a delta has no live consumer, so it was not delivered."""
+
+
+def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, str, bool]:
+    """Return chat text, failure reason and retryability for pre-turn resolution failures."""
+    from agent.error_classifier import FailoverReason
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_state_runtime import RuntimeStoreError
+    auth_permanent = FailoverReason.auth_permanent.value
+    if isinstance(exc, RuntimeStoreError):
+        return (f"⚠️ This session's launch credentials are no longer available ({exc.reason}), so this "
+                "message wasn't processed. Start a new session from the CLI to bind them again.", auth_permanent, False)
+    if is_rate_limited_auth_error(exc.__cause__):
+        from gateway.run import _gateway_provider_error_reply
+        return _gateway_provider_error_reply(str(exc)), auth_permanent, False
+    if platform == Platform.LOCAL:
+        return f"⚠️ {exc}", auth_permanent, False
+    seen: set[int] = set()
+    host = auth = False
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        host = host or isinstance(link, OSError)
+        auth = auth or isinstance(link, AuthError)
+        link = link.__cause__ or link.__context__
+    if host and not auth:
+        return t("gateway.errors.generic_failed"), "host_error", False
+    return t("gateway.errors.no_credentials"), auth_permanent, False
+
+
+def _persisted_turn(agent, agent_history, result, compressions) -> dict | None:
+    """Build the persisted-turn receipt used by TUI completion notifications."""
+    from agent.persisted_turn_receipt import persisted_turn_receipt
+    if not isinstance(result, dict):
+        return None
+    status = ("interrupted" if result.get("interrupted")
+              else "error" if result.get("failed") or result.get("error") else "complete")
+    return persisted_turn_receipt(
+        result.get("messages"), getattr(agent, "_persist_user_message_idx", None), agent_history,
+        result.get("final_response"), status,
+        compression_unchanged=type(compressions) is int and compressions == getattr(
+            getattr(agent, "context_compressor", None), "compression_count", None),
+        prefix_row_matches=lambda before, after: before is after)
+
+
+def _settle_api_runtime_lock(agent, result, captured):
+    """Settle a confirmed API runtime lock against the runtime that served the turn."""
+    from gateway.session_api_turn import api_runtime_locked
+    api = api_runtime_locked()
+    if api is None or not isinstance(result, dict):
+        return
+    settings = api["settings"]
+    try:
+        captured["usage"]["runtime"] = api["adapter"]._turn_runtime_metadata(
+            agent, route=settings.get("route"), requested_runtime=settings.get("requested_runtime"),
+            route_source=settings.get("route_source") or "", confirmed_runtime_lock=True)
+    except RuntimeError as exc:
+        result.update(final_response="", failed=True, completed=False, error=str(exc))
 
 
 def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
@@ -76,8 +144,12 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-class TurnRunner:
+class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
+
+    # ``None`` is a legitimate state: turns without a canonical session authority publish no
+    # execution events and take no controls snapshot.
+    _approval_owner = None
 
     def __init__(self, runner: GatewayRunner, ctx: TurnContext) -> None:
         self._runner = runner
@@ -85,6 +157,28 @@ class TurnRunner:
         from gateway.status_delivery import StatusDelivery
         self._status_delivery = StatusDelivery(ctx, lambda: runner._delivery_adapter_for(ctx.source))
         ctx._status_delivery = self._status_delivery
+        from gateway.session_authorities import active_authority
+        authority = active_authority(runner)
+        if authority is not None:
+            source = getattr(ctx, "source", None)
+            owner_id = (source.chat_id if getattr(source, "platform", None) == Platform.LOCAL
+                        else authority.logical_owner(ctx.session_id))
+            if owner_id in authority.sessions:
+                generation = authority.db.get_session(owner_id)["runtime_generation"]
+                self._approval_owner = (authority, owner_id, generation)
+
+    def _publish_execution(self, event_type, payload):
+        if self._approval_owner is not None:
+            authority, session_id, generation = self._approval_owner
+            return authority.publish_execution(session_id, generation, event_type, payload)
+        return False
+
+    def _publish_api_tool(self, event_type, call_id, tool_name, args, result=None):
+        if self._approval_owner is not None:
+            from gateway.session_api_turn import publish_api_tool_event
+            authority, session_id, generation = self._approval_owner
+            publish_api_tool_event(authority, session_id, generation, event_type,
+                                   str(call_id or ""), str(tool_name or "tool"), args, result)
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -129,61 +223,10 @@ class TurnRunner:
     # ── progress_callback (agent thread → progress queue) ───────────────────────────────────
 
     def progress_callback(self, event_type: str, tool_name: str | None = None, preview: str | None = None, args: dict | None = None, **kwargs):
-        """Callback invoked by agent on tool lifecycle events."""
-        ctx = self._ctx
-        # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
-        # gate: platforms with tool_progress off must still hear about a dead delegation.
-        if event_type == "subagent.complete":
-            self._progress_subagent_notice(preview, kwargs)
-            return
-        self._progress_live_status(event_type, tool_name, args)
-        # "log" mode: append tool.started lines to the log queue, silent in chat. Handled before
-        # the progress_queue guard because log mode runs without a chat progress queue.
-        if ctx.log_queue is not None and event_type == "tool.started" and tool_name and tool_name != "_thinking":
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            preview_str = f' "{preview}"' if preview else ""
-            ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
-        if not ctx.progress_queue or not ctx._run_still_current():
-            return
-        if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
-            self._progress_onboarding_hint(kwargs)
-            return
-        # "_thinking" is assistant scratch text between tool calls, never ordinary tool progress:
-        # only relayed when the platform explicitly opted into thinking_progress.
-        if event_type == "_thinking" or tool_name == "_thinking":
-            thinking_text = (preview if tool_name == "_thinking" else tool_name) if ctx._thinking_enabled else None
-            if thinking_text:
-                ctx.progress_queue.put(t("gateway.progress.thinking_prefix", text=thinking_text))
-            return
-        # Native task cards consume the ID-bearing tool_start/tool_complete callbacks instead;
-        # name-correlated text events would duplicate cards and mispair concurrent same-tool calls.
-        if ctx._native_slack_task_cards and event_type in {"tool.started", "tool.completed"}:
-            return
-        # tool_progress off → only _thinking passes (above). Only tool.started renders. clarify:
-        # send_clarify IS the user-facing rendering (a bubble would duplicate it, and verbose mode
-        # would dump the raw args JSON right under the prompt). Post-`stop`: N parallel tool calls
-        # fire N tool.started events before the interrupt check, so a late stop must not render them.
-        if (
-            not ctx.tool_progress_enabled
-            or event_type != "tool.started"
-            # The adapter's send_clarify IS the user-facing rendering (interactive buttons or the
-            # numbered-text fallback), so a progress bubble is pure duplication — and in verbose mode it
-            # dumps the raw tool-call args JSON into the chat. Because
-            # the progress queue drains on a background task, that raw JSON typically lands right underneath
-            # the rendered prompt (#52374).
-            or tool_name == "clarify"
-            or self._agent_interrupted()
-        ):
-            return
-        # "new" mode: only report when tool changes
-        if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
-            return
-        ctx.last_tool[0] = tool_name
-        msg = self._progress_build_message(tool_name, preview, args)
-        if msg is not None:
-            self._progress_emit(msg)
+        """Delegate to the canonical progress mixin, including local-viewer frames."""
+        return GatewayTurnProgressMixin.progress_callback(self, event_type, tool_name, preview, args, **kwargs)
 
-    def _progress_subagent_notice(self, preview, kwargs: dict) -> None:
+    def _progress_subagent_notice_legacy(self, preview, kwargs: dict) -> None:
         """Only terminal failure statuses render (same notice rail as credit warnings)."""
         ctx = self._ctx
         from gateway.warning_notifications import render_notification
@@ -907,13 +950,6 @@ class TurnRunner:
             "type": "tool.completed", "tool_call_id": str(call_id or ""), "tool_name": name, "is_error": bool(is_error),
         })
 
-    def combined_tool_start_callback(self, call_id, tool_name, args):
-        """Compose the voice ack + native task-card start consumers."""
-        if self._ctx._voice_ack_guild[0] is not None:
-            self.voice_ack_callback(call_id, tool_name, args)
-        if self._ctx._native_slack_task_cards:
-            self.native_tool_start_callback(call_id, tool_name, args)
-
     # ── hook / status bridges (agent thread → gateway loop) ────────────────────────────────
 
     def _step_callback_sync(self, iteration: int, prev_tools: list) -> None:
@@ -1083,21 +1119,38 @@ class TurnRunner:
             ) if sc is not None
         ]
         stream_delta_cb = None
-        if delta_sinks:
+        local_viewer_route = getattr(ctx.source, "platform", None) == Platform.LOCAL
+        if delta_sinks or self._approval_owner is not None:
             def stream_delta_cb(text: Optional[str]) -> None:
-                if ctx._run_still_current():
-                    for sink in delta_sinks:
-                        sink.on_delta(text)
+                if not ctx._run_still_current():
+                    return
+                delivered = bool(delta_sinks)
+                if text is not None:
+                    delivered = self._publish_execution("message.delta", {"text": text}) or delivered
+                elif local_viewer_route:
+                    # The segment boundary closes the local reply before tool lines.
+                    self._publish_execution("message.delta", {"text": None})
+                for sink in delta_sinks:
+                    sink.on_delta(text)
+                if text is not None and (not delivered or _finite_viewer_turn()):
+                    raise _NoStreamConsumer()
 
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
+            unseen = False
+            if local_viewer_route and not already_streamed and str(text or "").strip():
+                unseen = not self._publish_execution("message.interim", {
+                    "text": text, "already_streamed": False,
+                })
             if stts is not None:
                 # Flush accepted deltas; completed commentary is a separate speech segment.
                 stts.on_delta(None)
                 if not already_streamed:
                     stts.on_delta(text)
                     stts.on_delta(None)
+            if unseen:
+                return
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
             elif not already_streamed and ctx._status_adapter and str(text or "").strip():
@@ -1500,7 +1553,8 @@ class TurnRunner:
                 if callable(handoff):
                     handoff(ctx.session_key, conversation={"pending_attended_notice": None})
                 else:
-                    state = runner._peek_session_state(ctx.session_key)
+                    peek = getattr(runner, "_peek_session_state", None)
+                    state = peek(ctx.session_key) if callable(peek) else None
                     if state is not None:
                         state.conversation.pending_attended_notice = None
         except Exception:
@@ -1523,15 +1577,30 @@ class TurnRunner:
             if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
         )
         agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
-        agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
+        if self._approval_owner is not None:
+            agent.tool_start_callback = self.combined_tool_start_callback
+            agent.tool_complete_callback = self.combined_tool_complete_callback
+        agent.step_callback = ctx._step_callback_sync if (ctx._hooks_ref.loaded_hooks or self._approval_owner is not None) else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
-        agent.status_callback, agent.notice_callback = ctx._status_callback_sync, self._notice_callback_sync
-        agent.notice_clear_callback = None  # sends can't be retracted
+        from gateway.run_turn_progress import local_viewer_turn
+        agent.status_callback, agent.notice_callback = ctx._status_callback_sync, (
+            self._local_notice_callback_sync if local_viewer_turn(self) else self._notice_callback_sync)
+        agent.reasoning_callback = None
+        if self._approval_owner is not None:
+            from gateway.session_api_turn import api_execution, wire_api_observers
+            if api_execution.get() is not None:
+                wire_api_observers(agent, self._approval_owner, want_interim_messages)
+        agent.notice_clear_callback = self._local_notice_clear_callback_sync if local_viewer_turn(self) else None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
         agent._voice_turn_pending = ctx.voice_turn  # auxiliary.voice_chat route
-        agent.reasoning_override = runner._session_reasoning_override(ctx.session_key)
+        reasoning_loader = getattr(runner, "_session_reasoning_override", None)
+        if callable(reasoning_loader):
+            agent.reasoning_override = reasoning_loader(ctx.session_key)
+        else:
+            overrides = getattr(runner, "_session_reasoning_overrides", None) or {}
+            agent.reasoning_override = overrides.get(ctx.session_key)
         expiry_loader = getattr(runner, "_session_service_tier_expiry", None)
         try:
             expiry_at, _ = expiry_loader(ctx.session_key) if callable(expiry_loader) else (0.0, 0.0)
@@ -1541,9 +1610,13 @@ class TurnRunner:
         set_gateway_fast_expiry_state(agent, expiry_at, runner._service_tier)
         agent._pre_fallback_reasoning_override = None  # a live pick supersedes a set-aside one
         self._merge_turn_request_overrides(agent, turn_route)
+        from gateway.session_surface import arm_surface_turn
+        arm_surface_turn(agent, runner._consume_pending_turn_sidecar_notes(ctx.session_key), voice_turn=ctx.voice_turn)
         agent._gateway_before_api_call = lambda loop_state: self._apply_attended_before_api_call(agent, loop_state)
+        peek = getattr(runner, "_peek_session_state", None)
+        _attended_state = peek(ctx.session_key) if (ctx.session_key and callable(peek)) else None
         agent._gateway_attended_decision = getattr(
-            getattr(runner._peek_session_state(ctx.session_key) if ctx.session_key else None, "conversation", None),
+            getattr(_attended_state, "conversation", None),
             "last_attended_decision", None,
         )
         agent._gateway_attended_decision_key = getattr(
@@ -1584,6 +1657,9 @@ class TurnRunner:
             agent.interim_assistant_callback = None
             agent.thinking_progress = False
         ctx.agent_holder[0] = agent  # interrupt support
+        if self._approval_owner is not None:
+            authority, owner_id, generation = self._approval_owner
+            authority.adopt_agent(owner_id, generation, agent)
         # The titler fires from the turn prologue, so attach the rename lane before the run.
         self._attach_session_title_callback(agent, ctx)
         # Publish turn ownership for /stop, /new, disconnect and shutdown interrupts; older session
@@ -1729,6 +1805,20 @@ class TurnRunner:
         return response, answered
 
     def _approval_notify_sync(self, approval_data: dict) -> None:
+        owner = self._approval_owner
+        if owner is not None:
+            authority, session_id, generation = owner
+            authority.check_approval_generation(session_id, generation)
+        # A native decline must finish before any observer can authorize work.
+        self._render_approval_sync(approval_data)
+        if owner is not None:
+            from gateway import local_viewer_events
+            authority.register_approval(
+                session_id, generation, self._ctx.session_key, approval_data,
+                timeout_s=local_viewer_events.prompt_timeout_s(self, "approval"),
+            )
+
+    def _render_approval_sync(self, approval_data: dict) -> None:
         """Send the approval request from the agent thread: the adapter's interactive button
         approvals (``send_exec_approval``) when available, else plain text with ``/approve`` steps."""
         from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
@@ -2168,6 +2258,23 @@ class TurnRunner:
         return final_response + "\n" + "\n".join(unique_tags)
 
     def run_sync(self):
+        from gateway.session_policy import policy_for_source, policy_scope
+        from gateway.session_api_turn import api_policy_scope
+        from gateway.session_authorities import active_authority
+        with policy_scope(policy_for_source(self._runner, self._ctx.source),
+                          authority=active_authority(self._runner)), api_policy_scope():
+            result = self._run_sync_scoped()
+            from gateway.session_results import execution_result
+            captured = execution_result.get()
+            if captured is not None:
+                cli_fields = self.__dict__.pop("_cli_result_fields", None)
+                captured['result'] = (
+                    {**result, **cli_fields, **({'response_previewed': True} if result.get('response_previewed') else {})}
+                    if cli_fields else result
+                )
+            return result
+
+    def _run_sync_scoped(self):
         """Executor-thread body of the turn; returns the gateway result dict.
 
         The turn message lives on the shared TurnContext (``ctx.message``) so ``_run_agent_inner`` sees
@@ -2208,19 +2315,13 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            # Model/credential resolution failed before the turn began; the raw text (URLs, status
-            # codes) belongs in the log, and the chat gets the commands that fix it.
-            logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc)
-            from hermes_cli.auth import is_rate_limited_auth_error
-            if is_rate_limited_auth_error(exc.__cause__):
-                # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
-                from gateway.run import _gateway_provider_error_reply
-                return {"final_response": _gateway_provider_error_reply(str(exc)),
-                        "messages": [], "api_calls": 0, "tools": []}
-            return {
-                "final_response": t("gateway.errors.no_credentials"),
-                "messages": [], "api_calls": 0, "tools": [],
-            }
+            # Model/credential resolution failed before the turn began. Keep the raw cause in logs,
+            # but return a failed turn with a stable user-facing recovery message and reason.
+            logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
+            from agent.turn_failure_copy import stamp_failure
+            text, reason, retryable = _resolution_failure_reply(exc, ctx.source.platform)
+            return stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
+                                  "failed": True, "completed": False, "error": str(exc)}, reason, retryable)
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
@@ -2236,15 +2337,34 @@ class TurnRunner:
         state = runner._session_state(ctx.session_key) if ctx.session_key else None
         attended_notice = getattr(getattr(state, "conversation", None), "pending_attended_notice", None)
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        from gateway.run_turn_progress import local_viewer_turn
+        local_sinks = None
+        if local_viewer_turn(self) and not ctx.mute_notification_reply:
+            # Per-turn local-viewer callbacks must be installed on the shared cached agent only for
+            # the duration of this run. Without this bridge the final response is painted twice by
+            # the CLI/TUI path and billing/preview metadata never reaches the completion frame.
+            from gateway import local_viewer_events
+            local_sinks = local_viewer_events.wire(self, agent)
+            from gateway.session_usage import TURN_BASE_ATTR
+            setattr(agent, TURN_BASE_ATTR, int(getattr(agent, "session_output_tokens", 0) or 0))
         if attended_notice:
             emit_status = getattr(agent, "_emit_diagnostic_status", None)
             if callable(emit_status):
                 emit_status(attended_notice)
             if state is not None:
                 state.conversation.pending_attended_notice = None
-        agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
-        persist_msg, persist_ts = self._prepare_turn_message(agent_history)
-        result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        try:
+            agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
+            persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+            result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        finally:
+            if local_sinks is not None:
+                from gateway import local_viewer_events
+                local_viewer_events.restore(agent, local_sinks)
+                from gateway.session_usage import publish_usage
+                publish_usage(self, agent, record=True)
+                from gateway.session_local_inventory import publish_settled_info
+                publish_settled_info(self, agent)
         from hermes_cli.goal_turn_outcome import model_final_response
         # Judge goals on the model's own text, before stream finish may add a recovery marker.
         model_response = model_final_response(result)
@@ -2277,6 +2397,16 @@ class TurnRunner:
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
             **usage,
         }
+        previewed = result.get("response_previewed", False)
+        viewer_meta = {}
+        if local_sinks is not None:
+            was_delivered = getattr(agent, "_interim_text_was_delivered", None)
+            previewed = bool(previewed or (callable(was_delivered) and bool(final_response) and was_delivered(final_response) is True))
+            viewer_meta = {
+                "local_viewer": True,
+                **({"billing_block": result["billing_block"]} if isinstance(result.get("billing_block"), dict) else {}),
+                **({"warning": result["warning"]} if isinstance(result.get("warning"), str) and result["warning"] else {}),
+            }
         if not final_response:
             # Keep the model copy raw for evaluation, but retain the finalized display copy here.
             # Some queued/direct delivery paths consume this result without the outer shape step.
@@ -2289,12 +2419,15 @@ class TurnRunner:
                 display_response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
             # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
             # defaults agent_persisted differently when the key is absent.
-            return {"final_response": final_response or "", "delivery_text": display_response, **common}
+            return {"final_response": final_response or "", "delivery_text": display_response, **common, **viewer_meta,
+                    "response_previewed": previewed,
+                    "response_transformed": bool(result.get("response_transformed"))}
         final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
         return {
-            "final_response": final_response, "delivery_text": final_response, "last_reasoning": result.get("last_reasoning"), **common,
-            "response_previewed": result.get("response_previewed", False),
+            "final_response": final_response, "delivery_text": final_response, "last_reasoning": result.get("last_reasoning"), **common, **viewer_meta,
+            "response_previewed": previewed,
             "response_transformed": result.get("response_transformed", False),
+            "response_reused": result.get("response_reused", False),
             # Lets the persistence block tell whether the codex app-server path self-persisted (it
             # didn't — see codex_runtime.py); default True keeps skip-db for the standard runtime.
             "agent_persisted": result.get("agent_persisted", True),

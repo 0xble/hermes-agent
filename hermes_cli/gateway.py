@@ -5,6 +5,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 
 import asyncio
 import contextlib
+import math
 from hermes_cli.cli_output import line_input
 from hermes_cli.gateway_host_record import _discard_dead_host_record, _forget_host_gateway_probe
 import json
@@ -43,6 +44,7 @@ from gateway.restart import (
     is_gateway_supervisor_process,
     parse_cron_drain_timeout,
     parse_restart_after_turn_timeout,
+    parse_restart_delegation_timeout,
     parse_restart_drain_timeout,
     resolve_restart_exit_wait_budget,
     resolve_systemd_timeout_stop_sec,
@@ -236,6 +238,26 @@ def _get_parent_pid(pid: int) -> int | None:
     except ValueError:
         return None
     return parent_pid if parent_pid > 0 else None
+
+
+def _ancestor_chain_to(target_pid: int) -> list[int]:
+    """PIDs from ``target_pid`` down to (excluding) this process when ``target_pid`` is an
+    ancestor, else ``[]``. A supervisor may own a wrapper (launchd's ``osascript`` →
+    ``stderr_timestamp`` → gateway), so the supervised pid and the gateway that stamps its
+    code identity are different processes on the same chain."""
+    if target_pid <= 0:
+        return []
+
+    pid = os.getpid()
+    chain: list[int] = []
+    seen: set[int] = set()
+    while pid and pid not in seen:
+        if pid == target_pid:
+            return [pid, *reversed(chain[1:])] if chain else [pid]
+        seen.add(pid)
+        chain.append(pid)
+        pid = _get_parent_pid(pid) or 0
+    return []
 
 
 def _is_pid_ancestor_of_current_process(target_pid: int) -> bool:
@@ -2861,22 +2883,22 @@ def get_systemd_linger_status(username: str | None = None) -> tuple[bool | None,
     return None, f"unexpected loginctl output: {value or '<empty>'}"
 
 
-def get_launchd_plist_path() -> Path:
-    """``~/Library/LaunchAgents/ai.hermes.gateway[-<profile>].plist`` under the real account home."""
-    import pwd
-    suffix = _profile_suffix()
-    name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
-    # Real account home: profile mode may point HOME at a profile dir. Sandboxed/app-hosted
-    # shells can expose a UID that pwd cannot resolve (#57292); fall back to the shared
-    # real-home resolver (HERMES_REAL_HOME → HOME → pwd → ~, profile home skipped) instead
-    # of crashing launchd commands.
+def _launchd_account_home() -> Path:
+    """Return the real macOS account home, not a profile or test HOME override."""
     try:
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd helper
     except (KeyError, ImportError, OSError):
         from hermes_constants import get_real_home
 
-        home = Path(get_real_home())
-    return home / "Library" / "LaunchAgents" / f"{name}.plist"
+        return Path(get_real_home())
+
+
+def get_launchd_plist_path() -> Path:
+    """``~/Library/LaunchAgents/ai.hermes.gateway[-<profile>].plist`` under the real account home."""
+    suffix = _profile_suffix()
+    name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+    return _launchd_account_home() / "Library" / "LaunchAgents" / f"{name}.plist"
 
 
 def launchd_gateway_labels_for_install() -> list[str]:
@@ -3206,7 +3228,8 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         _append_node_dir_for_service(path_entries)
 
     # TimeoutStopSec must cover the full stop budget (cron drain + cleanup) or systemd SIGKILLs mid-drain.
-    restart_timeout = resolve_systemd_timeout_stop_sec(_get_restart_drain_timeout(), _get_cron_drain_timeout())
+    stop_budget = resolve_systemd_timeout_stop_sec(_get_restart_drain_timeout(), _get_cron_drain_timeout())
+    restart_timeout = stop_budget if math.isfinite(stop_budget) else "infinity"
 
     if system:
         username, group_name, home_dir, uid = _system_service_identity(run_as_user)
@@ -3529,6 +3552,18 @@ def _agent_timeout_setting(env_var: str, key: str, parse) -> float:
     return parse(None)
 
 
+def _gateway_timeout_setting(env_var: str, key: str, parse) -> float:
+    """Read a gateway timeout from its environment override or gateway config section."""
+    env_raw = os.getenv(env_var)
+    if env_raw is not None and str(env_raw).strip() != "":
+        return parse(env_raw)
+    cfg = read_raw_config()
+    gateway_cfg = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+    if isinstance(gateway_cfg, dict) and key in gateway_cfg:
+        return parse(gateway_cfg.get(key))
+    return parse(None)
+
+
 def _get_cron_drain_timeout() -> float:
     """Return the configured cron and api_server (/v1) drain floor in seconds.
 
@@ -3544,7 +3579,10 @@ def _get_restart_exit_wait_budget() -> float:
         _agent_timeout_setting(
             "HERMES_RESTART_AFTER_TURN_TIMEOUT", "restart_after_turn_timeout", parse_restart_after_turn_timeout
         ),
-        _get_cron_drain_timeout(),
+        delegation_timeout=_gateway_timeout_setting(
+            "HERMES_RESTART_DELEGATION_TIMEOUT", "restart_delegation_timeout", parse_restart_delegation_timeout
+        ),
+        cron_drain_timeout=_get_cron_drain_timeout(),
     )
 
 
@@ -5034,6 +5072,9 @@ def _print_runtime_health() -> None:
 def _cmd_run(args):
     if _maybe_redirect_run_to_s6_supervision(args):
         return  # unreachable; execvp doesn't return
+    # The direct/launchd ``gateway run`` path must refuse withdrawn handover leftovers too:
+    # a live generation job beside this process would be a second poller on one bot token.
+    _refuse_forward_only_leftovers(retry_on_inspection_error=True)
     if getattr(args, "external_supervisor", False):
         os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
     run_gateway(
@@ -5185,6 +5226,9 @@ def _cmd_install(args):
     if is_managed():
         managed_error("install gateway service")
         return
+    # Installing/bootstrapping the legacy service beside a live withdrawn generation job would
+    # start a second poller on the same bot token.
+    _refuse_forward_only_leftovers()
     if getattr(args, "if_missing", False) and _is_service_installed():
         print("✓ Gateway service already installed")
         return
@@ -5268,7 +5312,23 @@ def _print_unfolded_gateway_note(owner) -> None:
     print("  They were left running; fold them in with: hermes gateway migrate --multiplex")
 
 
+def _refuse_forward_only_leftovers(*, retry_on_inspection_error: bool = False) -> None:
+    """Block gateway lifecycle actions until withdrawn handover state is inspected."""
+    from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+    from hermes_cli.forward_only_guard import LeftoverInspectionError, refuse_if_forward_only_leftovers
+    try:
+        refuse_if_forward_only_leftovers(get_hermes_home())
+    except LeftoverInspectionError as exc:
+        print_error(str(exc))
+        code = GATEWAY_SERVICE_RESTART_EXIT_CODE if retry_on_inspection_error else GATEWAY_FATAL_CONFIG_EXIT_CODE
+        raise SystemExit(code) from exc
+    except RuntimeError as exc:
+        print_error(str(exc))
+        raise SystemExit(GATEWAY_FATAL_CONFIG_EXIT_CODE) from exc
+
+
 def _cmd_start(args):
+    _refuse_forward_only_leftovers()
     from hermes_cli.gateway_profile_lifecycle import host_scope_for_all_verb, profile_lifecycle
     if profile_lifecycle("start", args):
         return
@@ -5468,6 +5528,7 @@ def _refuse_restart_of_service_managed_gateway(pid: int | None) -> None:
 
 
 def _cmd_restart(args):
+    _refuse_forward_only_leftovers()
     _refuse_from_inside_gateway("restart", "restart loops")
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("restart", args):

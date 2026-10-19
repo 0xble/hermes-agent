@@ -17,7 +17,7 @@ async def admit_relay_delivery(adapter, runner, event):
     admission of the same chat, so one chat's deliveries still commit in arrival order."""
     from gateway.run_inbound_consumer import POST_ADMISSION_HOOK
     from hermes_cli.lifecycle import has_hook
-    if not (has_hook('pre_gateway_dispatch') or has_hook(POST_ADMISSION_HOOK)):
+    if not (await asyncio.to_thread(has_hook, 'pre_gateway_dispatch') or await asyncio.to_thread(has_hook, POST_ADMISSION_HOOK)):
         await _admit(adapter, runner, event)
         return None
     lanes = adapter._admission_lanes
