@@ -40,7 +40,9 @@ from agent.conversation_compression import (
 from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
-from agent.message_metadata import ABSORBED_MESSAGE_UIDS, DB_ROW_SNAPSHOT, MESSAGE_UID, copy_identity_fields
+from agent.message_metadata import (
+    ABSORBED_MESSAGE_UIDS, DB_ROW_SNAPSHOT, MESSAGE_UID, REPLAY_PERSISTED_CONTENT, copy_identity_fields,
+)
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
@@ -1351,15 +1353,22 @@ def _build_gateway_agent_history(
                 ):
                     entry.pop("api_content", None)
                 entry["content"] = rendered
+                if rendered != content and isinstance(msg.get("content"), str):
+                    entry[REPLAY_PERSISTED_CONTENT] = content
             if msg.get("mirror"):
                 mirror_src = msg.get("mirror_source", "another session")
                 entry["content"] = f"[Delivered from {mirror_src}] {entry['content']}"
                 entry.pop("api_content", None)  # prefix rewrite: the sidecar no longer matches
             if entry.get("content") != msg.get("content"):
-                entry.pop(DB_ROW_SNAPSHOT, None)  # a rendered view is not the stored row version
-                for field in ("_db_persisted", "_compressed_summary", "message_id", "platform_message_id",
-                              "observed", "display_kind", "display_metadata", "effect_disposition"):
-                    entry.pop(field, None)
+                if REPLAY_PERSISTED_CONTENT in entry:
+                    # The visible content is a model-only timestamp view. Keep the CAS and row metadata,
+                    # but force the next flush to write the original durable content from the override.
+                    entry.pop("_db_persisted", None)
+                else:
+                    entry.pop(DB_ROW_SNAPSHOT, None)  # a rewritten view is not the stored row version
+                    for field in ("_db_persisted", "_compressed_summary", "message_id", "platform_message_id",
+                                  "observed", "display_kind", "display_metadata", "effect_disposition"):
+                        entry.pop(field, None)
             agent_history.append(entry)
 
     # Keep gateway resume byte-identical to the TUI resume and send paths. The

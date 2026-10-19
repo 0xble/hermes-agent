@@ -222,6 +222,34 @@ def test_replay_drops_persistence_metadata_when_content_is_rewritten():
 
 
 
+def test_timestamp_replay_persists_original_content_and_row_metadata(tmp_path):
+    from agent.message_metadata import REPLAY_PERSISTED_CONTENT
+    from hermes_state import SessionDB
+    from gateway.run import _build_gateway_agent_history
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s", "gateway")
+        stored = [{
+            "role": "user", "content": "follow up", "message_uid": "u1", "_db_row_snapshot": "snap1",
+            "_db_persisted": True, "platform_message_id": "plat-9", "display_kind": "user_text",
+            "timestamp": 1_700_000_000.0,
+        }]
+        replayed, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
+        assert replayed[0]["content"] != "follow up"
+        assert replayed[0][REPLAY_PERSISTED_CONTENT] == "follow up"
+        assert replayed[0]["platform_message_id"] == "plat-9"
+        assert replayed[0]["display_kind"] == "user_text"
+        db.append_messages_batch("s", replayed)
+        persisted = db.get_messages_as_conversation("s")[0]
+        assert persisted["content"] == "follow up"
+        assert persisted["message_id"] == "plat-9"
+        assert persisted["display_kind"] == "user_text"
+    finally:
+        db.close()
+
+
+
 def test_replay_keeps_the_stored_row_version_only_for_unchanged_content():
     from gateway.run import _build_gateway_agent_history
 
@@ -236,5 +264,6 @@ def test_replay_keeps_the_stored_row_version_only_for_unchanged_content():
 
     rendered, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
     assert rendered[0]["content"] != stored[0]["content"]
-    assert "_db_row_snapshot" not in rendered[0]
+    assert rendered[0]["_replay_persisted_content"] == stored[0]["content"]
+    assert rendered[0]["_db_row_snapshot"] == "snap1"
     assert rendered[1]["_db_row_snapshot"] == "snap2"

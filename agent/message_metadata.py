@@ -39,12 +39,15 @@ ABSORBED_MESSAGE_UIDS = "_absorbed_message_uids"
 # (``messages.tool_call_uid``). The provider-facing ``id`` is untouched; these never reach the wire.
 TOOL_CALL_UIDS = "_tool_call_uids"
 TOOL_CALL_UID = "_tool_call_uid"
+# Original durable content retained on a timestamp-rendered gateway replay view. The model sees the
+# rendered copy, while a lease-less compaction must write the stored text back to state.db.
+REPLAY_PERSISTED_CONTENT = "_replay_persisted_content"
 PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset(
     # Membership is the real contract, NOT the leading underscore: the chat-completions transport happens
     # to sweep underscore keys, but turn_context.py pops this set from every outgoing copy and a strict
     # backend 400s on any key it does not know.
     {"timestamp", "display_kind", "display_metadata", "message_id", "platform_message_id", "observed",
-     "effect_disposition", "_compressed_summary", "_row_id", "_submit_row_session_id",
+     "effect_disposition", "_compressed_summary", REPLAY_PERSISTED_CONTENT, "_row_id", "_submit_row_session_id",
      MERGED_TURN_PREFIX, MESSAGE_UID, ABSORBED_MESSAGE_UIDS, TOOL_CALL_UIDS, TOOL_CALL_UID,
      # The alternation repair's row counts: an in-place compaction reads them off the live dict.
      MERGED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS, RETIRED_DURABLE_ROWS}
