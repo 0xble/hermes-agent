@@ -132,6 +132,66 @@ class TestRetrievalBoundaryEvals:
         rows = db.search_messages(query)
         assert any(row["session_id"] == "boundary" for row in rows)
 
+    @pytest.mark.parametrize("query, content", [
+        ("don't", "I like donut glaze."),
+        ("foo,bar", "The fooXbar migration is ready."),
+    ])
+    def test_stale_fts_like_fallback_phrase_gap_is_a_separator(self, db, query, content):
+        _seed_boundary_message(db, content)
+        db._fts_stale = True
+        assert db.search_messages(query) == []
+
+    @pytest.mark.parametrize("query, content", [
+        ("foo,bar", "The foo, bar migration is ready."),
+        ("don't", "I don\u2019t like Sarah's standup time."),
+    ])
+    def test_stale_fts_like_fallback_matches_multi_char_and_curly_separators(self, db, query, content):
+        _seed_boundary_message(db, content)
+        db._fts_stale = True
+        assert any(row["session_id"] == "boundary" for row in db.search_messages(query))
+
+    @staticmethod
+    def _seed_unindexed_gap(db, content):
+        """One canonical row the deferred FTS rebuild has not indexed yet (progress=0)."""
+        triggers = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'messages_fts%'").fetchall()
+        for (name,) in triggers:
+            db._conn.execute(f"DROP TRIGGER {name}")
+        db.create_session("gap", source="cli")
+        db.append_message("gap", "assistant", content)
+        high_water = db._conn.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+        db.set_meta("fts_rebuild_high_water", str(high_water))
+        db.set_meta("fts_rebuild_progress", "0")
+        db._conn.commit()
+        assert db.fts_rebuild_status()["indexed"] == 0
+
+    @pytest.mark.parametrize("query, content, kwargs", [
+        ("don't", "I don't like Sarah's standup time.", {}),
+        ("Sarah's", "I don't like Sarah's standup time.", {"exclude_tool_calls": True}),
+        ("12:30", "The standup moved to 12:30 today.", {}),
+        ("error:timeout", "upstream returned error:timeout twice", {}),
+        ("http://example.com/a", "see http://example.com/a for details", {}),
+    ])
+    def test_unindexed_gap_matches_punctuated_phrases(self, db, query, content, kwargs):
+        self._seed_unindexed_gap(db, content)
+        rows = db.search_messages(query, **kwargs)
+        assert any(row["session_id"] == "gap" for row in rows)
+
+    def test_unindexed_gap_phrase_gap_is_a_separator(self, db):
+        self._seed_unindexed_gap(db, "I like donut glaze.")
+        assert db.search_messages("don't") == []
+
+    @pytest.mark.parametrize("query", ["100%完成", "xyzabc 100%完成", "notes 100%完成"])
+    def test_cjk_percent_token_matches_literally_in_multi_token_query(self, db, query):
+        db._fts_cjk_available = False  # pin the LIKE route (the bigram index is optional)
+        db.create_session("cjk", source="cli")
+        db.append_message("cjk", "user", "the 100%完成 marker is set")
+        db.create_session("wild", source="cli")
+        db.append_message("wild", "user", "the 100X完成 marker is set")
+        db._conn.commit()
+        rows = db.search_messages(query)
+        assert {row["session_id"] for row in rows} == {"cjk"}
+
     def test_legacy_inline_fts_discovery_ignores_tool_call_json(self, tmp_path):
         path = tmp_path / "legacy.db"
         initial = SessionDB(path)
