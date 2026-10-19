@@ -1436,11 +1436,22 @@ class TurnRunner:
                 _handoff(conversation={"last_api_call_at": time.time()})
             agent._gateway_attended_decision = decision
             desired_key = decision.decision_key
-            if desired_key == previous_key:
-                return
+
+            def _persist_committed_route_marker():
+                if not commit or not ctx.session_key:
+                    return
+                store = getattr(runner, "session_store", None)
+                mark_route = getattr(store, "mark_attended_route_active", None)
+                if callable(mark_route):
+                    mark_route(ctx.session_key, decision.reason == "attended")
+
             if getattr(agent, "_fallback_activated", False) or getattr(agent, "_provider_fallback_active", False):
                 agent._gateway_attended_decision_key = desired_key
                 return
+            if desired_key == previous_key:
+                _persist_committed_route_marker()
+                return
+
             if decision.switched_back:
                 snapshot = getattr(runner, "_snapshot_session_runtime_state", None)
                 if callable(snapshot):
@@ -1513,6 +1524,7 @@ class TurnRunner:
                 agent.reasoning_config = runner._resolve_session_reasoning_config(
                     source=ctx.source, session_key=ctx.session_key, model=model,
                 )
+            _persist_committed_route_marker()
             agent._gateway_attended_decision_key = desired_key
             if ctx.session_key:
                 _handoff(conversation={"last_resolved_model": model})
@@ -1522,7 +1534,12 @@ class TurnRunner:
                     emit_status(format_attended_switch_back_notice(
                         model, parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
                     ))
-            elif decision.reason == "attended" and not unavailable_emitted and not (previous_key and previous_key[-1]):
+            elif (
+                decision.reason == "attended"
+                and not decision.new_session
+                and not unavailable_emitted
+                and not (previous_key and previous_key[-1])
+            ):
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
                 emit_status = getattr(agent, "_emit_diagnostic_status", None)
                 if callable(emit_status):

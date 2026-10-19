@@ -287,6 +287,8 @@ compression:
   # model_thresholds:        # Per-model threshold overrides (substring match,
   #   "glm-5.2": 0.40        # longest key wins). See "Per-model threshold
   #   "claude-sonnet": 0.35  # overrides" below.
+  agent_request_floor_ratio: 0.30 # Refuse requests below 30% of auto threshold
+  agent_request_cooldown_api_calls: 10 # Minimum API calls between accepted requests
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
   tail_mode: lean            # Tail retention policy: lean | legacy (default: lean)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
@@ -312,6 +314,8 @@ auxiliary:
 |-----------|---------|-------|-------------|
 | `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` (floored at 0.75 below 512K windows) |
 | `threshold_tokens` | `null` | int or `null` | Optional absolute cap on the trigger: when set, compaction fires at the lower of the ratio trigger and this count. `null` = ratio-only |
+| `agent_request_floor_ratio` | `0.30` | ≥0 | Minimum fraction of the automatic threshold required for `compact_context`. |
+| `agent_request_cooldown_api_calls` | `10` | ≥0 | Minimum API calls between accepted agent-requested compactions. |
 | `model_thresholds` | `{}` | map | Per-model overrides of `threshold`. Keys are substring-matched against the model name (longest match wins); `"<provider>:<substring>"` keys apply only on that provider. The small-context floor still applies on top (see below) |
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` (legacy mode only — `lean` uses its own clamp) |
 | `tail_mode` | `lean` | `lean`, `legacy` | Tail retention policy. `legacy` keeps a `target_ratio`-sized verbatim tail (~100K+ tokens on big-window models). `lean` keeps a clamped tail of `2.5% × context window` (10K floor, 25K cap) and instead carries continuity in the summary: a detailed identifier-preserving session log (produced by the same single summary request — lean compaction makes exactly one auxiliary LLM call per attempt), a mechanically extracted anchor index (PR numbers, SHAs, paths, error strings — regex, never paraphrased), every real user message quoted verbatim (newest-first budget), and a `session_search` recovery pointer so the agent can re-access anything summarized away. Oversized regions are evenly sampled into the summarizer input (with explicit elision markers) rather than triggering extra calls. Result on 500K-token real sessions: ~49K retained vs ~162K, with higher recall when paired with recovery (see `evals/compaction/results/`). Old tool results inside the lean tail are demoted to one-line stubs carrying a recovery pointer |
@@ -325,6 +329,29 @@ auxiliary:
 | `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Engages for gpt-5.6-family models on the direct OpenAI API or a ChatGPT Codex subscription, and `gpt-6-astra` (including its `-900k` picker alias) on official Codex OAuth (see below) |
 | `codex_responses_compact_threshold` | `null` | `null` or positive integer | Server-side compaction trigger, read **only when `codex_responses_native: true`** — it never changes when local compression fires; the local trigger is `threshold` (ratio) capped by `threshold_tokens`. `null` follows the resolved local compression trigger with an 8,192 token safety margin. A positive integer remains absolute and only clamps downward when required. Invalid values use automatic behavior. Automatic mode falls back to `200000` when no usable local trigger exists |
 | `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
+
+### Agent-requested compaction
+
+The `compression` toolset adds a `compact_context` tool with a short `reason`
+and optional `focus`. It is on by default; disable it with `hermes tools` or
+`agent.disabled_toolsets: [compression]`.
+
+The tool never compacts inside its own tool batch. It records one request and
+returns whether it was accepted, along with current context tokens and the
+automatic compression threshold. The next post-tool boundary performs the
+rewrite with trigger `agent_requested` and passes `focus` to the summarizer.
+A request is refused when compression is disabled, when a compaction already ran
+and fresh provider usage has not arrived, on a second request in the same turn,
+below `agent_request_floor_ratio` of the threshold, within
+`agent_request_cooldown_api_calls` session API calls of the last accepted
+request, or when the compression attempt budget is spent. A lock or transient
+cooldown at the boundary keeps the request pending; a hard failure or the end of
+the turn clears it. `codex_app_server` refuses every request because native
+thread compaction cannot accept focus guidance.
+
+The tool description asks the model to call it at a phase boundary, after a
+finished sub-task or an unrelated topic switch. Size stays with the automatic
+threshold. `evals/agent_requested_compaction` measures that behavior.
 
 ### In-place compaction (single stable session id)
 

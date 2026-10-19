@@ -305,8 +305,15 @@ def _setup_mcp_shim(agent, args: dict, ctx: InlineToolContext) -> Any:
     }, ctx)
 
 
+def _compact_context(agent, args: dict, ctx: InlineToolContext) -> Any:
+    from agent.compact_context import request_compaction
+
+    return request_compaction(agent, args, messages=getattr(agent, "_session_messages", None))
+
+
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
+    "compact_context": _compact_context,
     "todo_list": _tool(
         "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
         store=lambda agent, ctx: agent._todo_store,

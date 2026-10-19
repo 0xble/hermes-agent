@@ -184,8 +184,8 @@ except the two summarizer identifiers:
 | `scope` | `history`, `provider` |
 | `official` | `true` only for `compress_context` attempts |
 | `method` | `llm_summary`, `aux_fallback_main`, `deterministic_fallback`, `deterministic_prune`, `provider`, `none` |
-| `trigger` | `manual`, `turn_start_threshold`, `pre_api`, `post_tool`, `idle`, `engine_preflight`, `overflow`, `gateway_hygiene`, `between_turns`, `proactive_prune`, `provider`, `unknown` |
-| `trigger_class` | `auto`, `manual`, `overflow`, `provider`, `unknown` |
+| `trigger` | `manual`, `turn_start_threshold`, `pre_api`, `post_tool`, `idle`, `engine_preflight`, `overflow`, `gateway_hygiene`, `between_turns`, `proactive_prune`, `agent_requested`, `provider`, `unknown` |
+| `trigger_class` | `auto`, `agent`, `manual`, `overflow`, `provider`, `unknown` |
 | `outcome` | `committed`, `aborted`, `failed`, `skipped`, `blocked` |
 | `split_status` | `not_applicable`, `in_place_committed`, `rotated_committed`, `failed_not_indexed`, `aborted`, or `null` |
 | `token_count_method` | `estimate_rough`, or `null` |
