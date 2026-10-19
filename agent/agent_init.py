@@ -2052,6 +2052,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
     agent.compression_agent_request_floor_ratio, agent.compression_agent_request_cooldown_api_calls = cs.agent_request_floor_ratio, cs.agent_request_cooldown_api_calls
+    agent._agent_compaction_request_lock = threading.Lock()
 
 
 def _enforce_minimum_context(agent):

@@ -12,8 +12,7 @@ COMPACT_CONTEXT_SCHEMA = {
         "verbatim. A long transcript alone is enough. Do not wait for a token count. Skip it when the new "
         "message continues the same unfinished edit or debug, because exact recent output matters there. "
         "Also skip it right after a compaction, on a short transcript, or more than once per phase. "
-        "Always pass focus naming decisions, open items, file paths, and IDs to preserve. "
-        "Not supported on codex_app_server because native thread compaction cannot accept focus guidance."
+        "Always pass focus naming decisions, open items, file paths, and IDs to preserve."
     ),
     "parameters": {
         "type": "object",

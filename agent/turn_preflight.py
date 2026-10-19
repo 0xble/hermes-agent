@@ -341,6 +341,7 @@ def compress_after_tool_results(
         else:
             ensure_compression_feasibility_checked(agent, _real_tokens)
             compression_attempts += 1
+            _clear_overflow_warn(agent)
             _post_tool_input = messages
             _safe_print = getattr(agent, "_safe_print", lambda _message: None)
             _safe_print("  ⟳ compacting context…")
@@ -367,6 +368,12 @@ def compress_after_tool_results(
             conversation_history = conversation_history_after_compression(
                 agent, messages, conversation_history
             )
+            if _should_skip_model_call_for_reference_handoff(messages, user_message):
+                logger.info("Skipping agent-requested compaction model call: reference-only handoff (#80622)")
+                if not final_response:
+                    final_response = _HANDOFF_SKIP_FINAL_RESPONSE
+                turn_exit_reason = "compaction_handoff_not_actionable"
+                return _verdict(True)
             current_turn_user_idx = _reanchor(agent, messages, user_message)
             # One requested pass is the boundary for this invocation; do not also run
             # automatic compaction on the same post-tool result.

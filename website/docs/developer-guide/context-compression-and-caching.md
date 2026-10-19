@@ -332,20 +332,26 @@ auxiliary:
 
 ### Agent-requested compaction
 
-The model can call `compact_context` with a short `reason` and optional `focus`.
-The tool never compacts inside its own tool batch: it reports whether the request
-was accepted, along with current context tokens and the automatic compression
-threshold, then the existing post-tool boundary performs the rewrite.
+The `compression` toolset adds a `compact_context` tool with a short `reason`
+and optional `focus`. It is on by default; disable it with `hermes tools` or
+`agent.disabled_toolsets: [compression]`.
 
-Call it on a long transcript, before other tools, when earlier work is no longer
-needed verbatim because the previous sub-task finished or the user switched to an
-unrelated topic. Do not call it while the user is still on the same unfinished
-task, especially mid-edit or mid-debug when exact recent output matters,
-immediately after compaction, to tidy a small context, or more than once per
-phase. Reaching a token level is not a trigger. The automatic threshold already
-covers size. Use `focus` for decisions, open items,
-file paths, and IDs the summary must preserve. `compact_context` is refused for
-`codex_app_server`, whose native thread compaction does not accept focus guidance.
+The tool never compacts inside its own tool batch. It records one request and
+returns whether it was accepted, along with current context tokens and the
+automatic compression threshold. The next post-tool boundary performs the
+rewrite with trigger `agent_requested` and passes `focus` to the summarizer.
+A request is refused when compression is disabled, when a compaction already ran
+and fresh provider usage has not arrived, on a second request in the same turn,
+below `agent_request_floor_ratio` of the threshold, within
+`agent_request_cooldown_api_calls` session API calls of the last accepted
+request, or when the compression attempt budget is spent. A lock or transient
+cooldown at the boundary keeps the request pending; a hard failure or the end of
+the turn clears it. `codex_app_server` refuses every request because native
+thread compaction cannot accept focus guidance.
+
+The tool description asks the model to call it at a phase boundary, after a
+finished sub-task or an unrelated topic switch. Size stays with the automatic
+threshold. `evals/agent_requested_compaction` measures that behavior.
 
 ### In-place compaction (single stable session id)
 

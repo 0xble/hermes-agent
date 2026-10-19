@@ -44,19 +44,18 @@ def _result(*, accepted: bool, state: str = "refused", reason: str, current: int
     }, ensure_ascii=False)
 
 
+_LOCK_INIT = threading.Lock()
+
+
 def _request_lock(agent: Any) -> threading.Lock:
+    # agent_init creates the lock up front; the guarded fallback covers bare test agents.
     lock = getattr(agent, "_agent_compaction_request_lock", None)
     if lock is None:
-        candidate = threading.Lock()
-        existing = getattr(agent, "_agent_compaction_request_lock", None)
-        if existing is None:
-            try:
-                agent._agent_compaction_request_lock = candidate
-                lock = candidate
-            except AttributeError:
-                lock = candidate
-        else:
-            lock = existing
+        with _LOCK_INIT:
+            lock = getattr(agent, "_agent_compaction_request_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                agent._agent_compaction_request_lock = lock
     return lock
 
 
@@ -89,7 +88,8 @@ def request_compaction(agent: Any, args: dict, *, messages: Optional[list] = Non
         if bool(getattr(agent, "_agent_requested_compaction_this_turn", False)):
             return _result(accepted=False, reason="already requested or compacted by the agent this turn", current=current, threshold=threshold)
 
-        floor_ratio = float(getattr(agent, "compression_agent_request_floor_ratio", _DEFAULT_FLOOR_RATIO) or _DEFAULT_FLOOR_RATIO)
+        _ratio = getattr(agent, "compression_agent_request_floor_ratio", None)
+        floor_ratio = _DEFAULT_FLOOR_RATIO if _ratio is None else max(0.0, float(_ratio))
         floor = int(threshold * floor_ratio) if threshold > 0 else 0
         if floor > 0 and current < floor:
             return _result(
@@ -100,7 +100,8 @@ def request_compaction(agent: Any, args: dict, *, messages: Optional[list] = Non
             )
 
         cooldown = int(getattr(agent, "compression_agent_request_cooldown_api_calls", _DEFAULT_COOLDOWN_API_CALLS) or 0)
-        api_calls = int(getattr(agent, "_api_call_count", 0) or 0)
+        # Session-wide count: the per-turn _api_call_count restarts every turn.
+        api_calls = int(getattr(agent, "session_api_calls", 0) or 0)
         last_call = getattr(agent, "_last_agent_compaction_request_api_call", None)
         if last_call is not None and api_calls - int(last_call) < cooldown:
             return _result(

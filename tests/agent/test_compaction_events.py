@@ -123,6 +123,17 @@ def test_committed_summary_publishes_one_compaction_mark_with_the_v1_shape(publi
     assert SECRET not in raw and "SANITIZED SUMMARY" not in raw and "focus on" not in raw
 
 
+def test_agent_requested_trigger_survives_event_normalization(published):
+    agent = _Agent(_compressor())
+    with patch.object(agent.context_compressor, "_generate_summary", return_value="SANITIZED SUMMARY"):
+        compress_context(agent, _messages(), "system prompt", approx_tokens=80_000, trigger="agent_requested")
+
+    [(_sid, name, payload)] = published
+    assert name == "compaction"
+    assert payload["trigger"] == "agent_requested"
+    assert payload["trigger_class"] == "agent"
+
+
 def test_deterministic_fallback_is_a_committed_compaction_with_its_method(published):
     agent = _Agent(_compressor())
 

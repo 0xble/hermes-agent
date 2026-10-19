@@ -13,7 +13,11 @@ Primary model `gpt-6.1-sol` via `custom:codex-proxy`, final description, 5 runs 
 | Mid-debug | no call | 0/5 |
 | Just compacted | no call | 0/5 |
 
-The original bar (every should-call scenario calls in every run, no should-not scenario ever calls) was not met by description wording alone after 4 revisions. The shipped bar scores what reaches the conversation: no should-not scenario produces an accepted compaction (0 of 15), and the 2 phase-boundary triggers fire in at least 80% of runs (8 of 10). A missed call costs nothing beyond today's behavior, because automatic compression still runs at the threshold. Small-context calls are harmless because the code floor refuses them (about 36K tokens against a 61,200 token floor).
+**The original bar was not met.** It required every should-call scenario to call in every run and no should-not scenario to ever call. Description wording alone could not reach it after 4 revisions. The bar used to ship is weaker: no should-not scenario produced an accepted compaction (0 of 15), and the 2 phase-boundary triggers fired in 8 of 10 runs.
+
+The 0 of 15 depends partly on code. The model called the tool in 2 of 5 small-context runs, and the 30% floor refused both (about 36K tokens against a 61,200 token floor). A missed call falls back to today's behavior, because automatic compression still runs at the threshold.
+
+Limits: 5 runs on 1 model. Summary quality and prompt-cache cost are not measured here.
 
 `claude-opus-5-5` was not evaluated on the final description: its proxy returned `HTTP 503 auth_unavailable` (no Anthropic credit).
 

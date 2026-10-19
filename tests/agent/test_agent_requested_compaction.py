@@ -27,7 +27,7 @@ def _agent(*, current=500, threshold=1000, enabled=True, api_mode=""):
         api_mode=api_mode,
         compression_agent_request_floor_ratio=0.30,
         compression_agent_request_cooldown_api_calls=10,
-        max_compression_attempts=3, _compression_attempts=0, _api_call_count=1,
+        max_compression_attempts=3, _compression_attempts=0, _api_call_count=1, session_api_calls=1,
         _session_messages=[{"role": "user", "content": "x"}],
     )
 
@@ -152,3 +152,28 @@ def test_commit_arms_fresh_usage_and_clear_removes_request():
     assert _call(agent, reason="phase complete")["accepted"]
     clear_pending_compaction(agent)
     assert agent._pending_agent_compaction is None
+
+
+def test_cooldown_counts_session_api_calls_across_turns():
+    agent = _agent()
+    agent.session_api_calls, agent._api_call_count = 15, 15
+    assert _call(agent, reason="phase complete")["accepted"]
+    reset_compaction_request_turn(agent)
+    # Next turn: the per-turn counter restarts but the session counter keeps going.
+    agent._api_call_count, agent.session_api_calls = 1, 19
+    assert "cooldown" in _call(agent, reason="too soon")["reason"]
+    agent._api_call_count, agent.session_api_calls = 2, 25
+    assert _call(agent, reason="next phase")["accepted"]
+
+
+def test_zero_floor_ratio_disables_the_floor():
+    agent = _agent(current=10, threshold=1000)
+    agent.compression_agent_request_floor_ratio = 0
+    assert _call(agent, reason="phase complete")["accepted"]
+
+
+def test_shared_metrics_keeps_agent_requested_out_of_other():
+    from hermes_cli.observability.shared_metrics_fields import compression_fields
+
+    fields = compression_fields(trigger="agent_requested", outcome="success", tokens_before=1, context_length=10)
+    assert fields["trigger"] == "manual"
