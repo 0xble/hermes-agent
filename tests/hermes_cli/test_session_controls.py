@@ -600,7 +600,7 @@ def test_approval_blocks_cross_process_definition_swap_at_apply_boundary(state, 
     def at_boundary(*args, **kwargs):
         attempt = subprocess.run(
             [sys.executable, "-c", script, str(state.db_path), key, json.dumps(replacement)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         attempts.append(attempt)
         return original(*args, **kwargs)
@@ -1130,6 +1130,19 @@ def test_replacement_payload_must_be_fully_displayable(state, payload, code):
     result = apply_control("goal", "replace", "target", requester_sid="requester", payload=payload)
     assert result["error_code"] == code
     assert load_goal("target").goal == "old objective"
+
+
+def test_replacement_accepts_unlimited_budget(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("old objective")
+    result = apply_control("goal", "replace", "target", requester_sid="requester",
+                           payload={"goal": "ship", "max_turns": 0})
+    assert result["status"] == "applied"
+    installed = load_goal("target")
+    assert installed is not None
+    assert (installed.goal, installed.max_turns) == ("ship", 0)
 
 
 @pytest.mark.parametrize("message,quote,refusal", [

@@ -72,7 +72,7 @@ class GatewaySessionControlsMixin:
             from hermes_cli.goals import _CONTRACT_LABELS
             from hermes_cli.session_controls import replacement_contract
             suffix = f" -> {new}"
-            current = affected[: -len(suffix)] if affected.endswith(suffix) else affected
+            current = affected.removesuffix(suffix)
             lines = [f"Affected: {cls._clip(current or '(state unavailable)', 600)}",
                      f"Proposed goal: {cls._clip(new, REPLACEMENT_MAX_CHARS)}"]
             # Approval installs every one of these, so every one is shown: a missing contract
@@ -84,7 +84,8 @@ class GatewaySessionControlsMixin:
             else:
                 lines.append("Proposed contract: none (the current contract is dropped)")
             max_turns = payload.get("max_turns")
-            lines.append(f"Max turns: {max_turns if max_turns is not None else 'unchanged'}")
+            budget = {None: "unchanged", 0: "unlimited"}.get(max_turns, max_turns)
+            lines.append(f"Max turns: {budget}")
             return "\n".join(lines)
         return f"Affected: {cls._clip(affected or '(state unavailable)', 2400)}"
 
