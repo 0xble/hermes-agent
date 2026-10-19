@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE, compression_blocked_transiently,
-    compression_skipped_due_to_lock, context_compression_timed_out,
+    compression_pool_saturated, compression_skipped_due_to_lock, context_compression_timed_out,
     conversation_history_after_compression, ensure_compression_feasibility_checked,
 )
 from agent.conversation_compression_boundary import mark_context_loss_boundary
@@ -348,9 +348,11 @@ def compress_after_tool_results(
         messages, active_system_prompt = agent._compress_context(
             messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id, trigger="post_tool",
         )
-        if messages is _post_tool_input and compression_skipped_due_to_lock(agent):
-            # Lock-skip no-op is a temporary defer, not evidence about compressibility:
-            # refund so a lock-loser loop doesn't burn the budget toward exhausted.
+        if messages is _post_tool_input and (
+            compression_skipped_due_to_lock(agent) or compression_pool_saturated(agent)
+        ):
+            # Lock or full-pool no-op is a temporary defer, not evidence about compressibility:
+            # refund so a contention loop doesn't burn the budget toward exhausted.
             # #69870 lock-skip / #97488 transient-block: this pass no-oped for a TEMPORARY reason (another
             # path holds the compression lock, or a timed cooldown/backoff guard is active). That is a
             # temporary DEFER, not evidence about compressibility — refund the attempt (it must not burn the

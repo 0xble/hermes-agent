@@ -1258,6 +1258,13 @@ def run_compress_context_with_progress_timeout(
             "slot when they return; if this persists, check the summary provider health.",
             _COMPRESS_EXECUTOR_MAX_WORKERS,
         )
+        # Saturation is a transient capacity refusal, not evidence that this session is
+        # incompressible. Publish the same defer signal used by cooldown/backoff guards
+        # so preflight and overflow callers refund this attempt and retry on a later pass.
+        agent = telemetry_agent
+        if agent is not None:
+            with contextlib.suppress(Exception):
+                agent._compression_blocked_transient = "pool_saturated"
         # Saturation refusals must hit the same telemetry stream as other failures, or
         # a wedged pool looks like compression simply stopped being attempted.
         if telemetry_agent is not None:
@@ -1295,7 +1302,7 @@ def run_compress_context_with_progress_timeout(
         return result[0] is messages
 
     def _recover_from_stall(
-        preserved_result: Optional[Tuple[list, str]] = None,
+        preserved_result: Optional[tuple[list, str]] = None,
     ) -> tuple[list[dict[str, Any]], str]:
         """One stall-fallback ladder for every host-side stall exit.
 
@@ -1631,7 +1638,7 @@ def _automatic_compression_gate_blocks(
 
 def compression_blocked_transiently(agent: Any) -> bool:
     """Type-pinned read of the transient-block signal.
-    Set when an automatic pass no-ops on a TRANSIENT guard (summary-failure cooldown or structural backoff).
+    Set when an automatic pass no-ops on a TRANSIENT guard (summary-failure cooldown, structural backoff, or compression-pool saturation).
     Consumers must defer, not count it toward ``compression_exhausted``, or an overflow auto-reset wipes a
     session that was merely cooling down. The permanent ``ineffective`` breaker never sets it.
 
@@ -1646,10 +1653,17 @@ def compression_blocked_transiently(agent: Any) -> bool:
     return isinstance(_sig, str) and bool(_sig)
 
 
+def compression_pool_saturated(agent: Any) -> bool:
+    """Whether the last pass was refused only because the shared compression pool was full.
+    Narrower than ``compression_blocked_transiently``: callers that keep cooldown semantics
+    (block further passes) still defer on saturation, which says nothing about this session."""
+    return getattr(agent, "_compression_blocked_transient", None) == "pool_saturated"
+
+
 def _mark_compression_blocked_transient(agent: Any, compressor: Any, reason: str) -> None:
     """Publish the transient-block signal when the active guard is transient.
     ``reason`` comes from ``_compression_block_reason``: ``cooldown:*`` and ``structural_backoff:*`` are
-    transient; ``ineffective`` stays unmarked."""
+    transient; ``ineffective`` stays unmarked. Pool saturation publishes its own reason at the admission gate."""
     if reason.startswith("cooldown") or reason.startswith("structural_backoff"):
         logger.info(
             "Skipping automatic compression re-entry: transient guard "

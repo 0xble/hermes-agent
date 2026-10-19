@@ -1,5 +1,16 @@
 # Maintained fork patch register
 
+## compression-pool-saturation-transient-defer
+
+- **Status:** Candidate; fork PR open.
+- **Summary:** Treat a full shared compression pool as transient capacity pressure. A refused pre-API pass publishes the existing transient-block signal so callers refund the compression attempt, leave insufficient-progress blockers unarmed, and retry after pool capacity returns.
+- **Source surfaces:** `agent/conversation_compression.py`; `agent/turn_preflight.py`; `agent/turn_context_compaction.py`; `tests/agent/test_preflight_compression_pool_saturation.py`.
+- **Contract:** Pool saturation keeps the original messages unchanged without counting as an incompressible transcript. Pre-API and other automatic callers defer consistently with lock and cooldown paths. A later pass compresses after admission succeeds.
+- **Upstream findings:** Current upstream guidance and related compression-pool history were inspected. No matching upstream issue or PR for this saturation-attempt accounting bug was found.
+- **Verification:** Red-first regression on fork base and patched pass, plus affected compression suites. Final exact commands and results are recorded in the delivery handoff.
+- **Rollback:** Revert the transient signal and caller-coverage changes with the regression. No schema, migration, dependency, configuration, or runtime-state changes.
+- **Retirement:** Remove when a released upstream implementation provides the same transient pool-saturation contract and equivalent caller coverage.
+
 ## background-review-memory-delete: durable observer requirement
 
 - **Status:** Candidate; not landed or activated.
