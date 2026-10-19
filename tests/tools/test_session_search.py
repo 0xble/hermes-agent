@@ -100,6 +100,26 @@ class TestRetrievalBoundaryEvals:
         assert result["success"] is True
         assert result["count"] == 0
 
+    def test_tool_call_filter_keeps_matching_assistant_prose(self, db):
+        _seed_boundary_message(
+            db,
+            "The saved-unassigned router decision is staged.",
+            tool_calls=[{"function": {"name": "terminal", "arguments": "echo unrelated"}}],
+        )
+        rows = db.search_messages("saved-unassigned router decision", exclude_tool_calls=True)
+        assert any(row["session_id"] == "boundary" for row in rows)
+
+    @pytest.mark.parametrize("query, content", [
+        ("build not passing", "The build is not passing on main."),
+        ("don't", "I don't like Sarah's standup time."),
+        ("Sarah's", "I don't like Sarah's standup time."),
+        ("foo,bar", "The foo bar migration is ready."),
+    ])
+    def test_natural_language_punctuation_and_lowercase_words_are_searchable(self, db, query, content):
+        _seed_boundary_message(db, content)
+        rows = db.search_messages(query)
+        assert any(row["session_id"] == "boundary" for row in rows)
+
     def test_exact_quoted_phrase_stays_exact(self, db):
         _seed_boundary_message(db, "docker networking tls configuration")
         db.create_session("near", source="cli")

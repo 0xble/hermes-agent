@@ -54,6 +54,10 @@ _LIKE_COALESCED_COLUMN_SQL = (
     "COALESCE(m.tool_name, '') LIKE ? ESCAPE '\\' OR "
     "COALESCE(m.tool_calls, '') LIKE ? ESCAPE '\\')"
 )
+# Discovery searches conversation text, not the agent's tool-call JSON: the same predicates with
+# the tool_calls column replaced by an empty literal keep the bind count (``_like_params``) intact.
+_LIKE_ANY_COLUMN_NO_TOOL_CALLS_SQL = _LIKE_ANY_COLUMN_SQL.replace("m.tool_calls", "''")
+_LIKE_COALESCED_NO_TOOL_CALLS_SQL = _LIKE_COALESCED_COLUMN_SQL.replace("COALESCE(m.tool_calls, '')", "''")
 # ``sort`` -> ORDER BY for the FTS routes; unknown values are rank-only (user input passes through).
 _FTS_ORDER_BY = {"newest": "ORDER BY m.timestamp DESC, rank", "oldest": "ORDER BY m.timestamp ASC, rank"}
 # Indexed neighbor seeks avoid scanning whole sessions for a sparse set of hits.
@@ -163,8 +167,7 @@ def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_
 def _search_filter_clauses(
     where: list[str], params: list, *, include_inactive: bool, source_filter: Optional[list[str]],
     exclude_sources: Optional[list[str]], role_filter: Optional[list[str]],
-    after_ts: Optional[int] = None, before_ts: Optional[int] = None,
-    exclude_tool_calls: bool = False) -> None:
+    after_ts: Optional[int] = None, before_ts: Optional[int] = None) -> None:
     """Append the visibility/source/role/session-start predicates every search route shares. Live
     rows (active=1) AND compaction-archived rows (compacted=1) are discoverable; only
     rewind/undo rows (active=0, compacted=0) are hidden. ``after_ts``/``before_ts`` bound
@@ -174,10 +177,6 @@ def _search_filter_clauses(
         where.append("(m.active = 1 OR m.compacted = 1)")
     # display_kind="hidden" rows are model-facing scaffolding the person never saw; a hit would confuse.
     where.append("COALESCE(m.display_kind, '') <> 'hidden'")
-    if exclude_tool_calls:
-        # Tool-call payloads are model-facing scaffolding, not conversation text. Indexing
-        # them makes discovery find the agent's own prior tool calls (especially search calls).
-        where.append("(m.role <> 'assistant' OR m.tool_calls IS NULL OR m.tool_calls = '')")
     if source_filter is not None:
         where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
         params.extend(source_filter)
@@ -831,18 +830,18 @@ class SessionSearchMixin:
         """
         query = query[:MAX_FTS5_QUERY_CHARS]
         tokens = _LIKE_TOKEN_RE.findall(query)
-        while tokens and tokens[0].upper() in _FTS_OPERATORS:
+        # FTS5 only treats uppercase AND/OR/NOT as operators; lowercase ones are words.
+        while tokens and tokens[0] in _FTS_OPERATORS:
             tokens.pop(0)
-        while tokens and tokens[-1].upper() in _FTS_OPERATORS:
+        while tokens and tokens[-1] in _FTS_OPERATORS:
             tokens.pop()
         sanitized: list[str] = []
         for token in tokens:
-            upper = token.upper()
             if token.startswith('"') and token.endswith('"') and len(token) >= 2:
                 sanitized.append(token)
                 continue
-            if upper in _FTS_OPERATORS:
-                sanitized.append(upper)
+            if token in _FTS_OPERATORS:
+                sanitized.append(token)
                 continue
             # Keep FTS prefix semantics, but quote the structured token before the '*'.
             suffix = "*" if token.endswith("*") else ""
@@ -857,13 +856,18 @@ class SessionSearchMixin:
             if ":" in body and not re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?", body):
                 allowed = allowed.replace(":", "")
             unsafe = "".join(ch for ch in _FTS5_SPECIAL_CHARS if ch not in allowed)
-            body = re.sub(f"[{re.escape(unsafe)}]", "", body)
-            body = body.replace("*", "")
+            # Unsafe punctuation splits words the way the unicode61 tokenizer does
+            # (``don't`` -> ``don t``); the pieces stay one adjacent phrase below.
+            body = re.sub(f"[{re.escape(unsafe)}]", " ", body)
+            body = body.replace("*", " ")
             if "%" in body and not SessionSearchMixin._contains_cjk(body):
-                body = body.replace("%", "")
+                body = body.replace("%", " ")
+            body = " ".join(body.split())
             if not body:
                 continue
-            if re.search(r"[^\w]", body, flags=re.UNICODE):
+            # Quote punctuated phrases and mixed-case operator words (``not`` stays a term
+            # on every route, including the LIKE fallbacks that compare case-insensitively).
+            if re.search(r"[^\w]", body, flags=re.UNICODE) or body.upper() in _LIKE_SKIP_TOKENS:
                 sanitized.append('"' + body.replace('"', '""') + '"' + suffix)
             else:
                 sanitized.append(body + suffix)
@@ -948,6 +952,10 @@ class SessionSearchMixin:
     def _fts_match_sql(table: str, match_query: str, order_by_sql: str, *, limit: int, offset: int,
                        **filters) -> tuple[str, list]:
         """MATCH query + params against one FTS5 index joined to messages/sessions."""
+        if filters.pop("exclude_tool_calls", False):
+            # Column filter, not a row filter: assistant prose on a row that also made tool
+            # calls stays searchable; only the tool-call JSON column stops matching.
+            match_query = f"{{content}} : ({match_query})"
         where = [f"{table} MATCH ?"]
         params: list = [match_query]
         _search_filter_clauses(where, params, **filters)
@@ -986,7 +994,8 @@ class SessionSearchMixin:
         return [dict(row) for row in self._read_all(sql, params)]
 
     @staticmethod
-    def _compile_like_boolean_query(query: str) -> tuple[str, list[Any], Optional[str]]:
+    def _compile_like_boolean_query(
+            query: str, exclude_tool_calls: bool = False) -> tuple[str, list[Any], Optional[str]]:
         """Compile the supported FTS boolean subset into LIKE predicates: terms within an OR
         group are ANDed (FTS5's implicit conjunction) and ``NOT`` negates the next term."""
         groups: list[list[tuple[str, bool]]] = [[]]
@@ -1008,6 +1017,7 @@ class SessionSearchMixin:
                 groups[-1].append((term, negate_next))
                 negate_next = False
 
+        column_sql = _LIKE_COALESCED_NO_TOOL_CALLS_SQL if exclude_tool_calls else _LIKE_COALESCED_COLUMN_SQL
         compiled_groups: list[str] = []
         params: list[Any] = []
         snippet_term: Optional[str] = None
@@ -1016,7 +1026,7 @@ class SessionSearchMixin:
                 continue
             clauses: list[str] = []
             for term, negated in group:
-                clauses.append(f"NOT {_LIKE_COALESCED_COLUMN_SQL}" if negated else _LIKE_COALESCED_COLUMN_SQL)
+                clauses.append(f"NOT {column_sql}" if negated else column_sql)
                 params.extend(_like_params(term))
                 if snippet_term is None and not negated:
                     snippet_term = term
@@ -1026,7 +1036,8 @@ class SessionSearchMixin:
     def _search_messages_like_fallback(
         self, query: str, *, limit: int, offset: int, sort: Optional[str], **filters) -> list[dict[str, Any]]:
         """Search canonical messages while derived FTS state is stale."""
-        predicate, params, snippet_term = self._compile_like_boolean_query(query)
+        predicate, params, snippet_term = self._compile_like_boolean_query(
+            query, exclude_tool_calls=filters.pop("exclude_tool_calls", False))
         if not predicate or snippet_term is None:
             return []
         where = [f"({predicate})"]
@@ -1231,7 +1242,8 @@ class SessionSearchMixin:
                 return matches
         non_op_tokens = _non_operator_tokens(raw_query) or [raw_query]
         like_params: list = [p for tok in non_op_tokens for p in _like_params(tok)]
-        like_where = [f"({' OR '.join([_LIKE_ANY_COLUMN_SQL] * len(non_op_tokens))})"]
+        column_sql = _LIKE_ANY_COLUMN_NO_TOOL_CALLS_SQL if route.get("exclude_tool_calls") else _LIKE_ANY_COLUMN_SQL
+        like_where = [f"({' OR '.join([column_sql] * len(non_op_tokens))})"]
         filters = {k: route[k] for k in ("include_inactive", "source_filter", "exclude_sources", "role_filter",
                                          "after_ts", "before_ts")}
         _search_filter_clauses(like_where, like_params, **filters)
@@ -1250,7 +1262,9 @@ class SessionSearchMixin:
                  if tok and tok.upper() not in _LIKE_SKIP_TOKENS]
         if not terms:
             return []
-        where = ["m.id > ? AND m.id <= ?", *([_LIKE_ANY_COLUMN_SQL] * len(terms))]
+        column_sql = (_LIKE_ANY_COLUMN_NO_TOOL_CALLS_SQL if filters.pop("exclude_tool_calls", False)
+                      else _LIKE_ANY_COLUMN_SQL)
+        where = ["m.id > ? AND m.id <= ?", *([column_sql] * len(terms))]
         params: list = [status["indexed"], status["total"], *(p for term in terms for p in _like_params(term))]
         _search_filter_clauses(where, params, **filters)
         return self._like_rows(where, [terms[0], *params, limit], order_by="ORDER BY m.timestamp DESC",
