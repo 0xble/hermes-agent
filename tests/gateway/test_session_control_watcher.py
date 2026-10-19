@@ -27,8 +27,8 @@ def state(tmp_path, monkeypatch):
     release_or_close(db)
 
 
-def _runner(state, *, target_route=True, request_success=True, send_success=True, injection_result=True,
-            target_origin=True):
+def _runner(state, *, target_route=True, request_success=True, send_success=True, send_error=None,
+            send_retryable=True, injection_result=True, target_origin=True):
     from gateway.run_session_controls import GatewaySessionControlsMixin
     from gateway.run_goals import GatewayGoalsMixin
     from gateway.session import Platform, SessionEntry, SessionSource
@@ -50,7 +50,7 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
 
         async def send(self, chat_id, text, metadata=None):
             self.sends.append((chat_id, text, metadata))
-            return SimpleNamespace(success=self.send_success)
+            return SimpleNamespace(success=self.send_success, error=send_error, retryable=send_retryable)
 
     adapter = Adapter()
     now = datetime.now(timezone.utc)
@@ -117,12 +117,12 @@ def test_control_card_leads_with_decision_and_nonblocking_note():
         "affected_text": "Current goal: old objective -> new objective",
         "payload": {"goal": "new objective", "contract": {"verification": "green"}, "max_turns": 8},
     })
-    assert text.startswith("Approval needed\nChange: Goal Replace\n")
-    assert "Session: Target session (target)" in text
-    assert "Requested by: Requester session (requester)" in text
+    assert text.startswith("◆ Replace this goal?\n\n")
+    assert "Target: Target session" in text
+    assert "Requested by: Requester session" in text
     assert "Proposed goal: new objective" in text
     assert "Proposed contract (replaces the current one):" in text
-    assert "The requesting session continues while this is pending." in text
+    assert "Approve only if this still matches the target's current state." in text
     assert "Session control request" not in text
 
 
@@ -168,6 +168,28 @@ async def test_watcher_applied_clear_delivers_notice_injection_and_marks_done(st
     assert len(runner.adapter.sends) == 1
     assert len(runner.injections) == 1
     assert runner.injections[0]["expected_session_id"] == "requester"
+    assert pending_outbox() == []
+
+
+@pytest.mark.asyncio
+async def test_watcher_settles_nonretryable_target_notice_failure(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import _load_record, apply_control, pending_outbox
+
+    runner = _runner(state, send_success=False, send_error="daily_budget_shed", send_retryable=False)
+    GoalManager("target").set("watch the build")
+    state.append_message("requester", "user", "Please clear the target goal immediately")
+    result = apply_control("goal", "clear", "target", requester_sid="requester",
+                           user_quote="clear the target goal immediately")
+    assert result["status"] == "applied"
+
+    await runner._drain_session_controls()
+
+    record = _load_record(result["record"]["id"])
+    assert record is not None
+    assert record["target_notice_skipped"] is True
+    assert record["requester_notified"] is True
+    assert record["outbox_done"] is True
     assert pending_outbox() == []
 
 
@@ -829,3 +851,12 @@ def test_replace_card_shows_contract_and_max_turns_that_approval_installs():
     text = GatewaySessionControlsMixin._control_text(record)
     assert "Proposed contract: none (the current contract is dropped)" in text
     assert "Max turns: unchanged" in text
+
+
+def test_control_card_names_loop_actions():
+    from gateway.run_session_controls import GatewaySessionControlsMixin
+
+    for action in ("pause", "resume", "stop"):
+        text = GatewaySessionControlsMixin._control_text({"kind": "loop", "action": action})
+        assert "this loop" in text
+        assert "this goal" not in text
