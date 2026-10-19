@@ -38,21 +38,24 @@ class GatewaySessionControlsMixin:
 
     @classmethod
     def _control_text(cls, record: dict) -> str:
-        # Every free-text field is bounded: the card is one message with buttons (Telegram caps a
-        # message at 4096 chars), and an oversized card would fail and strand the request.
+        # Keep the card scannable on mobile: decision first, then the affected session, the actor,
+        # the exact change and the reason. Every free-text field remains bounded so one Telegram
+        # message can carry the complete proposal with its buttons.
         kind, action = record.get("kind", ""), record.get("action", "")
         target = record.get("target_session_id", "")
         requester = record.get("requester_session_id", "")
         requester_title = cls._clip(record.get("requester_title") or "Untitled session", 120)
         target_title = cls._clip(record.get("target_title") or "Untitled session", 120)
         reason = cls._clip(record.get("reason") or "session-control", 600)
+        label = f"{kind.title()} {action.title()}"
         return (
-            "Session control request\n"
-            f"Requester: {requester_title} ({requester})\n"
-            f"Target: {target_title} ({target})\n"
-            f"Action: {kind} {action}\n"
+            "Approval needed\n"
+            f"Change: {label}\n"
+            f"Session: {target_title} ({target})\n"
+            f"Requested by: {requester_title} ({requester})\n"
             f"Reason: {reason}\n"
-            f"{cls._change_text(record)}"
+            f"{cls._change_text(record)}\n\n"
+            "The requesting session continues while this is pending."
         )
 
     @classmethod
@@ -376,8 +379,15 @@ class GatewaySessionControlsMixin:
         }.get(action, action)
         change = (f"\n{cls._change_text(record)}"
                   if action == "replace" and record.get("affected_text") else "")
+        authority = record.get("authority") or {}
+        if authority.get("via") == "session":
+            session_id = cls._clip(str(authority.get("session_id") or requester_id), 120)
+            return (
+                f"⊘ {kind.title()} {verb} by {requester} "
+                f"(applied by session {session_id} without approval){change}"
+            )
         if quote:
-            message = str((record.get("authority") or {}).get("message") or "")
+            message = str(authority.get("message") or "")
             full = (f"\nFull message: \"{cls._clip(message, 1200)}\""
                     if message and message != quote else "")
             quote = cls._clip(quote, 300)
@@ -391,8 +401,12 @@ class GatewaySessionControlsMixin:
         target = f"{target_title} ({target_id})"
         action = f"{record.get('kind', '')} {record.get('action', '')}"
         if record.get("status") == "applied":
-            if record.get("authority", {}).get("via") == "quote":
+            authority = record.get("authority") or {}
+            if authority.get("via") == "quote":
                 how = "using your quoted words"
+            elif authority.get("via") == "session":
+                session_id = cls._clip(str(authority.get("session_id") or ""), 120)
+                how = f"by session authority{f' from {session_id}' if session_id else ''}"
             else:
                 how = "after Telegram approval"
             change = (f"\n{cls._change_text(record)}"

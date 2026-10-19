@@ -958,23 +958,80 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
     return db._execute_write(create)
 
 
+def _is_cross_session_goal_change(kind: str, action: str, target_sid: str, requester_sid: str) -> bool:
+    """Goal objective changes requested for another session are session-authorized, not user-gated."""
+    return kind == "goal" and action in {"clear", "replace"} and target_sid != requester_sid
+
+
 def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
                   reason: str = "", user_quote: str = "",
                   payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Apply an authorized control immediately, or create an approval request."""
+    """Apply an authorized control immediately, or queue an asynchronous approval request.
+
+    A session may clear or replace another session's goal directly. Only a self-targeted
+    destructive goal change falls back to Brian's approval when it lacks a fresh user quote.
+    """
     if (kind, action) not in CONTROLS:
         return {"ok": False, "error_code": "unsupported_control"}
     try:
         payload = _check_payload(kind, action, payload)
         target_sid = resolve_target(target_sid)
-        if not _has_gateway_route(target_sid):
-            raise ValueError("target_unroutable")
     except ValueError as exc:
         return {"ok": False, "error_code": str(exc), "error": str(exc)}
+
+    cross_session_goal_change = _is_cross_session_goal_change(
+        kind, action, target_sid, requester_sid,
+    ) and not user_quote
+    quote_check = None
+    quote_matches = False
+    if user_quote:
+        quote_check = check_user_quote(requester_sid, user_quote)
+        if not isinstance(quote_check, str):
+            quote_matches = _quote_matches_control(
+                kind, action, target_sid, requester_sid,
+                _governing_sentence(*quote_check), payload,
+            )
+
+    def commit(conn, authority: Dict[str, Any], savepoint: str) -> Dict[str, Any]:
+        """Apply and record one immediate control while holding the SessionDB write lock."""
+        raw = _meta_value(conn, _definition_key(kind, target_sid))
+        affected_before = _affected_text(kind, action, raw, payload)
+        conn.execute(f"SAVEPOINT {savepoint}")
+        result = _manager_apply(kind, action, target_sid, reason=reason, payload=payload,
+                                authority=authority, cursor=conn)
+        manager_result = result.get("result")
+        code = ""
+        if isinstance(manager_result, dict) and not manager_result.get("ok", True):
+            code = manager_result.get("error_code") or manager_result.get("error") or "apply_failed"
+            conn.execute(f"ROLLBACK TO {savepoint}")
+        conn.execute(f"RELEASE {savepoint}")
+        now = _now()
+        record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
+                             authority=authority, status="failed" if code else "applied", now=now,
+                             expires_at=None, affected_text=affected_before, cursor=conn)
+        record["resolved_at"], record["error"] = now, code or None
+        _bind_continuation(record, result, conn)
+        _save_record(record, cursor=conn)
+        return {"ok": not bool(code), "status": record["status"], "record": record,
+                **({"error_code": code, "error": code} if code else {}), **result}
+
+    # Cross-session goal clear/replace without a quote is intentionally non-blocking and does not
+    # require a Telegram route. A supplied quote remains subject to the normal safety checks, so a
+    # refused quote still falls back to approval rather than gaining authority.
+    if cross_session_goal_change and not quote_matches:
+        authority = {"via": "session", "session_id": str(requester_sid)}
+        try:
+            return _db()._execute_write(
+                lambda conn: commit(conn, authority, "session_control_session"))
+        except Exception as exc:
+            return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
+
+    if not _has_gateway_route(target_sid):
+        return {"ok": False, "error_code": "target_unroutable", "error": "target_unroutable"}
+
     def request_approval(refused: str) -> Dict[str, Any]:
-        # A missing or refused quote (stale, paraphrased, relayed, negated, or overtaken by a newer
-        # message before the write lock) never authorizes the control; it falls back to an
-        # Approve/Deny request so Brian decides.
+        # A missing or refused quote never blocks the requester. The durable request is delivered
+        # asynchronously, and its outcome returns to the requester as a later internal event.
         try:
             record = request_control(kind, action, target_sid, requester_sid=requester_sid,
                                      reason=reason, payload=payload)
@@ -982,17 +1039,14 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
             return {"ok": False, "error_code": str(exc), "error": str(exc)}
         if not record.get("id"):
             return record
-        outcome = {"ok": True, "status": "pending", "request_id": record["id"], "record": record}
+        outcome = {"ok": True, "status": "pending", "request_id": record["id"], "record": record,
+                   "non_blocking": True}
         if user_quote:
             outcome["quote_refused"] = refused
         return outcome
 
-    quote_check = check_user_quote(requester_sid, user_quote)
-    if isinstance(quote_check, str):
-        return request_approval(quote_check)
-    if not _quote_matches_control(kind, action, target_sid, requester_sid,
-                                  _governing_sentence(*quote_check), payload):
-        return request_approval("user_quote_mismatch")
+    if isinstance(quote_check, str) or not quote_matches:
+        return request_approval(quote_check if isinstance(quote_check, str) else "user_quote_mismatch")
     _REFUSED = "_quote_refused_in_transaction"
 
     def apply(conn):
@@ -1005,27 +1059,8 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                                       cursor=conn):
             return {_REFUSED: "user_quote_mismatch"}
         quote, message = checked
-        authority = {"via": "quote", "quote": quote, "message": message}
-        raw = _meta_value(conn, _definition_key(kind, target_sid))
-        affected_before = _affected_text(kind, action, raw, payload)
-        conn.execute("SAVEPOINT session_control_quote")
-        result = _manager_apply(kind, action, target_sid, reason=reason, payload=payload,
-                                authority=authority, cursor=conn)
-        manager_result = result.get("result")
-        code = ""
-        if isinstance(manager_result, dict) and not manager_result.get("ok", True):
-            code = manager_result.get("error_code") or manager_result.get("error") or "apply_failed"
-            conn.execute("ROLLBACK TO session_control_quote")
-        conn.execute("RELEASE session_control_quote")
-        now = _now()
-        record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
-                             authority=authority, status="failed" if code else "applied", now=now,
-                             expires_at=None, affected_text=affected_before, cursor=conn)
-        record["resolved_at"], record["error"] = now, code or None
-        _bind_continuation(record, result, conn)
-        _save_record(record, cursor=conn)
-        return {"ok": not bool(code), "status": record["status"], "record": record,
-                **({"error_code": code, "error": code} if code else {}), **result}
+        return commit(conn, {"via": "quote", "quote": quote, "message": message},
+                      "session_control_quote")
 
     try:
         outcome = _db()._execute_write(apply)

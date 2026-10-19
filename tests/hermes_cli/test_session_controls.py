@@ -40,28 +40,28 @@ def test_quote_applies_cross_session_clear_and_audits(state):
     assert any(r["id"] == result["record"]["id"] for r in pending_outbox())
 
 
-def test_stale_and_paraphrased_quotes_are_refused(state):
+def test_stale_and_paraphrased_self_quotes_are_refused(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.session_controls import apply_control
-    GoalManager("target").set("watch the build")
-    _user(state, "requester", "Please clear the target goal immediately")
+    GoalManager("requester").set("watch the build")
+    _user(state, "requester", "Please clear the requester goal immediately")
     _user(state, "requester", "That earlier request is no longer current")
-    stale = apply_control("goal", "clear", "target", requester_sid="requester",
-                          reason="x", user_quote="clear the target goal immediately")
-    paraphrase = apply_control("goal", "clear", "target", requester_sid="requester",
-                               reason="x", user_quote="remove the target objective now")
+    stale = apply_control("goal", "clear", "requester", requester_sid="requester",
+                          reason="x", user_quote="clear the requester goal immediately")
+    paraphrase = apply_control("goal", "clear", "requester", requester_sid="requester",
+                               reason="x", user_quote="remove the requester objective now")
     assert (stale["status"], stale["quote_refused"]) == ("pending", "user_quote_not_found")
     assert (paraphrase["status"], paraphrase["quote_refused"]) == ("pending", "user_quote_not_found")
-    assert GoalManager("target").state.status == "active"
+    assert GoalManager("requester").state.status == "active"
 
 
 def test_quote_overtaken_before_write_lock_falls_back_to_approval(state, monkeypatch):
-    """A quote valid at first check but stale under the write lock still requests approval."""
+    """A self-targeted quote valid at first check but stale under the write lock still requests approval."""
     from hermes_cli.goals import GoalManager
     from hermes_cli import session_controls
     from hermes_cli.session_controls import apply_control, pending_outbox
-    GoalManager("target").set("watch the build")
-    _user(state, "requester", "Please clear the target goal immediately")
+    GoalManager("requester").set("watch the build")
+    _user(state, "requester", "Please clear the requester goal immediately")
     real = session_controls.check_user_quote
 
     def overtaken(sid, quote, *, cursor=None):
@@ -70,37 +70,59 @@ def test_quote_overtaken_before_write_lock_falls_back_to_approval(state, monkeyp
         return real(sid, quote)
 
     monkeypatch.setattr(session_controls, "check_user_quote", overtaken)
-    result = apply_control("goal", "clear", "target", requester_sid="requester",
-                           reason="x", user_quote="clear the target goal immediately")
+    result = apply_control("goal", "clear", "requester", requester_sid="requester",
+                           reason="x", user_quote="clear the requester goal immediately")
     assert (result["status"], result["quote_refused"]) == ("pending", "user_quote_not_found")
     assert [r["id"] for r in pending_outbox()] == [result["request_id"]]
-    assert GoalManager("target").state.status == "active"
+    assert GoalManager("requester").state.status == "active"
 
 
-def test_quote_from_different_session_and_relay_are_refused(state):
-    from hermes_cli.goals import GoalManager
-    from hermes_cli.session_controls import apply_control
+def test_cross_session_goal_changes_do_not_wait_for_approval(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control, pending_outbox
+
     GoalManager("target").set("watch the build")
-    _user(state, "other", "Please clear the target goal immediately")
-    different = apply_control("goal", "clear", "target", requester_sid="requester",
-                              reason="x", user_quote="clear the target goal immediately")
-    assert (different["status"], different["quote_refused"]) == ("pending", "user_quote_not_found")
-    _user(state, "requester", "[relay from=other receipt=abc]\nPlease clear the target goal immediately")
-    relay = apply_control("goal", "clear", "target", requester_sid="requester",
-                          reason="x", user_quote="Please clear the target goal immediately")
-    assert (relay["status"], relay["quote_refused"]) == ("pending", "user_quote_not_found")
+    cleared = apply_control("goal", "clear", "target", requester_sid="requester", reason="finished")
+    assert cleared["status"] == "applied"
+    assert cleared["record"]["authority"]["via"] == "session"
+    assert load_goal("target").status == "cleared"
+    assert not [record for record in pending_outbox() if record.get("status") == "pending"]
+
+    GoalManager("target").set("old objective")
+    replaced = apply_control(
+        "goal", "replace", "target", requester_sid="requester", reason="pivot",
+        payload={"goal": "new objective"},
+    )
+    assert replaced["status"] == "applied"
+    assert replaced["record"]["authority"]["via"] == "session"
+    assert load_goal("target").goal == "new objective"
 
 
-def test_no_quote_approval_deny_and_second_press_noop(state):
+def test_self_goal_change_approval_is_non_blocking_and_second_press_noop(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.session_controls import apply_control, resolve_request
-    GoalManager("target").set("watch the build")
-    pending = apply_control("goal", "clear", "target", requester_sid="requester", reason="x")
+
+    GoalManager("requester").set("watch the build")
+    pending = apply_control("goal", "clear", "requester", requester_sid="requester", reason="x")
     assert pending["status"] == "pending"
+    assert pending["non_blocking"] is True
     denied = resolve_request(pending["request_id"], "deny", "admin")
     assert denied["status"] == "denied"
     assert resolve_request(pending["request_id"], "approve", "admin") is None
-    assert GoalManager("target").state.status == "active"
+    assert GoalManager("requester").state.status == "active"
+
+
+def test_cross_session_goal_change_with_refused_quote_still_uses_approval(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", "[relay from=other receipt=abc]\nPlease clear the target goal immediately")
+    result = apply_control("goal", "clear", "target", requester_sid="requester",
+                           reason="x", user_quote="Please clear the target goal immediately")
+    assert result["status"] == "pending"
+    assert result["quote_refused"] == "user_quote_not_found"
+    assert load_goal("target").status == "active"
 
 
 def test_expire_request_uses_transaction_and_is_consume_once(state):
@@ -212,17 +234,20 @@ def test_noop_controls_are_failed_for_quote_and_approval_paths(state):
     assert LoopManager("target").state is None
 
 
-def test_unroutable_target_is_rejected_before_creating_request(state):
+def test_cross_session_goal_change_can_apply_to_a_local_target(state):
+    from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control, request_control
 
     state.create_session(
         "cli-target", "cli", profile_name="default", chat_id=None,
         session_key="agent:main:cli:cli-target",
     )
+    GoalManager("cli-target").set("watch the build")
     direct = request_control("goal", "clear", "cli-target", requester_sid="requester")
     assert direct["error_code"] == "target_unroutable"
     result = apply_control("goal", "clear", "cli-target", requester_sid="requester")
-    assert result["error_code"] == "target_unroutable"
+    assert result["status"] == "applied"
+    assert load_goal("cli-target").status == "cleared"
 
 
 def test_goal_replace_records_continuation_prompt(state):
@@ -241,7 +266,7 @@ def test_goal_replace_records_continuation_prompt(state):
     assert result["record"]["continuation_prompt"] == result["continuation_prompt"]
 
 
-@pytest.mark.parametrize("via", ["quote", "button"])
+@pytest.mark.parametrize("via", ["quote", "button", "session"])
 @pytest.mark.parametrize("replacement_count", [1, 2])
 def test_replacement_prompts_bind_only_the_current_contract(state, via, replacement_count):
     """Both real authority paths supersede all prior contracts/criteria. Revision rows stay an audit
@@ -251,7 +276,8 @@ def test_replacement_prompts_bind_only_the_current_contract(state, via, replacem
     from hermes_cli.goals import GoalContract, GoalManager, judge_goal, load_goal
     from hermes_cli.session_controls import apply_control, resolve_request
 
-    manager = GoalManager("target")
+    target_sid = "requester" if via == "button" else "target"
+    manager = GoalManager(target_sid)
     manager.set("migrate production", contract=GoalContract(
         verification="production migration verified", constraints="do not lose production data",
         boundaries="production shards only", stop_when="production unavailable",
@@ -267,7 +293,7 @@ def test_replacement_prompts_bind_only_the_current_contract(state, via, replacem
         if via == "quote":
             _user(state, "requester", f"Please {quote}")
         result = apply_control(
-            "goal", "replace", "target", requester_sid="requester", reason="user pivot",
+            "goal", "replace", target_sid, requester_sid="requester", reason="user pivot",
             user_quote=quote if via == "quote" else "",
             payload={"goal": goal, "contract": {"verification": verification}},
         )
@@ -277,7 +303,7 @@ def test_replacement_prompts_bind_only_the_current_contract(state, via, replacem
         else:
             record = result["record"]
         assert record["status"] == "applied"
-        return GoalManager("target")
+        return GoalManager(target_sid)
 
     manager = replace("write a local design note", "design note exists")
     manager.add_subgoal("include local examples")
@@ -315,19 +341,46 @@ def test_replacement_prompts_bind_only_the_current_contract(state, via, replacem
             assert marker not in prompt
     # Prompt building changes no audit data.
     assert manager.state.revisions == history
-    assert load_goal("target").revisions == history
+    assert load_goal(target_sid).revisions == history
+
+
+def test_session_replacement_resets_resume_override(state):
+    from unittest.mock import patch
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import apply_control
+
+    manager = GoalManager("target")
+    manager.set("continue despite the blocker")
+    assert manager.state is not None
+    with patch.object(goals, "judge_goal", return_value=(
+        "blocked", "the irreversible no-delete constraint would be breached", False, None, False,
+    )):
+        assert manager.evaluate_after_turn("I cannot proceed")["verdict"] == "blocked"
+    assert manager.resume() is not None
+    assert manager.state.has_resume_override() is True
+
+    result = apply_control(
+        "goal", "replace", "target", requester_sid="requester", reason="pivot",
+        payload={"goal": "ship the release"},
+    )
+    assert result["status"] == "applied"
+    assert result["record"]["authority"]["via"] == "session"
+    replaced_state = GoalManager("target").state
+    assert replaced_state is not None
+    assert replaced_state.has_resume_override() is False
 
 
 def test_button_approved_replace_records_user_authority(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import request_control, resolve_request
 
-    GoalManager("target").set("old objective: migrate the database")
-    request = request_control("goal", "replace", "target", requester_sid="requester", reason="pivot",
+    GoalManager("requester").set("old objective: migrate the database")
+    request = request_control("goal", "replace", "requester", requester_sid="requester", reason="pivot",
                               payload={"goal": "new objective: write docs"})
     record = resolve_request(request["id"], "approve", "42")
     assert record["status"] == "applied"
-    revision = load_goal("target").revisions[-1]
+    revision = load_goal("requester").revisions[-1]
     assert (revision["actor"], revision["authority"], revision["approved_by"]) == ("user", "button", "42")
     assert revision["user_message"] == 'Approved in Telegram: replace goal with "new objective: write docs"'
     prompt = record["continuation_prompt"]
@@ -431,8 +484,10 @@ def test_request_control_refuses_target_without_approval_surface(state):
     GoalManager("slack-target").set("watch the build")
     assert request_control("goal", "clear", "slack-target", requester_sid="requester")["error_code"] \
         == "target_unapprovable"
-    assert apply_control("goal", "clear", "slack-target", requester_sid="requester")["error_code"] \
-        == "target_unapprovable"
+    direct = apply_control("goal", "clear", "slack-target", requester_sid="requester")
+    assert direct["status"] == "applied"
+    assert load_goal("slack-target").status == "cleared"
+    GoalManager("slack-target").set("watch the build again")
     _user(state, "requester", "Please clear the slack-target goal right now")
     quoted = apply_control("goal", "clear", "slack-target", requester_sid="requester",
                            user_quote="clear the slack-target goal right now")
@@ -494,15 +549,15 @@ def test_approval_is_bound_to_the_definition_on_the_card(state):
     from hermes_cli.loops import LoopManager, load_loop
     from hermes_cli.session_controls import request_control, resolve_request
 
-    GoalManager("target").set("old objective")
-    request = request_control("goal", "clear", "target", requester_sid="requester")
-    GoalManager("target").clear()
-    GoalManager("target").set("a different objective")
+    GoalManager("requester").set("old objective")
+    request = request_control("goal", "clear", "requester", requester_sid="requester")
+    GoalManager("requester").clear()
+    GoalManager("requester").set("a different objective")
     resolved = resolve_request(request["id"], "approve", "admin")
     assert resolved["status"] == "failed"
     assert resolved["error"] == "target_changed"
-    assert load_goal("target").goal == "a different objective"
-    assert load_goal("target").status == "active"
+    assert load_goal("requester").goal == "a different objective"
+    assert load_goal("requester").status == "active"
     assert resolve_request(request["id"], "approve", "admin") is None
 
     LoopManager("target").set("check the build")
@@ -513,6 +568,7 @@ def test_approval_is_bound_to_the_definition_on_the_card(state):
     assert stopped["error"] == "target_changed"
     assert load_loop("target").prompt == "check a different thing"
 
+    GoalManager("target").set("pause this goal")
     unchanged = request_control("goal", "pause", "target", requester_sid="requester")
     assert resolve_request(unchanged["id"], "approve", "admin")["status"] == "applied"
     assert load_goal("target").status == "paused"
