@@ -721,11 +721,44 @@ def find_closest_lines(old_string: str, content: str, context_lines: int = 2, ma
     return result
 
 
+_NO_MATCH_EXCERPT_LINES = 8
+_NO_MATCH_EXCERPT_CHARS = 1200
+
+
+def _cap_no_match_excerpt(excerpt: str) -> str:
+    """Keep the closest-region portion bounded enough for a model tool result."""
+    region, separator, extra = excerpt.partition("\n\nWhitespace difference detected")
+    lines = region.splitlines()
+    if len(lines) > _NO_MATCH_EXCERPT_LINES:
+        lines = lines[:_NO_MATCH_EXCERPT_LINES - 1] + ["... (closest region truncated)"]
+    result = []
+    remaining = _NO_MATCH_EXCERPT_CHARS
+    for line in lines:
+        if remaining <= 0:
+            break
+        if len(line) > remaining:
+            result.append(line[:max(0, remaining - 3)] + "...")
+            break
+        result.append(line)
+        remaining -= len(line) + 1
+    capped = "\n".join(result)
+    return capped + (separator + extra if separator else "")
+
+
 def format_no_match_hint(error: Optional[str], match_count: int,
                          old_string: str, content: str) -> str:
-    """'\\n\\nDid you mean...' snippet for plain no-match errors only, else '' (ambiguous /
-    escape-drift / identical errors also have ``match_count == 0`` but a hint would mislead)."""
+    """Closest-region recovery text for plain no-match errors, else ''.
+
+    The excerpt is deliberately bounded and is diagnostic only: no candidate is
+    applied, and callers are told that the file remains unchanged.
+    """
     if match_count != 0 or not error or not error.startswith("Could not find"):
         return ""
-    hint = find_closest_lines(old_string, content)
-    return "\n\nDid you mean one of these sections?\n" + hint if hint else ""
+    hint = find_closest_lines(
+        old_string, content, context_lines=1, max_results=1)
+    if not hint:
+        return "\n\nThe file was not modified. Re-read it and provide an exact old_string."
+    return (
+        "\n\nClosest region in the file (the file was not modified). "
+        "Use the exact existing text shown here to anchor the next attempt:\n"
+        + _cap_no_match_excerpt(hint))

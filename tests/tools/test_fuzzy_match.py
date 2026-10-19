@@ -507,7 +507,8 @@ class TestFormatNoMatchHint:
             "Could not find a match for old_string in the file",
             0, "def baz():", content,
         )
-        assert "Did you mean" in result
+        assert "Closest region in the file" in result
+        assert "file was not modified" in result
         assert "foo" in result or "bar" in result
 
 
@@ -538,13 +539,13 @@ class TestFormatNoMatchHint:
         result = self.fmt(None, 0, "foo", "bar\n")
         assert result == ""
 
-    def test_silent_when_no_similar_content(self):
-        """Even for a valid no-match error, skip hint when nothing similar exists."""
+    def test_no_similar_content_still_states_file_is_unchanged(self):
+        """A valid no-match still tells the caller that no write occurred."""
         result = self.fmt(
             "Could not find a match for old_string in the file",
             0, "totally_unique_xyzzy_qux", "abc\nxyz\n",
         )
-        assert result == ""
+        assert result == "\n\nThe file was not modified. Re-read it and provide an exact old_string."
 
 
 class TestEscapeNormalizedNewString:

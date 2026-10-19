@@ -307,9 +307,11 @@ def apply_v4a_operations(operations: list[PatchOperation], file_ops: Any) -> Pat
         return "\n".join(f"  • {e}" for e in errs)
 
     if errors := _validate_operations(operations, file_ops):
-        return PatchResult(
-            success=False,
-            error="Patch validation failed (no files were modified):\n" + _bullets(errors))
+        validation_error = errors[0]
+        if len(errors) > 1:
+            validation_error += "\n" + _bullets(errors[1:])
+        validation_error += "\nPatch validation failed (no files were modified)"
+        return PatchResult(success=False, error=validation_error)
     files: dict[str, list[str]] = {"created": [], "deleted": [], "modified": []}
     all_diffs: list[str] = []
     notes: list[str] = []
