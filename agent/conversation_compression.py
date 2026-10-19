@@ -1246,6 +1246,11 @@ def run_compress_context_with_progress_timeout(
     # poll idle budget + ceiling, fence-cancel on timeout so no late commit lands.
     from tools.thread_context import propagate_context_to_thread
     executor = _get_compress_timeout_executor()
+    # A saturation signal left by an earlier attempt must not label this one: the worker's own
+    # per-attempt reset never runs if this attempt is refused or expires before the worker starts.
+    if telemetry_agent is not None and getattr(telemetry_agent, "_compression_blocked_transient", None) == "pool_saturated":
+        with contextlib.suppress(Exception):
+            telemetry_agent._compression_blocked_transient = None
     # Refuse rather than queue when the pool is full: a queued job would wait out
     # its budget unstarted and run stale later. Skip compression this cycle.
     # A queued job would silently wait out its whole budget without starting and stay eligible to run as a
@@ -1261,10 +1266,12 @@ def run_compress_context_with_progress_timeout(
         # Saturation is a transient capacity refusal, not evidence that this session is
         # incompressible. Publish the same defer signal used by cooldown/backoff guards
         # so preflight and overflow callers refund this attempt and retry on a later pass.
-        agent = telemetry_agent
-        if agent is not None:
+        # Only the primary admission publishes it: a refused stall-fallback retry
+        # (stall_fallback=False) belongs to an attempt that already timed out, and the
+        # timeout must keep priority so over-window turns still fail closed.
+        if telemetry_agent is not None and stall_fallback:
             with contextlib.suppress(Exception):
-                agent._compression_blocked_transient = "pool_saturated"
+                telemetry_agent._compression_blocked_transient = "pool_saturated"
         # Saturation refusals must hit the same telemetry stream as other failures, or
         # a wedged pool looks like compression simply stopped being attempted.
         if telemetry_agent is not None:

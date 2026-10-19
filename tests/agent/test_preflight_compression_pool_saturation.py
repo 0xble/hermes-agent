@@ -8,7 +8,7 @@ pass can compress after a worker frees.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import agent.conversation_compression as compression
 from agent.turn_preflight import PreflightGateVerdict, run_preflight_compression
@@ -83,9 +83,7 @@ def test_saturated_pool_refunds_pre_api_attempt_and_recovers(monkeypatch):
     saturated = {"value": True}
 
     def _compress_context(messages, _system_message, **_kwargs):
-        # The facade clears per-attempt signals before entering the shared
-        # timeout wrapper. Mirror that boundary in this focused preflight test.
-        agent._compression_blocked_transient = None
+        # No manual reset: the wrapper itself must drop the previous pass's saturation signal.
         return compression.run_compress_context_with_progress_timeout(
             worker=(
                 lambda _fence: (messages, "sys")
@@ -151,3 +149,44 @@ def test_saturated_pool_refunds_pre_api_attempt_and_recovers(monkeypatch):
     finally:
         for _ in held:
             compression._release_compression_admission()
+
+
+def _fill_pool():
+    held = 0
+    for _ in range(compression._COMPRESS_EXECUTOR_MAX_WORKERS):
+        assert compression._try_admit_compression_job()
+        held += 1
+    return held
+
+
+def _release(held):
+    for _ in range(held):
+        compression._release_compression_admission()
+
+
+def _run(agent, worker, *, stall_fallback=True):
+    return compression.run_compress_context_with_progress_timeout(
+        worker=worker, messages=_MESSAGES, system_prompt_fallback="sys", idle_timeout_seconds=1.0,
+        total_ceiling_seconds=2.0, telemetry_agent=agent, stall_fallback=stall_fallback,
+    )
+
+
+def test_refused_stall_fallback_retry_keeps_the_timeout_as_the_cause():
+    """A refused nested retry belongs to a timed-out attempt, so it must not relabel it as saturation."""
+    agent = SimpleNamespace(session_id="pool-saturation-retry", _compression_blocked_transient=None)
+    held = _fill_pool()
+    try:
+        result = _run(agent, lambda _fence: (_MESSAGES, "sys"), stall_fallback=False)
+    finally:
+        _release(held)
+    assert result[0] is _MESSAGES
+    assert agent._compression_blocked_transient is None
+    assert compression.compression_pool_saturated(agent) is False
+
+
+def test_stale_saturation_signal_is_cleared_when_the_next_attempt_is_admitted():
+    agent = SimpleNamespace(session_id="pool-saturation-stale", _compression_blocked_transient="pool_saturated")
+    compressed = [{"role": "user", "content": "summary"}]
+    result = _run(agent, lambda _fence: (compressed, "sys"))
+    assert result[0] == compressed
+    assert agent._compression_blocked_transient is None

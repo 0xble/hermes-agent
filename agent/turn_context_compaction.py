@@ -429,8 +429,9 @@ def _run_preflight_passes(
                 # insufficient-progress blocker (the loop's error handlers must keep their provider-proven
                 # retry budget) and stop preflight passes for this turn; the lock winner is shrinking the
                 # same session concurrently. See #69870.
-                "Preflight compression deferred: compression lock "
-                "held by another path (session %s)",
+                "Preflight compression deferred: %s (session %s)",
+                "compression pool saturated" if compression_pool_saturated(agent)
+                else "compression lock held by another path",
                 agent.session_id or "none",
             )
             break
