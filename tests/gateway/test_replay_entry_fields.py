@@ -183,6 +183,26 @@ def test_a_plain_replay_row_does_not_carry_a_tool_call_uid_map_without_its_calls
     assert "_tool_call_uids" not in replayed[1] and "_tool_call_uid" not in replayed[1]
 
 
+def test_replay_preserves_summary_metadata_and_does_not_timestamp_summary_rows():
+    from gateway.run import _build_gateway_agent_history
+
+    stored = [{
+        "role": "user", "content": "[CONTEXT COMPACTION] summary", "message_uid": "u1",
+        "_db_row_snapshot": "snap1", "_db_persisted": True, "_compressed_summary": True,
+        "timestamp": 1_700_000_000.0, "message_id": "m1", "display_kind": "summary",
+        "display_metadata": {"source": "compression"},
+    }]
+    replayed, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
+    entry = replayed[0]
+    assert entry["content"] == stored[0]["content"]
+    assert entry["_compressed_summary"] is True
+    assert entry["_db_row_snapshot"] == "snap1"
+    assert entry["message_id"] == "m1"
+    assert entry["display_kind"] == "summary"
+    assert entry["display_metadata"] == {"source": "compression"}
+
+
+
 def test_replay_keeps_the_stored_row_version_only_for_unchanged_content():
     from gateway.run import _build_gateway_agent_history
 

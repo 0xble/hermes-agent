@@ -1191,6 +1191,13 @@ def _build_replay_entry(
     snapshot = msg.get(DB_ROW_SNAPSHOT)
     if isinstance(snapshot, str) and snapshot and content == msg.get("content"):
         entry[DB_ROW_SNAPSHOT] = snapshot
+    # Preserve durable insert metadata needed when this replay view is later flushed. In particular,
+    # losing _compressed_summary would disarm the stale-generation guard, while dropping the display and
+    # platform fields would silently change the stored row on a marker-only rewrite.
+    for field in ("_compressed_summary", "message_id", "platform_message_id", "observed",
+                  "display_kind", "display_metadata", "effect_disposition"):
+        if field in msg and msg[field] is not None:
+            entry[field] = msg[field]
     # A merged user dict lost that stamp; this one is what ties it to its durable rows at compaction.
     # The other counts the rows the repair dropped behind a dict or folded into an assistant turn,
     # which this view cannot name either; the last names them for the commit.
@@ -1333,7 +1340,7 @@ def _build_gateway_agent_history(
                     continue
             # Keep user timestamps for the stale-dangerous-confirmation stripper in agent/replay_cleanup.py.
             entry = _build_replay_entry(role, content, msg, preserve_timestamp=(role == "user"))
-            if inject_timestamps and role == "user" and isinstance(content, str):
+            if inject_timestamps and role == "user" and isinstance(content, str) and not msg.get("_compressed_summary"):
                 rendered = _render_msg_ts(content, replay_timestamp, tz=_msg_tz)
                 # Preserve only a sidecar matching the complete rendered message,
                 # optionally followed by the normal context separator. Cleanup
