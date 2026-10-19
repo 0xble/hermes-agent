@@ -606,7 +606,7 @@ DEFAULT_CONFIG = {
         # are floored at 0.75 (raise-only) so compaction doesn't fire with half the window free; set
         # above 0.75 to override the floor.
         "threshold": 0.50,
-        "threshold_tokens": None,
+        "threshold_tokens": None, "agent_request_floor_ratio": 0.30, "agent_request_cooldown_api_calls": 10,
         # "progress_notices": False,    # opt-in (#52995): when True, routine compression
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         # tail_mode: "lean" = clamped 2.5%-of-window tail (10K floor / 25K cap) plus chunked

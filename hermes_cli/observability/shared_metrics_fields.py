@@ -123,7 +123,7 @@ _COMPRESSION_TRIGGERS = {
         ("idle", "turn_start_threshold", "engine_preflight", "pre_api", "post_tool", "gateway_hygiene"), "auto",
     ),
     **dict.fromkeys(("overflow", "context_overflow", "overflow_error", "error"), "overflow"),
-    **dict.fromkeys(("manual", "user", "command", "slash"), "manual"),
+    **dict.fromkeys(("manual", "user", "command", "slash", "agent_requested"), "manual"),
 }
 _COMPRESSION_OUTCOMES = {
     **dict.fromkeys(("success", "ok", "compressed", "completed"), "success"),
