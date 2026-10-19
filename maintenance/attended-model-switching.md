@@ -62,7 +62,7 @@ The combined resolution is implemented in `gateway/run_turn.py` and
 `gateway/run_config_loaders.py`; the topic commit path is
 `gateway/telegram_topic_sessions.py` and `gateway/slash_commands_model.py`.
 This is a fork-only gateway feature that adds per-topic attended routing, idle
-expiry, persisted activity timestamps, and boundary-only idle expiry. A new genuine user message switches in at the next API call; idle expiry switches back to the default only when the session is quiet and the request fits the default route, including during a long autonomous turn. An active fallback is never undone. The deprecated `compact_before_switch_tokens` key remains accepted but is ignored; normal per-model preflight compression remains the only compaction path. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly.
+expiry, persisted activity timestamps, and boundary-only idle expiry. A new genuine user message switches in at the next API call; idle expiry switches back to the default only when the session is quiet and the request fits the default route. A long autonomous turn that continues making API calls stays on the attended route. An active fallback is never undone. The deprecated `compact_before_switch_tokens` key remains accepted but is ignored; normal per-model preflight compression remains the only compaction path. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly.
 
 ## Verification
 

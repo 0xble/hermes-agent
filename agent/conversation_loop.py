@@ -1702,6 +1702,16 @@ def _run_conversation_turn(
             after_route = (agent.model, agent.provider, getattr(agent, "api_mode", ""))
             if after_route != before_route:
                 _run_phase(assemble_api_request, agent, s)
+                # A boundary-only idle switch-back is intentionally applied after the first
+                # preflight gate. Rebuild and re-run the gate for the destination route so its
+                # context threshold and output ceiling, not the old route's, govern the request.
+                _pg = _run_phase(run_preflight_gate, agent, s)
+                if _pg.action == "return":
+                    return _pg.result
+                if _pg.action == "break":
+                    break
+                if _pg.action == "continue":
+                    continue
         _run_phase(announce_api_call, agent, s)
 
         s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries

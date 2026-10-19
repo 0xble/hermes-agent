@@ -6,6 +6,7 @@ from gateway.attended_model import AttendedResolution
 from gateway.session import Platform, SessionSource
 from gateway.turn_context import TurnContext
 from gateway.run_turn_runner import TurnRunner
+from agent import conversation_loop
 
 
 def _ctx(config=None):
@@ -195,3 +196,72 @@ def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
 
     assert notices == ["⇄ Switched to Opus while you're active."]
     assert state.conversation.pending_attended_notice is None
+
+
+def test_conversation_loop_orders_route_hooks_around_destination_preflight(monkeypatch):
+    """Route changes use the real loop seam: assemble/preflight see the active route,
+    and a post-preflight boundary switch rebuilds and fits for its destination route."""
+    events = []
+    ctx = SimpleNamespace(
+        user_message="hello", original_user_message="hello", messages=[{"role": "user", "content": "hello"}],
+        conversation_history=[], active_system_prompt="system", effective_task_id="task", turn_id="turn",
+        should_review_memory=False, plugin_user_context="", ext_prefetch_cache="", current_turn_user_idx=0,
+        preflight_compression_blocked=False,
+    )
+    budget = SimpleNamespace(remaining=1)
+    agent = SimpleNamespace(
+        model="default", provider="default-provider", api_mode="default-mode", max_iterations=1,
+        max_compression_attempts=3, iteration_budget=budget, _budget_grace_call=False,
+        _api_max_retries=0, _try_refresh_env_client_credentials=lambda: None,
+    )
+
+    def before(_state):
+        events.append(("before", agent.model))
+        agent.model, agent.provider, agent.api_mode = "attended", "attended-provider", "attended-mode"
+
+    def after(_state):
+        events.append(("after", agent.model))
+        agent.model, agent.provider, agent.api_mode = "default", "default-provider", "default-mode"
+
+    agent._gateway_before_api_call = before
+    agent._gateway_after_preflight = after
+
+    def phase(fn, _agent, _state, **_extra):
+        name = fn.__name__
+        if name == "begin_iteration":
+            _state.api_call_count = 1
+        if name == "assemble_api_request":
+            events.append(("assemble", _agent.model))
+        elif name == "run_preflight_gate":
+            events.append(("preflight", _agent.model))
+            _agent._preflight_output_ceiling = 111 if _agent.model == "attended" else 222
+        elif name == "apply_retry_restarts":
+            return SimpleNamespace(action="break")
+        elif name == "announce_api_call":
+            return SimpleNamespace(action="fallthrough")
+        return SimpleNamespace(action="fallthrough")
+
+    monkeypatch.setattr(conversation_loop, "begin_fast_mode_turn", lambda *_args: None)
+    monkeypatch.setattr(conversation_loop, "build_turn_context", lambda *_args, **_kwargs: ctx)
+    monkeypatch.setattr("agent.voice_turn_route.begin_voice_turn_route", lambda _agent, _messages, prompt: prompt)
+    monkeypatch.setattr(conversation_loop, "play_prelude", lambda *_args: ("continue", None))
+    monkeypatch.setattr(conversation_loop, "_run_phase", phase)
+    def finalize(agent, *, final_response, api_call_count, interrupted, failed, messages,
+                 conversation_history, effective_task_id, turn_id, user_message,
+                 original_user_message, _should_review_memory, _turn_exit_reason,
+                 _pending_verification_response=None, _pending_verification_response_previewed=False):
+        return {"completed": True}
+    monkeypatch.setattr(conversation_loop, "finalize_turn", finalize)
+
+    result = conversation_loop._run_conversation_turn(agent, "hello")
+
+    assert result == {"completed": True}
+    assert events == [
+        ("before", "default"),
+        ("assemble", "attended"),
+        ("preflight", "attended"),
+        ("after", "attended"),
+        ("assemble", "default"),
+        ("preflight", "default"),
+    ]
+    assert agent._preflight_output_ceiling == 222

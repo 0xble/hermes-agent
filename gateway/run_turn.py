@@ -392,23 +392,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             decision = dataclasses.replace(
                 decision, new_session=new_session, switched_back=switched_back,
             )
-        if switched_back:
-            log_decision = getattr(self, "_log_attended_decision", None)
-            if callable(log_decision):
-                log_decision(session_key, source, action="switch", reason="idle")
-            self._handoff_attended_state(
-                session_key,
-                conversation={"last_attended_decision": decision},
-                runner={"_last_attended_decision": decision},
-            )
-        elif decision is previous_decision:
+        if decision is previous_decision:
             log_decision = getattr(self, "_log_attended_decision", None)
             if callable(log_decision):
                 log_decision(
                     session_key, source, action="defer" if not allow_switch_back else "keep",
-                    reason="no_api_call" if not api_quiet else "session_busy",
+                    reason="session_busy" if not api_quiet else "no_api_call",
                 )
-        else:
+        elif not switched_back:
             self._handoff_attended_state(
                 session_key,
                 conversation={"last_attended_decision": decision},

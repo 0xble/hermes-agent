@@ -1428,14 +1428,11 @@ class TurnRunner:
                 return
             previous_decision = getattr(agent, "_gateway_attended_decision", None)
             previous_key = getattr(agent, "_gateway_attended_decision_key", None)
-            if not commit:
-                # The first callback runs before preflight. It may resolve active/explicit
-                # changes, but idle expiry is only committed by the post-preflight callback.
-                if decision.reason == "attended" and previous_decision is not None:
-                    decision = previous_decision
-                agent._gateway_attended_decision = decision
-                return
-            if ctx.session_key:
+            # The pre-preflight callback resolves and applies active/explicit route changes so
+            # request assembly and the first preflight gate see the destination model. The resolver
+            # suppresses idle switch-back when ``allow_switch_back`` is false; only the post-preflight
+            # callback may commit that boundary-only transition.
+            if commit and ctx.session_key:
                 _handoff(conversation={"last_api_call_at": time.time()})
             agent._gateway_attended_decision = decision
             desired_key = decision.decision_key
@@ -1461,16 +1458,33 @@ class TurnRunner:
                 model, runtime = runner._resolve_session_agent_runtime(
                     source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
                 )
-            if decision.switched_back and self._attended_request_context_too_large(
+            if commit and decision.switched_back and self._attended_request_context_too_large(
                 agent, loop_state, model=model, runtime=runtime,
             ):
-                logger.info(
-                    "attended decision: session=%s origin=%s action=keep reason=context_too_large",
-                    ctx.session_key, "user",
-                )
+                log_decision = getattr(runner, "_log_attended_decision", None)
+                if callable(log_decision):
+                    log_decision(
+                        ctx.session_key, ctx.source, action="keep", reason="context_too_large",
+                    )
+                else:
+                    logger.info(
+                        "attended decision: session=%s origin=%s action=keep reason=context_too_large",
+                        ctx.session_key,
+                        "automation" if str(getattr(getattr(ctx.source, "platform", None), "value", "")).lower()
+                        in {"automation", "cron", "goal_wakeup", "kanban", "subagent", "system"}
+                        else "user",
+                    )
                 agent._gateway_attended_decision = previous_decision
                 _handoff(conversation={"last_attended_decision": previous_decision})
                 return
+            if commit and decision.switched_back:
+                log_decision = getattr(runner, "_log_attended_decision", None)
+                if callable(log_decision):
+                    log_decision(ctx.session_key, ctx.source, action="switch", reason="idle")
+                _handoff(
+                    conversation={"last_attended_decision": decision},
+                    runner_state={"_last_attended_decision": decision},
+                )
             current_route = (
                 getattr(agent, "model", ""), getattr(agent, "provider", ""), getattr(agent, "api_mode", ""),
             )
