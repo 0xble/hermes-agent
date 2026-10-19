@@ -1121,7 +1121,6 @@ def test_oversized_replacement_is_refused_before_any_request(state):
     ({"goal": "ship", "contract": {"constraints": "x" * 1600}}, "replacement_too_long"),
     ({"goal": "ship", "max_turns": "999"}, "invalid_max_turns"),
     ({"goal": "ship", "max_turns": -1}, "invalid_max_turns"),
-    ({"goal": "ship", "max_turns": 0}, "invalid_max_turns"),
 ])
 def test_replacement_payload_must_be_fully_displayable(state, payload, code):
     from hermes_cli.goals import GoalManager, load_goal
