@@ -5249,8 +5249,10 @@ class BasePlatformAdapter(ABC):
             delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
+            # A cron review is always muted, but its reply is the scheduler's verdict, not a
+            # presentation: review_capture keeps it off every send path instead.
             with self._media_delivery_scope(event.source):
-                if diagnostic_wake_muted(event):
+                if review_capture.future is None and diagnostic_wake_muted(event):
                     response = None
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.

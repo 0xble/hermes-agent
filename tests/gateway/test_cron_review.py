@@ -258,3 +258,55 @@ def test_drain_never_preserves_a_review():
     assert GatewayBusySessionMixin._preserve_drain_event(runner, "key", event) is False
     with pytest.raises(RuntimeError, match="busy"):
         capture.result(timeout=0)
+
+
+@pytest.mark.asyncio
+async def test_muted_review_turn_still_reaches_the_scheduler_as_its_exact_reply(monkeypatch):
+    """A review turn mutes its own presentation; that mute must not erase the captured reply.
+
+    Drives control socket -> CronReviewControl._review -> admit_internal_event -> adapter ->
+    the runner's real private delivery step, then parses exactly what the scheduler receives.
+    """
+    from cron.review import parse_decision
+    from gateway.run_turn import GatewayTurnMixin
+
+    adapter = Adapter(PlatformConfig(enabled=True), Platform.TELEGRAM)
+    adapter.sent = []
+    adapter.send_typing = AsyncMock()
+
+    async def runner_turn(event):
+        # The runner forces mute_notification_reply for every review turn and carries it back
+        # onto the event, exactly as _run_agent/_handle_message_with_agent do.
+        agent_result = {"final_response": "PRESENT", "_model_final_response": "PRESENT",
+                        "_notification_reply_muted": True}
+        event._notification_reply_muted = agent_result["_notification_reply_muted"]
+        return await GatewayTurnMixin._hmwa_deliver_turn_response(
+            SimpleNamespace(), event, event.source, None, event.metadata["gateway_session_key"], 1,
+            agent_result, [], "PRESENT", None, False)
+
+    adapter.set_message_handler(runner_turn)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm",
+                           thread_id="139328")
+    entry = SimpleNamespace(origin=source, session_id="sid")
+
+    class Scope:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc):
+            return False
+
+    runner = SimpleNamespace(
+        _plugin_injection_accepting=lambda: True,
+        async_session_store=SimpleNamespace(lookup_by_session_key=AsyncMock(return_value=entry)),
+        _restored_source=lambda entry: source,
+        _plugin_injection_authorized=lambda *a, **kw: True,
+        _delivery_adapter_for=lambda source: adapter,
+        _plugin_injection_scope=lambda source: Scope())
+    key = "agent:main:telegram:dm:chat:139328"
+    reply = await CronReviewControl(runner)._review(key, "sid", "review", 5)
+    await asyncio.gather(*tuple(adapter._background_tasks))
+    assert reply == "PRESENT"
+    assert parse_decision(reply) == ("PRESENT", "")
+    assert adapter.sent == []
+    adapter.send_typing.assert_not_awaited()
