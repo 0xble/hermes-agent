@@ -57,24 +57,29 @@ class GatewaySessionControlsMixin:
         requester_title = cls._clip(record.get("requester_title") or "Untitled session", 120)
         target_title = cls._clip(record.get("target_title") or "Untitled session", 120)
         reason = cls._clip(record.get("reason") or "session-control", 600)
+        # Keyed by (kind, action): goals and loops share pause/resume, and the card must name
+        # the thing approval actually changes.
         decision = {
-            "clear": "Clear this goal?",
-            "pause": "Pause this goal?",
-            "resume": "Resume this goal?",
-            "replace": "Replace this goal?",
-            "stop": "Stop this loop?",
-        }.get(action, f"Apply {kind} {action}?")
+            ("goal", "clear"): "Clear this goal?",
+            ("goal", "pause"): "Pause this goal?",
+            ("goal", "resume"): "Resume this goal?",
+            ("goal", "replace"): "Replace this goal?",
+            ("loop", "pause"): "Pause this loop?",
+            ("loop", "resume"): "Resume this loop?",
+            ("loop", "stop"): "Stop this loop?",
+        }.get((kind, action), f"Apply {kind} {action}?")
         effect = {
-            "clear": "The target goal will become cleared.",
-            "pause": "The target goal will stop progressing.",
-            "resume": "The target goal will become active again.",
-            "replace": "The target goal will be replaced by the proposal below.",
-            "stop": "The target loop will stop.",
-        }.get(action, f"The target {kind} will be changed.")
+            ("goal", "clear"): "The target goal will become cleared.",
+            ("goal", "pause"): "The target goal will stop progressing.",
+            ("goal", "resume"): "The target goal will become active again.",
+            ("goal", "replace"): "The target goal will be replaced by the proposal below.",
+            ("loop", "pause"): "The target loop will stop waking until resumed.",
+            ("loop", "resume"): "The target loop will start waking again.",
+            ("loop", "stop"): "The target loop will stop.",
+        }.get((kind, action), f"The target {kind} will be changed.")
         guidance = {
-            "clear": "Approval clears the current goal. It does not replace or restore its text.",
-            "replace": "Approve only if this still matches the target's current state.",
-        }.get(action, "Approve only if this still matches the target's current state.")
+            ("goal", "clear"): "Approval clears the current goal. It does not replace or restore its text.",
+        }.get((kind, action), "Approve only if this still matches the target's current state.")
         return (
             f"◆ {decision}\n\n"
             f"Target: {target_title}\n"

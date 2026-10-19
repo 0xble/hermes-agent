@@ -1092,9 +1092,10 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
         if not isinstance(record, dict) or record.get("status") != "pending":
             return None
         if float(record.get("expires_at") or 0) <= now:
+            # Return the settled record so the tapped card can say it expired.
             record["status"], record["resolved_at"] = "expired", now
             _save_record(record, cursor=conn)
-            return None
+            return record
         record["authority"] = {"via": "button", "user_id": str(user_id)}
         record["resolved_at"] = now
         if decision == "deny":

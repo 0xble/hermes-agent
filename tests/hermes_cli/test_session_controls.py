@@ -155,6 +155,23 @@ def test_expire_request_uses_transaction_and_is_consume_once(state):
     assert json.loads(state.get_meta(key))["status"] == "expired"
 
 
+def test_resolve_request_reports_expired_record_for_callback_feedback(state):
+    import json
+    from hermes_cli import session_controls
+
+    request = session_controls.request_control("goal", "clear", "target", requester_sid="requester")
+    key = session_controls._record_key(request["id"])
+    record = json.loads(state.get_meta(key))
+    record["expires_at"] = 0
+    state.set_meta(key, json.dumps(record))
+
+    resolved = session_controls.resolve_request(request["id"], "approve", "admin")
+
+    assert resolved is not None
+    assert resolved["status"] == "expired"
+    assert json.loads(state.get_meta(key))["status"] == "expired"
+
+
 def test_session_controls_do_not_pollute_goal_or_loop_revisions(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.loops import LoopManager, load_loop

@@ -5935,15 +5935,17 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
     def _session_control_outcome(record: Dict[str, Any], who: str) -> tuple[str, str]:
         """Return user-facing resolution text that explains stale approvals instead of hiding them."""
         status = str(record.get("status") or "failed")
-        action = str(record.get("action") or "")
+        kind, action = str(record.get("kind") or "goal"), str(record.get("action") or "")
         if status == "applied":
             verb = {
-                "clear": "Goal cleared",
-                "pause": "Goal paused",
-                "resume": "Goal resumed",
-                "stop": "Loop stopped",
-                "replace": "Goal replaced",
-            }.get(action, "Approved")
+                ("goal", "clear"): "Goal cleared",
+                ("goal", "pause"): "Goal paused",
+                ("goal", "resume"): "Goal resumed",
+                ("goal", "replace"): "Goal replaced",
+                ("loop", "pause"): "Loop paused",
+                ("loop", "resume"): "Loop resumed",
+                ("loop", "stop"): "Loop stopped",
+            }.get((kind, action), "Approved")
             return f"✓ {verb} by {who}", ""
         if status == "denied":
             return f"• Kept as-is, denied by {who}", ""

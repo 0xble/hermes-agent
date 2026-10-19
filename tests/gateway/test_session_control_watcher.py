@@ -851,3 +851,12 @@ def test_replace_card_shows_contract_and_max_turns_that_approval_installs():
     text = GatewaySessionControlsMixin._control_text(record)
     assert "Proposed contract: none (the current contract is dropped)" in text
     assert "Max turns: unchanged" in text
+
+
+def test_control_card_names_loop_actions():
+    from gateway.run_session_controls import GatewaySessionControlsMixin
+
+    for action in ("pause", "resume", "stop"):
+        text = GatewaySessionControlsMixin._control_text({"kind": "loop", "action": action})
+        assert "this loop" in text
+        assert "this goal" not in text

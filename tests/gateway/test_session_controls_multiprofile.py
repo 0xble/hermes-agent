@@ -118,3 +118,13 @@ async def test_button_resolves_in_the_profile_that_owns_the_chat(two_homes):
     with scope(secondary_home):
         assert _load_record(request["id"])["status"] == "applied"
         assert load_goal("target").status == "paused"
+
+
+@pytest.mark.parametrize("action,expected", [("pause", "Loop paused"), ("resume", "Loop resumed"), ("stop", "Loop stopped")])
+def test_session_control_loop_outcome_uses_loop_label(action, expected):
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    label, detail = TelegramAdapter._session_control_outcome(
+        {"status": "applied", "kind": "loop", "action": action}, "Brian")
+    assert label == f"✓ {expected} by Brian"
+    assert detail == ""
