@@ -117,6 +117,13 @@ def test_cross_session_goal_replace_without_an_active_goal_fails_before_any_requ
     assert load_goal("target") is None
     assert not [record for record in pending_outbox() if record.get("status") == "pending"]
 
+    self_result = apply_control(
+        "goal", "replace", "target", requester_sid="target", user_quote="replace it",
+        payload={"goal": "self replacement"},
+    )
+    assert self_result["error_code"] == "no_goal"
+    assert self_result["status"] == "failed"
+
 
 def test_self_goal_change_approval_is_non_blocking_and_second_press_noop(state):
     from hermes_cli.goals import GoalManager
