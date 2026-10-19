@@ -185,6 +185,52 @@ def test_second_numeric_topic_owner_shares_existing_owner(db):
     assert second["canonical_owner_key"] == "cron:first"
 
 
+@pytest.mark.parametrize("stuck_status", ["creating", "conflict", "retired"])
+def test_stuck_numeric_topic_owner_shares_existing_active_owner(db, monkeypatch, stuck_status):
+    _live_session(db, "existing", "Meridian Gmail Watcher", 324637)
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:first", topic_name="X")
+    db.set_telegram_topic_owner_active(
+        chat_id="123", owner_key="cron:first", thread_id="324637", topic_name="X")
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:second", topic_name="X")
+    if stuck_status != "creating":
+        db.set_telegram_topic_owner_state(
+            chat_id="123", owner_key="cron:second", status=stuck_status,
+            canonical_owner_key="cron:first")
+    if stuck_status == "retired":
+        monkeypatch.setattr(db, "get_telegram_topic_owner_for_thread", lambda **_: None)
+
+    _adapter(db).ensure_existing_telegram_topic_owner("123", "324637", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == "active"
+    assert second["thread_id"] is None
+    assert second["canonical_owner_key"] == "cron:first"
+
+
+def test_racing_first_numeric_topic_claim_shares_after_activation_conflict(db, monkeypatch):
+    _live_session(db, "existing", "Meridian Gmail Watcher", 324637)
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:first", topic_name="X")
+    db.set_telegram_topic_owner_active(
+        chat_id="123", owner_key="cron:first", thread_id="324637", topic_name="X")
+    original = db.get_telegram_topic_owner_for_thread
+    calls = 0
+
+    def hide_owner_for_first_race_check(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return original(**kwargs)
+
+    monkeypatch.setattr(db, "get_telegram_topic_owner_for_thread", hide_owner_for_first_race_check)
+    _adapter(db).ensure_existing_telegram_topic_owner("123", "324637", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == "active"
+    assert second["thread_id"] is None
+    assert second["canonical_owner_key"] == "cron:first"
+
+
 def test_conflicting_activation_retires_creating_claim(db):
     db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:first", topic_name="X")
     db.set_telegram_topic_owner_active(

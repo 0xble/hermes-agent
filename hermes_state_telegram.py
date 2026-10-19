@@ -397,7 +397,7 @@ class SessionTelegramTopicsMixin:
             self.set_telegram_topic_owner_state(
                 chat_id=str(chat_id), owner_key=str(owner_key), status="conflict",
                 canonical_owner_key=canonical, profile_name=profile_name)
-            detail = f" already owned by {canonical}" if canonical else ""
+            detail = f" by {canonical}" if canonical else ""
             raise RuntimeError(
                 f"Telegram topic thread {thread_id} is already owned{detail}; refusing duplicate owner"
             ) from exc
@@ -408,13 +408,14 @@ class SessionTelegramTopicsMixin:
         profile_name: str = "default",
     ) -> dict[str, Any]:
         """Record a second automation owner sharing an existing canonical owner."""
+        self.apply_telegram_topic_migration()
         profile_name = _normalize_telegram_topic_profile_name(profile_name)
         self._write_sql(
             """UPDATE telegram_dm_topic_owners
                   SET thread_id = NULL, topic_name = ?, status = 'active',
                       canonical_owner_key = ?, updated_at = ?
                 WHERE profile_name = ? AND chat_id = ? AND owner_key = ?
-                  AND status = 'creating'""",
+                  AND status IN ('creating', 'conflict', 'retired')""",
             (str(topic_name), str(canonical_owner_key), time.time(), profile_name,
              str(chat_id), str(owner_key)),
         )
