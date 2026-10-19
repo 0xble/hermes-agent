@@ -852,7 +852,15 @@ def test_replace_card_shows_contract_and_max_turns_that_approval_installs():
     assert "Proposed contract: none (the current contract is dropped)" in text
     assert "Max turns: unchanged" in text
     record["payload"] = {"goal": "finish writing docs", "max_turns": 0}
+    assert "Max turns: unlimited" in GatewaySessionControlsMixin._control_text(record)
+    record["current_max_turns"] = 20
+    assert "Max turns: unlimited" in GatewaySessionControlsMixin._control_text(record)
+    record["current_max_turns"] = 0
     assert "Max turns" not in GatewaySessionControlsMixin._control_text(record)
+    record["payload"] = {"goal": "finish writing docs"}
+    assert "Max turns" not in GatewaySessionControlsMixin._control_text(record)
+    record["payload"] = {"goal": "finish writing docs", "max_turns": 30}
+    assert "Max turns: 30" in GatewaySessionControlsMixin._control_text(record)
 
 
 def test_control_card_names_loop_actions():
