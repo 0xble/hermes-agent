@@ -535,6 +535,17 @@ def _affected_text(kind: str, action: str, raw: Optional[str], payload: Optional
     return ""
 
 
+def _current_max_turns(kind: str, raw: Optional[str]) -> Optional[int]:
+    """The target goal's budget before the control, so the card can tell an unchanged budget from a change."""
+    if kind != "goal" or not raw:
+        return None
+    try:
+        from hermes_cli.goals import GoalState
+        return GoalState.from_json(raw).max_turns
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def _definition_fingerprint(kind: str, raw: Optional[str]) -> str:
     """Bind the authored definition, not progress counters or scheduler bookkeeping.
 
@@ -952,6 +963,7 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
                              expires_at=now + _REQUEST_TTL_SECONDS,
                              affected_text=_affected_text(kind, action, raw, payload), cursor=conn)
         record["target_fingerprint"] = _definition_fingerprint(kind, raw)
+        record["current_max_turns"] = _current_max_turns(kind, raw)
         _save_record(record, cursor=conn)
         return record
 
@@ -1010,6 +1022,7 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                              authority=authority, status="failed" if code else "applied", now=now,
                              expires_at=None, affected_text=affected_before, cursor=conn)
         record["resolved_at"], record["error"] = now, code or None
+        record["current_max_turns"] = _current_max_turns(kind, raw)
         _bind_continuation(record, result, conn)
         _save_record(record, cursor=conn)
         return {"ok": not bool(code), "status": record["status"], "record": record,

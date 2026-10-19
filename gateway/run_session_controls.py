@@ -108,7 +108,8 @@ class GatewaySessionControlsMixin:
             lines = [f"Affected: {cls._clip(current or '(state unavailable)', 600)}",
                      f"Proposed goal: {cls._clip(new, REPLACEMENT_MAX_CHARS)}"]
             # Approval installs every one of these, so every one is shown: a missing contract
-            # drops the current one, and max_turns changes the budget.
+            # drops the current one, and max_turns changes the budget. The budget line is left
+            # out only when it would say unlimited and the goal is already unlimited.
             contract = {f: v for f, v in replacement_contract(payload).items() if v}
             if contract:
                 lines.append("Proposed contract (replaces the current one):")
@@ -116,8 +117,9 @@ class GatewaySessionControlsMixin:
             else:
                 lines.append("Proposed contract: none (the current contract is dropped)")
             max_turns = payload.get("max_turns")
-            budget = {None: "unchanged", 0: "unlimited"}.get(max_turns, max_turns)
-            lines.append(f"Max turns: {budget}")
+            if not (max_turns in (None, 0) and record.get("current_max_turns") == 0):
+                budget = {None: "unchanged", 0: "unlimited"}.get(max_turns, max_turns)
+                lines.append(f"Max turns: {budget}")
             return "\n".join(lines)
         return f"Affected: {cls._clip(affected or '(state unavailable)', 2400)}"
 

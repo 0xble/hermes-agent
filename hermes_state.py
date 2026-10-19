@@ -807,6 +807,8 @@ class SessionDB(
             check_same_thread=False, timeout=timeout, isolation_level=None,
         )
         conn.row_factory = sqlite3.Row
+        from hermes_state_search import _register_search_functions
+        _register_search_functions(conn)
         return conn
 
     def _handle_quarantine_if_invalid(self, already_locked: bool = False) -> None:
@@ -840,6 +842,8 @@ class SessionDB(
         )
         try:
             conn.row_factory = sqlite3.Row
+            from hermes_state_search import _register_search_functions
+            _register_search_functions(conn)
             mode = apply_wal_with_fallback(conn, db_label="state.db")
             # "wal" is also the *assumed* mode when the on-disk probe was blocked by a concurrent opener
             # (#86515): the lock-free mode=ro read pool needs a confirmed WAL header, so confirm it here.

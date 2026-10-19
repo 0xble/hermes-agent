@@ -1175,6 +1175,17 @@ def test_replacement_accepts_unlimited_budget(state):
     installed = load_goal("target")
     assert installed is not None
     assert (installed.goal, installed.max_turns) == ("ship", 0)
+    assert result["record"]["current_max_turns"] == 20
+
+
+def test_replace_record_carries_the_budget_it_replaces(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("old objective", max_turns=0)
+    result = apply_control("goal", "replace", "target", requester_sid="requester",
+                           payload={"goal": "ship", "max_turns": 0})
+    assert result["record"]["current_max_turns"] == 0
 
 
 @pytest.mark.parametrize("message,quote,refusal", [
