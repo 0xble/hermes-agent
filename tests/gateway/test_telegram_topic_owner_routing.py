@@ -169,6 +169,36 @@ def test_numeric_topic_delivery_claims_existing_live_binding(db):
     assert owner["thread_id"] == "324637"
 
 
+def test_second_numeric_topic_owner_shares_existing_owner(db):
+    _live_session(db, "existing", "Meridian Gmail Watcher", 324637)
+    adapter = _adapter(db)
+
+    adapter.ensure_existing_telegram_topic_owner("123", "324637", "cron:first")
+    adapter.ensure_existing_telegram_topic_owner("123", "324637", "cron:second")
+
+    first = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:first")
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert first["status"] == "active"
+    assert first["thread_id"] == "324637"
+    assert second["status"] == "active"
+    assert second["thread_id"] is None
+    assert second["canonical_owner_key"] == "cron:first"
+
+
+def test_conflicting_activation_retires_creating_claim(db):
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:first", topic_name="X")
+    db.set_telegram_topic_owner_active(
+        chat_id="123", owner_key="cron:first", thread_id="324637", topic_name="X")
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:second", topic_name="X")
+
+    with pytest.raises(RuntimeError, match="already owned"):
+        db.set_telegram_topic_owner_active(
+            chat_id="123", owner_key="cron:second", thread_id="324637", topic_name="X")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == "conflict"
+
+
 def test_numeric_topic_without_binding_fails_closed(db):
     adapter = _adapter(db)
     with pytest.raises(RuntimeError, match="no live Hermes binding"):

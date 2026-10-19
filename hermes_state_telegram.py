@@ -330,6 +330,18 @@ class SessionTelegramTopicsMixin:
         )
         return dict(row) if row else None
 
+    def get_telegram_topic_owner_for_thread(
+        self, *, chat_id: str, thread_id: str, profile_name: str = "default",
+    ) -> Optional[dict[str, Any]]:
+        """Return the active automation owner for one numeric DM topic, if any."""
+        self.apply_telegram_topic_migration()
+        row = self._topic_read_one(
+            """SELECT * FROM telegram_dm_topic_owners
+               WHERE profile_name = ? AND chat_id = ? AND thread_id = ? AND status = 'active'""",
+            (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(thread_id)),
+        )
+        return dict(row) if row else None
+
     def reserve_telegram_topic_owner(
         self, *, chat_id: str, owner_key: str, topic_name: str, profile_name: str = "default",
     ) -> dict[str, Any]:
@@ -371,13 +383,43 @@ class SessionTelegramTopicsMixin:
         """Publish the exact remote thread after a successful create/readback."""
         self.apply_telegram_topic_migration()
         profile_name = _normalize_telegram_topic_profile_name(profile_name)
+        try:
+            self._write_sql(
+                """UPDATE telegram_dm_topic_owners
+                      SET thread_id = ?, topic_name = ?, status = 'active', updated_at = ?
+                    WHERE profile_name = ? AND chat_id = ? AND owner_key = ? AND status = 'creating'""",
+                (str(thread_id), str(topic_name), time.time(), profile_name, str(chat_id), str(owner_key)),
+            )
+        except sqlite3.IntegrityError as exc:
+            existing = self.get_telegram_topic_owner_for_thread(
+                chat_id=str(chat_id), thread_id=str(thread_id), profile_name=profile_name)
+            canonical = str(existing.get("owner_key")) if existing else None
+            self.set_telegram_topic_owner_state(
+                chat_id=str(chat_id), owner_key=str(owner_key), status="conflict",
+                canonical_owner_key=canonical, profile_name=profile_name)
+            detail = f" already owned by {canonical}" if canonical else ""
+            raise RuntimeError(
+                f"Telegram topic thread {thread_id} is already owned{detail}; refusing duplicate owner"
+            ) from exc
+        return self.get_telegram_topic_owner(chat_id=str(chat_id), owner_key=str(owner_key), profile_name=profile_name) or {}
+
+    def set_telegram_topic_owner_shared(
+        self, *, chat_id: str, owner_key: str, canonical_owner_key: str, topic_name: str,
+        profile_name: str = "default",
+    ) -> dict[str, Any]:
+        """Record a second automation owner sharing an existing canonical owner."""
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
         self._write_sql(
             """UPDATE telegram_dm_topic_owners
-                  SET thread_id = ?, topic_name = ?, status = 'active', updated_at = ?
-                WHERE profile_name = ? AND chat_id = ? AND owner_key = ? AND status = 'creating'""",
-            (str(thread_id), str(topic_name), time.time(), profile_name, str(chat_id), str(owner_key)),
+                  SET thread_id = NULL, topic_name = ?, status = 'active',
+                      canonical_owner_key = ?, updated_at = ?
+                WHERE profile_name = ? AND chat_id = ? AND owner_key = ?
+                  AND status = 'creating'""",
+            (str(topic_name), str(canonical_owner_key), time.time(), profile_name,
+             str(chat_id), str(owner_key)),
         )
-        return self.get_telegram_topic_owner(chat_id=str(chat_id), owner_key=str(owner_key), profile_name=profile_name) or {}
+        return self.get_telegram_topic_owner(
+            chat_id=str(chat_id), owner_key=str(owner_key), profile_name=profile_name) or {}
 
     def set_telegram_topic_owner_state(
         self, *, chat_id: str, owner_key: str, status: str,

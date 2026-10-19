@@ -3311,10 +3311,22 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         owner = db.get_telegram_topic_owner(
             chat_id=str(chat_id), owner_key=str(owner_key), profile_name=profile_name)
         if owner:
-            if owner.get("status") != "active" or str(owner.get("thread_id")) != str(thread_id):
+            if owner.get("status") != "active":
                 raise RuntimeError(
                     f"Telegram topic owner {owner_key} does not own thread {thread_id}; refusing reroute")
-            return
+            if owner.get("canonical_owner_key"):
+                canonical = db.get_telegram_topic_owner(
+                    chat_id=str(chat_id), owner_key=str(owner["canonical_owner_key"]), profile_name=profile_name)
+                if (
+                    canonical
+                    and canonical.get("status") == "active"
+                    and str(canonical.get("thread_id")) == str(thread_id)
+                ):
+                    return
+            elif str(owner.get("thread_id")) == str(thread_id):
+                return
+            raise RuntimeError(
+                f"Telegram topic owner {owner_key} does not own thread {thread_id}; refusing reroute")
         binding = db.get_telegram_topic_binding(
             chat_id=str(chat_id), thread_id=str(thread_id), profile_name=profile_name)
         if not binding:
@@ -3336,6 +3348,28 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             mark_automation(
                 chat_id=str(chat_id), thread_id=str(thread_id),
                 managed_mode="automation", profile_name=profile_name)
+        existing_thread_owner = db.get_telegram_topic_owner_for_thread(
+            chat_id=str(chat_id), thread_id=str(thread_id), profile_name=profile_name)
+        if existing_thread_owner and str(existing_thread_owner.get("owner_key")) != str(owner_key):
+            reserved = db.reserve_telegram_topic_owner(
+                chat_id=str(chat_id), owner_key=str(owner_key),
+                topic_name=str(session.get("title") or ""), profile_name=profile_name)
+            if reserved.get("_reserved"):
+                shared = db.set_telegram_topic_owner_shared(
+                    chat_id=str(chat_id), owner_key=str(owner_key),
+                    canonical_owner_key=str(existing_thread_owner["owner_key"]),
+                    topic_name=str(session.get("title") or ""), profile_name=profile_name)
+            else:
+                shared = reserved
+            if (
+                shared.get("status") != "active"
+                or str(shared.get("canonical_owner_key")) != str(existing_thread_owner["owner_key"])
+            ):
+                raise RuntimeError(f"Telegram topic owner {owner_key} lost its shared claim")
+            logger.info(
+                "[%s] Telegram topic owner share owner_key=%s canonical_owner_key=%s thread_id=%s decision=existing-numeric",
+                self.name, owner_key, existing_thread_owner["owner_key"], thread_id)
+            return
         reserved = db.reserve_telegram_topic_owner(
             chat_id=str(chat_id), owner_key=str(owner_key),
             topic_name=str(session.get("title") or ""), profile_name=profile_name)
