@@ -87,7 +87,7 @@ def test_progress_builder_uses_friendly_mcp_label_and_literal_preview():
     line = _runner(_telegram())[0]._progress_build_message(
         "mcp__mobbin__search_sections", "Ease website sections for therapists,", {})
 
-    assert line == '🔌 `Mobbin · search sections`: "`Ease website sections for therapists,`"'
+    assert line == '🔌 `mobbin · search sections`: "`Ease website sections for therapists,`"'
 
 
 @pytest.mark.parametrize("mode", ["all", "verbose"])
@@ -98,7 +98,7 @@ def test_every_progress_fragment_is_a_code_span_in_the_rich_payload(mode):
 
     for literal in LITERALS:
         assert literal in spans, (literal, markdown)
-    assert "Paper · get guide" in spans
+    assert "paper · get guide" in spans
     assert "mcp__paper__get_guide" not in markdown
 
 
@@ -108,7 +108,7 @@ def test_every_progress_fragment_is_a_code_entity_in_markdownv2():
 
     for literal in LITERALS:
         assert literal in spans, (literal, spans)
-    assert "Paper · get guide" in spans
+    assert "paper · get guide" in spans
 
 
 def test_verbose_args_dump_is_literal():
@@ -184,7 +184,7 @@ def test_stream_event_formatter_shares_the_literal_path():
         ToolCallChunk("mcp__paper__get_guide", preview="references/index.md", args={"path": "references/index.md"}),
         mode="verbose", preview_max_len=0)
 
-    assert line.startswith("🔌 `Paper · get guide`(")
+    assert line.startswith("🔌 `paper · get guide`(")
     assert '`{"path": "references/index.md"}`' in line
 
 

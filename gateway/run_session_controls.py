@@ -36,23 +36,58 @@ class GatewaySessionControlsMixin:
         text = str(text or "")
         return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
+    # A resolved notice is cosmetic. Keep it retryable briefly, then settle it so an
+    # unavailable target route cannot keep waking the gateway forever.
+    _TARGET_NOTICE_RETRY_SECONDS = 15 * 60
+
+    @classmethod
+    def _target_notice_is_stale(cls, record: dict) -> bool:
+        resolved_at = record.get("resolved_at") or record.get("created_at")
+        try:
+            return bool(resolved_at and time.time() - float(resolved_at) >= cls._TARGET_NOTICE_RETRY_SECONDS)
+        except (TypeError, ValueError):
+            return False
+
     @classmethod
     def _control_text(cls, record: dict) -> str:
-        # Every free-text field is bounded: the card is one message with buttons (Telegram caps a
-        # message at 4096 chars), and an oversized card would fail and strand the request.
+        # Keep the card scannable on mobile: decision first, then the affected session, the actor,
+        # the exact change and the reason. Every free-text field remains bounded so one Telegram
+        # message can carry the complete proposal with its buttons.
         kind, action = record.get("kind", ""), record.get("action", "")
-        target = record.get("target_session_id", "")
-        requester = record.get("requester_session_id", "")
         requester_title = cls._clip(record.get("requester_title") or "Untitled session", 120)
         target_title = cls._clip(record.get("target_title") or "Untitled session", 120)
         reason = cls._clip(record.get("reason") or "session-control", 600)
+        # Keyed by (kind, action): goals and loops share pause/resume, and the card must name
+        # the thing approval actually changes.
+        decision = {
+            ("goal", "clear"): "Clear this goal?",
+            ("goal", "pause"): "Pause this goal?",
+            ("goal", "resume"): "Resume this goal?",
+            ("goal", "replace"): "Replace this goal?",
+            ("loop", "pause"): "Pause this loop?",
+            ("loop", "resume"): "Resume this loop?",
+            ("loop", "stop"): "Stop this loop?",
+        }.get((kind, action), f"Apply {kind} {action}?")
+        effect = {
+            ("goal", "clear"): "The target goal will become cleared.",
+            ("goal", "pause"): "The target goal will stop progressing.",
+            ("goal", "resume"): "The target goal will become active again.",
+            ("goal", "replace"): "The target goal will be replaced by the proposal below.",
+            ("loop", "pause"): "The target loop will stop waking until resumed.",
+            ("loop", "resume"): "The target loop will start waking again.",
+            ("loop", "stop"): "The target loop will stop.",
+        }.get((kind, action), f"The target {kind} will be changed.")
+        guidance = {
+            ("goal", "clear"): "Approval clears the current goal. It does not replace or restore its text.",
+        }.get((kind, action), "Approve only if this still matches the target's current state.")
         return (
-            "Session control request\n"
-            f"Requester: {requester_title} ({requester})\n"
-            f"Target: {target_title} ({target})\n"
-            f"Action: {kind} {action}\n"
-            f"Reason: {reason}\n"
-            f"{cls._change_text(record)}"
+            f"◆ {decision}\n\n"
+            f"Target: {target_title}\n"
+            f"Requested by: {requester_title}\n\n"
+            f"{effect}\n"
+            f"{cls._change_text(record)}\n\n"
+            f"Reason: {reason}\n\n"
+            f"{guidance}"
         )
 
     @classmethod
@@ -69,7 +104,7 @@ class GatewaySessionControlsMixin:
             from hermes_cli.goals import _CONTRACT_LABELS
             from hermes_cli.session_controls import replacement_contract
             suffix = f" -> {new}"
-            current = affected[: -len(suffix)] if affected.endswith(suffix) else affected
+            current = affected.removesuffix(suffix)
             lines = [f"Affected: {cls._clip(current or '(state unavailable)', 600)}",
                      f"Proposed goal: {cls._clip(new, REPLACEMENT_MAX_CHARS)}"]
             # Approval installs every one of these, so every one is shown: a missing contract
@@ -81,7 +116,8 @@ class GatewaySessionControlsMixin:
             else:
                 lines.append("Proposed contract: none (the current contract is dropped)")
             max_turns = payload.get("max_turns")
-            lines.append(f"Max turns: {max_turns if max_turns is not None else 'unchanged'}")
+            budget = {None: "unchanged", 0: "unlimited"}.get(max_turns, max_turns)
+            lines.append(f"Max turns: {budget}")
             return "\n".join(lines)
         return f"Affected: {cls._clip(affected or '(state unavailable)', 2400)}"
 
@@ -155,6 +191,42 @@ class GatewaySessionControlsMixin:
                     record.get("id"),
                     exc_info=True,
                 )
+
+    async def _drain_target_notice(self, record: dict, session_controls, source, adapter):
+        if record.get("target_notice_sent") or record.get("target_notice_skipped"):
+            return record
+        request_id = record["id"]
+        if self._target_notice_is_stale(record):
+            logger.warning("session-control target notice stale for %s; settling as skipped", request_id)
+            return await self._mark_and_finish(
+                session_controls, record, "target_notice_skipped"
+            )
+        if source is None or adapter is None:
+            return await self._mark_and_finish(
+                session_controls, record, "target_notice_skipped"
+            )
+
+        metadata = dict(self._thread_metadata_for_source(source) or {})
+        metadata["session_control_request_id"] = request_id
+        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+        with outbound_class(OUTBOUND_NOTICE):
+            result = await adapter.send(
+                source.chat_id, self._control_notice(record), metadata=metadata
+            )
+        if _send_succeeded(result):
+            return await self._mark_and_finish(
+                session_controls, record, "target_notice_sent"
+            )
+        if getattr(result, "retryable", False):
+            logger.info("session-control target notice delivery failed for %s; retrying", request_id)
+            return None
+        logger.warning(
+            "session-control target notice not retryable for %s; settling as skipped: %s",
+            request_id, getattr(result, "error", None) or "delivery_failed",
+        )
+        return await self._mark_and_finish(
+            session_controls, record, "target_notice_skipped"
+        )
 
     async def _drain_session_control_record(self, record: dict, session_controls) -> None:
         request_id = record.get("id")
@@ -279,25 +351,10 @@ class GatewaySessionControlsMixin:
                     if not record.get("continuation_enqueued"):
                         return
 
-        notice = self._control_notice(record)
-        if (not target_offline and not record.get("target_notice_sent")
-                and not record.get("target_notice_skipped")):
-            if source is None or adapter is None:
-                record = await self._mark_and_finish(
-                    session_controls, record, "target_notice_skipped"
-                )
-            else:
-                metadata = dict(self._thread_metadata_for_source(source) or {})
-                metadata["session_control_request_id"] = request_id
-                from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
-                with outbound_class(OUTBOUND_NOTICE):
-                    result = await adapter.send(source.chat_id, notice, metadata=metadata)
-                if not _send_succeeded(result):
-                    logger.info("session-control target notice delivery failed for %s; retrying", request_id)
-                    return
-                record = await self._mark_and_finish(
-                    session_controls, record, "target_notice_sent"
-                )
+        if not target_offline:
+            record = await self._drain_target_notice(record, session_controls, source, adapter)
+            if record is None:
+                return
 
         if not record.get("requester_notified") and not record.get("requester_notification_skipped"):
             requester_source, _requester_adapter = await self._session_control_route(requester_entry)
@@ -376,8 +433,15 @@ class GatewaySessionControlsMixin:
         }.get(action, action)
         change = (f"\n{cls._change_text(record)}"
                   if action == "replace" and record.get("affected_text") else "")
+        authority = record.get("authority") or {}
+        if authority.get("via") == "session":
+            session_id = cls._clip(str(authority.get("session_id") or requester_id), 120)
+            return (
+                f"⊘ {kind.title()} {verb} by {requester} "
+                f"(applied by session {session_id} without approval){change}"
+            )
         if quote:
-            message = str((record.get("authority") or {}).get("message") or "")
+            message = str(authority.get("message") or "")
             full = (f"\nFull message: \"{cls._clip(message, 1200)}\""
                     if message and message != quote else "")
             quote = cls._clip(quote, 300)
@@ -391,8 +455,12 @@ class GatewaySessionControlsMixin:
         target = f"{target_title} ({target_id})"
         action = f"{record.get('kind', '')} {record.get('action', '')}"
         if record.get("status") == "applied":
-            if record.get("authority", {}).get("via") == "quote":
+            authority = record.get("authority") or {}
+            if authority.get("via") == "quote":
                 how = "using your quoted words"
+            elif authority.get("via") == "session":
+                session_id = cls._clip(str(authority.get("session_id") or ""), 120)
+                how = f"by session authority{f' from {session_id}' if session_id else ''}"
             else:
                 how = "after Telegram approval"
             change = (f"\n{cls._change_text(record)}"

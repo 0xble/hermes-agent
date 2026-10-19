@@ -27,7 +27,7 @@ async def test_control_callback_resolves_and_edits_card():
     adapter._edit_html_quiet = AsyncMock()
     query = SimpleNamespace(
         from_user=SimpleNamespace(id=99, first_name="Brian"), answer=AsyncMock(),
-        message=SimpleNamespace(text="Session control request"),
+        message=SimpleNamespace(text="Approval needed\nChange: Goal Clear"),
     )
     record = {"status": "applied"}
     with patch("hermes_cli.session_controls.resolve_request", return_value=record) as resolve:
@@ -35,8 +35,27 @@ async def test_control_callback_resolves_and_edits_card():
     resolve.assert_called_once_with("abc123", "approve", "99")
     query.answer.assert_awaited_once()
     adapter._edit_html_quiet.assert_awaited_once()
-    assert "Session control request" in adapter._edit_html_quiet.call_args.args[1]
+    assert "Approval needed" in adapter._edit_html_quiet.call_args.args[1]
     assert "Approved by Brian" in adapter._edit_html_quiet.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_control_callback_explains_stale_approval():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    adapter = object.__new__(TelegramAdapter)
+    adapter._callback_authorized = AsyncMock(return_value=True)
+    adapter._edit_html_quiet = AsyncMock()
+    query = SimpleNamespace(
+        from_user=SimpleNamespace(id=99, first_name="Brian"), answer=AsyncMock(),
+        message=SimpleNamespace(text="◆ Clear this goal?"),
+    )
+    record = {"status": "failed", "error": "target_changed", "action": "clear"}
+    with patch("hermes_cli.session_controls.resolve_request", return_value=record):
+        await adapter._handle_session_control_callback(query, "ctl:a:stale", {})
+
+    assert "Not applied" in query.answer.await_args.kwargs["text"]
+    edited = adapter._edit_html_quiet.call_args.args[1]
+    assert "target changed before approval" in edited
 
 
 @pytest.mark.asyncio

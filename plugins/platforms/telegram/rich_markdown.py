@@ -1,6 +1,7 @@
 """Normalization for Telegram's permissive Rich Markdown block parser."""
 
 import re
+from html import escape as html_escape
 
 from markdown_it import MarkdownIt
 
@@ -104,6 +105,124 @@ _PARSER = MarkdownIt("commonmark")
 _PARSER.inline.ruler.before("escape", "telegram_math", _math_rule)
 _PARSER.inline.ruler.before("html_inline", "telegram_literal_html", _literal_html_rule)
 _PARSER.inline.ruler.before("link", "telegram_adjacent_footnote", _adjacent_ref_rule)
+
+# Telegram's Rich Markdown parser treats an HTML ``blockquote`` as a raw block,
+# so Markdown inside an expandable blockquote is displayed literally. Render
+# only the inline Markdown in those blocks as HTML, which Telegram does parse
+# there, while leaving the native quote and expandable behavior intact.
+_BLOCKQUOTE_RE = re.compile(
+    r"(?P<open><blockquote\b[^>]*>)(?P<body>[\s\S]*?)(?P<close></blockquote\s*>)",
+    re.IGNORECASE,
+)
+_BLOCKQUOTE_PARSER = MarkdownIt("commonmark", {"html": True}).enable(
+    "strikethrough"
+)
+_BLOCKQUOTE_FENCE_RE = re.compile(
+    r"^[ \t]*(?P<marker>`{3,}|~{3,})[^\n]*\n"
+    r"(?:[\s\S]*?^[ \t]*(?P=marker)[ \t]*(?:\n|\Z)|[\s\S]*\Z)",
+    re.MULTILINE,
+)
+_BLOCKQUOTE_CODE_SPAN_RE = re.compile(
+    r"(?P<ticks>`+)(?!`)(?P<body>.*?)(?<!`)(?P=ticks)(?!`)",
+    re.DOTALL,
+)
+
+
+def _protect_blockquote_code(body: str) -> tuple[str, dict[str, str]]:
+    """Protect code regions while the surrounding Markdown is rendered."""
+    protected: dict[str, str] = {}
+
+    def stash(value: str) -> str:
+        key = f"\ue000{len(protected)}\ue001"
+        protected[key] = value
+        return key
+
+    body = _BLOCKQUOTE_FENCE_RE.sub(lambda match: stash(match.group(0)), body)
+    body = _LITERAL_HTML_RE.sub(lambda match: stash(match.group(0)), body)
+
+    def stash_code_span(match: re.Match[str]) -> str:
+        code = match.group("body")
+        if len(code) >= 2 and code[0] == code[-1] == " ":
+            code = code[1:-1]
+        return stash(f"<code>{html_escape(code, quote=False)}</code>")
+
+    body = _BLOCKQUOTE_CODE_SPAN_RE.sub(stash_code_span, body)
+    return body, protected
+
+
+def _restore_blockquote_code(text: str, protected: dict[str, str]) -> str:
+    for key, value in protected.items():
+        text = text.replace(key, value)
+    return text
+
+
+def _render_blockquote(match: re.Match[str]) -> str:
+    raw_body = match.group("body")
+    body = raw_body.strip("\r\n")
+    if not body:
+        return match.group(0)
+    leading = raw_body[: len(raw_body) - len(raw_body.lstrip("\r\n"))]
+    trailing = raw_body[len(raw_body.rstrip("\r\n")) :]
+    body, protected = _protect_blockquote_code(body)
+    rendered_lines = [
+        _BLOCKQUOTE_PARSER.renderInline(line)
+        .replace("<strong>", "<b>")
+        .replace("</strong>", "</b>")
+        .replace("<em>", "<i>")
+        .replace("</em>", "</i>")
+        for line in body.splitlines()
+    ]
+    rendered = (
+        f"{match.group('open')}{leading}{'<br>'.join(rendered_lines)}"
+        f"{trailing}{match.group('close')}"
+    )
+    return _restore_blockquote_code(rendered, protected)
+
+
+def normalize_blockquote_markdown(text: str) -> str:
+    """Render inline Markdown inside HTML blockquotes as Telegram HTML.
+
+    Rich Markdown does not parse Markdown nested inside ``<blockquote>`` or
+    ``<blockquote expandable>``. Telegram does parse supported HTML tags there,
+    so convert each line's inline Markdown and preserve line breaks as ``<br>``.
+    Only actual HTML blockquote tokens are changed, leaving fenced examples and
+    inline code byte-for-byte unchanged.
+    """
+    if "<blockquote" not in text.lower():
+        return text
+
+    lines = text.splitlines(keepends=True)
+    line_starts = [0]
+    for line in lines:
+        line_starts.append(line_starts[-1] + len(line))
+
+    replacements: list[tuple[int, int, str]] = []
+    open_line: int | None = None
+    for token in _BLOCKQUOTE_PARSER.parse(text):
+        if token.type != "html_block" or not token.map:
+            continue
+        if open_line is None and re.search(r"<blockquote\b", token.content, re.IGNORECASE):
+            open_line = token.map[0]
+        if open_line is not None and re.search(
+            r"</blockquote\s*>", token.content, re.IGNORECASE
+        ):
+            start, end = line_starts[open_line], line_starts[token.map[1]]
+            original = text[start:end]
+            rendered = _BLOCKQUOTE_RE.sub(_render_blockquote, original)
+            if rendered != original:
+                replacements.append((start, end, rendered))
+            open_line = None
+
+    if not replacements:
+        return text
+    out: list[str] = []
+    cursor = 0
+    for start, end, rendered in replacements:
+        out.append(text[cursor:start])
+        out.append(rendered)
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
 
 
 def _separate_inline(lines: list[str], first: int, content: str, env: dict) -> None:

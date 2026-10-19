@@ -1447,6 +1447,8 @@ class SessionStore(
                 display_name=old_entry.display_name, model_override=old_entry.model_override,
                 yolo=old_entry.yolo,
                 reasoning_override=old_entry.reasoning_override,
+                # The user's activity belongs to the route, not the session row it points at.
+                last_user_activity_at=old_entry.last_user_activity_at,
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
                     if preserve_prompt_pin and old_entry.prompt_pin is not None else None

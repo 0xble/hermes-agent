@@ -8,6 +8,7 @@ rehydration), a real ``SessionDB`` (titles, topic bindings, icon state) and the 
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,6 +17,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource, SessionStore
 from gateway.telegram_topic_sessions import TopicRequestError, TopicSpec, create_topic_session, edit_topic_session
 from hermes_state import AsyncSessionDB, SessionDB
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 CHAT = "2027045491"
 ICONS = [{"emoji": "🧵", "custom_emoji_id": "icon-thread"}, {"emoji": "💡", "custom_emoji_id": "icon-idea"}]
@@ -26,7 +28,11 @@ class FakeTelegram:
 
     def __init__(self, thread_id=4242):
         self.thread_id = thread_id
+        self.username = "hermes_test_bot"
         self.created, self.renamed, self.sent, self.admitted = [], [], [], []
+
+    def _current_bot_username(self):
+        return self.username
 
     async def get_forum_topic_icon_options(self):
         return list(ICONS)
@@ -90,11 +96,21 @@ def _runner(home, adapter, *, auto_icons=False):
     return runner
 
 
+async def _seed_caller(runner, home, thread_id="297206", title="Calling Topic", icon="🧵"):
+    source = _source(thread_id=thread_id)
+    entry = await runner.async_session_store.get_or_create_session(source)
+    await runner._session_db.set_session_title_in_lineage(entry.session_id, title)
+    if icon:
+        home.db.record_telegram_topic_icon_state(CHAT, thread_id, emoji=icon, owner="manual")
+    return entry
+
+
 @pytest.mark.asyncio
 async def test_create_binds_a_new_session_with_every_setting_and_starts_it(home):
     adapter = FakeTelegram()
     adapter.get_forum_topic_icon_options = AsyncMock(return_value=list(ICONS))
     runner = _runner(home, adapter)
+    await _seed_caller(runner, home)
 
     result = await create_topic_session(runner, _source(thread_id="297206"), TopicSpec(
         name="Planning Room", icon="💡", model="gpt-test", provider="openai-codex",
@@ -116,11 +132,13 @@ async def test_create_binds_a_new_session_with_every_setting_and_starts_it(home)
     assert home.db.get_session_title_source(sid) == "user"
     assert home.db.get_telegram_topic_icon_state(CHAT, "4242")["owner"] == "manual"
     # The brief is shown in the topic and admitted as the session's first turn, never as a command.
-    assert adapter.sent[0]["content"] == "/title is not a command here: read the plan"
+    expected_origin = "Split from [🧵 Calling Topic](https://t.me/hermes_test_bot/297206/297206)"
+    assert cast(Any, TelegramAdapter).format_message(None, expected_origin) == expected_origin
+    assert adapter.sent[0]["content"] == expected_origin + "\n\n/title is not a command here: read the plan"
     assert adapter.sent[0]["metadata"] == {"thread_id": "4242"}
     turn = adapter.admitted[0]
     assert turn.internal and not turn.allow_gateway_control and not turn.is_command()
-    assert turn.source.thread_id == "4242" and turn.text.startswith("/title is not a command")
+    assert turn.source.thread_id == "4242" and turn.text.startswith(expected_origin)
     # The turn is anchored on the shown brief, so the session's replies thread under it.
     assert turn.message_id == "m1" and turn.source.message_id == "m1"
 
@@ -130,6 +148,31 @@ async def test_create_binds_a_new_session_with_every_setting_and_starts_it(home)
     assert restarted._session_model_override(key)["model"] == "gpt-test"
     assert restarted._session_model_override(key)["provider"] == "openai-codex"
     assert restarted._resolve_session_reasoning_config(session_key=key) == {"enabled": True, "effort": "xhigh"}
+
+
+@pytest.mark.asyncio
+async def test_create_from_general_topic_uses_main_chat_origin_line(home):
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+
+    await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", message="start here"))
+
+    assert adapter.sent[0]["content"] == "Split from the main chat\n\nstart here"
+    assert adapter.admitted[0].text == adapter.sent[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_create_from_topic_without_recorded_icon_omits_icon(home):
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    await _seed_caller(runner, home, icon="")
+
+    await create_topic_session(runner, _source(thread_id="297206"), TopicSpec(name="Room", icon="💡", message="start here"))
+
+    assert adapter.sent[0]["content"] == (
+        "Split from [Calling Topic](https://t.me/hermes_test_bot/297206/297206)\n\nstart here"
+    )
+    assert adapter.admitted[0].text == adapter.sent[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -407,7 +450,7 @@ async def test_a_model_commit_queues_when_the_session_becomes_busy(home):
 
 @pytest.mark.asyncio
 async def test_a_paused_hermes_starts_no_brief(home, monkeypatch):
-    import agent.estop as estop
+    from agent import estop
 
     monkeypatch.setattr(estop, "paused_reply", lambda: "Hermes is paused.")
     adapter = FakeTelegram()
@@ -641,7 +684,7 @@ def test_tool_survives_schemas_built_before_telegram_connects(monkeypatch):
     or it stays missing for every Telegram session until the gateway restarts."""
     import gateway.run as gateway_run
     import model_tools
-    from tools import telegram_topic_tool  # noqa: F401  # registers the tool
+    from tools import telegram_topic_tool  # registers the tool
     from tools.registry import invalidate_check_fn_cache
 
     def visible():

@@ -62,7 +62,10 @@ _HOOK_CALLER_THREAD_HOOKS: set[str] = {"subagent_stop"}
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 # Live workers a hung callback may accumulate before it is skipped outright (#105223 / #98382).
 _HOOK_MAX_ABANDONED_WORKERS = 3
-_PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
+_PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = (
+    "pre_tool_call plugin callback timed out or is still running. "
+    "Do not retry the same tool call in this turn."
+)
 
 
 class PluginDiscoveryIncomplete(RuntimeError):

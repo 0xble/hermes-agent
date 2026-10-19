@@ -398,9 +398,19 @@ class TestSkillView:
         assert existing["success"] is True
         assert "Endpoint info" in existing["content"]
         assert missing["success"] is False
+        assert "references/api.md" in missing["hint"]
         # The skill view advertises what else can be opened.
         assert skill["linked_files"] is not None
         assert "references" in skill["linked_files"]
+
+    def test_missing_reference_without_linked_files_explains_the_next_call(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "my-skill")
+            result = json.loads(skill_view("my-skill", file_path="references/nope.md"))
+
+        assert result["success"] is False
+        assert result["available_files"] == {}
+        assert "no linked files" in result["hint"]
 
     def test_view_file_path_directory_returns_available_files(self, tmp_path):
         """Requesting a directory (e.g. 'references') must not raise.

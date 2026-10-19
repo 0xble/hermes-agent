@@ -32,6 +32,9 @@ def _aux(timeout, *, reasoning_effort=True, **extra):
 
 
 DEFAULT_CONFIG = {
+    # Main model selector. Optional model.attended config is intentionally omitted by default so
+    # attended routing stays disabled; see website/docs/user-guide/configuration.md.
+    # model.attended.start_new_sessions defaults true when that opt-in block is present.
     "model": "",
     "providers": {},
     "fallback_providers": [],

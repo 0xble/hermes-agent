@@ -2,7 +2,9 @@
 
 ## Required behavior
 
-When `model.attended` is configured, genuine user activity in a topic may route the next gateway request to the attended model and reasoning effort until the configured idle window expires. Relays, wakeups, reactions, edits, and internal messages do not reset the user-activity clock. Explicit session and one-turn model choices retain their precedence.
+When `model.attended` is configured, genuine user activity in a topic may route the next gateway request to the attended model and reasoning effort until the configured idle window expires. New sessions start on the attended model by default when `model.attended.start_new_sessions` is true; their first route is silent. Relays, wakeups, reactions, edits, and internal messages do not reset the user-activity clock. Explicit session and one-turn model choices retain their precedence. Idle expiry is committed only at a real API-request boundary, and only when both the genuine-activity window and the session's API-call quiet window have elapsed. A session opened by automation, such as a topic split or relay, has no genuine-activity stamp yet, so it stays attended until the user's first message there starts the idle window. If the request is already at the default model's compression threshold, Hermes keeps the attended route and does not switch or compact for this purpose.
+
+The legacy `model.compact_before_switch_tokens` key is still accepted for compatibility but is deprecated and ignored. Normal per-model preflight compression is the only compaction path.
 
 When the attended configuration is unset or disabled, all attended activity tracking, route resolution, notices, compaction, and model-switch hooks are no-ops. Existing gateway call shapes and default model behavior remain unchanged.
 
@@ -41,13 +43,12 @@ limited to a configured owner's direct message; group messages are denied.
 
 The attended switch-in card is rendered by one helper in
 `gateway/attended_model.py` as a single sentence-style line, like the `/fast`
-expiry notice. It names the idle-return model because switching back is silent,
-and leads with the `⇄` symbol because Hermes' gear icon already means
-tool-progress settings. For example, with a `gpt-6.1-sol` default and a 15
-minute window:
+expiry notice. A fresh session starts attended without a switch-in card. Idle
+expiry emits a separate back-to-default line and leads with the `⇄` symbol.
+For example, with a `gpt-6.1-sol` default and a 15 minute window:
 
 ```text
-⇄ Switched to Opus 5.5 while you're active. Back to GPT-6.1 Sol after 15m idle.
+⇄ Back to GPT-6.1 Sol after 15m idle.
 ```
 
 ## Provenance and patch
@@ -55,18 +56,13 @@ minute window:
 Fork patch identities: `attended-model-switching` and
 `gateway-telegram-topic-tool`.
 
-The attended feature adds per-topic attended routing, idle expiry, persisted activity timestamps, and route re-evaluation before every API call. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly. The topic tool commits through the gateway's existing model and reasoning persistence paths rather than adding a second store.
+The attended feature adds per-topic attended routing, idle expiry, persisted activity timestamps, and route re-evaluation at the real API-request boundary. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly. The topic tool commits through the gateway's existing model and reasoning persistence paths rather than adding a second store.
 
 The combined resolution is implemented in `gateway/run_turn.py` and
 `gateway/run_config_loaders.py`; the topic commit path is
 `gateway/telegram_topic_sessions.py` and `gateway/slash_commands_model.py`.
 This is a fork-only gateway feature that adds per-topic attended routing, idle
-expiry, persisted activity timestamps, and route re-evaluation before every
-API call. A new genuine user message switches in at the next API call; idle
-expiry switches back to the default at the next API call, including during a
-long autonomous turn. An active fallback is never undone. Keep its disabled
-path inert so users without the new keys receive the pre-feature behavior
-exactly.
+expiry, persisted activity timestamps, and boundary-only idle expiry. A new genuine user message switches in at the next API call; idle expiry switches back to the default only when the session is quiet and the request fits the default route. A long autonomous turn that continues making API calls stays on the attended route. An active fallback is never undone. The deprecated `compact_before_switch_tokens` key remains accepted but is ignored; normal per-model preflight compression remains the only compaction path. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly.
 
 ## Verification
 

@@ -1110,10 +1110,16 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
             "turn deferred: compression transiently blocked (%s) (session=%s) — not counting as "
             "compression exhaustion", block if isinstance(block, str) else "unknown guard", session,
         )
-        _final = (
-            "⏸️ Context compression is temporarily paused after a recent failed attempt. Please retry "
-            "in a moment — compression will resume automatically (or run /compress to force a retry now)."
-        )
+        if block == "pool_saturated":
+            _final = (
+                "⏳ Context compression is waiting for capacity: other sessions are compressing right now. "
+                "Please retry in a moment — compression will resume automatically once a slot frees."
+            )
+        else:
+            _final = (
+                "⏸️ Context compression is temporarily paused after a recent failed attempt. Please retry "
+                "in a moment — compression will resume automatically (or run /compress to force a retry now)."
+            )
     else:
         holder = getattr(agent, "_compression_skipped_due_to_lock", None)
         logger.info(
@@ -1135,8 +1141,8 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
 
 
 def _preflight_hard_window_result(
-    agent, messages: List[Dict], conversation_history, api_call_count: int,
-) -> Dict[str, Any]:
+    agent, messages: list[dict], conversation_history, api_call_count: int,
+) -> dict[str, Any]:
     """Typed fail-closed result for a wire-sized request that still cannot fit.
 
     This is distinct from compression timeout/exhaustion: the accepted input and
@@ -1703,6 +1709,23 @@ def _run_conversation_turn(
             break
         if _pg.action == "continue":
             continue
+        after_preflight = getattr(agent, "_gateway_after_preflight", None)
+        if callable(after_preflight):
+            before_route = (agent.model, agent.provider, getattr(agent, "api_mode", ""))
+            after_preflight(s)
+            after_route = (agent.model, agent.provider, getattr(agent, "api_mode", ""))
+            if after_route != before_route:
+                _run_phase(assemble_api_request, agent, s)
+                # A boundary-only idle switch-back is intentionally applied after the first
+                # preflight gate. Rebuild and re-run the gate for the destination route so its
+                # context threshold and output ceiling, not the old route's, govern the request.
+                _pg = _run_phase(run_preflight_gate, agent, s)
+                if _pg.action == "return":
+                    return _pg.result
+                if _pg.action == "break":
+                    break
+                if _pg.action == "continue":
+                    continue
         _run_phase(announce_api_call, agent, s)
 
         s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries

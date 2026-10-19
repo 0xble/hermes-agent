@@ -23,6 +23,14 @@ class TestSandboxFailureHint:
     def test_empty_stderr_no_hint(self):
         assert _sandbox_failure_hint("") is None
 
+    def test_json_decode_failure_explains_structured_tool_results(self):
+        hint = _sandbox_failure_hint(
+            "json.decoder.JSONDecodeError: Extra data: line 1 column 2 (char 1)"
+        )
+        assert hint is not None
+        assert "structured dict" in hint
+        assert "json.loads() the entire tool output" in hint
+
 
 class TestLiveSandboxHint:
     def test_bad_import_produces_hint_field(self, tmp_path, monkeypatch):

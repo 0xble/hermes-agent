@@ -368,7 +368,8 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
             title_result = None
     raw_results, err = _loud(lambda: db.search_messages(
         query=query, role_filter=role_filter or ["user", "assistant"],
-        exclude_sources=list(_HIDDEN_SESSION_SOURCES), limit=_DISCOVER_SCAN_LIMIT, offset=0, sort=sort,
+        exclude_sources=list(_HIDDEN_SESSION_SOURCES), exclude_tool_calls=True,
+        limit=_DISCOVER_SCAN_LIMIT, offset=0, sort=sort,
         fields=_DISCOVER_SEARCH_FIELDS, after_ts=after_ts, before_ts=before_ts), "FTS5 search failed: %s", "Search failed")
     if err:
         return err

@@ -1290,6 +1290,11 @@ def run_compress_context_with_progress_timeout(
     # poll idle budget + ceiling, fence-cancel on timeout so no late commit lands.
     from tools.thread_context import propagate_context_to_thread
     executor = _get_compress_timeout_executor()
+    # A saturation signal left by an earlier attempt must not label this one: the worker's own
+    # per-attempt reset never runs if this attempt is refused or expires before the worker starts.
+    if telemetry_agent is not None and getattr(telemetry_agent, "_compression_blocked_transient", None) == "pool_saturated":
+        with contextlib.suppress(Exception):
+            telemetry_agent._compression_blocked_transient = None
     # Refuse rather than queue when the pool is full: a queued job would wait out
     # its budget unstarted and run stale later. Skip compression this cycle.
     # A queued job would silently wait out its whole budget without starting and stay eligible to run as a
@@ -1302,6 +1307,15 @@ def run_compress_context_with_progress_timeout(
             "slot when they return; if this persists, check the summary provider health.",
             _COMPRESS_EXECUTOR_MAX_WORKERS,
         )
+        # Saturation is a transient capacity refusal, not evidence that this session is
+        # incompressible. Publish the same defer signal used by cooldown/backoff guards
+        # so preflight and overflow callers refund this attempt and retry on a later pass.
+        # Only the primary admission publishes it: a refused stall-fallback retry
+        # (stall_fallback=False) belongs to an attempt that already timed out, and the
+        # timeout must keep priority so over-window turns still fail closed.
+        if telemetry_agent is not None and stall_fallback:
+            with contextlib.suppress(Exception):
+                telemetry_agent._compression_blocked_transient = "pool_saturated"
         # Saturation refusals must hit the same telemetry stream as other failures, or
         # a wedged pool looks like compression simply stopped being attempted.
         if telemetry_agent is not None:
@@ -1338,7 +1352,7 @@ def run_compress_context_with_progress_timeout(
         return result[0] is messages
 
     def _recover_from_stall(
-        preserved_result: Optional[Tuple[list, str]] = None,
+        preserved_result: Optional[tuple[list, str]] = None,
     ) -> tuple[list[dict[str, Any]], str]:
         """One stall-fallback ladder for every host-side stall exit.
 
@@ -1607,7 +1621,7 @@ def _automatic_compression_gate_blocks(
 
 def compression_blocked_transiently(agent: Any) -> bool:
     """Type-pinned read of the transient-block signal.
-    Set when an automatic pass no-ops on a TRANSIENT guard (summary-failure cooldown or structural backoff).
+    Set when an automatic pass no-ops on a TRANSIENT guard (summary-failure cooldown, structural backoff, or compression-pool saturation).
     Consumers must defer, not count it toward ``compression_exhausted``, or an overflow auto-reset wipes a
     session that was merely cooling down. The permanent ``ineffective`` breaker never sets it.
 
@@ -1622,10 +1636,17 @@ def compression_blocked_transiently(agent: Any) -> bool:
     return isinstance(_sig, str) and bool(_sig)
 
 
+def compression_pool_saturated(agent: Any) -> bool:
+    """Whether the last pass was refused only because the shared compression pool was full.
+    Narrower than ``compression_blocked_transiently``: callers that keep cooldown semantics
+    (block further passes) still defer on saturation, which says nothing about this session."""
+    return getattr(agent, "_compression_blocked_transient", None) == "pool_saturated"
+
+
 def _mark_compression_blocked_transient(agent: Any, compressor: Any, reason: str) -> None:
     """Publish the transient-block signal when the active guard is transient.
     ``reason`` comes from ``_compression_block_reason``: ``cooldown:*`` and ``structural_backoff:*`` are
-    transient; ``ineffective`` stays unmarked."""
+    transient; ``ineffective`` stays unmarked. Pool saturation publishes its own reason at the admission gate."""
     if reason.startswith("cooldown") or reason.startswith("structural_backoff"):
         logger.info(
             "Skipping automatic compression re-entry: transient guard "

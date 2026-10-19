@@ -56,6 +56,10 @@ def test_no_progress_preflight_fails_closed_only_when_the_request_exceeds_the_wi
     cooling = _agent(context_length=131_072)
     cooling._compression_blocked_transient = "cooldown:42"
     assert _preflight(cooling, 356_113).blocked is True
+    # A full compression pool says nothing about this session: defer without blocking later passes.
+    saturated = _agent(context_length=131_072)
+    saturated._compression_blocked_transient = "pool_saturated"
+    assert _preflight(saturated, 356_113).blocked is False
 
 
 def test_over_window_wait_is_bounded_by_one_inactivity_budget():
