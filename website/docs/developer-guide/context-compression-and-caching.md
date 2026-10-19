@@ -337,12 +337,13 @@ The tool never compacts inside its own tool batch: it reports whether the reques
 was accepted, along with current context tokens and the automatic compression
 threshold, then the existing post-tool boundary performs the rewrite.
 
-Call it at a natural phase boundary when a sub-task is finished and raw tool
-output is no longer needed verbatim, the conversation changed to an unrelated
-topic, or a long multi-step stretch is about to start while context is already
-past half the automatic threshold. Do not call it mid-edit or mid-debug when
-exact recent output matters, immediately after compaction, to tidy a small
-context, or more than once per phase. Use `focus` for decisions, open items,
+Call it on a long transcript, before other tools, when earlier work is no longer
+needed verbatim because the previous sub-task finished or the user switched to an
+unrelated topic. Do not call it while the user is still on the same unfinished
+task, especially mid-edit or mid-debug when exact recent output matters,
+immediately after compaction, to tidy a small context, or more than once per
+phase. Reaching a token level is not a trigger. The automatic threshold already
+covers size. Use `focus` for decisions, open items,
 file paths, and IDs the summary must preserve. `compact_context` is refused for
 `codex_app_server`, whose native thread compaction does not accept focus guidance.
 
