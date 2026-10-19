@@ -186,7 +186,11 @@ def _positive_int(raw: Any, *, default: int, key: str) -> int:
 
 
 def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
-    """Validate the opt-in ``model.attended`` block and its idle/compaction knobs."""
+    """Validate the opt-in ``model.attended`` block and its idle knob.
+
+    ``compact_before_switch_tokens`` remains parsed for backward compatibility, but
+    route changes never trigger a dedicated compaction pass.
+    """
     model_cfg = _as_model_config(config)
     attended_raw = model_cfg.get("attended")
     enabled = any(key in model_cfg for key in ("attended", "idle_revert_minutes", "compact_before_switch_tokens"))

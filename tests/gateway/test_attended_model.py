@@ -1,6 +1,7 @@
 import asyncio
+import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from gateway import run as gateway_run
 from gateway.attended_model import (
@@ -383,7 +384,7 @@ def test_first_user_message_preserves_new_session_boundary_before_activity_stamp
     assert state.conversation.pending_attended_notice is None
 
 
-def test_pre_turn_idle_expiry_stages_switch_back_notice_once():
+def test_pre_turn_idle_expiry_defers_switch_back_without_notice():
     cfg = _cfg(
         default="gpt-6.1-sol", provider="nous", idle_revert_minutes=15,
         attended={"model": "claude-opus-5-5", "provider": "custom:claude"},
@@ -403,10 +404,94 @@ def test_pre_turn_idle_expiry_stages_switch_back_notice_once():
             route_runner, source=None, session_key="k", user_config=cfg,
             override=None, last_model="claude-opus-5-5",
         )
-    assert route is None
-    assert state.conversation.pending_attended_notice == format_attended_switch_back_notice(
-        "gpt-6.1-sol", 15,
+    assert route is not None
+    assert route["model"] == "claude-opus-5-5"
+    assert state.conversation.pending_attended_notice is None
+    assert state.conversation.last_attended_decision.reason == "attended"
+
+
+def test_idle_switch_back_stays_attended_when_session_recently_called_api():
+    cfg = _cfg(
+        default="gpt-6.1-sol", provider="nous", idle_revert_minutes=15,
+        attended={"model": "claude-opus-5-5", "provider": "custom:claude"},
     )
+    state = SimpleNamespace(conversation=SimpleNamespace(
+        attended_new_session=False, last_user_activity_at=0,
+        last_api_call_at=time.time(),
+        last_attended_decision=AttendedResolution(
+            "claude-opus-5-5", "custom:claude", "high", "attended", True,
+            idle_model="gpt-6.1-sol",
+        ),
+        pending_attended_notice=None, model_override=None, model_override_scope="session",
+        reasoning_override=None, reasoning_override_scope="session",
+    ))
+    route_runner = _attended_route_runner(state)
+    with patch.object(gateway_run, "_resolve_gateway_model", return_value="gpt-6.1-sol"):
+        route = GatewayTurnMixin._attended_route_for_session(
+            route_runner, source=None, session_key="k", user_config=cfg,
+            override=None, last_model="claude-opus-5-5",
+        )
+    assert route["model"] == "claude-opus-5-5"
+    assert state.conversation.pending_attended_notice is None
+
+
+def test_automation_opened_session_stays_attended_until_first_user_message():
+    """A split/relay-opened topic never reverts before Brian has spoken in it."""
+    cfg = _cfg(
+        default="gpt-6.1-sol", provider="nous", idle_revert_minutes=15,
+        attended={"model": "claude-opus-5-5", "provider": "custom:claude"},
+    )
+    attended = AttendedResolution(
+        "claude-opus-5-5", "custom:claude", "high", "attended", True,
+        idle_model="gpt-6.1-sol",
+    )
+    state = SimpleNamespace(conversation=SimpleNamespace(
+        attended_new_session=False,
+        # Process-local stamp from the automation-opened first turn, long expired.
+        last_user_activity_at=time.time() - 3600,
+        last_api_call_at=None,
+        last_attended_decision=attended,
+        pending_attended_notice=None, model_override=None, model_override_scope="session",
+        reasoning_override=None, reasoning_override_scope="session",
+    ))
+    durable: dict[str, float | None] = {"stamp": None}
+    route_runner = _attended_route_runner(state)
+    route_runner._load_attended_activity_stamp = lambda _key: durable["stamp"]
+    with patch.object(gateway_run, "_resolve_gateway_model", return_value="gpt-6.1-sol"):
+        held = GatewayTurnMixin._attended_resolution_for_session(
+            route_runner, source=None, session_key="k", user_config=cfg, allow_switch_back=True,
+        )
+        assert held is attended
+        assert held.switched_back is False
+
+        # Brian's first message writes the durable stamp; once that window lapses the
+        # ordinary idle switch-back resumes.
+        durable["stamp"] = time.time() - 3600
+        state.conversation.last_user_activity_at = durable["stamp"]
+        reverted = GatewayTurnMixin._attended_resolution_for_session(
+            route_runner, source=None, session_key="k", user_config=cfg, allow_switch_back=True,
+        )
+    assert reverted.reason == "default"
+    assert reverted.switched_back is True
+
+
+def test_internal_new_session_attended_window_is_ephemeral():
+    cfg = _cfg(
+        default="gpt-6.1-sol", provider="nous",
+        attended={"model": "claude-opus-5-5", "provider": "custom:claude"},
+    )
+    state = SimpleNamespace(conversation=SimpleNamespace(attended_new_session=True))
+    mark_user_activity = Mock()
+    runner = SimpleNamespace(
+        _peek_session_state=lambda _key: state,
+        session_store=SimpleNamespace(mark_user_activity=mark_user_activity),
+    )
+    stamp, new_session = GatewayTurnMixin._ensure_attended_new_session_activity(
+        runner, "k", parse_attended_config(cfg), None,
+    )
+    assert new_session is True
+    assert stamp is not None
+    mark_user_activity.assert_not_called()
 
 
 def test_disabled_attended_routing_does_not_reopen_existing_sessions():
@@ -432,3 +517,20 @@ def test_disabled_attended_routing_does_not_reopen_existing_sessions():
     assert second == (False, False)
     assert state.conversation.attended_new_session is False
     assert runner.hooks.emit.await_count == 1
+
+
+def test_route_repoint_keeps_the_users_last_activity(tmp_path):
+    from datetime import datetime, timezone
+
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource, SessionStore
+
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="repoint", user_id="owner")
+    entry = store.get_or_create_session(source)
+    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=timezone.utc)
+    store.mark_user_activity(entry.session_key, spoke_at)
+
+    store.switch_session(entry.session_key, entry.session_id + "-compressed")
+
+    assert store.get_last_user_activity_at(entry.session_key) == spoke_at
