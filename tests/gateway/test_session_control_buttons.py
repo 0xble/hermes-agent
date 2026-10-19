@@ -40,6 +40,28 @@ async def test_control_callback_resolves_and_edits_card():
 
 
 @pytest.mark.asyncio
+async def test_control_callback_failed_approval_explains_not_applied_reason():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter._callback_authorized = AsyncMock(return_value=True)
+    adapter._edit_html_quiet = AsyncMock()
+    query = SimpleNamespace(
+        from_user=SimpleNamespace(id=99, first_name="Brian"), answer=AsyncMock(),
+        message=SimpleNamespace(text="Approval needed"),
+    )
+    record = {"kind": "goal", "action": "resume", "status": "failed", "error": "nothing_to_resume"}
+    with patch("hermes_cli.session_controls.resolve_request", return_value=record):
+        await adapter._handle_session_control_callback(query, "ctl:a:abc123", {})
+
+    expected = "✓ Approved by Brian · not applied: goal was not paused (already running or cleared)"
+    assert query.answer.await_args.kwargs["text"] == expected
+    edited = adapter._edit_html_quiet.call_args.args[1]
+    assert edited.count(expected) == 1
+    assert "Failed by Brian" not in edited
+
+
+@pytest.mark.asyncio
 async def test_control_callback_without_message_text_only_answers():
     from plugins.platforms.telegram.adapter import TelegramAdapter
 

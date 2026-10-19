@@ -565,6 +565,23 @@ async def test_control_continuation_revalidated_for_active_replacement_in_follow
     assert session_controls._load_record(record["id"])["continuation_discarded"] == "target_changed"
 
 
+def test_failed_approval_notice_explains_not_applied_reason(state):
+    runner = _runner(state)
+    notice = runner._control_notice({
+        "kind": "goal",
+        "action": "resume",
+        "requester_session_id": "requester",
+        "requester_title": "Requester",
+        "status": "failed",
+        "error": "nothing_to_resume",
+        "authority": {"via": "button", "user_id": "99"},
+    })
+    assert notice == (
+        "✓ Request to resume this goal was approved but not applied: "
+        "goal was not paused (already running or cleared)"
+    )
+
+
 def test_replace_notices_show_old_and_new_goal(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.session_controls import apply_control, request_control, resolve_request
