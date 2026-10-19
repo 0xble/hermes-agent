@@ -442,18 +442,64 @@ class TestDiscoveryShape:
 
 
 class TestDiscoverySort:
-    def test_sort_newest_orders_by_recency(self, db):
-        _seed_modpack_sessions(db)
-        result = json.loads(session_search(query="modpack", limit=3, sort="newest", db=db))
-        # First result should be the most recent session
-        first = result["results"][0]
-        assert first["session_id"] == "s_newest" or "Newest" in (first.get("title") or "")
+    def test_sort_newest_orders_equal_relevance_by_recency(self, db):
+        now = int(time.time())
+        for session_id, age in (("s_oldest", 30000), ("s_middle", 15000), ("s_newest", 1000)):
+            db.create_session(session_id, source="cli")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (now - age, session_id),
+            )
+            db.append_message(
+                session_id,
+                role="assistant",
+                content="same modpack marker",
+                timestamp=now - age,
+            )
+        db._conn.commit()
+
+        result = json.loads(session_search(query="same modpack marker", limit=3, sort="newest", db=db))
+
+        assert [row["session_id"] for row in result["results"]] == [
+            "s_newest", "s_middle", "s_oldest",
+        ]
 
     def test_sort_oldest_orders_by_age(self, db):
-        _seed_modpack_sessions(db)
-        result = json.loads(session_search(query="modpack", limit=3, sort="oldest", db=db))
-        first = result["results"][0]
-        assert first["session_id"] == "s_oldest"
+        now = int(time.time())
+        for session_id, age in (("s_oldest", 30000), ("s_middle", 15000), ("s_newest", 1000)):
+            db.create_session(session_id, source="cli")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (now - age, session_id),
+            )
+            db.append_message(session_id, role="assistant", content="same modpack marker")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="same modpack marker", limit=3, sort="oldest", db=db))
+
+        assert [row["session_id"] for row in result["results"]] == [
+            "s_oldest", "s_middle", "s_newest",
+        ]
+
+    def test_temporal_sort_does_not_override_relevance(self, db):
+        now = int(time.time())
+        db.create_session("s_relevant", source="cli")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 30000, "s_relevant"))
+        db.append_message(
+            "s_relevant", role="assistant",
+            content="quartz atlas " * 12 + "The migration decision is documented.",
+        )
+        db.create_session("s_recent", source="cli")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 10, "s_recent"))
+        db.append_message(
+            "s_recent", role="assistant",
+            content="A recent status note mentions quartz atlas once.",
+        )
+        db._conn.commit()
+
+        result = json.loads(session_search(query="quartz atlas", limit=2, sort="newest", db=db))
+
+        assert result["results"][0]["session_id"] == "s_relevant"
 
 
 # =========================================================================
