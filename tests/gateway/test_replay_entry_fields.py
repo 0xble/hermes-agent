@@ -255,6 +255,23 @@ def test_timestamp_replay_persists_original_content_and_row_metadata(tmp_path):
 
 
 
+def test_timestamped_mirror_replay_drops_view_identity_but_keeps_persisted_content():
+    from agent.message_metadata import REPLAY_PERSISTED_CONTENT
+    from gateway.run import _build_gateway_agent_history
+
+    stored = [{
+        "role": "user", "content": "hello", "message_uid": "u1", "_db_row_snapshot": "snap1",
+        "_db_persisted": True, "message_id": "m1", "display_kind": "user_text",
+        "mirror": True, "mirror_source": "other", "timestamp": 1_700_000_000.0,
+    }]
+    replayed, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
+    entry = replayed[0]
+    assert entry[REPLAY_PERSISTED_CONTENT] == "hello"
+    assert "_db_row_snapshot" not in entry
+    assert "message_id" not in entry
+    assert "display_kind" not in entry
+
+
 def test_rewritten_replay_rows_stay_out_of_the_real_flush_path(tmp_path):
     from agent.session_persistence import SessionPersistenceMixin
     from gateway.run import _build_gateway_agent_history

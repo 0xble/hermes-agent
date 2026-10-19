@@ -1360,7 +1360,7 @@ def _build_gateway_agent_history(
                 entry["content"] = f"[Delivered from {mirror_src}] {entry['content']}"
                 entry.pop("api_content", None)  # prefix rewrite: the sidecar no longer matches
             if entry.get("content") != msg.get("content"):
-                if REPLAY_PERSISTED_CONTENT not in entry:
+                if REPLAY_PERSISTED_CONTENT not in entry or msg.get("mirror"):
                     entry.pop(DB_ROW_SNAPSHOT, None)  # a rewritten view is not the stored row version
                     for field in ("_compressed_summary", "message_id", "platform_message_id",
                                   "observed", "display_kind", "display_metadata", "effect_disposition"):
