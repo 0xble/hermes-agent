@@ -3417,6 +3417,17 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             reserved = db.reserve_telegram_topic_owner(
                 chat_id=str(chat_id), owner_key=str(owner_key),
                 topic_name=str(session.get("title") or ""), profile_name=profile_name)
+            if unpinned_reservation:
+                # A leftover reservation names the lane it was created for. It may join
+                # only that lane, never an unrelated topic another owner holds.
+                reserved_name = str(owner.get("topic_name") or "")
+                lane_names = {
+                    str(existing_thread_owner.get("topic_name") or ""),
+                    str(session.get("title") or ""),
+                } - {""}
+                if reserved_name not in lane_names:
+                    raise RuntimeError(
+                        f"Telegram topic owner {owner_key} is reserved for another topic; refusing reroute")
             if reserved.get("_reserved") or unpinned_reservation:
                 _share(existing_thread_owner, str(session.get("title") or ""))
                 return

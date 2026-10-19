@@ -315,6 +315,18 @@ def test_stuck_owner_without_canonical_is_not_bound_to_thread_owner(db, stuck_st
     assert not second["canonical_owner_key"]
 
 
+def test_creating_reservation_for_another_topic_is_not_shared_onto_owned_thread(db):
+    _two_owned_threads(db)
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:second", topic_name="Other lane")
+
+    with pytest.raises(RuntimeError, match="refusing reroute"):
+        _adapter(db).ensure_existing_telegram_topic_owner("123", "200", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == "creating"
+    assert not second["canonical_owner_key"]
+
+
 def test_numeric_topic_without_binding_fails_closed(db):
     adapter = _adapter(db)
     with pytest.raises(RuntimeError, match="no live Hermes binding"):
