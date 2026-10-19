@@ -25,6 +25,10 @@ from agent.turn_context_compaction import (
     _apply_grown_window, _blocked_compress_reason, _clear_overflow_warn, _refund_api_call,
     _reanchor, _reset_retry_state_after_compaction,
 )
+from agent.compact_context import (
+    commit_compaction, mark_compaction_refused,
+    release_pending_compaction, mark_compaction_failure, take_pending_compaction,
+)
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -326,6 +330,47 @@ def compress_after_tool_results(
             agent, messages, active_system_prompt or "",
             estimate_request_tokens_rough(messages, tools=agent.tools or None),
         )
+
+    # Agent-requested compaction is a separate path: unlike automatic compaction it is
+    # intentionally allowed below the threshold. It still runs only at this post-tool
+    # boundary, under the same attempt budget and transient/lock refund rules.
+    _agent_pending = take_pending_compaction(agent)
+    if _agent_pending is not None:
+        if not agent.compression_enabled or compression_attempts >= max_compression_attempts:
+            mark_compaction_refused(agent)
+        else:
+            ensure_compression_feasibility_checked(agent, _real_tokens)
+            compression_attempts += 1
+            _post_tool_input = messages
+            _safe_print = getattr(agent, "_safe_print", lambda _message: None)
+            _safe_print("  ⟳ compacting context…")
+            try:
+                messages, active_system_prompt = agent._compress_context(
+                    messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id,
+                    focus_topic=_agent_pending.get("focus") or None, trigger="agent_requested",
+                )
+            except Exception:
+                mark_compaction_failure(agent)
+                raise
+            if messages is _post_tool_input and (
+                compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
+            ):
+                # Keep the request pending for the next safe boundary in this turn.
+                compression_attempts -= 1
+                release_pending_compaction(agent)
+                return _verdict(False)
+            if messages is _post_tool_input:
+                # A hard failure/no-op consumes the request; do not retry repeatedly.
+                mark_compaction_failure(agent)
+                return _verdict(False)
+            commit_compaction(agent)
+            conversation_history = conversation_history_after_compression(
+                agent, messages, conversation_history
+            )
+            current_turn_user_idx = _reanchor(agent, messages, user_message)
+            # One requested pass is the boundary for this invocation; do not also run
+            # automatic compaction on the same post-tool result.
+            return _verdict(False)
 
     if agent.compression_enabled and compression_attempts < max_compression_attempts:
         ensure_compression_feasibility_checked(agent, _real_tokens)

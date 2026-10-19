@@ -71,6 +71,11 @@ def run_tool_round(
     if not agent.quiet_mode:
         agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
 
+    # Inline compact_context gates need the live attempt budget and API-call ordinal
+    # while the tool batch is executing; the local loop state remains authoritative.
+    agent._compression_attempts = compression_attempts
+    agent._api_call_count = api_call_count
+
     if agent.verbose_logging:
         for tc in assistant_message.tool_calls:
             raw_args = tc.function.arguments

@@ -334,6 +334,10 @@ def export_current_turn_boundary(agent: Any, result: Any, user_message: Any) -> 
     """
     if not isinstance(result, dict) or result.get("turn_exit_reason") == "context_compression_timeout":
         return result
+    # Agent-requested compaction is scoped to one turn. A request that never reached a
+    # safe boundary must not leak into the next user turn.
+    from agent.compact_context import clear_pending_compaction
+    clear_pending_compaction(agent)
     messages = result.get("messages")
     turn_id = str(getattr(agent, "_current_turn_id", "") or "")
     if not isinstance(messages, list) or not turn_id or user_message is None:
@@ -642,6 +646,8 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     # sends identical bytes. Distinct from note_turn_start's _inflight_turn_started, a
     # tripwire slot cleared at persist.
     agent._current_turn_timestamp = time.time()
+    from agent.compact_context import reset_compaction_request_turn
+    reset_compaction_request_turn(agent)
 
     # Pre-turn connection health check: clean up dead TCP connections.
     if agent.api_mode != "anthropic_messages":

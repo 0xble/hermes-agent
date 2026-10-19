@@ -371,10 +371,8 @@ def _cfg_dict(cfg: dict[str, Any], key: str) -> dict[str, Any]:
     section = cfg.get(key, {})
     return section if isinstance(section, dict) else {}
 
-
 class CompressionSettings(SimpleNamespace):
     """Parsed ``compression`` config section (see ``_parse_compression_config``)."""
-
 
 _EXPLICIT_API_MODES = {
     "chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse",
@@ -1584,7 +1582,8 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
             str(k): float(v) for k, v in _cfg_dict(cfg, "model_thresholds").items()
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         },
-        threshold_tokens=threshold_tokens,
+        threshold_tokens=threshold_tokens, agent_request_floor_ratio=max(0.0, float(cfg.get("agent_request_floor_ratio", 0.30))),
+        agent_request_cooldown_api_calls=max(0, _parse_config_int(cfg.get("agent_request_cooldown_api_calls", 10), 10)),
         checkpoint_required=checkpoint_required,
         # In-place compaction: no session-id rotation. default=True MUST match DEFAULT_CONFIG
         # (a False default flipped agents into rotation mode when the key was omitted).
@@ -2052,6 +2051,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     )
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
+    agent.compression_agent_request_floor_ratio, agent.compression_agent_request_cooldown_api_calls = cs.agent_request_floor_ratio, cs.agent_request_cooldown_api_calls
 
 
 def _enforce_minimum_context(agent):
