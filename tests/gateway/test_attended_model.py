@@ -517,3 +517,20 @@ def test_disabled_attended_routing_does_not_reopen_existing_sessions():
     assert second == (False, False)
     assert state.conversation.attended_new_session is False
     assert runner.hooks.emit.await_count == 1
+
+
+def test_route_repoint_keeps_the_users_last_activity(tmp_path):
+    from datetime import datetime, timezone
+
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource, SessionStore
+
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="repoint", user_id="owner")
+    entry = store.get_or_create_session(source)
+    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=timezone.utc)
+    store.mark_user_activity(entry.session_key, spoke_at)
+
+    store.switch_session(entry.session_key, entry.session_id + "-compressed")
+
+    assert store.get_last_user_activity_at(entry.session_key) == spoke_at
