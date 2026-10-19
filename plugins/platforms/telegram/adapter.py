@@ -5955,9 +5955,20 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             await query.answer(text=text[:_TOAST_LIMIT])
             return
         who = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
+        from hermes_cli.session_controls import control_error_reason
         status = str(record.get("status") or "failed")
-        label = "✓ Approved" if status == "applied" else "✗ Denied" if status == "denied" else status.title()
-        await query.answer(text=label[:_TOAST_LIMIT])
+        if status == "applied":
+            attributed_label = f"✓ Approved by {who}"
+        elif status == "denied":
+            attributed_label = f"✗ Denied by {who}"
+        else:
+            reason = control_error_reason(record.get("error"), kind=record.get("kind"))
+            if parts[1] == "a":
+                attributed_label = f"✓ Approved by {who} · not applied: {reason}"
+            else:
+                attributed_label = f"✗ Denied by {who} · {reason}"
+        label = attributed_label
+        await query.answer(text=attributed_label[:_TOAST_LIMIT])
         message = getattr(query, "message", None)
         message_text = getattr(message, "text", None) or ""
         if not message_text:
@@ -5965,7 +5976,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         await self._edit_html_quiet(
             query,
             f"{_html.escape(message_text)}\n\n"
-            f"<b>{_html.escape(label)} by {_html.escape(who)}</b>",
+            f"<b>{_html.escape(label)}</b>",
         )
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):

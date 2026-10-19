@@ -23,6 +23,20 @@ logger = logging.getLogger(__name__)
 
 _REQUEST_TTL_SECONDS = 24 * 60 * 60
 _CONTROL_PREFIX = "session_control:"
+_CONTROL_ERROR_REASONS = {
+    "target_changed": "target changed since the request",
+}
+
+
+def control_error_reason(error: Any, *, kind: Optional[str] = None) -> str:
+    """Turn durable control error codes into concise user-facing explanations."""
+    code = str(error or "unknown error")
+    if code == "nothing_to_resume":
+        subject = kind or "target"
+        return f"{subject} was not paused (already running or cleared)"
+    return _CONTROL_ERROR_REASONS.get(code, code)
+
+
 _CURRENT_AUTHORITY: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
     "session_control_authority", default=None
 )
@@ -459,7 +473,10 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     if kind == "goal" and action == "resume":
         from hermes_cli.goals import GoalManager
         manager = GoalManager(target_sid, cursor=cursor)
-        # Only a paused goal resumes: never revive a done/cleared goal or re-arm an active one.
+        # Only paused goals need a state transition. Resuming an active goal is an idempotent
+        # success, while done/cleared goals remain protected from resurrection.
+        if manager.state is not None and manager.state.status == "active":
+            return {"result": {"ok": True, "idempotent": True}, "state": manager.state}
         if manager.state is None or manager.state.status != "paused":
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},

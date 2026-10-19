@@ -442,7 +442,7 @@ def test_reply_prefix_does_not_block_users_own_quote(state):
 
 
 @pytest.mark.parametrize("status", ["done", "cleared", "active"])
-def test_resume_refuses_goals_that_are_not_paused(state, status):
+def test_resume_only_active_goals_are_idempotent(state, status):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control, request_control, resolve_request
 
@@ -455,10 +455,17 @@ def test_resume_refuses_goals_that_are_not_paused(state, status):
     _user(state, "requester", "Please resume the target goal now please")
     quoted = apply_control("goal", "resume", "target", requester_sid="requester",
                            user_quote="resume the target goal now please")
-    assert quoted["error_code"] == "nothing_to_resume"
+    if status == "active":
+        assert quoted["status"] == "applied"
+        assert quoted.get("error") is None
+    else:
+        assert quoted["error_code"] == "nothing_to_resume"
     pending = request_control("goal", "resume", "target", requester_sid="requester")
     resolved = resolve_request(pending["id"], "approve", "admin")
-    assert (resolved["status"], resolved["error"]) == ("failed", "nothing_to_resume")
+    if status == "active":
+        assert (resolved["status"], resolved["error"]) == ("applied", None)
+    else:
+        assert (resolved["status"], resolved["error"]) == ("failed", "nothing_to_resume")
     assert load_goal("target").status == status
 
 
