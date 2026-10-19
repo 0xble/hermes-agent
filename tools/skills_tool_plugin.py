@@ -5,6 +5,7 @@ file-serving helpers shared with the local-skill path. Helpers tests patch on th
 import json
 import logging
 from contextlib import suppress
+from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -81,9 +82,21 @@ def _serve_skill_file(
         return _fail(path_error, **extra)
     # is_file(), not exists(): a bare directory must take the not-found branch.
     if not target.is_file():
-        listing = {} if not list_available else {
-            "available_files": _available_skill_files(skill_root),
-            "hint": "Use one of the available file paths listed above"}
+        if not list_available:
+            return _fail(f"File '{file_path}' not found in skill '{label}'.", **extra)
+        available_files = _available_skill_files(skill_root)
+        available_paths = [path for paths in available_files.values() for path in paths]
+        close_matches = get_close_matches(file_path, available_paths, n=3, cutoff=0.45)
+        if available_paths:
+            hint_text = "Use one of the available file paths listed above"
+            if close_matches:
+                hint_text += f". Closest matches: {', '.join(close_matches)}"
+        else:
+            hint_text = (
+                "This skill has no linked files. Omit file_path to load SKILL.md, "
+                "or load the reference from the skill that owns it."
+            )
+        listing = {"available_files": available_files, "hint": hint_text}
         return _fail(f"File '{file_path}' not found in skill '{label}'.", **listing)
     try:
         content = _read_skill_text(target)

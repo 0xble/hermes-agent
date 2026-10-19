@@ -94,6 +94,17 @@ not-started result because replaying their shell would repeat earlier side effec
 Provenance: 1,196 terminal calls timed out over two days, including 432 pytest and
 202 unittest calls; dotfiles#941 added the host helper support.
 
+## Actionable failure hints
+
+The recurring five-day audit adds no-retry and next-action guidance at the producer:
+
+- `pre_tool_call` timeout blocks explicitly say not to retry the same tool call in the current turn. The fail-closed policy is unchanged.
+- `terminal` tells the model to use the process wait action instead of a standalone foreground sleep or timer.
+- `execute_code` explains that Hermes tool results are structured dictionaries, not JSON strings, and points JSON parsing at one isolated value or `json_parse()`.
+- Plugin skill-file misses list available files, show close matches, and explain the `SKILL.md` fallback when no linked files exist.
+
+The proof surface is `tests/hermes_cli/test_plugins.py`, `tests/tools/test_sandbox_failure_hints.py`, `tests/tools/test_skills_tool.py`, `tests/tools/test_terminal_tool.py`, and `tests/ci/test_prompt_surface.py`.
+
 ## Retirement
 
 Retire when an upstream equivalent preserves unread pending tool results and
