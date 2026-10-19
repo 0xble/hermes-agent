@@ -74,7 +74,7 @@ def _check_payload(kind: str, action: str, payload: Optional[Dict[str, Any]]) ->
             raise ValueError("replacement_too_long")
         max_turns = payload.get("max_turns")
         if max_turns is not None and (
-                isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 1):
+                isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 0):
             raise ValueError("invalid_max_turns")  # shown exactly as approval installs it
         normalized: Dict[str, Any] = {"goal": new}
         if "contract" in payload:
