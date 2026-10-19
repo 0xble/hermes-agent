@@ -192,6 +192,42 @@ class GatewaySessionControlsMixin:
                     exc_info=True,
                 )
 
+    async def _drain_target_notice(self, record: dict, session_controls, source, adapter):
+        if record.get("target_notice_sent") or record.get("target_notice_skipped"):
+            return record
+        request_id = record["id"]
+        if self._target_notice_is_stale(record):
+            logger.warning("session-control target notice stale for %s; settling as skipped", request_id)
+            return await self._mark_and_finish(
+                session_controls, record, "target_notice_skipped"
+            )
+        if source is None or adapter is None:
+            return await self._mark_and_finish(
+                session_controls, record, "target_notice_skipped"
+            )
+
+        metadata = dict(self._thread_metadata_for_source(source) or {})
+        metadata["session_control_request_id"] = request_id
+        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+        with outbound_class(OUTBOUND_NOTICE):
+            result = await adapter.send(
+                source.chat_id, self._control_notice(record), metadata=metadata
+            )
+        if _send_succeeded(result):
+            return await self._mark_and_finish(
+                session_controls, record, "target_notice_sent"
+            )
+        if getattr(result, "retryable", False):
+            logger.info("session-control target notice delivery failed for %s; retrying", request_id)
+            return None
+        logger.warning(
+            "session-control target notice not retryable for %s; settling as skipped: %s",
+            request_id, getattr(result, "error", None) or "delivery_failed",
+        )
+        return await self._mark_and_finish(
+            session_controls, record, "target_notice_skipped"
+        )
+
     async def _drain_session_control_record(self, record: dict, session_controls) -> None:
         request_id = record.get("id")
         if not request_id:
@@ -315,43 +351,10 @@ class GatewaySessionControlsMixin:
                     if not record.get("continuation_enqueued"):
                         return
 
-        notice = self._control_notice(record)
-        if (not target_offline and not record.get("target_notice_sent")
-                and not record.get("target_notice_skipped")):
-            if self._target_notice_is_stale(record):
-                logger.warning("session-control target notice stale for %s; settling as skipped", request_id)
-                record = await self._mark_and_finish(
-                    session_controls, record, "target_notice_skipped"
-                )
-            elif source is None or adapter is None:
-                record = await self._mark_and_finish(
-                    session_controls, record, "target_notice_skipped"
-                )
-            else:
-                metadata = dict(self._thread_metadata_for_source(source) or {})
-                metadata["session_control_request_id"] = request_id
-                from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
-                with outbound_class(OUTBOUND_NOTICE):
-                    result = await adapter.send(source.chat_id, notice, metadata=metadata)
-                if not _send_succeeded(result):
-                    # A deliberate notice shed or another non-retryable rejection must settle the
-                    # outbox. Retrying it every watcher tick turns a cosmetic delivery failure into a
-                    # permanent loop, especially after the underlying request is already resolved.
-                    if not getattr(result, "retryable", False):
-                        logger.warning(
-                            "session-control target notice not retryable for %s; settling as skipped: %s",
-                            request_id, getattr(result, "error", None) or "delivery_failed",
-                        )
-                        record = await self._mark_and_finish(
-                            session_controls, record, "target_notice_skipped"
-                        )
-                    else:
-                        logger.info("session-control target notice delivery failed for %s; retrying", request_id)
-                        return
-                else:
-                    record = await self._mark_and_finish(
-                        session_controls, record, "target_notice_sent"
-                    )
+        if not target_offline:
+            record = await self._drain_target_notice(record, session_controls, source, adapter)
+            if record is None:
+                return
 
         if not record.get("requester_notified") and not record.get("requester_notification_skipped"):
             requester_source, _requester_adapter = await self._session_control_route(requester_entry)
