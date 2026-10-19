@@ -172,6 +172,11 @@ _FAILURE_HINT_RULES = (
     (r"TypeError: string indices must be integers|AttributeError: 'str' object has no attribute 'get'",
      lambda m, _: "Tool functions in the sandbox return DICTS (already parsed) — "
                   "do not json.loads() them or index them like strings. Example: read_file(path)['content']."),
+    (r"JSONDecodeError: (?:Extra data|Invalid control character|Expecting value)",
+     lambda _, __: "The text is not one JSON value. Do not json.loads() the entire tool output; "
+                   "use the structured dict returned by the Hermes tool or isolate one JSON value "
+                   "before parsing. For terminal/web_extract text with control characters or a BOM, "
+                   "use json_parse()."),
 )
 
 

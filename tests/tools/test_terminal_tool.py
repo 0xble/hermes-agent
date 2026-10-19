@@ -81,6 +81,11 @@ def test_validate_workdir_allows_unicode_filesystem_paths():
     assert terminal_tool._validate_workdir("/home/jürgen/über projekt") is None
 
 
+def test_terminal_description_avoids_standalone_wait_commands():
+    assert "Never use a standalone foreground sleep or timer" in terminal_tool.TERMINAL_TOOL_DESCRIPTION
+    assert "process wait action" in terminal_tool.TERMINAL_TOOL_DESCRIPTION
+
+
 def test_validate_workdir_still_blocks_metachars_in_unicode_paths():
     # Widening to Unicode letters must not open the injection boundary:
     # shell metacharacters and control chars stay rejected even when mixed
