@@ -26,7 +26,6 @@ COMPACT_CONTEXT_SCHEMA = {
             },
         },
         "required": ["reason"],
-        "additionalProperties": False,
     },
 }
 
