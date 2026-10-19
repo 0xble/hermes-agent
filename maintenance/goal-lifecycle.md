@@ -19,6 +19,13 @@ clears the goal once with one short notice, before dispute pause or timed backof
 
 ## Provenance and adaptation
 
+- Fork patch identity: `goal-done-loop-prompts`. Standing-goal continuation guidance treats restarts, updates,
+  and new releases without changed results as unchanged and silent. The contract judge accepts recorded test
+  evidence for a case that the goal's boundaries or constraints forbid demonstrating live when tool output names
+  the tests and includes a pass count. Regression: `tests/hermes_cli/test_goals.py`. Retire when the selected
+  upstream release carries equivalent prompt wording and regression coverage; rollback reverts this prompt/test
+  slice without changing goal state or judge mechanics.
+
 - Fork patch identity: `goal-authoring-check`. The shared goal-authoring
   validator warns on `/goal` and rejects agent-authored contracts that exceed
   the compact shape, carry stale identifiers, contradict read-only limits with

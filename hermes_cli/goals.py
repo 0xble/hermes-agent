@@ -508,6 +508,13 @@ _GATE_OUTPUT_TAIL_CHARS = 3000
 
 # Shared autonomous-wakeup reply contract. Goal continuations and /loop wakeups are machinery,
 # not conversations: the user hears from them only when something new needs attention.
+_UNCHANGED_AUTONOMOUS_RECHECK_RULE = (
+    "A restart, update, or new release by itself is not news, and re-running a check that returns "
+    "the same result as your last visible report counts as unchanged; reply with exactly "
+    f"{SILENCE_MARKER} and nothing else. "
+)
+
+
 _AUTONOMOUS_REPLY_RULES = (
     "Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. "
     "If since your last visible update nothing new and material happened and nothing needs the "
@@ -523,7 +530,8 @@ _AUTONOMOUS_REPLY_RULES = (
     "new state, or a changed blocker appeared. If you already reported done and nothing material changed "
     "since that report, reply with exactly "
     f"{SILENCE_MARKER} and nothing else; the runtime will still re-check completion. "
-    "The FIRST time you are blocked or need user input, say so visibly. While the same blocker or input need "
+    + _UNCHANGED_AUTONOMOUS_RECHECK_RULE
+    + "The FIRST time you are blocked or need user input, say so visibly. While the same blocker or input need "
     "is unchanged, reply with exactly "
     f"{SILENCE_MARKER} and nothing else.\n"
 )
@@ -801,6 +809,9 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "- Verification items no command can prove (a human review, a report to "
     "the user) are satisfied by the response stating them, unless the "
     "evidence contradicts it.\n"
+    "- When the goal's boundaries or constraints forbid demonstrating a case live, recorded "
+    "test evidence for that case satisfies the criterion if the tool output names the tests and "
+    "includes a pass count.\n"
     "- Judge the end state, not the route: a different method, order or tool "
     "than the agent first planned is fine when the outcome holds.\n"
     "- A Constraint describing a state that must hold (e.g. no secret left "
@@ -3368,6 +3379,10 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
         if not prompt:
             return None
         note = _barrier_lift_note(self._state)
+        # A barrier-lift note describes the target outcome directly; avoid adding the generic
+        # release-recheck wording when the wake also carries a diagnostic note.
+        if note:
+            prompt = prompt.replace(_UNCHANGED_AUTONOMOUS_RECHECK_RULE, "")
         return f"{prompt}\n\n{note}" if note else prompt
 
     # --- the main entry point called after every turn -----------------
