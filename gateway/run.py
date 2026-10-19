@@ -1360,13 +1360,9 @@ def _build_gateway_agent_history(
                 entry["content"] = f"[Delivered from {mirror_src}] {entry['content']}"
                 entry.pop("api_content", None)  # prefix rewrite: the sidecar no longer matches
             if entry.get("content") != msg.get("content"):
-                if REPLAY_PERSISTED_CONTENT in entry:
-                    # The visible content is a model-only timestamp view. Keep the CAS and row metadata,
-                    # but force the next flush to write the original durable content from the override.
-                    entry.pop("_db_persisted", None)
-                else:
+                if REPLAY_PERSISTED_CONTENT not in entry:
                     entry.pop(DB_ROW_SNAPSHOT, None)  # a rewritten view is not the stored row version
-                    for field in ("_db_persisted", "_compressed_summary", "message_id", "platform_message_id",
+                    for field in ("_compressed_summary", "message_id", "platform_message_id",
                                   "observed", "display_kind", "display_metadata", "effect_disposition"):
                         entry.pop(field, None)
             agent_history.append(entry)

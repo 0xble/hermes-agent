@@ -24,10 +24,13 @@ deferred summary adoption, the hygiene token count stored on the session entry, 
   the summary. A gateway projection carries each row's `message_uid` and stored-row CAS snapshot, and the summary is
   matched by that exact version; only legacy projections without them fall back to role and loaded-view content. The
   gateway replay builder (`gateway/run.py::_build_replay_entry`) must therefore keep `_db_row_snapshot` on every row
-  whose content it leaves unchanged, and drop it from a rewritten view (timestamp render, mirror prefix, expired
-  confirmation redaction). Tool rows pass through whole with their snapshot, so a summary row stripped of its snapshot
-  looks unheld and every lease-less prune and defrag after the first compaction is refused as "another compaction
-  already committed this session". `held_messages` must also be a per-dict snapshot taken before any in-place rewrite.
+  whose content it leaves unchanged. A timestamp render is a model-only view: it keeps the snapshot and
+  `_replay_persisted_content`, so compaction writes the stored text while the normal flush skips the already-durable
+  row. Other rewritten views (mirror prefix, expired confirmation redaction) keep `_db_persisted` to prevent
+  marker-only flush from inserting a duplicate, but drop `_db_row_snapshot` and row metadata so lease-less compaction
+  cannot treat the rewritten view as held. Tool rows pass through whole with their snapshot. A summary row stripped
+  of its snapshot looks unheld and every lease-less prune and defrag after the first compaction is refused as
+  "another compaction already committed this session". `held_messages` must also be a per-dict snapshot taken before any in-place rewrite.
   Micro-compaction defrag edits the live marker dict, and an aliased snapshot would refuse every defrag of the current
   generation as stale.
 

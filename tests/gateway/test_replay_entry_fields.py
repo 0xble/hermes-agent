@@ -215,8 +215,9 @@ def test_replay_drops_persistence_metadata_when_content_is_rewritten():
     replayed, _ = _build_gateway_agent_history(stored)
     entry = replayed[0]
     assert entry["content"].startswith("[Delivered from other]")
+    assert entry["_db_persisted"] is True
     assert all(key not in entry for key in (
-        "_db_persisted", "_db_row_snapshot", "_compressed_summary", "message_id", "observed",
+        "_db_row_snapshot", "_compressed_summary", "message_id", "observed",
         "platform_message_id", "display_kind", "display_metadata", "effect_disposition",
     ))
 
@@ -240,6 +241,10 @@ def test_timestamp_replay_persists_original_content_and_row_metadata(tmp_path):
         assert replayed[0][REPLAY_PERSISTED_CONTENT] == "follow up"
         assert replayed[0]["platform_message_id"] == "plat-9"
         assert replayed[0]["display_kind"] == "user_text"
+        assert replayed[0]["_db_persisted"] is True
+        from agent.session_persistence import _db_flush_row
+        flush_row = _db_flush_row(object(), replayed[0], False)
+        assert flush_row["content"] == "follow up"
         db.append_messages_batch("s", replayed)
         persisted = db.get_messages_as_conversation("s")[0]
         assert persisted["content"] == "follow up"
@@ -248,6 +253,40 @@ def test_timestamp_replay_persists_original_content_and_row_metadata(tmp_path):
     finally:
         db.close()
 
+
+
+def test_rewritten_replay_rows_stay_out_of_the_real_flush_path(tmp_path):
+    from agent.session_persistence import SessionPersistenceMixin
+    from gateway.run import _build_gateway_agent_history
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s", "gateway")
+        db.append_message("s", "user", content="hello")
+        stored = [{
+            "role": "user", "content": "hello", "_db_persisted": True,
+            "_db_row_snapshot": "snap1", "message_uid": "u1", "mirror": True,
+            "mirror_source": "other",
+        }]
+        replayed, _ = _build_gateway_agent_history(stored)
+        assert replayed[0]["_db_persisted"] is True
+        assert "_db_row_snapshot" not in replayed[0]
+
+        agent = object.__new__(SessionPersistenceMixin)
+        agent._session_db = db
+        agent.session_id = "s"
+        agent._session_db_created = True
+        agent._flushed_db_message_ids = set()
+        agent._last_flushed_db_idx = 0
+        agent._db_flush_scan_prefix = None
+        agent._persist_user_message_idx = None
+        agent._pending_cli_user_message = None
+        flushed = SessionPersistenceMixin._flush_messages_to_session_db.__get__(agent)
+        assert flushed(replayed) is True
+        assert [row["content"] for row in db.get_messages_as_conversation("s")] == ["hello"]
+    finally:
+        db.close()
 
 
 def test_replay_keeps_the_stored_row_version_only_for_unchanged_content():
