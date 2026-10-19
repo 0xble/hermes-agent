@@ -116,8 +116,8 @@ class GatewaySessionControlsMixin:
             else:
                 lines.append("Proposed contract: none (the current contract is dropped)")
             max_turns = payload.get("max_turns")
-            budget = {None: "unchanged", 0: "unlimited"}.get(max_turns, max_turns)
-            lines.append(f"Max turns: {budget}")
+            if max_turns != 0:  # 0 is unlimited, the normal case, so it adds no line
+                lines.append(f"Max turns: {'unchanged' if max_turns is None else max_turns}")
             return "\n".join(lines)
         return f"Affected: {cls._clip(affected or '(state unavailable)', 2400)}"
 
