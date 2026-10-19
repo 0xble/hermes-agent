@@ -163,7 +163,8 @@ def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_
 def _search_filter_clauses(
     where: list[str], params: list, *, include_inactive: bool, source_filter: Optional[list[str]],
     exclude_sources: Optional[list[str]], role_filter: Optional[list[str]],
-    after_ts: Optional[int] = None, before_ts: Optional[int] = None) -> None:
+    after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+    exclude_tool_calls: bool = False) -> None:
     """Append the visibility/source/role/session-start predicates every search route shares. Live
     rows (active=1) AND compaction-archived rows (compacted=1) are discoverable; only
     rewind/undo rows (active=0, compacted=0) are hidden. ``after_ts``/``before_ts`` bound
@@ -173,6 +174,10 @@ def _search_filter_clauses(
         where.append("(m.active = 1 OR m.compacted = 1)")
     # display_kind="hidden" rows are model-facing scaffolding the person never saw; a hit would confuse.
     where.append("COALESCE(m.display_kind, '') <> 'hidden'")
+    if exclude_tool_calls:
+        # Tool-call payloads are model-facing scaffolding, not conversation text. Indexing
+        # them makes discovery find the agent's own prior tool calls (especially search calls).
+        where.append("(m.role <> 'assistant' OR m.tool_calls IS NULL OR m.tool_calls = '')")
     if source_filter is not None:
         where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
         params.extend(source_filter)
@@ -817,40 +822,52 @@ class SessionSearchMixin:
 
     @staticmethod
     def _sanitize_fts5_query(query: str) -> str:
-        """Sanitize user input for FTS5 MATCH (raw special characters raise): preserve paired
-        quoted phrases, strip unmatched special characters, and quote hyphenated/dotted
-        terms so FTS5 matches them as phrases (``chat-send``, ``P2.2``, ``my-app.config.ts``)."""
-        # Cap before any regex processing so adversarial input stays bounded.
+        """Sanitize user input for FTS5 MATCH while keeping structured identifiers one unit.
+
+        FTS5 treats punctuation as query grammar (``:`` is a column selector and ``-``
+        can be a token boundary). Quote every unquoted token that contains punctuation
+        so hashes, timestamps, paths, and hyphenated names retain their token boundary;
+        boolean operators and explicitly quoted phrases keep their existing semantics.
+        """
         query = query[:MAX_FTS5_QUERY_CHARS]
-
-        # 1. Protect balanced quoted phrases via numbered placeholders (``"[^"]*"`` pairs
-        # left-to-right without backtracking); a leftover unmatched quote becomes whitespace.
-        _quoted_parts: list = []
-
-        def _hold(m: re.Match[str]) -> str:
-            _quoted_parts.append(m.group(0))
-            return f"\x00Q{len(_quoted_parts) - 1}\x00"
-
-        sanitized = _QUOTED_PHRASE_RE.sub(_hold, query).replace('"', " ")
-
-        # 2. Strip FTS5-special characters (an unquoted ``TODO: fix`` parses as
-        # ``column:term``). ``%`` is only spared for the CJK LIKE fallback.
-        sanitized = _FTS5_SPECIAL_RE.sub(" ", sanitized)
-        if "%" in sanitized and not SessionSearchMixin._contains_cjk(sanitized):
-            sanitized = sanitized.replace("%", " ")
-        # 3. Collapse repeated * and drop leading * (prefix needs a char).
-        sanitized = re.sub(r"\*+", "*", sanitized)
-        sanitized = re.sub(r"(^|\s)\*", r"\1", sanitized)
-        # 4. Drop dangling boolean operators at start/end (syntax errors).
-        sanitized = re.sub(r"(?i)^(AND|OR|NOT)\b\s*", "", sanitized.strip())
-        sanitized = re.sub(r"(?i)\s+(AND|OR|NOT)\s*$", "", sanitized.strip())
-        # 5. Quote dotted/hyphenated/underscored terms in ONE pass (sequential passes
-        # double-quote ``my-app.config``).
-        sanitized = re.sub(r"\b(\w+(?:[._-]\w+)+)\b", r'"\1"', sanitized)
-        # 6. Restore preserved quoted phrases.
-        for i, quoted in enumerate(_quoted_parts):
-            sanitized = sanitized.replace(f"\x00Q{i}\x00", quoted)
-        return sanitized.strip()
+        tokens = _LIKE_TOKEN_RE.findall(query)
+        while tokens and tokens[0].upper() in _FTS_OPERATORS:
+            tokens.pop(0)
+        while tokens and tokens[-1].upper() in _FTS_OPERATORS:
+            tokens.pop()
+        sanitized: list[str] = []
+        for token in tokens:
+            upper = token.upper()
+            if token.startswith('"') and token.endswith('"') and len(token) >= 2:
+                sanitized.append(token)
+                continue
+            if upper in _FTS_OPERATORS:
+                sanitized.append(upper)
+                continue
+            # Keep FTS prefix semantics, but quote the structured token before the '*'.
+            suffix = "*" if token.endswith("*") else ""
+            body = token[:-1] if suffix else token
+            if not body:
+                continue
+            # Keep identifier punctuation, but retain the historical fail-closed behavior
+            # for FTS operators/wildcards such as ``+`` and ``%``.
+            # A colon is meaningful inside ISO timestamps, but remains an FTS
+            # column selector in ordinary prose (``TODO: fix``).
+            allowed = "#:/._-@"
+            if ":" in body and not re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?", body):
+                allowed = allowed.replace(":", "")
+            unsafe = "".join(ch for ch in _FTS5_SPECIAL_CHARS if ch not in allowed)
+            body = re.sub(f"[{re.escape(unsafe)}]", "", body)
+            body = body.replace("*", "")
+            if "%" in body and not SessionSearchMixin._contains_cjk(body):
+                body = body.replace("%", "")
+            if not body:
+                continue
+            if re.search(r"[^\w]", body, flags=re.UNICODE):
+                sanitized.append('"' + body.replace('"', '""') + '"' + suffix)
+            else:
+                sanitized.append(body + suffix)
+        return " ".join(sanitized)
 
     @staticmethod
     def _contains_cjk(text: str) -> bool:
@@ -1066,6 +1083,7 @@ class SessionSearchMixin:
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        exclude_tool_calls: bool = False,
     ) -> list[dict[str, Any]]:
         """:meth:`_search_messages_impl` plus one log line per slow search with the routing
         path taken. Threshold HERMES_SEARCH_SLOW_MS (default 1000; 0 logs every call)."""
@@ -1075,7 +1093,7 @@ class SessionSearchMixin:
             rows = self._search_messages_impl(
                 query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
                 limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
-                after_ts=after_ts, before_ts=before_ts)
+                after_ts=after_ts, before_ts=before_ts, exclude_tool_calls=exclude_tool_calls)
             return rows
         finally:
             elapsed_ms = (time.time() - started) * 1000.0
@@ -1089,6 +1107,7 @@ class SessionSearchMixin:
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        exclude_tool_calls: bool = False,
     ) -> list[dict[str, Any]]:
         """FTS5 search across session messages (keywords, ``"phrases"``, AND/OR/NOT, ``prefix*``).
         Returns snippet + session metadata + 1-message context per hit; ``fields`` selects a
@@ -1105,7 +1124,8 @@ class SessionSearchMixin:
             return []
         filters = dict(include_inactive=include_inactive, source_filter=source_filter,
                        exclude_sources=exclude_sources, role_filter=role_filter,
-                       after_ts=after_ts, before_ts=before_ts)
+                       after_ts=after_ts, before_ts=before_ts,
+                       exclude_tool_calls=exclude_tool_calls)
         # New oversized tool results index only a bounded prefix; an explicit tool-role search is the
         # opt-in full-body path and scans canonical rows via LIKE.
         if role_filter and "tool" in role_filter:

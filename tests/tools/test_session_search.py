@@ -15,6 +15,7 @@ from datetime import datetime, timezone, UTC
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_search import SessionSearchMixin
 from tools.session_search_tool import (
     _format_timestamp,
     _is_compacted_message,
@@ -62,8 +63,51 @@ def _seed_modpack_sessions(db):
 
 
 # =========================================================================
-# Schema invariants
+# Retrieval boundary evals (synthetic versions of the private misses)
 # =========================================================================
+
+
+def _seed_boundary_message(db, content, *, tool_calls=None):
+    db.create_session("boundary", source="cli")
+    db.append_message("boundary", "assistant", content, tool_calls=tool_calls)
+    db._conn.commit()
+
+
+class TestRetrievalBoundaryEvals:
+    def test_long_multiword_miss_retries_with_any_term(self, db):
+        _seed_boundary_message(db, "Sarah prefers the standup meeting on Thursday mornings")
+        rows = db.search_messages("when does Sarah like her standup scheduled")
+        assert any(row["session_id"] == "boundary" for row in rows)
+
+    @pytest.mark.parametrize("query, content, token", [
+        ("#b380c9eee3a19b4c2f01", "release #b380c9eee3a19b4c2f01-prod", '"#b380c9eee3a19b4c2f01"'),
+        ("2026-09-03T02:02:24", "auth recovery at 2026-09-03T02:02:24", '"2026-09-03T02:02:24"'),
+        ("saved-unassigned", "the saved-unassigned router decision", '"saved-unassigned"'),
+    ])
+    def test_boundary_tokens_survive_fts_sanitization(self, db, query, content, token):
+        _seed_boundary_message(db, content)
+        assert token in SessionSearchMixin._sanitize_fts5_query(query)
+        assert db.search_messages(query)
+
+    def test_discovery_does_not_match_session_search_tool_call_json(self, db):
+        _seed_boundary_message(
+            db,
+            "I checked the history and found nothing useful.",
+            tool_calls=[{"function": {"name": "session_search", "arguments":
+                                      '{"query":"saved-unassigned router"}'}}],
+        )
+        result = json.loads(session_search(query="saved-unassigned router", db=db))
+        assert result["success"] is True
+        assert result["count"] == 0
+
+    def test_exact_quoted_phrase_stays_exact(self, db):
+        _seed_boundary_message(db, "docker networking tls configuration")
+        db.create_session("near", source="cli")
+        db.append_message("near", "assistant", "docker config for networking")
+        db._conn.commit()
+        rows = db.search_messages('"docker networking"')
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "boundary"
 
 
 class TestFormatTimestamp:
