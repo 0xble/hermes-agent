@@ -1105,8 +1105,13 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
         expected = record.get("target_fingerprint")
         kind, action = record.get("kind"), record.get("action")
         live = _meta_value(conn, _definition_key(kind, record.get("target_session_id", "")))
+        definition_changed = expected != _definition_fingerprint(kind, live)
+        # Clearing is an instruction about the target's current goal state, not an instruction
+        # to install the definition shown on the card. Keep the fence for replacements and all
+        # other definition-bound controls, but let an approved clear settle the current goal.
         if ((kind, action) not in CONTROLS or not isinstance(expected, str)
-                or not expected.startswith("v2:") or expected != _definition_fingerprint(kind, live)):
+                or not expected.startswith("v2:")
+                or (definition_changed and not (kind == "goal" and action == "clear"))):
             record["status"], record["error"] = "failed", "target_changed"
             _save_record(record, cursor=conn)
             return record

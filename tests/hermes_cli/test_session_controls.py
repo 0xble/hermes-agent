@@ -125,6 +125,21 @@ def test_cross_session_goal_change_with_refused_quote_still_uses_approval(state)
     assert load_goal("target").status == "active"
 
 
+def test_no_quote_approval_applies_clear_to_unchanged_goal(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control, resolve_request
+
+    GoalManager("target").set("watch the build")
+    pending = apply_control("goal", "clear", "target", requester_sid="target", reason="x")
+    assert pending["status"] == "pending"
+
+    applied = resolve_request(pending["request_id"], "approve", "admin")
+
+    assert applied is not None
+    assert applied["status"] == "applied"
+    assert load_goal("target").status == "cleared"
+
+
 def test_expire_request_uses_transaction_and_is_consume_once(state):
     import json
     from hermes_cli import session_controls
@@ -544,7 +559,7 @@ def test_unnegated_quote_is_allowed(state, message, quote):
     assert load_goal("target").status == "cleared"
 
 
-def test_approval_is_bound_to_the_definition_on_the_card(state):
+def test_approval_clear_applies_to_the_current_goal_after_revision(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.loops import LoopManager, load_loop
     from hermes_cli.session_controls import request_control, resolve_request
@@ -554,10 +569,10 @@ def test_approval_is_bound_to_the_definition_on_the_card(state):
     GoalManager("requester").clear()
     GoalManager("requester").set("a different objective")
     resolved = resolve_request(request["id"], "approve", "admin")
-    assert resolved["status"] == "failed"
-    assert resolved["error"] == "target_changed"
+    assert resolved is not None
+    assert resolved["status"] == "applied"
+    assert load_goal("requester").status == "cleared"
     assert load_goal("requester").goal == "a different objective"
-    assert load_goal("requester").status == "active"
     assert resolve_request(request["id"], "approve", "admin") is None
 
     LoopManager("target").set("check the build")

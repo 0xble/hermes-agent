@@ -36,26 +36,53 @@ class GatewaySessionControlsMixin:
         text = str(text or "")
         return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
+    # A resolved notice is cosmetic. Keep it retryable briefly, then settle it so an
+    # unavailable target route cannot keep waking the gateway forever.
+    _TARGET_NOTICE_RETRY_SECONDS = 15 * 60
+
+    @classmethod
+    def _target_notice_is_stale(cls, record: dict) -> bool:
+        resolved_at = record.get("resolved_at") or record.get("created_at")
+        try:
+            return bool(resolved_at and time.time() - float(resolved_at) >= cls._TARGET_NOTICE_RETRY_SECONDS)
+        except (TypeError, ValueError):
+            return False
+
     @classmethod
     def _control_text(cls, record: dict) -> str:
         # Keep the card scannable on mobile: decision first, then the affected session, the actor,
         # the exact change and the reason. Every free-text field remains bounded so one Telegram
         # message can carry the complete proposal with its buttons.
         kind, action = record.get("kind", ""), record.get("action", "")
-        target = record.get("target_session_id", "")
-        requester = record.get("requester_session_id", "")
         requester_title = cls._clip(record.get("requester_title") or "Untitled session", 120)
         target_title = cls._clip(record.get("target_title") or "Untitled session", 120)
         reason = cls._clip(record.get("reason") or "session-control", 600)
-        label = f"{kind.title()} {action.title()}"
+        decision = {
+            "clear": "Clear this goal?",
+            "pause": "Pause this goal?",
+            "resume": "Resume this goal?",
+            "replace": "Replace this goal?",
+            "stop": "Stop this loop?",
+        }.get(action, f"Apply {kind} {action}?")
+        effect = {
+            "clear": "The target goal will become cleared.",
+            "pause": "The target goal will stop progressing.",
+            "resume": "The target goal will become active again.",
+            "replace": "The target goal will be replaced by the proposal below.",
+            "stop": "The target loop will stop.",
+        }.get(action, f"The target {kind} will be changed.")
+        guidance = {
+            "clear": "Approval clears the current goal. It does not replace or restore its text.",
+            "replace": "Approve only if this still matches the target's current state.",
+        }.get(action, "Approve only if this still matches the target's current state.")
         return (
-            "Approval needed\n"
-            f"Change: {label}\n"
-            f"Session: {target_title} ({target})\n"
-            f"Requested by: {requester_title} ({requester})\n"
-            f"Reason: {reason}\n"
+            f"◆ {decision}\n\n"
+            f"Target: {target_title}\n"
+            f"Requested by: {requester_title}\n\n"
+            f"{effect}\n"
             f"{cls._change_text(record)}\n\n"
-            "The requesting session continues while this is pending."
+            f"Reason: {reason}\n\n"
+            f"{guidance}"
         )
 
     @classmethod
@@ -286,7 +313,12 @@ class GatewaySessionControlsMixin:
         notice = self._control_notice(record)
         if (not target_offline and not record.get("target_notice_sent")
                 and not record.get("target_notice_skipped")):
-            if source is None or adapter is None:
+            if self._target_notice_is_stale(record):
+                logger.warning("session-control target notice stale for %s; settling as skipped", request_id)
+                record = await self._mark_and_finish(
+                    session_controls, record, "target_notice_skipped"
+                )
+            elif source is None or adapter is None:
                 record = await self._mark_and_finish(
                     session_controls, record, "target_notice_skipped"
                 )
@@ -297,11 +329,24 @@ class GatewaySessionControlsMixin:
                 with outbound_class(OUTBOUND_NOTICE):
                     result = await adapter.send(source.chat_id, notice, metadata=metadata)
                 if not _send_succeeded(result):
-                    logger.info("session-control target notice delivery failed for %s; retrying", request_id)
-                    return
-                record = await self._mark_and_finish(
-                    session_controls, record, "target_notice_sent"
-                )
+                    # A deliberate notice shed or another non-retryable rejection must settle the
+                    # outbox. Retrying it every watcher tick turns a cosmetic delivery failure into a
+                    # permanent loop, especially after the underlying request is already resolved.
+                    if not getattr(result, "retryable", False):
+                        logger.warning(
+                            "session-control target notice not retryable for %s; settling as skipped: %s",
+                            request_id, getattr(result, "error", None) or "delivery_failed",
+                        )
+                        record = await self._mark_and_finish(
+                            session_controls, record, "target_notice_skipped"
+                        )
+                    else:
+                        logger.info("session-control target notice delivery failed for %s; retrying", request_id)
+                        return
+                else:
+                    record = await self._mark_and_finish(
+                        session_controls, record, "target_notice_sent"
+                    )
 
         if not record.get("requester_notified") and not record.get("requester_notification_skipped"):
             requester_source, _requester_adapter = await self._session_control_route(requester_entry)

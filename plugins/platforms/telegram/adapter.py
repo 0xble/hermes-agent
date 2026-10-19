@@ -5387,8 +5387,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         """Render a durable session-control approval request with Approve/Deny buttons."""
         def build():
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("Approve", callback_data=f"ctl:a:{request_id}", style=_APPROVE_BUTTON_STYLE),
-                InlineKeyboardButton("Deny", callback_data=f"ctl:d:{request_id}"),
+                InlineKeyboardButton("✓ Approve", callback_data=f"ctl:a:{request_id}", style=_APPROVE_BUTTON_STYLE),
+                InlineKeyboardButton("Keep as-is", callback_data=f"ctl:d:{request_id}"),
             ]])
             return self.format_message(text), keyboard, None
         return await self._send_prompt(
@@ -5931,6 +5931,29 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             thread_id=str(thread_id) if thread_id is not None else None)
         return scope_for(source)
 
+    @staticmethod
+    def _session_control_outcome(record: Dict[str, Any], who: str) -> tuple[str, str]:
+        """Return user-facing resolution text that explains stale approvals instead of hiding them."""
+        status = str(record.get("status") or "failed")
+        action = str(record.get("action") or "")
+        if status == "applied":
+            verb = {
+                "clear": "Goal cleared",
+                "pause": "Goal paused",
+                "resume": "Goal resumed",
+                "stop": "Loop stopped",
+                "replace": "Goal replaced",
+            }.get(action, "Approved")
+            return f"✓ {verb} by {who}", ""
+        if status == "denied":
+            return f"• Kept as-is, denied by {who}", ""
+        if status == "expired":
+            return "⌛ Not applied", "This approval expired before it was resolved."
+        if record.get("error") == "target_changed":
+            return f"◆ Not applied by {who}", "The target changed before approval, so nothing was changed."
+        error = str(record.get("error") or "unknown error")
+        return f"✗ Not applied by {who}", f"Reason: {error}"
+
     async def _handle_session_control_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """Resolve durable session-control requests after the normal callback allowlist gate."""
         parts = data.split(":", 2)
@@ -5955,18 +5978,16 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             await query.answer(text=text[:_TOAST_LIMIT])
             return
         who = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
-        status = str(record.get("status") or "failed")
-        label = "✓ Approved" if status == "applied" else "✗ Denied" if status == "denied" else status.title()
+        label, detail = self._session_control_outcome(record, who)
         await query.answer(text=label[:_TOAST_LIMIT])
         message = getattr(query, "message", None)
         message_text = getattr(message, "text", None) or ""
         if not message_text:
             return
-        await self._edit_html_quiet(
-            query,
-            f"{_html.escape(message_text)}\n\n"
-            f"<b>{_html.escape(label)} by {_html.escape(who)}</b>",
-        )
+        suffix = f"\n\n<b>{_html.escape(label)}</b>"
+        if detail:
+            suffix += f"\n{_html.escape(detail)}"
+        await self._edit_html_quiet(query, f"{_html.escape(message_text)}{suffix}")
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
