@@ -580,6 +580,19 @@ def test_failed_approval_notice_explains_not_applied_reason(state):
         "✓ Request to resume this goal was approved but not applied: "
         "goal was not paused (already running or cleared)"
     )
+    requester_notice = runner._requester_notice({
+        "kind": "goal",
+        "action": "resume",
+        "target_session_id": "target",
+        "target_title": "Target",
+        "status": "failed",
+        "error": "nothing_to_resume",
+        "authority": {"via": "button", "user_id": "99"},
+    })
+    assert requester_notice == (
+        "✓ Your request to goal resume in Target (target) was approved but not applied: "
+        "goal was not paused (already running or cleared)"
+    )
 
 
 def test_replace_notices_show_old_and_new_goal(state):

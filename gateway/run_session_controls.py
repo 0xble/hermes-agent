@@ -427,5 +427,5 @@ class GatewaySessionControlsMixin:
         error = control_error_reason(record.get("error"), kind=kind)
         authority = record.get("authority") or {}
         if authority.get("via") == "button" and authority.get("user_id"):
-            return f"✗ Your request to {action} in {target} was approved but not applied: {error}"
+            return f"✓ Your request to {action} in {target} was approved but not applied: {error}"
         return f"✗ Your request to {action} in {target} failed: {error}"
