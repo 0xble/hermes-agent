@@ -565,9 +565,11 @@ def tool_row_emoji(tool_name: str, args: dict | None = None, default: str = "⚡
 
 
 def progress_tool_label(tool_name: str, default: str = "⚡") -> tuple[str, str]:
-    """``(emoji, label)`` naming a tool in a progress line: the friendly ``App · action`` label for
-    MCP and connector tools (``mcp__paper__get_guide`` -> ``Paper · get guide``) when friendly
-    labels are on, else the raw tool name with its registry/skin emoji."""
+    """``(emoji, label)`` naming a tool in a progress line: the friendly ``app · action`` label for
+    MCP and connector tools (``mcp__paper__get_guide`` -> ``paper · get guide``) when friendly
+    labels are on, else the raw tool name with its registry/skin emoji. The app is lowercased to
+    match the raw lowercase names built-in tools show on the same lines; GUI payloads keep the
+    title-cased ``ToolLabel.app``."""
     if _friendly_tool_labels:
         try:
             from tools.tool_labels import label_for_tool_name
@@ -578,7 +580,7 @@ def progress_tool_label(tool_name: str, default: str = "⚡") -> tuple[str, str]
         if label is not None and label.kind in ("mcp", "connector"):
             skin = _get_skin()
             override = skin.tool_emojis.get(tool_name) if skin and skin.tool_emojis else None
-            return override or label.emoji, label.text
+            return override or label.emoji, replace(label, app=label.app.lower()).text
     return get_tool_emoji(tool_name, default), tool_name
 
 
