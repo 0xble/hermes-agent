@@ -10,6 +10,8 @@ A compression pass refused only because the shared compression pool is full is a
 
 Fork patch identity: `compression-pool-saturation`.
 
+Fork-Patch-Backfill: a8645c8abecbc2e5edf24210a77a325248c97535; compression-pool-saturation
+
 Reproduced on 2026-10-17: 4 concurrent long compressions held all 4 workers, and a fifth session spent its 3 attempts in about 35 seconds on `pool_saturated` refusals and ended `attempts_exhausted:3` without compressing. No matching upstream issue or PR was found.
 
 ## Verification
