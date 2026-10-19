@@ -186,6 +186,10 @@ class ToolPreview:
 
 _SHELL_SILENT_HEADS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", "false", ":"}
 _SHELL_PIPE_TAIL_HEADS = {"head", "tail", "wc", "sort", "uniq"}
+_HERMES_STATE_DB_PREVIEW = "checking Hermes state"
+_STATE_DB_RE = re.compile(r"\bstate\.db(?:-(?:wal|shm))?\b")
+_HERMES_HOME_RE = re.compile(r"(?:\.hermes(?:[/\\]|\s|$)|\$\{?HERMES_HOME\}?(?:/|\s|$))")
+_SQLITE_STATE_RE = re.compile(r"\b(?:sqlite3|python(?:\d+(?:\.\d+)?)?|pypy(?:\d+(?:\.\d+)?)?|SessionDB)\b")
 
 
 def _shell_basename(head: str) -> str:
@@ -275,6 +279,16 @@ def _is_shell_boundary_echo(segment: str) -> bool:
     if _shell_basename(words[0] if words else "") != "echo":
         return False
     return bool(re.search(r"-{2,}|_exit=|(?:^|\s|=)\$[?{]|PIPESTATUS", " ".join(words[1:])))
+
+
+def _is_hermes_state_db_command(command: str) -> bool:
+    """Whether a terminal command inspects a Hermes state database."""
+    original = _oneline(command)
+    if not _STATE_DB_RE.search(original) or not _HERMES_HOME_RE.search(original):
+        return False
+    if any(_shell_head_word(segment) == "sqlite3" for segment in _split_shell_compound(original)):
+        return True
+    return bool(_SQLITE_STATE_RE.search(original) and re.search(r"(?:sqlite3|SessionDB|mode=ro|mode=rw|connect)", original, re.I))
 
 
 def summarize_shell_command(command: str) -> str:
@@ -406,9 +420,11 @@ def _preview_todo_list(args: dict, _max_len: int) -> str:
     return t("display.preview.todo_reading") if todos_arg is None else t("display.preview.todo_tasks", verb=verb, count=len(todos_arg))
 
 
-def _preview_shell(key: str):
+def _preview_shell(key: str, *, redact_hermes_state: bool = False):
     def _build(args: dict, max_len: int) -> str | None:
         command = args.get(key)
+        if redact_hermes_state and command is not None and _is_hermes_state_db_command(str(command)):
+            return _tail_trunc(_HERMES_STATE_DB_PREVIEW, max_len)
         return None if command is None else _tail_trunc(summarize_shell_command(str(command)), max_len) or None
     return _build
 
@@ -464,7 +480,7 @@ def _preview_bridge_call(tool_name: str):
 _PREVIEW_BUILDERS = {
     "browser_exec": _preview_browser_exec, "delegate_task": _preview_delegate_task,
     "process_manage": _preview_process_manage, "todo_list": _preview_todo_list,
-    "terminal": _preview_shell("command"), "execute_code": _preview_shell("code"),
+    "terminal": _preview_shell("command", redact_hermes_state=True), "execute_code": _preview_shell("code"),
     "read_file": _preview_read_file, "memory": _preview_memory, "send_message": _preview_send_message,
     "skill_view": _preview_skill_view, "clarify": _preview_clarify,
     "session_search": lambda args, _m: t("display.preview.session_search_recall", query=_clip(_oneline(args.get("query", "")), 25)),
