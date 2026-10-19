@@ -111,6 +111,16 @@ def _like_params(term: str) -> list[str]:
     return [f"%{_escape_like(term)}%"] * 3
 
 
+def _like_phrase_params(term: str) -> list[str]:
+    """``_like_params`` for a sanitized phrase: each word gap matches any one character.
+
+    ``_sanitize_fts5_query`` turns punctuation into the space unicode61 would split on
+    (``don't`` -> ``don t``), so canonical text needs ``don't``/``don’t``/``don t`` to match.
+    """
+    pattern = "_".join(_escape_like(word) for word in term.split())
+    return [f"%{pattern}%"] * 3
+
+
 def _strip_cjk_wildcards(raw_query: str) -> str:
     """Drop the trailing prefix wildcard callers append for ASCII ("nimb" -> "nimb*").
 
@@ -1027,7 +1037,7 @@ class SessionSearchMixin:
             clauses: list[str] = []
             for term, negated in group:
                 clauses.append(f"NOT {column_sql}" if negated else column_sql)
-                params.extend(_like_params(term))
+                params.extend(_like_phrase_params(term))
                 if snippet_term is None and not negated:
                     snippet_term = term
             compiled_groups.append(f"({' AND '.join(clauses)})")
@@ -1144,6 +1154,11 @@ class SessionSearchMixin:
             return self._finalize_search_matches(matches, result_fields=result_fields)
         self._refresh_fts_stale_state()
         if self._fts_stale:
+            matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
+            return self._finalize_search_matches(matches, result_fields=result_fields)
+        # Pre-v23 inline FTS stores content, tool_name, and tool_calls in one column, so a
+        # column-qualified MATCH cannot exclude only tool_calls there: scan canonical rows.
+        if exclude_tool_calls and self._read_retrying_ioerr(self._db_has_legacy_inline_fts):
             matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
             return self._finalize_search_matches(matches, result_fields=result_fields)
         if not self._fts_enabled:

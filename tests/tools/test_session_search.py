@@ -15,6 +15,7 @@ from datetime import datetime, timezone, UTC
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_common import LEGACY_FTS_SQL, _FTS_TRIGGERS
 from hermes_state_search import SessionSearchMixin
 from tools.session_search_tool import (
     _format_timestamp,
@@ -119,6 +120,57 @@ class TestRetrievalBoundaryEvals:
         _seed_boundary_message(db, content)
         rows = db.search_messages(query)
         assert any(row["session_id"] == "boundary" for row in rows)
+
+    @pytest.mark.parametrize("query, content", [
+        ("don't", "I don't like Sarah's standup time."),
+        ("Sarah's", "I don't like Sarah's standup time."),
+        ("foo,bar", "The foo bar migration is ready."),
+    ])
+    def test_stale_fts_like_fallback_matches_split_punctuation(self, db, query, content):
+        _seed_boundary_message(db, content)
+        db._fts_stale = True
+        rows = db.search_messages(query)
+        assert any(row["session_id"] == "boundary" for row in rows)
+
+    def test_legacy_inline_fts_discovery_ignores_tool_call_json(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        initial = SessionDB(path)
+        if not initial._fts_enabled:
+            initial.close()
+            pytest.skip("SQLite FTS5 unavailable")
+        for trigger in _FTS_TRIGGERS:
+            initial._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        initial._conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        initial._conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+        initial._conn.execute("DROP TABLE IF EXISTS messages_fts")
+        initial._conn.executescript(LEGACY_FTS_SQL)
+        initial.close()
+
+        legacy = SessionDB(path)
+        try:
+            assert legacy._db_has_legacy_inline_fts(legacy._conn.cursor()) is True
+            legacy.create_session("leaky", source="cli")
+            legacy.append_message(
+                "leaky", "assistant", "I checked the history and found nothing useful.",
+                tool_calls=[{"function": {"name": "session_search", "arguments":
+                                          '{"query":"saved-unassigned router"}'}}],
+            )
+            legacy.create_session("prose", source="cli")
+            legacy.append_message(
+                "prose", "assistant", "The saved-unassigned router decision is staged.",
+                tool_calls=[{"function": {"name": "terminal", "arguments": "echo unrelated"}}],
+            )
+            legacy._conn.commit()
+            # The legacy inline index really does carry the tool-call JSON.
+            assert {r["session_id"] for r in legacy.search_messages("saved-unassigned router")} == {
+                "leaky", "prose"}
+            rows = legacy.search_messages("saved-unassigned router", exclude_tool_calls=True)
+            assert {r["session_id"] for r in rows} == {"prose"}
+            result = json.loads(session_search(query="saved-unassigned router", db=legacy))
+            assert result["success"] is True
+            assert "leaky" not in json.dumps(result)
+        finally:
+            legacy.close()
 
     def test_exact_quoted_phrase_stays_exact(self, db):
         _seed_boundary_message(db, "docker networking tls configuration")
