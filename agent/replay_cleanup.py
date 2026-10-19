@@ -104,6 +104,9 @@ def strip_interrupted_tool_tails(agent_history: list[dict[str, Any]]) -> list[di
                             name = call_names.get(str(tool_result.get("tool_call_id") or ""), "")
                             disposition, content = _orphan_recovery(name, _INTERRUPTED_NOTICES)
                             tool_result = {**tool_result, "effect_disposition": disposition, "content": content}
+                            # The recovered view differs from the stored row, so it must not carry
+                            # the original CAS snapshot into a later lease-less rewrite.
+                            tool_result.pop(DB_ROW_SNAPSHOT, None)
                         cleaned.append(tool_result)
                 else:
                     logger.debug("Stripping interrupted read-only assistant→tool replay block (indices %d–%d, tool_results=%d)",
