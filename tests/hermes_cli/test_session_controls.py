@@ -125,6 +125,21 @@ def test_cross_session_goal_change_with_refused_quote_still_uses_approval(state)
     assert load_goal("target").status == "active"
 
 
+def test_no_quote_approval_applies_clear_to_unchanged_goal(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control, resolve_request
+
+    GoalManager("target").set("watch the build")
+    pending = apply_control("goal", "clear", "target", requester_sid="target", reason="x")
+    assert pending["status"] == "pending"
+
+    applied = resolve_request(pending["request_id"], "approve", "admin")
+
+    assert applied is not None
+    assert applied["status"] == "applied"
+    assert load_goal("target").status == "cleared"
+
+
 def test_expire_request_uses_transaction_and_is_consume_once(state):
     import json
     from hermes_cli import session_controls
@@ -137,6 +152,23 @@ def test_expire_request_uses_transaction_and_is_consume_once(state):
     expired = session_controls.expire_request(request["id"])
     assert expired["status"] == "expired"
     assert session_controls.expire_request(request["id"]) is None
+    assert json.loads(state.get_meta(key))["status"] == "expired"
+
+
+def test_resolve_request_reports_expired_record_for_callback_feedback(state):
+    import json
+    from hermes_cli import session_controls
+
+    request = session_controls.request_control("goal", "clear", "target", requester_sid="requester")
+    key = session_controls._record_key(request["id"])
+    record = json.loads(state.get_meta(key))
+    record["expires_at"] = 0
+    state.set_meta(key, json.dumps(record))
+
+    resolved = session_controls.resolve_request(request["id"], "approve", "admin")
+
+    assert resolved is not None
+    assert resolved["status"] == "expired"
     assert json.loads(state.get_meta(key))["status"] == "expired"
 
 
@@ -544,7 +576,7 @@ def test_unnegated_quote_is_allowed(state, message, quote):
     assert load_goal("target").status == "cleared"
 
 
-def test_approval_is_bound_to_the_definition_on_the_card(state):
+def test_approval_clear_applies_to_the_current_goal_after_revision(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.loops import LoopManager, load_loop
     from hermes_cli.session_controls import request_control, resolve_request
@@ -554,10 +586,10 @@ def test_approval_is_bound_to_the_definition_on_the_card(state):
     GoalManager("requester").clear()
     GoalManager("requester").set("a different objective")
     resolved = resolve_request(request["id"], "approve", "admin")
-    assert resolved["status"] == "failed"
-    assert resolved["error"] == "target_changed"
+    assert resolved is not None
+    assert resolved["status"] == "applied"
+    assert load_goal("requester").status == "cleared"
     assert load_goal("requester").goal == "a different objective"
-    assert load_goal("requester").status == "active"
     assert resolve_request(request["id"], "approve", "admin") is None
 
     LoopManager("target").set("check the build")
@@ -600,7 +632,7 @@ def test_approval_blocks_cross_process_definition_swap_at_apply_boundary(state, 
     def at_boundary(*args, **kwargs):
         attempt = subprocess.run(
             [sys.executable, "-c", script, str(state.db_path), key, json.dumps(replacement)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         attempts.append(attempt)
         return original(*args, **kwargs)
@@ -1121,7 +1153,6 @@ def test_oversized_replacement_is_refused_before_any_request(state):
     ({"goal": "ship", "contract": {"constraints": "x" * 1600}}, "replacement_too_long"),
     ({"goal": "ship", "max_turns": "999"}, "invalid_max_turns"),
     ({"goal": "ship", "max_turns": -1}, "invalid_max_turns"),
-    ({"goal": "ship", "max_turns": 0}, "invalid_max_turns"),
 ])
 def test_replacement_payload_must_be_fully_displayable(state, payload, code):
     from hermes_cli.goals import GoalManager, load_goal
@@ -1131,6 +1162,19 @@ def test_replacement_payload_must_be_fully_displayable(state, payload, code):
     result = apply_control("goal", "replace", "target", requester_sid="requester", payload=payload)
     assert result["error_code"] == code
     assert load_goal("target").goal == "old objective"
+
+
+def test_replacement_accepts_unlimited_budget(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("old objective")
+    result = apply_control("goal", "replace", "target", requester_sid="requester",
+                           payload={"goal": "ship", "max_turns": 0})
+    assert result["status"] == "applied"
+    installed = load_goal("target")
+    assert installed is not None
+    assert (installed.goal, installed.max_turns) == ("ship", 0)
 
 
 @pytest.mark.parametrize("message,quote,refusal", [

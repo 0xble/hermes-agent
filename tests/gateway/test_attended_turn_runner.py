@@ -6,6 +6,7 @@ from gateway.attended_model import AttendedResolution
 from gateway.session import Platform, SessionSource
 from gateway.turn_context import TurnContext
 from gateway.run_turn_runner import TurnRunner
+from agent import conversation_loop
 
 
 def _ctx(config=None):
@@ -76,7 +77,9 @@ def test_mid_turn_idle_expiry_switches_back_once_with_one_notice():
     previous = AttendedResolution(
         "claude-opus-5-5", "anthropic", "medium", "attended", True, idle_model="gpt-6.1-sol",
     )
-    decision = AttendedResolution("gpt-6.1-sol", "nous", "xhigh", "default", False)
+    decision = AttendedResolution(
+        "gpt-6.1-sol", "nous", "xhigh", "default", False, switched_back=True,
+    )
     turn, _, state = _runner(
         decision, runtime=("gpt-6.1-sol", {"provider": "nous", "api_mode": "codex_responses"}),
     )
@@ -100,65 +103,49 @@ def test_mid_turn_idle_expiry_switches_back_once_with_one_notice():
     )
     assert notices == ["⇄ Back to GPT-6.1 Sol after 15m idle."]
     assert state.conversation.last_resolved_model == "gpt-6.1-sol"
+    # The reasoning lookup is stubbed to the stale attended effort; the committed decision wins.
+    assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
 
 
-def test_compaction_reanchors_current_user_index():
-    from unittest.mock import patch
-
-    turn = TurnRunner.__new__(TurnRunner)
-    turn._ctx = _ctx({
-        "model": {
-            "attended": {"model": "opus", "provider": "anthropic"},
-            "compact_before_switch_tokens": 10,
-        }
-    })
-    compressor = SimpleNamespace(last_prompt_tokens=100, context_length=1000)
-    compressed = [
-        {"role": "user", "content": "older"},
-        {"role": "user", "content": "current"},
-    ]
+def test_oversized_default_context_keeps_attended_route_without_compaction():
+    previous = AttendedResolution(
+        "claude-opus-5-5", "anthropic", "medium", "attended", True, idle_model="gpt-6.1-sol",
+    )
+    decision = AttendedResolution(
+        "gpt-6.1-sol", "nous", "xhigh", "default", False, switched_back=True,
+    )
+    turn, _, state = _runner(
+        decision, runtime=("gpt-6.1-sol", {"provider": "nous", "api_mode": "codex_responses", "context_length": 272000}),
+    )
+    state.conversation.last_attended_decision = previous
+    notices = []
+    compressed = []
+    compressor = SimpleNamespace(
+        preview_threshold_tokens=lambda *_args: 204000,
+    )
     agent = SimpleNamespace(
-        context_compressor=compressor, compression_enabled=True, tools=[],
-        _compress_context=lambda *args, **kwargs: (compressed, ""),
+        model="claude-opus-5-5", provider="anthropic", api_mode="anthropic_messages",
+        _gateway_attended_decision=previous,
+        _gateway_attended_decision_key=previous.decision_key,
+        _fallback_activated=False, _provider_fallback_active=False,
+        reasoning_config={"enabled": True, "effort": "medium"},
+        _emit_diagnostic_status=notices.append,
+        context_compressor=compressor,
+        _compress_context=lambda *_args, **_kwargs: compressed.append(True),
     )
-    loop_state = SimpleNamespace(
-        messages=[{"role": "user", "content": "current"}], active_system_prompt="",
-        system_message="", effective_task_id="task", conversation_history=[],
-        user_message="current", current_turn_user_idx=0,
-    )
+    loop_state = SimpleNamespace(request_pressure_tokens=204000, messages=[])
 
-    with patch("agent.conversation_compression.conversation_history_after_compression", return_value=[]):
-        turn._compact_before_attended_switch(
-            agent, loop_state, model="opus", runtime={"provider": "anthropic", "context_length": 1000},
-        )
+    with patch("agent.agent_runtime_helpers.switch_model") as switch:
+        turn._apply_attended_before_api_call(agent, loop_state)
 
-    assert loop_state.current_turn_user_idx == 1
-    assert agent._persist_user_message_idx == 1
+    switch.assert_not_called()
+    assert notices == []
+    assert compressed == []
+    assert state.conversation.last_attended_decision is previous
 
 
-def test_compaction_failure_does_not_block_a_switch():
-    turn = TurnRunner.__new__(TurnRunner)
-    turn._ctx = _ctx({
-        "model": {
-            "attended": {"model": "opus", "provider": "anthropic"},
-            "compact_before_switch_tokens": 10,
-        }
-    })
-    compressor = SimpleNamespace(last_prompt_tokens=100, context_length=1000)
-    agent = SimpleNamespace(
-        context_compressor=compressor, compression_enabled=True, tools=[],
-        _compress_context=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("compress failed")),
-    )
-    loop_state = SimpleNamespace(
-        messages=[{"role": "user", "content": "large"}], active_system_prompt="",
-        system_message="", effective_task_id="task", conversation_history=[],
-    )
-
-    # The method is intentionally fail-open: an exception is logged and the caller can switch.
-    turn._compact_before_attended_switch(
-        agent, loop_state, model="opus", runtime={"provider": "anthropic", "context_length": 1000},
-    )
-    assert loop_state.messages == [{"role": "user", "content": "large"}]
+def test_switch_only_compaction_path_was_removed():
+    assert not hasattr(TurnRunner, "_compact_before_attended_switch")
 
 
 def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
@@ -211,3 +198,72 @@ def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
 
     assert notices == ["⇄ Switched to Opus while you're active."]
     assert state.conversation.pending_attended_notice is None
+
+
+def test_conversation_loop_orders_route_hooks_around_destination_preflight(monkeypatch):
+    """Route changes use the real loop seam: assemble/preflight see the active route,
+    and a post-preflight boundary switch rebuilds and fits for its destination route."""
+    events = []
+    ctx = SimpleNamespace(
+        user_message="hello", original_user_message="hello", messages=[{"role": "user", "content": "hello"}],
+        conversation_history=[], active_system_prompt="system", effective_task_id="task", turn_id="turn",
+        should_review_memory=False, plugin_user_context="", ext_prefetch_cache="", current_turn_user_idx=0,
+        preflight_compression_blocked=False,
+    )
+    budget = SimpleNamespace(remaining=1)
+    agent = SimpleNamespace(
+        model="default", provider="default-provider", api_mode="default-mode", max_iterations=1,
+        max_compression_attempts=3, iteration_budget=budget, _budget_grace_call=False,
+        _api_max_retries=0, _try_refresh_env_client_credentials=lambda: None,
+    )
+
+    def before(_state):
+        events.append(("before", agent.model))
+        agent.model, agent.provider, agent.api_mode = "attended", "attended-provider", "attended-mode"
+
+    def after(_state):
+        events.append(("after", agent.model))
+        agent.model, agent.provider, agent.api_mode = "default", "default-provider", "default-mode"
+
+    agent._gateway_before_api_call = before
+    agent._gateway_after_preflight = after
+
+    def phase(fn, _agent, _state, **_extra):
+        name = fn.__name__
+        if name == "begin_iteration":
+            _state.api_call_count = 1
+        if name == "assemble_api_request":
+            events.append(("assemble", _agent.model))
+        elif name == "run_preflight_gate":
+            events.append(("preflight", _agent.model))
+            _agent._preflight_output_ceiling = 111 if _agent.model == "attended" else 222
+        elif name == "apply_retry_restarts":
+            return SimpleNamespace(action="break")
+        elif name == "announce_api_call":
+            return SimpleNamespace(action="fallthrough")
+        return SimpleNamespace(action="fallthrough")
+
+    monkeypatch.setattr(conversation_loop, "begin_fast_mode_turn", lambda *_args: None)
+    monkeypatch.setattr(conversation_loop, "build_turn_context", lambda *_args, **_kwargs: ctx)
+    monkeypatch.setattr("agent.voice_turn_route.begin_voice_turn_route", lambda _agent, _messages, prompt: prompt)
+    monkeypatch.setattr(conversation_loop, "play_prelude", lambda *_args: ("continue", None))
+    monkeypatch.setattr(conversation_loop, "_run_phase", phase)
+    def finalize(agent, *, final_response, api_call_count, interrupted, failed, messages,
+                 conversation_history, effective_task_id, turn_id, user_message,
+                 original_user_message, _should_review_memory, _turn_exit_reason,
+                 _pending_verification_response=None, _pending_verification_response_previewed=False):
+        return {"completed": True}
+    monkeypatch.setattr(conversation_loop, "finalize_turn", finalize)
+
+    result = conversation_loop._run_conversation_turn(agent, "hello")
+
+    assert result == {"completed": True}
+    assert events == [
+        ("before", "default"),
+        ("assemble", "attended"),
+        ("preflight", "attended"),
+        ("after", "attended"),
+        ("assemble", "default"),
+        ("preflight", "default"),
+    ]
+    assert agent._preflight_output_ceiling == 222

@@ -9,9 +9,17 @@ def rich_message_payload(content: str, *, skip_entity_detection: bool = False) -
     adapter's shaping rules across the gateway and standalone CLI/cron lanes.
     """
     from .adapter import _degrade_unsupported_markdown_links, _protect_rich_currency, _rich_normalize_linebreaks
-    from .rich_markdown import escape_literal_hash_prefixes, normalize_footnotes
+    from .rich_markdown import (
+        escape_literal_hash_prefixes,
+        normalize_blockquote_markdown,
+        normalize_footnotes,
+    )
 
-    markdown = normalize_footnotes(escape_literal_hash_prefixes(_degrade_unsupported_markdown_links(content)))
+    markdown = normalize_blockquote_markdown(
+        normalize_footnotes(
+            escape_literal_hash_prefixes(_degrade_unsupported_markdown_links(content))
+        )
+    )
     payload: dict[str, Any] = {"markdown": _rich_normalize_linebreaks(_protect_rich_currency(markdown))}
     if skip_entity_detection:
         payload["skip_entity_detection"] = True

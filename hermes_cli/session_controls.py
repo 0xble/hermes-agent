@@ -74,7 +74,7 @@ def _check_payload(kind: str, action: str, payload: Optional[Dict[str, Any]]) ->
             raise ValueError("replacement_too_long")
         max_turns = payload.get("max_turns")
         if max_turns is not None and (
-                isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 1):
+                isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 0):
             raise ValueError("invalid_max_turns")  # shown exactly as approval installs it
         normalized: Dict[str, Any] = {"goal": new}
         if "contract" in payload:
@@ -1092,9 +1092,10 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
         if not isinstance(record, dict) or record.get("status") != "pending":
             return None
         if float(record.get("expires_at") or 0) <= now:
+            # Return the settled record so the tapped card can say it expired.
             record["status"], record["resolved_at"] = "expired", now
             _save_record(record, cursor=conn)
-            return None
+            return record
         record["authority"] = {"via": "button", "user_id": str(user_id)}
         record["resolved_at"] = now
         if decision == "deny":
@@ -1105,8 +1106,13 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
         expected = record.get("target_fingerprint")
         kind, action = record.get("kind"), record.get("action")
         live = _meta_value(conn, _definition_key(kind, record.get("target_session_id", "")))
+        definition_changed = expected != _definition_fingerprint(kind, live)
+        # Clearing is an instruction about the target's current goal state, not an instruction
+        # to install the definition shown on the card. Keep the fence for replacements and all
+        # other definition-bound controls, but let an approved clear settle the current goal.
         if ((kind, action) not in CONTROLS or not isinstance(expected, str)
-                or not expected.startswith("v2:") or expected != _definition_fingerprint(kind, live)):
+                or not expected.startswith("v2:")
+                or (definition_changed and not (kind == "goal" and action == "clear"))):
             record["status"], record["error"] = "failed", "target_changed"
             _save_record(record, cursor=conn)
             return record

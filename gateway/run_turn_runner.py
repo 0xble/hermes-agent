@@ -1365,140 +1365,158 @@ class TurnRunner:
         agent.request_overrides = overrides
         agent._gateway_turn_request_overrides = turn_overrides
 
-    def _compact_before_attended_switch(self, agent, loop_state, *, model, runtime) -> None:
-        """Compact the live turn before a route switch when either window requires it."""
-        from agent.model_metadata import estimate_request_tokens_rough, get_model_context_length
-
-        cfg = parse_attended_config(self._ctx.user_config or {})
+    def _attended_request_context_too_large(self, agent, loop_state, *, model, runtime) -> bool:
+        """Return whether the current request is already at the default route's compaction trigger."""
         compressor = getattr(agent, "context_compressor", None)
-        if not cfg.enabled or compressor is None or not getattr(agent, "compression_enabled", True):
-            return
-        messages = getattr(loop_state, "messages", None)
-        if not isinstance(messages, list):
-            return
+        if compressor is None or loop_state is None:
+            return False
         try:
-            estimate = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
-            if estimate <= 0:
-                estimate = int(estimate_request_tokens_rough(
-                    messages, system_prompt=getattr(loop_state, "active_system_prompt", "") or "",
+            request_tokens = getattr(loop_state, "request_pressure_tokens", None)
+            if not isinstance(request_tokens, int) or request_tokens <= 0:
+                from agent.model_metadata import estimate_request_tokens_rough
+                request_tokens = int(estimate_request_tokens_rough(
+                    getattr(loop_state, "messages", []) or [],
+                    system_prompt=getattr(loop_state, "active_system_prompt", "") or "",
                     tools=getattr(agent, "tools", None) or None,
                 ))
-        except Exception:
-            logger.debug("attended switch token estimate failed", exc_info=True)
-            return
-        old_window = int(getattr(compressor, "context_length", 0) or 0)
-        new_window = int(runtime.get("context_length", 0) or 0)
-        if not new_window:
-            try:
-                new_window = int(get_model_context_length(
+            context_length = int(runtime.get("context_length", 0) or 0)
+            if context_length <= 0:
+                from agent.model_metadata import get_model_context_length
+                context_length = int(get_model_context_length(
                     model, base_url=runtime.get("base_url", "") or "",
                     api_key=runtime.get("api_key", "") or "",
                     provider=runtime.get("provider", "") or "",
                     api_mode=runtime.get("api_mode", "") or "",
                 ))
-            except Exception:
-                logger.debug("attended switch destination context lookup failed", exc_info=True)
-        hard_limit = min(window for window in (old_window, new_window) if window > 0) if old_window and new_window else 0
-        if estimate <= cfg.compact_before_switch_tokens and (not hard_limit or estimate <= hard_limit):
-            return
-        try:
-            before = loop_state.messages
-            loop_state.messages, loop_state.active_system_prompt = agent._compress_context(
-                loop_state.messages,
-                loop_state.system_message,
-                approx_tokens=estimate,
-                task_id=loop_state.effective_task_id,
-                trigger="attended_switch",
-            )
-            if loop_state.messages is not before:
-                from agent.conversation_compression import conversation_history_after_compression
-                from agent.turn_context_compaction import _reanchor
-                loop_state.conversation_history = conversation_history_after_compression(
-                    agent, loop_state.messages, loop_state.conversation_history,
-                )
-                loop_state.current_turn_user_idx = _reanchor(
-                    agent, loop_state.messages, loop_state.user_message,
-                )
+            preview = getattr(compressor, "preview_threshold_tokens", None)
+            if callable(preview):
+                threshold = int(preview(model, context_length, runtime.get("provider", "") or ""))
+            else:
+                threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
+            return threshold > 0 and request_tokens >= threshold
         except Exception:
-            # A failed best-effort compaction must never strand the requested route switch.
-            logger.warning("attended switch compaction failed; continuing with route switch", exc_info=True)
+            logger.debug("attended destination context threshold lookup failed", exc_info=True)
+            return False
 
-    def _apply_attended_before_api_call(self, agent, loop_state=None):
-        """Apply a changed desired route before request construction, never on fallback retries."""
+    def _apply_attended_before_api_call(self, agent, loop_state=None, *, commit=True):
+        """Apply a changed desired route at the real request boundary, never on fallback retries."""
         runner = self._runner
         ctx = self._ctx
         if getattr(agent, "is_subagent", False) or getattr(agent, "_is_auxiliary", False):
             return
         if ctx.session_key in (getattr(runner, "_bulk_reset_pending_sessions", set()) or set()):
-            # A bulk reset clears persistence immediately, but the current agent keeps its route
-            # until this turn ends; the next turn resolves from defaults.
             return
+        def _handoff(*, conversation=None, runner_state=None):
+            handoff = getattr(runner, "_handoff_attended_state", None)
+            if callable(handoff):
+                handoff(ctx.session_key, conversation=conversation, runner=runner_state)
+            elif ctx.session_key and conversation:
+                state = runner._session_state(ctx.session_key)
+                for name, value in conversation.items():
+                    setattr(state.conversation, name, value)
+            if runner_state:
+                for name, value in runner_state.items():
+                    setattr(runner, name, value)
+
         try:
             decision = runner._attended_resolution_for_session(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
                 override=(runner._session_model_override(ctx.session_key) if ctx.session_key else None),
+                allow_switch_back=commit,
             )
             if decision is None:
                 return
             previous_decision = getattr(agent, "_gateway_attended_decision", None)
+            previous_key = getattr(agent, "_gateway_attended_decision_key", None)
+            # The pre-preflight callback resolves and applies active/explicit route changes so
+            # request assembly and the first preflight gate see the destination model. The resolver
+            # suppresses idle switch-back when ``allow_switch_back`` is false; only the post-preflight
+            # callback may commit that boundary-only transition.
+            if commit and ctx.session_key:
+                _handoff(conversation={"last_api_call_at": time.time()})
             agent._gateway_attended_decision = decision
             desired_key = decision.decision_key
-            previous_key = getattr(agent, "_gateway_attended_decision_key", None)
             if desired_key == previous_key:
                 return
-            # Fallback owns the remainder of this turn.  Record that the desired
-            # decision was observed so later retries do not resurrect the failed
-            # primary, but do not mutate the fallback route.
             if getattr(agent, "_fallback_activated", False) or getattr(agent, "_provider_fallback_active", False):
                 agent._gateway_attended_decision_key = desired_key
                 return
-            model, runtime = runner._resolve_session_agent_runtime(
-                source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+            if decision.switched_back:
+                snapshot = getattr(runner, "_snapshot_session_runtime_state", None)
+                if callable(snapshot):
+                    _override, _last_model, _ = snapshot(ctx.session_key)
+                    model, runtime, _notice, _cache_model = runner._load_session_agent_runtime(
+                        source=ctx.source, skey=ctx.session_key, user_config=ctx.user_config,
+                        config=getattr(runner, "config", None), override=_override,
+                        last_model=_last_model, attended_route=None,
+                    )
+                else:
+                    model, runtime = runner._resolve_session_agent_runtime(
+                        source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+                    )
+            else:
+                model, runtime = runner._resolve_session_agent_runtime(
+                    source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+                )
+            if commit and decision.switched_back and self._attended_request_context_too_large(
+                agent, loop_state, model=model, runtime=runtime,
+            ):
+                log_decision = getattr(runner, "_log_attended_decision", None)
+                if callable(log_decision):
+                    log_decision(
+                        ctx.session_key, ctx.source, action="keep", reason="context_too_large",
+                    )
+                else:
+                    logger.info(
+                        "attended decision: session=%s origin=%s action=keep reason=context_too_large",
+                        ctx.session_key,
+                        "automation" if str(getattr(getattr(ctx.source, "platform", None), "value", "")).lower()
+                        in {"automation", "cron", "goal_wakeup", "kanban", "subagent", "system"}
+                        else "user",
+                    )
+                agent._gateway_attended_decision = previous_decision
+                _handoff(conversation={"last_attended_decision": previous_decision})
+                return
+            if commit and decision.switched_back:
+                log_decision = getattr(runner, "_log_attended_decision", None)
+                if callable(log_decision):
+                    log_decision(ctx.session_key, ctx.source, action="switch", reason="idle")
+                _handoff(
+                    conversation={"last_attended_decision": decision},
+                    runner_state={"_last_attended_decision": decision},
+                )
+            current_route = (
+                getattr(agent, "model", ""), getattr(agent, "provider", ""), getattr(agent, "api_mode", ""),
             )
-            current_route = (getattr(agent, "model", ""), getattr(agent, "provider", ""), getattr(agent, "api_mode", ""))
             destination_route = (model, runtime.get("provider", ""), runtime.get("api_mode", ""))
             unavailable_emitted = False
             if decision.reason == "attended" and destination_route == current_route:
                 consume_notice = getattr(runner, "_consume_pre_agent_fallback_notice", None)
-                if callable(consume_notice) and getattr(consume_notice, "__self__", None) is runner:
-                    unavailable = consume_notice(ctx.session_key)
-                else:
-                    unavailable = getattr(runner, "_pre_agent_fallback_notice", None)
-                    runner._pre_agent_fallback_notice = None
+                unavailable = consume_notice(ctx.session_key) if callable(consume_notice) else None
                 emit_status = getattr(agent, "_emit_diagnostic_status", None)
                 if unavailable and callable(emit_status):
                     emit_status(unavailable)
                     unavailable_emitted = True
             if destination_route != current_route:
-                if loop_state is not None:
-                    self._compact_before_attended_switch(agent, loop_state, model=model, runtime=runtime)
                 from agent.agent_runtime_helpers import switch_model
                 switch_model(
                     agent, model, runtime.get("provider", agent.provider), runtime.get("api_key", ""),
                     runtime.get("base_url", ""), runtime.get("api_mode", ""), runtime.get("capabilities"),
                 )
-            agent.reasoning_config = runner._resolve_session_reasoning_config(
-                source=ctx.source, session_key=ctx.session_key, model=model,
-            )
+            if decision.switched_back and decision.reasoning_effort:
+                # The committed decision already carries the destination effort. Re-resolving here
+                # would read session state whose handoff to the gateway loop may not have landed yet,
+                # and could pair the default model with the attended route's effort.
+                from hermes_constants import parse_reasoning_effort
+                agent.reasoning_config = parse_reasoning_effort(decision.reasoning_effort)
+            else:
+                agent.reasoning_config = runner._resolve_session_reasoning_config(
+                    source=ctx.source, session_key=ctx.session_key, model=model,
+                )
             agent._gateway_attended_decision_key = desired_key
             if ctx.session_key:
-                handoff = getattr(runner, "_handoff_attended_state", None)
-                if callable(handoff):
-                    handoff(ctx.session_key, conversation={"last_resolved_model": model})
-                else:
-                    route_state = runner._session_state(ctx.session_key)
-                    route_state.conversation.last_resolved_model = model
-            if (
-                decision.reason == "default"
-                and previous_decision is not None
-                and previous_decision.reason == "attended"
-                and previous_decision.active
-                and previous_decision.idle_model
-                and previous_decision.idle_model != previous_decision.model
-                and previous_key
-                and previous_key[-1]
-                and not unavailable_emitted
-            ):
+                _handoff(conversation={"last_resolved_model": model})
+            if decision.switched_back and not unavailable_emitted:
                 emit_status = getattr(agent, "_emit_diagnostic_status", None)
                 if callable(emit_status):
                     emit_status(format_attended_switch_back_notice(
@@ -1513,13 +1531,7 @@ class TurnRunner:
                         idle_minutes=parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
                     ))
             if ctx.session_key:
-                handoff = getattr(runner, "_handoff_attended_state", None)
-                if callable(handoff):
-                    handoff(ctx.session_key, conversation={"pending_attended_notice": None})
-                else:
-                    state = runner._peek_session_state(ctx.session_key)
-                    if state is not None:
-                        state.conversation.pending_attended_notice = None
+                _handoff(conversation={"pending_attended_notice": None})
         except Exception:
             logger.warning("attended model refresh before API call failed; keeping current route", exc_info=True)
 
@@ -1558,7 +1570,12 @@ class TurnRunner:
         set_gateway_fast_expiry_state(agent, expiry_at, runner._service_tier)
         agent._pre_fallback_reasoning_override = None  # a live pick supersedes a set-aside one
         self._merge_turn_request_overrides(agent, turn_route)
-        agent._gateway_before_api_call = lambda loop_state: self._apply_attended_before_api_call(agent, loop_state)
+        agent._gateway_before_api_call = lambda loop_state: self._apply_attended_before_api_call(
+            agent, loop_state, commit=False,
+        )
+        agent._gateway_after_preflight = lambda loop_state: self._apply_attended_before_api_call(
+            agent, loop_state, commit=True,
+        )
         agent._gateway_attended_decision = getattr(
             getattr(runner._peek_session_state(ctx.session_key) if ctx.session_key else None, "conversation", None),
             "last_attended_decision", None,
