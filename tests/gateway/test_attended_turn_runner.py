@@ -49,6 +49,26 @@ def test_fallback_is_not_undone_when_desired_route_changes_mid_turn():
     assert agent._gateway_attended_decision_key == decision.decision_key
 
 
+def test_committed_api_boundary_persists_attended_route_marker():
+    decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
+    turn, runner, _state = _runner(decision)
+    marked = []
+    runner.session_store = SimpleNamespace(
+        mark_attended_route_active=lambda key, active: marked.append((key, active)),
+    )
+    agent = SimpleNamespace(
+        model="opus", provider="anthropic", api_mode="anthropic_messages",
+        _gateway_attended_decision_key=decision.decision_key,
+        _fallback_activated=False, _provider_fallback_active=False,
+        reasoning_config={"enabled": True, "effort": "medium"},
+        context_compressor=None,
+    )
+
+    turn._apply_attended_before_api_call(agent)
+
+    assert marked == [("session-1", True)]
+
+
 def test_mid_turn_activation_switches_once_and_posts_one_notice():
     decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
     turn, _, state = _runner(decision)
@@ -146,6 +166,27 @@ def test_oversized_default_context_keeps_attended_route_without_compaction():
 
 def test_switch_only_compaction_path_was_removed():
     assert not hasattr(TurnRunner, "_compact_before_attended_switch")
+
+
+def test_new_session_first_attended_turn_has_no_switch_in_notice():
+    decision = AttendedResolution("opus", "anthropic", "medium", "attended", True, new_session=True)
+    turn, runner, _state = _runner(decision)
+    runner.session_store = SimpleNamespace(get_attended_route_active=lambda _key: None)
+    notices = []
+    agent = SimpleNamespace(
+        model="default", provider="nous", api_mode="codex_responses",
+        _gateway_attended_decision=None,
+        _gateway_attended_decision_key=None,
+        _fallback_activated=False, _provider_fallback_active=False,
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+        _emit_diagnostic_status=notices.append,
+        context_compressor=None,
+    )
+
+    with patch("agent.agent_runtime_helpers.switch_model"):
+        turn._apply_attended_before_api_call(agent)
+
+    assert notices == []
 
 
 def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
