@@ -40,7 +40,7 @@ from agent.conversation_compression import (
 from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
-from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, copy_identity_fields
+from agent.message_metadata import ABSORBED_MESSAGE_UIDS, DB_ROW_SNAPSHOT, MESSAGE_UID, copy_identity_fields
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
@@ -1180,9 +1180,17 @@ def _build_replay_entry(
     # their calls (those pass through whole); on a plain row a leftover map would name calls it no longer has.
     copy_identity_fields({key: msg[key] for key in (MESSAGE_UID, ABSORBED_MESSAGE_UIDS) if key in msg}, entry)
     # Replay rewrites are view-only: keep the durable-row stamp so marker-only
-    # flushes skip rows already in state.db (#121462/#123462).
+    # flushes skip rows already in state.db (#121462/#123462). Keep the CAS snapshot
+    # as well, but only when the content is still the durable text. The stale-generation
+    # guard matches a held summary by uid plus exact stored-row version, so a replay
+    # that drops it looks unheld and every lease-less prune is refused. A rewritten view,
+    # such as a timestamp render, must not carry it, or a flush would treat that view as
+    # the row's current payload.
     if msg.get("_db_persisted"):
         entry["_db_persisted"] = True
+    snapshot = msg.get(DB_ROW_SNAPSHOT)
+    if isinstance(snapshot, str) and snapshot and content == msg.get("content"):
+        entry[DB_ROW_SNAPSHOT] = snapshot
     # A merged user dict lost that stamp; this one is what ties it to its durable rows at compaction.
     # The other counts the rows the repair dropped behind a dict or folded into an assistant turn,
     # which this view cannot name either; the last names them for the commit.
@@ -1340,6 +1348,8 @@ def _build_gateway_agent_history(
                 mirror_src = msg.get("mirror_source", "another session")
                 entry["content"] = f"[Delivered from {mirror_src}] {entry['content']}"
                 entry.pop("api_content", None)  # prefix rewrite: the sidecar no longer matches
+            if entry.get("content") != msg.get("content"):
+                entry.pop(DB_ROW_SNAPSHOT, None)  # a rendered view is not the stored row version
             agent_history.append(entry)
 
     # Keep gateway resume byte-identical to the TUI resume and send paths. The

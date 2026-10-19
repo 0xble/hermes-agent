@@ -231,3 +231,65 @@ def test_patch_session_model_config_merge_and_delete(tmp_path: Path) -> None:
     # Missing rows and empty patches are no-ops, never errors.
     db.patch_session_model_config("NO_SUCH_SESSION", {"x": 1})
     db.patch_session_model_config(session_id, {})
+
+def _compacted_session(db: SessionDB, session_id: str) -> None:
+    """A session after one summary-producing compaction, then fresh large tool results."""
+    db.create_session(session_id, source="telegram")
+    db.append_messages_batch(session_id, _history())
+    current = db.get_messages_as_conversation(session_id)
+    db.archive_and_compact(
+        session_id,
+        [{"role": "user", "content": "[CONTEXT COMPACTION] summary", "_compressed_summary": True}, *current[-4:]],
+        tail_count=4,
+    )
+    db.append_messages_batch(session_id, _history()[1:])
+
+def _gateway_replay(db: SessionDB, session_id: str) -> list[dict]:
+    from gateway.run import _build_gateway_agent_history
+
+    history, _observed = _build_gateway_agent_history(
+        db.get_messages_as_conversation(session_id, repair_alternation=True))
+    return history
+
+def test_gateway_replay_after_compaction_still_prunes(tmp_path: Path) -> None:
+    """Compress once, then a gateway turn's lease-less prune must commit.
+
+    The replay must keep each row's CAS snapshot: without it the held summary looks unheld and
+    every prune is refused as "another compaction already committed this session"."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "PRUNE_AFTER_COMPACTION"
+    _compacted_session(db, session_id)
+    agent = _build_agent(db, session_id)
+    _configure_pruning(agent)
+
+    _pruned, count = agent.context_compressor.prune_tool_results_only(
+        _gateway_replay(db, session_id), current_tokens=120_000,
+    )
+
+    assert count >= 1
+    durable = db.get_messages_as_conversation(session_id)
+    assert any(m.get("content") == "[CONTEXT COMPACTION] summary" for m in durable)
+    assert max(len(str(m.get("content") or "")) for m in durable) < 24_000
+
+def test_gateway_replay_prune_still_aborts_after_a_newer_compaction(tmp_path: Path) -> None:
+    """A compaction that commits after the replay was built must still win over the prune."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "PRUNE_LOSES_TO_NEWER_COMPACTION"
+    _compacted_session(db, session_id)
+    agent = _build_agent(db, session_id)
+    _configure_pruning(agent)
+    held = _gateway_replay(db, session_id)
+
+    current = db.get_messages_as_conversation(session_id)
+    db.archive_and_compact(
+        session_id,
+        [{"role": "user", "content": "[CONTEXT COMPACTION] summary", "_compressed_summary": True}, *current[-4:]],
+        tail_count=4,
+    )
+    winner = [m["content"] for m in db.get_messages_as_conversation(session_id)]
+
+    result, count = agent.context_compressor.prune_tool_results_only(held, current_tokens=120_000)
+
+    assert result is held
+    assert count == 0
+    assert [m["content"] for m in db.get_messages_as_conversation(session_id)] == winner

@@ -21,9 +21,15 @@ deferred summary adoption, the hygiene token count stored on the session entry, 
 - A lease-less `archive_and_compact` caller passes `held_messages`. If an active summary row is absent from the held
   history, the commit raises `StaleHeldHistory` inside the write transaction and writes nothing. That rewrite was built
   from the generation a compaction already replaced, and committing it would re-insert the whole old transcript beside
-  the summary. Gateway history carries no `_row_id`, so the summary is matched by role and loaded-view content;
-  `held_messages` must therefore be a per-dict snapshot taken before any in-place rewrite. Micro-compaction defrag
-  edits the live marker dict, and an aliased snapshot would refuse every defrag of the current generation as stale.
+  the summary. A gateway projection carries each row's `message_uid` and stored-row CAS snapshot, and the summary is
+  matched by that exact version; only legacy projections without them fall back to role and loaded-view content. The
+  gateway replay builder (`gateway/run.py::_build_replay_entry`) must therefore keep `_db_row_snapshot` on every row
+  whose content it leaves unchanged, and drop it from a rewritten view (timestamp render, mirror prefix, expired
+  confirmation redaction). Tool rows pass through whole with their snapshot, so a summary row stripped of its snapshot
+  looks unheld and every lease-less prune and defrag after the first compaction is refused as "another compaction
+  already committed this session". `held_messages` must also be a per-dict snapshot taken before any in-place rewrite.
+  Micro-compaction defrag edits the live marker dict, and an aliased snapshot would refuse every defrag of the current
+  generation as stale.
 
 Fork patch identity: `hygiene-deferred-adoption`.
 
@@ -36,7 +42,7 @@ prompt count was also stale, so hygiene ran a 93-second compression for a 33-to-
 
 ## Verification
 
-- `scripts/run_tests.sh tests/gateway/test_session_hygiene_turnhold_adoption.py tests/hermes_state/test_stale_held_generation_guard.py tests/agent/test_micro_compaction.py`
+- `scripts/run_tests.sh tests/gateway/test_session_hygiene_turnhold_adoption.py tests/hermes_state/test_stale_held_generation_guard.py tests/agent/test_micro_compaction.py tests/agent/test_proactive_prune_restart_safety.py tests/gateway/test_replay_entry_fields.py`
 - Live: a deferred adoption logs `summary adopted at the watermark-fenced commit boundary` and sends no chat notice.
   The next turn's hygiene check does not report a pre-compaction `actual` token count.
 

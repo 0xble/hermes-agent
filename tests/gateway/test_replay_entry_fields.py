@@ -181,3 +181,21 @@ def test_a_plain_replay_row_does_not_carry_a_tool_call_uid_map_without_its_calls
     replayed, _ = _build_gateway_agent_history(history)
     assert replayed[1]["message_uid"] == "2" * 32
     assert "_tool_call_uids" not in replayed[1] and "_tool_call_uid" not in replayed[1]
+
+
+def test_replay_keeps_the_stored_row_version_only_for_unchanged_content():
+    from gateway.run import _build_gateway_agent_history
+
+    stored = [
+        {"role": "user", "content": "[CONTEXT COMPACTION] summary", "message_uid": "u1",
+         "_db_row_snapshot": "snap1", "_db_persisted": True, "timestamp": 1_700_000_000.0},
+        {"role": "assistant", "content": "ok", "message_uid": "u2", "_db_row_snapshot": "snap2",
+         "_db_persisted": True},
+    ]
+    plain, _ = _build_gateway_agent_history(stored)
+    assert [m.get("_db_row_snapshot") for m in plain] == ["snap1", "snap2"]
+
+    rendered, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
+    assert rendered[0]["content"] != stored[0]["content"]
+    assert "_db_row_snapshot" not in rendered[0]
+    assert rendered[1]["_db_row_snapshot"] == "snap2"
