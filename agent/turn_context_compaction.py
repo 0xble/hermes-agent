@@ -17,7 +17,8 @@ from typing import Any, Dict, List, Optional
 from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
-    compression_skipped_due_to_lock, conversation_history_after_compression,
+    compression_pool_saturated, compression_skipped_due_to_lock,
+    conversation_history_after_compression,
 )
 
 logger = logging.getLogger("agent.turn_context")
@@ -418,16 +419,19 @@ def _run_preflight_passes(
             _preflight_input, system_message, approx_tokens=_preflight_tokens,
             task_id=effective_task_id, trigger="turn_start_threshold",
         )
-        if out.messages is _preflight_input and compression_skipped_due_to_lock(agent):
-            # Lock-skip: another path holds the lock, so this is a DEFER, not proof of
+        if out.messages is _preflight_input and (
+            compression_skipped_due_to_lock(agent) or compression_pool_saturated(agent)
+        ):
+            # Lock or full-pool no-op is a temporary defer, not evidence of
             # incompressibility — don't arm the blocker; stop passes this turn.
             logger.info(
                 # That is a temporary DEFER, not proof the transcript cannot compress — do NOT arm the
                 # insufficient-progress blocker (the loop's error handlers must keep their provider-proven
                 # retry budget) and stop preflight passes for this turn; the lock winner is shrinking the
                 # same session concurrently. See #69870.
-                "Preflight compression deferred: compression lock "
-                "held by another path (session %s)",
+                "Preflight compression deferred: %s (session %s)",
+                "compression pool saturated" if compression_pool_saturated(agent)
+                else "compression lock held by another path",
                 agent.session_id or "none",
             )
             break

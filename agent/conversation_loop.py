@@ -1102,10 +1102,16 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
             "turn deferred: compression transiently blocked (%s) (session=%s) — not counting as "
             "compression exhaustion", block if isinstance(block, str) else "unknown guard", session,
         )
-        _final = (
-            "⏸️ Context compression is temporarily paused after a recent failed attempt. Please retry "
-            "in a moment — compression will resume automatically (or run /compress to force a retry now)."
-        )
+        if block == "pool_saturated":
+            _final = (
+                "⏳ Context compression is waiting for capacity: other sessions are compressing right now. "
+                "Please retry in a moment — compression will resume automatically once a slot frees."
+            )
+        else:
+            _final = (
+                "⏸️ Context compression is temporarily paused after a recent failed attempt. Please retry "
+                "in a moment — compression will resume automatically (or run /compress to force a retry now)."
+            )
     else:
         holder = getattr(agent, "_compression_skipped_due_to_lock", None)
         logger.info(
@@ -1127,8 +1133,8 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
 
 
 def _preflight_hard_window_result(
-    agent, messages: List[Dict], conversation_history, api_call_count: int,
-) -> Dict[str, Any]:
+    agent, messages: list[dict], conversation_history, api_call_count: int,
+) -> dict[str, Any]:
     """Typed fail-closed result for a wire-sized request that still cannot fit.
 
     This is distinct from compression timeout/exhaustion: the accepted input and
