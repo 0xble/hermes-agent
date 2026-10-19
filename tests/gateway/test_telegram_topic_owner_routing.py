@@ -138,6 +138,24 @@ async def test_parallel_owner_reuses_its_own_lane(db):
     assert adapter._bot.create_forum_topic.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_named_shared_owner_resolves_canonical_thread(db):
+    _live_session(db, "existing", "Same subject", 10, managed_mode="automation")
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="job:first", topic_name="Same subject")
+    db.set_telegram_topic_owner_active(
+        chat_id="123", owner_key="job:first", thread_id="10", topic_name="Same subject")
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="job:second", topic_name="Same subject")
+    db.set_telegram_topic_owner_shared(
+        chat_id="123", owner_key="job:second", canonical_owner_key="job:first",
+        topic_name="Same subject")
+
+    adapter = _adapter(db)
+    result = await adapter.ensure_dm_topic("123", "Same subject", owner_key="job:second")
+
+    assert result == "10"
+    assert adapter._bot.create_forum_topic.await_count == 0
+
+
 def test_owner_state_survives_restart_and_retired_owner_is_not_active(db, tmp_path):
     db_path = tmp_path / "state.db"
     db.reserve_telegram_topic_owner(chat_id="123", owner_key="job:x", topic_name="X")
@@ -243,6 +261,58 @@ def test_conflicting_activation_retires_creating_claim(db):
 
     second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
     assert second["status"] == "conflict"
+
+
+def _two_owned_threads(db):
+    _live_session(db, "first-session", "First", 100)
+    _live_session(db, "third-session", "Third", 200)
+    for owner_key, thread_id in (("cron:first", "100"), ("cron:third", "200")):
+        db.reserve_telegram_topic_owner(chat_id="123", owner_key=owner_key, topic_name="X")
+        db.set_telegram_topic_owner_active(
+            chat_id="123", owner_key=owner_key, thread_id=thread_id, topic_name="X")
+
+
+def test_shared_owner_is_refused_on_thread_held_by_another_owner(db):
+    _two_owned_threads(db)
+    adapter = _adapter(db)
+    adapter.ensure_existing_telegram_topic_owner("123", "100", "cron:second")
+
+    with pytest.raises(RuntimeError, match="refusing reroute"):
+        adapter.ensure_existing_telegram_topic_owner("123", "200", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["canonical_owner_key"] == "cron:first"
+
+
+@pytest.mark.parametrize("stuck_status", ["conflict", "retired"])
+def test_stuck_owner_is_refused_on_thread_held_by_unrelated_owner(db, stuck_status):
+    _two_owned_threads(db)
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:second", topic_name="X")
+    db.set_telegram_topic_owner_state(
+        chat_id="123", owner_key="cron:second", status=stuck_status,
+        canonical_owner_key="cron:first")
+
+    with pytest.raises(RuntimeError, match="refusing reroute"):
+        _adapter(db).ensure_existing_telegram_topic_owner("123", "200", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == stuck_status
+    assert second["canonical_owner_key"] == "cron:first"
+
+
+@pytest.mark.parametrize("stuck_status", ["conflict", "retired"])
+def test_stuck_owner_without_canonical_is_not_bound_to_thread_owner(db, stuck_status):
+    _two_owned_threads(db)
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="cron:second", topic_name="X")
+    db.set_telegram_topic_owner_state(
+        chat_id="123", owner_key="cron:second", status=stuck_status)
+
+    with pytest.raises(RuntimeError, match="refusing reroute"):
+        _adapter(db).ensure_existing_telegram_topic_owner("123", "200", "cron:second")
+
+    second = db.get_telegram_topic_owner(chat_id="123", owner_key="cron:second")
+    assert second["status"] == stuck_status
+    assert not second["canonical_owner_key"]
 
 
 def test_numeric_topic_without_binding_fails_closed(db):
