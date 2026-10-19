@@ -1413,7 +1413,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.delivery_queue.enqueue", return_value={"status": "queued"}) as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
@@ -1426,7 +1426,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.delivery_queue.enqueue", return_value={"status": "queued"}) as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
@@ -1437,7 +1437,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.delivery_queue.enqueue", return_value={"status": "queued"}) as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
@@ -1452,7 +1452,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
                  patch("cron.scheduler.run_job", return_value=(True, "# output", marker, None)), \
                  patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-                 patch("cron.scheduler._deliver_result") as deliver_mock, \
+                 patch("cron.delivery_queue.enqueue", return_value={"status": "queued"}) as deliver_mock, \
                  patch("cron.scheduler.mark_job_run"):
                 tick(verbose=False)
             deliver_mock.assert_not_called()
@@ -1465,7 +1465,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.delivery_queue.enqueue", return_value={"status": "queued"}) as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
@@ -1477,7 +1477,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.delivery_queue.enqueue", return_value={"status": "queued"}) as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
@@ -1488,7 +1488,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output") as save_mock, \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.delivery_queue.enqueue", return_value={"status": "queued"}) as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             save_mock.return_value = "/tmp/out.md"
             from cron.scheduler import tick
@@ -1502,12 +1502,13 @@ class TestSilentDelivery:
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.delivery_queue.enqueue", return_value={"status": "queued"}) as deliver_mock, \
              patch("cron.scheduler.mark_job_run") as mark_mock:
             from cron.scheduler import tick
             tick(verbose=False)
 
         deliver_mock.assert_not_called()
+        assert mark_mock.call_args.kwargs["execution_id"]
         mark_mock.assert_called_once()
         assert mark_mock.call_args[0][:2] == ("monitor-job", False)
 

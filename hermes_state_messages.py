@@ -1988,9 +1988,13 @@ class SessionMessagesMixin:
         """
         rows = self._fetch_conversation_rows(
             self._resume_lineage_ids(session_id), _DISPLAY_ACTIVE_CLAUSE, with_session_id=True)
-        # The model projection stays active-only: it is the compressed working context.
+        # The model projection stays active-only: it is the compressed working context. The gateway's
+        # first-turn ``session_meta`` marker (tools/model/platform bookkeeping) is transcript logging,
+        # never LLM input: a resuming surface that fed it to the agent would count it in the history
+        # and send a prefix the previous process never sent.
         model_history = self._rows_to_conversation(
-            [r for r in rows if r["session_id"] == session_id and r["active"]], session_id=session_id,
+            [r for r in rows if r["session_id"] == session_id and r["active"] and r["role"] != "session_meta"],
+            session_id=session_id,
             include_ancestors=False, repair_alternation=True, include_row_ids=True, include_summary_markers=True)
         display_history = self._rows_to_conversation(
             self._dedupe_display_generations(rows), session_id=session_id,

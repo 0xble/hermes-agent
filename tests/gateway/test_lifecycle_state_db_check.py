@@ -8,11 +8,8 @@ it on 2026-08-30 17:15 and surfaced as "Session not found".
 
 ``record_startup`` already detects the unclean exit and logs "SIGKILL / OOM /
 VM death" — it just never looked at the database that death may have torn.
-The check is gated on the unclean exit; a clean boot must not scan. Where it
-runs depends on the on-disk journal mode: a WAL store is scanned off the
-readiness path (a WAL reader never blocks writers), while a rollback-journal
-store is scanned synchronously before any writer exists, because its reader
-holds SHARED for the whole scan and fails every writer with "database is locked".
+The check is gated on the unclean exit; a clean boot must not scan. WAL scans
+are deferred until after startup so the forensic check cannot gate readiness.
 """
 from __future__ import annotations
 
@@ -92,7 +89,6 @@ def _exit_diag_records(home: Path) -> list:
     if not log.exists():
         return []
     return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
-
 
 
 @pytest.fixture(autouse=True)
@@ -320,6 +316,7 @@ def test_deferred_startup_never_runs_the_check_inline(tmp_path: Path, monkeypatc
         return "ok"
 
     monkeypatch.setattr(ledger, "check_state_db_integrity", _blocking_check)
+    _make_state_db(tmp_path, corrupt=False, journal="wal")
     _write_sentinel(tmp_path)
 
     begin = time.monotonic()
@@ -401,7 +398,7 @@ def test_deferred_scan_still_runs_on_a_wal_store(tmp_path: Path, monkeypatch) ->
 
 
 def test_deferred_scan_skips_a_rollback_journal_store(tmp_path: Path, monkeypatch, caplog) -> None:
-    path = _make_state_db(tmp_path, corrupt=False)
+    path = _make_state_db(tmp_path, corrupt=False, journal="delete")
     calls = _spy_on_scan(monkeypatch)
     evidence = {"prior_pid": _DEAD_PID}
 
@@ -471,6 +468,20 @@ def test_deadline_bounds_the_scan(tmp_path: Path, monkeypatch) -> None:
     assert verdict.startswith("check-incomplete: exceeded"), verdict
 
 
+def test_bounded_background_scan_never_renews_the_startup_lease(tmp_path: Path, monkeypatch) -> None:
+    """The fork guard: only the synchronous startup scan may renew the startup-watchdog
+    lease. A deadline-bounded background scan renewing it would mask a wedged startup."""
+    import gateway.lifecycle_ledger as ledger
+
+    handle = _armed_handle(monkeypatch)
+    monkeypatch.setattr(ledger, "_INTEGRITY_CHECK_LEASE_RENEW_S", 0.0)
+    monkeypatch.setattr(ledger, "_INTEGRITY_CHECK_PROGRESS_OPS", 1_000)
+    _make_state_db(tmp_path, corrupt=False)
+
+    assert check_state_db_integrity(home=tmp_path, deadline_s=60.0) == "ok"
+    assert getattr(handle, "_lease_phase", None) != "state_db_unclean_integrity_check"
+
+
 def test_no_deadline_keeps_the_historic_verdict_contract(tmp_path: Path, monkeypatch) -> None:
     """``deadline_s=None`` must be byte-for-byte today's behaviour: the handler never aborts."""
     import gateway.lifecycle_ledger as ledger
@@ -480,8 +491,6 @@ def test_no_deadline_keeps_the_historic_verdict_contract(tmp_path: Path, monkeyp
 
     assert check_state_db_integrity(home=tmp_path) == "ok"
     assert check_state_db_integrity(home=tmp_path, deadline_s=None) == "ok"
-
-
 
 
 def _held_check(monkeypatch, verdict=None, *, on_start=None):
@@ -629,30 +638,6 @@ def test_rollback_journal_check_renews_the_startup_lease_while_sqlite_progresses
     assert verdict not in ("ok", "absent") and not verdict.startswith("check-failed")
 
 
-def test_unclean_exit_check_renews_the_startup_lease_while_sqlite_progresses(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """A 37 GB store needs ~4200 s of quick_check; one 900 s entry lease cannot cover it
-    and the watchdog killed every boot with exit 75 (#115542). The check must keep renewing
-    a phase-owned lease from SQLite's progress handler for as long as the PRAGMA advances,
-    through the real unclean-exit entry point.
-    """
-    import gateway.lifecycle_ledger as ledger
-
-    handle = _armed_handle(monkeypatch)
-    # Renew on every handler tick so the renewal count is deterministic, not clock-bound.
-    monkeypatch.setattr(ledger, "_INTEGRITY_CHECK_LEASE_RENEW_S", 0.0)
-    monkeypatch.setattr(ledger, "_INTEGRITY_CHECK_PROGRESS_OPS", 1_000)
-    _make_state_db(tmp_path, corrupt=False)
-    _write_sentinel(tmp_path)
-
-    evidence = record_startup(home=tmp_path, defer_integrity_check=False)
-
-    assert evidence is not None and evidence["state_db_integrity"] == "ok"
-    assert handle._lease_phase == "state_db_unclean_integrity_check"
-    assert handle._lease_count > 1, "lease was taken once at entry and never renewed"
-
-
 def test_unclean_exit_check_keeps_the_verdict_contract_under_the_lease(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -661,73 +646,8 @@ def test_unclean_exit_check_keeps_the_verdict_contract_under_the_lease(
     handle = _armed_handle(monkeypatch)
     _make_state_db(tmp_path, corrupt=True)
 
-    verdict = check_state_db_integrity(home=tmp_path)
+    verdict = check_state_db_integrity(home=tmp_path, renew_startup_lease=True)
 
     assert verdict not in ("ok", "absent") and not verdict.startswith("check-failed")
     assert handle._lease_phase == "state_db_unclean_integrity_check"
     assert check_state_db_integrity(home=tmp_path / "nowhere") == "absent"
-
-
-def test_unclean_exit_on_a_healthy_store_records_ok(tmp_path: Path) -> None:
-    _make_state_db(tmp_path, corrupt=False)
-    _write_sentinel(tmp_path)
-
-    evidence = record_startup(home=tmp_path, defer_integrity_check=False)
-
-    assert evidence is not None
-    assert evidence["state_db_integrity"] == "ok"
-
-
-def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch) -> None:
-    """A clean boot must not scan the store — that is the whole cost gate."""
-    _make_state_db(tmp_path, corrupt=True)
-    _write_sentinel(tmp_path, phase="exited")
-
-    called = []
-    import gateway.lifecycle_ledger as ledger
-
-    monkeypatch.setattr(
-        ledger, "check_state_db_integrity", lambda **kw: called.append(1) or "ok"
-    )
-    record_startup(home=tmp_path)
-
-    assert not called, "integrity check ran on a clean boot"
-
-
-
-def test_unclean_exit_records_the_corruption_verdict(tmp_path: Path) -> None:
-    _make_state_db(tmp_path, corrupt=True)
-    _write_sentinel(tmp_path)
-
-    evidence = record_startup(home=tmp_path, defer_integrity_check=False)
-
-    assert evidence is not None
-    assert evidence["state_db_integrity"] != "ok"
-    record = _exit_diag_records(tmp_path)[0]
-    assert record["state_db_integrity"] != "ok"
-
-
-def test_unclean_exit_on_a_healthy_store_records_ok(tmp_path: Path) -> None:
-    _make_state_db(tmp_path, corrupt=False)
-    _write_sentinel(tmp_path)
-
-    evidence = record_startup(home=tmp_path, defer_integrity_check=False)
-
-    assert evidence is not None
-    assert evidence["state_db_integrity"] == "ok"
-
-
-def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch) -> None:
-    """A clean boot must not scan the store — that is the whole cost gate."""
-    _make_state_db(tmp_path, corrupt=True)
-    _write_sentinel(tmp_path, phase="exited")
-
-    called = []
-    import gateway.lifecycle_ledger as ledger
-
-    monkeypatch.setattr(
-        ledger, "check_state_db_integrity", lambda **kw: called.append(1) or "ok"
-    )
-    record_startup(home=tmp_path)
-
-    assert not called, "integrity check ran on a clean boot"

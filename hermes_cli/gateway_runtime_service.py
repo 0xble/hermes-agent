@@ -42,17 +42,14 @@ def service_suffix(home: Path) -> str:
     profile name; any other root (Docker, a temp harness) yields a path hash so a
     custom root can never resolve to the production ``hermes-gateway`` unit.
     """
-    from hermes_constants import _platform_default_hermes_home
-    from hermes_cli.gateway import _profile_name_from_home
-    # ``Path.home()`` follows the isolated HOME used by e2e harnesses. Launchd and
-    # systemd service names are account-wide identities, so their native default
-    # must come from the OS account, not that temporary profile HOME.
-    try:
-        import pwd
-        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except (ImportError, KeyError, OSError):
-        account_home = Path.home()
-    default = _platform_default_hermes_home(os.environ, lambda: account_home).resolve()
+    from hermes_constants import _get_platform_default_hermes_home
+    from hermes_cli.gateway import _launchd_account_home, _profile_name_from_home, is_macos
+    default = _get_platform_default_hermes_home()
+    if is_macos():
+        # Same authority as ``_native_service_homes``: launchd labels are account-wide, so an
+        # isolated HOME (e2e harness, sandbox) must not claim the account's bare label.
+        default = _launchd_account_home() / (".hermes" + os.environ.get("HERMES_DATA_DIR_SUFFIX", ""))
+    default = default.resolve()
     home = home.resolve()
     if home == default:
         return ""
