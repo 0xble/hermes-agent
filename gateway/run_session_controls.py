@@ -379,8 +379,15 @@ class GatewaySessionControlsMixin:
         }.get(action, action)
         change = (f"\n{cls._change_text(record)}"
                   if action == "replace" and record.get("affected_text") else "")
+        authority = record.get("authority") or {}
+        if authority.get("via") == "session":
+            session_id = cls._clip(str(authority.get("session_id") or requester_id), 120)
+            return (
+                f"⊘ {kind.title()} {verb} by {requester} "
+                f"(applied by session {session_id} without approval){change}"
+            )
         if quote:
-            message = str((record.get("authority") or {}).get("message") or "")
+            message = str(authority.get("message") or "")
             full = (f"\nFull message: \"{cls._clip(message, 1200)}\""
                     if message and message != quote else "")
             quote = cls._clip(quote, 300)
@@ -394,8 +401,12 @@ class GatewaySessionControlsMixin:
         target = f"{target_title} ({target_id})"
         action = f"{record.get('kind', '')} {record.get('action', '')}"
         if record.get("status") == "applied":
-            if record.get("authority", {}).get("via") == "quote":
+            authority = record.get("authority") or {}
+            if authority.get("via") == "quote":
                 how = "using your quoted words"
+            elif authority.get("via") == "session":
+                session_id = cls._clip(str(authority.get("session_id") or ""), 120)
+                how = f"by session authority{f' from {session_id}' if session_id else ''}"
             else:
                 how = "after Telegram approval"
             change = (f"\n{cls._change_text(record)}"

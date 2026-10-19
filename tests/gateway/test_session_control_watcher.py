@@ -586,6 +586,19 @@ def test_replace_notices_show_old_and_new_goal(state):
     assert "(approved in Telegram)\nAffected: goal: ship now\nProposed goal: write docs" in runner._control_notice(approved)
     assert "after Telegram approval.\nAffected: goal: ship now\nProposed goal: write docs" in runner._requester_notice(approved)
 
+    session_applied = apply_control(
+        "goal", "replace", "target", requester_sid="requester", reason="session pivot",
+        payload={"goal": "update the plan"},
+    )
+    assert (
+        "(applied by session requester without approval)"
+        in runner._control_notice(session_applied["record"])
+    )
+    assert (
+        "by session authority from requester."
+        in runner._requester_notice(session_applied["record"])
+    )
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("handoff", ["event_loop", "reentrant"])

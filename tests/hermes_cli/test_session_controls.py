@@ -266,7 +266,7 @@ def test_goal_replace_records_continuation_prompt(state):
     assert result["record"]["continuation_prompt"] == result["continuation_prompt"]
 
 
-@pytest.mark.parametrize("via", ["quote", "button"])
+@pytest.mark.parametrize("via", ["quote", "button", "session"])
 @pytest.mark.parametrize("replacement_count", [1, 2])
 def test_replacement_prompts_bind_only_the_current_contract(state, via, replacement_count):
     """Both real authority paths supersede all prior contracts/criteria. Revision rows stay an audit
@@ -276,7 +276,7 @@ def test_replacement_prompts_bind_only_the_current_contract(state, via, replacem
     from hermes_cli.goals import GoalContract, GoalManager, judge_goal, load_goal
     from hermes_cli.session_controls import apply_control, resolve_request
 
-    target_sid = "target" if via == "quote" else "requester"
+    target_sid = "requester" if via == "button" else "target"
     manager = GoalManager(target_sid)
     manager.set("migrate production", contract=GoalContract(
         verification="production migration verified", constraints="do not lose production data",
@@ -290,7 +290,6 @@ def test_replacement_prompts_bind_only_the_current_contract(state, via, replacem
 
     def replace(goal, verification):
         quote = f"replace the target goal with {goal}"
-        target_sid = "target" if via == "quote" else "requester"
         if via == "quote":
             _user(state, "requester", f"Please {quote}")
         result = apply_control(
@@ -343,6 +342,33 @@ def test_replacement_prompts_bind_only_the_current_contract(state, via, replacem
     # Prompt building changes no audit data.
     assert manager.state.revisions == history
     assert load_goal(target_sid).revisions == history
+
+
+def test_session_replacement_resets_resume_override(state):
+    from unittest.mock import patch
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import apply_control
+
+    manager = GoalManager("target")
+    manager.set("continue despite the blocker")
+    assert manager.state is not None
+    with patch.object(goals, "judge_goal", return_value=(
+        "blocked", "the irreversible no-delete constraint would be breached", False, None, False,
+    )):
+        assert manager.evaluate_after_turn("I cannot proceed")["verdict"] == "blocked"
+    assert manager.resume() is not None
+    assert manager.state.has_resume_override() is True
+
+    result = apply_control(
+        "goal", "replace", "target", requester_sid="requester", reason="pivot",
+        payload={"goal": "ship the release"},
+    )
+    assert result["status"] == "applied"
+    assert result["record"]["authority"]["via"] == "session"
+    replaced_state = GoalManager("target").state
+    assert replaced_state is not None
+    assert replaced_state.has_resume_override() is False
 
 
 def test_button_approved_replace_records_user_authority(state):

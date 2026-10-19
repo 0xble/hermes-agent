@@ -1167,7 +1167,7 @@ class GoalState:
         return max(
             (i for i, revision in enumerate(self.revisions)
              if revision.get("kind") == "replace" and revision.get("actor") == "user"
-             and revision.get("authority") in {"quote", "button", "explicit_command"}),
+             and revision.get("authority") in {"quote", "button", "session", "explicit_command"}),
             default=-1,
         )
 
