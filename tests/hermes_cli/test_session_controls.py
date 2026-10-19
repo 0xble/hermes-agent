@@ -98,6 +98,26 @@ def test_cross_session_goal_changes_do_not_wait_for_approval(state):
     assert load_goal("target").goal == "new objective"
 
 
+def test_cross_session_goal_replace_without_an_active_goal_fails_before_any_request(state):
+    from hermes_cli.goals import load_goal
+    from hermes_cli.session_controls import apply_control, pending_outbox
+
+    result = apply_control(
+        "goal", "replace", "target", requester_sid="requester", reason="pivot",
+        payload={"goal": "new objective"},
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert result["error_code"] == "no_goal"
+    assert result["error"] == "there is no active or paused goal to replace"
+    assert result["state"] is None
+    assert result["revision"] is None
+    assert "record" not in result
+    assert load_goal("target") is None
+    assert not [record for record in pending_outbox() if record.get("status") == "pending"]
+
+
 def test_self_goal_change_approval_is_non_blocking_and_second_press_noop(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.session_controls import apply_control, resolve_request
@@ -799,21 +819,24 @@ def test_approval_allows_progress_without_overwriting_it(state, kind):
     assert json.loads(state.get_meta(key))[counter] == 9
 
 
-def test_replace_refuses_done_goal_on_quote_and_approval_paths(state):
+def test_replace_refuses_done_goal_before_quote_and_approval_paths(state):
     from hermes_cli.goals import GoalManager, load_goal
-    from hermes_cli.session_controls import apply_control, request_control, resolve_request
+    from hermes_cli.session_controls import apply_control, request_control
 
     GoalManager("target").set("finished work")
     GoalManager("target").mark_done("verified")
     pending = request_control("goal", "replace", "target", requester_sid="requester",
                               payload={"goal": "brand new objective"})
-    approved = resolve_request(pending["id"], "approve", "admin")
-    assert approved["status"] == "failed"
+    assert pending["error_code"] == "no_goal"
+    assert pending["status"] == "failed"
+    assert pending["revision"] is None
     _user(state, "requester", "Please replace the target goal with brand new objective")
     quoted = apply_control("goal", "replace", "target", requester_sid="requester",
                            user_quote="replace the target goal with brand new objective",
                            payload={"goal": "brand new objective"})
-    assert quoted["ok"] is False
+    assert quoted["error_code"] == "no_goal"
+    assert quoted["status"] == "failed"
+    assert quoted["revision"] is None
     assert load_goal("target").status == "done"
     assert load_goal("target").goal == "finished work"
 

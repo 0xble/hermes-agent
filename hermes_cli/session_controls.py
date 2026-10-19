@@ -941,6 +941,23 @@ def _has_gateway_route(session_id: str) -> bool:
     return platform.value != "local"
 
 
+def _goal_replace_failure(target_sid: str, *, cursor=None) -> Optional[dict[str, Any]]:
+    """Return the same no-goal failure the manager would return, before request creation."""
+    from hermes_cli.goals import load_goal
+
+    state = load_goal(target_sid, cursor=cursor)
+    if state is not None and getattr(state, "status", None) in {"active", "paused"}:
+        return None
+    return {
+        "ok": False,
+        "status": "failed",
+        "error_code": "no_goal",
+        "error": "there is no active or paused goal to replace",
+        "state": state,
+        "revision": None,
+    }
+
+
 def request_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
                     reason: str = "", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Create a durable, 24-hour pending approval request."""
@@ -956,6 +973,10 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
     db = _db()
 
     def create(conn):
+        if kind == "goal" and action == "replace":
+            failure = _goal_replace_failure(target_sid, cursor=conn)
+            if failure is not None:
+                return failure
         # Card description and binding come from one SQLite snapshot, never two manager loads.
         raw = _meta_value(conn, _definition_key(kind, target_sid))
         record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
@@ -990,6 +1011,11 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         target_sid = resolve_target(target_sid)
     except ValueError as exc:
         return {"ok": False, "error_code": str(exc), "error": str(exc)}
+
+    if kind == "goal" and action == "replace":
+        failure = _goal_replace_failure(target_sid)
+        if failure is not None:
+            return failure
 
     cross_session_goal_change = _is_cross_session_goal_change(
         kind, action, target_sid, requester_sid,
