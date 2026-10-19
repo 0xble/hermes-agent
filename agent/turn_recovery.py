@@ -1784,7 +1784,7 @@ def route_classified_error(
         compression_pool_saturated,
         conversation_history_after_compression,
     )
-    from agent.conversation_loop import _arm_fallback_restart, _ra
+    from agent.conversation_loop import _arm_fallback_restart, _compression_deferred_result, _ra
     from agent.model_metadata import estimate_request_tokens_rough
 
     _provider_overflow_recovery_pending = False
@@ -1860,6 +1860,15 @@ def route_classified_error(
             if compression_pool_saturated(agent):
                 # Pool admission is a transient defer, not a spent recovery attempt.
                 compression_attempts -= 1
+                conversation_history = conversation_history_after_compression(
+                    agent, messages, conversation_history
+                )
+                return _verdict(
+                    "return",
+                    _compression_deferred_result(
+                        agent, messages, api_call_count, reason="transient_block"
+                    ),
+                )
             conversation_history = conversation_history_after_compression(agent, messages, conversation_history)
             if len(messages) < original_len or old_ctx > _LONG_CONTEXT_TIER_CAP:
                 agent._buffer_diagnostic_status(
