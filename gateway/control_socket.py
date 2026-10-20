@@ -67,8 +67,7 @@ def _fallback_socket_path(home: Path, slot: str = SLOT_ACTIVE) -> Path:
     """Short path for homes whose direct socket path exceeds sun_path: private runtime first,
     then shared temp locations using the authenticated ``hermes-gw-<hash>/control.sock`` shape.
     """
-    dirname = f"hermes-gw-{_home_hash(home)}" + ("" if slot == SLOT_ACTIVE else f"-{slot}")
-    name = f"{dirname}/control.sock"
+    name = slot_filename(f"hermes-gw-{_home_hash(home)}.sock", slot)
     runtime = _private_runtime_dir()
     candidates = ([runtime / name] if runtime else []) + [Path(tempfile.gettempdir()) / name] + (
         [] if _IS_WINDOWS else [Path("/tmp") / name])

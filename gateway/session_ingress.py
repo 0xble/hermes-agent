@@ -205,6 +205,16 @@ def row_turn_author(policy, row):
 
 
 async def execute_admission(authority, ref, row):
+    # An admission explicitly claimed by the restore executor owns the corresponding queued
+    # inbound event. Remove it before dispatch so replay cannot run it a second time.
+    queue = getattr(authority.runner, '_startup_restore_queue', None)
+    if queue:
+        admission_id = row.get('admission_id')
+        authority.runner._startup_restore_queue = [
+            event for event in queue
+            if getattr(event, 'message_id', None) != admission_id
+            and getattr(event, '_outbox_admission_id', None) != admission_id
+        ]
     from gateway.session_completion_notes import note_if_unviewed
     noted = await note_if_unviewed(authority, ref, row)  # #134889 LC-7: no viewer, no turn
     if noted is not None:

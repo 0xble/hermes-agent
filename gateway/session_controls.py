@@ -400,7 +400,7 @@ class AuthorityConnection:
                 receipt = ref
                 await tracked_write(self.authority, partial(
                     commit_local_session, self.authority.db, epoch=self.authority.epoch, receipt=receipt))
-                ref = restore_local_session(self.authority, receipt['session_id'])
+                ref = await asyncio.to_thread(restore_local_session, self.authority, receipt['session_id'])
             # `--accept-hooks`: record this launch's consent; ``resume`` below registers the hooks.
             if params.get('accept_hooks') is True:
                 from gateway.session_policy import accept_launch_hooks, restore_policy

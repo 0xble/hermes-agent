@@ -218,8 +218,9 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
             + self._active_deferred_agent_worker_count()
             # Delegations count as busy in gateway_state.json/status and restart waits.
             # _drain_active_agents()/_drain_work_counts() deliberately exclude them
-            # so stop() still reaches the delegation interrupt path.
-            + self._active_async_delegation_count()
+            # so stop() still reaches the delegation interrupt path. Resolved via the class when a
+            # bare runner double lacks the hook (upstream drain tests call this unbound).
+            + getattr(self, "_active_async_delegation_count", GatewayShutdownMixin._active_async_delegation_count)()
         )
 
     @staticmethod

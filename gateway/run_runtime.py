@@ -417,6 +417,7 @@ async def recover_gateway_native_sessions(runner):
             await recover_webhook_finalizations(authority)
             pending = {row['target_session_id'] for row in authority.db._read_all(
                 "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
+            # The session-store lock guards state.db writes; never wait on it from the loop thread.
             session_entries = await asyncio.to_thread(runner.session_store.list_sessions)
             bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
                         for entry in session_entries if entry.origin is not None

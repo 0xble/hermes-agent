@@ -149,7 +149,11 @@ class ProfileOwnership:
             return tuple(self._handles)
 
     def reserve(self, homes) -> None:
+        from gateway.gateway_slot import effective_gateway_slot, slot_filename
         from gateway.status import _try_acquire_file_lock, _build_pid_record
+        # Zero-cut handover: a slot-b gateway reserves ``gateway.b.lock`` beside slot a's
+        # ``gateway.lock``; this process's own slot, never the probed serving slot.
+        lock_name = slot_filename('gateway.lock', effective_gateway_slot())
         with self._mutex:
             added = []
             try:
@@ -157,7 +161,7 @@ class ProfileOwnership:
                     if home in self._handles:
                         continue
                     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    path = home / 'gateway.lock'
+                    path = home / lock_name
                     fd = _open_lock(path)
                     handle = os.fdopen(fd, 'r+', encoding='utf-8')  # windows-footgun: ok — write-only
                     try:

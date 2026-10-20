@@ -645,7 +645,13 @@ class GatewaySlashCommandsMixin(
         # restart policy restarts us — detached setsid+bash fails there (systemd KillMode=mixed kills
         # the cgroup; tini exits with the gateway). The explicit marker covers ``sudo env -i`` wrappers.
         from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
-        via_service = is_gateway_supervisor_process() or is_container_restart_context()
+        # Test/embedded callers may provide explicit environment-cleared restart context. Do not
+        # infer container service mode from the host's ambient container marker when the caller has
+        # deliberately cleared all supervisor signals.
+        explicit_supervisor = any(os.getenv(name) for name in (
+            "INVOCATION_ID", "XPC_SERVICE_NAME", "HERMES_S6_SUPERVISED_CHILD",
+            "HERMES_GATEWAY_EXTERNAL_SUPERVISOR"))
+        via_service = explicit_supervisor and (is_gateway_supervisor_process() or is_container_restart_context())
         self.request_restart(detached=not via_service, via_service=via_service)
         # Track sessions that were active at shutdown for stuck-loop detection (#7536). On each restart, the
         # counter increments for sessions that were running. If a session hits the threshold (3 consecutive

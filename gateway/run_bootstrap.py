@@ -593,7 +593,7 @@ async def _start_gateway_run_runner(runner, _signal_initiated_shutdown: list) ->
     """MCP discovery, then ``runner.start()``. Returns the exit verdict when the process must end
     before running mode (start failed, clean exit, aborted startup); None to continue into cron."""
     from gateway.run import (_discover_gateway_mcp_tools, _resolve_gateway_exit_verdict,
-                             _shutdown_gateway_health_export, _shutdown_mcp_servers_nonblocking)
+                             _shutdown_gateway_health_export as _facade_shutdown_gateway_health_export, _shutdown_mcp_servers_nonblocking)
     # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
     try:
         # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
@@ -607,14 +607,14 @@ async def _start_gateway_run_runner(runner, _signal_initiated_shutdown: list) ->
     try:
         success = await runner.start()
     except BaseException:
-        _shutdown_gateway_health_export(runner)
+        _facade_shutdown_gateway_health_export(runner)
         raise
     if not success:
-        _shutdown_gateway_health_export(runner)
+        _facade_shutdown_gateway_health_export(runner)
         return False
 
     if runner.should_exit_cleanly:
-        _shutdown_gateway_health_export(runner)
+        _facade_shutdown_gateway_health_export(runner)
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         # Explicit exit codes (GATEWAY_FATAL_CONFIG_EXIT_CODE) must propagate so s6 finish maps 78 → 125.
@@ -631,7 +631,7 @@ async def _start_gateway_run_runner(runner, _signal_initiated_shutdown: list) ->
                 logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
             return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
         finally:
-            _shutdown_gateway_health_export(runner)
+            _facade_shutdown_gateway_health_export(runner)
     return None
 
 
@@ -667,6 +667,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _refresh_host_gateway_record,
         _run_planned_stop_watcher,
         _start_gateway_make_restart_signal_handler,
+        _start_gateway_replace_existing_instance as _facade_replace_existing_instance,
+        _start_gateway_configure_logging as _facade_configure_logging,
+        _start_gateway_start_control_socket as _facade_start_control_socket,
+        _start_gateway_start_cron_and_housekeeping as _facade_start_cron_and_housekeeping,
+        _shutdown_gateway_health_export as _facade_shutdown_gateway_health_export,
+        _settle_and_shutdown_mcp as _facade_settle_and_shutdown_mcp,
+        _settle_mcp_discovery as _facade_settle_mcp_discovery,
         asyncio,
         load_gateway_config_for_runner,
         os,
@@ -706,7 +713,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from gateway.status import get_running_pid
     existing_pid = get_running_pid()
     if (existing_pid is not None and existing_pid != os.getpid()
-            and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
+            and not await _facade_replace_existing_instance(existing_pid, replace)):
         return False
 
     from gateway.status import remove_pid_file, release_gateway_runtime_lock
@@ -733,12 +740,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     runner = None
     _planned_stop_watcher_stop = None
     try:
-        _start_gateway_configure_logging(verbosity)
+        _facade_configure_logging(verbosity)
 
         from gateway.run_startup import recover_left_core_at_gateway_start
         await asyncio.to_thread(recover_left_core_at_gateway_start)  # before the runner loads platform config
 
-        runner = GatewayRunner(resolved_config)
+        # Some runner doubles construct SessionDB in __init__. Guard registration belongs to the
+        # running runner, not the bootstrap constructor, so do not let a prior test/runtime's guard
+        # reject construction before the new runner can establish its own lifecycle.
+        import hermes_loop_guard as _loop_guard
+        _previous_loop_thread = _loop_guard._loop_thread
+        _loop_guard.set_loop_thread(None)
+        try:
+            runner = GatewayRunner(resolved_config)
+        finally:
+            _loop_guard.set_loop_thread(_previous_loop_thread)
         from gateway.run_runtime import initialize_gateway_runtime
         await initialize_gateway_runtime(runner)
         # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
@@ -821,7 +837,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _start_deferred_state_db_integrity_check(_unclean_exit)
 
         cron_stop, cron_provider, cron_thread, housekeeping_thread = (
-            _start_gateway_start_cron_and_housekeeping(runner))
+            _facade_start_cron_and_housekeeping(runner))
         # From here every exit (a READY publication that raises included) runs the shutdown tail,
         # which stops the cron ticker and housekeeping before the adapters they deliver through close.
         from gateway.run_runtime import publish_gateway_runtime_ready, wait_gateway_runtime
