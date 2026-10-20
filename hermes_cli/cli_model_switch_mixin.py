@@ -68,6 +68,9 @@ def stored_session_route(session_meta, *, current_model, current_provider):
         base_url = None
         if provider is None:
             api_mode = None
+    if provider is None:
+        base_url = None
+        api_mode = None
     provider_changed = bool(provider) and provider != current_provider
     if stored_model == current_model and not provider_changed:
         return None

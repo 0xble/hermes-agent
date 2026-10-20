@@ -18,6 +18,7 @@ from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_
 # Transcript-repair bookkeeping riding on batch rows / live dicts (agent/transcript_repair.py): the
 # stored-row CAS digest and the durable row adopted onto the live dict. Never transcript payload.
 DB_ROW_SNAPSHOT = "_db_row_snapshot"
+REPLAY_PERSISTED_CONTENT = "_replay_persisted_content"
 CANONICAL_ROW = "_canonical_row"
 REPAIR_BOOKKEEPING_FIELDS = frozenset({DB_ROW_SNAPSHOT, CANONICAL_ROW})
 # Unanswered text a merged user row held before the current turn was absorbed
@@ -46,7 +47,7 @@ PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset(
     {"timestamp", "display_kind", "display_metadata", "_row_id", "_submit_row_session_id",
      MERGED_TURN_PREFIX, MESSAGE_UID, ABSORBED_MESSAGE_UIDS, TOOL_CALL_UIDS, TOOL_CALL_UID,
      # The alternation repair's row counts: an in-place compaction reads them off the live dict.
-     MERGED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS, RETIRED_DURABLE_ROWS}
+     MERGED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, REPLAY_PERSISTED_CONTENT}
 ) | REPAIR_BOOKKEEPING_FIELDS
 
 

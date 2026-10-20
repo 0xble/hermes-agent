@@ -4,11 +4,11 @@ Unlock: ``op signin --raw`` with the master password on stdin (desktop-app
 integration or account-level auth) mints an ``OP_SESSION_<account>`` token.
 A configured service-account token skips the prompt entirely (headless).
 List: ``op item list --categories Login,"Credit Card" --format json`` → title,
-urls, username / masked card number, and vault hints. Display listings are reused for 15 minutes
-and fetched single-flight. Fill authorization instead resolves exactly one handle with a fresh
-metadata-only ``op item get <id> --vault <vault-id> --format json``; its verified vault is then
-used for the secret read, as required for service accounts. Cards carry no origin: the browser
-binds them to the page it is on and the user confirms that origin per fill.
+urls, username / masked card number. Display listings are reused for 15 minutes and fetched
+single-flight. Fill authorization instead resolves exactly one handle with a fresh metadata-only
+``op item get <id> --vault <vault-id> --format json``; its verified vault is then used for the
+secret read. Cards carry no origin: the browser binds them to the page it is on and the user
+confirms that origin per fill.
 
 Additional accounts (``vault.onepassword.accounts``) are separate backend instances
 with ``op@<alias>:`` handles. Each authenticates only with its own service-account
@@ -430,33 +430,11 @@ class OnePasswordLoginBackend(LoginBackend):
             "item moved",
         ))
 
-    def _listing_item(self, item_id: str) -> Optional[dict]:
-        key = self._listing_key()
-        with _LISTING_LOCK:
-            hit = _LISTING_CACHE.get(key)
-            raw_text = hit[1] if hit and time.monotonic() - hit[0] < _LISTING_TTL_SECONDS else None
-        if raw_text is None:
-            raw_text = self._list_json_fresh()
-        try:
-            raw = json.loads(raw_text or "[]")
-        except (TypeError, ValueError):
-            return None
-        matches = [item for item in raw if isinstance(item, dict) and item.get("id") == item_id]
-        return matches[0] if len(matches) == 1 else None
-
     def _read_item_metadata(self, item_id: str, vault_id: str, categories) -> Optional[dict]:
         try:
             raw = json.loads(self._run(
                 "item", "get", item_id, "--vault", vault_id, "--format", "json"
             ) or "{}")
-        except json.JSONDecodeError:
-            # Older/service-account-compatible `op` shims may ignore --format json and
-            # return the scalar field payload. The listing is still non-secret metadata.
-            raw = self._listing_item(item_id)
-            if raw is None:
-                raise RuntimeError("Invalid 1Password item metadata")
-            raw = dict(raw)
-            raw.setdefault("category", "LOGIN")
         except BaseException as exc:
             if self._metadata_error_is_retryable(exc):
                 raise _ItemMetadataRetry(str(exc)) from exc
@@ -496,41 +474,25 @@ class OnePasswordLoginBackend(LoginBackend):
         if not owner:
             return pending.result()
         try:
-            vault_id = self._listing_vault_hint(item_id, fresh=True)
+            vault_id = self._listing_vault_hint(item_id)
             if vault_id is None:
                 item = None
             else:
-                if self._service_token:
-                    # Service-account listings already provide the non-secret identity metadata.
-                    # Keep metadata lookup listing-only, then scope the later secret read to the
-                    # listed vault. This also supports older `op` clients that return scalar field
-                    # output when asked for JSON metadata.
-                    item = self._listing_item(item_id)
-                    if item is not None:
-                        item = dict(item)
-                        item.setdefault("category", "LOGIN")
-                        item.setdefault("state", "ACTIVE")
-                        vault = item.get("vault")
-                        if not isinstance(vault, dict) or vault.get("id") != vault_id:
-                            item = None
-                        elif item.get("state") != "ACTIVE" or item.get("category") not in categories:
-                            item = None
-                else:
-                    try:
-                        item = self._read_item_metadata(item_id, vault_id, categories)
-                    except _ItemMetadataRetry:
-                        if not _retry:
-                            item = None
-                        else:
-                            invalidate_listing_cache()
-                            fresh_vault_id = self._listing_vault_hint(item_id, fresh=True)
-                            if fresh_vault_id:
-                                try:
-                                    item = self._read_item_metadata(item_id, fresh_vault_id, categories)
-                                except _ItemMetadataRetry:
-                                    item = None
-                            else:
+                try:
+                    item = self._read_item_metadata(item_id, vault_id, categories)
+                except _ItemMetadataRetry:
+                    if not _retry:
+                        item = None
+                    else:
+                        invalidate_listing_cache()
+                        fresh_vault_id = self._listing_vault_hint(item_id, fresh=True)
+                        if fresh_vault_id:
+                            try:
+                                item = self._read_item_metadata(item_id, fresh_vault_id, categories)
+                            except _ItemMetadataRetry:
                                 item = None
+                        else:
+                            item = None
         except BaseException as exc:
             with _LISTING_LOCK:
                 if _ITEM_META_INFLIGHT.get(key) is pending:
@@ -698,10 +660,7 @@ class OnePasswordLoginBackend(LoginBackend):
 
     def _locate(self, handle: str, categories) -> tuple:
         """``([item_id, "--vault", vault_id], category)`` from fresh per-item metadata."""
-        try:
-            item_id = self._metadata_handle_id(handle)
-        except ValueError as exc:
-            raise RuntimeError("1Password item not found") from exc
+        item_id = self._metadata_handle_id(handle)
         item = self._take_fill_metadata(handle, categories)
         if item is None:
             item = self._fresh_item_metadata(handle)
@@ -723,23 +682,7 @@ class OnePasswordLoginBackend(LoginBackend):
             if len(passwords) != 1 or not isinstance(passwords[0], str) or not passwords[0]:
                 raise RuntimeError("Connect login requires one password field")
             return passwords[0]
-        if self._service_token:
-            try:
-                item_id = self._metadata_handle_id(handle)
-            except ValueError:
-                raise RuntimeError("1Password item not found") from None
-            vault_id = self._listing_vault_hint(item_id, fresh=False)
-            if not vault_id:
-                raise RuntimeError("1Password item is missing, archived, or not an eligible category")
-            return self._read_password([item_id, "--vault", vault_id])
-        try:
-            return self._read_password(self._item_selector(handle))
-        except ValueError:
-            # Service-account callers need a stable not-found refusal for malformed handles,
-            # while the interactive CLI backend retains its ValueError validation contract.
-            if self._service_token:
-                raise RuntimeError("1Password item not found") from None
-            raise
+        return self._read_password(self._item_selector(handle))
 
     def _read_password(self, selector: List[str]) -> str:
         return self._run("item", "get", *selector, "--fields", "label=password", "--reveal").rstrip("\r\n")

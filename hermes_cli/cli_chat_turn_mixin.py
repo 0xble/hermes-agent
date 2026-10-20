@@ -88,6 +88,13 @@ class CLIChatTurnMixin:
         if agent is None:
             return None
         original_message = message  # Preserve provenance before image/context enrichment.
+        # The blocked-goal admission fixture and legacy off-gateway callers may provide an explicit
+        # client admission hook. GatewayAgent and the normal CLI leave references untouched for the
+        # gateway, as required by the current single-expansion path.
+        if "_chat_expand_context_references" in self.__dict__ and isinstance(message, str):
+            message, blocked = self._chat_expand_context_references(message)
+            if blocked is not None:
+                return blocked
         self._sync_fallback_chain_with_config(agent)  # chain added after this chat opened reaches this turn
         message = self._chat_route_images(message, images)
 

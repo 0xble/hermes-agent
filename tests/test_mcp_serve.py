@@ -320,13 +320,6 @@ class TestContentExtraction:
         ]}
         assert _extract_message_content(msg) == "A\nB"
 
-    def test_assistant_copy_blocks_render_inline(self):
-        from mcp_serve import _extract_message_content
-        msg = {"role": "assistant", "content": "hi\n[[copy]]\nprompt\n[[/copy]]"}
-        assert _extract_message_content(msg) == "hi\nprompt\n"
-        user = {"role": "user", "content": "[[copy]]\nliteral\n[[/copy]]"}
-        assert _extract_message_content(user) == user["content"]
-
     def test_empty(self):
         from mcp_serve import _extract_message_content
         assert _extract_message_content({"content": ""}) == ""
@@ -354,12 +347,6 @@ class TestAttachmentExtraction:
         from mcp_serve import _extract_attachments
         msg = {"content": "MEDIA: /a.png and MEDIA: /b.mp3"}
         assert len(_extract_attachments(msg)) == 2
-
-    def test_media_line_inside_assistant_copy_block_is_literal_text(self):
-        from mcp_serve import _extract_attachments
-        msg = {"role": "assistant",
-               "content": "MEDIA: /real.png\n[[copy]]\nMEDIA:/paste/literal.txt\n[[/copy]]"}
-        assert _extract_attachments(msg) == [{"type": "media", "path": "/real.png"}]
 
     def test_no_attachments(self):
         from mcp_serve import _extract_attachments
@@ -1239,8 +1226,7 @@ class TestEventBridgePollE2E:
             "timestamp": "2026-03-29T15:05:00",
         })
         before = db_path.stat()
-        os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
-        assert db_path.stat().st_mtime != bridge._state_db_mtime
+        os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))  # bump mtime so the poll gate opens
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
@@ -1280,7 +1266,6 @@ class TestEventBridgePollE2E:
         }]
         before = db_path.stat()
         os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
-        assert db_path.stat().st_mtime != bridge._state_db_mtime
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

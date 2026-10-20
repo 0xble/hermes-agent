@@ -20,6 +20,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
+_UpdatePaths = Any
+_UpdateTarget = Any
+
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
@@ -1744,20 +1747,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
         try:
             synth_text = _mark_internal_notification(synth_text)
-            session_key = str(evt.get("session_key") or "").strip()
-            from agent.notification_presentation import diagnostic_process_event
-            if diagnostic_process_event(evt):
-                metadata["notification_category"] = "diagnostic"
-            if session_key.startswith("agent:"):
-                metadata["gateway_session_key"] = session_key
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
-                metadata["gateway_session_id"] = parent_session_id
-            proven_session_id = str(evt.get("proven_session_id") or "").strip()
-            if proven_session_id:
-                metadata["gateway_proven_session_id"] = proven_session_id
-            if completion_ids := evt.get("completion_ids"):
-                metadata["gateway_completion_ids"] = list(completion_ids)
+            metadata = _watch_notification_metadata(evt, source)
             if retry_claim := str(evt.get("retry_notice_claim") or "").strip():
                 # Lets every later wake fence drop this notice once its retry is cancelled.
                 from hermes_cli.session_controls import RETRY_WAKE_METADATA_KEY
@@ -1800,7 +1790,17 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         raise WakeNotAccepted("gateway draining; delegation result stays pending")
                     return False
                 return self._preserve_drain_event(self._session_key_for_source(source), synth_event)
-            await admit_internal_event(adapter, synth_event)
+            from gateway.session_authorities import active_authority
+            authority = active_authority(self)
+            if authority is not None:
+                from gateway.session_automation import admit_process_notice
+                from hermes_state_runtime import RuntimeStoreError
+                try:
+                    await admit_process_notice(self, authority, adapter, synth_event, evt)
+                except RuntimeStoreError as exc:
+                    raise WakeNotAccepted(str(exc)) from exc
+            else:
+                await admit_internal_event(adapter, synth_event)
             return True
         except WakeNotAccepted as exc:
             logger.warning("Watch notification not admitted for %s chat=%s: %s",
@@ -3026,8 +3026,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         last_output_len = 0
         busy_receipt_sent = False
         text_retry_interval = min(max(interval, 1.0), 30.0)
+        completion_attempts = 0
+        retry_interval = interval
         while True:
-            await asyncio.sleep(interval)
+            await asyncio.sleep(retry_interval)
             # A finished process falls back to retained results, whose ownership check reads state.db.
             session = await asyncio.to_thread(process_registry.get, session_id)
             if session is None:
@@ -3084,14 +3086,40 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         message_text = self._format_process_final_message(session_id, session, "concise")
                         await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
                     admitted = await delivery
-                    if admitted is False:
-                        # The process remains terminal; retry after failed adapter injection instead
-                        # of suppressing the result. Only this claim owner may return it to pending.
+                    if admitted is not False:
+                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                        break
+                    # A refusal may clear (adapter reconnecting, store draining), so retry with backoff
+                    # for a few minutes, then fall through to the plain notice instead of dropping it.
+                    completion_attempts += 1
+                    if completion_attempts < _MAX_COMPLETION_INJECTION_ATTEMPTS:
+                        # The process remains terminal; only this claim owner may return it to pending.
                         if getattr(session, "survive_restart", False):
                             process_registry.release_survivor_completion(session_id)
+                        retry_interval = jittered_backoff(
+                            completion_attempts, base_delay=max(interval, 1) * 2,
+                            max_delay=_COMPLETION_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
                         continue
-                    acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
-                    break
+                    if (getattr(self, 'session_authority', None) is not None
+                            and self._completion_delivery_identity(completion_evt) is not None):
+                        from gateway.session_automation import completion_admission
+                        try:
+                            # The owning profile's authority, as on the delivery path.
+                            async with self._completion_event_scope(completion_evt):
+                                committed = completion_admission(self, completion_evt) is not None
+                        except Exception:
+                            # Failing open sends the notice; a dead watcher would send nothing.
+                            logger.debug("Process watcher: admission recheck failed for %s", session_id,
+                                         exc_info=True)
+                            committed = False
+                        if committed:
+                            # The last refusal was a lost ACK: the turn is committed.
+                            acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                            break
+                    logger.warning(
+                        "Process watcher: completion for %s was refused %d times; falling back to the "
+                        "notify_mode=%s notice", session_id, completion_attempts, notify_mode,
+                    )
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).
                 if process_registry.is_completion_consumed(session_id):
@@ -3122,7 +3150,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         process_registry.release_survivor_completion(session_id)
                         # Keep one offer alive until shutdown cancels the watcher, even if
                         # transport recovery takes hours. A capped scalar bounds retry state.
-                        interval = text_retry_interval
+                        interval = retry_interval = text_retry_interval
                         text_retry_interval = min(text_retry_interval * 2, 15 * 60.0)
                         continue
                 # Presented, or deliberately suppressed by the notification mode: either way the

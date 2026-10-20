@@ -164,12 +164,20 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
 
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
-        user_config: Optional[dict] = None,
+        user_config: Optional[dict] = None, fallback: bool = True,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
-        Priority (highest first): session ``/model`` → ``channel_overrides`` → global config/env
-        (``_resolve_gateway_model(user_config)`` and default provider resolution)."""
+        Priority (highest first): launch policy → session ``/model`` → ``channel_overrides`` → global
+        config/env (``_resolve_gateway_model(user_config)`` and default provider resolution).
+        ``fallback=False`` keeps a launch-policy session on its own route (see
+        ``_resolve_policy_agent_runtime``)."""
+        from gateway.session_policy import policy_for_source
+        self._pre_agent_fallback_notice = None
+        policy = policy_for_source(self, source) if source is not None else None
+        if policy is not None:
+            from gateway.run_turn_prepare import _resolve_policy_agent_runtime
+            return _resolve_policy_agent_runtime(self, policy, fallback=fallback)
         skey = self._resolve_session_key_or_none(source, session_key)
         self._last_attended_decision = None
         self._pre_agent_fallback_notice = None
@@ -754,6 +762,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         user_config: Optional[dict] = None,
     ) -> tuple[str, dict]:
         """Off-loop reads/credentials, on-loop snapshots and compare-and-set commits."""
+        from gateway.session_policy import policy_for_source
+        policy = policy_for_source(self, source) if source is not None else None
+        if policy is not None:
+            # A launch-policy session runs its frozen route; resolution may read credentials.
+            return await asyncio.to_thread(
+                self._resolve_session_agent_runtime, source=source, session_key=session_key, user_config=user_config)
         skey = self._resolve_session_key_or_none(source, session_key)
         self._pre_agent_fallback_notice = None
         activity_stamp = _NO_ATTENDED_ACTIVITY_STAMP
@@ -2625,9 +2639,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if is_context_overflow_failure:
             pass  # Skip all transcript writes — don't grow a broken session
         else:
-            if not history:
+            if not history and source.platform != Platform.LOCAL:
                 # Fresh session: the tool definitions (as sent in the API request) make the transcript
-                # self-describing.
+                # self-describing. A LOCAL route (one-shot, chat -q, ACP, TUI attach) keeps the classic
+                # in-process CLI's transcript shape: the marker is gateway bookkeeping every local
+                # reader filters out, and the session row already carries model/model_config.
                 await store.append_to_transcript(sid, {
                     "role": "session_meta",
                     "tools": agent_result.get("tools", []) or [],
@@ -2986,7 +3002,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             event=event, source=source, history=history, session_key=session_key,
         )
         if message_text is None:
-            return None, _session_env_tokens
+            # A refused local turn answers with its refusal (session_context_refs.turn_references).
+            return getattr(event, "_gateway_turn_refusal", None), _session_env_tokens
 
         message_text, persist_user_message, persist_user_timestamp = (
             self._hmwa_apply_message_timestamp(event, message_text)
@@ -3626,10 +3643,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             lines = [t("gateway.reload_mcp.header")] + [
                 t(key, names=", ".join(sorted(names))) for _label, key, names in changes if names
             ]
+            from tools.mcp_tool_discovery import mcp_servers_not_connected
+            failed = await self._run_in_executor_with_context(mcp_servers_not_connected)
             if not connected_servers:
                 lines.append(t("gateway.reload_mcp.none_connected"))
             else:
                 lines.append(t("gateway.reload_mcp.tools_available", tools=len(new_tools), servers=len(connected_servers)))
+            if failed:  # a configured server that did not connect is named, never passed over as success
+                lines.append(t("gateway.reload_mcp.failed", error=f"did not connect: {', '.join(failed)}"))
 
             self._mcp_reload_refresh_cached_agents(multiplex, event.source.profile)
 
@@ -3878,6 +3899,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                             if _consume_sse_line(line):
                                 saw_done = True
                                 break
+                        if saw_done:
+                            break
                         if len(buffer) > _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS:
                             raise ValueError("Proxy SSE stream exceeded max buffer size without a line boundary")
                     # The final SSE frame may not be newline-terminated: flush the residual
@@ -3948,9 +3971,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         from agent.secret_scope import get_secret
         from gateway.display_config import resolve_display_setting, resolve_tool_progress
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
-        user_config = _load_gateway_config()
-        platform_key = _platform_config_key(source.platform)
+        from gateway.session_policy import policy_for_source
+        policy = policy_for_source(self, source)
+        from gateway.session_authorities import active_authority
+        user_config = policy.config(active_authority(self), secrets=False) if policy else _load_gateway_config()
+        platform_key = policy.platform if policy else _platform_config_key(source.platform)
         enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
+        if policy:
+            enabled_toolsets = list(policy.current_toolsets(user_config))
         adapter = self._delivery_adapter_for(source)
         # Tool preview length (0 = no limit) and friendly tool labels (default on), per-platform.
         for _setter, _setting, _default, _cast in (
@@ -4982,7 +5010,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
             next_channel_prompt, next_source = self._pinned_channel_inputs(
-                next_session_key, pending_event.channel_prompt, next_source, internal=pending_event.internal,
+                next_session_key, pending_event.channel_prompt, next_source,
+                internal=pending_event.internal or getattr(pending_event, "inherit_channel_pin", False),
             )
             if not pending_event.internal:
                 # A drained human turn re-pins its channel inputs; make them durable like a first turn.

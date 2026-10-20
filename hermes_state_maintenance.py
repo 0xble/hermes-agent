@@ -124,12 +124,16 @@ class SessionMaintenanceMixin:
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id
                   )
             """, (cutoff,)).fetchall()]
+            from hermes_state_mutation_retirement import retire_prunable
+            ids = retire_prunable(conn, ids)
             for chunk in _id_chunks(ids):
                 conn.execute(f"DELETE FROM sessions WHERE id IN ({_placeholders(chunk)})", chunk)
             if ids:
                 self._delete_unreferenced_system_prompts(conn)
             return ids
         removed_ids = self._execute_write(_do) or []
+        from hermes_state_media import collect_retired_media
+        collect_retired_media(self)
         for sid in removed_ids if sessions_dir else ():
             self._remove_session_files(sessions_dir, sid)
         return len(removed_ids)
@@ -354,6 +358,10 @@ class SessionMaintenanceMixin:
         candidate_rows = self._read_all(
             f"SELECT s.id FROM sessions s WHERE {where} ORDER BY s.started_at DESC", where_params)
         candidate_ids = [str(row["id"]) for row in candidate_rows]
+        # Tombstones are retained on a separate retry horizon from transcript retention.  A
+        # prune pass must advance that horizon even when no session row matches its age window.
+        from hermes_state_mutation_retirement import prune_retired_tombstones
+        self._execute_write(lambda conn: prune_retired_tombstones(conn))
         removed_count = 0
 
         # Keep each transaction small enough that message/FTS triggers release the WAL write lock

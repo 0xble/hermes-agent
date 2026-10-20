@@ -19,6 +19,11 @@ from hermes_state_common import (
 # Log-record parity with the origin module (caplog tests pin "hermes_state").
 logger = logging.getLogger("hermes_state")
 
+# Retired-session fence lookup on a bound entry_json (bind it twice). Non-throwing: a routing
+# value that is not a JSON object names no session, so it is never fenced and never aborts the
+# whole replace with "malformed JSON".
+_RETIRED_FENCE_SESSION_ID = _sql_json_extract("?", "$.session_id")
+
 # Recursive CTE naming a session plus its compression ancestors (rows a
 # resume must keep on one routing peer); branch/delegate/tool/reset rows stop it
 # (same membership rule as get_compression_lineage / _CHAIN_STEP_SQL, #114271).
@@ -299,13 +304,13 @@ class SessionGatewayMixin:
         if not session_key or not entry_json:
             return
         self._write_sql(
-            """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+            f"""INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
                SELECT ?, ?, ?, ? WHERE NOT EXISTS (
-                   SELECT 1 FROM state_meta WHERE key='gateway.retired_session.v1.' || json_extract(?, '$.session_id'))
+                   SELECT 1 FROM state_meta WHERE key='gateway.retired_session.v1.' || {_RETIRED_FENCE_SESSION_ID})
                ON CONFLICT(scope, session_key) DO UPDATE SET
                    entry_json = excluded.entry_json,
                    updated_at = excluded.updated_at""",
-            (scope, session_key, entry_json, time.time(), entry_json),
+            (scope, session_key, entry_json, time.time(), entry_json, entry_json),
         )
 
     def load_gateway_routing_entry(self, session_key: str, *, scope: str = "") -> Optional[str]:
@@ -362,13 +367,13 @@ class SessionGatewayMixin:
             changed = [(scope, k, v, now) for k, v in wanted.items() if current.get(k) != v]
             if changed:
                 conn.executemany(
-                    """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                    f"""INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
                        SELECT ?, ?, ?, ? WHERE NOT EXISTS (
-                           SELECT 1 FROM state_meta WHERE key='gateway.retired_session.v1.' || json_extract(?, '$.session_id'))
+                           SELECT 1 FROM state_meta WHERE key='gateway.retired_session.v1.' || {_RETIRED_FENCE_SESSION_ID})
                        ON CONFLICT(scope, session_key) DO UPDATE SET
                            entry_json = excluded.entry_json,
                            updated_at = excluded.updated_at""",
-                    [(*row, row[2]) for row in changed])
+                    [(*row, row[2], row[2]) for row in changed])
         self._execute_write(_do)
 
     def load_gateway_routing_entries(self, *, scope: str = "") -> dict[str, str]:
@@ -931,8 +936,15 @@ class SessionGatewayMixin:
         # record for sessions that never ran /model. Bare buckets ("auto"/"custom") are not
         # routable identities; filter them so resume falls back to the ambient default.
         billing_provider = str((session_meta or {}).get("billing_provider") or "").strip()
+        billing_base_url = str((session_meta or {}).get("billing_base_url") or "").strip()
         if billing_provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
             top_level.setdefault("provider", billing_provider)
+        elif billing_provider.lower() == "custom" and billing_base_url:
+            # Older CLI rows persisted the billing class and endpoint rather than
+            # a routable custom identity. Keep both so resume can heal the
+            # endpoint to the current custom entry.
+            top_level.setdefault("provider", billing_provider)
+            top_level.setdefault("base_url", billing_base_url)
         if top_level:
             return top_level
         if not isinstance(runtime, dict):

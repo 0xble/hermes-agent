@@ -3244,6 +3244,10 @@ def _save_compose_deliver(
             # The queue owns this send even if subsequent bookkeeping fails.
             d.delivery_attempted = True
         job["last_delivery_queued"] = {"canonical": {"status": queued["status"], "execution_id": execution_id}}
+        # The durable row is the point of no return: a schedule stop after this handoff
+        # cannot recall the send, so report it as completed rather than interrupted.
+        from cron.scheduler_control import note_completed_delivery
+        note_completed_delivery(job["id"])
         return
     try:
         with fence.side_effect_fence() as owns_delivery:
@@ -3347,7 +3351,9 @@ def _finish_completed_run(
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
     marked = self_removal_delivery_allowed(job["id"]) or mark_job_run(
         job["id"], d.success, d.error, **mark_kwargs)
-    if fire_owner is not None and not marked and not (d.delivery_attempted and _run_delivery_outcome(d) == "delivered"):
+    # A send already handed to the durable queue cannot be recalled, like a direct delivery.
+    delivered_or_queued = d.delivery_attempted and _run_delivery_outcome(d) in ("delivered", "queued")
+    if fire_owner is not None and not marked and not delivered_or_queued:
         finish_execution(
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")

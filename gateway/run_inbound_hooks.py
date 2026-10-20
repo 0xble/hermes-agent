@@ -75,6 +75,7 @@ class GatewayInboundHooksMixin:
         from gateway.session_ingress import executing_admission
         if executing_admission.get():
             return event
+        from hermes_cli.plugins import PluginDiscoveryIncomplete
         try:
             from hermes_cli.lifecycle import ainvoke_hook as _ainvoke_hook
             _hook_results = await _ainvoke_hook(
@@ -82,6 +83,8 @@ class GatewayInboundHooksMixin:
                 # getattr: bare-runner tests build GatewayRunner via object.__new__ without __init__.
                 session_store=getattr(self, "session_store", None),
             )
+        except PluginDiscoveryIncomplete:
+            raise  # A discovery timeout is not an allow decision; leave dispatch unadmitted.
         except Exception as _hook_exc:  # health: allow BLE001 -- moved unchanged from run_inbound.py (main has the same handler): a plugin hook must never stop dispatch
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
             _hook_results = []

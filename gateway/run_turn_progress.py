@@ -204,7 +204,15 @@ class GatewayTurnProgressMixin:
         status = kwargs.get("status")
         try:
             from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
-            if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current():
+            from tools.delegate_tool_progress import subagent_failure_notice_claimed
+            claimed = kwargs.get("failure_notice_claimed")
+            if claimed is None and status in SUBAGENT_FAILURE_STATUSES:
+                # Only events that bypassed the delegation relay reach here without a decision.
+                claimed = subagent_failure_notice_claimed(
+                    child_session_id=kwargs.get("child_session_id"), child_goal=kwargs.get("goal"),
+                    child_status=status, error=kwargs.get("summary") or preview,
+                    failure_reason=kwargs.get("failure_reason"))
+            if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current() and not claimed:
                 line = format_subagent_failure_line(
                     kwargs.get("goal"), status, error=kwargs.get("summary") or preview,
                     duration_seconds=kwargs.get("duration_seconds"), failure_reason=kwargs.get("failure_reason"),
@@ -280,14 +288,20 @@ class GatewayTurnProgressMixin:
         return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short}\n```"
 
     def _progress_build_message(self, tool_name, preview, args) -> Optional[str]:
-        """Render the progress line. Verbose mode queues directly (no dedup) and returns None."""
+        """Render the progress line. Verbose mode queues directly (no dedup) and returns None.
+
+        Every interpolated tool label, preview and args dump passes through the delivery adapter's
+        ``format_progress_literal`` (via ``format_tool_preview`` for compact previews), so a
+        Markdown-parsing platform shows ``mcp__x__y``, ``**/*.md`` or ``\\s+`` verbatim."""
         ctx = self._ctx
-        from agent.display import get_tool_emoji
-        emoji = get_tool_emoji(tool_name, default="⚙️")
+        from agent.display import progress_tool_label
+        emoji, label = progress_tool_label(tool_name, default="⚙️")
         try:
             adapter = self._runner._delivery_adapter_for(ctx.source)
         except Exception:
             adapter = None
+        literal = getattr(adapter, "format_progress_literal", None) or (lambda text: text)
+        tool = literal(label)
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
         verbose = ctx.progress_mode == "verbose"
         code = code_full if verbose else code_short
@@ -295,20 +309,26 @@ class GatewayTurnProgressMixin:
         if verbose:
             if code is None and args:
                 from agent.display import get_tool_preview_max_len, verbose_tool_args_text
-                # tool_preview_length 0 (default) = no truncation in verbose mode; the user asked
-                # for full detail and platform message-length limits handle the rest.
-                args_str = verbose_tool_args_text(args, get_tool_preview_max_len(),
-                                                  getattr(adapter, "supports_code_blocks", False))
-                code = t("gateway.progress.tool_verbose", emoji=emoji, tool=tool_name, keys=list(args.keys()), args=args_str)
+                pl = get_tool_preview_max_len() if getattr(ctx, "user_config", None) is not None else 0
+                _code_blocks = (
+                    getattr(adapter, "supports_code_blocks", False)
+                    and getattr(type(adapter) if adapter is not None else BasePlatformAdapter,
+                                "format_progress_literal", None) is BasePlatformAdapter.format_progress_literal
+                )
+                args_str = verbose_tool_args_text(args, pl, _code_blocks)
+                if not args_str.startswith("```") and adapter is not None:
+                    args_str = adapter.format_progress_literal(args_str)
+                code = t("gateway.progress.tool_verbose", emoji=emoji, tool=tool,
+                         keys=literal(str(list(args.keys()))), args=args_str)
             elif code is None:
-                code = (t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview) if preview
-                        else t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name))
+                code = (t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=literal(preview)) if preview
+                        else t("gateway.progress.tool_pending", emoji=emoji, tool=tool))
             ctx.progress_queue.put(code)
             return None
         if code is not None:
             return code
         if not preview:
-            return t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name)
+            return t("gateway.progress.tool_pending", emoji=emoji, tool=tool)
         from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview
         prepared = prepare_tool_preview(tool_name, args, fallback=preview, max_len=self._preview_cap())
         preview = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
@@ -316,7 +336,7 @@ class GatewayTurnProgressMixin:
         # by prefixing the verb onto the computed preview, so the command/url/query is kept.
         verb = get_tool_verb(tool_name)
         if not verb:
-            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview)
+            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=preview)
         return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
 
     def _progress_emit(self, msg: str) -> None:
@@ -614,9 +634,11 @@ class GatewayTurnProgressMixin:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
-        result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-        )
+        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
+        with outbound_class(OUTBOUND_PROGRESS):
+            result = await st.adapter.send(
+                chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+            )
         self._track_progress_result(result)
         return result
 
@@ -631,16 +653,19 @@ class GatewayTurnProgressMixin:
         groups = self._split_progress_groups(st, st.progress_lines)
         if len(groups) <= 1:
             return False
+        if self._progress_deferred(st):
+            return True
         if st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(groups[0]))
-            if not result.success:
-                if getattr(result, "retryable", False):
-                    logger.debug("[%s] Transient overflow edit failure — keeping can_edit=True", st.adapter.name)
-                    return True
-                st.can_edit = False
-                # Fall back to the existing non-edit behavior.
+            if result.success:
+                st.reanchored = False
+                groups = groups[1:]
+            elif self._edit_failure_is_deferrable(st, result):
+                # Keep the buffer intact; the next tick retries the same split.
+                return True
+            elif not self._abandon_progress_bubble(st):
                 return False
-            groups = groups[1:]
+            # An abandoned bubble never received groups[0], so it is re-sent below in a fresh one.
         for group in groups:
             result = await self._send_progress_text(st, self._progress_text(group))
             if result.success and result.message_id:
@@ -672,7 +697,8 @@ class GatewayTurnProgressMixin:
         return raw
 
     async def _flush_progress_edit(self, st) -> None:
-        if st.can_edit and st.progress_lines and st.progress_msg_id:
+        # A deferred bubble may still hold an unsplit, over-limit buffer: never send that as one edit.
+        if st.can_edit and st.progress_lines and st.progress_msg_id and not self._progress_deferred(st):
             with suppress(Exception):
                 await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
 
@@ -704,22 +730,21 @@ class GatewayTurnProgressMixin:
     async def _progress_send_or_edit(self, st, msg) -> bool:
         """Deliver this tick's bubble. Returns False on a transient edit failure (retry next tick).
 
-        Transient network errors (ConnectError, timeouts) must not disable editing; only permanent
-        failures (not found, permissions) set can_edit=False. Flood control backs off but keeps editing.
+        Transient and flood failures keep the bubble and its lines for a later edit. A permanent
+        failure (not found, permissions) moves progress to a fresh bubble; only a second one in a
+        row sets can_edit=False.
         """
         if st.can_edit and st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, "\n".join(st.progress_lines))
             if result.success:
+                st.reanchored = False
                 return True
-            if getattr(result, "retryable", False):
-                logger.debug("[%s] Transient edit failure — keeping can_edit=True", st.adapter.name)
-                return False
-            if any(w in (getattr(result, "error", "") or "").lower() for w in ("flood", "retry after")):
-                logger.info("[%s] Progress edit flood control, backing off", st.adapter.name)
-            else:
-                st.can_edit = False
-            await self._send_progress_text(st, msg)
-            return True
+            if self._edit_failure_is_deferrable(st, result):
+                # Flood keeps the throttle cadence (True); a bare transient error retries next tick.
+                return self._is_flood_refusal(result)
+            if self._abandon_progress_bubble(st):
+                # The fresh bubble starts at the newest line; the dead one keeps what it shows.
+                st.progress_lines = st.progress_lines[-1:]
         # First tool: send all accumulated text as a new message; editing unsupported: just this line.
         result = await self._send_progress_text(st, "\n".join(st.progress_lines) if st.can_edit else msg)
         if result.success and result.message_id:
@@ -743,7 +768,7 @@ class GatewayTurnProgressMixin:
             return
         st = self._progress_edit_state(adapter)
         last_edit_ts = 0.0
-        EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
+        EDIT_INTERVAL = self._progress_edit_interval(adapter)
         while True:
             try:
                 if not ctx._run_still_current():
@@ -759,6 +784,13 @@ class GatewayTurnProgressMixin:
                     self._reset_progress_bubble(st)
                     continue
                 msg = self._progress_absorb(st, raw)
+                defer_remaining = st.defer_until - time.monotonic()
+                if defer_remaining > 0:
+                    # Inside a flood refusal: wait it out, then edit once with everything buffered
+                    # meanwhile, instead of retrying the refused bubble once per incoming line.
+                    await asyncio.sleep(defer_remaining)
+                    if not ctx._run_still_current():
+                        return
                 if not await self._roll_progress_overflow_if_needed(st):
                     # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
                     # proactively rate-limit rather than react to 429s). Loop back to drain further

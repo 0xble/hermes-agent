@@ -16,6 +16,8 @@ def test_run_error_persists_redacted_cause_but_returns_summary(tmp_path, monkeyp
     with jobs.use_cron_store(tmp_path):
         job = jobs.create_job(prompt="Check status", schedule="every 1h", model="local-probe", deliver="local")
         owner = SimpleNamespace(db=SimpleNamespace(db_path=tmp_path / "state.db"))
+        # Agent runs acquire the owner's store before their gates; lend that exact store.
+        monkeypatch.setattr("hermes_state_registry.acquire", lambda *_: owner.db)
         token = session_cron._execution.set((owner, "diagnostic-session", job["id"], "diagnostic-fire"))
         try:
             success, output, response, error = scheduler.run_job(job, execution_id="diagnostic-fire")

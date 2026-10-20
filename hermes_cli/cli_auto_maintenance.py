@@ -40,6 +40,8 @@ def _run_state_db_auto_maintenance(session_db) -> None:
             if meta_key == "ghost_session_prune_v1" and not deletion_window_open():
                 continue
             try:
+                if session_db.get_meta(meta_key):
+                    continue
                 count = repair()
             # Every SessionDB refusal: sqlite/IO, RuntimeStoreError (ValueError), and the
             # hermes_state_errors busy/replaced family (RuntimeError).

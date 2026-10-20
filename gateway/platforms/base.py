@@ -178,6 +178,14 @@ def _reply_anchor_for_event(event) -> str | None:
     raw_message = getattr(event, "raw_message", None)
     if getattr(event, "internal", False) or (platform == "slack" and isinstance(raw_message, dict)
                                              and raw_message.get("_hermes_no_thread_response")):
+        # Synthetic producer identities are not platform ids, but a numeric Telegram event id remains
+        # a valid DM-topic reply anchor.
+        if getattr(event, "internal", False) and platform == "telegram" and thread_id \
+                and getattr(source, "chat_type", None) == "dm":
+            return _telegram_reply_anchor(
+                getattr(event, "message_id", None), getattr(event, "reply_to_message_id", None),
+                getattr(source, "message_id", None),
+            )
         # A synthetic wake's message_id is its producer identity, not a platform id (Telegram int()s
         # it; #52694). A Slack reaction handoff is a new top-level message, not a thread reply.
         return None
@@ -186,6 +194,8 @@ def _reply_anchor_for_event(event) -> str | None:
         # message — replying to the topic seed/anchor can render outside the active lane.
         if getattr(source, "chat_type", None) != "dm":
             return None
+        if not getattr(event, "internal", False) and getattr(event, "message_id", None) is not None:
+            return event.message_id
         return _telegram_reply_anchor(
             getattr(event, "message_id", None), getattr(event, "reply_to_message_id", None),
             getattr(source, "message_id", None),
@@ -2290,7 +2300,11 @@ class BasePlatformAdapter(ABC):
         literal = self.format_progress_literal
         tool = literal(label)
         if mode == "verbose" and event.args:
-            args_str = verbose_tool_args_text(event.args, preview_max_len, self.supports_code_blocks)
+            _code_blocks = (
+                self.supports_code_blocks
+                and type(self).format_progress_literal is BasePlatformAdapter.format_progress_literal
+            )
+            args_str = verbose_tool_args_text(event.args, preview_max_len, _code_blocks)
             rendered_args = args_str if args_str.startswith("```") else literal(args_str)
             return t("gateway.progress.tool_verbose", emoji=emoji, tool=tool,
                      keys=literal(str(list(event.args.keys()))), args=rendered_args)

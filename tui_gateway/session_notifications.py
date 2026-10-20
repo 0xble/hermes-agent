@@ -536,8 +536,10 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
 def _notif_defer_event(evt, claim, put=None):
     from tools.async_delegation import defer_completion_delivery
     from tools.process_registry import process_registry
-    if claim:
-        defer_completion_delivery(evt['delegation_id'], claim)
+    # Only a durable delegation or outbox row has a claim to defer; a process completion's copy is
+    # simply re-queued (its survivor lease is refunded by the caller).
+    if claim and (evt.get("delegation_id") or evt.get("_delivery_event_id")):
+        defer_completion_delivery(str(evt.get("delegation_id") or ""), claim)
     (put or process_registry.completion_queue.put)(evt)
 
 
@@ -592,7 +594,7 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
 def _notif_retry_survivor(evt, registry, emitted, session):
     """Refund our lease, then park retries without delaying unrelated notifications."""
     if (evt.get("type", "completion") == "completion"
-            and registry.release_survivor_completion(evt.get("session_id", ""))):
+            and getattr(registry, "release_survivor_completion", lambda _sid: False)(evt.get("session_id", ""))):
         key = _notification_event_dedup_key(evt)
         retries = session.setdefault("_notification_retry_backoff", {})
         previous_delay, _ = retries.get(key, (0.25, 0.0))

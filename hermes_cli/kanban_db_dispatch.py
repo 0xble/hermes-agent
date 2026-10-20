@@ -2772,45 +2772,18 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+    """The profile owner executes; this subprocess only waits for its receipt.
+
+    Model/provider/reasoning overrides, skills, hooks and the assignee profile's
+    CLI toolsets are resolved by the owner from the claimed card
+    (``gateway.session_kanban.build_kanban_policy``), never from mutable argv.
+    """
     from hermes_cli.immutable_releases import LOADED_RELEASE_ROOT, worker_launch_spec
-    # A gateway-owned task belongs to its loaded release, not an HERMES_BIN or
-    # PATH shim that can be redirected when `current` is promoted.
-    hermes_argv = (_resolve_hermes_argv() if LOADED_RELEASE_ROOT is None else
-                   [worker_launch_spec(LOADED_RELEASE_ROOT, {})[0], "-m", "hermes_cli.main"])
-    cmd = [
-        *hermes_argv,
-        "-p", profile_arg,
-        # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
-        # exits 0 without doing the task → "protocol violation" every attempt.
-        "--cli",
-        # Workers run under a profile-scoped HERMES_HOME and so see that
-        # profile's shell-hook allowlist; pass --accept-hooks explicitly so
-        # configured hooks still register.
-        "--accept-hooks",
-    ]
-    # One `--skills X` pair per name: easier to read in `ps` and avoids quoting
-    # ambiguity if a skill name contains unusual chars.
-    for sk in task.skills or ():
-        if sk:
-            cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
-        # Pin the provider too so the worker resolves the model against the
-        # intended backend (model X with provider Y is the classic board-stall).
-        if task.provider_override:
-            cmd.extend(["--provider", task.provider_override])
-    # Independent of the model override — a task can run the profile's own
-    # model at a different depth.
-    if task.reasoning_effort:
-        cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
-    # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
-    # worker log keeps its live tool feed (forcing -Q blanked it).
-    return cmd
+    # A gateway-owned task belongs to its loaded release's interpreter, not the
+    # `current` shim that can be redirected when a new release is promoted.
+    python = (sys.executable if LOADED_RELEASE_ROOT is None else
+              worker_launch_spec(LOADED_RELEASE_ROOT, {})[0])
+    return [python, "-m", "hermes_cli.kanban_worker_client"]
 
 
 def _open_worker_log(task: Task, board: Optional[str]):

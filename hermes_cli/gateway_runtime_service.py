@@ -81,6 +81,19 @@ def _verify_binding(verify, *args, **kwargs):
         } else "service_identity_unverified") from None
 
 
+def _foreign_root(verify, *args, **kwargs) -> bool:
+    """``_verify_binding`` that reports a definition pinned to another HOME root instead of refusing it."""
+    from hermes_cli.gateway_runtime_service_identity import ForeignRoot
+
+    def check():
+        try:
+            verify(*args, **kwargs)
+        except ForeignRoot:
+            return True
+        return False
+    return _verify_binding(check)
+
+
 def _exists(path: Path) -> bool:
     try:
         path.lstat()
@@ -207,12 +220,16 @@ def _launchd(home: Path, deadline: float) -> ExistingService | None:
             raise RuntimeStartError("service_manager_unavailable")
     if len(found) > 1:
         raise RuntimeStartError("service_scope_conflict", "conflict")
-    if found:
-        _verify_binding(verify_launchd_loaded, loaded[0], home, uid=os.getuid(), username=account.pw_name)  # windows-footgun: ok — native launchd only
+    # A same-named job pinned to another HOME root belongs to another install (a sandbox HOME
+    # beside a real one): it neither serves nor blocks this home, as on the systemd path.
+    if found and not _foreign_root(verify_launchd_loaded, loaded[0], home, uid=os.getuid(), username=account.pw_name):  # windows-footgun: ok — native launchd only
         return found[0]
+    if found:
+        return None
     if installed:
         definition = _verify_binding(plistlib.loads, read_definition(plist))
-        _verify_binding(verify_launchd_plist, definition, label, home)
+        if _foreign_root(verify_launchd_plist, definition, label, home):
+            return None
         # Load ONLY the existing file, never bootout/rewrite or kickstart -k.
         return ExistingService("launchd", ("launchctl", "bootstrap", domains[0], str(plist)))
     return None

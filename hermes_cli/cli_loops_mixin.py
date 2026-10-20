@@ -770,7 +770,10 @@ class CLILoopsMixin:
                 pass
             _cprint(f"  {_DIM}{t('cli.loop.paused_interrupted')}{_RST}")
             return
-        decision = mgr.complete_tick(self._last_assistant_response_text())
+        # The raw turn result, never the transcript: a failed turn's rendered notice or an
+        # earlier reply's marker is not this wakeup's response.
+        response, successful = self._post_turn_response()
+        decision = mgr.complete_tick(response if successful else "")
         # With the live-work dock up its loop row carries the countdown; the one-shot line would go stale.
         if (not _print_decision_message(decision) and decision.get("status") == "active"
                 and mgr.state is not None and getattr(self, "_subagent_monitor", None) is None):

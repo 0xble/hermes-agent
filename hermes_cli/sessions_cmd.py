@@ -1302,6 +1302,9 @@ def cmd_sessions(args, sessions_parser=None):
     pre = _PRE_DB_HANDLERS.get(action)
     if pre is not None:
         return pre(args)
+    if action == "optimize" and (getattr(args, "at_next_start", False)
+                                 or getattr(args, "cancel_next_start", False)):
+        return _cmd_optimize_next_start(args)
     from hermes_state import SessionDB
     from hermes_constants import get_hermes_home
     # Verified deletion is an explicit mutation, not a read-only export.

@@ -322,13 +322,16 @@ class _ResponsesStream:
 
     def _item_id(self, kind, *, call_id=None, commentary=False):
         from gateway.platforms.api_server_response_identity import next_item_id
-        return next_item_id(self.response_id, self._identity_counts, kind,
+        counters = getattr(self, "_identity_counts", {})
+        self._identity_counts = counters
+        return next_item_id(getattr(self, "response_id", "resp_local"), counters, kind,
                             call_id=call_id, commentary=commentary)
 
     def _output_index(self, item_id):
-        index = (self.response_store.output_index(self.durable_key[0], item_id)
-                 if self.durable_key else self.output_index)
-        self.output_index = max(self.output_index, index + 1)
+        durable_key = getattr(self, "durable_key", None)
+        index = (self.response_store.output_index(durable_key[0], item_id)
+                 if durable_key else getattr(self, "output_index", 0))
+        self.output_index = max(getattr(self, "output_index", 0), index + 1)
         return index
 
     def envelope(self, status: str) -> dict[str, Any]:

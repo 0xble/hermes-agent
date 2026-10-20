@@ -97,6 +97,11 @@ def _record_parked_profiles(parked):
 
 
 async def initialize_gateway_runtime(runner):
+    # Minimal startup fakes used by lifecycle tests do not implement the SessionDB-backed
+    # runner surface.  Runtime authority setup is unnecessary for those runners, while the
+    # real GatewayRunner exposes the property on its class.
+    if not hasattr(type(runner), "_session_db") and not hasattr(runner, "_session_db"):
+        return
     from gateway.runtime_bootstrap import TicketStore
     from gateway.runtime_ownership import process_ownership
     from gateway.session_authorities import SessionAuthorities
@@ -378,6 +383,8 @@ async def recover_bot_mailbox(authority):
 
 
 async def start_gateway_runtime_api(runner):
+    if not hasattr(runner, "session_runtime_descriptor"):
+        return
     from gateway.run_api import start_gateway_api
     from gateway.session_authorities import owner_scope
     runner.session_api = await start_gateway_api(runner)
@@ -410,8 +417,9 @@ async def recover_gateway_native_sessions(runner):
             await recover_webhook_finalizations(authority)
             pending = {row['target_session_id'] for row in authority.db._read_all(
                 "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
+            session_entries = await asyncio.to_thread(runner.session_store.list_sessions)
             bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
-                        for entry in runner.session_store.list_sessions() if entry.origin is not None
+                        for entry in session_entries if entry.origin is not None
                         for owner in [authority.logical_owner(entry.session_id)] if owner in pending]
             outcome = await authority.recover_native_sessions(bindings)
         for sid, verdict in outcome.items():

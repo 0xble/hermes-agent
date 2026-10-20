@@ -854,9 +854,12 @@ def _valid_client_env(value, kind: type = str):
 def policy_for_source(runner, source):
     from gateway.session_local import LocalSessionAdapter
     from gateway.config import Platform
-    if source.platform != Platform.LOCAL:
+    if source is None or getattr(source, "platform", None) != Platform.LOCAL:
         return None
-    adapter = runner._adapter_for_source(source)
+    adapter_for_source = getattr(runner, "_adapter_for_source", None)
+    if not callable(adapter_for_source):
+        return None
+    adapter = adapter_for_source(source)
     if isinstance(adapter, LocalSessionAdapter) and adapter.authorize_source(source):
         policy = adapter.policies.get(source.chat_id)
         if policy is None:

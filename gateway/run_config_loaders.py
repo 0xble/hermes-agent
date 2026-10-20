@@ -255,12 +255,18 @@ class GatewayConfigLoadersMixin:
             return None
         self._apply_pending_bulk_reset_if_idle(session_key)
         state_loader = getattr(self, "_peek_session_state", None)
-        state = state_loader(session_key) if callable(state_loader) else None
-        conversation = getattr(state, "conversation", None)
-        value = getattr(conversation, "reasoning_override", None)
+        if callable(state_loader):
+            state = state_loader(session_key)
+            value = getattr(getattr(state, "conversation", None), "reasoning_override", None)
+        else:  # Bare test doubles carry only the legacy mapping.
+            value = (getattr(self, "_session_reasoning_overrides", None) or {}).get(session_key)
         if value is not None:
             return value
-        return (getattr(self, "_session_reasoning_overrides", None) or {}).get(session_key)
+        value = (getattr(self, "_session_reasoning_overrides", None) or {}).get(session_key)
+        if value is not None:
+            return value
+
+        # After a gateway restart the in-memory pick is gone; rehydrate it from the routing entry
 
         # (written through by _set_session_reasoning_override), the same way /model overrides are.
         store = getattr(self, "session_store", None)

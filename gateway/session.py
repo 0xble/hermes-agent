@@ -1525,5 +1525,6 @@ def build_session_context(
     if session_entry:
         context.session_key = session_entry.session_key
         context.session_id = session_entry.session_id
-        context.created_at, context.updated_at = session_entry.created_at, session_entry.updated_at
+        context.created_at = getattr(session_entry, "created_at", None)
+        context.updated_at = getattr(session_entry, "updated_at", None)
     return context

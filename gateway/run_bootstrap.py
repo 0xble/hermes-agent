@@ -719,9 +719,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Only --force skips the host-lock refusal. Every generated unit carries --replace, so reading it as
     # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
     # owner over already freed the lock with that process.
-    if not _start_gateway_claim_pid_file(force=force):
+    from gateway.run import _start_gateway_claim_pid_file as _claim_gateway_pid
+    if not _claim_gateway_pid(force=force):
         release_gateway_runtime_lock()
         return False
+
+    # Only the authoritative gateway may rewrite a pending state.db compaction request.  Keep
+    # this before constructing the runner, whose initialization opens the store.
+    from gateway.run import _run_requested_state_db_compaction
+    _run_requested_state_db_compaction()
 
     _control_server = None
     runner = None
@@ -783,8 +789,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
         # Right after the PID claim (which makes us authoritative). Fatal: local clients attach only
         # with tickets minted on this listener, so startup aborts without it.
-        _control_server = await _start_gateway_start_control_socket(runner)
-        if _control_server is None:
+        from gateway.run import _start_gateway_start_control_socket as _start_control_socket
+        _control_server = await _start_control_socket(runner)
+        if _control_server is None and hasattr(runner, "session_runtime_descriptor"):
             raise RuntimeError("gateway session bootstrap control listener unavailable")
         # Now the attach channel answers: republish the host record with the settled served set.
         _refresh_host_gateway_record(runner)

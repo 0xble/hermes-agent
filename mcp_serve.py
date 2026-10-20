@@ -226,19 +226,11 @@ def _coerce_int(value, *, default: int, minimum: int, maximum: int) -> int:
 
 
 def _extract_message_content(msg: dict) -> str:
-    """Extract text content from a message, handling multi-part content.
-
-    Assistant copy blocks render inline: MCP clients read one text per message.
-    """
+    """Extract text content from a message, handling multi-part content."""
     content = msg.get("content", "")
     if isinstance(content, list):
-        text = "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
-    else:
-        text = str(content) if content else ""
-    if text and msg.get("role") == "assistant":
-        from gateway.copy_blocks import render_copy_blocks_inline
-        text = render_copy_blocks_inline(text)
-    return text
+        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    return str(content) if content else ""
 
 
 def _extract_attachments(msg: dict) -> list[dict]:
@@ -259,12 +251,7 @@ def _extract_attachments(msg: dict) -> list[dict]:
             continue
         if url:
             attachments.append({"type": "image", "url": url})
-    # Scan text outside copy blocks only: a MEDIA line inside a body is literal paste-ready text.
-    scan = _extract_message_content({"content": content})
-    if msg.get("role") == "assistant":
-        from gateway.copy_blocks import strip_copy_blocks
-        scan = strip_copy_blocks(scan)
-    for match in re.finditer(r'MEDIA:\s*(\S+)', scan):
+    for match in re.finditer(r'MEDIA:\s*(\S+)', _extract_message_content(msg)):
         attachments.append({"type": "media", "path": match.group(1)})
     return attachments
 

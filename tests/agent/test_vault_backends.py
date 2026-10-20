@@ -248,6 +248,11 @@ if argv[:2] == ["item", "get"]:
         sys.stderr.write("a vault query must be provided when this command is called by a service account\n"); sys.exit(1)
     if "item-c" in argv:  # a revoked/garbled token: op's own wording mentions a session
         sys.stderr.write("error initializing client: Validation: (failed to session.DecodeSACredentials)\n"); sys.exit(1)
+    if "--format" in argv:  # metadata-only read: the item's verified vault, never a secret
+        i = argv[2]
+        print(json.dumps({"id": i, "title": i, "category": "LOGIN", "state": "ACTIVE",
+                          "vault": {"id": argv[argv.index("--vault") + 1]},
+                          "urls": [{"href": "https://example.com/login"}]})); sys.exit(0)
     print("123456" if "--otp" in argv else "dummy-password"); sys.exit(0)
 sys.exit(2)
 '''
@@ -268,22 +273,30 @@ def fake_op_service_account(tmp_path):
 
 def test_onepassword_service_account_reads_name_the_items_own_vault(fake_op_service_account):
     """#108335: a service account can list logins but every fill/OTP read failed because
-    `op item get` never named a vault. Each read now carries the vault its listing reported."""
+    `op item get` never named a vault. Each read now carries the vault its fresh metadata verified."""
+    from agent.vault_backends.onepassword import invalidate_listing_cache
+
+    invalidate_listing_cache()
     new_backend, log = fake_op_service_account
-    fill = new_backend()  # a fill: get_meta proves handle + origin, then the read reuses that listing
+    fill = new_backend()  # a fill: get_meta proves handle + origin, then the read consumes that metadata
     assert fill.get_meta("op:item-b") is not None
     assert fill.resolve_password("op:item-b") == "dummy-password"
-    assert new_backend().resolve_otp("op:item-a") == "123456"  # a code read on a fresh backend lists once
+    assert new_backend().resolve_otp("op:item-a") == "123456"  # the display listing is reused, not re-run
     calls = [a[:2] if a[:2] == ["item", "list"] else a for a in map(json.loads, log.read_text(encoding="utf-8-sig").splitlines())]
-    assert calls == [["item", "list"], ["item", "get", "item-b", "--vault", "vault-b", "--fields", "label=password", "--reveal"],
-                     ["item", "list"], ["item", "get", "item-a", "--vault", "vault-a", "--otp"]]
+    assert calls == [["item", "list"], ["item", "get", "item-b", "--vault", "vault-b", "--format", "json"],
+                     ["item", "get", "item-b", "--vault", "vault-b", "--fields", "label=password", "--reveal"],
+                     ["item", "get", "item-a", "--vault", "vault-a", "--format", "json"],
+                     ["item", "get", "item-a", "--vault", "vault-a", "--otp"]]
 
 
 def test_onepassword_service_account_refusals_name_the_real_cause(fake_op_service_account):
     """A handle no listing returned is refused before any secret read, and a token op rejects
     surfaces op's error rather than an unlock prompt a service account can never satisfy."""
+    from agent.vault_backends.onepassword import invalidate_listing_cache
+
+    invalidate_listing_cache()
     new_backend, log = fake_op_service_account
-    with pytest.raises(RuntimeError, match="not found"):
+    with pytest.raises(ValueError, match="Invalid 1Password item handle"):
         new_backend().resolve_password("op:--help")
     assert new_backend().resolve_otp("op:ghost") is None
     assert all(json.loads(a)[:2] != ["item", "get"] for a in log.read_text(encoding="utf-8-sig").splitlines())

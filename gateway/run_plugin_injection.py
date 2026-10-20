@@ -393,6 +393,19 @@ class GatewayPluginInjectionMixin:
             return False
         session_key = self._session_key_for_source(source)
         async with self._plugin_injection_scope(source):
+            from gateway.session_authorities import active_authority
+            if active_authority(self) is not None:
+                # The FIFO admits a producer turn only into a session that already holds a
+                # committed human turn (its connector provenance is borrowed, never minted), so
+                # an origin with no session yet is refused rather than run outside the FIFO.
+                entry = await self.async_session_store.lookup_by_session_key(session_key)
+                if entry is None:
+                    logger.warning("Plugin message injection refused: plugin=%s %s has no session under "
+                                   "the session authority yet", plugin_id, target)
+                    return False
+                return await self._admit_plugin_injection(
+                    adapter, source, session_key=session_key, session_id=entry.session_id,
+                    content=content, plugin_id=plugin_id)
             await adapter.handle_message(MessageEvent(
                 text=content, message_type=MessageType.TEXT, source=source, internal=True,
                 allow_gateway_control=False,

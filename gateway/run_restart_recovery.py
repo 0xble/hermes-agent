@@ -436,6 +436,14 @@ class RestartRecoveryMixin:
             return None, "stale"
         if self._is_session_running(entry.session_key):
             return None, "already-running"
+        from gateway.session_authorities import admission_owner, all_authorities
+        for authority in all_authorities(self):
+            owner = admission_owner(authority, entry.session_id)
+            if owner and authority.db._read_one(
+                "SELECT 1 FROM session_admissions WHERE target_session_id IN (?, ?) AND status = 'unknown' LIMIT 1",
+                (entry.session_id, owner),
+            ):
+                return None, "admission-unknown"
         source = self._restored_source(entry)
         adapter = self._delivery_adapter_for(source)
         authorization = self._resume_owner_authorized(entry.session_key, source)
