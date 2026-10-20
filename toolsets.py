@@ -172,6 +172,10 @@ TOOLSETS = {
         "Create and edit Telegram DM topics as Hermes sessions (name, icon, model, reasoning, opening brief)",
         ["telegram_topic"],
     ),
+    "session_state": _ts(
+        "Read-only typed inspection of Hermes topic, session, and delivery state",
+        ["session_state"],
+    ),
     "yuanbao": _ts("Yuanbao platform tools - group info, member queries, DM, stickers", _YUANBAO_TOOLS),
     "feishu_doc": _ts("Read Feishu/Lark document content", ["feishu_doc_read"]),
     "feishu_drive": _ts("Feishu/Lark document comment operations (list, reply, add)", _FEISHU_TOOLS[1:]),
@@ -211,7 +215,7 @@ TOOLSETS = {
     "hermes-cron": _bundle("Default cron toolset - same core tools as hermes-cli; gated by `hermes tools`"),
     "hermes-telegram": _bundle(
         "Telegram bot toolset - full access for personal use (terminal has safety checks)",
-        ["telegram_topic"],
+        ["telegram_topic", "session_state"],
     ),
     "hermes-discord": _bundle(
         "Discord bot toolset - full access (terminal has safety checks via dangerous "
