@@ -109,8 +109,38 @@ class GatewayGoalManager(_Remote):
         """Revive a goal the judge paused for user input, on the gateway's row (never raises)."""
         s = self._state
         if s is None or s.status != "paused" or s.last_verdict != "blocked":
-            return False  # main's own precondition answers locally: no round trip per user turn
+            return False
         return bool(self._rpc("resume_for_user_input"))
+
+    def lifted_barrier_prompt(self):
+        """Barrier-lift prompt computed where the barrier (pid / process session / timer) lives."""
+        if not self.is_parked():
+            return None
+        return self._rpc("lifted_barrier_prompt")
+
+    def mark_automatic_continuation_dispatched(self, dispatched_at=None, *, expected_instance=None,
+                                               expected_fingerprint=None):
+        return bool(self._rpc("mark_automatic_continuation_dispatched", dispatched_at,
+                              expected_instance=expected_instance, expected_fingerprint=expected_fingerprint))
+
+    def clear_lifted_wait(self, waiting_since):
+        return bool(self._rpc("clear_lifted_wait", waiting_since))
+
+    def remove_contract_item(self, field, index_1based):
+        return self._rpc("remove_contract_item", field, int(index_1based))
+
+    def replace(self, *, reason, goal, max_turns=None, contract=None, actor="agent", user_quote="",
+                user_messages=None):
+        kwargs = {k: v for k, v in (("max_turns", max_turns), ("user_quote", user_quote),
+                                    ("user_messages", user_messages)) if v}
+        if contract is not None:
+            kwargs["contract"] = contract.to_dict() if hasattr(contract, "to_dict") else contract
+        result = self._rpc("replace", reason=reason, goal=goal, actor=actor, **kwargs)
+        if not isinstance(result, dict):
+            return {"ok": False, "error": "Goal unavailable: the gateway did not answer."}
+        if result.get("ok"):
+            result = {**result, "state": self._state}
+        return result
 
     def set(self, goal, *, max_turns=None, contract=None):
         kwargs = {"max_turns": max_turns} if max_turns is not None else {}
@@ -168,36 +198,6 @@ class GatewayGoalManager(_Remote):
         if s is None or (s.waiting_on_pid is None and s.waiting_on_session is None and not s.waiting_until):
             return False
         return bool(self._rpc("is_waiting"))
-
-    def lifted_barrier_prompt(self):
-        """Barrier-lift prompt computed where the barrier (pid / process session / timer) lives."""
-        if not self.is_parked():
-            return None
-        return self._rpc("lifted_barrier_prompt")
-
-    def mark_automatic_continuation_dispatched(self, dispatched_at=None, *, expected_instance=None,
-                                               expected_fingerprint=None):
-        return bool(self._rpc("mark_automatic_continuation_dispatched", dispatched_at,
-                              expected_instance=expected_instance, expected_fingerprint=expected_fingerprint))
-
-    def clear_lifted_wait(self, waiting_since):
-        return bool(self._rpc("clear_lifted_wait", waiting_since))
-
-    def remove_contract_item(self, field, index_1based):
-        return self._rpc("remove_contract_item", field, int(index_1based))
-
-    def replace(self, *, reason, goal, max_turns=None, contract=None, actor="agent", user_quote="",
-                user_messages=None):
-        kwargs = {k: v for k, v in (("max_turns", max_turns), ("user_quote", user_quote),
-                                    ("user_messages", user_messages)) if v}
-        if contract is not None:
-            kwargs["contract"] = contract.to_dict() if hasattr(contract, "to_dict") else contract
-        result = self._rpc("replace", reason=reason, goal=goal, actor=actor, **kwargs)
-        if not isinstance(result, dict):
-            return {"ok": False, "error": "Goal unavailable: the gateway did not answer."}
-        if result.get("ok"):
-            result = {**result, "state": self._state}
-        return result
 
     def command(self, arg, last_user_message=None):
         """The whole ``/goal <arg>`` run by the gateway (``/goal draft``: its contract drafter is a model call)."""
