@@ -1010,6 +1010,7 @@ class SlackAdapter(BasePlatformAdapter):
     _ASSISTANT_THREADS_MAX = _AGENT_VIEW_CONTEXTS_MAX = _THREAD_REHYDRATION_CHECKED_MAX = 5000
     _REACTING_MESSAGE_IDS_MAX = _TITLED_ASSISTANT_THREADS_MAX = 5000
     _CHANNEL_TEAM_MAX = 10000
+    _CHANNEL_TYPES_MAX = 5000
     _APPROVAL_RESOLVED_MAX = _CLARIFY_RESOLVED_MAX = _ACTIVE_STATUS_THREADS_MAX = 1000
     # Tighter cap than the approval/clarify dicts: each entry holds the
     # full provider list, and a picker is only live for minutes.
@@ -1046,6 +1047,9 @@ class SlackAdapter(BasePlatformAdapter):
         # holds all claimants; an ambiguous id is dropped, not last-writer-wins.
         self._channel_team: Dict[str, str] = {}
         self._channel_teams: Dict[str, set] = {}
+        # Slack channel type per workspace/channel, used to distinguish MPIMs
+        # (G...) from ordinary channels when suppressing assistant status.
+        self._channel_types: Dict[Tuple[str, str], str] = {}
         # user target (team_id:user_id) → opened DM conversation ID (D...)
         self._dm_conversation_cache: Dict[str, str] = {}
         # Dedup for Socket Mode reconnect replays; TTL must outlast the worst-case
@@ -2533,9 +2537,15 @@ class SlackAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=ts)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Show a thread status via assistant.threads.setStatus.
-        Needs assistant:write or chat:write scope; auto-clears on reply."""
+        """Show a thread status for DMs via assistant.threads.setStatus.
+
+        Slack renders assistant status below the newest channel message, which
+        makes it look like the assistant replied to itself. Channels use only
+        the in-progress reaction instead.
+        """
         if self._suppressed_ignored(chat_id, "typing/status in", level=logging.DEBUG):
+            return
+        if not self._is_dm_status_target(chat_id, metadata):
             return
         if not self._app:
             return
@@ -2584,6 +2594,23 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setStatus %s: %s", fail_label, e)
 
+    def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
+        """Keep live status phrases DM-only, matching ``send_typing``."""
+        if not self._is_dm_status_target(chat_id):
+            return
+        super().set_status_text(chat_id, text)
+
+    def _is_dm_status_target(self, chat_id: str, metadata=None) -> bool:
+        """Return whether assistant status is allowed for this Slack target."""
+        channel_type = str((metadata or {}).get("slack_channel_type") or "").lower()
+        if channel_type in {"im", "mpim", "dm"}:
+            return True
+        team_id = self._metadata_team_id(metadata) or self._channel_team.get(str(chat_id), "")
+        known_type = str(
+            getattr(self, "_channel_types", {}).get((str(team_id), str(chat_id)), "")
+        ).lower()
+        return str(chat_id or "").startswith("D") or known_type in {"im", "mpim"}
+
     @staticmethod
     def _default_status_text(started: Optional[float]) -> str:
         """Fallback status label: after 30s show elapsed progress so long turns don't read
@@ -2595,9 +2622,22 @@ class SlackAdapter(BasePlatformAdapter):
         return f"still working… ({f'{mins}m{secs:02d}s' if mins else f'{secs}s'})"
 
     async def stop_typing(self, chat_id: str, metadata=None) -> None:
-        """Clear the assistant thread status indicator."""
+        """Clear the assistant thread status indicator for DMs only."""
         if self._suppressed_ignored(chat_id, "status clear in", level=logging.DEBUG):
             self._active_status_threads.pop(chat_id, None)
+            return
+        if not self._is_dm_status_target(chat_id, metadata):
+            requested_thread_ts = str(
+                (metadata or {}).get("thread_id") or (metadata or {}).get("thread_ts") or "")
+            requested_team_id = self._metadata_team_id(metadata)
+            matching_keys = [
+                key for key in self._active_status_threads
+                if key[1] == str(chat_id)
+                and (not requested_thread_ts or key[2] == requested_thread_ts)
+                and (not requested_team_id or key[0] == requested_team_id)
+            ]
+            for key in matching_keys:
+                self._active_status_threads.pop(key, None)
             return
         if not self._app:
             return
@@ -4409,6 +4449,10 @@ class SlackAdapter(BasePlatformAdapter):
             self._remember_channel_team(channel_id, team_id)
         channel_type = event.get("channel_type", "") or ("im" if channel_id.startswith("D") else "")
         is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
+        if channel_id and channel_type:
+            self._channel_types[(str(team_id or ""), channel_id)] = channel_type
+            if len(self._channel_types) > self._CHANNEL_TYPES_MAX:
+                self._channel_types.pop(next(iter(self._channel_types)))
         if is_dm and self._slack_disable_dms():
             logger.info(
                 "[Slack] Ignoring DM because Slack DMs are disabled: channel=%s user=%s",
