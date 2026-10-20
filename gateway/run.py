@@ -40,7 +40,9 @@ from agent.conversation_compression import (
 from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
-from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, copy_identity_fields
+from agent.message_metadata import (
+    ABSORBED_MESSAGE_UIDS, DB_ROW_SNAPSHOT, MESSAGE_UID, REPLAY_PERSISTED_CONTENT, copy_identity_fields,
+)
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
@@ -1180,9 +1182,24 @@ def _build_replay_entry(
     # their calls (those pass through whole); on a plain row a leftover map would name calls it no longer has.
     copy_identity_fields({key: msg[key] for key in (MESSAGE_UID, ABSORBED_MESSAGE_UIDS) if key in msg}, entry)
     # Replay rewrites are view-only: keep the durable-row stamp so marker-only
-    # flushes skip rows already in state.db (#121462/#123462).
+    # flushes skip rows already in state.db (#121462/#123462). Keep the CAS snapshot
+    # as well, but only when the content is still the durable text. The stale-generation
+    # guard matches a held summary by uid plus exact stored-row version, so a replay
+    # that drops it looks unheld and every lease-less prune is refused. A rewritten view,
+    # such as a timestamp render, must not carry it, or a flush would treat that view as
+    # the row's current payload.
     if msg.get("_db_persisted"):
         entry["_db_persisted"] = True
+    snapshot = msg.get(DB_ROW_SNAPSHOT)
+    if isinstance(snapshot, str) and snapshot and content == msg.get("content"):
+        entry[DB_ROW_SNAPSHOT] = snapshot
+    # Preserve durable insert metadata needed when this replay view is later flushed. In particular,
+    # losing _compressed_summary would disarm the stale-generation guard, while dropping the display and
+    # platform fields would silently change the stored row on a marker-only rewrite.
+    for field in ("_compressed_summary", "message_id", "platform_message_id", "observed",
+                  "display_kind", "display_metadata", "effect_disposition"):
+        if field in msg and msg[field] is not None:
+            entry[field] = msg[field]
     # A merged user dict lost that stamp; this one is what ties it to its durable rows at compaction.
     # The other counts the rows the repair dropped behind a dict or folded into an assistant turn,
     # which this view cannot name either; the last names them for the commit.
@@ -1325,7 +1342,7 @@ def _build_gateway_agent_history(
                     continue
             # Keep user timestamps for the stale-dangerous-confirmation stripper in agent/replay_cleanup.py.
             entry = _build_replay_entry(role, content, msg, preserve_timestamp=(role == "user"))
-            if inject_timestamps and role == "user" and isinstance(content, str):
+            if inject_timestamps and role == "user" and isinstance(content, str) and not msg.get("_compressed_summary"):
                 rendered = _render_msg_ts(content, replay_timestamp, tz=_msg_tz)
                 # Preserve only a sidecar matching the complete rendered message,
                 # optionally followed by the normal context separator. Cleanup
@@ -1336,10 +1353,18 @@ def _build_gateway_agent_history(
                 ):
                     entry.pop("api_content", None)
                 entry["content"] = rendered
+                if rendered != content and isinstance(msg.get("content"), str):
+                    entry[REPLAY_PERSISTED_CONTENT] = content
             if msg.get("mirror"):
                 mirror_src = msg.get("mirror_source", "another session")
                 entry["content"] = f"[Delivered from {mirror_src}] {entry['content']}"
                 entry.pop("api_content", None)  # prefix rewrite: the sidecar no longer matches
+            if entry.get("content") != msg.get("content"):
+                if REPLAY_PERSISTED_CONTENT not in entry or msg.get("mirror"):
+                    entry.pop(DB_ROW_SNAPSHOT, None)  # a rewritten view is not the stored row version
+                    for field in ("_compressed_summary", "message_id", "platform_message_id",
+                                  "observed", "display_kind", "display_metadata", "effect_disposition"):
+                        entry.pop(field, None)
             agent_history.append(entry)
 
     # Keep gateway resume byte-identical to the TUI resume and send paths. The

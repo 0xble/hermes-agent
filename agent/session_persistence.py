@@ -24,7 +24,7 @@ from agent.memory_manager import sanitize_context
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
 from agent.message_metadata import (
-    DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, REPAIR_BOOKKEEPING_FIELDS, TOOL_CALL_UID, copy_identity_fields,
+    DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, REPAIR_BOOKKEEPING_FIELDS, REPLAY_PERSISTED_CONTENT, TOOL_CALL_UID, copy_identity_fields,
     tool_call_uid_from_history)
 from agent.transcript_repair import sync_flushed_message_markers
 
@@ -204,7 +204,7 @@ def _db_flush_scan_start(agent, messages: list[dict]) -> int:
 def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any]:
     """Build the session-db row for ``msg``, applying the persist override to THIS row only."""
     role = msg.get("role", "unknown")
-    content = msg.get("content")
+    content = msg.get(REPLAY_PERSISTED_CONTENT, msg.get("content"))
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
     api_content = msg.get("api_content") if isinstance(msg.get("api_content"), str) else None
     timestamp = msg.get("timestamp")
