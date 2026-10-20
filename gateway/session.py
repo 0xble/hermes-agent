@@ -582,6 +582,9 @@ class SessionEntry:
     # is configured.  Existing rows omit these keys and retain the historical session-scoped behavior.
     model_override_scope: str = "session"
     reasoning_override_scope: str = "session"
+    # Route the last API call committed to: True attended, False idle/explicit, None never committed.
+    # Process memory loses the attended decision on restart; this keeps the idle switch-back card.
+    attended_route_active: Optional[bool] = None
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -625,6 +628,8 @@ class SessionEntry:
         result["active_turn_started_at"] = _iso(self.active_turn_started_at)
         if self.last_user_activity_at is not None:
             result["last_user_activity_at"] = _iso(self.last_user_activity_at)
+        if self.attended_route_active is not None:
+            result["attended_route_active"] = self.attended_route_active
         if self.active_turn_token and self.active_turn_owner_pid and self.active_turn_owner_slot:
             result["active_turn_owner_pid"] = self.active_turn_owner_pid
             result["active_turn_owner_slot"] = self.active_turn_owner_slot
@@ -719,6 +724,8 @@ class SessionEntry:
             model_override=sanitize_model_override(data.get("model_override")),
             reasoning_override=sanitize_reasoning_override(data.get("reasoning_override")),
             last_user_activity_at=_parse_iso(data.get("last_user_activity_at")),
+            attended_route_active=data.get("attended_route_active")
+            if isinstance(data.get("attended_route_active"), bool) else None,
             model_override_scope=data.get("model_override_scope", "session")
             if data.get("model_override_scope") in ("session", "temporary", "once") else "session",
             reasoning_override_scope=data.get("reasoning_override_scope", "session")
@@ -1305,6 +1312,21 @@ class SessionStore(
                 self._save_entry(session_key, entry_data=entry.to_dict(), lock_held=True)
             return changed
 
+    def get_attended_route_active(self, session_key: str) -> Optional[bool]:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return getattr(entry, "attended_route_active", None) if entry else None
+
+    def mark_attended_route_active(self, session_key: str, active: bool) -> bool:
+        """Persist which route the session's latest API call committed to (attended or not)."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or entry.attended_route_active is bool(active):
+                return False
+            entry.attended_route_active = bool(active)
+            self._save_entry(session_key, entry_data=entry.to_dict(), lock_held=True)
+            return True
+
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         with self._lock:
@@ -1449,6 +1471,7 @@ class SessionStore(
                 reasoning_override=old_entry.reasoning_override,
                 # The user's activity belongs to the route, not the session row it points at.
                 last_user_activity_at=old_entry.last_user_activity_at,
+                attended_route_active=old_entry.attended_route_active,
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
                     if preserve_prompt_pin and old_entry.prompt_pin is not None else None

@@ -207,6 +207,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             return stamp
         return None
 
+    def _load_attended_route_active(self, session_key: str) -> Optional[bool]:
+        """Read the last route that actually reached an API call, if persisted."""
+        with suppress(Exception):
+            return self.session_store.get_attended_route_active(session_key)
+        return None
+
     def _ensure_attended_new_session_activity(self, session_key: str, cfg, stamp):
         """Start the attended window for a newly opened session without persisting automation as user activity."""
         state = self._peek_session_state(session_key)
@@ -256,15 +262,18 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             "attended_reasoning": attended_reasoning,
         }
 
-    def _log_attended_decision(self, session_key, source, *, action: str, reason: str) -> None:
+    def _log_attended_decision(
+        self, session_key, source, *, action: str, reason: str, effort: Optional[str] = None,
+    ) -> None:
         platform = getattr(getattr(source, "platform", None), "value", "") if source is not None else ""
         origin = "automation" if str(platform).lower() in {
             "automation", "cron", "goal_wakeup", "kanban", "subagent", "system",
         } else "user"
-        logger.info(
-            "attended decision: session=%s origin=%s action=%s reason=%s",
-            session_key, origin, action, reason,
-        )
+        fmt, args = "attended decision: session=%s origin=%s action=%s reason=%s", [session_key, origin, action, reason]
+        if effort is not None:
+            fmt += " effort=%s"
+            args.append(effort or "none")
+        logger.info(fmt, *args)
 
     def _handoff_attended_state(self, session_key: Optional[str], *, conversation=None, runner=None) -> None:
         """Publish worker-thread attended bookkeeping on the owning gateway loop."""
@@ -378,13 +387,20 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             },
             time.time(), user_config or {},
         )
+        load_route_active = getattr(self, "_load_attended_route_active", None)
+        durable_route_active = load_route_active(session_key) if callable(load_route_active) else None
         switched_back = bool(
             decision.reason == "default"
-            and previous_decision is not None
-            and previous_decision.reason == "attended"
-            and previous_decision.active
-            and previous_decision.idle_model
-            and previous_decision.idle_model != previous_decision.model
+            and (
+                (
+                    previous_decision is not None
+                    and previous_decision.reason == "attended"
+                    and previous_decision.active
+                    and previous_decision.idle_model
+                    and previous_decision.idle_model != previous_decision.model
+                )
+                or durable_route_active is True
+            )
         )
         api_quiet = True
         awaiting_first_message = False

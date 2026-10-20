@@ -719,6 +719,127 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
 
     # ── hook / status bridges (agent thread → gateway loop) ────────────────────────────────
 
+    def _step_callback_sync(self, iteration: int, prev_tools: list) -> None:
+        ctx = self._ctx
+        if not ctx._run_still_current():
+            return
+        # prev_tools may be list[str] or list[dict] with "name"/"result" keys. Normalise so
+        # "tool_names" stays backward-compatible for user hooks that do ', '.join(tool_names).
+        names = [(t.get("name") or "") if isinstance(t, dict) else str(t) for t in (prev_tools or [])]
+        self._schedule(
+            ctx._hooks_ref.emit("agent:step", {
+                "platform": ctx.source.platform.value if ctx.source.platform else "",
+                "user_id": ctx.source.user_id, "session_id": ctx.session_id,
+                "iteration": iteration, "tool_names": names, "tools": prev_tools,
+            }),
+            "agent:step hook scheduling error",
+        )
+
+    def _event_callback_sync(self, event_type: str, context: dict) -> None:
+        ctx = self._ctx
+        try:
+            asyncio.run_coroutine_threadsafe(ctx._hooks_ref.emit(event_type, context), ctx._loop_for_step)
+        except Exception as e:
+            logger.debug("event_callback hook error: %s", e)
+
+    def _status_live(self) -> bool:
+        """Status adapter present and this run is still the current generation."""
+        return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
+
+    def _send_status_text(self, text: str, metadata, log_message: str) -> None:
+        ctx = self._ctx
+        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+
+    def _attach_session_title_callback(self, agent, ctx) -> None:
+        """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
+
+        The titler runs in the turn prologue, so attach before the run, not after it.
+        """
+        try:
+            # Gateway auto-title failures are not user-actionable, so never surface them as messages;
+            # overriding the failure sink keeps CLI on _emit_auxiliary_failure while gateway logs debug.
+            agent._title_failure_callback = lambda task, exc: logger.debug(
+                "Gateway auto-title failure suppressed (not user-visible): %s: %s", task, exc,
+            )
+            session_id = getattr(agent, "session_id", None)
+            runner = self._runner
+            source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
+            # Both lanes spend a rate-limited platform call per title, so they use the model's title
+            # only (TitleCallback); renaming twice burns Discord's 2-per-10-min budget on a throwaway.
+            # Relay Discord predicate is shape-only: whether the connector auto-threaded our reply is
+            # only knowable AFTER delivery, so register eagerly and let the rename lane look up the
+            # cache at fire time — gating registration on the cache read meant it never registered.
+            if runner._is_telegram_topic_lane(source):
+                # Capture now: _prepare_turn_message may prepend resume/model notes to
+                # ctx.message before the titler fires, and the icon heuristic must score
+                # the user's words, not recovery guidance.
+                opening_message = getattr(ctx, "message", "") or ""
+                if not isinstance(opening_message, str):
+                    opening_message = ""
+
+                def _schedule_telegram_title(title, title_source, *, display_title=None, icon=None):
+                    if title_source != "llm":
+                        return False
+                    return runner._schedule_telegram_topic_title_rename(
+                        source, session_id, display_title or title,
+                        user_message=opening_message, model_icon=icon,
+                    )
+                agent._on_session_title = _schedule_telegram_title
+                agent._title_icon_context = runner._telegram_topic_icon_context(source)
+            elif runner._is_discord_auto_thread_lane(source) or runner._is_relay_discord_channel_lane(source):
+                lane = "_schedule_discord_semantic_thread_rename"
+                agent._on_session_title = lambda title, title_source: (
+                    title_source == "llm" and getattr(runner, lane)(source, session_id, title)
+                )
+            else:
+                return
+
+
+        except Exception:
+            logger.debug("Failed to attach session title callback", exc_info=True)
+
+    def _emit_persistent_attended_notice(self, message: str) -> None:
+        """Deliver an attended route card outside the temporary status-bubble rail."""
+        from gateway.warning_notifications import render_notification
+        ctx = self._ctx
+        if ctx.mute_notification_reply or not self._status_live():
+            return
+
+        def present() -> None:
+            self._schedule(
+                self._runner._deliver_platform_notice(ctx.source, message),
+                "attended notice delivery scheduling error",
+            )
+
+        render_notification(
+            present,
+            platform=ctx.source.platform,
+            user_config=ctx.user_config,
+            diagnostic=True,
+        )
+
+    def _status_callback_sync(self, event_type: str, message: str) -> None:
+        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
+        from gateway.warning_notifications import is_warning_status, render_notification
+        ctx = self._ctx
+        if ctx.mute_notification_reply or not self._status_live():
+            return
+        prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
+        if prepared is None:
+            logger.debug(
+                "status_callback suppressed for %s/%s: %s",
+                ctx.source.platform.value if ctx.source.platform else "unknown", event_type,
+                _redact_gateway_user_facing_secrets(str(message or ""))[:160],
+            )
+            return
+        def present():
+            self._schedule(
+                self._status_delivery.send(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
+                f"status_callback ({event_type}) scheduling error",
+            )
+        render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
+                            diagnostic=is_warning_status(event_type, message))
+
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
     def _setup_stream_consumer(self, platform_key):
@@ -1171,11 +1292,22 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 _handoff(conversation={"last_api_call_at": time.time()})
             agent._gateway_attended_decision = decision
             desired_key = decision.decision_key
-            if desired_key == previous_key:
-                return
+
+            def _persist_committed_route_marker():
+                if not commit or not ctx.session_key:
+                    return
+                store = getattr(runner, "session_store", None)
+                mark_route = getattr(store, "mark_attended_route_active", None)
+                if callable(mark_route):
+                    mark_route(ctx.session_key, decision.reason == "attended")
+
             if getattr(agent, "_fallback_activated", False) or getattr(agent, "_provider_fallback_active", False):
                 agent._gateway_attended_decision_key = desired_key
                 return
+            if desired_key == previous_key:
+                _persist_committed_route_marker()
+                return
+
             if decision.switched_back:
                 snapshot = getattr(runner, "_snapshot_session_runtime_state", None)
                 if callable(snapshot):
@@ -1215,7 +1347,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if commit and decision.switched_back:
                 log_decision = getattr(runner, "_log_attended_decision", None)
                 if callable(log_decision):
-                    log_decision(ctx.session_key, ctx.source, action="switch", reason="idle")
+                    log_decision(
+                        ctx.session_key, ctx.source, action="switch", reason="idle",
+                        effort=decision.reasoning_effort or "none",
+                    )
                 _handoff(
                     conversation={"last_attended_decision": decision},
                     runner_state={"_last_attended_decision": decision},
@@ -1248,23 +1383,25 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 agent.reasoning_config = runner._resolve_session_reasoning_config(
                     source=ctx.source, session_key=ctx.session_key, model=model,
                 )
+            _persist_committed_route_marker()
             agent._gateway_attended_decision_key = desired_key
             if ctx.session_key:
                 _handoff(conversation={"last_resolved_model": model})
             if decision.switched_back and not unavailable_emitted:
-                emit_status = getattr(agent, "_emit_diagnostic_status", None)
-                if callable(emit_status):
-                    emit_status(format_attended_switch_back_notice(
-                        model, parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
-                    ))
-            elif decision.reason == "attended" and not unavailable_emitted and not (previous_key and previous_key[-1]):
+                self._emit_persistent_attended_notice(format_attended_switch_back_notice(
+                    model, parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
+                ))
+            elif (
+                decision.reason == "attended"
+                and not decision.new_session
+                and not unavailable_emitted
+                and not (previous_key and previous_key[-1])
+            ):
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
-                emit_status = getattr(agent, "_emit_diagnostic_status", None)
-                if callable(emit_status):
-                    emit_status(format_attended_switch_notice(
-                        model, effort, idle_model=decision.idle_model,
-                        idle_minutes=parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
-                    ))
+                self._emit_persistent_attended_notice(format_attended_switch_notice(
+                    model, effort, idle_model=decision.idle_model,
+                    idle_minutes=parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
+                ))
             if ctx.session_key:
                 _handoff(conversation={"pending_attended_notice": None})
         except Exception:
@@ -2176,9 +2313,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             from gateway.session_usage import TURN_BASE_ATTR
             setattr(agent, TURN_BASE_ATTR, int(getattr(agent, "session_output_tokens", 0) or 0))
         if attended_notice:
-            emit_status = getattr(agent, "_emit_diagnostic_status", None)
-            if callable(emit_status):
-                emit_status(attended_notice)
+            self._emit_persistent_attended_notice(attended_notice)
             if state is not None:
                 state.conversation.pending_attended_notice = None
         try:
