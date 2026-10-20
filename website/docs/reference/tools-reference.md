@@ -193,7 +193,7 @@ Enabled for sessions whose source is the desktop app, whichever backend it's con
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `session_state` | Read-only, profile-scoped Hermes state for 3 named actions: `resolve_topic` maps a Telegram DM `chat_id` and `thread_id` to its bound session, `inspect_session` returns bounded metadata and lineage for an exact `session_id`, and `inspect_delivery` returns bounded delivery-obligation status for an exact obligation, session key, or session. Delivery content is omitted unless `include_content=true`. The tool rejects SQL and arbitrary selectors, uses fixed row and byte caps, and never creates, migrates, or writes `state.db`. Use `session_search` instead for conversation discovery and transcript search. | — |
+| `session_state` | Read-only, profile-scoped Hermes state for 3 named actions: `resolve_topic` maps a Telegram DM `chat_id` and `thread_id` to its bound session, `inspect_session` returns bounded metadata and lineage for an exact `session_id`, and `inspect_delivery` returns bounded delivery-obligation status for an exact obligation, session key, or session. Delivery content is omitted unless `include_content=true`. Under multiplexed routing, delivery status comes from the process-home shared ledger, filtered to the served adapter profile. The tool rejects SQL and arbitrary selectors, uses fixed row and byte caps, and never creates, migrates, or writes `state.db`. Use `session_search` instead for conversation discovery and transcript search. | — |
 
 ## `skills` toolset
 

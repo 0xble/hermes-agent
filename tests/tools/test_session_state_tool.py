@@ -27,7 +27,9 @@ def _set_profile(monkeypatch, profile):
     set_session_vars(profile=profile)
 
 
-def _seed_delivery(db, *, obligation_id="ob-1", session_key="agent:alpha:1", content="payload"):
+def _seed_delivery(
+    db, *, obligation_id="ob-1", session_key="agent:alpha:1", content="payload", adapter_profile="alpha"
+):
     from gateway.delivery_ledger import _initialize_schema
 
     db._execute_write(_initialize_schema)
@@ -37,8 +39,8 @@ def _seed_delivery(db, *, obligation_id="ob-1", session_key="agent:alpha:1", con
                (obligation_id, session_key, platform, chat_id, thread_id, content, state,
                 attempts, created_at, updated_at, last_error, adapter_profile)
                VALUES (?, ?, 'telegram', 'chat-1', 'thread-1', ?, 'pending', 2,
-                       1.0, 2.0, ?, 'alpha')""",
-            (obligation_id, session_key, content, "E" * 10000),
+                       1.0, 2.0, ?, ?)""",
+            (obligation_id, session_key, content, "E" * 10000, adapter_profile),
         )
     )
 
@@ -99,6 +101,67 @@ def test_session_state_two_profiles_can_read_same_id_without_cross_profile_fallb
         _set_profile(monkeypatch, profile)
         result = _dispatch(registry, {"action": "inspect_session", "session_id": "same-id"})
         assert result["session"]["title"] == profile.title()
+
+
+def test_session_state_named_profile_uses_home_identity_without_bound_profile(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+    from hermes_state import SessionDB
+    from tools.registry import discover_builtin_tools, registry
+
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session("work-id", "telegram", profile_name="work")
+    finally:
+        db.close()
+
+    discover_builtin_tools()
+    result = _dispatch(registry, {"action": "inspect_session", "session_id": "work-id"})
+    assert result["found"] is True
+    assert result["session"]["profile_name"] == "work"
+
+
+def test_session_state_multiplex_delivery_reads_process_home_ledger(monkeypatch, tmp_path):
+    root = tmp_path / "root"
+    secondary_home = root / "profiles" / "secondary"
+    secondary_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    _set_profile(monkeypatch, "secondary")
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+    from tools.registry import discover_builtin_tools, registry
+
+    profile_db = SessionDB(db_path=secondary_home / "state.db")
+    process_db = SessionDB(db_path=root / "state.db")
+    try:
+        profile_db.create_session(
+            "secondary-id", "telegram", profile_name="secondary", session_key="agent:secondary:1"
+        )
+        _seed_delivery(
+            profile_db, obligation_id="profile-copy", session_key="agent:secondary:1", adapter_profile="secondary"
+        )
+        _seed_delivery(
+            process_db, obligation_id="shared-ledger", session_key="agent:secondary:1", adapter_profile="secondary"
+        )
+        _seed_delivery(
+            process_db, obligation_id="other-profile", session_key="agent:secondary:1", adapter_profile="default"
+        )
+    finally:
+        profile_db.close()
+        process_db.close()
+
+    discover_builtin_tools()
+    token = set_hermes_home_override(str(secondary_home))
+    try:
+        by_session = _dispatch(registry, {"action": "inspect_delivery", "session_id": "secondary-id"})
+        by_key = _dispatch(registry, {"action": "inspect_delivery", "session_key": "agent:secondary:1"})
+    finally:
+        reset_hermes_home_override(token)
+    for result in (by_session, by_key):
+        assert result["found"] is True
+        assert [row["obligation_id"] for row in result["rows"]] == ["shared-ledger"]
 
 
 def test_session_state_absent_db_does_not_create_one(monkeypatch, tmp_path):

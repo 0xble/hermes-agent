@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from gateway.session_context import bound_session_env, get_session_env
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_process_hermes_home, profile_name_for_home
 from hermes_state import SessionDB
 from tools.registry import registry, tool_error
 
@@ -50,13 +50,20 @@ SESSION_STATE_SCHEMA = {
 
 
 def _profile() -> str:
-    """Resolve the served profile, failing closed after multiplexing is engaged."""
+    """Resolve the served profile from the bound scope or the active state path."""
     value = bound_session_env("HERMES_SESSION_PROFILE", "")
-    return str(value or "default").strip() or "default"
+    if (profile := str(value or "").strip()):
+        return profile
+    return profile_name_for_home(get_hermes_home()) or "default"
 
 
 def _db_path() -> Path:
     return get_hermes_home() / "state.db"
+
+
+def _delivery_db_path() -> Path:
+    """Return the process-home ledger path, shared by multiplexed profiles."""
+    return get_process_hermes_home() / "state.db"
 
 
 def _selector(value: Any) -> str:
@@ -149,8 +156,11 @@ def _delivery_selector(db: SessionDB, args: dict[str, Any], profile: str) -> tup
     return name, value
 
 
-def _inspect_delivery(db: SessionDB, args: dict[str, Any], profile: str) -> dict[str, Any]:
-    columns = _table_columns(db)
+def _inspect_delivery(
+    profile_db: SessionDB, delivery_db: SessionDB, args: dict[str, Any], profile: str
+) -> dict[str, Any]:
+    """Resolve session selectors in the served profile, then read the process-home ledger."""
+    columns = _table_columns(delivery_db)
     required = {
         "obligation_id", "session_key", "platform", "chat_id", "thread_id", "state", "attempts",
         "created_at", "updated_at", "owner_pid", "last_error", "adapter_profile",
@@ -166,13 +176,13 @@ def _inspect_delivery(db: SessionDB, args: dict[str, Any], profile: str) -> dict
     include_content = bool(args.get("include_content")) and "content" in columns
     if include_content:
         selected.append("content")
-    selector = _delivery_selector(db, args, profile)
+    selector = _delivery_selector(profile_db, args, profile)
     if selector is None:
         return _empty("inspect_delivery", "session_not_found")
     selector_name, selector_value = selector
     profile_clause = " AND adapter_profile = ?"
     params: list[Any] = [selector_value, profile, _MAX_ROWS]
-    rows = db._read_all(
+    rows = delivery_db._read_all(
         "SELECT " + ", ".join(selected) + " FROM delivery_obligations WHERE " + selector_name + " = ?"
         + profile_clause + " ORDER BY updated_at DESC, obligation_id DESC LIMIT ?",
         params,
@@ -220,7 +230,6 @@ def _table_columns_for_topic(db: SessionDB) -> set[str]:
 _ACTION_HANDLERS = {
     "resolve_topic": _resolve_topic,
     "inspect_session": _inspect_session_action,
-    "inspect_delivery": _inspect_delivery,
 }
 
 
@@ -240,21 +249,34 @@ def session_state_tool(args: dict, **_kwargs: Any) -> str:
         )
         if len(selectors) > 1:
             return tool_error("inspect_delivery accepts exactly one of obligation_id, session_key, or session_id")
-    path = _db_path()
-    if not path.is_file():
-        return json.dumps(_empty(action), separators=(",", ":"))
     profile = _profile()
-    db = None
+    profile_path = _db_path()
+    delivery_path = _delivery_db_path() if action == "inspect_delivery" else profile_path
+    if not delivery_path.is_file():
+        return json.dumps(_empty(action), separators=(",", ":"))
+    opened: list[SessionDB] = []
     try:
-        db = SessionDB(db_path=path, read_only=True)
-        result = _ACTION_HANDLERS[action](db, args, profile)
+        delivery_db = SessionDB(db_path=delivery_path, read_only=True)
+        opened.append(delivery_db)
+        if action != "inspect_delivery":
+            result = _ACTION_HANDLERS[action](delivery_db, args, profile)
+        elif profile_path.resolve() == delivery_path.resolve():
+            result = _inspect_delivery(delivery_db, delivery_db, args, profile)
+        elif str(args.get("session_id") or "").strip() and not profile_path.is_file():
+            result = _empty(action, "session_not_found")
+        else:
+            profile_db = delivery_db
+            if str(args.get("session_id") or "").strip():
+                profile_db = SessionDB(db_path=profile_path, read_only=True)
+                opened.append(profile_db)
+            result = _inspect_delivery(profile_db, delivery_db, args, profile)
         return json.dumps(_bounded(result), ensure_ascii=False, separators=(",", ":"))
     except ValueError as exc:
         return tool_error(str(exc))
     except Exception as exc:
         return json.dumps({"ok": False, "action": action, "error": f"state read failed: {type(exc).__name__}"})
     finally:
-        if db is not None:
+        for db in opened:
             db.close()
 
 
