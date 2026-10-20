@@ -224,7 +224,35 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
 
     # ── progress_callback (agent thread → progress queue) ───────────────────────────────────
 
+    def progress_callback(self, event_type: str, tool_name: str | None = None, preview: str | None = None, args: dict | None = None, **kwargs):
+        """Delegate to the canonical progress mixin, including local-viewer frames."""
+        return GatewayTurnProgressMixin.progress_callback(self, event_type, tool_name, preview, args, **kwargs)
 
+    def _progress_subagent_notice_legacy(self, preview, kwargs: dict) -> None:
+        """Only terminal failure statuses render (same notice rail as credit warnings)."""
+        ctx = self._ctx
+        from gateway.warning_notifications import render_notification
+        status = kwargs.get("status")
+        try:
+            from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
+            from tools.delegate_tool_progress import subagent_failure_notice_claimed
+            claimed = kwargs.get("failure_notice_claimed")
+            if claimed is None and status in SUBAGENT_FAILURE_STATUSES:
+                # Only events that bypassed the delegation relay reach here without a decision.
+                claimed = subagent_failure_notice_claimed(
+                    child_session_id=kwargs.get("child_session_id"), child_goal=kwargs.get("goal"),
+                    child_status=status, error=kwargs.get("summary") or preview,
+                    failure_reason=kwargs.get("failure_reason"))
+            if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current() and not claimed:
+                line = format_subagent_failure_line(
+                    kwargs.get("goal"), status, error=kwargs.get("summary") or preview,
+                    duration_seconds=kwargs.get("duration_seconds"), failure_reason=kwargs.get("failure_reason"),
+                )
+                render_notification(
+                    lambda: self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error"),
+                    platform=ctx.source.platform, user_config=ctx.user_config)
+        except Exception:
+            logger.debug("subagent failure notice failed", exc_info=True)
     def _progress_live_status(self, event_type: str, tool_name, args) -> None:
         """Live status line (Slack assistant status): stash the tool phrase on the adapter; the
         _keep_typing refresh renders it. Plain dict write, safe from the sync worker thread."""

@@ -274,7 +274,7 @@ class SessionAuthority:
             prompts = live.controls.snapshot(ref.session_id, active_generation)
             epoch, sequence = live.event_stream.watermark()
             snapshot = SubscriptionSnapshot(subscription, handle, epoch,
-                                        sequence, tuple(local_history(self, ref)),
+                                        sequence, tuple(await asyncio.to_thread(local_history, self, ref)),
                                         tuple(self._pending_receipt(r) for r in self._pending_rows(ref)), prompts)
         from gateway.session_deferred_pick import reask_on_attach
         await reask_on_attach(self, ref, live)
@@ -862,7 +862,7 @@ class SessionAuthority:
                 await apply_deferred_pick(self, ref, live)
             if first is not None and live.source.platform == Platform.LOCAL:
                 from gateway.session_local_recovery import restore_local_session
-                restore_local_session(self, ref.session_id)
+                await asyncio.to_thread(restore_local_session, self, ref.session_id)
                 if first['request_id'].startswith('hosted:'):
                     from gateway.session_hosted_transport import check_remote_hosted_admission
                     if not await asyncio.to_thread(check_remote_hosted_admission, self, ref, first):

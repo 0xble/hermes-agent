@@ -5732,7 +5732,7 @@ async def _start_gateway_start_control_socket(runner):
         # a truthful liveness/identity query for updater and fleet consumers. Strictly non-fatal: a bind
         # failure only means consumers fall back to the process-scan/state-file layer, exactly as before
         # this feature. See #92091.
-        from gateway.control_socket import GatewayControlServer
+        from gateway.control_socket import GatewayControlServer, build_identify_payload
         from gateway.update_launcher import make_agent_update_handler
         from gateway.slash_commands import _spawn_detached_update
         from hermes_cli.config import is_managed
@@ -5787,13 +5787,32 @@ async def _start_gateway_start_control_socket(runner):
             spawn=_spawn_detached_update, is_managed=is_managed,
         )
 
+        def _identify_runtime():
+            from gateway.drain_control import RESTART_WAIT_REASON
+            payload = build_identify_payload()
+            descriptor = getattr(runner, "session_runtime_descriptor", {})
+            payload.update({key: descriptor[key] for key in (
+                "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
+                "served_profiles", "parked_profiles", "capabilities") if key in descriptor})
+            if getattr(runner, "_draining", False):
+                payload.update(state="draining")
+                # The restart's after-turn wait still owns its turns, so the endpoint stays dialable.
+                if descriptor.get("drain_reason") != RESTART_WAIT_REASON:
+                    payload["capabilities"] = []
+            if payload.get("state") == "draining" and descriptor.get("drain_reason"):
+                payload["drain_reason"] = descriptor["drain_reason"]
+            payload["supervisor"] = {"manual": "none", "desktop": "none"}.get(
+                payload.get("supervisor"), payload.get("supervisor", "none"))
+            return payload
+
         from gateway.cron_review import CronReviewControl
         from gateway import zero_cut_standby as zcs
         from gateway.zero_cut_handover_drain import request_handover, status as handover_status
         _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
-            verb_handlers={"cron-review": _cron_review_control.submit,
+            verb_handlers={"identify": _identify_runtime,
+                           "cron-review": _cron_review_control.submit,
                            "cron-review-result": _cron_review_control.result,
                            "pause-for-update": _pause_for_update_handler,
                            "agent-update": _agent_update_handler,
@@ -5806,6 +5825,7 @@ async def _start_gateway_start_control_socket(runner):
                            "promote": lambda: asyncio.run_coroutine_threadsafe(zcs.promote(runner), _main_loop).result(),
                            "handover": lambda: request_handover(runner, _main_loop),
                            "handover-status": lambda: handover_status(runner)})
+        _control_server.ticket_store = runner.session_ticket_store
         if not await _control_server.start():
             _control_server = None
         else:

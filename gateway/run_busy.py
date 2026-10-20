@@ -1020,6 +1020,14 @@ class GatewayBusySessionMixin:
         # messages sent while the agent was busy (interrupt mode, or a steer that fell back to queue)
         # arrived as one mashed-together turn (#43066 sub-bug 2). The FIFO path gives each text its own turn
         # in arrival order while still preserving photo-burst / album merge semantics for media.
+        is_queue_mode = effective_mode == "queue"
+        is_steer_mode = effective_mode == "steer" and not redirected
+        is_redirect_mode = redirected
+        if (
+            effective_mode == "interrupt" and not redirected
+            and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
+        ):
+            await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
         await self._busy_interrupt_and_ack(event, session_key, adapter, _busy_state, running_agent, _steer)
         return True
 

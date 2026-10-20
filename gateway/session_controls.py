@@ -518,7 +518,8 @@ class AuthorityConnection:
             # owner, not on the physical transcript ID the history picker / Desktop supplies
             # after list_sessions projects the tip (#139306).
             if row and row['source'] in LEGACY_LOCAL_SOURCES | {Platform.LOCAL.value}:
-                ref = resolve_local_target(self.authority, self.actor,
+                ref = await asyncio.to_thread(
+                    resolve_local_target, self.authority, self.actor,
                     self.authority.db.get_compression_tip(ref.session_id) or ref.session_id)
             elif row:
                 # A messaging compression continuation attaches to its lineage root, the session

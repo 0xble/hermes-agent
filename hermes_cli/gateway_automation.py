@@ -111,7 +111,6 @@ class GatewayGoalManager(_Remote):
         if s is None or s.status != "paused" or s.last_verdict != "blocked":
             return False
         return bool(self._rpc("resume_for_user_input"))
-
     def lifted_barrier_prompt(self):
         """Barrier-lift prompt computed where the barrier (pid / process session / timer) lives."""
         if not self.is_parked():

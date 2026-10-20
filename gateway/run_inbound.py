@@ -2601,11 +2601,6 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
                 clip_memo = {}
                 event._gateway_pending_stt_clips = clip_memo
 
-            clip_memo = getattr(event, "_gateway_pending_stt_clips", None)
-            if clip_memo is None:
-                clip_memo = {}
-                event._gateway_pending_stt_clips = clip_memo
-
             async def _transcribe():
                 # Limit provider calls (including local fallback) across pending messages, not
                 # just clips within one message. Queued events can fill the FIFO at once.
