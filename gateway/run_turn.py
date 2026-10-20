@@ -254,15 +254,18 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             "attended_reasoning": attended_reasoning,
         }
 
-    def _log_attended_decision(self, session_key, source, *, action: str, reason: str) -> None:
+    def _log_attended_decision(
+        self, session_key, source, *, action: str, reason: str, effort: Optional[str] = None,
+    ) -> None:
         platform = getattr(getattr(source, "platform", None), "value", "") if source is not None else ""
         origin = "automation" if str(platform).lower() in {
             "automation", "cron", "goal_wakeup", "kanban", "subagent", "system",
         } else "user"
-        logger.info(
-            "attended decision: session=%s origin=%s action=%s reason=%s",
-            session_key, origin, action, reason,
-        )
+        fmt, args = "attended decision: session=%s origin=%s action=%s reason=%s", [session_key, origin, action, reason]
+        if effort is not None:
+            fmt += " effort=%s"
+            args.append(effort or "none")
+        logger.info(fmt, *args)
 
     def _handoff_attended_state(self, session_key: Optional[str], *, conversation=None, runner=None) -> None:
         """Publish worker-thread attended bookkeeping on the owning gateway loop."""

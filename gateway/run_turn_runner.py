@@ -997,6 +997,26 @@ class TurnRunner:
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
+    def _emit_persistent_attended_notice(self, message: str) -> None:
+        """Deliver an attended route card outside the temporary status-bubble rail."""
+        from gateway.warning_notifications import render_notification
+        ctx = self._ctx
+        if ctx.mute_notification_reply or not self._status_live():
+            return
+
+        def present() -> None:
+            self._schedule(
+                self._runner._deliver_platform_notice(ctx.source, message),
+                "attended notice delivery scheduling error",
+            )
+
+        render_notification(
+            present,
+            platform=ctx.source.platform,
+            user_config=ctx.user_config,
+            diagnostic=True,
+        )
+
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
         from gateway.warning_notifications import is_warning_status, render_notification
@@ -1491,7 +1511,10 @@ class TurnRunner:
             if commit and decision.switched_back:
                 log_decision = getattr(runner, "_log_attended_decision", None)
                 if callable(log_decision):
-                    log_decision(ctx.session_key, ctx.source, action="switch", reason="idle")
+                    log_decision(
+                        ctx.session_key, ctx.source, action="switch", reason="idle",
+                        effort=decision.reasoning_effort or "none",
+                    )
                 _handoff(
                     conversation={"last_attended_decision": decision},
                     runner_state={"_last_attended_decision": decision},
@@ -1529,11 +1552,9 @@ class TurnRunner:
             if ctx.session_key:
                 _handoff(conversation={"last_resolved_model": model})
             if decision.switched_back and not unavailable_emitted:
-                emit_status = getattr(agent, "_emit_diagnostic_status", None)
-                if callable(emit_status):
-                    emit_status(format_attended_switch_back_notice(
-                        model, parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
-                    ))
+                self._emit_persistent_attended_notice(format_attended_switch_back_notice(
+                    model, parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
+                ))
             elif (
                 decision.reason == "attended"
                 and not decision.new_session
@@ -1541,12 +1562,10 @@ class TurnRunner:
                 and not (previous_key and previous_key[-1])
             ):
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
-                emit_status = getattr(agent, "_emit_diagnostic_status", None)
-                if callable(emit_status):
-                    emit_status(format_attended_switch_notice(
-                        model, effort, idle_model=decision.idle_model,
-                        idle_minutes=parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
-                    ))
+                self._emit_persistent_attended_notice(format_attended_switch_notice(
+                    model, effort, idle_model=decision.idle_model,
+                    idle_minutes=parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
+                ))
             if ctx.session_key:
                 _handoff(conversation={"pending_attended_notice": None})
         except Exception:
@@ -2288,9 +2307,7 @@ class TurnRunner:
         attended_notice = getattr(getattr(state, "conversation", None), "pending_attended_notice", None)
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
         if attended_notice:
-            emit_status = getattr(agent, "_emit_diagnostic_status", None)
-            if callable(emit_status):
-                emit_status(attended_notice)
+            self._emit_persistent_attended_notice(attended_notice)
             if state is not None:
                 state.conversation.pending_attended_notice = None
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
