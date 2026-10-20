@@ -73,6 +73,22 @@ def test_long_home_uses_pointer_fallback(tmp_path: Path):
     assert pointer == deep / "gateway.sock.path"
 
 
+def test_long_home_fallback_server_starts_and_answers(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    home = tmp_path / ("x" * 120) / ".hermes"
+    home.mkdir(parents=True)
+
+    async def scenario():
+        server = GatewayControlServer(home, verb_handlers={"identify": lambda: {"pid": 1}})
+        assert await server.start()
+        try:
+            return await asyncio.to_thread(query_gateway_control, home, "identify")
+        finally:
+            await server.stop()
+
+    assert _run(scenario()) == {"pid": 1}
+
+
 def test_client_resolution_prefers_direct_then_pointer(home: Path, tmp_path: Path):
     assert resolve_client_socket_path(home) is None
     # pointer file to an existing socket-ish file

@@ -212,7 +212,13 @@ class GatewayControlServer:
         if pointer_file is not None:
             with contextlib.suppress(FileExistsError):
                 bind_path.parent.mkdir(mode=0o700)
-            if not _private_directory(bind_path.parent):
+            try:
+                private = _private_directory(bind_path.parent)
+            except OSError:
+                # Some sandboxed temp roots deny metadata reads even though a child can be created.
+                # Treat that as unsafe and use the unpredictable private root below it.
+                private = False
+            if not private:
                 # Another local user pre-created the predictable shared-temp name; bootstrap treats
                 # a missing listener as fatal, so move to an unpredictable private root instead.
                 logger.warning("Fallback control directory %s is not private; using a fresh one", bind_path.parent)
@@ -230,7 +236,10 @@ class GatewayControlServer:
         old_umask = os.umask(0o177)
         try:
             bind_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(bind_path.parent, 0o700)
+            if pointer_file is None:
+                # The in-home socket directory belongs to Hermes. A long-home fallback may instead
+                # live in a private temp directory owned by the OS, which must not be chmod'ed.
+                os.chmod(bind_path.parent, 0o700)
             self._server = await asyncio.start_unix_server(self._handle_connection, path=str(bind_path))
         finally:
             os.umask(old_umask)

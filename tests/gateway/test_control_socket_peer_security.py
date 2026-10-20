@@ -99,8 +99,8 @@ def test_clients_refuse_a_control_listener_run_by_another_uid(tmp_path, monkeypa
         assert "connect_private(" in source and "AF_UNIX" not in source, client.__qualname__
 
 
-def test_long_home_survives_a_squatted_shared_fallback_directory(tmp_path, monkeypatch):
-    # Any local user can pre-create the predictable shared-temp name; that must not stop the
+def test_long_home_survives_a_squatted_shared_fallback_socket(tmp_path, monkeypatch):
+    # Any local user can pre-create the predictable shared-temp socket path; that must not stop the
     # gateway from publishing its control socket (the bootstrap treats that as fatal).
     import asyncio
     from gateway.control_socket import GatewayControlServer, resolve_server_socket_path
@@ -108,14 +108,14 @@ def test_long_home_survives_a_squatted_shared_fallback_directory(tmp_path, monke
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     home = tmp_path / ("p" * 90) / ".hermes"
     home.mkdir(parents=True, mode=0o700)
-    squatted = resolve_server_socket_path(home)[0].parent
+    squatted = resolve_server_socket_path(home)[0]
     squatted.write_text("not yours")
 
     async def run():
         server = GatewayControlServer(home, verb_handlers={"identify": lambda: {"pid": 1}})
         assert await server.start()
         try:
-            assert _socket_path(home).parent.parent != squatted.parent
+            assert _socket_path(home).parent != squatted.parent
         finally:
             await server.stop()
     try:
