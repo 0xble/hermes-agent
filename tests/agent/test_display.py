@@ -45,6 +45,32 @@ class TestBuildToolPreview:
         """Empty dict has no keys to preview."""
         assert build_tool_preview("terminal", {}) is None
 
+    def test_terminal_preview_redacts_hermes_state_db_inspection(self):
+        result = build_tool_preview(
+            "terminal",
+            {"command": 'sqlite3 "$HOME/.hermes/state.db" "SELECT id FROM messages"'},
+        )
+
+        assert result == "checking Hermes state"
+        assert "state.db" not in result
+
+    def test_terminal_preview_keeps_unrelated_sqlite_commands(self):
+        command = 'sqlite3 /tmp/other.db "SELECT id FROM messages"'
+
+        assert build_tool_preview("terminal", {"command": command}) == command
+
+    def test_state_db_redaction_is_terminal_only(self):
+        code = 'sqlite3.connect("$HOME/.hermes/state.db")'
+
+        assert build_tool_preview("execute_code", {"code": code}) == code
+
+    def test_terminal_preview_redacts_python_sqlite_and_sessiondb_forms(self):
+        for command in (
+            'python3 -c "import sqlite3; sqlite3.connect(\"file:$HOME/.hermes/state.db?mode=ro\")"',
+            'python -c "from hermes_state import SessionDB; SessionDB(\"$HOME/.hermes/state.db\")"',
+        ):
+            assert build_tool_preview("terminal", {"command": command}) == "checking Hermes state"
+
 
 
 

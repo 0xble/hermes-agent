@@ -717,9 +717,12 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "string",
                 "enum": ["newest", "oldest"],
                 "description": (
-                    "Discovery shape only. Temporal bias on top of FTS5 ranking: omit "
-                    "for relevance-only (exploratory recall), 'newest' for "
-                    "\"where did we leave X\", 'oldest' for \"how did X start\"."
+                    "Discovery shape only. 'newest' and 'oldest' keep BM25 relevance "
+                    "primary and use session time plus message ID only as deterministic "
+                    "tie-breakers. Omit for relevance-only ordering (the default; "
+                    "suitable for exploratory recall). Use either temporal direction "
+                    "when recency matters among equally relevant matches. Use 'after' "
+                    "or 'before' to bound the time range."
                 ),
             },
             "detail": {

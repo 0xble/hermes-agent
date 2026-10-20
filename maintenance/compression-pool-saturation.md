@@ -1,10 +1,10 @@
 # Compression pool saturation
 
-Load this unit when changing compression-pool admission, transient compression signals, or attempt accounting in pre-API and turn-start compression.
+Load this unit when changing compression-pool admission, transient compression signals, or attempt accounting in automatic compression callers.
 
 ## Required behavior
 
-A compression pass refused only because the shared compression pool is full is a temporary defer, not a failed attempt. The refusal publishes `_compression_blocked_transient = "pool_saturated"`. Pre-API passes refund the compression attempt and leave the insufficient-progress blocker unarmed, and turn-start passes stop for the turn without blocking later passes. A later pass compresses once a slot frees. Summary-failure cooldown no-ops keep their existing semantics, so only saturation uses the narrower `compression_pool_saturated()` check. The deferred-turn notice names the busy pool instead of a failed attempt.
+A compression pass refused only because the shared compression pool is full is a temporary defer, not a failed attempt. The refusal publishes `_compression_blocked_transient = "pool_saturated"`. Pre-API passes refund the compression attempt and leave the insufficient-progress blocker unarmed, turn-start passes stop for the turn without blocking later passes, and long-context overflow recovery refunds the attempt before re-entering its recovery loop. A later pass compresses once a slot frees. Summary-failure cooldown no-ops keep their existing semantics, so only saturation uses the narrower `compression_pool_saturated()` check. The deferred-turn notice names the busy pool instead of a failed attempt.
 
 ## Provenance and patches
 
@@ -16,7 +16,7 @@ Reproduced on 2026-10-17: 4 concurrent long compressions held all 4 workers, and
 
 ## Verification
 
-`scripts/run_tests.sh tests/agent/test_preflight_compression_pool_saturation.py tests/agent/test_over_window_compression_fail_closed.py tests/agent/test_compression_attempt_lifecycle.py`
+`scripts/run_tests.sh tests/agent/test_preflight_compression_pool_saturation.py tests/agent/test_over_window_compression_fail_closed.py tests/agent/test_compression_attempt_lifecycle.py tests/agent/test_long_context_pool_saturation.py`
 
 ## Retirement and rollback
 

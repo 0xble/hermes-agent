@@ -33,6 +33,7 @@ from agent.model_metadata import (
 from agent.image_token_cost import bind_image_token_cost
 from agent.usage_anchor import anchored_context_tokens, restore_usage_anchor
 from agent.turn_author import parse_turn_author
+from agent.reasoning_effort import effort_log_label
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +335,10 @@ def export_current_turn_boundary(agent: Any, result: Any, user_message: Any) -> 
     """
     if not isinstance(result, dict) or result.get("turn_exit_reason") == "context_compression_timeout":
         return result
+    # Agent-requested compaction is scoped to one turn. A request that never reached a
+    # safe boundary must not leak into the next user turn.
+    from agent.compact_context import clear_pending_compaction
+    clear_pending_compaction(agent)
     messages = result.get("messages")
     turn_id = str(getattr(agent, "_current_turn_id", "") or "")
     if not isinstance(messages, list) or not turn_id or user_message is None:
@@ -642,6 +647,8 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     # sends identical bytes. Distinct from note_turn_start's _inflight_turn_started, a
     # tripwire slot cleared at persist.
     agent._current_turn_timestamp = time.time()
+    from agent.compact_context import reset_compaction_request_turn
+    reset_compaction_request_turn(agent)
 
     # Pre-turn connection health check: clean up dead TCP connections.
     if agent.api_mode != "anthropic_messages":
@@ -1119,10 +1126,11 @@ def build_turn_context(
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = _preview_text[:80] + ("..." if len(_preview_text) > 80 else "")
     _turn_fmt = (
-        "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r"
+        "conversation turn: session=%s model=%s provider=%s effort=%s platform=%s history=%d msg=%r"
     )
     _turn_args = [
         agent.session_id or "none", agent.model, agent.provider or "unknown",
+        effort_log_label(getattr(agent, "reasoning_config", None)),
         agent.platform or "unknown", len(conversation_history or []),
         _msg_preview.replace("\n", " "),
     ]

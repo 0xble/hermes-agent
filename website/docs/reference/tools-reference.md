@@ -189,6 +189,12 @@ Enabled for sessions whose source is the desktop app, whichever backend it's con
 |------|-------------|----------------------|
 | `session_search` | Search past sessions stored in the local session DB, or scroll inside one. FTS5-backed retrieval; returns actual messages from the DB (no LLM calls). Four shapes: discovery (pass `query`), scroll (pass `session_id` + `around_message_id`), read (pass `session_id` only), browse (no args). Discovery supports time bounds (`after`/`before` — ISO dates or relative durations like `7d`, `24h`, `2w`) and `exclude_session_ids` for iterative re-finding. | — |
 
+## `session_state` toolset
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `session_state` | Read-only, profile-scoped Hermes state for 3 named actions: `resolve_topic` maps a Telegram DM `chat_id` and `thread_id` to its bound session, `inspect_session` returns bounded metadata and lineage for an exact `session_id`, and `inspect_delivery` returns bounded delivery-obligation status for an exact obligation, session key, or session. Delivery content is omitted unless `include_content=true`. Under multiplexed routing, delivery status comes from the process-home shared ledger, filtered to the served adapter profile. The tool rejects SQL and arbitrary selectors, uses fixed row and byte caps, and never creates, migrates, or writes `state.db`. Use `session_search` instead for conversation discovery and transcript search. | — |
+
 ## `skills` toolset
 
 | Tool | Description | Requires environment |

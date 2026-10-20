@@ -213,6 +213,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             return self.session_store.get_attended_route_active(session_key)
         return None
 
+    def _load_attended_route_active(self, session_key: str) -> Optional[bool]:
+        """Read the last route that actually reached an API call, if persisted."""
+        with suppress(Exception):
+            return self.session_store.get_attended_route_active(session_key)
+        return None
+
     def _ensure_attended_new_session_activity(self, session_key: str, cfg, stamp):
         """Start the attended window for a newly opened session without persisting automation as user activity."""
         state = self._peek_session_state(session_key)

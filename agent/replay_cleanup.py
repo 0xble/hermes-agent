@@ -13,6 +13,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.message_metadata import DB_ROW_SNAPSHOT
 from agent.tool_dispatch_helpers import make_tool_result_message
 from agent.tool_result_classification import tool_may_have_side_effect
 from agent.turn_context import drop_stale_api_content
@@ -103,6 +104,9 @@ def strip_interrupted_tool_tails(agent_history: list[dict[str, Any]]) -> list[di
                             name = call_names.get(str(tool_result.get("tool_call_id") or ""), "")
                             disposition, content = _orphan_recovery(name, _INTERRUPTED_NOTICES)
                             tool_result = {**tool_result, "effect_disposition": disposition, "content": content}
+                            # The recovered view differs from the stored row, so it must not carry
+                            # the original CAS snapshot into a later lease-less rewrite.
+                            tool_result.pop(DB_ROW_SNAPSHOT, None)
                         cleaned.append(tool_result)
                 else:
                     logger.debug("Stripping interrupted read-only assistant→tool replay block (indices %d–%d, tool_results=%d)",
@@ -241,5 +245,7 @@ def strip_stale_dangerous_confirmations(
         redacted["content"] = _EXPIRED_CONFIRMATION_SENTINEL
         # The api_content sidecar carries the exact bytes sent — the confirmation itself; replaying it would undo the redaction.
         drop_stale_api_content(redacted)
+        # The redacted view is not the stored row version, so it must not claim that row's CAS snapshot.
+        redacted.pop(DB_ROW_SNAPSHOT, None)
         cleaned.append(redacted)
     return cleaned

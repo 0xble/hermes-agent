@@ -984,7 +984,7 @@ The keyword mode supports standard FTS5 query syntax:
 
 ### Optional parameters
 
-- `sort` — `newest` or `oldest`, on top of FTS5 ranking. Omit for relevance-only ordering (the default; suitable for exploratory recall). Use `newest` for "where did we leave X" questions, `oldest` for "how did X start" questions.
+- `sort` — `newest` or `oldest`, with BM25 relevance remaining primary and session time plus message ID used only as deterministic tie-breakers. Omit for relevance-only ordering (the default; suitable for exploratory recall). Use either temporal direction when recency matters among equally relevant matches. Use `after` or `before` to bound the time range.
 - `detail` — `adaptive` (default) fully hydrates only the top discovery result; `full` hydrates every discovery result.
 - `role_filter` — comma-separated roles to include. Discovery defaults to `user,assistant` (tool output is usually noise). Pass `user,assistant,tool` to include tool output (debugging tool behaviour) or `tool` to search tool output only.
 

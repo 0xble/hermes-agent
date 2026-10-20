@@ -818,6 +818,26 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             diagnostic=True,
         )
 
+    def _emit_persistent_attended_notice(self, message: str) -> None:
+        """Deliver an attended route card outside the temporary status-bubble rail."""
+        from gateway.warning_notifications import render_notification
+        ctx = self._ctx
+        if ctx.mute_notification_reply or not self._status_live():
+            return
+
+        def present() -> None:
+            self._schedule(
+                self._runner._deliver_platform_notice(ctx.source, message),
+                "attended notice delivery scheduling error",
+            )
+
+        render_notification(
+            present,
+            platform=ctx.source.platform,
+            user_config=ctx.user_config,
+            diagnostic=True,
+        )
+
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
         from gateway.warning_notifications import is_warning_status, render_notification

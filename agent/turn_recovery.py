@@ -1780,8 +1780,11 @@ def route_classified_error(
     (immediately) and transport failures (after 1 retry) unless credential-pool rotation may
     still recover (upstream-aggregator 429s always fall back); persistent 401/403 → fallback
     chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
-    from agent.conversation_compression import conversation_history_after_compression
-    from agent.conversation_loop import _arm_fallback_restart, _ra
+    from agent.conversation_compression import (
+        compression_pool_saturated,
+        conversation_history_after_compression,
+    )
+    from agent.conversation_loop import _arm_fallback_restart, _compression_deferred_result, _ra
     from agent.model_metadata import estimate_request_tokens_rough
 
     _provider_overflow_recovery_pending = False
@@ -1854,6 +1857,18 @@ def route_classified_error(
                 approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                 task_id=effective_task_id, trigger="overflow", overflow_reason=classified.reason.value,
             )
+            if compression_pool_saturated(agent):
+                # Pool admission is a transient defer, not a spent recovery attempt.
+                compression_attempts -= 1
+                conversation_history = conversation_history_after_compression(
+                    agent, messages, conversation_history
+                )
+                return _verdict(
+                    "return",
+                    _compression_deferred_result(
+                        agent, messages, api_call_count, reason="transient_block"
+                    ),
+                )
             conversation_history = conversation_history_after_compression(agent, messages, conversation_history)
             if len(messages) < original_len or old_ctx > _LONG_CONTEXT_TIER_CAP:
                 agent._buffer_diagnostic_status(

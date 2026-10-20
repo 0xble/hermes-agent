@@ -5,7 +5,7 @@
       "stable": 1935,
       "volatile": 1813
     },
-    "tool_tokens": 14678,
+    "tool_tokens": 14953,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -24,6 +24,7 @@
       "browser_vault_list",
       "browser_vision",
       "clarify",
+      "compact_context",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -51,7 +52,7 @@
       "stable": 1445,
       "volatile": 1813
     },
-    "tool_tokens": 14678,
+    "tool_tokens": 14953,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -70,6 +71,7 @@
       "browser_vault_list",
       "browser_vision",
       "clarify",
+      "compact_context",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -97,7 +99,7 @@
       "stable": 1866,
       "volatile": 1812
     },
-    "tool_tokens": 14678,
+    "tool_tokens": 14953,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -116,6 +118,7 @@
       "browser_vault_list",
       "browser_vision",
       "clarify",
+      "compact_context",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -143,7 +146,7 @@
       "stable": 2640,
       "volatile": 1810
     },
-    "tool_tokens": 14834,
+    "tool_tokens": 15109,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -162,6 +165,7 @@
       "browser_vault_list",
       "browser_vision",
       "clarify",
+      "compact_context",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -189,7 +193,7 @@
       "stable": 1445,
       "volatile": 1813
     },
-    "tool_tokens": 14678,
+    "tool_tokens": 14953,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -208,6 +212,7 @@
       "browser_vault_list",
       "browser_vision",
       "clarify",
+      "compact_context",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -235,7 +240,7 @@
       "stable": 1317,
       "volatile": 1814
     },
-    "tool_tokens": 14678,
+    "tool_tokens": 14953,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -254,6 +259,7 @@
       "browser_vault_list",
       "browser_vision",
       "clarify",
+      "compact_context",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -281,7 +287,7 @@
       "stable": 1579,
       "volatile": 1814
     },
-    "tool_tokens": 15312,
+    "tool_tokens": 15587,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -300,6 +306,7 @@
       "browser_vault_list",
       "browser_vision",
       "clarify",
+      "compact_context",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -328,7 +335,7 @@
       "stable": 1349,
       "volatile": 1814
     },
-    "tool_tokens": 14678,
+    "tool_tokens": 14953,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -347,6 +354,7 @@
       "browser_vault_list",
       "browser_vision",
       "clarify",
+      "compact_context",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -374,7 +382,7 @@
       "stable": 1418,
       "volatile": 1815
     },
-    "tool_tokens": 14704,
+    "tool_tokens": 15003,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -393,6 +401,7 @@
       "browser_vault_list",
       "browser_vision",
       "clarify",
+      "compact_context",
       "delegate_task",
       "execute_code",
       "manage_connections",

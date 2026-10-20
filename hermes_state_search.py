@@ -59,8 +59,12 @@ _LIKE_COALESCED_COLUMN_SQL = (
 # the tool_calls column replaced by an empty literal keep the bind count (``_like_params``) intact.
 _LIKE_ANY_COLUMN_NO_TOOL_CALLS_SQL = _LIKE_ANY_COLUMN_SQL.replace("m.tool_calls", "''")
 _LIKE_COALESCED_NO_TOOL_CALLS_SQL = _LIKE_COALESCED_COLUMN_SQL.replace("COALESCE(m.tool_calls, '')", "''")
-# ``sort`` -> ORDER BY for the FTS routes; unknown values are rank-only (user input passes through).
-_FTS_ORDER_BY = {"newest": "ORDER BY m.timestamp DESC, rank", "oldest": "ORDER BY m.timestamp ASC, rank"}
+# ``sort`` -> ORDER BY for the FTS routes. Relevance stays primary; temporal order is
+# a stable tie-breaker so a recent weak match cannot displace a strong older match.
+_FTS_ORDER_BY = {
+    "newest": "ORDER BY rank, m.timestamp DESC, m.id DESC",
+    "oldest": "ORDER BY rank, m.timestamp ASC, m.id ASC",
+}
 # Indexed neighbor seeks avoid scanning whole sessions for a sparse set of hits.
 _CONTEXT_WINDOW_SQL = """WITH target AS (
     SELECT session_id, timestamp, id FROM messages WHERE id IN ({ids})
@@ -1189,8 +1193,8 @@ class SessionSearchMixin:
     ) -> list[dict[str, Any]]:
         """FTS5 search across session messages (keywords, ``"phrases"``, AND/OR/NOT, ``prefix*``).
         Returns snippet + session metadata + 1-message context per hit; ``fields`` selects a
-        projection. ``sort``: None = BM25 rank; "newest"/"oldest" = timestamp then rank (the
-        CJK LIKE fallback ignores it). Rewound rows (``active=0, compacted=0``) are excluded
+        projection. ``sort``: None = BM25 rank; "newest"/"oldest" = BM25 rank with timestamp/id
+        tie-breakers (the CJK LIKE fallback ignores it). Rewound rows (``active=0, compacted=0``) are excluded
         by default; compaction-archived rows ARE included; ``include_inactive`` = every row.
         ``after_ts``/``before_ts`` bound ``sessions.started_at`` on every route (FTS5, CJK,
         trigram, LIKE fallback, unindexed-gap supplement)."""
@@ -1282,7 +1286,7 @@ class SessionSearchMixin:
         # scheduled" vs "Sarah prefers the standup meeting scheduled ... Thursday mornings"). Once
         # the exact query and the substring fallbacks all miss, retry the unicode61 index matching
         # ANY term. The caller's ``sort`` still applies (``route`` carries order_by_sql): rank order
-        # puts rows covering more terms first, newest/oldest keep their timestamp order. Gated on a
+        # puts rows covering more terms first, newest/oldest only break rank ties. Gated on a
         # zero-result miss so hits keep exact-match semantics; explicit OR/NOT, single-term and
         # CJK-routed queries are left alone.
         if not matches and not is_cjk and not self._fts_stale:

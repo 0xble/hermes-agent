@@ -311,6 +311,7 @@ def _attended_route_runner(state):
         _session_state=lambda _key: state,
         _peek_session_state=lambda _key: state,
         _load_attended_activity_stamp=lambda _key: state.conversation.last_user_activity_at,
+        _load_attended_route_active=lambda _key: None,
         _handoff_attended_state=handoff,
         _session_reasoning_override=lambda _key: None,
         _load_reasoning_config=lambda _model: {},
@@ -517,6 +518,50 @@ def test_disabled_attended_routing_does_not_reopen_existing_sessions():
     assert second == (False, False)
     assert state.conversation.attended_new_session is False
     assert runner.hooks.emit.await_count == 1
+
+
+def test_restart_with_durable_attended_route_marks_switch_back(tmp_path):
+    """A fresh process has no in-memory decision, but the route marker survives it."""
+    from datetime import datetime, timezone
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource, SessionStore
+
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="restart", user_id="owner")
+    entry = store.get_or_create_session(source)
+    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=timezone.utc)
+    store.mark_user_activity(entry.session_key, spoke_at)
+    store.mark_attended_route_active(entry.session_key, True)
+
+    restarted = SessionStore(tmp_path / "sessions", GatewayConfig())
+    assert restarted.get_attended_route_active(entry.session_key) is True
+
+
+def test_restart_resolution_switches_back_from_durable_attended_route():
+    cfg = _cfg(
+        default="gpt-6.1-sol", provider="nous", idle_revert_minutes=15,
+        attended={"model": "claude-opus-5-5", "provider": "custom:claude"},
+    )
+    state = SimpleNamespace(conversation=SimpleNamespace(
+        attended_new_session=False,
+        last_user_activity_at=time.time() - 3600,
+        last_api_call_at=None,
+        last_attended_decision=None,
+        pending_attended_notice=None,
+        model_override=None, model_override_scope="session",
+        reasoning_override=None, reasoning_override_scope="session",
+    ))
+    route_runner = _attended_route_runner(state)
+    route_runner.session_store = SimpleNamespace(
+        get_attended_route_active=lambda _key: True,
+    )
+    route_runner._load_attended_route_active = route_runner.session_store.get_attended_route_active
+    with patch.object(gateway_run, "_resolve_gateway_model", return_value="gpt-6.1-sol"):
+        decision = GatewayTurnMixin._attended_resolution_for_session(
+            route_runner, source=None, session_key="k", user_config=cfg, allow_switch_back=True,
+        )
+    assert decision.reason == "default"
+    assert decision.switched_back is True
 
 
 def test_route_repoint_keeps_the_users_last_activity(tmp_path):

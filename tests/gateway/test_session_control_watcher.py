@@ -127,6 +127,24 @@ def test_control_card_leads_with_decision_and_nonblocking_note():
 
 
 @pytest.mark.asyncio
+async def test_request_control_replace_without_an_active_goal_returns_no_goal(state):
+    from hermes_cli.session_controls import pending_outbox, request_control
+
+    runner = _runner(state)
+    result = request_control(
+        "goal", "replace", "target", requester_sid="requester", reason="pivot",
+        payload={"goal": "new objective"},
+    )
+
+    assert result["error_code"] == "no_goal"
+    assert result["status"] == "failed"
+    assert result["revision"] is None
+    await runner._drain_session_controls()
+    assert runner.adapter.requests == []
+    assert pending_outbox() == []
+
+
+@pytest.mark.asyncio
 async def test_watcher_posts_pending_once_with_topic_metadata_and_skips_unrouted(state):
     from hermes_cli.session_controls import request_control, pending_outbox
 
@@ -851,6 +869,16 @@ def test_replace_card_shows_contract_and_max_turns_that_approval_installs():
     text = GatewaySessionControlsMixin._control_text(record)
     assert "Proposed contract: none (the current contract is dropped)" in text
     assert "Max turns: unchanged" in text
+    record["payload"] = {"goal": "finish writing docs", "max_turns": 0}
+    assert "Max turns: unlimited" in GatewaySessionControlsMixin._control_text(record)
+    record["current_max_turns"] = 20
+    assert "Max turns: unlimited" in GatewaySessionControlsMixin._control_text(record)
+    record["current_max_turns"] = 0
+    assert "Max turns" not in GatewaySessionControlsMixin._control_text(record)
+    record["payload"] = {"goal": "finish writing docs"}
+    assert "Max turns" not in GatewaySessionControlsMixin._control_text(record)
+    record["payload"] = {"goal": "finish writing docs", "max_turns": 30}
+    assert "Max turns: 30" in GatewaySessionControlsMixin._control_text(record)
 
 
 def test_control_card_names_loop_actions():

@@ -3,6 +3,7 @@
 ## Required Behavior
 
 Patch identity: `reviewed-cron-delivery`.
+Fork-Patch-Backfill: b7f8c5a8993701ce0c41027c80c5d2737ea9f78e; reviewed-cron-delivery
 
 Only jobs carrying a `review` declaration opt in, and they require `deliver: local`. Setting review also sets `output_local_only: true`. Other jobs retain their existing save, queue, delivery, silence, failure, and transcript behavior. CLI and cron tool edits preserve review unless explicitly replaced or cleared.
 
