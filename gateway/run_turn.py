@@ -46,7 +46,7 @@ from gateway.attended_model import (
     is_active, parse_attended_config, resolve_attended_model,
 )
 from gateway.session_transcript import TranscriptReadError
-from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
+from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
@@ -205,12 +205,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             if stamp is not None and hasattr(stamp, "timestamp"):
                 stamp = stamp.timestamp()
             return stamp
-        return None
-
-    def _load_attended_route_active(self, session_key: str) -> Optional[bool]:
-        """Read the last route that actually reached an API call, if persisted."""
-        with suppress(Exception):
-            return self.session_store.get_attended_route_active(session_key)
         return None
 
     def _load_attended_route_active(self, session_key: str) -> Optional[bool]:
@@ -4792,7 +4786,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     replace_source(source, user_id=None, user_name=None, user_id_alt=None))
                 spool_value = MessageEvent(text=spool_value, source=spool_source,
                                            user_id=getattr(spool_source, "user_id", None))
-                setattr(spool_value, "_hermes_recovery_id", f"hermes-recovery-{uuid.uuid4().hex}")
+                spool_value._hermes_recovery_id = f"hermes-recovery-{uuid.uuid4().hex}"
             elif (spool_value is not None and _bind_turn_author
                     and not getattr(spool_value, "internal", False)):
                 event_source = getattr(spool_value, "source", None) or source
