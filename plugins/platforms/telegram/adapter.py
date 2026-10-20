@@ -217,6 +217,9 @@ _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
 # Compatibility name retained from the pre-shared-budget implementation; active pacing is owned by
 # ChatOutboundBudget/ChatBudgetRateLimiter above and uses its configured gap.
 _TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS = 1.0
+# Compatibility name retained from the pre-shared-budget implementation; active pacing is owned by
+# ChatOutboundBudget/ChatBudgetRateLimiter above and uses its configured gap.
+_TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS = 1.0
 # Sentinel: cancel typing re-arms for every topic in a chat (chat-level pause carries no metadata).
 _ALL_TOPICS: Any = object()
 # One quick retry for a keep-typing tick shed by lock contention, a timeout or an error; at a 4.5s

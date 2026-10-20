@@ -45,7 +45,7 @@ _executor_max_workers: int = 0
 _records_lock = threading.RLock()
 # delegation_id -> record dict; kept for the run plus a short completed tail.
 _records: dict[str, dict[str, Any]] = {}
-# A closing session's token -> the (field, value) selectors a new dispatch is refused for (``refuse_for_session``),
+# A closed session's token -> the (field, value) selectors a new dispatch is refused for (``refuse_for_session``),
 # and each selector -> the tokens refusing it, so a dispatch checks its own selectors, not every fence.
 _refused: dict[Any, frozenset] = {}
 _refused_by: dict[tuple, set] = {}
@@ -498,7 +498,7 @@ def _stamp_resume_availability(evt: dict[str, Any], conn=None) -> None:
     try:
         from tools.delegation_resume import stamp_resume_availability
         stamp_resume_availability(evt, conn)
-    except Exception:
+    except Exception:  # noqa: BLE001 - an unimportable resume module offers no resume line
         evt["resume_available"] = False
 
 
@@ -1127,7 +1127,7 @@ def _resolve_terminal_ownership(evt: dict[str, Any], meta: dict[str, Any]) -> st
             _persist_outbox_event(event, result, event_kind="terminal_fallback",
                                   terminal_status=meta["terminal_status"], expected_state=expected)
             return "outbox"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — lost the CAS, or committed before raising
             logger.error("Async delegation %s: deferred terminal fallback write failed; reconciling: %s",
                          evt.get("delegation_id"), exc)
             disposition = _reconcile_terminal_write(event, result, expected, persisted)
@@ -1151,7 +1151,7 @@ def resolve_event_ownership(evt: dict[str, Any]) -> bool:
     token = set_hermes_home_override(meta["home"])
     try:
         disposition = _resolve_terminal_ownership(evt, meta)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — unavailable ledger: ownership stays unproven
         _hold_unresolved(evt, meta, exc)
         return False
     finally:
@@ -1456,7 +1456,10 @@ def _session_selectors(session_key: str, origin_ui_session_id: str, parent_sessi
 
 
 def _session_records(statuses, session_key: str, origin_ui_session_id: str, parent_session_id: str) -> list:
-    """Records in ``statuses`` owned by a session, excluding fenced selectors."""
+    """Records in ``statuses`` owned by a session: any non-empty selector claims the
+    record — ``origin_ui_session_id`` (TUI tab), ``session_key`` (routing key at
+    dispatch), or ``parent_session_id`` (spawner's durable id — the right one for
+    gateway chats, whose session_key survives ``/new`` while the session id rotates)."""
     selectors = _session_selectors(session_key, origin_ui_session_id, parent_session_id)
     if not selectors:
         return []
@@ -1466,12 +1469,9 @@ def _session_records(statuses, session_key: str, origin_ui_session_id: str, pare
 
 
 def refuse_for_session(token: Any, *, session_key: str = "", parent_session_ids=(), origin_ui_session_id: str = "") -> None:
-    """Refuse new dispatches carrying selectors from one ending session.
-
-    The refusal is installed before the caller interrupts existing work, so a
-    still-running turn cannot dispatch new background work after its session
-    has closed. A later attach removes the same token with ``allow_for_session``.
-    """
+    """Refuse new dispatches for ONE closing session (any selector matches) until ``allow_for_session``.
+    Set before ``interrupt_for_session``: a dispatch registered first is interrupted, a later one refused.
+    ``origin_ui_session_id`` additionally fences a TUI tab's dispatches."""
     selectors = set(_session_selectors(session_key, origin_ui_session_id, None))
     selectors.update(("parent_session_id", parent) for parent in parent_session_ids if parent)
     with _records_lock:
@@ -1482,6 +1482,7 @@ def refuse_for_session(token: Any, *, session_key: str = "", parent_session_ids=
 
 
 def allow_for_session(token: Any) -> None:
+    """Lift ONE session's refusal: a viewer attached again, or the owner retired its live state."""
     with _records_lock:
         _unfence(token)
 
@@ -1602,7 +1603,7 @@ def _submit_record(record: dict[str, Any], max_async_children: int) -> Optional[
     try:
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
         executor = _get_executor(max(max_async_children, live_units))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - admission must settle a failed executor lookup
         logger.warning("Async delegation %s could not create an executor: %s", delegation_id, exc)
         return f"Failed to schedule async delegation{label}: {exc}"
 
@@ -1616,7 +1617,7 @@ def _submit_record(record: dict[str, Any], max_async_children: int) -> Optional[
         try:
             result = record["runner"]() or {}
             status = record["classify"](result)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
             result = record["crash_result"](
                 f"{type(exc).__name__}: {exc}", round(time.time() - record["dispatched_at"], 2)
@@ -1889,7 +1890,7 @@ def _admit_pending() -> None:
                 for item in selected:
                     try:
                         error = _record_context_run(item, _submit_record, item, item["max_async_children"])
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - settle every sibling on any submit path
                         logger.exception("Async delegation %s submission raised", item["delegation_id"])
                         error = f"Failed to schedule async delegation: {exc}"
                     if error:
@@ -1955,7 +1956,7 @@ def _dispatch_admitted(
     with _records_lock:
         if any(selector in _refused_by for selector in session_selectors):
             return {"status": "rejected", "accepted": False,
-                    "error": "session is ending; reconnect to continue"}
+                    "error": "This session was closed (exit or /new): no new background work."}
         existing = _records.get(delegation_id)
         if existing is not None:
             return {"status": "rejected", "accepted": False,
@@ -2265,7 +2266,7 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
         try:
             _persist_completion(evt, result, delivery_state="superseded",
                                 expected_state=record.get("_durable_state") or "running")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — the replacement still reports; only the audit row is lost
             logger.error("Async delegation %s: superseded completion write failed: %s", record.get("delegation_id"), exc)
         record.update(_terminal_state=durable_status(evt, record.get("_terminal_state") or status), _completion_status=evt["status"])
         logger.info("Async delegation%s %s superseded by %s; completion recorded, not delivered",
@@ -2277,7 +2278,7 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
         persist_evt = dict(evt)
         persist_evt["status"] = terminal_status
         ok = _persist_completion(persist_evt, result, expected_state=expected_state)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — reconcile an ambiguous terminal write
         logger.error("Async delegation%s %s: durable terminal row write failed; reconciling fallback ownership: %s",
                      label, record.get("delegation_id"), exc)
         ok = False
@@ -2779,7 +2780,7 @@ def _cancel_pending_retries_safely(caller: str, **selectors: Any) -> set:
         return set()
     try:
         return set(cancel_pending_retries(**selectors, reason=reason))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - live child interruption is the safety path
         logger.warning("%s: durable retry cancellation failed: %s", caller, exc, exc_info=True)
         return set()
 

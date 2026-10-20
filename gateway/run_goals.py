@@ -184,6 +184,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         ``reply_expected=False`` marks a gateway-authored wake that may end silently (a goal
         continuation on a no-change tick). A typed message absorbed into the same turn still
         restores the human contract through ``MessageEvent.absorb_reply_expected``.
+        ``replace_source`` keeps the receiving-adapter provenance native admission reads.
         """
         metadata = {}
         if goal_continuation:
@@ -390,6 +391,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
     ) -> None:
         """Send a /goal judge status line without holding the turn open for flood recovery."""
         if getattr(source, "platform", None) == Platform.LOCAL:
+            # The local adapter's send is a no-op (viewers read the event stream): main's TUI
+            # painted the verdict from ``status.update {kind: goal}``.
             from gateway.session_authorities import active_authority
             authority = active_authority(self)
             live = authority.sessions.get(source.chat_id) if authority is not None else None
@@ -1171,7 +1174,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                     await self._run_in_executor_with_context(
                         mgr.abandon_tick, tick=tick, owns_turn=_turn_owner_exists,
                     )
-            self._publish_local_control(source)
+        # Viewers swap the countdown for "running now" (or re-anchor it after a slash tick settled).
+        self._publish_local_control(source)
 
     async def _goal_wakeup_fire_one(self, sid: str) -> None:
         """Resume one idle parked /goal whose wait barrier has lifted.

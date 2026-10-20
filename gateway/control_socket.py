@@ -326,10 +326,16 @@ class GatewayControlServer:
                 response = {"ok": False, "error": f"unknown verb: {verb!r}",
                             "protocol": CONTROL_PROTOCOL_VERSION, "supported_verbs": sorted(self._handlers)}
             else:
-                params = request.get("params") if isinstance(request.get("params"), dict) else {}
-                wants_params = "params" in inspect.signature(handler).parameters
+                parameters = inspect.signature(handler).parameters
+                if "payload" in parameters:
+                    result = handler(request.get("payload"))
+                elif "params" in parameters:
+                    params = request.get("params")
+                    result = handler(params if isinstance(params, dict) else {})
+                else:
+                    result = handler()
                 response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION,
-                            "result": handler(params) if wants_params else handler()}
+                            "result": result}
         except Exception as exc:
             response = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "protocol": CONTROL_PROTOCOL_VERSION}
         if request_id is not None:

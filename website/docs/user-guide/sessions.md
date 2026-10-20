@@ -102,6 +102,11 @@ VACUUMs the database without touching any session data. With the gateway running
 asks the gateway to delete the sessions it selected. `optimize`, and `prune` with no gateway
 running, refuse while another Hermes process (Desktop, dashboard, cron) holds `state.db`. Stop
 it first, or pass `--force`; see [Session storage recovery](session-storage-recovery.md).
+With a gateway that is always running, `hermes sessions optimize --at-next-start` records a
+one-shot request instead: the next gateway start runs the same optimization before it connects
+any platform, then clears the request. That start takes longer on a large store, and the
+request waits for a later start while another process still holds `state.db` or free disk is
+short. `--cancel-next-start` withdraws it.
 Compression reduces the active context; it is not a privacy delete.
 Pass a name to `/new` (e.g. `/new payments-refactor`) to set the new session's
 initial title up front — useful for finding it later with `/resume <name>` or

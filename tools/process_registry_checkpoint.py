@@ -122,11 +122,15 @@ class ProcessCheckpointMixin:
             # do not adopt it and do not signal it.
             log = adoptable_log(entry.get("output_log"))
             fate = self._detached_host_fate(pid, entry.get("host_start_time")) if pid else "gone"
-            # A worker handoff log is authoritative for an otherwise missing PID, but a
-            # positive start-time mismatch still proves the PID was recycled and must not
-            # be adopted or signalled.
+            # A worker spawn's output log and recorded exit outlive both the spawner and the PID,
+            # so its reader decides the outcome. A positive start-time mismatch still proves the
+            # PID was recycled, so a reused PID is never adopted or signalled.
             if log and fate != "reused":
                 fate = "running"
+            # A survivor whose PID was recycled is never adopted, supervised, or signalled
+            # either. Only a result its wrapper already recorded is reported (once, via the
+            # delivery claim); without one the stale entry is discarded like any other.
+            if fate == "reused" and not survivor:
                 logger.info(
                     "Not recovering session %s: pid %d is alive but its "
                     "start time no longer matches — PID was recycled onto "

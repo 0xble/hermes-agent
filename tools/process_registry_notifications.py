@@ -629,7 +629,7 @@ def _format_process_notification_payload(evt: dict) -> str | None:
     attribution = f"{_attribution}\n" if _attribution else ""
     if evt_type == "heartbeat":
         return (
-            f"[Background process {_sid} heartbeat #{evt.get('seq', '?')} — still running after "
+            f"{HEARTBEAT_NOTICE_OPEN}{_sid} heartbeat #{evt.get('seq', '?')} — still running after "
             f"{_format_age(float(evt.get('elapsed') or 0))} (next in {evt.get('interval', '?')}s when there "
             f"is new output; you will also be told when it exits).\n"
             f"{attribution}Command: {_cmd}\nOutput since last heartbeat:\n{heartbeat_output_text(evt)}]")

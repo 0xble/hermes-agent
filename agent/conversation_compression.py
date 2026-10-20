@@ -31,7 +31,8 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor_summary import _accepts_keyword_argument
 from agent.context_engine import automatic_compaction_status_message, sanitize_memory_context
-from agent.conversation_compression_boundary import mark_context_loss_boundary
+# _reset_read_dedup_caches is re-exported: upstream callers import it from this module.
+from agent.conversation_compression_boundary import _reset_read_dedup_caches, mark_context_loss_boundary  # noqa: F401
 from agent.conversation_compression_codex import _compress_context_via_codex_app_server
 from agent.conversation_compression_deadline import resolve_context_compression_timeouts
 from agent.conversation_compression_telemetry import (
@@ -3458,24 +3459,6 @@ def _warn_summary_or_aux_fallback(agent: Any) -> None:
                 f"ℹ Configured compression model '{_aux_fail_model}' failed, so Hermes summarised "
                 "with your main model instead. Check auxiliary.compression.model in your config."
             )
-
-
-def _reset_read_dedup_caches(task_id: str, *, session_id: str = "") -> None:
-    """Advance the file-read and skill_view repeat-read dedup to a fresh generation after a boundary.
-    The mtime map is kept: the first read of each unchanged key returns full content compaction may have
-    omitted; later reads return stubs, and stub-hit counters restart at the same boundary (#84857).
-    The computer_use screenshot dedup is session-keyed and forgets its last frame for the same reason.
-    """
-    with contextlib.suppress(Exception):
-        from tools.file_tools_read_tracking import reset_file_dedup
-        reset_file_dedup(task_id)
-    if session_id:
-        with contextlib.suppress(Exception):
-            from tools.computer_use.tool import reset_screenshot_dedup
-            reset_screenshot_dedup(session_id)
-    with contextlib.suppress(Exception):
-        from tools.skills_tool import reset_skill_view_dedup
-        reset_skill_view_dedup(task_id)
 
 
 def _finish_compaction_boundary(

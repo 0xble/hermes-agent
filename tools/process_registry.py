@@ -97,7 +97,6 @@ WATCH_LIFETIME_MAX_HITS = 8
 HEARTBEAT_MIN_SECONDS = 60
 # Legacy public constant retained for compatibility with the fork surface; heartbeat
 # truncation is implemented by process_registry_notifications.
-HEARTBEAT_OUTPUT_CHARS = 2000
 HEARTBEAT_TICK_SECONDS = 5
 # Reader final drain after a reconcile saw the direct child exit: the exited child's unread tail is at
 # most one pipe buffer (Linux pipe-max-size default 1 MiB), and the reader publishes within one select
@@ -1066,7 +1065,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         never collected an exit status.
         """
         if session is None or session.exited or not session.detached or session.pid_scope != "host" or session.output_log:
-            return session
+            return session  # a log-backed adoption's reader collects the recorded exit itself
         if self._file_backed(session):
             return session
         fate = self._detached_host_fate(session.pid, session.host_start_time)
@@ -2124,7 +2123,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             if not finalizing:
                 self._poll_observed.add(session_id)
         if session.detached and not session.output_log:
-            result.update(detached=True, note="Process recovered after restart -- output history unavailable")
+            result["detached"] = True
+            if not self._file_backed(session):
+                result["note"] = "Process recovered after restart -- output history unavailable"
         return result
 
     def read_log(self, session_id: str, offset: int | None = None, limit: int = 200) -> dict:

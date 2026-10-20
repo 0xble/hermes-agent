@@ -362,6 +362,7 @@ def _wire(manager: Any, home_key: str, specs: list[ShellHookSpec]) -> list[Shell
         key = _key(home_key, spec)
         if key in _registered:
             continue
+        spec.home = home_key  # scopes fail-open backoff to the home this hook was wired under
         callback = _make_callback(spec)
         callback.shell_hook_key = key  # type: ignore[attr-defined]  # identifies it for sync_from_config
         manager._hooks.setdefault(spec.event, []).append(callback)

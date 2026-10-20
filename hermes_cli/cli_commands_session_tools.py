@@ -89,18 +89,6 @@ def _probe(module: str, name: str, default, *args):
         return default
 
 
-def print_session_diff(cli, result: dict, stat_only: bool) -> None:
-    if not result.get("success"):
-        return print(f"  {result.get('error') or _t('shared.could_not_generate_diff')}")
-    stat, diff = result.get("stat", ""), result.get("diff", "")
-    if result.get("empty") or (not stat and not diff):
-        return print(f"  {_t('diff.no_session_changes')}")
-    if stat:
-        cli._print_diff_text(f"\n{stat}")
-    if diff and not stat_only:
-        cli._print_diff_body(diff, _t("diff.stat_hint_session"), total=int(result.get("diff_lines") or 0))
-
-
 class CLICommandsSessionToolsMixin:
     """``/stop``, ``/agents``, ``/journey``, ``/paste``, ``/copy``, ``/image``, ``/tools``,
     ``/profile`` handlers (moved from ``CLICommandsMixin``)."""
@@ -116,13 +104,14 @@ class CLICommandsSessionToolsMixin:
 
         See #14602.
         """
-        if getattr(self, "_agent_running", False) and getattr(self, "agent", None):
+        if not getattr(self, "_agent_running", False):
+            return _stop_background_work()
+        if getattr(self, "agent", None):
             from agent.interrupt_compat import request_hard_interrupt
             print(f"  {t('cli.tui.interrupting')}")
             request_hard_interrupt(self.agent)
         from agent.memory_provider import spawn_context_thread
         spawn_context_thread(_stop_background_work, name="cli-stop").start()
-
 
     def _handle_agents_command(self):
         """Handle /agents — show background processes and agent status. On the gateway both run there:
@@ -318,6 +307,18 @@ def _stop_background_work() -> None:
         print(f"  {_t('stop.interrupted_delegations', count=interrupted)}")
 
 
+def print_session_diff(cli, result: dict, stat_only: bool) -> None:
+    """Render a ``CheckpointManager.session_diff`` result (``/diff session``): this process's agent's,
+    or the gateway session's ``rollback.session_diff`` (``diff_lines``: its uncut body's line count)."""
+    if not result.get("success"):
+        return print(f"  {result.get('error') or _t('shared.could_not_generate_diff')}")
+    stat, diff = result.get("stat", ""), result.get("diff", "")
+    if result.get("empty") or (not stat and not diff):
+        return print(f"  {_t('diff.no_session_changes')}")
+    if stat:
+        cli._print_diff_text(f"\n{stat}")
+    if diff and not stat_only:
+        cli._print_diff_body(diff, _t("diff.stat_hint_session"), total=int(result.get("diff_lines") or 0))
 
 
 def _print_local_delegations() -> None:
