@@ -535,6 +535,17 @@ def _affected_text(kind: str, action: str, raw: Optional[str], payload: Optional
     return ""
 
 
+def _current_max_turns(kind: str, raw: Optional[str]) -> Optional[int]:
+    """The target goal's budget before the control, so the card can tell an unchanged budget from a change."""
+    if kind != "goal" or not raw:
+        return None
+    try:
+        from hermes_cli.goals import GoalState
+        return GoalState.from_json(raw).max_turns
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def _definition_fingerprint(kind: str, raw: Optional[str]) -> str:
     """Bind the authored definition, not progress counters or scheduler bookkeeping.
 
@@ -930,6 +941,23 @@ def _has_gateway_route(session_id: str) -> bool:
     return platform.value != "local"
 
 
+def _goal_replace_failure(target_sid: str, *, cursor=None) -> Optional[dict[str, Any]]:
+    """Return the same no-goal failure the manager would return, before request creation."""
+    from hermes_cli.goals import load_goal
+
+    state = load_goal(target_sid, cursor=cursor)
+    if state is not None and getattr(state, "status", None) in {"active", "paused"}:
+        return None
+    return {
+        "ok": False,
+        "status": "failed",
+        "error_code": "no_goal",
+        "error": "there is no active or paused goal to replace",
+        "state": state,
+        "revision": None,
+    }
+
+
 def request_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
                     reason: str = "", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Create a durable, 24-hour pending approval request."""
@@ -945,6 +973,10 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
     db = _db()
 
     def create(conn):
+        if kind == "goal" and action == "replace":
+            failure = _goal_replace_failure(target_sid, cursor=conn)
+            if failure is not None:
+                return failure
         # Card description and binding come from one SQLite snapshot, never two manager loads.
         raw = _meta_value(conn, _definition_key(kind, target_sid))
         record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
@@ -952,6 +984,7 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
                              expires_at=now + _REQUEST_TTL_SECONDS,
                              affected_text=_affected_text(kind, action, raw, payload), cursor=conn)
         record["target_fingerprint"] = _definition_fingerprint(kind, raw)
+        record["current_max_turns"] = _current_max_turns(kind, raw)
         _save_record(record, cursor=conn)
         return record
 
@@ -979,6 +1012,11 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     except ValueError as exc:
         return {"ok": False, "error_code": str(exc), "error": str(exc)}
 
+    if kind == "goal" and action == "replace":
+        failure = _goal_replace_failure(target_sid)
+        if failure is not None:
+            return failure
+
     cross_session_goal_change = _is_cross_session_goal_change(
         kind, action, target_sid, requester_sid,
     ) and not user_quote
@@ -994,6 +1032,10 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
 
     def commit(conn, authority: Dict[str, Any], savepoint: str) -> Dict[str, Any]:
         """Apply and record one immediate control while holding the SessionDB write lock."""
+        if kind == "goal" and action == "replace":
+            failure = _goal_replace_failure(target_sid, cursor=conn)
+            if failure is not None:
+                return failure
         raw = _meta_value(conn, _definition_key(kind, target_sid))
         affected_before = _affected_text(kind, action, raw, payload)
         conn.execute(f"SAVEPOINT {savepoint}")
@@ -1010,6 +1052,7 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                              authority=authority, status="failed" if code else "applied", now=now,
                              expires_at=None, affected_text=affected_before, cursor=conn)
         record["resolved_at"], record["error"] = now, code or None
+        record["current_max_turns"] = _current_max_turns(kind, raw)
         _bind_continuation(record, result, conn)
         _save_record(record, cursor=conn)
         return {"ok": not bool(code), "status": record["status"], "record": record,

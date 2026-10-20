@@ -191,6 +191,11 @@ def requested_effort(reasoning_config: Optional[dict]) -> Optional[str]:
     return str(reasoning_config.get("effort") or "").strip().lower() or None
 
 
+def effort_log_label(reasoning_config: Optional[dict]) -> str:
+    """The effort a request carries, for log lines: ``"none"`` when no effort is sent."""
+    return requested_effort(reasoning_config) or "none"
+
+
 def tokenhub_effort(requested: Optional[str]) -> str:
     """TokenHub's top-level ``reasoning_effort``: ``high`` when no level was chosen, else the
     request clamped to low/medium/high. Shared by the tencent-tokenhub profile and the host-based
