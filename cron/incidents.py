@@ -162,6 +162,21 @@ def upsert_incident(
     ``last_seen_at``/``error``/``output_file`` and keeps its state — a ``closed`` incident stays
     closed, while a ``resolved`` one (job recovered, then broke the same way again) re-opens as
     ``detected`` so the operator is alerted once more. A changed error text mints a new incident."""
+    with _transaction() as conn:
+        return _upsert_incident_on_connection(
+            conn, job_id, error, failure_type=failure_type, output_file=output_file,
+        )
+
+
+def _upsert_incident_on_connection(
+    conn: sqlite3.Connection, job_id: str, error: str, *,
+    failure_type: Optional[str] = None, output_file: Optional[str] = None,
+) -> tuple[str, bool]:
+    """Upsert inside an initialized caller-owned transaction on the shared cron ledger.
+
+    Recovery uses the same connection as its execution transition so a crash cannot
+    commit ``unknown`` without the incident the failure router reads.
+    """
     job_id = str(job_id or "")
     sig = _error_signature(job_id, error)
     stored_error = _redact_error(error)
@@ -170,31 +185,30 @@ def upsert_incident(
     failure_type = failure_type or _classify_failure_type(error)
     output_file = str(output_file) if output_file is not None else None
 
-    with _transaction() as conn:
-        row = conn.execute(
-            "SELECT id, state FROM cron_incidents WHERE id=?", (incident_id,)
-        ).fetchone()
-        if row is not None:
-            reopen = row["state"] == "resolved"
-            conn.execute(
-                """UPDATE cron_incidents
-                   SET last_seen_at=?, error=?, output_file=?,
-                       state=CASE WHEN state='resolved' THEN 'detected' ELSE state END,
-                       alerted_at=CASE WHEN state='resolved' THEN NULL ELSE alerted_at END,
-                       closed_at=CASE WHEN state='resolved' THEN NULL ELSE closed_at END
-                   WHERE id=?""",
-                (now, stored_error, output_file, incident_id),
-            )
-            return incident_id, reopen
+    row = conn.execute(
+        "SELECT id, state FROM cron_incidents WHERE id=?", (incident_id,)
+    ).fetchone()
+    if row is not None:
+        reopen = row["state"] == "resolved"
         conn.execute(
-            """INSERT INTO cron_incidents
-               (id, job_id, error_sig, state, failure_type,
-                first_seen_at, last_seen_at, error, output_file)
-               VALUES (?, ?, ?, 'detected', ?, ?, ?, ?, ?)""",
-            (incident_id, job_id, sig, failure_type, now, now,
-             stored_error, output_file),
+            """UPDATE cron_incidents
+               SET last_seen_at=?, error=?, output_file=?,
+                   state=CASE WHEN state='resolved' THEN 'detected' ELSE state END,
+                   alerted_at=CASE WHEN state='resolved' THEN NULL ELSE alerted_at END,
+                   closed_at=CASE WHEN state='resolved' THEN NULL ELSE closed_at END
+               WHERE id=?""",
+            (now, stored_error, output_file, incident_id),
         )
-        return incident_id, True
+        return incident_id, reopen
+    conn.execute(
+        """INSERT INTO cron_incidents
+           (id, job_id, error_sig, state, failure_type,
+            first_seen_at, last_seen_at, error, output_file)
+           VALUES (?, ?, ?, 'detected', ?, ?, ?, ?, ?)""",
+        (incident_id, job_id, sig, failure_type, now, now,
+         stored_error, output_file),
+    )
+    return incident_id, True
 
 
 def set_incident_state(incident_id: str, state: str) -> bool:

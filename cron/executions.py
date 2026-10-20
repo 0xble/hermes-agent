@@ -10,8 +10,8 @@ from __future__ import annotations
 import logging
 import math
 import os
-import subprocess
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -20,10 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-from hermes_constants import get_hermes_home
-from hermes_time import now as _hermes_now
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM
 from hermes_cli.observability.shared_metrics_gateway import record_cron_finish
+from hermes_constants import get_hermes_home
+from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,20 @@ LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+
+
+class RecoveredExecutions(int):
+    """Recovered records that remain compatible with the former integer count result."""
+
+    records: tuple[Dict[str, Any], ...]
+
+    def __new__(cls, records: List[Dict[str, Any]]):
+        result = super().__new__(cls, len(records))
+        result.records = tuple(records)
+        return result
+
+    def __iter__(self):
+        return iter(self.records)
 
 
 # --- executions ledger --------------------------------------------------------------------------
@@ -394,6 +408,8 @@ def finish_execution(
     return record
 
 
+# Recovery reasons participate in the cron incident signature. Keep durable wording
+# stable unless intentionally starting a distinct incident series.
 _OWNER_GONE_REASON = (
     "Execution owner process stopped before recording a durable terminal state; "
     "the cause is not known (it may have been stopped by an operator). "
@@ -416,19 +432,39 @@ def settle_unstarted_execution(execution_id: str, job_id: str, error: str) -> No
                      job_id, execution_id, error, record_err)
 
 
-def recover_interrupted_executions() -> int:
-    """Mark abandoned attempts unknown only for proved-dead owners. Legacy gateway-owned
-    live stale claims retain their existing bounded recovery; detached live workers never do."""
+def record_execution_delivery_outcome(
+    execution_id: str, delivery_outcome: str,
+) -> Optional[Dict[str, Any]]:
+    """Record notification outcome for a recovered attempt without changing ``unknown``."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET delivery_outcome=? WHERE id=? AND status='unknown'",
+            (str(delivery_outcome), execution_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record, delivery_outcome=delivery_outcome)
+    return record
+
+
+def recover_interrupted_executions() -> RecoveredExecutions:
+    """Mark abandoned attempts unknown and return count-compatible records.
+
+    Recovery never retries because side effects are unknown. It includes both
+    provably dead owners and live owners whose claim exceeded the derived stale
+    bound; callers can use each returned record's reason to select notification
+    policy.
+    """
     now = _hermes_now().isoformat()
-    changed = 0
-    recovered: List[Dict[str, Any]] = []
+    recovered: list[dict[str, Any]] = []
     # Derived on the first live-owned row only: the bound reads config, and the idle gateway
     # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
     stale_after: Optional[float] = None
     stale_after_resolved = False
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, status, process_id, pid, process_started_at,
+            """SELECT id, job_id, status, process_id, pid, process_started_at,
                       handoff_pending, handoff_started_at, claimed_at, progress_at, owner_kind
                FROM executions
                WHERE status IN ('claimed','running')"""
@@ -480,16 +516,23 @@ def recover_interrupted_executions() -> int:
                 (now, reason, row["id"], row["status"], row["process_id"], row["pid"],
                  row["handoff_pending"], row["handoff_started_at"]),
             )
-            changed += cur.rowcount
             if cur.rowcount:
+                from cron import incidents
+
+                # Both tables share this ledger. Commit the recovery and the router's
+                # incident together, before pruning or any best-effort notification.
+                # A failed incident write rolls recovery back for the next sweep.
+                if not recovered:
+                    incidents._initialize_schema(conn)
+                incidents._upsert_incident_on_connection(conn, row["job_id"], reason)
                 record = _fetch(conn, row["id"])
                 if record is not None:
                     recovered.append(record)
-        if changed:
+        if recovered:
             _prune_unlocked(conn)
     for record in recovered:
         _emit_execution_state(record)
-    return changed
+    return RecoveredExecutions(recovered)
 
 
 def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
@@ -497,7 +540,7 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
 
     ``recover_interrupted_executions`` sweeps every attempt whose owner is provably
     dead, and knows nothing but that absence — so all it can write is
-    ``_OWNER_GONE_REASON``, which asserts a scheduler restart. A waiter that held the
+    ``_OWNER_GONE_REASON``, which describes only that absence. A waiter that held the
     worker's ``Popen`` knows more: the owner was that external worker, and it exited
     with a known status. Without this, a manual run whose worker dies is filed as
     "Scheduler restarted ..." (a restart that never happened) and, because the sweep
@@ -514,7 +557,7 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         row = conn.execute(
-            """SELECT id, status, process_id, pid, process_started_at,
+            """SELECT id, job_id, status, process_id, pid, process_started_at,
                       handoff_pending, handoff_started_at
                FROM executions WHERE id=?""",
             (execution_id,),
@@ -541,6 +584,12 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        from cron import incidents
+
+        # The observed-worker-exit lane has the same lost-callback boundary as
+        # the generic sweep. Its truthful reason and incident commit together.
+        incidents._initialize_schema(conn)
+        incidents._upsert_incident_on_connection(conn, row["job_id"], reason)
         record = _fetch(conn, execution_id)
         _prune_unlocked(conn)
     _emit_execution_state(record)

@@ -3313,12 +3313,13 @@ def _finish_completed_run(
 
 
 def _deliver_crash_failure(
-    job: dict, err_text: str, *, adapters, loop,
+    job: dict, err_text: str, *, adapters, loop, incident_error: Optional[str] = None,
 ) -> tuple[Optional[str], str]:
-    """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
+    """Failure notice, optionally grouped by a durable cause rather than appended diagnostics."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
-    incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
+    incident_acked, failure_incident_id = _upsert_incident_for_failure(
+        job, err_text if incident_error is None else incident_error)
     if incident_acked:
         return None, "suppressed_acked"
     delivery_error = None
@@ -3737,7 +3738,11 @@ def _wait_for_external_cron_worker_body(
 
         reason = external_worker_exited_reason(returncode)
         if not terminalize_dead_owner(execution_id, reason=reason):
-            recover_interrupted_executions()
+            from cron.scheduler_recovery import _alert_reclaimed_executions
+
+            _alert_reclaimed_executions(
+                recover_interrupted_executions(), exclude_execution_id=execution_id
+            )
             # A concurrent sweep may have won the unknown transition. Still
             # surface this waiter's exit code and stderr instead of discarding them.
             current = get_execution(execution_id)
@@ -4370,16 +4375,11 @@ def _release_tick_lock(lock_fd) -> None:
     lock_fd.close()
 
 
-def _maybe_reap_dead_owners() -> None:
-    """Dead-owner reclaim: a run that died mid-flight would leave its row 'claimed' forever. Rows
-    whose owner process is proved gone are released (_owner_is_live), as are rows whose live owner
-    holds a claim older than the derived stale bound (the process is not killed). Throttled."""
-    # Dead-owner claim reclaim (#86721): execution rows carry their owner pid + process start time, but
-    # recovery previously ran only at scheduler STARTUP. A one-shot `hermes cron run` that claimed a job and
-    # died mid-run (its runner thread lived in the exiting CLI process) left the row 'claimed' forever while
-    # the long-lived gateway ticker kept running — blocking every future run of that job. Reap provably-dead
-    # owners periodically so stale claims auto-clear without a gateway restart. Throttled so idle 60s ticks
-    # don't pay a ledger connection every cycle (#33612).
+def _maybe_reap_dead_owners(*, adapters=None, loop=None) -> None:
+    """Reap dead or wedged owners and route only confirmed-death notices. Throttled."""
+    # A CLI-owned run can die while the gateway remains alive, so startup-only
+    # recovery leaves its claim stuck (#86721). Periodic recovery checks the owner
+    # incarnation, while throttling avoids a ledger connection on every idle tick (#33612).
     _reap_key = hermes_home_key(_get_hermes_home())
     _reap_now = time.monotonic()
     _last_reap = _last_dead_owner_reap_at.get(_reap_key)
@@ -4390,9 +4390,9 @@ def _maybe_reap_dead_owners() -> None:
         return
     _last_dead_owner_reap_at[_reap_key] = _reap_now
     try:
-        from cron.executions import recover_interrupted_executions
+        from cron.scheduler_recovery import _recover_interrupted_executions_with_alerts
 
-        _reclaimed = recover_interrupted_executions()
+        _reclaimed = _recover_interrupted_executions_with_alerts(adapters=adapters, loop=loop)
         if _reclaimed:
             logger.warning(
                 "Reclaimed %d cron execution(s) whose owner process died "

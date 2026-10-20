@@ -247,7 +247,7 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
 
 
 def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
-    """Real temp-HERMES_HOME subprocess restart: in-flight is audit-only unknown."""
+    """A real exited owner leaves a durable unknown attempt and incident, never a retry."""
     home = tmp_path / "home"
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
@@ -296,6 +296,22 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     # Recovery only classifies the old attempt. It must not manufacture a new
     # claimed record (which would imply an automatic retry).
     assert [r["status"] for r in records] == ["unknown"]
+
+    # The recovery subprocess also exited without running the notification
+    # callback. The incident must already be durable for an independent reader.
+    conn = sqlite3.connect((home / "cron" / "executions.db").as_uri() + "?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        incident_rows = conn.execute(
+            "SELECT job_id, state, error FROM cron_incidents WHERE job_id=?",
+            ("restart-job",),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(incident_rows) == 1
+    assert incident_rows[0]["state"] == "detected"
+    assert incident_rows[0]["error"] == records[0]["error"]
+    assert records[0]["delivery_outcome"] is None
 
 
 def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
