@@ -2319,9 +2319,9 @@ class TestSendTyping:
         a._app = MagicMock()
         a._app.client = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await a.send_typing("D123", metadata={"thread_id": "parent_ts"})
         a._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
+            channel_id="D123",
             thread_ts="parent_ts",
             status="is pouncing… 🐾",
         )
@@ -2339,14 +2339,14 @@ class TestSendTyping:
         a._app = MagicMock()
         a._app.client = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
-        a.set_status_text("C123", "is reading docs/api.md…")
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        a.set_status_text("D123", "is reading docs/api.md…")
+        await a.send_typing("D123", metadata={"thread_id": "parent_ts"})
         assert (
             a._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
             == "is reading docs/api.md…"
         )
-        a.set_status_text("C123", None)
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        a.set_status_text("D123", None)
+        await a.send_typing("D123", metadata={"thread_id": "parent_ts"})
         assert (
             a._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
             == "is pouncing… 🐾"
@@ -2363,7 +2363,7 @@ class TestSendTyping:
         clock = [1000.0]
         monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
 
-        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.send_typing("D123", metadata={"thread_id": "parent_ts"})
         assert (
             adapter._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
             == "is thinking..."
@@ -2371,7 +2371,7 @@ class TestSendTyping:
 
         # 2m03s later, the refresh loop calls send_typing again.
         clock[0] += 123
-        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.send_typing("D123", metadata={"thread_id": "parent_ts"})
         assert (
             adapter._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
             == "still working… (2m03s)"
@@ -2386,12 +2386,12 @@ class TestSendTyping:
         clock = [2000.0]
         monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
 
-        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.send_typing("D123", metadata={"thread_id": "parent_ts"})
         clock[0] += 90
-        await adapter.stop_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.stop_typing("D123", metadata={"thread_id": "parent_ts"})
 
         clock[0] += 5
-        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.send_typing("D123", metadata={"thread_id": "parent_ts"})
         assert (
             adapter._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
             == "is thinking..."
@@ -2404,12 +2404,12 @@ class TestSendTyping:
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
 
         await adapter.send_typing(
-            "C123",
+            "D123",
             metadata={"thread_id": "171.000", "message_id": "171.500"},
         )
 
         adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
+            channel_id="D123",
             thread_ts="171.000",
             status="is thinking...",
         )
@@ -2426,10 +2426,10 @@ class TestSendTyping:
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
         assert adapter._active_status_threads == {}
 
-        await adapter.stop_typing("C123", metadata={"thread_id": "stuck_ts"})
+        await adapter.stop_typing("D123", metadata={"thread_id": "stuck_ts"})
 
         adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
+            channel_id="D123",
             thread_ts="stuck_ts",
             status="",
         )
@@ -2461,21 +2461,48 @@ class TestSendTyping:
             return_value={"ts": "reply_ts"}
         )
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        adapter._active_status_threads[("", "D123", "parent_ts")] = {
+            "thread_ts": "parent_ts",
+            "team_id": "",
+        }
+
+        result = await adapter.send("D123", "done", metadata={"thread_id": "parent_ts"})
+
+        assert result.success
+        adapter._app.client.chat_postMessage.assert_called_once()
+        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="D123",
+            thread_ts="parent_ts",
+            status="",
+        )
+        assert ("", "D123", "parent_ts") not in adapter._active_status_threads
+
+    @pytest.mark.asyncio
+    async def test_channels_never_set_or_clear_assistant_status(self, adapter):
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
         adapter._active_status_threads[("", "C123", "parent_ts")] = {
             "thread_ts": "parent_ts",
             "team_id": "",
         }
 
-        result = await adapter.send("C123", "done", metadata={"thread_id": "parent_ts"})
+        adapter.set_status_text("C123", "is using a tool…")
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.stop_typing("C123", metadata={"thread_id": "parent_ts"})
 
-        assert result.success
-        adapter._app.client.chat_postMessage.assert_called_once()
-        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
-            thread_ts="parent_ts",
-            status="",
-        )
+        adapter._app.client.assistant_threads_setStatus.assert_not_called()
+        assert "C123" not in getattr(adapter, "_status_text", {})
         assert ("", "C123", "parent_ts") not in adapter._active_status_threads
+
+    @pytest.mark.asyncio
+    async def test_mpim_status_is_allowed_when_channel_type_is_known(self, adapter):
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        adapter._channel_types[("", "G123")] = "mpim"
+
+        await adapter.send_typing("G123", metadata={"thread_id": "parent_ts"})
+
+        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="G123", thread_ts="parent_ts", status="is thinking..."
+        )
 
 
     @pytest.mark.asyncio
@@ -2568,21 +2595,21 @@ class TestSendTyping:
         thread stuck "is thinking..." (#24117).
         """
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
-        adapter._active_status_threads[("", "C123", "parent_ts")] = {
+        adapter._active_status_threads[("", "D123", "parent_ts")] = {
             "thread_ts": "parent_ts",
             "team_id": "",
         }
         adapter.format_message = MagicMock(side_effect=RuntimeError("format boom"))
 
-        result = await adapter.send("C123", "done", metadata={"thread_id": "parent_ts"})
+        result = await adapter.send("D123", "done", metadata={"thread_id": "parent_ts"})
 
         assert not result.success
         adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
+            channel_id="D123",
             thread_ts="parent_ts",
             status="",
         )
-        assert ("", "C123", "parent_ts") not in adapter._active_status_threads
+        assert ("", "D123", "parent_ts") not in adapter._active_status_threads
 
 
 # ---------------------------------------------------------------------------
@@ -2983,6 +3010,38 @@ class TestReactions:
 
         # Message ID should be cleaned up
         assert "1234567890.000001" not in adapter._reacting_message_ids
+
+    @pytest.mark.asyncio
+    async def test_failure_removes_in_progress_reaction(self, adapter):
+        """A failed turn must not leave the in-progress reaction behind."""
+        from gateway.config import Platform
+        from gateway.platforms.base import SessionSource
+        from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+        timestamp = "1234567890.000002"
+        adapter._reacting_message_ids.add(adapter._workspace_message_marker("", timestamp))
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK, chat_id="C123", chat_type="group", user_id="U_USER"
+            ),
+            message_id=timestamp,
+        )
+
+        await adapter.on_processing_start(event)
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter._app.client.reactions_remove.assert_awaited_once_with(
+            channel="C123", timestamp=timestamp, name="eyes"
+        )
+        adapter._app.client.reactions_add.assert_has_awaits([
+            call(channel="C123", timestamp=timestamp, name="eyes"),
+            call(channel="C123", timestamp=timestamp, name="x"),
+        ])
+        assert adapter._workspace_message_marker("", timestamp) not in adapter._reacting_message_ids
 
 
 # ---------------------------------------------------------------------------
@@ -5990,9 +6049,9 @@ class TestAgentSessionsApiRouting:
         a = self._adapter()
         a._app.client.agents_sessions_setStatus = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await a.send_typing("D123", metadata={"thread_id": "parent_ts"})
         a._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
+            channel_id="D123",
             thread_ts="parent_ts",
             status="is thinking...",
         )
@@ -6003,9 +6062,9 @@ class TestAgentSessionsApiRouting:
         _slack_mod._AGENT_SESSIONS_SUPPORTED = False
         a = self._adapter()
         a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await a.send_typing("D123", metadata={"thread_id": "parent_ts"})
         a._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
+            channel_id="D123",
             thread_ts="parent_ts",
             status="is thinking...",
         )
@@ -6018,11 +6077,11 @@ class TestAgentSessionsApiRouting:
         a = self._adapter()
         a._app.client.agents_sessions_setStatus = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await a.send_typing("D123", metadata={"thread_id": "parent_ts"})
         a._app.client.assistant_threads_setStatus.reset_mock()
-        await a.stop_typing("C123", metadata={"thread_id": "parent_ts"})
+        await a.stop_typing("D123", metadata={"thread_id": "parent_ts"})
         a._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
+            channel_id="D123",
             thread_ts="parent_ts",
             status="",
         )
