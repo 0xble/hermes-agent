@@ -69,8 +69,7 @@ def _fallback_socket_path(home: Path, slot: str = SLOT_ACTIVE) -> Path:
     """
     name = slot_filename(f"hermes-gw-{_home_hash(home)}.sock", slot)
     runtime = _private_runtime_dir()
-    candidates = ([runtime / name] if runtime else []) + [Path(tempfile.gettempdir()) / name] + (
-        [] if _IS_WINDOWS else [Path("/tmp") / name])
+    candidates = ([runtime / name] if runtime else []) + [Path(tempfile.gettempdir()) / name]
     return next((c for c in candidates if _fits_sun_path(c)), candidates[0])
 
 
@@ -382,10 +381,11 @@ class GatewayControlServer:
             home = self._home
             info = home.lstat()
             if (home.absolute() != home.resolve() or not stat.S_ISDIR(info.st_mode)
-                    or info.st_uid != os.getuid() or home_mode_unsafe(info, home)):
+                    or info.st_uid != os.getuid()  # windows-footgun: ok — POSIX branch guarded by os.name
+                    or home_mode_unsafe(info, home)):
                 return None
             uid = socket_peer_uid(writer.get_extra_info("socket"))
-            return f"uid:{uid}" if uid == os.getuid() else None
+            return f"uid:{uid}" if uid == os.getuid() else None  # windows-footgun: ok — POSIX branch guarded by os.name
         except OSError:
             return None
 
