@@ -1747,7 +1747,26 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
         try:
             synth_text = _mark_internal_notification(synth_text)
-            metadata = _watch_notification_metadata(evt, source)
+            session_key = str(evt.get("session_key") or "").strip()
+            metadata = {} if platform_name == Platform.SLACK.value else _watch_notification_metadata(evt, source)
+            from agent.notification_presentation import diagnostic_process_event
+            if diagnostic_process_event(evt):
+                metadata["notification_category"] = "diagnostic"
+            if session_key.startswith("agent:"):
+                metadata["gateway_session_key"] = session_key
+            parent_session_id = str(evt.get("parent_session_id") or "").strip()
+            if parent_session_id:
+                metadata["gateway_session_id"] = parent_session_id
+                # Compressed routes keep the admission FIFO on the logical root, even though the
+                # transcript and event provenance point at the child tip.
+                authority = getattr(self, "session_authority", None)
+                if authority is not None:
+                    metadata["gateway_session_id"] = authority.logical_owner(parent_session_id)
+            proven_session_id = str(evt.get("proven_session_id") or "").strip()
+            if proven_session_id:
+                metadata["gateway_proven_session_id"] = proven_session_id
+            if completion_ids := evt.get("completion_ids"):
+                metadata["gateway_completion_ids"] = list(completion_ids)
             if retry_claim := str(evt.get("retry_notice_claim") or "").strip():
                 # Lets every later wake fence drop this notice once its retry is cancelled.
                 from hermes_cli.session_controls import RETRY_WAKE_METADATA_KEY

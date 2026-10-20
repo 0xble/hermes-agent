@@ -1874,12 +1874,10 @@ def get_portable_mcp_server_names_nowait() -> set[str]:
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke hooks, waiting for policy discovery; loop observers snapshot current callbacks.
-
-    Bounded hooks use ``plugins.hook_callback_timeout``; timed-out or still-running
-    ``pre_tool_call`` callbacks fail closed with a block directive. Unknown/policy
-    hooks never use a partial registry. Observer returns cannot authorize work.
-    """
+    """Invoke hooks, waiting for policy discovery; loop observers snapshot current callbacks."""
+    from agent.safe_worker_policy import safe_worker_enabled
+    if safe_worker_enabled():
+        return []
     snapshot = _loop_observer_snapshot(hook_name)
     if snapshot is not None:
         manager, callbacks = snapshot
@@ -1899,21 +1897,18 @@ def render_system_prompt_sections(session_info: Mapping[str, Any]) -> list[Rende
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> list[Any]:
-    """Invoke registered middleware callbacks (lazy-discovers like :func:`invoke_hook`).
-
-    Lazy-discovers plugins on first use — same delivery-parity guarantee as :func:`invoke_hook` (tracking
-    #64178).
-    """
+    """Invoke registered middleware callbacks, skipping plugin delivery in safe workers."""
+    from agent.safe_worker_policy import safe_worker_enabled
+    if safe_worker_enabled():
+        return []
     return _delivery_manager().invoke_middleware(kind, **kwargs)
 
 
 def has_middleware(kind: str) -> bool:
-    """True when middleware is registered for ``kind``; lazy-discovers first since callers gate
-    :func:`invoke_middleware` on it.
-
-    Lazy-discovers first: callers use this as a gate before :func:`invoke_middleware`, so a pre-discovery
-    ``False`` here would silently skip delivery on surfaces that never ran discovery (#64178).
-    """
+    """True when middleware is registered, or false in a safe worker."""
+    from agent.safe_worker_policy import safe_worker_enabled
+    if safe_worker_enabled():
+        return False
     manager = _delivery_manager()
     method = getattr(manager, "has_middleware", None)
     if callable(method):
@@ -1922,7 +1917,10 @@ def has_middleware(kind: str) -> bool:
 
 
 def has_hook(hook_name: str) -> bool:
-    """Probe hooks; loop observers snapshot, policy/worker callers await discovery."""
+    """Probe hooks, with no plugin manager in a safe worker."""
+    from agent.safe_worker_policy import safe_worker_enabled
+    if safe_worker_enabled():
+        return False
     snapshot = _loop_observer_snapshot(hook_name)
     if snapshot is not None:
         return bool(snapshot[1])
@@ -1930,7 +1928,10 @@ def has_hook(hook_name: str) -> bool:
 
 
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:
-    """Snapshot hooks; loop observers do not wait, policy callers require readiness."""
+    """Snapshot hooks, with no plugin manager in a safe worker."""
+    from agent.safe_worker_policy import safe_worker_enabled
+    if safe_worker_enabled():
+        return ()
     snapshot = _loop_observer_snapshot(hook_name)
     if snapshot is not None:
         return snapshot[1]

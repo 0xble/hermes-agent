@@ -79,6 +79,17 @@ def _delivery_manager():
     manager off-loop, then await callbacks on their original loop. Look up facade seams lazily
     so scoped managers and compatibility monkeypatches retain one authoritative import path.
     """
+    from agent.safe_worker_policy import safe_worker_enabled
+    if safe_worker_enabled():
+        class _SafeWorkerManager:
+            _middleware = {}
+            _hooks = {}
+            def has_middleware(self, _kind): return False
+            def has_hook(self, _name): return False
+            def iter_hook_callbacks(self, _name): return ()
+            def invoke_middleware(self, _kind, **_kwargs): return []
+            def invoke_hook(self, _name, **_kwargs): return []
+        return _SafeWorkerManager()
     from hermes_cli import plugins
     manager = plugins.get_plugin_manager()
     try:

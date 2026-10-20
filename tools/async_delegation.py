@@ -450,20 +450,24 @@ def _persist_completion(
     event: dict[str, Any], result: dict[str, Any], delivery_state: str = "pending",
     *, expected_state: Optional[str] = None,
 ) -> bool:
-    """Conditionally persist a terminal payload without replacing the row."""
-    event, result = redact_completion_event(event), redact_child_result(result)
+    """Conditionally persist a terminal payload without replacing the row.
+
+    Checkpoint reconciliation mutates the caller's ``event``/``result`` in place (the producer
+    syncs the reconciled payload into its live event); only the stored copies are force-redacted."""
     if remote := worker_ledger():
-        return remote.complete(event, result)
+        return remote.complete(redact_completion_event(event), redact_child_result(result))
     now = time.time()
     expected_state = expected_state or event.get("expected_state") or "queued"
     with _DB_LOCK, _transaction() as conn:
         conn.execute("BEGIN IMMEDIATE")
         reconcile_checkpoint(conn, event, result, expected_state)
+        stored_event, stored_result = redact_completion_event(event), redact_child_result(result)
         changed = conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state=?
                WHERE delegation_id=? AND state=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), delivery_state, event["delegation_id"], expected_state)).rowcount
+             json.dumps(stored_event), json.dumps(stored_result), delivery_state, event["delegation_id"],
+             expected_state)).rowcount
     if changed != 1:
         logger.error("Async delegation %s terminal transition %s -> %s changed %s rows",
                      event.get("delegation_id"), expected_state, event.get("status"), changed)

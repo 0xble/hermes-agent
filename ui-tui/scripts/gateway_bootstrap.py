@@ -113,9 +113,15 @@ if __name__ == "__main__":
     # bad JSON (ValueError), rejected grants (RuntimeError), malformed reply shapes. Anything else
     # still exits 1, with a traceback.
     except ImportError as exc:
-        # This interpreter cannot load Hermes at all: no reconnect fixes that, so name it
-        # (gatewayClient.ts stops retrying on this verdict).
-        print(f"gateway unavailable: bootstrap_dependencies\n{exc}\n{BOOTSTRAP_REMEDY}", file=sys.stderr)
+        # A missing committed generation is terminal. A transient install-state lock leaves the
+        # caller's interpreter untouched, so dependency imports can still fail once and should use
+        # the ordinary retry path rather than poisoning the TUI for its lifetime.
+        from pm.environments import install_state_dir
+        transient_install_read = (install_state_dir(python_root()) / ".install.lock").is_dir()
+        if str(exc).startswith("dependency environment unavailable:") or not transient_install_read:
+            print(f"gateway unavailable: bootstrap_dependencies\n{exc}\n{BOOTSTRAP_REMEDY}", file=sys.stderr)
+        else:
+            print(f"dependency bootstrap deferred: {exc}", file=sys.stderr)
         raise SystemExit(1)
     except (OSError, RuntimeError, ValueError, LookupError, AttributeError, TypeError) as exc:
         print(str(exc), file=sys.stderr)

@@ -104,14 +104,15 @@ class CLICommandsSessionToolsMixin:
 
         See #14602.
         """
+        session_id = getattr(self, "session_id", "") or ""
         if not getattr(self, "_agent_running", False):
-            return _stop_background_work()
+            return _stop_background_work(session_id)
         if getattr(self, "agent", None):
             from agent.interrupt_compat import request_hard_interrupt
             print(f"  {t('cli.tui.interrupting')}")
             request_hard_interrupt(self.agent)
         from agent.memory_provider import spawn_context_thread
-        spawn_context_thread(_stop_background_work, name="cli-stop").start()
+        spawn_context_thread(_stop_background_work, name="cli-stop", args=(session_id,)).start()
 
     def _handle_agents_command(self):
         """Handle /agents — show background processes and agent status. On the gateway both run there:
@@ -283,9 +284,11 @@ class CLICommandsSessionToolsMixin:
                    f"  {_t('profile.home', home=reply.data['home'])}")
 
 
-def _stop_background_work() -> None:
+def _stop_background_work(session_id: str = "") -> None:
     """``/stop``'s cleanup: kill the background processes, then interrupt the background (async)
-    delegations. Mid-turn it runs on a worker thread and prints its result from there."""
+    delegations. Mid-turn it runs on a worker thread and prints its result from there. A local
+    stop scopes durable cancellation to this CLI session (``parent_session_id``) so it never
+    revokes another session's claimed recovery."""
     from hermes_cli.gateway_tools import process_registry as _registry, process_view
     process_registry, view = _registry(), process_view()
     if view is not None:
@@ -303,7 +306,7 @@ def _stop_background_work() -> None:
             interrupted = view.interrupt_delegations()  # the gateway interrupts this session's own
         else:
             from tools.async_delegation import interrupt_all
-            interrupted = interrupt_all(reason='/stop')
+            interrupted = interrupt_all(reason='/stop', parent_session_id=session_id)
         print(f"  {_t('stop.interrupted_delegations', count=interrupted)}")
 
 

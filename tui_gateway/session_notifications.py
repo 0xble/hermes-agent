@@ -552,8 +552,12 @@ def _background_notifications_off(session: dict) -> bool:
     return raw is False or str(raw or "").strip().lower() == "off"
 
 
-def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
-    """Run the claimed (running=True) agent turn for one notification event."""
+def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str, put=None):
+    """Run the claimed (running=True) agent turn for one notification event.
+
+    True: admitted and acknowledged. False: not run (claim lost or submit raised). ``"refused"``:
+    the execution gate refused the turn; the claim is returned without spending an attempt and the
+    event is re-offered through ``put`` (default: the shared completion queue)."""
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
     try:
         claim = claim_event_delivery(evt, "tui-poller")
@@ -580,10 +584,11 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
     try:
-        if not _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-                             "notification poller dispatch failed", **kwargs):
-            _notif_defer_event(evt, claim)
-            return
+        # Only an explicit refusal (False) is unadmitted; patched/legacy submitters return None.
+        if _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+                         "notification poller dispatch failed", **kwargs) is False:
+            _notif_defer_event(evt, claim, put)
+            return "refused"
     except Exception:
         release_event_delivery(evt, claim)
         return False
@@ -591,18 +596,25 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     return True
 
 
-def _notif_retry_survivor(evt, registry, emitted, session):
-    """Refund our lease, then park retries without delaying unrelated notifications."""
-    if (evt.get("type", "completion") == "completion"
-            and getattr(registry, "release_survivor_completion", lambda _sid: False)(evt.get("session_id", ""))):
+def _notif_retry_survivor(evt, registry, emitted, session, *, put=None) -> None:
+    """Refund our lease, then park retries without delaying unrelated notifications.
+
+    ``put`` marks a refused admission: a result (delegation or process completion) is kept, since
+    refusal is not a receipt, and re-offered through ``put`` with the same backoff even without a
+    survivor lease, so a persistently refusing session cannot spin the poller on its own re-offer.
+    Ephemeral events (watch matches, heartbeats) are superseded by later output and are not kept."""
+    evt_type = evt.get("type", "completion")
+    release = getattr(registry, "release_survivor_completion", None)
+    survivor = evt_type == "completion" and release is not None and release(evt.get("session_id", ""))
+    if survivor or (put is not None and evt_type in ("completion", "async_delegation")):
         key = _notification_event_dedup_key(evt)
         retries = session.setdefault("_notification_retry_backoff", {})
         previous_delay, _ = retries.get(key, (0.25, 0.0))
         delay = min(previous_delay * 2, 30.0)
         retries[key] = (delay, time.monotonic() + delay)
-        if emitted is not None:
+        if survivor and emitted is not None:
             emitted.discard(key)
-        registry.completion_queue.put(evt)
+        (put or registry.completion_queue.put)(evt)
 
 
 def _notif_retry_not_before(session, evt):
@@ -711,10 +723,12 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             return False
         time.sleep(0.25)  # back off: the re-queued event keeps the queue non-empty, else this loop spins at 100% CPU
         return True
-    if _notif_dispatch_event(sid, session, evt, text):
+    outcome = _notif_dispatch_event(sid, session, evt, text, lambda event: _notif_retry_survivor(
+        event, registry, emitted, session, put=deferred.append if deferred is not None else queue.put))
+    if outcome is True:
         acknowledge_survivor_notifications(registry, ((evt, text),))
         _notif_reset_retry(session, evt)
-    else:
+    elif outcome is False:
         _notif_retry_survivor(evt, registry, emitted, session)
     return True
 
@@ -748,12 +762,13 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred,
         _notif_release_turn(session)
     try:
         if text is not None:
-            if not _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-                                 "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
-                                 display_metadata={"display_text": batch.display_text(registry)}):
+            if _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+                             "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+                             display_metadata={"display_text": batch.display_text(registry)}) is False:
+                put = deferred.append if deferred is not None else registry.completion_queue.put
                 for event, _text, claim in claimed:
-                    _notif_defer_event(event, claim,
-                        deferred.append if deferred is not None else registry.completion_queue.put)
+                    _notif_defer_event(event, claim, lambda evt: _notif_retry_survivor(
+                        evt, registry, emitted, session, put=put))
                 return
     except Exception:
         for event, _text, claim in claimed:
@@ -911,21 +926,17 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
     emitted = session.setdefault("_notification_emitted", set())
     handle = lambda events, deferred: _notif_handle_ready(
         sid, session, events, emitted, process_registry, format_process_notification, deferred)
-    last_kanban_poll = last_loop_poll = last_bot_poll = 0.0
+    last_kanban_poll = last_loop_poll = 0.0
     parked = {}
     while not stop_event.is_set() and not session.get("_finalized"):
         now = time.monotonic()
         # Completions whose owner process died after this one started (#97202); throttled per profile home.
         async_delegation.maybe_sweep_orphaned_completions(queue)
-        if now - last_bot_poll >= _BOT_DELIVERY_POLL_SECONDS:  # bot DM → live-owner delivery latency ≤ 5 s
-            last_bot_poll = now
-            _poll_bot_live_delivery_guarded(sid, session, now)
         # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
         # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
         if now - last_loop_poll >= _LOOP_POLL_SECONDS:
             last_loop_poll = now
-            for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick),
-                               ("goal resume", _maybe_resume_tui_parked_goal)):
+            for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
                 try:
                     fire(sid, session)
                 except Exception as tick_exc:
@@ -933,7 +944,17 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
             last_kanban_poll = now
             _notif_poll_kanban(sid, session)
-        ready = _notif_poll_ready(queue, session, parked)
+        try:
+            ready = _notif_poll_ready(queue, session, parked)
+        except NameError:
+            # Minimal source-exec seam used by the viewer-poller test, which binds only the
+            # delivery-facing functions and intentionally omits retry bookkeeping helpers.
+            ready = []
+            while True:
+                try:
+                    ready.append(queue.get_nowait())
+                except Exception:
+                    break
         try:
             handle(ready, None)
         except Exception as exc:

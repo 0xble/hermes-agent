@@ -829,6 +829,27 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             return True, None
         return False, None
 
+    async def _hm_cancel_queued_followups(self, _quick_key: str) -> None:
+        """Busy /stop and /new drop the human follow-up queued behind the running turn, as main
+        dropped the adapter slot; under session authority it sits in the durable FIFO instead.
+        Only still-queued ``messaging:*`` rows of this route's logical owner: automation wakes,
+        LOCAL/API input and ``unknown`` rows are untouched. Settled silently (no pause notice)."""
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        sid = authority.logical_owner(self.session_store.peek_session_id(_quick_key)) if authority else None
+        if not sid or sid not in authority.sessions:
+            return
+        from gateway.session_contract import Principal, SessionRef
+        from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+        ref = SessionRef(authority.profile_id, sid)
+        actor = Principal('messaging-control', authority.profile_id,
+                          frozenset({'session:submit', 'session:control'}), 'busy-command')
+        for row in await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid):
+            if row['status'] == 'queued' and row['principal_id'].startswith('messaging:'):
+                # Claimed meanwhile (stale_generation): it runs as main's post-claim race does.
+                with suppress(RuntimeStoreError):
+                    await authority.cancel_queued(actor, ref, row['admission_id'])
+
     def _hm_busy_telegram_grace_queue(
         self, event: MessageEvent, source: SessionSource, _quick_key: str, effective_busy_input_mode: str
     ) -> bool:
@@ -1706,9 +1727,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         process does not serve."""
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
+        from gateway.session_ingress import admit_message, executing_admission
         authority = active_authority(self)
         if authority is not None and not event.get_command() and not is_internal:
-            from gateway.session_ingress import admit_message, executing_admission
             if not executing_admission.get():
                 # The durable FIFO only orders turns; busy_input_mode still decides what a follow-up
                 # does to the RUNNING one (steer into it, redirect it, or end it so the FIFO advances).
@@ -1816,6 +1837,49 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
                 return t("gateway.busy.draining_maintenance")
 
+        # Compression new-turn gate (#134239): a post-turn compression starts ~0.4 s after
+        # "Turn ended", i.e. while ``_is_session_running`` is already False, so a follow-up
+        # message reaches this fresh-turn path with the guard from #56391 never firing. The
+        # turn it starts reads the pre-rotation history and its own post-turn compression later
+        # commits a snapshot taken before the previous commit — double-compressing the
+        # transcript. The running-agent path already demotes for this; the fresh-turn path
+        # must refuse too. Lock is TTL-leased (~300 s), so a leaked lock can't wedge this.
+        _compression_in_flight = await self._session_has_compression_in_flight(_quick_key)
+        if _compression_in_flight:
+            # The lock can cover several gateway inputs. Keep one automatic retry turn for the
+            # whole episode, rather than dropping internal wakes or creating one retry per notice.
+            _deferred = self._queue_compression_deferred_event(_quick_key, event)
+            if not _deferred:
+                # The normal route is the adapter's pending slot. The durable drain fallback is
+                # only for a transiently missing adapter, so an internal wake is still retained.
+                preserve = getattr(self, "_preserve_drain_event", None)
+                _deferred = bool(preserve and preserve(_quick_key, event))
+            if is_internal:
+                if not _deferred:
+                    logger.error(
+                        "Could not preserve internal turn for session %s during compression.",
+                        _quick_key,
+                    )
+                else:
+                    logger.info(
+                        "Deferring internal turn for session %s — context compression in flight.",
+                        _quick_key,
+                    )
+                return None
+            _conversation = self._session_state(_quick_key).conversation
+            if not _conversation.compression_deferred_notice_sent:
+                _conversation.compression_deferred_notice_sent = True
+                logger.info("Deferring user turn for session %s — context compression in flight.", _quick_key)
+                return t("gateway.busy.compressing_retry")
+            logger.info("Coalescing another deferred user turn for session %s.", _quick_key)
+            return None
+        else:
+            # The next held lock starts a new notice episode after the automatic retry clears this
+            # transient latch. Conversation boundaries also reset it through ConversationState.clear().
+            _state = self._peek_session_state(_quick_key)
+            if _state is not None:
+                _state.conversation.compression_deferred_notice_sent = False
+
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
@@ -1852,13 +1916,15 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
+        # The admission context is set by the durable executor, not by direct legacy dispatch.
+        from gateway.session_ingress import executing_admission
         try:
             # Mark genuine user activity inside the claimed turn, before resolving the model. This
             # preserves the attended route's same-turn semantics without delaying the sentinel claim.
             _attended_activity_marked = await self._mark_attended_user_activity(event, source, _quick_key)
             if _attended_activity_marked:
                 setattr(event, "_attended_activity_marked", True)
-            if not is_internal:  # fail-open plugin consume, inside the claimed slot (#129958)
+            if not is_internal and not executing_admission.get():  # fail-open plugin consume, inside the claimed slot (#129958)
                 from gateway.run_inbound_consumer import run_post_admission_hook
                 _consumed, _consumer_reply = await run_post_admission_hook(self, event, source, _quick_key)
                 if _consumed:
@@ -2454,7 +2520,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
     ) -> tuple[str, list[str]]:
         """Transcribe voice clips with the configured STT provider and prepend the transcripts →
         ``(enriched_text, successful_transcripts)``; the transcripts (input order; empty if every clip
-        failed or STT is disabled) let callers echo them back before the agent loop."""
+        failed or STT is disabled) let callers echo them back before the agent loop. ``clip_memo``
+        (path → ``_transcribe_one_clip`` result) skips clips an earlier pass already transcribed."""
         from gateway.run import _probe_audio_duration
         audio_paths = list(dict.fromkeys(audio_paths))
         if not getattr(self.config, "stt_enabled", True):
@@ -2529,6 +2596,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             semaphore = getattr(self, "_pending_stt_semaphore", None)
             if semaphore is None:
                 semaphore = self._pending_stt_semaphore = asyncio.Semaphore(2)
+            clip_memo = getattr(event, "_gateway_pending_stt_clips", None)
+            if clip_memo is None:
+                clip_memo = {}
+                event._gateway_pending_stt_clips = clip_memo
 
             clip_memo = getattr(event, "_gateway_pending_stt_clips", None)
             if clip_memo is None:

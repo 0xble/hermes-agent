@@ -446,6 +446,40 @@ class GatewayBusySessionMixin:
         return ((isinstance(pending_slot, dict) and pending_slot.get(session_key) is event)
                 or any(item is event for item in (self._overflow_queue(session_key) or ())))
 
+    def _queue_compression_deferred_event(self, session_key: str, event: MessageEvent) -> bool:
+        """Coalesce an event deferred by the compression lock into one automatic retry turn.
+
+        Compression can pause several unrelated gateway inputs while the session is between its
+        old and new transcript generations. They must not become one adapter retry per input, and
+        they must not be lost when the fresh-turn gate returns before an agent starts.
+        """
+        from gateway.platforms.base import merge_pending_message_event
+
+        adapter = self._delivery_adapter_for(event.source)
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if not isinstance(pending_slot, dict):
+            return False
+        existing = pending_slot.get(session_key)
+        if existing is None:
+            pending_slot[session_key] = event
+        else:
+            merge_pending_message_event(pending_slot, session_key, event, merge_text=True)
+            # A real user message must keep the coalesced retry on the external path. Conversely,
+            # a goal continuation arriving after an internal notice must retain its goal identity.
+            existing.internal = bool(existing.internal and event.internal)
+            if (event.metadata or {}).get("goal_continuation"):
+                existing.metadata.update({
+                    key: value for key, value in (event.metadata or {}).items()
+                    if key.startswith("goal_continuation") or key == "goal_continuation"
+                })
+            if getattr(event, "_post_turn_goal_identity", None) is not None:
+                existing._post_turn_goal_identity = event._post_turn_goal_identity
+        event._gateway_accepted = True
+        if existing is not None:
+            existing._gateway_accepted = True
+        self._prefetch_queued_voice_transcript(event, adapter)
+        return True
+
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
 
@@ -505,14 +539,11 @@ class GatewayBusySessionMixin:
 
     @staticmethod
     def _busy_reply_to(event: MessageEvent, reply_anchor):
-        # Telegram DM topics anchor on the thread; other Telegram threads send unanchored.
-        return (
-            reply_anchor
-            if event.source.platform == Platform.TELEGRAM
-            and event.source.chat_type == "dm"
-            and event.source.thread_id
-            else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
-        )
+        # Telegram DM topics anchor on the thread; other Telegram threads send unanchored. An
+        # internal wake's message_id is its producer identity, never a platform id (#139611).
+        if event.source.platform == Platform.TELEGRAM and event.source.thread_id:
+            return reply_anchor if event.source.chat_type == "dm" else None
+        return None if getattr(event, "internal", False) else event.message_id
 
     async def _send_busy_reply(self, event: MessageEvent, adapter, content: str, *, plain_anchor: bool = False) -> None:
         """Send a busy-path reply anchored to the event (thread metadata included)."""

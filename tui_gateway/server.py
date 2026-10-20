@@ -1695,6 +1695,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # gateway last ran) before the TUI's top-level keys, then a routable ``billing_provider`` (#125942).
     from hermes_state import SessionDB
     route = SessionDB.session_gateway_runtime(row)
+    if not route.get("provider"):
+        route = {"provider": row.get("billing_provider"), "base_url": row.get("billing_base_url"),
+                 "api_mode": model_config.get("api_mode")}
     provider, base_url, api_mode = (str(route.get(k) or "").strip() for k in ("provider", "base_url", "api_mode"))
     service_tier = str(model_config.get("service_tier") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
@@ -1716,7 +1719,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             provider = healed
             base_url = ""  # the healed identity owns a registered endpoint; the snapshot URL must not override it
         else:
-            provider = ""
+            # The route is gone with its endpoint and wire: on the default provider they would send
+            # that provider's credentials to the stored URL.
+            provider = base_url = api_mode = ""
     if model:
         # Same dict-shaped override live /model switches use, so a DB-restored session keeps custom endpoint
         # metadata across resume and rebuilds (/new). Raw api_key is never persisted/restored.
@@ -1729,8 +1734,6 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
     return overrides
-
-
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     """Merge the agent's CURRENT runtime identity onto the row's persisted ``model_config``. Falsy agent
     attributes DELETE the key rather than skip the write: resume reads provider/endpoint from this JSON
@@ -3694,6 +3697,8 @@ from . import (
     methods_onboarding as _methods_onboarding, methods_i18n as _methods_i18n, methods_machine as _methods_machine,
     methods_shared_metrics as _methods_shared_metrics, methods_plugin_catalog as _methods_plugin_catalog)
 
+_server_stored_session_runtime_overrides = _stored_session_runtime_overrides
+
 for _m in (
     _session_registry, _agent_factory,
     _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
@@ -3708,3 +3713,6 @@ for _m in (
     _methods_i18n, _methods_machine, _methods_shared_metrics, _methods_plugin_catalog):
     _m.register(sys.modules[__name__])
 del _m
+
+# Keep the server's persisted-route reader visible after module registration binds factory names.
+_stored_session_runtime_overrides = _server_stored_session_runtime_overrides

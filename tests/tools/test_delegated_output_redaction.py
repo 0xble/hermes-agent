@@ -85,6 +85,9 @@ def _record():
         "model": "test-model",
     }
     ad._persist_dispatch(record)
+    # Terminal writes are conditional on the lifecycle row the producer owns (running).
+    assert ad._persist_transition(record["delegation_id"], "queued", "admitted") == 1
+    assert ad._persist_transition(record["delegation_id"], "admitted", "running") == 1
     return record
 
 

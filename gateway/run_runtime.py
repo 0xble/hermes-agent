@@ -413,12 +413,13 @@ async def recover_gateway_native_sessions(runner):
     results = {}
     for authority in authorities:
         with owner_scope(authority):
+            entries = await asyncio.to_thread(runner.session_store.list_sessions)
             recover_local_sessions(authority, schedule=True)
             await recover_webhook_finalizations(authority)
             pending = {row['target_session_id'] for row in authority.db._read_all(
                 "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
             # The session-store lock guards state.db writes; never wait on it from the loop thread.
-            session_entries = await asyncio.to_thread(runner.session_store.list_sessions)
+            session_entries = entries
             bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
                         for entry in session_entries if entry.origin is not None
                         for owner in [authority.logical_owner(entry.session_id)] if owner in pending]

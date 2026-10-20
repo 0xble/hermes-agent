@@ -292,22 +292,11 @@ def _sdk_supports_agent_sessions() -> bool:
 
 
 def _session_status_method(client: Any):
-    """Return the status setter: always legacy ``assistant.threads.setStatus``.
-
-    Deliberately NOT routed through ``agents.sessions.setStatus`` (#110374).
-    That API takes a closed enum (``active|processing|suspended|closed``) while
-    every Hermes status payload is free text — live per-tool phrases, the
-    elapsed-time heartbeat, ``typing_status_text`` — plus an EMPTY string to
-    clear. All of those are rejected with ``invalid_arguments``, and because
-    status failures are debug-logged the indicator vanishes silently.
-
-    The enum also has no auto-clear (``processing`` lingers up to an hour after
-    the app replies), which would re-open the stuck-indicator bug class of
-    #64621 / #24117. The legacy method keeps free text and auto-clear until its
-    February 2027 deprecation; migrating means mapping lifecycle states onto the
-    enum and accepting the loss of custom status text, which is a product call.
-    Titles are unaffected — ``agents.sessions.rename`` takes free text.
-    """
+    """Return Agent Sessions status API when the installed SDK exposes it, else legacy."""
+    if _sdk_supports_agent_sessions():
+        method = getattr(client, "agents_sessions_setStatus", None)
+        if method is not None:
+            return method
     return client.assistant_threads_setStatus
 
 
@@ -4754,12 +4743,8 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=self._channel_prompt_with_identity(channel_id, team_id),
             channel_context=channel_context,
             reply_expected=reply_expected,
-            # thread_ts is the thread root, not an explicit reply (root is in channel_context).
             reply_to_text=None,
-            auto_skill=resolve_channel_skills(self.config.extra, channel_id, None),
-            metadata={
-                "slack_team_id": team_id, "slack_channel_id": channel_id,
-                "slack_thread_ts": thread_ts})
+            auto_skill=resolve_channel_skills(self.config.extra, channel_id, None))
 
     def _note_attachment_failure(
         self, notices: list[str], detail: Optional[str], fallback_msg: str, *fallback_args: Any,
