@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from agent.image_token_cost import calibrate_from_usage
+from agent.reasoning_effort import effort_log_label
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
 from agent.usage_pricing import estimate_usage_cost, normalize_usage, with_served_service_tier
 
@@ -93,8 +94,9 @@ def record_response_usage(
         if callable(_note_usage_less):
             _note_usage_less()
         logger.info(
-            "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable",
+            "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable effort=%s",
             agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
+            effort_log_label(getattr(agent, "reasoning_config", None)),
         )
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
@@ -210,10 +212,10 @@ def record_response_usage(
     if isinstance(_upstream, str) and _upstream:
         _ident += f" upstream={_upstream}"
     logger.info(
-        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s%s",
+        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s%s effort=%s",
         agent.session_api_calls, agent.model, agent.provider or "unknown",
         prompt_tokens, completion_tokens, total_tokens,
-        api_duration, _cache_pct, _ident,
+        api_duration, _cache_pct, _ident, effort_log_label(getattr(agent, "reasoning_config", None)),
     )
     # nous.anthropic_wire=auto: the session's wire is decided once, from this first response.
     if agent.session_api_calls == 1 and (agent.provider or "") == "nous":

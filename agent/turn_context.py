@@ -33,6 +33,7 @@ from agent.model_metadata import (
 from agent.image_token_cost import bind_image_token_cost
 from agent.usage_anchor import anchored_context_tokens, restore_usage_anchor
 from agent.turn_author import parse_turn_author
+from agent.reasoning_effort import effort_log_label
 
 logger = logging.getLogger(__name__)
 
@@ -1125,10 +1126,11 @@ def build_turn_context(
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = _preview_text[:80] + ("..." if len(_preview_text) > 80 else "")
     _turn_fmt = (
-        "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r"
+        "conversation turn: session=%s model=%s provider=%s effort=%s platform=%s history=%d msg=%r"
     )
     _turn_args = [
         agent.session_id or "none", agent.model, agent.provider or "unknown",
+        effort_log_label(getattr(agent, "reasoning_config", None)),
         agent.platform or "unknown", len(conversation_history or []),
         _msg_preview.replace("\n", " "),
     ]

@@ -31,6 +31,9 @@ def _runner(decision, runtime=None):
     turn = TurnRunner.__new__(TurnRunner)
     turn._runner = runner
     turn._ctx = _ctx()
+    # Attended cards bypass the temporary status rail; capture the persistent sink.
+    turn.attended_notices = []
+    turn._emit_persistent_attended_notice = turn.attended_notices.append
     return turn, runner, state
 
 
@@ -89,7 +92,8 @@ def test_mid_turn_activation_switches_once_and_posts_one_notice():
     switch.assert_called_once_with(
         agent, "opus", "anthropic", "", "", "anthropic_messages", None,
     )
-    assert notices == ["⇄ Switched to Opus while you're active."]
+    assert turn.attended_notices == ["⇄ Switched to Opus while you're active."]
+    assert notices == []
     assert state.conversation.last_resolved_model == "opus"
 
 
@@ -121,7 +125,8 @@ def test_mid_turn_idle_expiry_switches_back_once_with_one_notice():
     switch.assert_called_once_with(
         agent, "gpt-6.1-sol", "nous", "", "", "codex_responses", None,
     )
-    assert notices == ["⇄ Back to GPT-6.1 Sol after 15m idle."]
+    assert turn.attended_notices == ["⇄ Back to GPT-6.1 Sol after 15m idle."]
+    assert notices == []
     assert state.conversation.last_resolved_model == "gpt-6.1-sol"
     # The reasoning lookup is stubbed to the stale attended effort; the committed decision wins.
     assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
@@ -159,7 +164,7 @@ def test_oversized_default_context_keeps_attended_route_without_compaction():
         turn._apply_attended_before_api_call(agent, loop_state)
 
     switch.assert_not_called()
-    assert notices == []
+    assert notices == [] and turn.attended_notices == []
     assert compressed == []
     assert state.conversation.last_attended_decision is previous
 
@@ -186,10 +191,10 @@ def test_new_session_first_attended_turn_has_no_switch_in_notice():
     with patch("agent.agent_runtime_helpers.switch_model"):
         turn._apply_attended_before_api_call(agent)
 
-    assert notices == []
+    assert notices == [] and turn.attended_notices == []
 
 
-def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
+def test_turn_start_attended_notice_is_delivered_persistently_once(monkeypatch):
     state = SimpleNamespace(
         conversation=SimpleNamespace(
             pending_attended_notice="⇄ Switched to Opus while you're active.",
@@ -217,6 +222,8 @@ def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
         session_prompt_tokens=0, session_completion_tokens=0,
     )
     notices = []
+    persistent = []
+    monkeypatch.setattr(turn, "_emit_persistent_attended_notice", persistent.append)
 
     monkeypatch.setattr(turn, "_combined_ephemeral_prompt", lambda: "")
     monkeypatch.setattr(turn, "_setup_stream_consumer", lambda _platform: (None, None, None, False))
@@ -237,7 +244,8 @@ def test_turn_start_attended_notice_reaches_status_callback_once(monkeypatch):
     with patch.dict(sys.modules, {"gateway.run": SimpleNamespace(_current_max_iterations=lambda: 1)}):
         turn.run_sync()
 
-    assert notices == ["⇄ Switched to Opus while you're active."]
+    assert persistent == ["⇄ Switched to Opus while you're active."]
+    assert notices == []
     assert state.conversation.pending_attended_notice is None
 
 
@@ -308,3 +316,66 @@ def test_conversation_loop_orders_route_hooks_around_destination_preflight(monke
         ("preflight", "default"),
     ]
     assert agent._preflight_output_ceiling == 222
+
+
+import asyncio
+import logging
+
+import pytest
+
+
+@pytest.mark.parametrize("suppressed", [False, True])
+def test_attended_notice_is_a_permanent_message_not_a_cleanup_bubble(monkeypatch, suppressed):
+    """With cleanup_progress on, temp status bubbles are deleted after the final reply; the
+    attended switch cards must survive, so they ride the platform-notice path, untracked."""
+    from gateway import run
+
+    sent = []
+
+    class Adapter:
+        config = SimpleNamespace(extra={})
+
+        async def send(self, chat_id, content, **kwargs):
+            sent.append((chat_id, content))
+            return SimpleNamespace(success=True, message_id=str(len(sent)))
+
+    adapter = Adapter()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", user_id="u", thread_id="7")
+    gateway = object.__new__(run.GatewayRunner)
+    gateway.config = None
+    gateway._delivery_adapter_for = lambda _source: adapter
+    gateway._thread_metadata_for_source = lambda s: {"thread_id": s.thread_id}
+    ctx = TurnContext(
+        source=source, _run_still_current=lambda: True, _cleanup_progress=True,
+        _status_adapter=adapter, _status_chat_id="chat",
+        user_config={"display": {"suppress_warning_notifications": suppressed}},
+    )
+    turn = TurnRunner(gateway, ctx)
+    monkeypatch.setattr(run, "safe_schedule_threadsafe", lambda coro, *a, **k: asyncio.run(coro))
+
+    turn._emit_persistent_attended_notice("⇄ Back to GPT-6.1 Sol after 15m idle.")
+
+    assert sent == ([] if suppressed else [("chat", "⇄ Back to GPT-6.1 Sol after 15m idle.")])
+    assert ctx._cleanup_msg_ids == []
+
+
+def test_idle_switch_back_decision_log_carries_destination_effort(caplog):
+    from gateway.run_turn import GatewayTurnMixin
+
+    runner = GatewayTurnMixin.__new__(GatewayTurnMixin)
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        runner._log_attended_decision("session-1", None, action="switch", reason="idle", effort="xhigh")
+
+    assert "action=switch reason=idle effort=xhigh" in caplog.text
+
+
+@pytest.mark.parametrize("config,label", [
+    ({"enabled": True, "effort": "xhigh"}, "xhigh"),
+    ({"enabled": False}, "none"),
+    (None, "none"),
+])
+def test_effort_log_label(config, label):
+    from agent.reasoning_effort import effort_log_label
+
+    assert effort_log_label(config) == label

@@ -80,3 +80,13 @@ def test_long_decode_context_buckets_use_the_first_hop(tmp_path, monkeypatch, ca
         a.close()
     assert " in=32968 " in line  # the log line keeps the billed sum
     assert (seen["prompt_tokens"], seen["input_tokens"], seen["cache_read_tokens"]) == (100, 60, 40)
+
+
+def test_trailing_effort_keeps_the_forensics_parser_matching(tmp_path):
+    from evals.postmortem.forensics.logcalls import parse_logs
+    log = tmp_path / "agent.log"
+    log.write_text(
+        "2026-10-19 10:00:00,000 INFO [s1] agent.conversation_loop: API call #1: model=gpt-6.1-sol provider=nous "
+        "in=100 out=7 total=107 latency=0.2s cache=40/100 (40%) upstream=Anthropic effort=xhigh\n", encoding="utf-8")
+    calls = parse_logs([str(log)], {"s1"})
+    assert len(calls) == 1 and calls[0]["upstream"] == "Anthropic"
