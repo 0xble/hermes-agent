@@ -21,6 +21,57 @@ from gateway.session import SessionSource
 _ATTACHMENT_REF_RE = re.compile(r"^(?:@(?:image|file|url):[^\n]+\n?)+", re.IGNORECASE)
 
 GOAL_CONTINUATION_METADATA_KEY = "goal_continuation"
+TURN_ORIGINS = frozenset({"user", "relay", "process", "goal_loop", "cron", "unknown"})
+
+
+def _event_chain(event: Any) -> list[Any]:
+    """Return an event and any events merged into its turn, newest event first."""
+    if event is None:
+        return []
+    return [event, *getattr(event, "_hermes_absorbed_events", ())]
+
+
+def _is_human_event(event: Any) -> bool:
+    """Recognize positively identified human ingress, default-deny."""
+    if event is None or getattr(event, "internal", False):
+        return False
+    source = getattr(event, "source", None)
+    if source is None:
+        return False
+    if getattr(source, "delivered_via_upstream_relay", False):
+        return False
+    if getattr(source, "is_bot", False):
+        return False
+    if not getattr(event, "allow_gateway_control", True):
+        return False
+    if getattr(event, "_heartbeat_session_id", None):
+        return False
+    return not is_goal_continuation_event(event)
+
+
+def turn_origin_for_event(event: Any) -> str:
+    """Classify a gateway turn, preserving human input when events are merged."""
+    events = _event_chain(event)
+    if any(_is_human_event(candidate) for candidate in events):
+        return "user"
+    if any(getattr(getattr(candidate, "source", None), "delivered_via_upstream_relay", False)
+           or (getattr(candidate, "metadata", None) or {}).get("notification_origin") == "relay_delivery"
+           for candidate in events):
+        return "relay"
+    if any(is_goal_continuation_event(candidate)
+           or bool((getattr(candidate, "metadata", None) or {}).get("loop_wakeup"))
+           or bool(getattr(candidate, "_heartbeat_session_id", None))
+           for candidate in events):
+        return "goal_loop"
+    if any((getattr(candidate, "metadata", None) or {}).get("notification_origin") == "cron_delivery"
+           or bool((getattr(candidate, "metadata", None) or {}).get("cron_delivery"))
+           for candidate in events):
+        return "cron"
+    if any((getattr(candidate, "metadata", None) or {}).get("notification_origin") in {
+        "process_registry_synthetic", "delegation_result",
+    } for candidate in events):
+        return "process"
+    return "unknown"
 
 
 def is_goal_continuation_event(event_or_text: Any) -> bool:

@@ -107,6 +107,8 @@ class TurnContext:
     event_metadata: dict = field(default_factory=dict)
     # Whether the source event was synthetic/internal; preserved for event-less requeues.
     internal: bool = False
+    # Stable provenance used by plugins and subprocesses. Unknown is default-deny.
+    turn_origin: str = "unknown"
     # display_kind of the persisted user row for a self-injected turn; DB-only, never sent.
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None
