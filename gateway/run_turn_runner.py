@@ -2050,8 +2050,10 @@ class TurnRunner:
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
-            kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id,
-                      "turn_origin": ctx.turn_origin}
+            # Turn provenance is already task-local in HERMES_TURN_ORIGIN. Do not add it to
+            # run_conversation's call shape, because gateway test doubles and provider adapters
+            # intentionally implement the older stable signature.
+            kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
             if _accepts_keyword(agent.run_conversation, "turn_author"):
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
                 kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,

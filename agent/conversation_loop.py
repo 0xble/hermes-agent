@@ -1796,6 +1796,11 @@ def run_conversation(
     from agent.voice_turn_route import end_voice_turn_route
     from tools.vision_tools_history_budget import native_turn_images
 
+    if turn_origin == "unknown":
+        # Gateway and cron bind provenance in task-local session context rather than widening the
+        # run_conversation call shape, which test doubles and provider adapters also implement.
+        from gateway.session_context import get_session_env
+        turn_origin = get_session_env("HERMES_TURN_ORIGIN", "unknown") or "unknown"
     if turn_origin not in {"user", "relay", "process", "goal_loop", "cron", "unknown"}:
         turn_origin = "unknown"
 
