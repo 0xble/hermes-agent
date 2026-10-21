@@ -1039,9 +1039,10 @@ class TestPrefetchServerRetainVisibility:
 
 
 class TestPrefetchSupersession:
-    def test_superseded_slow_worker_cannot_overwrite_newer_result(self, provider):
-        """A worker that outlives prefetch()'s capped join must not publish over a newer
-        request's completed recall in the same session."""
+    def test_query_queued_during_slow_recall_wins_over_it(self, provider):
+        """Prefetches are coalesced: a query queued while an older recall is still in flight
+        takes the single pending slot and runs after it on the same worker, so the slow older
+        recall must not publish over (or survive alongside) the newer query's result."""
         release_old = threading.Event()
         old_started = threading.Event()
 
@@ -1059,6 +1060,7 @@ class TestPrefetchSupersession:
         old_worker = provider._prefetch_thread
         assert old_started.wait(5.0)
         provider.queue_prefetch("new")
+        release_old.set()
         provider._prefetch_thread.join(timeout=5.0)
         assert "new memory" in provider._prefetch_result
 
@@ -1067,6 +1069,34 @@ class TestPrefetchSupersession:
         assert not old_worker.is_alive()
         assert "new memory" in provider._prefetch_result
         assert "old memory" not in provider._prefetch_result
+
+    def test_query_superseded_during_retain_drain_never_recalls(self, provider):
+        """A query superseded while its worker waits for retains to drain is skipped, so the
+        newest query's recall starts right after the wait instead of behind a stale recall."""
+        in_drain, release_drain = threading.Event(), threading.Event()
+
+        def _drain(_timeout):
+            in_drain.set()
+            assert release_drain.wait(5.0)
+            return True
+
+        recalled: list = []
+
+        async def _recall(**kwargs):
+            recalled.append(kwargs.get("query"))
+            return SimpleNamespace(results=[SimpleNamespace(text=f"{kwargs.get('query')} memory")])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall)
+        provider._prefetch_waits_for_retain = True
+        provider._wait_for_retains_drained = _drain
+        provider.queue_prefetch("old")
+        assert in_drain.wait(5.0)
+        provider.queue_prefetch("new")
+        release_drain.set()
+        provider._prefetch_thread.join(timeout=5.0)
+        assert not provider._prefetch_thread.is_alive()
+        assert recalled == ["new"]
+        assert "new memory" in provider._prefetch_result
 
     def test_empty_newer_recall_does_not_inject_older_query_memories(self, provider):
         """An older worker's result buffered after prefetch()'s capped join must not survive a

@@ -332,8 +332,6 @@ class TestAgentCacheBoundedGrowth:
 
         commit_calls: list = []
         release_calls: list = []
-        runner._release_evicted_agent_soft = lambda agent: release_calls.append(agent)
-
         runner.session_store = MagicMock()
         runner.session_store._entries = {"old": MagicMock(), "new": MagicMock()}
 
@@ -341,6 +339,9 @@ class TestAgentCacheBoundedGrowth:
         old_agent._memory_manager = MagicMock()  # has an external provider
         old_agent._session_messages = [{"role": "user", "content": "hi"}]
         old_agent.commit_memory_session = lambda msgs=None: commit_calls.append(msgs)
+        # Commit now runs inside the soft release's handoff-lock section, so observe the client release
+        # rather than stubbing out the whole soft release.
+        old_agent.release_clients = lambda: release_calls.append(old_agent)
         new_agent = self._fake_agent()
 
         with runner._agent_cache_lock:

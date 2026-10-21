@@ -423,6 +423,27 @@ def build_memory_context_block(raw_context: str) -> str:
     )
 
 
+_MEMORY_HANDOFF_GUARD = threading.Lock()
+
+
+def memory_handoff_lock(owner: Any) -> threading.Lock:
+    """Per-agent lock making "claim ``_memory_manager`` for shutdown" one atomic step.
+
+    ``AIAgent.shutdown_memory_provider()`` sets ``_memory_provider_shutdown`` and captures the manager under it;
+    gateway eviction reads both and detaches the manager under it, so exactly one side calls ``shutdown_all()``.
+    Created lazily (under a module guard) so ``__new__``-built and mock agents get one too. Hold it only for
+    those reads and writes, never across ``shutdown_all``. The one exception is eviction's pre-release session
+    commit, which holds it across ``on_session_end`` so /new or /reset cannot claim shutdown mid-commit."""
+    lock = vars(owner).get("_memory_handoff_lock")
+    if lock is None:
+        with _MEMORY_HANDOFF_GUARD:
+            lock = vars(owner).get("_memory_handoff_lock")
+            if lock is None:
+                lock = threading.Lock()
+                owner._memory_handoff_lock = lock
+    return lock
+
+
 class MemoryManager:
     """Builtin provider (always first) plus at most one external provider.
 
@@ -467,6 +488,7 @@ class MemoryManager:
         # within a bound, then report exactly what it abandoned.
         self._background_futures: dict[Future, str] = {}
         self._shutting_down = False
+        self._shutdown_started = False  # shutdown_all() ran (or is running); guards a second retirement
         self._shutdown_drain_state: dict[str, Any] = {
             "status": "not_started", "abandoned_writes": 0, "abandoned_prefetches": 0, "active_tasks": 0,
         }
@@ -1057,7 +1079,13 @@ class MemoryManager:
         )
 
     def shutdown_all(self) -> None:
-        """Drain the background executor (bounded), then shut providers down in reverse order."""
+        """Drain the background executor (bounded), then shut providers down in reverse order.
+
+        Idempotent: only the first call retires providers; later calls (racing teardown paths) return at once."""
+        with self._sync_executor_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
         self._drain_sync_executor()
         self._each_provider("shutdown failed", lambda p: p.shutdown(), level=logging.WARNING,
                             providers=self._providers[::-1])
