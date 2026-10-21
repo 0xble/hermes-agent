@@ -185,6 +185,10 @@ class TestAsyncIsSafeUrl:
 
 
 class TestSSRFGuardedHttpxClient:
+    def test_connect_blocks_literal_benchmark_host(self):
+        with pytest.raises(SSRFConnectionBlocked, match="benchmark address"):
+            _resolved_http_connect_ips("198.18.0.23", 443, "https")
+
     def test_connect_resolution_checks_private_ip_beyond_candidate_cap(self):
         answers = [
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"93.184.216.{idx}", 80))

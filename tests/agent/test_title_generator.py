@@ -541,6 +541,11 @@ class TestMaybeAutoTitle:
                 icon_context=None,
             )
 
+    def test_link_deferral_does_not_fetch_on_turn_start(self):
+        from agent.title_generator import opener_needs_reply
+        with patch("agent.title_generator._title_link_context", side_effect=AssertionError("network on turn start")):
+            assert opener_needs_reply("https://example.com/article") is True
+
     @pytest.mark.parametrize(
         "main_runtime, title_cfg, deferred",
         [
@@ -1102,6 +1107,13 @@ class TestForkTitleContracts:
             response.choices[0].message.content = content; response.choices[0].finish_reason = reason
             with patch("agent.title_generator.call_llm", return_value=response):
                 assert generate_title("real user request") is None
+
+    def test_icon_payload_abstain_is_respected(self):
+        response = MagicMock(); response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Unspecified Subject", "abstain": true, "icons": []}'
+        with patch("agent.title_generator.call_llm", return_value=response), \
+             patch("agent.title_generator._title_link_context", return_value=None):
+            assert generate_title("look at this", icon_options=["🧪"], icon_callback=lambda *_: None) is None
 
     def test_icon_request_precedes_examples_and_title_contract_closes_the_prompt(self):
         """The icon block rides inside the rules so the title examples and reply contract stay last;

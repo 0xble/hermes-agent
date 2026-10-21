@@ -435,6 +435,11 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str, allow_private:
     if allow_private is None:
         allow_private = _global_allow_private_urls()
     allow_private = allow_private or _allows_private_ip_resolution(hostname, scheme)
+    # Same rule as ``is_safe_url``: a benchmark address written as the host is not a proxy DNS
+    # answer. Enforced here too, since redirects and direct guarded clients never re-run it.
+    literal = _parse_ip(hostname)
+    if literal is not None and _is_benchmark_fake_ip(_embedded_ipv4(literal)) and not allow_private:
+        raise SSRFConnectionBlocked(f"Blocked request to benchmark address used as a URL host: {hostname}")
     try:
         addr_info = _getaddrinfo(hostname, port)
     except socket.gaierror as exc:

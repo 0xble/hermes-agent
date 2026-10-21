@@ -837,6 +837,8 @@ def generate_title(
                 fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
                 payload = json.loads(fence.group(1) if fence else candidate)
 
+        if icon_allowed and isinstance(payload, dict) and payload.get("abstain") is True:
+            return None
         title_value = payload.get("title") if isinstance(payload, dict) else None
         title = _clean_title(_extract_title_text(title_value or raw_content) or _title_from_reasoning(choice.message))
         if icon_allowed and icon_callback is not None:
@@ -1057,10 +1059,10 @@ def auto_title_session(
             link_context=link_context, reply_excerpt=reply_excerpt, **icon_kwargs,
         )
         source = "llm"
-        # Can't-tell and junk are not names. Leave the placeholder and let the next turn's reply try,
-        # through turn 3. After that the best concrete title wins, even if it is generic.
+        # Can't-tell and junk are not names. Leave the placeholder and let the next turn's reply try.
+        # Turn 3 is the last attempt ``maybe_auto_title`` allows, so there the best concrete title wins.
         if _hold_until_reply_enabled() and (not title or is_junk_title(title)):
-            if _real_user_turns(conversation_history) <= 3:
+            if _real_user_turns(conversation_history) < 3:
                 logger.debug("Auto-title held: opener does not name a subject yet")
                 return
             title = title or derive_title(user_message, title_preview)
@@ -1146,7 +1148,9 @@ def opener_needs_reply(user_message: str, title_preview: str | None = None) -> b
         return True
     from agent.title_link_context import first_link
     if first_link(text):
-        return _title_link_context(user_message, title_preview) is None
+        # Link metadata is fetched by the background upgrade. Never put that network request on
+        # the turn-start path just to decide whether the upgrade should wait for the reply.
+        return True
     return _attachment_only_opener(text)
 
 
