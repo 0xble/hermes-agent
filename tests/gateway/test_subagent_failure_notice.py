@@ -88,7 +88,7 @@ class TestFormatSubagentFailureLine:
         assert SUBAGENT_FAILURE_STATUSES == {"failed", "error", "timeout"}
 
 
-def _make_runner_and_captured(monkeypatch, run_still_current=True):
+def _make_runner_and_captured(monkeypatch, run_still_current=True, *, platform="telegram", user_config=None):
     """TurnRunner with a stub gateway runner; captures scheduled notices."""
     from gateway import run as run_mod
 
@@ -106,8 +106,11 @@ def _make_runner_and_captured(monkeypatch, run_still_current=True):
 
     monkeypatch.setattr(run_mod, "safe_schedule_threadsafe", _fake_schedule)
 
+    source = MagicMock()
+    source.platform = platform
     ctx = TurnContext(
-        source=MagicMock(),
+        source=source,
+        user_config=user_config,
         _run_still_current=lambda: run_still_current,
         progress_queue=None,
         _loop_for_step=None,
@@ -170,3 +173,26 @@ class TestGatewayFailureNotice:
             summary="the real error detail",
         )
         assert "the real error detail" in captured[0]
+
+    def test_suppressed_platform_does_not_deliver(self, monkeypatch):
+        runner, captured = _make_runner_and_captured(
+            monkeypatch,
+            platform="slack",
+            user_config={"display": {"platforms": {"slack": {"suppress_warning_notifications": True}}}},
+        )
+        runner.progress_callback(
+            "subagent.complete", preview="Error code: 404", status="failed", goal="scan the repo",
+        )
+        assert captured == []
+
+    def test_suppression_off_still_delivers(self, monkeypatch):
+        runner, captured = _make_runner_and_captured(
+            monkeypatch,
+            platform="slack",
+            user_config={"display": {"platforms": {"slack": {"suppress_warning_notifications": False}}}},
+        )
+        runner.progress_callback(
+            "subagent.complete", preview="Error code: 404", status="failed", goal="scan the repo",
+        )
+        assert len(captured) == 1
+        assert "404" in captured[0]

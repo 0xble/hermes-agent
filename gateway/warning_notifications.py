@@ -7,6 +7,18 @@ class DiagnosticText(str):
     """Producer-owned classification on the legacy two-argument status callback."""
 
 
+def render_notification(render, *, platform, diagnostic=True, user_config=None) -> bool:
+    """Invoke a synchronous UI renderer only when its classified content is visible.
+
+    Return whether the renderer ran, not whether a transport delivered anything.
+    Call only at a presentation sink, never around producer callbacks or persistence.
+    """
+    if diagnostic and not warning_notifications_enabled(platform, user_config):
+        return False
+    render()
+    return True
+
+
 def warning_notifications_enabled(platform, user_config=None) -> bool:
     """Return whether diagnostic notifications should reach the given platform."""
     if user_config is None:
