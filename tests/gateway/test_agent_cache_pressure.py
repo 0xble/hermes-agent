@@ -377,7 +377,7 @@ class TestConfiguredBoundsReachTheCache:
         runner._agent_cache = OrderedDict()
         runner._agent_cache_lock = threading.Lock()
         runner._running_agents = {}
-        runner._release_evicted_agent_soft = lambda agent, retired=None: None
+        runner._release_evicted_agent_soft = lambda agent, retired=None, commit_key=None: None
         runner._commit_then_release_soft = lambda agent, key, retired=None: None
 
         with runner._agent_cache_lock:
@@ -395,7 +395,7 @@ class TestConfiguredBoundsReachTheCache:
         runner._agent_cache = OrderedDict()
         runner._agent_cache_lock = threading.Lock()
         runner._running_agents = {}
-        runner._release_evicted_agent_soft = lambda agent, retired=None: None
+        runner._release_evicted_agent_soft = lambda agent, retired=None, commit_key=None: None
         runner.session_store = None
 
         stale = MagicMock()
