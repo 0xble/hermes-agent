@@ -1705,9 +1705,11 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
         _cfg_path = str(_get_hermes_home() / "config.yaml")
         if os.path.exists(_cfg_path):
             _cfg = load_user_config_effective(Path(_cfg_path))
+            from hermes_cli.model_presets import expand_model_presets
+            _runtime_cfg = expand_model_presets(_cfg)
             # Coerce null to {} so a falsy default never clobbers a resolved env value.
-            _model_cfg = _cfg.get("model") or {}
-            _cron_cfg_for_model = _cfg.get("cron") or {}
+            _model_cfg = _runtime_cfg.get("model") or {}
+            _cron_cfg_for_model = _runtime_cfg.get("cron") or {}
             _cron_default_model = ""
             if isinstance(_cron_cfg_for_model, dict):
                 _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()

@@ -4065,11 +4065,28 @@ def _replan_synchronous_cache_sections(
     )
 
 
+def _fallback_reasoning_config(
+    task: Optional[str], fb_label: str, reasoning_config: Optional[dict],
+    fallback_entry: Optional[dict[str, Any]] = None,
+) -> Optional[dict]:
+    """Apply a configured fallback route's reasoning effort to its wire request."""
+    fallback_entry = fallback_entry or _fallback_chain_entry(task, fb_label)
+    if not isinstance(fallback_entry, dict) or "reasoning_effort" not in fallback_entry:
+        return reasoning_config
+    effort = str(fallback_entry.get("reasoning_effort") or "").strip().lower()
+    if not effort:
+        return reasoning_config
+    result = dict(reasoning_config or {})
+    result["enabled"] = effort != "none"
+    result["effort"] = effort
+    return result
+
+
 def _fallback_request_kwargs(
     destination: _FallbackDestination, *, task: Optional[str], messages: list,
     tools: Optional[list], temperature: Optional[float], max_tokens: Optional[int],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
-    fallback_entry: dict, task_config: dict, apply_fast_lane: bool,
+    fallback_entry: dict, task_config: dict, apply_fast_lane: bool, fb_label: str = "",
 ) -> dict[str, Any]:
     """Build request kwargs for one fallback destination (cache-section replan + fast-lane cap)."""
     fallback_max_tokens, fallback_extra_body = max_tokens, effective_extra_body
@@ -4081,6 +4098,7 @@ def _fallback_request_kwargs(
             leak_guard_config=task_config, max_tokens=max_tokens, extra_body=effective_extra_body,
         )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(messages, tools, destination=destination)
+    reasoning_config = _fallback_reasoning_config(task, fb_label, reasoning_config, fallback_entry)
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
@@ -4109,9 +4127,19 @@ def _plan_fallback_candidate(
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
     task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
     fallback_entry = _fallback_chain_entry(task, fb_label) or {}
+    if not fallback_entry:
+        with contextlib.suppress(Exception):
+            from hermes_cli.config import load_config_readonly
+            from hermes_cli.fallback_config import get_fallback_chain
+            for candidate in get_fallback_chain(load_config_readonly()) or []:
+                if (str(candidate.get("model") or "") == str(fb_model or "")
+                        and str(candidate.get("provider") or "").strip().lower()
+                        == str(destination.provider or "").strip().lower()):
+                    fallback_entry = candidate
+                    break
     common = dict(
         task=task, effective_timeout=effective_timeout, fallback_entry=fallback_entry,
-        task_config=task_config, apply_fast_lane=apply_fast_lane, **request,
+        task_config=task_config, apply_fast_lane=apply_fast_lane, fb_label=fb_label, **request,
     )
 
     def _rebuild(provider: str, client: Any, model: Optional[str]) -> tuple[_FallbackDestination, dict[str, Any]]:

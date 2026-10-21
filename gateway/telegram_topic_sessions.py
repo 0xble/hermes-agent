@@ -133,6 +133,11 @@ def _reasoning_effort(config: Optional[dict]) -> Optional[str]:
 async def _resolve_model(runner, source: SessionSource, spec: TopicSpec, session_key: str = ""):
     if not (spec.model or spec.provider):
         return None
+    if spec.model.strip().startswith("@"):
+        # Named routes are persisted as roles, not expanded into a concrete session override.
+        from hermes_cli.model_preset_runtime import resolve_model_ref
+        resolve_model_ref(spec.model.strip(), runner._load_gateway_config())
+        return ("role", spec.model.strip()[1:].strip().lower())
     ctx, result, error = await runner.resolve_session_model_selection(
         source, spec.model, spec.provider, session_key=session_key)
     if error is not None:
@@ -184,15 +189,21 @@ async def _apply_session_settings(
     # the overrides set here; ``/model`` consumes the flag for the same reason (#48031).
     entry.was_auto_reset = False
     if model is not None:
-        ctx, result = model
-        error, model_status = await runner.commit_session_model_selection_with_status(
-            ctx, result, dest, announce=announce,
-        )
-        if error is not None:
-            raise TopicRequestError(error)
-        model_effective_when = "next_turn"
-        if getattr(result, "warning_message", ""):
-            warnings.append(result.warning_message)
+        if isinstance(model, tuple) and model and model[0] == "role":
+            role = model[1]
+            await runner._set_session_model_role(entry.session_key, role)
+            model_status = "applied"
+            model_effective_when = "next_turn"
+        else:
+            ctx, result = model
+            error, model_status = await runner.commit_session_model_selection_with_status(
+                ctx, result, dest, announce=announce,
+            )
+            if error is not None:
+                raise TopicRequestError(error)
+            model_effective_when = "next_turn"
+            if getattr(result, "warning_message", ""):
+                warnings.append(result.warning_message)
     if effort is not None or reasoning_reset:
         runner._session_state(entry.session_key)
         previous = runner._session_reasoning_override(entry.session_key)
@@ -386,11 +397,15 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
                 f"Topic {thread_id} and session {entry.session_id} are set up, but the opening brief "
                 f"was not delivered: {exc}. Send it with relay to {relay}.") from exc
     profile_home = None
-    effective_model = getattr(model[1], "new_model", None) if model else None
-    effective_provider = getattr(model[1], "target_provider", None) if model else None
-    if model:
-        profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
+    if model and isinstance(model, tuple) and model and model[0] == "role":
+        from hermes_cli.model_preset_runtime import resolve_model_ref
+        route = resolve_model_ref("@" + model[1], runner._load_gateway_config())
+        effective_model, effective_provider = route.model, route.provider
     else:
+        effective_model = getattr(model[1], "new_model", None) if model else None
+        effective_provider = getattr(model[1], "target_provider", None) if model else None
+        if model:
+            profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
         if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
                 and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
             profile_home = runner._resolve_profile_home_for_source(dest)
@@ -463,11 +478,15 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
         )
         warnings = settings["warnings"]
     profile_home = None
-    effective_model = getattr(model[1], "new_model", None) if model else None
-    effective_provider = getattr(model[1], "target_provider", None) if model else None
-    if model:
-        profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
+    if model and isinstance(model, tuple) and model and model[0] == "role":
+        from hermes_cli.model_preset_runtime import resolve_model_ref
+        route = resolve_model_ref("@" + model[1], runner._load_gateway_config())
+        effective_model, effective_provider = route.model, route.provider
     else:
+        effective_model = getattr(model[1], "new_model", None) if model else None
+        effective_provider = getattr(model[1], "target_provider", None) if model else None
+        if model:
+            profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
         if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
                 and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
             profile_home = runner._resolve_profile_home_for_source(dest)

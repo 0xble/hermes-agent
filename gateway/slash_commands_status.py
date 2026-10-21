@@ -287,6 +287,13 @@ class GatewayStatusCommandsMixin:
             lines.append(t("gateway.status.model_provider", model=fields["model"], provider=fields["provider"]))
         elif fields["model"]:
             lines.append(t("gateway.status.model", model=fields["model"]))
+        model_role = getattr(session_entry, "model_role", None)
+        if not model_role:
+            store = getattr(self, "session_store", None)
+            if store is not None:
+                model_role = store.get_model_role(session_key)
+        if model_role:
+            lines.append(f"Model role: @{model_role}")
         from agent.context_breakdown import context_display_source
         mark = "~" if context_display_source(getattr(status_agent, "context_compressor", None)) != "provider_usage" else ""
         if context_total:

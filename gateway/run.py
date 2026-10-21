@@ -2429,12 +2429,13 @@ def _resolve_gateway_model_context(
     def _read_config() -> None:
         nonlocal config_context_length, provider, base_url, custom_providers
         nonlocal configured_model, configured_provider, configured_base_url
-        data = _load_gateway_config()
+        data = _load_gateway_runtime_config()
         if not data:
             return
         model_cfg = data.get("model", {})
         if isinstance(model_cfg, dict):
-            configured_model = model_cfg.get("default") or model_cfg.get("model")
+            configured_model = (model_cfg.get("default") or model_cfg.get("model")
+                                or model_cfg.get("model_preset"))
             raw_ctx = model_cfg.get("context_length")
             if raw_ctx is not None:
                 with suppress(TypeError, ValueError):
@@ -2467,15 +2468,27 @@ def _resolve_gateway_model_context(
     def _pin_still_applies() -> bool:
         # Drop a configured context_length pin when the effective route no longer matches (or on error).
         from hermes_cli.route_identity import should_clear_context_pin
+        from hermes_cli.providers import normalize_provider
+        configured_route_provider = normalize_provider(configured_provider or "")
+        active_route_provider = normalize_provider(provider or "")
+        if str(configured_provider or "").lower().startswith("custom:"):
+            configured_route_provider = "custom"
+        if not configured_base_url:
+            return (not configured_model or configured_model == str(resolved_model or "").strip()) and (
+                not configured_provider or configured_route_provider == active_route_provider)
         return not should_clear_context_pin(
-            configured_model, resolved_model, configured_base_url, base_url, configured_provider, provider)
+            configured_model, resolved_model, configured_base_url, base_url,
+            configured_route_provider, active_route_provider)
 
     def _custom_ctx() -> Optional[int]:
         from hermes_cli.config import get_custom_provider_context_length
         return get_custom_provider_context_length(
             model=resolved_model, base_url=base_url, custom_providers=custom_providers)
 
-    _best_effort(_read_config)
+    if model is not None:
+        _read_config()
+    else:
+        _best_effort(_read_config)
     _best_effort(_read_runtime)
     if config_context_length is not None and not _best_effort(_pin_still_applies):
         config_context_length = None
@@ -2958,15 +2971,35 @@ def _checkpoint_agent_kwargs(config: dict | None) -> dict:
         "checkpoint_max_file_size_mb": cp_cfg.get("max_file_size_mb", defaults["max_file_size_mb"])}
 
 
+def _load_gateway_runtime_config(config: dict | None = None) -> dict:
+    """Load a raw gateway config and expand model presets at the runtime boundary."""
+    cfg = _load_gateway_config() if config is None else config
+    if (not isinstance(cfg, dict) or not cfg) and config is None:
+        config_path = _gateway_config_home() / "config.yaml"
+        if config_path.is_file():
+            from hermes_cli.config_effective import load_user_config_effective
+            cfg = load_user_config_effective(config_path, fail_closed=True)
+    if not isinstance(cfg, dict) or not cfg:
+        return {}
+    from hermes_cli.config import _expand_env_vars
+    from hermes_cli.model_presets import expand_model_presets
+    expanded = _expand_env_vars(cfg)
+    return expand_model_presets(expanded) if isinstance(expanded, dict) else {}
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml (single source of truth), else temporary AIAgents (e.g. /compress)
     use the hardcoded default, which fails under openai-codex."""
-    cfg = config if config is not None else _load_gateway_config()
+    cfg = _load_gateway_runtime_config(config)
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
         return model_cfg
     elif isinstance(model_cfg, dict):
-        return model_cfg.get("default") or model_cfg.get("model") or ""
+        raw = model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("model_preset") or ""
+        if isinstance(raw, dict) or (isinstance(raw, str) and raw.startswith("@")):
+            from hermes_cli.model_preset_runtime import resolve_model_ref
+            return resolve_model_ref(raw, cfg).model
+        return raw
     return ""
 
 
@@ -3549,6 +3582,7 @@ class GatewayRunner(
         self._init_lifecycle_state()
         self._init_runtime_caches()
         self._init_session_db()
+        self._VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
         self._init_registries_and_clocks()
 
     def _init_runtime_settings(self) -> None:

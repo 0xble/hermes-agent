@@ -21,7 +21,39 @@ This page covers configuring both from the dashboard. If you prefer config files
 On a brand-new install the bundled default config has `model: ""` (an empty string sentinel meaning "not configured yet"). The first time you run `hermes setup` or `hermes model`, that key is upgraded in-place to a mapping with `provider`, `default`, `base_url`, and `api_mode` sub-keys — the shape shown throughout this page and in [`profiles.md`](./profiles.md) / [`configuration.md`](./configuration.md). If you ever see an empty string in `config.yaml`, run `hermes model` (or click **Change** in the dashboard) and Hermes will write the dict form for you.
 :::
 
-## The Models page
+## Reusing a named route
+
+Use `model_presets` to name a provider/model route and refer to it with the canonical
+`model_preset: NAME` form or the `@NAME` shorthand. Presets are resolved when a new request,
+cron job, auxiliary task, or delegated child is created, so editing a preset affects future calls.
+Already-running or resumed children keep the route snapshot from launch.
+
+```yaml
+model_presets:
+  attended-fast:
+    provider: openrouter
+    model: google/gemini-3-flash-preview
+    reasoning_effort: medium
+  coding:
+    provider: openrouter
+    model: anthropic/claude-sonnet-4.6
+    fallbacks:
+      - provider: openai
+        model: gpt-5.4
+
+model:
+  model_preset: coding
+# Equivalent shorthand in supported model slots: model: "@coding"
+delegation:
+  model_preset: coding
+```
+
+Named roles can also be applied to a live session with `/model @coding`. The session stores the
+name rather than the concrete model, and `/model @attended` follows the live `model.attended` route.
+`/model reset` and a new session clear the role. Presets must define `provider` and `model`; unknown
+names, cycles, and conflicting inline route fields are rejected.
+
+
 
 Open the dashboard and click **Models** in the sidebar. You get two sections:
 

@@ -165,6 +165,18 @@ class GatewayConfigLoadersMixin:
         if config is None:
             config = (_load_gateway_config() if profile_home is None
                       else _load_gateway_config(profile_home / "config.yaml"))
+        from hermes_cli.model_preset_runtime import resolve_model_ref
+        if isinstance(config, dict):
+            model_cfg = config.get("model") if isinstance(config.get("model"), dict) else {}
+            raw_default = ("@" + str(model_cfg["model_preset"])
+                          if model_cfg.get("model_preset")
+                          else model_cfg.get("default") or model_cfg.get("model"))
+            try:
+                route = resolve_model_ref(raw_default, config)
+                if model and model in {raw_default, route.model} and route.reasoning_effort:
+                    return {"enabled": route.reasoning_effort != "none", "effort": route.reasoning_effort}
+            except Exception:
+                pass
         return resolve_reasoning_config(config, model)
 
     @staticmethod
@@ -665,11 +677,13 @@ class GatewayConfigLoadersMixin:
     @staticmethod
     def _load_fallback_model() -> list | None:
         """Fallback chain: ``fallback_providers`` (kept first) merged with legacy ``fallback_model``."""
-        from gateway.run import _load_gateway_config
+        from gateway.run import _load_gateway_runtime_config
         try:
-            # Canonical gateway loader (fail-open): managed overlay + ${VAR} expansion apply here too.
-            return get_fallback_chain(_load_gateway_config()) or None
-        except Exception:
+            return get_fallback_chain(_load_gateway_runtime_config()) or None
+        except Exception as exc:
+            from hermes_cli.model_presets import ModelPresetError
+            if isinstance(exc, ModelPresetError):
+                raise
             return None
 
     def _refresh_fallback_model(self) -> list | None:
@@ -708,6 +722,8 @@ class GatewayConfigLoadersMixin:
             logger.debug("fallback_providers refresh: config.yaml read failed; keeping last known-good chain", exc_info=True)
             self._fallback_model = by_home.get(home_key, self._fallback_model)
             return self._fallback_model
+        from hermes_cli.model_presets import expand_model_presets
+        cfg = expand_model_presets(cfg)
         by_home[home_key] = self._fallback_model = get_fallback_chain(cfg) or None
         return self._fallback_model
 

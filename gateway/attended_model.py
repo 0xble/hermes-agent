@@ -142,6 +142,7 @@ class AttendedResolution:
     idle_model: str = ""  # route used once the attended window lapses; display only
     new_session: bool = False  # fresh sessions may start attended without a switch-in card
     switched_back: bool = False  # this resolution crossed from attended to the idle route
+    role: Optional[str] = None
 
     @property
     def decision_key(self) -> tuple[str, str, str, str, bool]:
@@ -203,6 +204,18 @@ def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
     model = str(attended_raw.get("model") or "").strip()
     provider = str(attended_raw.get("provider") or "").strip()
     effort = str(attended_raw.get("reasoning_effort") or "").strip().lower()
+    # The attended route is live too. Resolve @attended/model_preset at request time
+    # from the raw config rather than freezing a concrete model in SessionStore.
+    if model.startswith("@") or attended_raw.get("model_preset"):
+        try:
+            from hermes_cli.model_preset_runtime import resolve_model_ref
+            route = resolve_model_ref(model or {"model_preset": attended_raw.get("model_preset")}, config or {})
+            model = route.model
+            provider = provider or route.provider
+            effort = effort or route.reasoning_effort
+        except Exception as exc:
+            logger.warning("Invalid attended model reference: %s", exc)
+            model = ""
     if effort and effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
         logger.warning("model.attended.reasoning_effort=%r is invalid; ignoring it", effort)
         effort = ""
@@ -286,6 +299,17 @@ def resolve_attended_model(
     default_reasoning = _effort_label(get("default_reasoning"))
     now_value = time.time() if now is None else float(now)
     new_session = bool(get("new_session", False)) and cfg.start_new_sessions
+    model_role = str(get("model_role", "") or "").strip()
+    role_route = None
+    if model_role:
+        from hermes_cli.model_preset_runtime import resolve_model_ref
+        try:
+            role_route = resolve_model_ref("@" + model_role, config=config or {})
+            if not role_route.model:
+                raise ValueError("role has no configured model")
+        except (ValueError, TypeError) as exc:
+            logger.warning("model_role @%s fallback=default: %s", model_role, exc)
+            model_role = ""
     active = cfg.enabled and (new_session or is_active(
         get("last_user_activity_at"), now=now_value, idle_revert_minutes=cfg.idle_revert_minutes
     ))
@@ -312,6 +336,14 @@ def resolve_attended_model(
         return AttendedResolution(
             str(explicit_model), str(explicit_provider or baseline_provider),
             str(explicit_reasoning or explicit_model_reasoning), "explicit", active,
+        )
+
+    if role_route is not None:
+        return AttendedResolution(
+            role_route.model, role_route.provider or baseline_provider,
+            _effort_label(role_route.reasoning_effort or explicit_reasoning or default_reasoning),
+            "role", True, idle_model=channel_model or default_model,
+            new_session=new_session, role=model_role,
         )
 
     if active:

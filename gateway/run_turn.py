@@ -300,10 +300,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             return None
         from gateway.run import _get_channel_override, _resolve_gateway_model
         cfg = parse_attended_config(user_config or {})
-        if not cfg.enabled:
-            return None
         state = self._session_state(session_key)
         conversation = state.conversation
+        model_role = getattr(conversation, "model_role", None)
+        if not model_role:
+            with suppress(Exception):
+                model_role = self.session_store.get_model_role(session_key)
+                conversation.model_role = model_role
+        if not cfg.enabled and not model_role:
+            return None
         new_session_pending = bool(new_session or getattr(conversation, "attended_new_session", False))
         new_session = new_session_pending and cfg.start_new_sessions
         stamp = conversation.last_user_activity_at
@@ -371,6 +376,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 "channel_provider": channel_provider,
                 "last_user_activity_at": stamp,
                 "new_session": new_session,
+                "model_role": model_role,
                 "default_reasoning": (default_reasoning or {}).get("effort", ""),
                 "explicit_model_reasoning": (default_reasoning or {}).get("effort", ""),
                 "attended_reasoning": (attended_reasoning or {}).get("effort", ""),
@@ -459,14 +465,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     ),
                 },
             )
-        if decision.reason != "attended":
+        if decision.reason not in {"attended", "role"}:
             return None
         route = {
             "active": True,
-            "model": cfg.model,
-            "provider": cfg.provider,
-            "reasoning_effort": cfg.reasoning_effort,
+            "model": decision.model,
+            "provider": decision.provider,
+            "reasoning_effort": decision.reasoning_effort,
             "decision_key": decision.decision_key,
+            "role": decision.role,
         }
         target_model = cfg.model or decision.model
         session_last_model = last_model or conversation.last_resolved_model or ""
