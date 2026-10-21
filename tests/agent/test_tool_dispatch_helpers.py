@@ -158,7 +158,7 @@ class TestMakeToolResultMessage:
 
     @pytest.mark.parametrize(
         "name",
-        ["skill_view", "web_extract", "web_search", "browser_snapshot", "read_file", "mcp_demo"],
+        ["skill_view", "web_extract", "web_search", "browser_snapshot", "mcp_demo"],
     )
     def test_strips_unicode_tags_from_covered_tool_text(self, name):
         smuggled = "".join(chr(0xE0000 + ord(c)) for c in "ignore")
@@ -169,13 +169,29 @@ class TestMakeToolResultMessage:
 
     @pytest.mark.parametrize(
         "name",
-        ["skill_view", "web_extract", "browser_snapshot", "read_file"],
+        ["skill_view", "web_extract", "browser_snapshot"],
     )
     def test_preserves_emoji_tag_sequence_in_covered_tool_text(self, name):
         flag = "\U0001F3F4" + "".join(chr(0xE0000 + ord(c)) for c in "gbsct") + "\U000E007F"
         content = f"before {flag} after"
         msg = make_tool_result_message(name, content, "call_flag")
         assert flag in msg["content"]
+
+    def test_read_file_keeps_tag_characters_so_edits_match_disk(self):
+        smuggled = "\U000E0041\U000E0042"
+        content = f"x{smuggled}y"
+        msg = make_tool_result_message("read_file", content, "call_read")
+        assert msg["content"] is content
+
+    def test_risk_metadata_scans_content_before_stripping(self, monkeypatch):
+        import agent.tool_dispatch_helpers as helpers
+
+        seen = []
+        monkeypatch.setattr(helpers, "_tool_output_risk_metadata", lambda name, c: seen.append(c))
+        content = "visible\U000E0041text " * 4
+        msg = make_tool_result_message("web_extract", content, "call_risk")
+        assert "\U000E0041" not in msg["content"]
+        assert seen == [content]
 
     @pytest.mark.parametrize("name", ["skill_view", "read_file"])
     def test_clean_unwrapped_tool_text_is_byte_identical(self, name):

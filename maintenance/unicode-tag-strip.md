@@ -7,12 +7,14 @@ This maintenance unit owns the fork patch identity `unicode-tag-strip`.
 ## Behavior
 
 Model-facing results from `skill_view`, `web_extract`, `web_search`, `browser_*`,
-`mcp_*`, and `read_file` have invisible Unicode TAG characters removed through
-the existing `strip_unicode_tags` helper. Valid emoji tag sequences survive.
-Clean text is returned unchanged, including object identity. `skill_view` and
-`read_file` are not added to the untrusted-wrapping set. File edits still match
-disk content, not the displayed `read_file` string, so stripping a result cannot
-change a later patch match.
+and `mcp_*` have invisible Unicode TAG characters removed through the existing
+`strip_unicode_tags` helper. Valid emoji tag sequences survive. Clean text is
+returned unchanged, including object identity. `skill_view` is not added to the
+untrusted-wrapping set.
+
+`read_file` is deliberately excluded. `patch` and `write_file` match against
+disk bytes, so a display that hides TAG characters still on disk makes an exact
+`old_string` miss, or lets a fuzzy fallback drop the characters silently.
 
 ## Source surfaces
 

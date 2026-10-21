@@ -445,8 +445,8 @@ def make_tool_result_message(
     """Build a tool-result message: OpenAI ``name`` (wire format) plus internal ``tool_name``
     (session DB). High-risk tool content (web_extract, web_search, browser_*, mcp_*) is
     wrapped in untrusted-data delimiters — the defense against indirect prompt injection.
-    Invisible Unicode TAG characters are stripped from that same set plus skill_view and
-    read_file before wrapping. Clean text is returned unchanged.
+    Invisible Unicode TAG characters are stripped from that same set plus skill_view
+    before wrapping. Clean text is returned unchanged.
     """
     # Replay-recovery callers bypass the executor's canonical-id helper, so normalize here too.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
@@ -492,10 +492,12 @@ def _is_untrusted_tool(name: Optional[str]) -> bool:
 def _should_strip_unicode_tags(name: Optional[str]) -> bool:
     """Model-facing results that can carry fetched or loaded third-party text.
 
-    Untrusted tools cover web, browser, and MCP output. skill_view and read_file
-    are stripped here too, but are not added to the untrusted-wrapping set.
+    Untrusted tools cover web, browser, and MCP output. skill_view is stripped
+    here too, but is not added to the untrusted-wrapping set. read_file is
+    excluded: its display must match disk bytes so patch and write_file can
+    target what the model saw.
     """
-    return _is_untrusted_tool(name) or name in {"skill_view", "read_file"}
+    return _is_untrusted_tool(name) or name == "skill_view"
 
 
 def _maybe_strip_unicode_tags(name: Optional[str], content: Any) -> Any:
