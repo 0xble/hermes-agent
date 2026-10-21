@@ -48,9 +48,19 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - `preserve_manual_topic_icons` relies on a Bot API `StatusUpdate` handler that observes
   `forum_topic_created`/`forum_topic_edited` service messages in private chats; a user-chosen
   icon recorded there is never replaced by an automatic rename.
+- A title the model cannot support does not lock. The schema includes `abstain`; a true
+  answer, or a deterministic junk title (`None`, `Investigation`, `Unspecified...`, a platform
+  label plus a raw ID such as `Slack Thread <id>` or `YouTube Video <id>`, or a title that is
+  mostly IDs), leaves the placeholder in place. The upgrade retries after turns 1, 2, and 3
+  with the opener plus a bounded excerpt of the latest assistant reply, then keeps the best
+  concrete title. A manual `/title` still wins, and a stored `llm` or `user` title is never
+  replaced. `auxiliary.title_generation.hold_until_reply: false` restores the previous
+  opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
-  multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. Upstream
-  #117296 defers the title until the turn settles whenever both share a self-hosted base URL,
+  multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. The opening
+  turn is the exception: `auxiliary.title_generation.hold_until_reply` (default true) waits
+  for that turn's reply before the first model title, so a can't-tell answer can use it.
+  Upstream #117296 defers the title until the turn settles whenever both share a self-hosted base URL,
   which delays a new topic's name and icon by the whole first turn on a routing proxy. The
   declaration is keyed by endpoint URL, never by route name, and an undeclared or `false`
   endpoint keeps the deferral. Equivalent host case/default-port spelling uses the
@@ -64,7 +74,7 @@ its optional icon, and the durable alias can be observed through one Telegram to
 
 - **Identity and status:** active fork adaptations `slice-15-title-config`,
   `slice-16-topic-icons`, `slice-17-topic-lineage`, `slice-9-telegram-topic-edit`,
-  `title-concurrent-endpoint`, and `telegram-topic-owner-routing`. The audit follow-up commit uses the owned identity
+  `title-concurrent-endpoint`, `title-hold-until-reply`, and `telegram-topic-owner-routing`. The audit follow-up commit uses the owned identity
   `slice-7-aux-title-routing` for endpoint normalization and conflicting capacity declarations.
 - **Source / fork refs:** baseline upstream release `v2026.9.14`, fork base
   `origin/main` `a0f8f3996dae`; source designs are NousResearch/hermes-agent PR

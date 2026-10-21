@@ -793,6 +793,9 @@ DEFAULT_CONFIG = {
             # Fetch the first link's page title/description (bounded, public addresses only) to inform
             # the model title. False = title from the typed text alone.
             "link_context": True,
+            # Hold a can't-tell or deterministic junk title until the turn reply supplies a subject.
+            # False restores the previous opening-message-only upgrade behavior.
+            "hold_until_reply": True,
             # Note: session_search no longer uses an auxiliary LLM (PR #27590 — single-shape tool returns DB
             # content directly). The old ``auxiliary.session_search.*`` block was removed here. Existing
             # values in user config.yaml files are harmless leftovers and ignored.

@@ -271,7 +271,7 @@ def _maybe_title_session_at_turn_start(
 
 
 def start_deferred_title_upgrade(agent: Any) -> None:
-    """Fire the title upgrade ``_maybe_title_session_at_turn_start`` held back; no-op when none."""
+    """Fire the title upgrade the turn start held back. The thread reads the reply itself. No-op when none."""
     upgrade = getattr(agent, "_deferred_title_upgrade", None)
     if upgrade is None:
         return
