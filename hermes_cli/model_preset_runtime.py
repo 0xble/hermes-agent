@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Mapping
 
 from hermes_cli.model_presets import ModelPresetError, ModelPresetRoute, preset_ref_name
@@ -86,3 +87,32 @@ def validate_model_refs(config: Mapping[str, Any] | None) -> list[str]:
             except ModelPresetError as exc:
                 errors.append(f"{path}: {exc}")
     return errors
+
+
+@dataclasses.dataclass(frozen=True)
+class DefaultRoute:
+    model: str = ""
+    provider: str = ""
+    reasoning_effort: str = ""
+    base_url: str = ""
+
+
+def resolve_default_route(config: Mapping[str, Any] | None) -> DefaultRoute:
+    """The concrete default route of a (possibly unexpanded) config.
+
+    Single reader for ``model`` as a string, ``@name``, ``{default|model: "@name"}``,
+    ``{model_preset: name}`` or plain concrete values, so no caller reads the raw
+    ``model.default`` and sees an empty or stale route when a preset owns it. Raises
+    ``ModelPresetError`` for an unknown or cyclic preset; fail-open callers catch it.
+    """
+    cfg = dict(config) if isinstance(config, Mapping) else {}
+    raw = cfg.get("model")
+    if not isinstance(raw, (str, Mapping)):
+        return DefaultRoute()
+    if isinstance(raw, str):
+        route = resolve_model_ref(raw, cfg)
+        return DefaultRoute(route.model, route.provider, route.reasoning_effort)
+    route = resolve_model_ref("@default", cfg)
+    return DefaultRoute(
+        route.model, route.provider, route.reasoning_effort, str(raw.get("base_url") or ""),
+    )

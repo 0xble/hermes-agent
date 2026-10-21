@@ -2351,13 +2351,14 @@ def _resolve_runtime_agent_kwargs() -> dict:
     An ``AuthError`` from the primary walks the configured fallback chain through the shared
     ``resolve_runtime_with_fallback`` (the gateway keeps no resolver loop of its own)."""
     from hermes_cli.runtime_provider import (
-        resolve_runtime_with_fallback, format_runtime_provider_error, _get_model_config)
+        resolve_runtime_with_fallback, format_runtime_provider_error)
 
     # Capture primary provider/model from config before the try block so we
     # can include it in the fallback notice if the primary fails (#74349).
-    _model_cfg = _get_model_config()
-    _primary_model = (_model_cfg.get("default") or "").strip()
-    _primary_provider = (_model_cfg.get("provider") or "").strip()
+    from hermes_cli.model_preset_runtime import resolve_default_route
+    _primary_route = resolve_default_route(_load_gateway_config())
+    _primary_model = _primary_route.model.strip()
+    _primary_provider = _primary_route.provider.strip()
 
     try:
         runtime, fallback_entry = resolve_runtime_with_fallback(_load_gateway_config())
@@ -2434,14 +2435,15 @@ def _resolve_gateway_model_context(
             return
         model_cfg = data.get("model", {})
         if isinstance(model_cfg, dict):
-            configured_model = (model_cfg.get("default") or model_cfg.get("model")
-                                or model_cfg.get("model_preset"))
-            raw_ctx = model_cfg.get("context_length")
-            if raw_ctx is not None:
+            _raw_ctx = model_cfg.get("context_length")
+            if _raw_ctx is not None:
                 with suppress(TypeError, ValueError):
-                    config_context_length = int(raw_ctx)
-            configured_provider = provider = model_cfg.get("provider") or None
-            configured_base_url = base_url = model_cfg.get("base_url") or None
+                    config_context_length = int(_raw_ctx)
+        from hermes_cli.model_preset_runtime import resolve_default_route
+        route = resolve_default_route(data)
+        configured_model = route.model or None
+        configured_provider = provider = route.provider or None
+        configured_base_url = base_url = route.base_url or None
         try:
             from hermes_cli.config import get_compatible_custom_providers
             custom_providers = get_compatible_custom_providers(data)
@@ -2995,21 +2997,8 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml (single source of truth), else temporary AIAgents (e.g. /compress)
     use the hardcoded default, which fails under openai-codex."""
     cfg = _load_gateway_runtime_config(config)
-    model_cfg = cfg.get("model", {})
-    if isinstance(model_cfg, str):
-        from hermes_cli.model_presets import preset_ref_name
-        if preset_ref_name(model_cfg):
-            from hermes_cli.model_preset_runtime import resolve_model_ref
-            return resolve_model_ref(model_cfg, cfg).model
-        return model_cfg
-    elif isinstance(model_cfg, dict):
-        raw = model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("model_preset") or ""
-        from hermes_cli.model_presets import preset_ref_name
-        if isinstance(raw, dict) or preset_ref_name(raw):
-            from hermes_cli.model_preset_runtime import resolve_model_ref
-            return resolve_model_ref(raw, cfg).model
-        return raw
-    return ""
+    from hermes_cli.model_preset_runtime import resolve_default_route
+    return resolve_default_route(cfg).model
 
 
 def _channel_override_lookup_keys(

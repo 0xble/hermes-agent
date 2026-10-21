@@ -141,12 +141,14 @@ def enrich_model_switch_warnings_for_gateway(
         try:
             cfg = load_gateway_config()
             model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            from hermes_cli.model_preset_runtime import resolve_default_route
+            route = resolve_default_route(cfg)
             if isinstance(model_cfg, dict) and model_cfg.get("context_length") is not None:
                 configured.update(
                     config_context_length=int(model_cfg["context_length"]),
-                    configured_model=model_cfg.get("default") or model_cfg.get("model"),
-                    configured_provider=model_cfg.get("provider"),
-                    configured_base_url=model_cfg.get("base_url"))
+                    configured_model=route.model,
+                    configured_provider=route.provider,
+                    configured_base_url=route.base_url)
         except Exception:
             pass
 

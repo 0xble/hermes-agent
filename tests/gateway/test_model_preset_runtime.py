@@ -189,3 +189,33 @@ def test_reasoning_config_propagates_invalid_preset_error():
     cfg = {"model": {"model_preset": "missing"}, "model_presets": {}}
     with pytest.raises(ModelPresetError):
         GatewayRunner._load_reasoning_config("", config=cfg)
+
+
+def test_resolve_default_route_accepts_all_authored_shapes():
+    from hermes_cli.model_preset_runtime import resolve_default_route
+
+    preset = {"provider": "custom:test", "model": "preset-model", "reasoning_effort": "high"}
+    for model in ("@primary", {"default": "@primary"}, {"model": "@primary"}, {"model_preset": "primary"}):
+        route = resolve_default_route({"model_presets": {"primary": preset}, "model": model})
+        assert (route.model, route.provider, route.reasoning_effort) == ("preset-model", "custom:test", "high")
+
+    concrete = resolve_default_route({"model": {"default": "concrete-model", "provider": "openrouter", "base_url": "https://example.invalid"}})
+    assert (concrete.model, concrete.provider, concrete.base_url) == (
+        "concrete-model", "openrouter", "https://example.invalid",
+    )
+
+
+def test_model_switch_context_uses_preset_default_route(tmp_path, monkeypatch):
+    from gateway.slash_commands_model import _ModelSwitchContext
+    from gateway import run as gateway_run
+
+    config = {
+        "model_presets": {"primary": {"provider": "custom:test", "model": "preset-model"}},
+        "model": {"model_preset": "primary"},
+    }
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda config_path=None: config)
+    ctx = _ModelSwitchContext("session", None, tmp_path / "config.yaml", False)
+    ctx.read_config()
+    assert (ctx.current_model, ctx.current_provider, ctx.route_provider) == (
+        "preset-model", "custom:test", "custom:test",
+    )

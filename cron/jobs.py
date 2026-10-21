@@ -1864,16 +1864,14 @@ def _main_model_pin() -> tuple[Optional[str], Optional[str]]:
 
     cfg_path = get_hermes_home() / "config.yaml"
     cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
-    model_cfg = cfg.get("model") or {}
-    model = model_cfg.get("default") or model_cfg.get("model") if isinstance(model_cfg, dict) else model_cfg
-    model = _normalize_job_optional_text(model)
-    if not model:
-        return None, None
-    provider = None
-    with contextlib.suppress(Exception):
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        provider = _normalize_job_optional_text(resolve_runtime_provider(requested=None).get("provider"))
-    return (provider.lower() if provider else None), model
+    from hermes_cli.model_preset_runtime import resolve_default_route
+    route = resolve_default_route(cfg)
+    provider = _normalize_job_optional_text(route.provider)
+    if not provider:
+        with contextlib.suppress(Exception):
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            provider = _normalize_job_optional_text(resolve_runtime_provider(requested=None).get("provider"))
+    return (provider.lower() if provider else None), route.model
 
 
 def _normalize_job_optional_text(
