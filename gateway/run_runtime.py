@@ -442,6 +442,10 @@ def publish_gateway_runtime_ready(runner):
 
 async def wait_gateway_runtime(runner):
     """A vanished interactive listener is fatal, not a healthy headless runtime."""
+    if getattr(runner, "session_api", None) is None:
+        # Minimal lifecycle runners (see initialize_gateway_runtime) serve no session API.
+        await runner.wait_for_shutdown()
+        return
     shutdown = asyncio.create_task(runner.wait_for_shutdown())
     listener = runner.session_api.task
     try:

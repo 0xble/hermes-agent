@@ -592,28 +592,23 @@ def _start_gateway_install_signal_handlers(loop, shutdown_signal_handler, restar
 async def _start_gateway_run_runner(runner, _signal_initiated_shutdown: list) -> Optional[bool]:
     """MCP discovery, then ``runner.start()``. Returns the exit verdict when the process must end
     before running mode (start failed, clean exit, aborted startup); None to continue into cron."""
-    from gateway.run import (_discover_gateway_mcp_tools, _resolve_gateway_exit_verdict,
+    from gateway.run import (_resolve_gateway_exit_verdict, _settle_and_shutdown_mcp, _settle_mcp_discovery,
                              _shutdown_gateway_health_export as _facade_shutdown_gateway_health_export, _shutdown_mcp_servers_nonblocking)
-    # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
-    try:
-        # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
-        # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
-        # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
-        # Telegram polling) until it returned. See #16856.
-        await _discover_gateway_mcp_tools(runner.config)
-    except Exception:
-        logger.debug("MCP tool discovery failed (non-fatal)", exc_info=True)
-
+    # runner.start() launches MCP discovery in the background once adapters are connecting, so an
+    # unreachable MCP server cannot delay platform readiness. Every early exit settles it first.
     try:
         success = await runner.start()
     except BaseException:
+        await _settle_and_shutdown_mcp(runner)
         _facade_shutdown_gateway_health_export(runner)
         raise
     if not success:
+        await _settle_and_shutdown_mcp(runner)
         _facade_shutdown_gateway_health_export(runner)
         return False
 
     if runner.should_exit_cleanly:
+        await _settle_and_shutdown_mcp(runner)
         _facade_shutdown_gateway_health_export(runner)
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
@@ -625,6 +620,7 @@ async def _start_gateway_run_runner(runner, _signal_initiated_shutdown: list) ->
         # Startup aborted by restart/shutdown before running mode; preserve that path without starting cron.
         try:
             await runner.wait_for_shutdown()
+            await _settle_mcp_discovery(runner)
             try:
                 await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
             except Exception:
@@ -671,6 +667,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _start_gateway_configure_logging as _facade_configure_logging,
         _start_gateway_start_control_socket as _facade_start_control_socket,
         _start_gateway_start_cron_and_housekeeping as _facade_start_cron_and_housekeeping,
+        _start_gateway_shutdown_tail as _facade_shutdown_tail,
         _shutdown_gateway_health_export as _facade_shutdown_gateway_health_export,
         _settle_and_shutdown_mcp as _facade_settle_and_shutdown_mcp,
         _settle_mcp_discovery as _facade_settle_mcp_discovery,
@@ -685,6 +682,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     from hermes_cli.resource_limits import apply_nofile_soft_limit
     apply_nofile_soft_limit()
+
+    # Pin the launchd slot and active/standby role once, before any slot-scoped path is read.
+    from gateway.gateway_slot import pin_gateway_slot
+    pin_gateway_slot(config)
+    from gateway.zero_cut_standby import is_standby, mark_ready
 
     # Snapshot the revision while sys.modules matches disk so a later `git pull` is detected safely.
     from gateway.code_skew import record_boot_fingerprint
@@ -705,7 +707,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Multiplex-only: the ONE host gateway decides first. Attach to it, make it serve this profile,
     # replace it (--replace) or refuse — before anything below binds a port or claims a PID file.
-    _host_decision = await _host_attach_or_none(replace, force)
+    # A standby never consults or claims the host record: the active slot owns it.
+    _host_decision = None if is_standby() else await _host_attach_or_none(replace, force)
     if _host_decision is not None:
         return _host_decision
 
@@ -734,7 +737,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Only the authoritative gateway may rewrite a pending state.db compaction request.  Keep
     # this before constructing the runner, whose initialization opens the store.
     from gateway.run import _run_requested_state_db_compaction
-    _run_requested_state_db_compaction()
+    if not is_standby():
+        _run_requested_state_db_compaction()
 
     _control_server = None
     runner = None
@@ -743,7 +747,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _facade_configure_logging(verbosity)
 
         from gateway.run_startup import recover_left_core_at_gateway_start
-        await asyncio.to_thread(recover_left_core_at_gateway_start)  # before the runner loads platform config
+        if not is_standby():
+            await asyncio.to_thread(recover_left_core_at_gateway_start)  # before the runner loads platform config
 
         # Some runner doubles construct SessionDB in __init__. Guard registration belongs to the
         # running runner, not the bootstrap constructor, so do not let a prior test/runtime's guard
@@ -810,7 +815,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if _control_server is None and hasattr(runner, "session_runtime_descriptor"):
             raise RuntimeError("gateway session bootstrap control listener unavailable")
         # Now the attach channel answers: republish the host record with the settled served set.
-        _refresh_host_gateway_record(runner)
+        if not is_standby():
+            _refresh_host_gateway_record(runner)
         _log_standalone_profiles_at_boot(runner)
         from gateway.run_runtime import start_gateway_runtime_api
         await start_gateway_runtime_api(runner)
@@ -826,7 +832,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
             start_nous_auth_keepalive()
 
-        _unclean_exit = _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
+        # The lifecycle sentinel belongs to the authoritative gateway, never a standby.
+        _unclean_exit = (None if is_standby() else
+                         _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s"))
         _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
         _ensure_windows_gateway_venv_imports()
 
@@ -843,7 +851,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         from gateway.run_runtime import publish_gateway_runtime_ready, wait_gateway_runtime
         try:
             # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
-            publish_gateway_runtime_ready(runner)
+            if hasattr(runner, "session_runtime_descriptor"):
+                publish_gateway_runtime_ready(runner)
+            mark_ready()
             runner._start_systemd_watchdog()
             if idle_exit:
                 from gateway.run_idle_exit import arm_unmanaged_idle_exit
@@ -859,7 +869,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             try:
                 await runner.stop()
             finally:
-                verdict = await _start_gateway_shutdown_tail(
+                verdict = await _facade_shutdown_tail(
                     runner, _control_server, cron_stop, cron_provider, cron_thread, housekeeping_thread,
                     _planned_stop_watcher_stop, _planned_stop_watcher_thread, _signal_initiated_shutdown)
         return verdict
