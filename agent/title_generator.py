@@ -718,7 +718,9 @@ def is_junk_title(title: str) -> bool:
     if lowered in _JUNK_GENERIC_TITLES or lowered.startswith("unspecified"):
         return True
     without_ids = _JUNK_ID_RE.sub(" ", lowered)
-    words = re.findall(r"[a-z][a-z'-]*", without_ids)
+    # Keep Unicode letters and digits so a real non-Latin subject is not treated as an empty,
+    # unsupported title. ASCII platform/generic words still use the same allowlist below.
+    words = re.findall(r"[^\W_]+(?:['’-][^\W_]+)*", without_ids, flags=re.UNICODE)
     if not words:
         return True
     return all(word in _JUNK_PLATFORM_WORDS or word in _JUNK_GENERIC_TITLES for word in words)

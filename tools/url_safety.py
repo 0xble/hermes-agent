@@ -240,7 +240,13 @@ def _parse_ip(hostname: str) -> Optional[_IPAddress]:
     try:
         return ipaddress.ip_address(hostname)
     except ValueError:
-        return None
+        # ``inet_aton`` accepts the legacy hex, octal, and shortened IPv4 forms that
+        # resolvers and http clients may also accept. Treat them as literals for the
+        # benchmark-host guard, not as DNS names.
+        try:
+            return ipaddress.ip_address(socket.inet_aton(hostname))
+        except (OSError, ValueError):
+            return None
 
 
 def _iter_resolved_ips(addr_info: Any):

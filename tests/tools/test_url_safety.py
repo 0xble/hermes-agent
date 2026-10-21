@@ -148,8 +148,9 @@ class TestProxyEnvironmentDnsDelegation:
         with _resolves_to("198.18.4.162"):
             assert is_safe_url("https://youtu.be/MgRynDGk-4Y", allow_private=False) is True
 
-    def test_literal_benchmark_host_stays_blocked(self):
-        assert is_safe_url("https://198.18.0.23/file.jpg", allow_private=False) is False
+    @pytest.mark.parametrize("host", ["198.18.0.23", "0xc6120017", "0306.022.0.027", "198.18.23"])
+    def test_literal_benchmark_host_stays_blocked(self, host):
+        assert is_safe_url(f"https://{host}/file.jpg", allow_private=False) is False
 
     def test_private_addresses_stay_blocked(self):
         for ip in ("127.0.0.1", "10.1.2.3", "192.168.1.9", "169.254.169.254"):
@@ -185,9 +186,10 @@ class TestAsyncIsSafeUrl:
 
 
 class TestSSRFGuardedHttpxClient:
-    def test_connect_blocks_literal_benchmark_host(self):
+    @pytest.mark.parametrize("host", ["198.18.0.23", "0xc6120017", "0306.022.0.027", "198.18.23"])
+    def test_connect_blocks_literal_benchmark_host(self, host):
         with pytest.raises(SSRFConnectionBlocked, match="benchmark address"):
-            _resolved_http_connect_ips("198.18.0.23", 443, "https")
+            _resolved_http_connect_ips(host, 443, "https")
 
     def test_connect_resolution_checks_private_ip_beyond_candidate_cap(self):
         answers = [

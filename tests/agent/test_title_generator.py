@@ -334,6 +334,8 @@ class TestGenerateTitle:
     ("aux-from-main", False),
     ("Sci-Fi Dark Ambiance", False),
     ("Planning-to-Deploy Delays", False),
+    ("南京市秦淮区 小时级天气预报", False),
+    ("Русский прогноз погоды", False),
 ])
 def test_junk_title_detector(title, junk):
     assert is_junk_title(title) is junk
