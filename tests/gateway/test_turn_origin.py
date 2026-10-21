@@ -67,3 +67,18 @@ def test_set_turn_origin_rebinds_after_session_vars_and_defaults_deny():
         assert get_session_env("HERMES_TURN_ORIGIN") == "unknown"
     finally:
         clear_session_vars(tokens)
+
+
+def test_webhook_ingress_is_not_user():
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:route:1",
+        chat_type="webhook",
+        user_id="webhook:route",
+    )
+    event = MessageEvent(text="payload", source=source)
+    assert turn_origin_for_event(event) == "unknown"
+
+
+def test_legacy_loop_wakeup_marker_is_goal_loop():
+    assert turn_origin_for_event(_event(internal=True, metadata={"hermes_loop_wakeup": True})) == "goal_loop"

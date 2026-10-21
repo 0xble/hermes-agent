@@ -31,6 +31,17 @@ def _event_chain(event: Any) -> list[Any]:
     return [event, *getattr(event, "_hermes_absorbed_events", ())]
 
 
+# Machine ingress: deliveries from third-party systems, never a person typing.
+_MACHINE_PLATFORMS = frozenset({"webhook", "msgraph_webhook", "wecom_callback"})
+
+
+def _is_machine_ingress(source: Any) -> bool:
+    platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
+    return (str(platform or "").lower() in _MACHINE_PLATFORMS
+            or str(getattr(source, "chat_type", "") or "").lower() == "webhook"
+            or str(getattr(source, "user_id", "") or "").startswith("webhook:"))
+
+
 def _is_human_event(event: Any) -> bool:
     """Recognize positively identified human ingress, default-deny."""
     if event is None or getattr(event, "internal", False):
@@ -39,6 +50,8 @@ def _is_human_event(event: Any) -> bool:
     if source is None:
         return False
     if getattr(source, "delivered_via_upstream_relay", False):
+        return False
+    if _is_machine_ingress(source):
         return False
     if getattr(source, "is_bot", False):
         return False
@@ -60,6 +73,7 @@ def turn_origin_for_event(event: Any) -> str:
         return "relay"
     if any(is_goal_continuation_event(candidate)
            or bool((getattr(candidate, "metadata", None) or {}).get("loop_wakeup"))
+           or bool((getattr(candidate, "metadata", None) or {}).get("hermes_loop_wakeup"))
            or bool(getattr(candidate, "_heartbeat_session_id", None))
            for candidate in events):
         return "goal_loop"
