@@ -726,8 +726,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # prev_tools may be list[str] or list[dict] with "name"/"result" keys. Normalise so
         # "tool_names" stays backward-compatible for user hooks that do ', '.join(tool_names).
         names = [(t.get("name") or "") if isinstance(t, dict) else str(t) for t in (prev_tools or [])]
+        hooks = getattr(ctx, "_hooks_ref", None)
+        if hooks is None or not hasattr(hooks, "emit"):
+            return
         self._schedule(
-            ctx._hooks_ref.emit("agent:step", {
+            hooks.emit("agent:step", {
                 "platform": ctx.source.platform.value if ctx.source.platform else "",
                 "user_id": ctx.source.user_id, "session_id": ctx.session_id,
                 "iteration": iteration, "tool_names": names, "tools": prev_tools,
@@ -737,8 +740,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
 
     def _event_callback_sync(self, event_type: str, context: dict) -> None:
         ctx = self._ctx
+        hooks = getattr(ctx, "_hooks_ref", None)
+        if hooks is None or not hasattr(hooks, "emit") or ctx._loop_for_step is None:
+            return
         try:
-            asyncio.run_coroutine_threadsafe(ctx._hooks_ref.emit(event_type, context), ctx._loop_for_step)
+            asyncio.run_coroutine_threadsafe(hooks.emit(event_type, context), ctx._loop_for_step)
         except Exception as e:
             logger.debug("event_callback hook error: %s", e)
 
@@ -1901,7 +1907,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         ctx = self._ctx
         persist_override: Optional[Any] = ctx.persist_user_message
         from gateway.session_cli_turn import cli_turn
-        api_text = cli_turn(ctx.inbound_message_id).get('api_text')
+        api_text = cli_turn(getattr(ctx, "inbound_message_id", None)).get('api_text')
         if api_text is not None:
             # The classic CLI's model-facing message (voice prefix, its own model-switch and
             # skills-reload notes); the admitted text stays the persisted user row.
@@ -2015,7 +2021,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # The raw inbound id (not event_message_id, the reply anchor) rides the persisted user
             # turn. Recovered internal follow-ups use a dedicated recovery key here; it must never
             # become event.message_id/source.message_id or reach transport routing.
-            persist_id = ctx.inbound_message_id or ctx.recovery_id
+            persist_id = getattr(ctx, "inbound_message_id", None) or ctx.recovery_id
             if persist_id is not None:
                 kwargs["persist_user_platform_id"] = str(persist_id)
             from agent.notification_presentation import notification_turn
@@ -2144,7 +2150,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     self._restore_telegram_thread_id_after_split(agent_session_id)
                 runner._sync_telegram_topic_binding(src, entry, reason="agent-run-compression")
         from gateway.session_cli_turn import cli_turn
-        if not cli_turn(ctx.inbound_message_id).get("model_override"):
+        if not cli_turn(getattr(ctx, "inbound_message_id", None)).get("model_override"):
             runner._sync_session_model_from_agent(agent_session_id, agent)
         # history_offset=0 whenever the agent's message list lost the original history prefix
         # (split OR in-place compaction): the returned `messages` is the compacted set, persist all
