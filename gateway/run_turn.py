@@ -28,6 +28,7 @@ from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, turn_origin_for_event
+from gateway.session_context import set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.response_filters import (
@@ -2946,8 +2947,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         restore_session_yolo(session_key, session_entry.yolo is True)  # a restarted gateway's set starts empty
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
-        turn_origin = turn_origin_for_event(event)
-        _session_env_tokens = self._set_session_env(context, turn_origin=turn_origin)
+        _session_env_tokens = self._set_session_env(context)
+        # Bound separately so _set_session_env keeps the one-argument shape test doubles stub.
+        set_turn_origin(turn_origin_for_event(event))
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
         persist_user_display_kind = display_kind_for_event(event)
         _redact_pii = False  # privacy.redact_pii, re-read per message
@@ -3179,8 +3181,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 inbound_message_id=str(event.message_id) if event.message_id else None,
                 recovery_id=getattr(event, "_hermes_recovery_id", None),
                 recovery_session_key=getattr(event, "_hermes_recovery_session_key", None),
-                channel_prompt=_turn_channel_prompt, internal=event.internal, turn_origin=turn_origin_for_event(event),
-                event_metadata=dict(event.metadata or {}),
+                channel_prompt=_turn_channel_prompt, internal=event.internal, event_metadata=dict(event.metadata or {}),
                 moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
                 persist_user_message=prepared.persist_user_message,
@@ -5425,8 +5426,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         run_generation: Optional[int] = None, _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None, inbound_message_id: Optional[str] = None,
         recovery_id: Optional[str] = None, recovery_session_key: Optional[str] = None,
-        channel_prompt: Optional[str] = None, internal: bool = False, turn_origin: str = "unknown",
-        event_metadata: Optional[dict] = None,
+        channel_prompt: Optional[str] = None, internal: bool = False, event_metadata: Optional[dict] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
@@ -5484,7 +5484,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             recovery_id=recovery_id,
             channel_prompt=channel_prompt, moa_config=moa_config, internal=internal,
-            turn_origin=turn_origin,
             event_metadata=dict(event_metadata or {}),
             title_user_message=title_user_message,
             persist_user_message=persist_user_message,

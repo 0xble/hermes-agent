@@ -113,6 +113,9 @@ def source_route_metadata(source: Any, metadata: dict | None) -> dict | None:
     return {**(metadata or {}), **anchors} if anchors else metadata
 
 
+_TURN_ORIGINS = frozenset({"user", "relay", "process", "goal_loop", "cron", "unknown"})
+
+
 def set_session_vars(
     platform: str = "", source: str = "", chat_id: str = "", chat_type: str = "",
     chat_name: str = "", thread_id: str = "", user_id: str = "", user_id_alt: str = "",
@@ -137,13 +140,18 @@ def set_session_vars(
         platform, source, chat_id, chat_type, chat_name, thread_id, user_id, user_id_alt,
         user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
         browser_control_principal, browser_control_transport_family, cron_session, parent_chat_id,
-        turn_origin if turn_origin in {"user", "relay", "process", "goal_loop", "cron", "unknown"} else "unknown",
+        turn_origin if turn_origin in _TURN_ORIGINS else "unknown",
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
+
+
+def set_turn_origin(turn_origin: str) -> None:
+    """Bind this task's turn provenance after ``set_session_vars``; unknown values default-deny."""
+    _TURN_ORIGIN.set(turn_origin if turn_origin in _TURN_ORIGINS else "unknown")
 
 
 def clear_session_vars(tokens: list) -> None:

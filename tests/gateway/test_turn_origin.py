@@ -54,3 +54,16 @@ def test_session_env_origin_defaults_deny():
         assert get_session_env("HERMES_TURN_ORIGIN") == "unknown"
     finally:
         clear_session_vars(tokens)
+
+
+def test_set_turn_origin_rebinds_after_session_vars_and_defaults_deny():
+    from gateway.session_context import set_turn_origin
+
+    tokens = set_session_vars()
+    try:
+        set_turn_origin("user")
+        assert get_session_env("HERMES_TURN_ORIGIN") == "user"
+        set_turn_origin("bogus")
+        assert get_session_env("HERMES_TURN_ORIGIN") == "unknown"
+    finally:
+        clear_session_vars(tokens)
