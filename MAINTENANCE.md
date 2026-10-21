@@ -187,6 +187,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Provider-reported cost | Capture a provider's finite per-call billed amount and persist it so every existing reader displays it exactly once, without changing estimated/actual combine semantics | Usage normalization, `estimate_usage_cost`, main-turn cost persistence, or `update_token_counts` cost columns | [Provider-reported cost](maintenance/provider-reported-cost.md) |
 | Provider output-cap preflight | Price the final provider wire request and effective output cap before the hard-window gate, shrink only within the current turn, and preserve provider thinking floors | `request_fits`, provider output-cap resolution, preflight ceiling state, or native/tool-schema request sizing | [Provider output-cap preflight](maintenance/provider-output-cap-preflight.md) |
 | Deferred local tool_call batching | Multi-entry local `tool_call` batches run losslessly, bounded and interruptible through each entry's ordinary pipeline, with entry-indexed, non-misleading errors | Tool Search bridge, `tool_call` batching, local batch splitter, or connector batch dispatch changes | [Deferred local batch](maintenance/deferred-local-batch.md) |
+| Unicode TAG character stripping | Strip invisible plane-14 TAG characters from model-facing skill, web, browser, MCP, and read_file results | Tool-result construction, Unicode tag stripping, or those tool output paths | [Unicode TAG character stripping](maintenance/unicode-tag-strip.md) |
 
 ## Active patch record: state.db prune lock batching
 

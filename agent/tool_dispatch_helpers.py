@@ -22,6 +22,7 @@ from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
     tool_may_have_side_effect,
 )
+from tools.ansi_strip import strip_unicode_tags
 from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
@@ -444,12 +445,18 @@ def make_tool_result_message(
     """Build a tool-result message: OpenAI ``name`` (wire format) plus internal ``tool_name``
     (session DB). High-risk tool content (web_extract, web_search, browser_*, mcp_*) is
     wrapped in untrusted-data delimiters — the defense against indirect prompt injection.
+    Invisible Unicode TAG characters are stripped from that same set plus skill_view and
+    read_file before wrapping. Clean text is returned unchanged.
     """
     # Replay-recovery callers bypass the executor's canonical-id helper, so normalize here too.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
+    # Strip before the elision notice and untrusted wrap so the model never sees the
+    # smuggled characters, including inside the wrapped block. Risk metadata still scans
+    # the pre-strip content.
+    shown = _maybe_strip_unicode_tags(name, content)
     # Elision notice is appended to the RAW content first, THEN wrapped, so it sits inside
     # the untrusted block next to the data it describes — once, at construction (cache-safe).
-    wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, content))
+    wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, shown))
     message = stamp_message_timestamp({
         "role": "tool",
         "name": name,
@@ -480,6 +487,35 @@ _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
 
 def _is_untrusted_tool(name: Optional[str]) -> bool:
     return bool(name) and (name in _UNTRUSTED_TOOL_NAMES or name.startswith(_UNTRUSTED_TOOL_PREFIXES))
+
+
+def _should_strip_unicode_tags(name: Optional[str]) -> bool:
+    """Model-facing results that can carry fetched or loaded third-party text.
+
+    Untrusted tools cover web, browser, and MCP output. skill_view and read_file
+    are stripped here too, but are not added to the untrusted-wrapping set.
+    """
+    return _is_untrusted_tool(name) or name in {"skill_view", "read_file"}
+
+
+def _maybe_strip_unicode_tags(name: Optional[str], content: Any) -> Any:
+    """Strip invisible TAG characters from covered tool text.
+
+    Strings and text parts of a multimodal list are passed through
+    ``strip_unicode_tags``. Valid emoji tag sequences survive. When no tag
+    characters are present the original string object is returned, so clean
+    output stays byte-identical. Other tools and non-text parts are untouched.
+    """
+    if not _should_strip_unicode_tags(name):
+        return content
+    if isinstance(content, str):
+        return strip_unicode_tags(content)
+    if isinstance(content, list):
+        return [
+            {**item, "text": strip_unicode_tags(item["text"])} if _is_text_item(item) else item
+            for item in content
+        ]
+    return content
 
 
 def _is_text_item(item: Any) -> bool:
