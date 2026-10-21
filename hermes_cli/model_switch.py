@@ -1797,6 +1797,13 @@ def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg:
         "default": result.new_model, "provider": result.target_provider,
         "base_url": result.base_url or None, "api_mode": result.api_mode or None,
     }
+    # A concrete selection replaces the authored reference, regardless of its
+    # spelling. Keeping one beside the inline route makes the next load invalid.
+    if "model_preset" in model_cfg:
+        updates["model_preset"] = None
+    from hermes_cli.model_presets import preset_ref_name
+    if preset_ref_name(model_cfg.get("model")):
+        updates["model"] = None
     if "context_length" in model_cfg:
         from hermes_cli.route_identity import should_clear_context_pin
         if should_clear_context_pin(

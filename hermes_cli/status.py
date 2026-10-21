@@ -62,7 +62,11 @@ def _first_env_value(names) -> str:
 
 
 def _configured_model_label(config: dict) -> str:
-    """Return the configured default model from config.yaml."""
+    """Return the configured default model, resolving a preset reference."""
+    from hermes_cli.model_preset_runtime import resolve_default_route
+    route = resolve_default_route(config)
+    if route.model:
+        return route.model
     model_cfg = config.get("model")
     if isinstance(model_cfg, dict):
         model_cfg = model_cfg.get("default") or model_cfg.get("name") or ""

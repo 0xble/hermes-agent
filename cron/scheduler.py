@@ -105,11 +105,12 @@ def _job_route_pinned(job: dict) -> bool:
     return any(isinstance(job.get(k), str) and job[k].strip() for k in ("provider", "model", "base_url"))
 
 
-def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
+def _job_fallback_chain(job: dict, cfg: Any, route: Any = None) -> Optional[list]:
     """The fallback chain this job may walk, at credential resolution AND mid-run (#100437).
 
     A pinned job never borrows the global chain, but can use an explicitly declared
-    ``cron.fallback_providers`` chain. Same-provider credential-pool rotation still applies.
+    ``cron.fallback_providers`` chain, or the fallbacks of the ``@preset`` route it names.
+    Same-provider credential-pool rotation still applies.
     """
     cron = cfg.get("cron") if isinstance(cfg, dict) else None
     declared = cron.get("fallback_providers") if isinstance(cron, dict) else None
@@ -117,6 +118,8 @@ def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
         # Unlike a delegated child's malformed override, an explicit cron override
         # never silently restores the global chain (including legacy fallback_model).
         return get_cron_fallback_chain(cfg) or None
+    if route is not None and getattr(route, "fallbacks", None):
+        return get_fallback_chain({"fallback_providers": list(route.fallbacks)}) or None
     return scoped_fallback_chain(
         get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
 
@@ -503,7 +506,7 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str]:
         ) from exc
 
 
-def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
+def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str, route: Any = None) -> dict | None:
     """Effective reasoning config for a cron run. A per-job ``reasoning_effort`` pin beats global
     and per-model config and is model-independent by design (also governs an auth-fallback swap);
     clamping stays with provider transports. An unparseable pin warns and falls back to config."""
@@ -523,6 +526,11 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
             job.get("id", "?"),
             pinned,
             job.get("id", "?"))
+    route_effort = getattr(route, "reasoning_effort", "") if route is not None else ""
+    if route_effort:
+        parsed = parse_reasoning_effort(route_effort)
+        if parsed is not None:
+            return parsed
     return resolve_reasoning_config(cfg if isinstance(cfg, dict) else {}, str(model))
 
 
@@ -1690,6 +1698,7 @@ class _CronJobConfig:
     model: str
     model_cfg: Any
     cron_default_provider: str
+    route: Any = None  # ModelPresetRoute when the run's model came from an ``@preset`` reference
 
 
 def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConfig:
@@ -1699,19 +1708,43 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
     model = job.get("model") or cron_env_setting("HERMES_MODEL") or ""
     _cron_default_provider = ""
     _cfg: dict = {}
+    _effective_cfg: dict = {}
     _model_cfg: Any = {}
+    _route = None
+    _job_route_provider = ""
     try:
         from hermes_cli.config_effective import load_user_config_effective
         _cfg_path = str(_get_hermes_home() / "config.yaml")
         if os.path.exists(_cfg_path):
             _cfg = load_user_config_effective(Path(_cfg_path))
+            from hermes_cli.model_preset_runtime import resolve_model_ref
+            # Resolve @ routes from the freshly read config on every fire. Do not persist the
+            # concrete model in the job or resolve it during cron creation.
+            from hermes_cli.model_presets import preset_ref_name
+            if preset_ref_name(model):
+                _route = resolve_model_ref(model.strip(), _cfg)
+                model = _route.model
+                if not job.get("provider"):
+                    _cron_default_provider = _job_route_provider = _route.provider
+            from hermes_cli.model_presets import expand_model_presets
+            _runtime_cfg = expand_model_presets(_cfg)
+            _effective_cfg = _runtime_cfg
             # Coerce null to {} so a falsy default never clobbers a resolved env value.
-            _model_cfg = _cfg.get("model") or {}
-            _cron_cfg_for_model = _cfg.get("cron") or {}
+            _model_cfg = _runtime_cfg.get("model") or {}
+            _cron_cfg_for_model = _runtime_cfg.get("cron") or {}
             _cron_default_model = ""
             if isinstance(_cron_cfg_for_model, dict):
                 _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
-                _cron_default_provider = str(_cron_cfg_for_model.get("model_provider") or "").strip()
+                # A job's own @route provider outranks the fleet default; an unset
+                # cron.model_provider must never erase it.
+                _cron_provider_cfg = str(_cron_cfg_for_model.get("model_provider") or "").strip()
+                if _cron_provider_cfg and not _job_route_provider:
+                    _cron_default_provider = _cron_provider_cfg
+                if preset_ref_name(_cron_default_model) and not job.get("model"):
+                    _route = resolve_model_ref(_cron_default_model, _cfg)
+                    _cron_default_model = _route.model
+                    if not _cron_provider_cfg and not _job_route_provider:
+                        _cron_default_provider = _route.provider
             if not job.get("model"):
                 if _cron_default_model:
                     model = _cron_default_model
@@ -1722,6 +1755,10 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
                         if isinstance(_model_cfg, dict) else "")
                     model = str(_main or "").strip() or model
     except Exception as e:
+        from hermes_cli.model_presets import ModelPresetError
+        if isinstance(e, ModelPresetError):
+            # An unknown/invalid @preset must fail the run, not fall back to the literal '@name'.
+            raise
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
     # Fail fast: an empty model otherwise reaches the provider as an opaque 400.
@@ -1742,7 +1779,8 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
         _net_cfg = _cfg.get("network", {})
         if isinstance(_net_cfg, dict) and _net_cfg.get("force_ipv4"):
             apply_ipv4_preference(force=True)
-    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider)
+    # Hand consumers the expanded config so a preset's reasoning_effort and fallbacks reach them.
+    return _CronJobConfig(_effective_cfg or _cfg, model, _model_cfg, _cron_default_provider, _route)
 
 
 def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
@@ -1858,7 +1896,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
-        chain = _job_fallback_chain(job, jc.cfg) or []
+        chain = _job_fallback_chain(job, jc.cfg, jc.route) or []
         logger.warning(
             "Job '%s': primary provider resolve failed (%s: %s), %s",
             job_id, "auth" if is_auth else "transient network", resolve_exc,
@@ -2480,11 +2518,11 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.runtime, setup.model = _resolve_job_runtime(job, job_id, jc)
     setup.fallback_notice = setup.runtime.pop("_fallback_notice", None)
     setup.reasoning_config = _resolve_job_reasoning_config(
-        job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
+        job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model), jc.route
     )
     # Mid-run provider ladder: same rule as resolution above. A pinned job cannot
     # borrow the global chain, but may use the explicitly declared cron chain.
-    setup.fallback_model = _job_fallback_chain(job, _cfg)
+    setup.fallback_model = _job_fallback_chain(job, _cfg, jc.route)
     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
     # MCP servers must be registered before AIAgent is constructed.
     _init_cron_mcp_tools(job_id)

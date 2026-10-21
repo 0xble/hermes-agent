@@ -203,6 +203,19 @@ def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
     model = str(attended_raw.get("model") or "").strip()
     provider = str(attended_raw.get("provider") or "").strip()
     effort = str(attended_raw.get("reasoning_effort") or "").strip().lower()
+    # The attended route is live too. Resolve @attended/model_preset at request time
+    # from the raw config rather than freezing a concrete model in SessionStore.
+    from hermes_cli.model_presets import preset_ref_name
+    if preset_ref_name(model) or attended_raw.get("model_preset"):
+        try:
+            from hermes_cli.model_preset_runtime import resolve_model_ref
+            route = resolve_model_ref(model or {"model_preset": attended_raw.get("model_preset")}, config or {})
+            model = route.model
+            provider = provider or route.provider
+            effort = effort or route.reasoning_effort
+        except Exception as exc:
+            logger.warning("Invalid attended model reference: %s", exc)
+            model = ""
     if effort and effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
         logger.warning("model.attended.reasoning_effort=%r is invalid; ignoring it", effort)
         effort = ""

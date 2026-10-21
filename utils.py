@@ -484,7 +484,7 @@ def atomic_roundtrip_yaml_update(path: str | Path, key_path: str, value: Any) ->
 
     mkdir_under_hermes_home(path.parent)
     yaml_rt, config = _roundtrip_load(path)
-    current = config
+    current: CommentedMap = config
     keys = _split_key_path(key_path)
     i = 0
     while True:
@@ -492,6 +492,19 @@ def atomic_roundtrip_yaml_update(path: str | Path, key_path: str, value: Any) ->
         seg, consumed = _greedy_literal_match(dict(current), remaining) or (remaining[0], 1)
         if i + consumed == len(keys):
             if value is None:
+                # ruamel attaches standalone comments before the next sibling
+                # to this key's end-of-line token. Keep those when deleting the
+                # key, but discard its own inline comment.
+                comment = current.ca.items.get(seg)
+                token = comment[2] if comment else None
+                trailing = token.value.partition("\n")[2] if token else ""
+                siblings = list(current)
+                if trailing.strip() and siblings.index(seg) + 1 < len(siblings):
+                    following = siblings[siblings.index(seg) + 1]
+                    lines = trailing.rstrip("\n").splitlines()
+                    indent = min(len(line) - len(line.lstrip()) for line in lines if line.strip())
+                    text = "\n".join(line.strip().removeprefix("#").removeprefix(" ") for line in lines)
+                    current.yaml_set_comment_before_after_key(following, before=text, indent=indent)
                 current.pop(seg, None)
             else:
                 current[seg] = value

@@ -98,12 +98,12 @@ class _ModelSwitchContext:
             cfg = _load_gateway_config(config_path=self.config_path)
             if not cfg:
                 return
-            model_cfg = cfg.get("model", {})
-            if isinstance(model_cfg, dict):
-                self.current_model = model_cfg.get("default", "")
-                self.current_provider = model_cfg.get("provider", self.current_provider)
-                self.route_provider = model_cfg.get("provider")
-                self.current_base_url = model_cfg.get("base_url", "")
+            from hermes_cli.model_preset_runtime import resolve_default_route
+            route = resolve_default_route(cfg)
+            self.current_model = route.model
+            self.current_provider = route.provider or self.current_provider
+            self.route_provider = route.provider or None
+            self.current_base_url = route.base_url
             self.user_provs = cfg.get("providers")
             try:
                 from hermes_cli.config import get_compatible_custom_providers
@@ -329,20 +329,27 @@ class GatewayModelCommandsMixin:
         mi = result.model_info
         model_cfg: dict = {}
         config_ctx = None
-        with contextlib.suppress(Exception):  # fail-open on config read errors
-            model_cfg = _load_gateway_config().get("model", {})
+        configured_route = None
+        cfg = _load_gateway_config()
+        with contextlib.suppress(Exception):
+            model_cfg = cfg.get("model", {})
+            from hermes_cli.model_preset_runtime import resolve_default_route
+            configured_route = resolve_default_route(cfg)
             if isinstance(model_cfg, dict) and model_cfg.get("context_length") is not None:
                 config_ctx = int(model_cfg["context_length"])
         if not isinstance(model_cfg, dict):
             model_cfg = {}
+        if configured_route is None:
+            from hermes_cli.model_preset_runtime import DefaultRoute
+            configured_route = DefaultRoute()
         ctx_len = await resolve_display_context_length_async(
             result.new_model, result.target_provider,
             base_url=result.base_url or ctx.current_base_url or "",
             api_key=result.api_key or ctx.current_api_key or "", model_info=mi, api_mode=result.api_mode or "",
             custom_providers=ctx.custom_provs, config_context_length=config_ctx,
-            configured_model=model_cfg.get("default") or model_cfg.get("model"),
-            configured_provider=model_cfg.get("provider"),
-            configured_base_url=model_cfg.get("base_url"),
+            configured_model=configured_route.model,
+            configured_provider=configured_route.provider,
+            configured_base_url=configured_route.base_url,
         )
         if ctx_len:
             lines.append(t("gateway.model.context_label", tokens=f"{ctx_len:,}"))
@@ -938,7 +945,19 @@ class GatewayModelCommandsMixin:
         if persist_global:
             if self._save_gateway_config_key("agent.reasoning_effort", value):
                 self._set_reasoning_override(session_key, None)
-                return t("gateway.reasoning.set_global", effort=value)
+                reply = t("gateway.reasoning.set_global", effort=value)
+                from gateway.run import _load_gateway_config
+                from hermes_cli.model_preset_runtime import resolve_default_route
+                try:
+                    route = resolve_default_route(_load_gateway_config(config_path=self.config_path))
+                except Exception:
+                    route = None
+                if route and route.name and route.reasoning_effort:
+                    reply += "\n" + t(
+                        "gateway.reasoning.preset_owns_effort",
+                        preset="@" + route.name, preset_effort=route.reasoning_effort, effort=value,
+                    )
+                return reply
             self._set_reasoning_override(session_key, parsed)
             return t("gateway.reasoning.set_global_save_failed", effort=value)
         self._set_reasoning_override(session_key, parsed, scope=scope)
@@ -999,13 +1018,15 @@ class GatewayModelCommandsMixin:
         from gateway.run import _load_gateway_config
         from hermes_cli.codex_runtime_switch import get_current_runtime
         _session_route = ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {})
-        _model_cfg = {}
-        with contextlib.suppress(Exception):  # fail-open on config read errors, like /model does
-            _model_cfg = _load_gateway_config(config_path=self.config_path).get("model", {}) or {}
+        from hermes_cli.model_preset_runtime import DefaultRoute, resolve_default_route
+        _default_route = None
+        with contextlib.suppress(Exception):
+            _default_route = resolve_default_route(_load_gateway_config(config_path=self.config_path))
+        _default_route = _default_route or DefaultRoute()
         _route = (
-            _session_route.get("provider") or _model_cfg.get("provider"),
-            _session_model or _model_cfg.get("default") or _model_cfg.get("model"),
-            get_current_runtime({"model": _model_cfg}),
+            _session_route.get("provider") or _default_route.provider,
+            _session_model or _default_route.model,
+            get_current_runtime({"model": {"provider": _default_route.provider, "default": _default_route.model}}),
         )
         if rc is None:
             level, current_effort = t("gateway.reasoning.level_default"), "medium"

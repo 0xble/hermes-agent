@@ -1290,17 +1290,19 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
     def _hmwa_hygiene_read_config(hs, data):
         """Apply model / compression knobs from the gateway config onto ``hs`` (invalid values keep the defaults)."""
         # Resolve model name (same logic as run_sync)
+        from hermes_cli.model_preset_runtime import resolve_default_route
+        _default_route = resolve_default_route(data)
         _model_cfg = data.get("model", {})
         if isinstance(_model_cfg, str):
-            hs.model = _model_cfg
+            hs.model = _default_route.model
         elif isinstance(_model_cfg, dict):
-            hs.model = _model_cfg.get("default") or _model_cfg.get("model") or hs.model
+            hs.model = _default_route.model or hs.model
             _raw_ctx = _model_cfg.get("context_length")
             if _raw_ctx is not None:
                 with suppress(TypeError, ValueError):
                     hs.config_context_length = int(_raw_ctx)
-            hs.provider = _model_cfg.get("provider") or None
-            hs.base_url = _model_cfg.get("base_url") or None
+            hs.provider = _default_route.provider or None
+            hs.base_url = _default_route.base_url or None
 
         # Only the enabled flag is shared with the agent's compression config (hygiene runs higher).
         _comp_cfg = data.get("compression", {})
