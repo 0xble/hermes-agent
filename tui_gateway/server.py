@@ -1293,7 +1293,8 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
 def _active_config_path() -> Path:
     """config.yaml of the per-session profile override (session.resume) when bound, else the launch home."""
     override = get_hermes_home_override()
-    return Path(override if isinstance(override, str) and override else _hermes_home) / "config.yaml"
+    home = override if isinstance(override, str) and override else _launch_home()
+    return Path(home) / "config.yaml"
 
 
 def _load_cfg_raw() -> dict:
