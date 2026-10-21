@@ -1717,6 +1717,13 @@ _INGRESS_CONSUMER: "_contextvars.ContextVar[Optional[asyncio.Task]]" = _contextv
     "gateway_ingress_consumer", default=None)
 
 
+# (obligation id, event, adapter) while send_final_ledgered awaits the send. Task-local, because
+# one adapter serves many sessions at once: the send's finally reads only its own turn's entry if
+# a cancel is delivered at the return, before the ledger write.
+_PENDING_LEDGER_SETTLEMENT: "_contextvars.ContextVar[Optional[tuple]]" = _contextvars.ContextVar(
+    "gateway_pending_ledger_settlement", default=None)
+
+
 def ingress_consumer_scope() -> "_contextvars.Token":
     """Mark the current task as the update consumer; reset with :func:`leave_ingress_consumer`."""
     return _INGRESS_CONSUMER.set(asyncio.current_task())
@@ -3980,6 +3987,31 @@ class BasePlatformAdapter(ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
+        returned: dict[str, SendResult] = {}
+        try:
+            result = await self._send_with_retry_body(
+                chat_id, content, reply_to=reply_to, metadata=metadata,
+                max_retries=max_retries, base_delay=base_delay)
+            returned["result"] = result
+            return result
+        finally:
+            # A queued follow-up, /stop, or preemption cancels this task while the platform
+            # call is in flight. Python raises that cancel at this return, so the caller
+            # never sees the result and the ledger write after the send is skipped. A result
+            # already returned successfully is not ambiguous. A cancel that aborts the body, or
+            # a failed result, leaves the row 'attempting' for the duplicate-marked sweep.
+            captured = returned.get("result")
+            task = asyncio.current_task()
+            pending = _PENDING_LEDGER_SETTLEMENT.get()
+            if (pending is not None and captured is not None and getattr(captured, "success", False)
+                    and task is not None and task.cancelling()):
+                self._settle_delivered_obligation_sync(pending[0])
+
+    async def _send_with_retry_body(
+        self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
+        max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
+        """Send with exponential-backoff retry on transient network errors; permanent
+        failures fall back to a plain-text send, exhausted retries notify the user."""
         async def _send(text: str) -> SendResult:
             return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
@@ -4749,6 +4781,21 @@ class BasePlatformAdapter(ABC):
             logger.debug("delivery ledger record failed", exc_info=True)
             return None
 
+    def _settle_delivered_obligation_sync(self, obligation_id: str) -> None:
+        """Mark delivered a send that already landed when this task was cancelled.
+
+        Another await would itself raise CancelledError and skip the write, which is how a
+        queued-lane interrupt left a landed Telegram message 'attempting' with attempts=0.
+        Only success settles here. A failed result needs the async finalizer's refusal,
+        follow-up and redelivery handling, which a cancelled turn cannot run, so that row
+        stays 'attempting' for the existing ambiguous-send recovery.
+        """
+        try:
+            from gateway.delivery_ledger import mark_delivered
+            mark_delivered(obligation_id)
+        except Exception:
+            logger.debug("delivery ledger update failed", exc_info=True)
+
     async def _finalize_delivery_obligation(
         self, obligation_id: str, result: Any, event: MessageEvent,
         delivery_adapter: "BasePlatformAdapter") -> None:
@@ -4872,8 +4919,18 @@ class BasePlatformAdapter(ABC):
             # The ledger now owns the crash recovery. It carries text only, so a caller with
             # attachments still to send keeps the marker until they are delivered.
             await self._release_turn_marker(event)
-        result = await delivery_adapter._send_with_retry(
-            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+        # A queued follow-up, /stop, or preemption cancels this task at the next await after
+        # Telegram has already accepted the message. That used to skip the ledger write, leaving
+        # the row 'attempting' with attempts=0 so a later boot resent a copy. The send's wrapper
+        # records a result it already returned before that cancellation propagates. A cancel that
+        # aborts the transport never produces a result, so that row stays attempting.
+        settlement = _PENDING_LEDGER_SETTLEMENT.set(
+            (obligation_id, event, delivery_adapter) if obligation_id is not None else None)
+        try:
+            result = await delivery_adapter._send_with_retry(
+                chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+        finally:
+            _PENDING_LEDGER_SETTLEMENT.reset(settlement)
         if (obligation_id is None and not result.success and result.pre_send
                 and self._outbox_covers_final(event, delivery_adapter)):
             obligation_id = await self._record_delivery_obligation(
