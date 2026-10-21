@@ -3998,14 +3998,14 @@ class BasePlatformAdapter(ABC):
             # A queued follow-up, /stop, or preemption cancels this task while the platform
             # call is in flight. Python raises that cancel at this return, so the caller
             # never sees the result and the ledger write after the send is skipped. A result
-            # already returned is not ambiguous. A cancel that aborts the body never fills
-            # the holder, so that row stays 'attempting' for the duplicate-marked sweep.
+            # already returned successfully is not ambiguous. A cancel that aborts the body, or
+            # a failed result, leaves the row 'attempting' for the duplicate-marked sweep.
             captured = returned.get("result")
             task = asyncio.current_task()
             pending = _PENDING_LEDGER_SETTLEMENT.get()
-            if pending is not None and captured is not None and task is not None and task.cancelling():
-                obligation_id, event, delivery_adapter = pending
-                self._settle_delivery_obligation_sync(obligation_id, captured, event, delivery_adapter)
+            if (pending is not None and captured is not None and getattr(captured, "success", False)
+                    and task is not None and task.cancelling()):
+                self._settle_delivered_obligation_sync(pending[0])
 
     async def _send_with_retry_body(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
@@ -4781,23 +4781,18 @@ class BasePlatformAdapter(ABC):
             logger.debug("delivery ledger record failed", exc_info=True)
             return None
 
-    def _settle_delivery_obligation_sync(
-        self, obligation_id: str, result: Any, event: MessageEvent,
-        delivery_adapter: "BasePlatformAdapter") -> None:
-        """Record a send that already returned after this task was cancelled.
+    def _settle_delivered_obligation_sync(self, obligation_id: str) -> None:
+        """Mark delivered a send that already landed when this task was cancelled.
 
         Another await would itself raise CancelledError and skip the write, which is how a
         queued-lane interrupt left a landed Telegram message 'attempting' with attempts=0.
-        Success and failure use the same ledger calls as the async finalizer. The reconnect
-        sweep and flood timer stay on that path: they need the event loop, and a cancelled
-        turn must not start another send.
+        Only success settles here. A failed result needs the async finalizer's refusal,
+        follow-up and redelivery handling, which a cancelled turn cannot run, so that row
+        stays 'attempting' for the existing ambiguous-send recovery.
         """
         try:
-            from gateway.delivery_ledger import mark_delivered, mark_failed
-            if getattr(result, "success", False):
-                mark_delivered(obligation_id)
-                return
-            mark_failed(obligation_id, str(getattr(result, "error", "") or ""))
+            from gateway.delivery_ledger import mark_delivered
+            mark_delivered(obligation_id)
         except Exception:
             logger.debug("delivery ledger update failed", exc_info=True)
 

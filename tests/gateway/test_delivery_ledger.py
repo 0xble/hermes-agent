@@ -1233,3 +1233,25 @@ async def test_concurrent_final_sends_settle_only_their_own_obligation():
     release_other.set()
     with pytest.raises(ConnectionError):
         await other
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_failed_send_leaves_attempting_for_recovery():
+    """A refused send plus a cancel must not be marked failed without the finalizer's
+    refusal and redelivery handling. The row keeps today's ambiguous-recovery state."""
+    import asyncio
+    from gateway.platforms.base import SendResult
+
+    async def refuse_then_cancel(**kwargs):
+        asyncio.current_task().cancel()
+        return SendResult(success=False, error="Flood control exceeded. Retry in 30 seconds")
+
+    adapter = _LedgerAdapter(refuse_then_cancel)
+    adapter._base._send_with_retry_body = lambda chat_id, content, **kw: refuse_then_cancel(content=content)
+    key = "agent:main:telegram:dm:2027045491:113596"
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.send_final_ledgered(
+            _telegram_event(message_id="m-refused"), key, "refused text", {}, reply_to=None)
+    row = _row(dl.compute_obligation_id(key, "m-refused", "refused text"))
+    assert row["state"] == "attempting"
+    assert row["attempts"] == 0
