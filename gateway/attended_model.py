@@ -206,7 +206,8 @@ def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
     effort = str(attended_raw.get("reasoning_effort") or "").strip().lower()
     # The attended route is live too. Resolve @attended/model_preset at request time
     # from the raw config rather than freezing a concrete model in SessionStore.
-    if model.startswith("@") or attended_raw.get("model_preset"):
+    from hermes_cli.model_presets import preset_ref_name
+    if preset_ref_name(model) or attended_raw.get("model_preset"):
         try:
             from hermes_cli.model_preset_runtime import resolve_model_ref
             route = resolve_model_ref(model or {"model_preset": attended_raw.get("model_preset")}, config or {})
@@ -341,7 +342,7 @@ def resolve_attended_model(
     if role_route is not None:
         return AttendedResolution(
             role_route.model, role_route.provider or baseline_provider,
-            _effort_label(role_route.reasoning_effort or explicit_reasoning or default_reasoning),
+            _effort_label(explicit_reasoning or role_route.reasoning_effort or default_reasoning),
             "role", True, idle_model=channel_model or default_model,
             new_session=new_session, role=model_role,
         )

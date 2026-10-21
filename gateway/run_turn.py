@@ -303,10 +303,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         state = self._session_state(session_key)
         conversation = state.conversation
         model_role = getattr(conversation, "model_role", None)
-        if not model_role:
-            with suppress(Exception):
-                model_role = self.session_store.get_model_role(session_key)
-                conversation.model_role = model_role
         if not cfg.enabled and not model_role:
             return None
         new_session_pending = bool(new_session or getattr(conversation, "attended_new_session", False))
@@ -787,6 +783,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         attended_snapshot = {}
         if skey:
             state = self._session_state(skey)
+            if state.conversation.model_role is None:
+                # Hydrate the persisted role once, off the event loop, like other durable
+                # conversation fields; the sync route resolver only reads conversation state.
+                with suppress(Exception):
+                    state.conversation.model_role = await asyncio.to_thread(
+                        self.session_store.get_model_role, skey)
             attended_enabled = parse_attended_config(user_config or {}).enabled
             if attended_enabled:
                 state.conversation.pre_agent_fallback_notice = None

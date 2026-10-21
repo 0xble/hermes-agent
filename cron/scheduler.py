@@ -1720,7 +1720,8 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             from hermes_cli.model_preset_runtime import resolve_model_ref
             # Resolve @ routes from the freshly read config on every fire. Do not persist the
             # concrete model in the job or resolve it during cron creation.
-            if isinstance(model, str) and model.strip().startswith("@"):
+            from hermes_cli.model_presets import preset_ref_name
+            if preset_ref_name(model):
                 _route = resolve_model_ref(model.strip(), _cfg)
                 model = _route.model
                 if not job.get("provider"):
@@ -1739,7 +1740,7 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
                 _cron_provider_cfg = str(_cron_cfg_for_model.get("model_provider") or "").strip()
                 if _cron_provider_cfg and not _job_route_provider:
                     _cron_default_provider = _cron_provider_cfg
-                if _cron_default_model.startswith("@") and not job.get("model"):
+                if preset_ref_name(_cron_default_model) and not job.get("model"):
                     _route = resolve_model_ref(_cron_default_model, _cfg)
                     _cron_default_model = _route.model
                     if not _cron_provider_cfg and not _job_route_provider:

@@ -166,6 +166,7 @@ class GatewayConfigLoadersMixin:
             config = (_load_gateway_config() if profile_home is None
                       else _load_gateway_config(profile_home / "config.yaml"))
         from hermes_cli.model_preset_runtime import resolve_model_ref
+        from hermes_cli.model_presets import ModelPresetError
         if isinstance(config, dict):
             raw_model_cfg = config.get("model")
             model_cfg = raw_model_cfg if isinstance(raw_model_cfg, dict) else {}
@@ -175,10 +176,15 @@ class GatewayConfigLoadersMixin:
                           else model_cfg.get("default") or model_cfg.get("model"))
             try:
                 route = resolve_model_ref(raw_default, config)
+            except ModelPresetError:
+                raise
+            except Exception:
+                logger.warning("Could not resolve reasoning effort for the default model route", exc_info=True)
+            else:
+                # A preset that declares an effort outranks per-model agent.reasoning_overrides
+                # and agent.reasoning_effort; a preset without one defers to them.
                 if (not model or model in {raw_default, route.model}) and route.reasoning_effort:
                     return {"enabled": route.reasoning_effort != "none", "effort": route.reasoning_effort}
-            except Exception:
-                pass
         return resolve_reasoning_config(config, model)
 
     @staticmethod

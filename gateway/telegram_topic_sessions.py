@@ -150,7 +150,8 @@ def _resolve_topic_model_ref(raw: str, source: Optional[SessionSource] = None, r
 async def _resolve_model(runner, source: SessionSource, spec: TopicSpec, session_key: str = ""):
     if not (spec.model or spec.provider):
         return None
-    if spec.model.strip().startswith("@"):
+    from hermes_cli.model_presets import preset_ref_name
+    if preset_ref_name(spec.model):
         if spec.provider:
             raise TopicRequestError(
                 f"model {spec.model.strip()!r} is a role, which carries its own provider. "

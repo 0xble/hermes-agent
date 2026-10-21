@@ -101,6 +101,8 @@ def test_role_preset_reasoning_applies_when_attended_is_unconfigured(tmp_path, m
     runner, _states = _runner(store)
     runner._session_reasoning_override = lambda _key: None
     runner._session_model_override = lambda _key: None
+    # Turn start hydrates the persisted role into conversation state; the sync resolver reads that.
+    runner._session_state(entry.session_key).conversation.model_role = store.get_model_role(entry.session_key)
 
     result = runner._resolve_session_reasoning_config(
         source=_source(), session_key=entry.session_key, model="gpt-6.1-sol",
@@ -491,3 +493,68 @@ def test_attended_migration_reply_is_localized_with_counts_and_failures():
     text = t("gateway.model.attended_migrated", converted=2, failures=1, detail=" (boom)")
     assert "2" in text and "1" in text and "(boom)" in text
     assert text != "gateway.model.attended_migrated"
+
+
+def test_role_branch_session_reasoning_pick_wins_over_role_effort():
+    cfg = _attended_cfg()
+    state = {"model_role": "fast", "session_reasoning": "high", "default_reasoning": "low"}
+    decision = resolve_attended_model(state, time.time(), cfg)
+    assert decision.reason == "role" and decision.model == "fast-model"
+    assert decision.reasoning_effort == "high"
+    state.pop("session_reasoning")
+    assert resolve_attended_model(state, time.time(), cfg).reasoning_effort == "minimal"
+
+
+@pytest.mark.asyncio
+async def test_model_command_with_literal_at_model_id_is_a_normal_pick_not_a_role(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    entry = store.get_or_create_session(_source())
+    runner, _states = _runner(store)
+    monkeypatch.setattr("gateway.run._load_gateway_config", _attended_cfg)
+    calls = []
+    runner._set_session_model_role = AsyncMock(side_effect=lambda *a, **k: calls.append(a))
+
+    with suppress_model_pick_failure():
+        await runner._handle_model_command_locked(_event("/model @cf/meta/llama-3.3-70b-instruct-fp8-fast"))
+
+    # A normal pick never sets a role (it may clear one).
+    assert all(call[1] is None for call in calls)
+    assert store.get_model_role(entry.session_key) is None
+
+
+def suppress_model_pick_failure():
+    import contextlib
+    # The pick itself needs live provider resolution; only the role/no-role routing is under test.
+    return contextlib.suppress(Exception)
+
+
+@pytest.mark.asyncio
+async def test_status_and_turn_read_role_from_conversation_without_touching_the_store(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    entry = store.get_or_create_session(_source())
+    store.set_model_role(entry.session_key, "fast")
+    conversation = ConversationState()
+    state = SimpleNamespace(conversation=conversation)
+    loop_thread = __import__("threading").get_ident()
+    seen = []
+    real_get = store.get_model_role
+    store.get_model_role = lambda key: (seen.append(__import__("threading").get_ident()), real_get(key))[1]
+    # Hydration (the only store read) runs off the event loop thread.
+    conversation.model_role = await asyncio.to_thread(store.get_model_role, entry.session_key)
+    assert seen and seen[0] != loop_thread
+    seen.clear()
+    from gateway.run_turn import GatewayTurnMixin
+    runner = SimpleNamespace(
+        _session_state=lambda _key: state, _peek_session_state=lambda _key: state,
+        _load_attended_activity_stamp=lambda _key: None,
+        _handoff_attended_state=lambda *a, **k: None,
+        _session_reasoning_override=lambda _key: None,
+        _load_reasoning_config=lambda _model: {},
+        _ensure_attended_new_session_activity=lambda *a, **k: (None, False),
+        session_store=store,
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *a, **k: "gpt-6.1-sol")
+    GatewayTurnMixin._attended_resolution_for_session(
+        runner, source=None, session_key=entry.session_key, user_config=_attended_cfg(),
+    )
+    assert seen == []

@@ -359,3 +359,94 @@ def test_inline_moa_nested_fallback_references_survive_unrelated_save():
     restored = preserve_model_preset_references(expanded, raw)
     assert restored["moa"]["aggregator"]["fallback_models"] == [{"model_preset": "fast"}]
     assert expand_model_presets(restored)["moa"] == expanded["moa"]
+
+
+CF_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+HF_ID = "@hf/thebloke/mistral-7b-instruct-v0.1-awq"
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("@fast", "fast"), ("@my-route_2", "my-route_2"), (" @fast ", "fast"),
+    (CF_ID, None), (HF_ID, None), ("@a.b", None), ("@a:b", None), ("@", None), ("fast", None), (None, None),
+])
+def test_preset_reference_rule_is_bare_name_only(value, expected):
+    from hermes_cli.model_presets import preset_ref_name
+    assert preset_ref_name(value) == expected
+
+
+def test_literal_at_model_ids_load_and_resolve_at_every_site(tmp_path, monkeypatch):
+    from hermes_cli import config as config_mod
+    from hermes_cli.model_preset_runtime import resolve_model_ref, validate_model_refs
+    home = tmp_path / "home"; home.mkdir()
+    raw = {
+        "model": {"default": CF_ID, "provider": "custom", "base_url": "https://cf.invalid/v1"},
+        "fallback_providers": [{"provider": "custom", "model": HF_ID, "base_url": "https://hf.invalid/v1"}],
+        "auxiliary": {"vision": {"provider": "custom", "model": CF_ID, "base_url": "https://cf.invalid/v1"}},
+        "delegation": {"provider": "custom", "model": HF_ID, "base_url": "https://hf.invalid/v1"},
+    }
+    (home / "config.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config_mod._RAW_CONFIG_CACHE.clear(); config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    cfg = config_mod.load_config()
+    assert cfg["model"]["default"] == CF_ID and cfg["model"]["base_url"] == "https://cf.invalid/v1"
+    assert cfg["fallback_providers"][0]["model"] == HF_ID
+    assert cfg["fallback_providers"][0]["base_url"] == "https://hf.invalid/v1"
+    assert cfg["auxiliary"]["vision"]["model"] == CF_ID
+    assert cfg["delegation"]["model"] == HF_ID and cfg["delegation"]["base_url"] == "https://hf.invalid/v1"
+    assert "model_preset" not in cfg["model"]
+    route = resolve_model_ref(CF_ID, raw)
+    assert (route.name, route.model, route.provider) == ("", CF_ID, "custom")
+    assert validate_model_refs(raw) == []
+    # An unknown bare reference still errors.
+    with pytest.raises(ModelPresetError):
+        resolve_model_ref("@nope", raw)
+
+
+def test_literal_at_model_id_expands_unchanged_in_string_sites():
+    config = {**routes(), "model": CF_ID, "fallback_providers": [HF_ID], "delegation": {"model": HF_ID}}
+    expanded = expand_model_presets(config)
+    assert expanded["model"] == CF_ID
+    assert expanded["delegation"]["model"] == HF_ID
+    assert expanded["fallback_providers"] == [HF_ID]
+
+
+def test_save_round_trip_keeps_authored_at_strings_and_injects_nothing(tmp_path, monkeypatch):
+    from hermes_cli import config as config_mod
+    home = tmp_path / "home"; home.mkdir()
+    raw = {**routes(),
+           "model": "@fast",
+           "delegation": {"model": "@primary", "max_concurrent_children": 3,
+                          "subagents": {"scout": {"model": "@fast"}}},
+           "auxiliary": {"vision": {"model": "@fast", "timeout": 20}},
+           "fallback_providers": ["@fast", "@fast"]}
+    (home / "config.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config_mod._RAW_CONFIG_CACHE.clear(); config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    loaded = config_mod.load_config()
+    assert loaded["model"]["default"] == "model-c"
+    loaded["display"]["show_thinking"] = False
+    config_mod.save_config(loaded)
+    saved = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert saved["model"] == "@fast"
+    assert saved["delegation"]["model"] == "@primary"
+    assert saved["delegation"]["subagents"]["scout"]["model"] == "@fast"
+    assert saved["delegation"]["max_concurrent_children"] == 3
+    assert saved["auxiliary"]["vision"]["model"] == "@fast"
+    assert saved["auxiliary"]["vision"]["timeout"] == 20
+    assert saved["fallback_providers"] == ["@fast", "@fast"]
+    assert "reasoning_effort" not in (saved.get("agent") or {})
+
+
+def test_save_round_trip_keeps_model_default_shorthand(tmp_path, monkeypatch):
+    from hermes_cli import config as config_mod
+    home = tmp_path / "home"; home.mkdir()
+    raw = {**routes(), "model": {"default": "@fast", "context_length": 4096}}
+    (home / "config.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config_mod._RAW_CONFIG_CACHE.clear(); config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    loaded = config_mod.load_config()
+    loaded["display"]["show_thinking"] = False
+    config_mod.save_config(loaded)
+    saved = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert saved["model"] == {"default": "@fast", "context_length": 4096}
+    assert "reasoning_effort" not in (saved.get("agent") or {})

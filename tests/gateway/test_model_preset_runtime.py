@@ -151,3 +151,41 @@ def test_gateway_string_at_model_keeps_preset_reasoning_effort():
     cfg = {"model_presets": {"primary": {"provider": "openrouter", "model": "m", "reasoning_effort": "high"}},
            "model": "@primary"}
     assert GatewayConfigLoadersMixin._load_reasoning_config(config=cfg) == {"enabled": True, "effort": "high"}
+
+
+def test_gateway_model_resolver_passes_literal_at_model_id_through():
+    from gateway.run import _resolve_gateway_model
+    cf = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    assert _resolve_gateway_model({"model": cf}) == cf
+    assert _resolve_gateway_model({"model": {"default": cf, "provider": "custom",
+                                              "base_url": "https://cf.invalid/v1"}}) == cf
+
+
+def _reasoning_cfg(**preset):
+    return {
+        "model": {"model_preset": "p"},
+        "model_presets": {"p": {"provider": "openrouter", "model": "m-1", **preset}},
+        "agent": {"reasoning_effort": "low", "reasoning_overrides": {"m-1": "high"}},
+    }
+
+
+def test_reasoning_config_preset_effort_outranks_per_model_override_and_global():
+    from gateway.run import GatewayRunner
+    result = GatewayRunner._load_reasoning_config("m-1", config=_reasoning_cfg(reasoning_effort="minimal"))
+    assert result == {"enabled": True, "effort": "minimal"}
+
+
+def test_reasoning_config_preset_without_effort_defers_to_per_model_override():
+    from gateway.run import GatewayRunner
+    result = GatewayRunner._load_reasoning_config("m-1", config=_reasoning_cfg())
+    assert result == {"enabled": True, "effort": "high"}
+    cfg = _reasoning_cfg(); cfg["agent"]["reasoning_overrides"] = {}
+    assert GatewayRunner._load_reasoning_config("m-1", config=cfg) == {"enabled": True, "effort": "low"}
+
+
+def test_reasoning_config_propagates_invalid_preset_error():
+    from gateway.run import GatewayRunner
+    from hermes_cli.model_presets import ModelPresetError
+    cfg = {"model": {"model_preset": "missing"}, "model_presets": {}}
+    with pytest.raises(ModelPresetError):
+        GatewayRunner._load_reasoning_config("", config=cfg)

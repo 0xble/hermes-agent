@@ -2997,13 +2997,15 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     cfg = _load_gateway_runtime_config(config)
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
-        if model_cfg.strip().startswith("@"):
+        from hermes_cli.model_presets import preset_ref_name
+        if preset_ref_name(model_cfg):
             from hermes_cli.model_preset_runtime import resolve_model_ref
             return resolve_model_ref(model_cfg, cfg).model
         return model_cfg
     elif isinstance(model_cfg, dict):
         raw = model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("model_preset") or ""
-        if isinstance(raw, dict) or (isinstance(raw, str) and raw.startswith("@")):
+        from hermes_cli.model_presets import preset_ref_name
+        if isinstance(raw, dict) or preset_ref_name(raw):
             from hermes_cli.model_preset_runtime import resolve_model_ref
             return resolve_model_ref(raw, cfg).model
         return raw

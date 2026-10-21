@@ -179,3 +179,16 @@ def test_unknown_preset_fails_the_run_instead_of_using_literal(tmp_path, monkeyp
         job["model"] = job_model
     with pytest.raises(ModelPresetError, match="missing"):
         scheduler._load_cron_job_config(job, "m", "m")
+
+
+def test_cron_literal_at_model_id_is_not_treated_as_a_preset(tmp_path, monkeypatch):
+    cf = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"default": "base-model", "provider": "custom", "base_url": "https://cf.invalid/v1"},
+    }))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job = {"id": "cf", "name": "cf", "prompt": "hello", "model": cf}
+    assert scheduler._load_cron_job_config(job, job["id"], job["name"]).model == cf
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"cron": {"model": cf}, "model": {"default": "base-model"}}))
+    nojob = {"id": "cf2", "name": "cf2", "prompt": "hello"}
+    assert scheduler._load_cron_job_config(nojob, nojob["id"], nojob["name"]).model == cf

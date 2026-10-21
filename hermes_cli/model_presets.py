@@ -5,6 +5,7 @@ an ordinary inline route before provider and credential resolution begins.
 """
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +18,21 @@ _MAIN_FORBIDDEN_REFERENCE_FIELDS = frozenset({
     "base_url", "api_base", "api_key", "api", "key_env", "api_key_env", "api_mode", "transport",
 })
 _EMPTY_DEFAULT_ROUTE_FIELDS = _MAIN_FORBIDDEN_REFERENCE_FIELDS | frozenset({"extra_body"})
+
+
+_PRESET_REF = re.compile(r"^@([A-Za-z0-9_-]+)$")
+
+
+def preset_ref_name(value: Any) -> str | None:
+    """Return the preset name when ``value`` is a bare ``@name`` reference, else ``None``.
+
+    Anything else starting with ``@`` (``@cf/meta/llama-3.3-70b``, ``@hf/...``) is a literal
+    model ID: a reference never contains ``/``, ``.`` or ``:``.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _PRESET_REF.match(value.strip())
+    return match.group(1) if match else None
 
 
 class ModelPresetError(ValueError):
@@ -96,8 +112,8 @@ def _definitions(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _reference(site: Any, path: str, definitions: dict[str, dict[str, Any]], *, conflicts: set[str]) -> dict[str, Any] | None:
     # String references are the shorthand accepted at every reference site. Normalize them
     # here so all sites retain identical validation, conflict, and expansion behavior.
-    if isinstance(site, str) and site.strip().startswith("@"):
-        site = {"model_preset": site.strip()[1:]}
+    if preset_ref_name(site):
+        site = {"model_preset": preset_ref_name(site)}
     if not isinstance(site, dict) or "model_preset" not in site:
         return None
     name = _text(site["model_preset"], path, "model_preset")
@@ -131,27 +147,46 @@ def _route_fields(route: dict[str, Any], *, fallback_key: str | None = None) -> 
 
 def _lift_model_shorthand(site: Any) -> Any:
     """Treat ``@name`` (bare, or as the ``model`` value of a mapping) as ``{model_preset: name}``."""
-    if isinstance(site, str) and site.strip().startswith("@"):
-        return {"model_preset": site.strip()[1:]}
+    if preset_ref_name(site):
+        return {"model_preset": preset_ref_name(site)}
     if isinstance(site, dict) and "model_preset" not in site:
-        value = site.get("model")
-        if isinstance(value, str) and value.strip().startswith("@"):
+        name = preset_ref_name(site.get("model"))
+        if name:
             lifted = {k: v for k, v in site.items() if k != "model"}
-            lifted["model_preset"] = value.strip()[1:]
+            lifted["model_preset"] = name
             return lifted
     return site
 
 
+def _in_authored_form(original: Any, restored: Any, keys: tuple[str, ...] = ("model",)) -> Any:
+    """Put a restored ``{model_preset: X}`` site back in the shorthand the user wrote.
+
+    ``original`` is the authored site (``"@X"`` string, or a mapping carrying ``@X`` in one of
+    ``keys``). Mapping-form references (``model_preset: X``) are already restored verbatim.
+    """
+    if not isinstance(restored, dict) or "model_preset" not in restored:
+        return restored
+    if isinstance(original, str) and preset_ref_name(original):
+        return original if set(restored) == {"model_preset"} else restored
+    if isinstance(original, dict) and "model_preset" not in original:
+        for key in keys:
+            if preset_ref_name(original.get(key)):
+                result = {k: v for k, v in restored.items() if k != "model_preset"}
+                result[key] = original[key]
+                return result
+    return restored
+
+
 def _expand_model(config: dict[str, Any], definitions: dict[str, dict[str, Any]]) -> None:
     model = config.get("model")
-    if isinstance(model, str) and model.strip().startswith("@"):
-        model = {"model_preset": model.strip()[1:]}
+    if preset_ref_name(model):
+        model = {"model_preset": preset_ref_name(model)}
         config["model"] = model
     if isinstance(model, dict):
         for key in ("default", "model"):
-            value = model.get(key)
-            if "model_preset" not in model and isinstance(value, str) and value.strip().startswith("@"):
-                model["model_preset"] = value.strip()[1:]
+            name = preset_ref_name(model.get(key))
+            if "model_preset" not in model and name:
+                model["model_preset"] = name
                 model.pop(key, None)
                 break
     if not isinstance(model, dict):
@@ -338,6 +373,21 @@ def expand_model_presets(config: Any) -> dict[str, Any]:
     return expanded
 
 
+def _lift_main_model(model: Any) -> Any:
+    """Authored top-level ``model`` with any ``@X`` shorthand lifted to ``model_preset``."""
+    name = preset_ref_name(model)
+    if name:
+        return {"model_preset": name}
+    if isinstance(model, dict) and "model_preset" not in model:
+        for key in ("default", "model"):
+            name = preset_ref_name(model.get(key))
+            if name:
+                lifted = {k: v for k, v in model.items() if k != key}
+                lifted["model_preset"] = name
+                return lifted
+    return model
+
+
 def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> dict[str, Any]:
     """Put unchanged named-route references back before a config write.
 
@@ -360,7 +410,8 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             return False
         return fallback_key is None or value(actual, fallback_key) == value(expected, fallback_key)
 
-    raw_model = authored.get("model")
+    original_model = authored.get("model")
+    raw_model = _lift_main_model(original_model)
     expected_model = expanded_authored.get("model")
     if isinstance(raw_model, dict) and "model_preset" in raw_model and isinstance(expected_model, dict):
         actual_model = result.get("model")
@@ -390,7 +441,7 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             restored_model["model_preset"] = raw_model["model_preset"]
             if raw_model.get("fallbacks") == []:
                 restored_model["fallbacks"] = []
-            result["model"] = restored_model
+            result["model"] = _in_authored_form(original_model, restored_model, ("default", "model"))
             expected_agent = (expanded_authored.get("agent") or {}).get("reasoning_effort")
             raw_agent = authored.get("agent")
             if (expected_agent is not None and not (isinstance(raw_agent, dict) and "reasoning_effort" in raw_agent)
@@ -402,7 +453,8 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
                 result.pop("fallback_providers", None)
 
     def restore_site(container: dict[str, Any], raw_container: Any, expected_container: Any, key: str, fallback_key: str | None = None) -> None:
-        raw_site = raw_container.get(key) if isinstance(raw_container, dict) else None
+        original_site = raw_container.get(key) if isinstance(raw_container, dict) else None
+        raw_site = _lift_model_shorthand(original_site)
         expected_site = expected_container.get(key) if isinstance(expected_container, dict) else None
         actual_site = container.get(key)
         if isinstance(raw_site, dict) and "model_preset" in raw_site and same_route(actual_site, expected_site, fallback_key):
@@ -423,7 +475,7 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             restored["model_preset"] = raw_site["model_preset"]
             if raw_site.get("fallbacks") == []:
                 restored["fallbacks"] = []
-            container[key] = restored
+            container[key] = _in_authored_form(original_site, restored)
 
     restore_site(result, authored, expanded_authored, "delegation", "fallback_providers")
     actual_delegation = result.get("delegation")
@@ -444,7 +496,10 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
         for key in raw:
             restore_site(actual, raw, expected, key, "fallback_chain")
 
-    def restore_slot(actual_slot: Any, raw_slot: Any, expected_slot: Any) -> Any:
+    def restore_slot(actual_slot: Any, raw_slot: Any, expected_slot: Any, *, shorthand: bool = False) -> Any:
+        original_slot = raw_slot
+        if shorthand:
+            raw_slot = _lift_model_shorthand(raw_slot)
         if not (isinstance(actual_slot, dict) and isinstance(raw_slot, dict) and isinstance(expected_slot, dict)):
             return actual_slot
         if "model_preset" not in raw_slot:
@@ -470,17 +525,17 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
         restored["model_preset"] = raw_slot["model_preset"]
         if raw_slot.get("fallback_models") == []:
             restored["fallback_models"] = []
-        return restored
+        return _in_authored_form(original_slot, restored) if shorthand else restored
 
     for fallback_key in ("fallback_providers", "fallback_model"):
         raw_entries = authored.get(fallback_key)
         actual_entries = result.get(fallback_key)
         expected_entries = expanded_authored.get(fallback_key)
-        raw_list = raw_entries if isinstance(raw_entries, list) else [raw_entries] if isinstance(raw_entries, dict) else None
+        raw_list = raw_entries if isinstance(raw_entries, list) else [raw_entries] if isinstance(raw_entries, (dict, str)) else None
         actual_list = actual_entries if isinstance(actual_entries, list) else [actual_entries] if isinstance(actual_entries, dict) else None
         expected_list = expected_entries if isinstance(expected_entries, list) else [expected_entries] if isinstance(expected_entries, dict) else None
         if raw_list is not None and actual_list is not None and expected_list is not None and len(raw_list) == len(actual_list) == len(expected_list):
-            restored = [restore_slot(actual, raw, expected) for actual, raw, expected in zip(actual_list, raw_list, expected_list)]
+            restored = [restore_slot(actual, raw, expected, shorthand=True) for actual, raw, expected in zip(actual_list, raw_list, expected_list)]
             result[fallback_key] = restored if isinstance(actual_entries, list) else restored[0]
 
     raw_moa, actual_moa, expected_moa = authored.get("moa"), result.get("moa"), expanded_authored.get("moa")

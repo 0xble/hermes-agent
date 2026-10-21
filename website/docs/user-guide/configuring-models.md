@@ -25,6 +25,12 @@ On a brand-new install the bundled default config has `model: ""` (an empty stri
 
 Use `model_presets` to name a provider/model route and refer to it with the canonical
 `model_preset: NAME` form or the `@NAME` shorthand. Presets are expanded at the point each consumer runs.
+
+The `@NAME` shorthand is a preset reference only when the whole value is `@` followed by letters, digits,
+`_` or `-`. A value containing `/`, `.` or `:` is a literal model ID and is passed through unchanged with its
+own provider and `base_url`, so IDs such as `@cf/meta/llama-3.3-70b-instruct-fp8-fast` and `@hf/...` work
+as written. An unknown bare name such as `@missing` is still an error. Saving the config keeps `@NAME`
+strings exactly as you wrote them.
 Cron jobs re-read and resolve their route at fire time, while live gateway roles resolve on each request.
 Editing a preset therefore affects future calls without rewriting the stored job or session role.
 

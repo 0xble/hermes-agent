@@ -721,7 +721,8 @@ class GatewayModelCommandsMixin:
                 continue
             override = getattr(entry, "model_override", None) or {}
             model = str(override.get("model") or "").strip()
-            if not model or model.startswith("@"):
+            from hermes_cli.model_presets import preset_ref_name
+            if not model or preset_ref_name(model):
                 continue
             try:
                 await asyncio.to_thread(store.set_model_role, entry.session_key, role, clear_overrides=True)
@@ -826,7 +827,8 @@ class GatewayModelCommandsMixin:
                          failures=len(failures), detail=detail)
             count = await self._reset_all_session_overrides()
             return t("gateway.model.reset_all_done", count=count)
-        if request.target.strip().startswith("@"):
+        from hermes_cli.model_presets import preset_ref_name
+        if request.target.strip() == "@" or preset_ref_name(request.target):
             from hermes_cli.model_preset_runtime import resolve_model_ref, ModelPresetError
             role = request.target.strip()[1:].strip().lower()
             if (request.is_global or request.is_session or request.is_once
