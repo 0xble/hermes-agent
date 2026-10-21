@@ -42,6 +42,12 @@ def _is_machine_ingress(source: Any) -> bool:
             or str(getattr(source, "user_id", "") or "").startswith("webhook:"))
 
 
+# Gateway-stamped notification provenance; an event carrying one is never human ingress.
+_NOTIFICATION_ORIGINS = frozenset({
+    "relay_delivery", "cron_delivery", "process_registry_synthetic", "delegation_result",
+})
+
+
 def _is_human_event(event: Any) -> bool:
     """Recognize positively identified human ingress, default-deny."""
     if event is None or getattr(event, "internal", False):
@@ -58,6 +64,9 @@ def _is_human_event(event: Any) -> bool:
     if not getattr(event, "allow_gateway_control", True):
         return False
     if getattr(event, "_heartbeat_session_id", None):
+        return False
+    metadata = getattr(event, "metadata", None) or {}
+    if metadata.get("notification_origin") in _NOTIFICATION_ORIGINS or metadata.get("cron_delivery"):
         return False
     return not is_goal_continuation_event(event)
 

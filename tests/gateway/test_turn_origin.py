@@ -1,3 +1,5 @@
+import pytest
+
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, turn_origin_for_event
 from gateway.session import SessionSource
@@ -82,3 +84,66 @@ def test_webhook_ingress_is_not_user():
 
 def test_legacy_loop_wakeup_marker_is_goal_loop():
     assert turn_origin_for_event(_event(internal=True, metadata={"hermes_loop_wakeup": True})) == "goal_loop"
+
+
+def test_non_internal_event_with_notification_origin_is_not_user():
+    for origin, expected in (
+        ("relay_delivery", "relay"),
+        ("cron_delivery", "cron"),
+        ("process_registry_synthetic", "process"),
+        ("delegation_result", "process"),
+    ):
+        assert turn_origin_for_event(_event(metadata={"notification_origin": origin})) == expected
+    assert turn_origin_for_event(_event(metadata={"cron_delivery": True})) == "cron"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("head", "pending", "expected"), [
+    ("user", {"internal": True, "metadata": {"notification_origin": "process_registry_synthetic"}}, "process"),
+    ("process", {"internal": False, "metadata": {}}, "user"),
+])
+async def test_queued_followup_runs_with_its_own_origin_and_restores_head(head, pending, expected):
+    """A drained follow-up is its own turn: plugins must see its origin, not the chain head's."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session_context import bound_turn_origin, set_turn_origin
+
+    seen = []
+
+    async def _run_agent(**_kwargs):
+        seen.append(bound_turn_origin())
+        return {"final_response": "done", "messages": []}
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(group_sessions_per_user=False)
+    runner.adapters = {}
+    runner._MAX_INTERRUPT_DEPTH = 8
+    runner._run_agent = _run_agent
+    runner._run_agent_deliver_first_response = AsyncMock()
+    runner._session_key_for_source = MagicMock(return_value="agent:main:local:dm:chat")
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="the follow-up")
+    runner._reply_anchor_for_event = MagicMock(return_value=None)
+    runner._delivery_adapter_for = MagicMock(return_value=None)
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    runner._persist_prompt_pins = AsyncMock()
+    runner._pinned_channel_inputs = lambda key, prompt, source, internal=False: (prompt, source)
+    pending_event = _event(**pending)
+    turn_ctx = SimpleNamespace(
+        source=pending_event.source, session_id="sid", session_key="agent:main:local:dm:chat",
+        run_generation=1, _interrupt_depth=0, history=[], _status_thread_metadata=None,
+        context_prompt=None, result_holder=[None],
+    )
+    tokens = set_session_vars(turn_origin=head)
+    try:
+        await GatewayRunner._run_agent_queued_followup(
+            runner, turn_ctx, adapter=None, pending="the follow-up", pending_event=pending_event,
+            response="resp", result={"interrupted": True, "messages": []}, stream_task=None,
+        )
+        assert seen == [expected]
+        assert bound_turn_origin() == head
+    finally:
+        set_turn_origin("unknown")
+        clear_session_vars(tokens)

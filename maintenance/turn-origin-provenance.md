@@ -12,7 +12,9 @@ The selected origin reaches `pre_llm_call` as `turn_origin` and is bound task-lo
 
 Fork patch identity: `turn-origin-provenance`.
 
-Source surfaces are `gateway/platforms/event.py`, `gateway/run_turn.py`, `gateway/session_context.py`, `gateway/run.py`, `gateway/run_turn_runner.py`, the agent turn plumbing, `cron/scheduler.py`, and the focused gateway and agent tests.
+Source surfaces are `gateway/platforms/event.py`, `gateway/run_turn.py`, `gateway/session_context.py`, `gateway/run.py`, `gateway/run_turn_runner.py`, the agent turn plumbing, `cron/scheduler.py`, and the focused gateway and agent tests. Each drained queued follow-up rebinds the origin of its own event for its turn and restores the chain head's origin afterward.
+
+API-server turns (`gateway/platforms/api_server.py`) bind through `set_session_vars` without an origin and stay `unknown`. That is deliberate default-deny: API callers are not positively identified human ingress.
 
 ## Verification
 
