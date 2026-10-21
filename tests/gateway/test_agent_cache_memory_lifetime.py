@@ -115,6 +115,41 @@ def test_eviction_drains_memory_once_and_refetches_fresh_manager(route, monkeypa
         manager.shutdown_all()
 
 
+def test_soft_eviction_commit_serializes_with_session_shutdown(monkeypatch):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    manager = Mock()
+    agent = SimpleNamespace(_memory_manager=manager, _session_messages=[{"role": "user", "content": "hello"}])
+    agent.shutdown_memory_provider = AIAgent.shutdown_memory_provider.__get__(agent, type(agent))
+    monkeypatch.setattr("run_agent._notify_context_engine_session_end", lambda *_args: None)
+    commit_started = threading.Event()
+    allow_commit = threading.Event()
+    events = []
+
+    def commit(_messages=None):
+        events.append("commit-start")
+        commit_started.set()
+        assert allow_commit.wait(5)
+        events.append("commit-end")
+
+    agent.commit_memory_session = commit
+    manager.on_session_end.side_effect = lambda _messages: events.append("shutdown-hook")
+    manager.shutdown_all.side_effect = lambda: events.append("shutdown")
+
+    commit_thread = threading.Thread(target=runner._commit_memory_before_soft_evict, args=(agent, "key"))
+    commit_thread.start()
+    assert commit_started.wait(5)
+    shutdown_thread = threading.Thread(target=agent.shutdown_memory_provider, args=([{"role": "user"}],))
+    shutdown_thread.start()
+    shutdown_thread.join(0.3)
+    assert shutdown_thread.is_alive(), "/new shutdown claimed the manager while the eviction commit was running"
+    assert not manager.on_session_end.called
+    allow_commit.set()
+    commit_thread.join(5)
+    shutdown_thread.join(5)
+
+    assert events == ["commit-start", "commit-end", "shutdown-hook", "shutdown"]
+
+
 class _CountingProvider(MemoryProvider):
     """Records lifecycle hooks; ``shutdown_delay`` models a slow bounded worker join."""
 

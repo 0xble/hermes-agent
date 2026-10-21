@@ -1075,22 +1075,32 @@ class GatewayAgentCacheMixin:
             target(*args)
 
     def _commit_memory_before_soft_evict(self, agent: Any, key: str) -> None:
-        """Commit the live transcript to memory providers before resource-only eviction."""
-        # No external memory provider (``_memory_manager`` None) — nothing to commit. An agent whose
-        # shutdown_memory_provider() already ran (/new cleanup) has fired on_session_end once already.
-        if agent is None or not hasattr(agent, "commit_memory_session") or getattr(agent, "_memory_manager", None) is None:
+        """Commit the live transcript to memory providers before resource-only eviction.
+
+        The lifecycle check and commit share the shutdown handoff lock. Otherwise /new or /reset can claim
+        shutdown after the check but before the commit, causing duplicate or failed on_session_end work.
+        """
+        if agent is None or not hasattr(agent, "commit_memory_session"):
             return
-        if getattr(agent, "_memory_provider_shutdown", False) is True:
-            return
+        from agent.memory_manager import memory_handoff_lock
         try:
-            messages = getattr(agent, "_session_messages", None)
-            agent.commit_memory_session(messages if isinstance(messages, list) else None)
-            logger.debug(
-                "Committed on_session_end extraction before soft-evicting "
-                "session=%s (resource eviction)", key,
-            )
-        except Exception as _e:
-            logger.debug("Pre-evict memory commit failed for %s: %s", key, _e)
+            lock = memory_handoff_lock(agent)
+        except Exception:  # no instance __dict__ (slotted test double)
+            lock = nullcontext()
+        with lock:
+            # No external memory provider (``_memory_manager`` None) — nothing to commit. An agent whose
+            # shutdown_memory_provider() already ran (/new cleanup) has fired on_session_end once already.
+            if getattr(agent, "_memory_manager", None) is None or getattr(agent, "_memory_provider_shutdown", False) is True:
+                return
+            try:
+                messages = getattr(agent, "_session_messages", None)
+                agent.commit_memory_session(messages if isinstance(messages, list) else None)
+                logger.debug(
+                    "Committed on_session_end extraction before soft-evicting "
+                    "session=%s (resource eviction)", key,
+                )
+            except Exception as _e:
+                logger.debug("Pre-evict memory commit failed for %s: %s", key, _e)
 
     def _commit_then_release_soft(self, agent: Any, key: str, *, retired: Optional[list] = None) -> None:
         """Commit end-of-session memory (if warranted), then soft-release — on the daemon eviction
