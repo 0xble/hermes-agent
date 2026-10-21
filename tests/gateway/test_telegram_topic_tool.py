@@ -826,3 +826,5 @@ async def test_role_resolves_from_routed_profile_config_under_multiplex(home, mo
     created = await create_topic_session(runner, _source(), TopicSpec(name="Held", icon="💡", model="@attended"))
     assert created["model"] == "profile-model"
     assert seen and all(p == home.path / "profiles" / "work" / "config.yaml" for p in seen)
+    # The role branch's reasoning readback uses the same routed profile as the route.
+    assert created["effective_effort"] == "medium"

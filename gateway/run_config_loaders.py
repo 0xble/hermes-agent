@@ -154,9 +154,11 @@ class GatewayConfigLoadersMixin:
         """Reasoning effort from the owning profile's config.yaml via
         :func:`hermes_constants.resolve_reasoning_config`.
 
-        Per-model override > global ``agent.reasoning_effort``; YAML False = disabled. Empty
-        ``model`` uses ``model.default``. ``profile_home`` is supplied by multiplexed callers so
-        readback never falls through to the launch profile's config.
+        Precedence lives in that resolver: the default route's declared preset
+        effort, then the per-model override, then global ``agent.reasoning_effort``.
+        YAML False = disabled. Empty ``model`` uses the default route.
+        ``profile_home`` is supplied by multiplexed callers so readback never
+        falls through to the launch profile's config.
 
         Closes #21256.
         """
@@ -165,16 +167,6 @@ class GatewayConfigLoadersMixin:
         if config is None:
             config = (_load_gateway_config() if profile_home is None
                       else _load_gateway_config(profile_home / "config.yaml"))
-        from hermes_cli.model_preset_runtime import resolve_default_route
-        if isinstance(config, dict):
-            route = resolve_default_route(config)
-            try:
-                # A preset that declares an effort outranks per-model agent.reasoning_overrides
-                # and agent.reasoning_effort; a preset without one defers to them.
-                if (not model or model == route.model) and route.reasoning_effort:
-                    return {"enabled": route.reasoning_effort != "none", "effort": route.reasoning_effort}
-            except Exception:
-                logger.warning("Could not resolve reasoning effort for the default model route", exc_info=True)
         return resolve_reasoning_config(config, model)
 
     @staticmethod

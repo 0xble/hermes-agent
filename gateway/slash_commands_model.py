@@ -698,20 +698,15 @@ class GatewayModelCommandsMixin:
         store = getattr(self, "session_store", None)
         if store is not None:
             await asyncio.to_thread(store.set_model_role, session_key, role, clear_overrides=bool(role))
-        state = self._session_state(session_key)
-        state.conversation.model_role = role
-        if role:
-            state.conversation.model_override = None
-            state.conversation.reasoning_override = None
-            self._session_model_overrides.pop(session_key, None)
-            self._session_reasoning_overrides.pop(session_key, None)
-        self._evict_cached_agent(session_key)
+        self._apply_role_memory(session_key, role)
 
     async def _migrate_telegram_model_overrides_to_role(self, role: str) -> tuple[list[str], list[str]]:
         """Convert concrete model overrides on existing Telegram sessions in the live store.
 
         This is deliberately not a snapshot/database scan. The store is the authority for
-        the current routing keys, and each conversion clears the concrete override atomically.
+        the current routing keys. Eligible keys are converted in one routing snapshot and
+        persist; in-memory state is then updated per session. A store without the batch
+        writer falls back to the per-session setter.
         """
         converted: list[str] = []
         failures: list[str] = []
@@ -722,6 +717,7 @@ class GatewayModelCommandsMixin:
             entries = await asyncio.to_thread(store.list_sessions)
         except Exception as exc:
             return [], [str(exc)]
+        eligible = []
         for entry in entries:
             if str(getattr(getattr(entry, "platform", None), "value", "")) != "telegram":
                 continue
@@ -731,12 +727,34 @@ class GatewayModelCommandsMixin:
             model = str(override.get("model") or "").strip()
             if not model or preset_ref_name(model):
                 continue
+            eligible.append(entry.session_key)
+        batch = getattr(store, "set_model_roles", None)
+        if callable(batch) and eligible:
             try:
-                await self._set_session_model_role(entry.session_key, role)
-                converted.append(entry.session_key)
+                persisted = await asyncio.to_thread(batch, eligible, role, clear_overrides=True)
             except Exception as exc:
-                failures.append(f"{entry.session_key}: {exc}")
+                return [], [str(exc)]
+            converted = list(persisted) if isinstance(persisted, list) else list(eligible)
+            for session_key in converted:
+                self._apply_role_memory(session_key, role)
+            return converted, failures
+        for session_key in eligible:
+            try:
+                await self._set_session_model_role(session_key, role)
+                converted.append(session_key)
+            except Exception as exc:
+                failures.append(f"{session_key}: {exc}")
         return converted, failures
+
+    def _apply_role_memory(self, session_key: str, role: Optional[str]) -> None:
+        state = self._session_state(session_key)
+        state.conversation.model_role = role
+        if role:
+            state.conversation.model_override = None
+            state.conversation.reasoning_override = None
+            self._session_model_overrides.pop(session_key, None)
+            self._session_reasoning_overrides.pop(session_key, None)
+        self._evict_cached_agent(session_key)
 
     async def _reset_all_session_overrides(self) -> int:
         """Clear persisted and in-memory model/reasoning picks without changing a live turn's route."""

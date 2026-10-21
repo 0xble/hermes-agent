@@ -224,9 +224,29 @@ def _cli_config_defaults():
 
 def _merge_file_config(defaults: dict[str, Any], file_config: dict[str, Any]) -> None:
     """Overlay a parsed config file onto *defaults* in place (model normalization, deep merge, legacy keys)."""
-    # model: string (new format) or dict (old format with default/base_url)
+    # model: string (new format) or dict (old format with default/base_url).
+    # Resolve @name and {model_preset: name} here so every CLI reader of
+    # model.default sees the preset's concrete model and provider.
     if "model" in file_config:
-        if isinstance(file_config["model"], str):
+        from hermes_cli.model_preset_runtime import resolve_default_route
+        from hermes_cli.model_presets import ModelPresetError
+
+        try:
+            route = resolve_default_route(file_config)
+        except ModelPresetError:
+            route = None
+        if route is not None and route.model and route.name:
+            model = defaults["model"]
+            if isinstance(file_config["model"], dict):
+                model.update(file_config["model"])
+            model["default"] = route.model
+            if route.provider:
+                model["provider"] = route.provider
+            if route.reasoning_effort:
+                model["reasoning_effort"] = route.reasoning_effort
+            model.pop("model_preset", None)
+            model.pop("model", None)
+        elif isinstance(file_config["model"], str):
             defaults["model"]["default"] = file_config["model"]
         elif isinstance(file_config["model"], dict):
             defaults["model"].update(file_config["model"])
@@ -260,8 +280,9 @@ def load_cli_config() -> dict[str, Any]:
 
     ``HERMES_IGNORE_USER_CONFIG=1`` skips the user config entirely (``.env`` still loads).
     """
-    from cli import _cli_config_defaults, _hermes_home, _merge_file_config, _mirror_config_to_env
-    config_path = _hermes_home / 'config.yaml'
+    from cli import _cli_config_defaults, _merge_file_config, _mirror_config_to_env
+    from hermes_constants import get_hermes_home
+    config_path = get_hermes_home() / 'config.yaml'
     if not config_path.exists() or os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
         config_path = Path(__file__).parent / 'cli-config.yaml'
 

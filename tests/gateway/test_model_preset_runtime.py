@@ -259,6 +259,22 @@ def test_resolve_default_route_accepts_all_authored_shapes():
     )
 
 
+def test_shared_resolver_and_gateway_loader_agree_on_preset_effort():
+    """Gateway must not keep its own precedence copy."""
+    from gateway.run import GatewayRunner
+    from hermes_constants import resolve_reasoning_config
+
+    cfg = {
+        "model": "@coding",
+        "model_presets": {"coding": {"provider": "openrouter", "model": "coding-model", "reasoning_effort": "high"}},
+        "agent": {"reasoning_effort": "low", "reasoning_overrides": {"coding-model": "low"}},
+    }
+    assert GatewayRunner._load_reasoning_config("coding-model", config=cfg) == resolve_reasoning_config(cfg, "coding-model")
+    assert GatewayRunner._load_reasoning_config(config=cfg) == {"enabled": True, "effort": "high"}
+    # A non-default model does not inherit the default route's preset effort.
+    assert GatewayRunner._load_reasoning_config("other", config=cfg) == {"enabled": True, "effort": "low"}
+
+
 def test_model_switch_context_uses_preset_default_route(tmp_path, monkeypatch):
     from gateway.slash_commands_model import _ModelSwitchContext
     from gateway import run as gateway_run

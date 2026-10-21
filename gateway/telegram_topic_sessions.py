@@ -420,6 +420,11 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
     if model and isinstance(model, tuple) and model and model[0] == "role":
         route = _resolve_topic_model_ref("@" + model[1], dest, runner)
         effective_model, effective_provider = route.model, route.provider
+        # The role was resolved from the routed profile; the reasoning readback
+        # must use that same profile, not the launch profile.
+        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
+                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
+            profile_home = runner._resolve_profile_home_for_source(dest)
     else:
         effective_model = getattr(model[1], "new_model", None) if model else None
         effective_provider = getattr(model[1], "target_provider", None) if model else None
@@ -500,6 +505,11 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
     if model and isinstance(model, tuple) and model and model[0] == "role":
         route = _resolve_topic_model_ref("@" + model[1], dest, runner)
         effective_model, effective_provider = route.model, route.provider
+        # The role was resolved from the routed profile; the reasoning readback
+        # must use that same profile, not the launch profile.
+        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
+                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
+            profile_home = runner._resolve_profile_home_for_source(dest)
     else:
         effective_model = getattr(model[1], "new_model", None) if model else None
         effective_provider = getattr(model[1], "target_provider", None) if model else None

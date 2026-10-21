@@ -476,6 +476,195 @@ def test_preset_effort_outranks_agent_reasoning_effort_on_every_reader(tmp_path,
     assert resolve_default_route(runtime).reasoning_effort == "medium"
 
 
+HIGH = {"enabled": True, "effort": "high"}
+
+
+def _preset_high_agent_low(**model):
+    """Preset declares high; agent.reasoning_effort is low and the override is low."""
+    return {
+        "model": model or "@coding",
+        "model_presets": {
+            "coding": {"provider": "openrouter", "model": "coding-model", "reasoning_effort": "high"},
+        },
+        "agent": {"reasoning_effort": "low", "reasoning_overrides": {"coding-model": "low"}},
+    }
+
+
+def test_preset_effort_agrees_across_cli_tui_cron_fallback_and_switch_back(tmp_path, monkeypatch):
+    """Preset high + agent low must resolve high on every default-route reader.
+
+    Session override stays with the caller. The shared resolver, CLI startup,
+    TUI startup, a cron job on the default route, fallback activation, and
+    switch_model back to the default model all agree.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from agent.agent_runtime_helpers import switch_model
+    from agent.chat_completion_helpers import _reresolve_fallback_reasoning_config
+    from cron.scheduler import _resolve_job_reasoning_config
+    from hermes_cli.cli_config_load import load_cli_config
+    from hermes_cli.cli_init_mixin import CLIInitMixin
+    from hermes_cli.model_preset_runtime import resolve_default_route
+    from hermes_constants import resolve_reasoning_config
+    from tui_gateway import server as tui_server
+
+    authored = _preset_high_agent_low()
+    home = tmp_path / "agree"
+    home.mkdir()
+    (home / "config.yaml").write_text(yaml.safe_dump(authored), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
+    import cli as cli_mod
+    monkeypatch.setattr(cli_mod, "CLI_CONFIG", load_cli_config())
+
+    assert resolve_reasoning_config(authored) == HIGH
+    assert resolve_reasoning_config(authored, "coding-model") == HIGH
+    # A non-default model keeps the per-model override; the preset does not leak.
+    assert resolve_reasoning_config(authored, "other-model") == {"enabled": True, "effort": "low"}
+
+    cli_cfg = load_cli_config()
+    assert resolve_default_route(cli_cfg).model == "coding-model"
+    assert resolve_reasoning_config(cli_cfg, "coding-model") == HIGH
+
+    cli = SimpleNamespace()
+    CLIInitMixin._init_model_and_provider(cli, None, None, None, None)
+    assert (cli.model, cli.requested_provider) == ("coding-model", "openrouter")
+    CLIInitMixin._init_prompt_and_reasoning(cli, None)
+    assert cli.reasoning_config == HIGH
+
+    monkeypatch.setattr(tui_server, "_load_cfg", lambda: authored)
+    assert tui_server._resolve_model() == "coding-model"
+    assert tui_server._config_model_target() == ("coding-model", "openrouter")
+    assert tui_server._load_reasoning_config("coding-model") == HIGH
+    assert tui_server._load_reasoning_config() == HIGH
+
+    cron = _resolve_job_reasoning_config({}, authored, "coding-model", resolve_default_route(authored))
+    assert cron == HIGH
+
+    fallback = SimpleNamespace(model="coding-model", reasoning_config=None, reasoning_override=None)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: authored)
+    _reresolve_fallback_reasoning_config(fallback, {})
+    assert fallback.reasoning_config == HIGH
+
+    agent = MagicMock()
+    agent.model = "other-model"
+    agent.provider = "openrouter"
+    agent.base_url = ""
+    agent.api_mode = "chat_completions"
+    agent.api_key = "k"
+    agent._client_kwargs = {}
+    agent._use_prompt_caching = False
+    agent._use_native_cache_layout = False
+    agent.reasoning_config = {"enabled": True, "effort": "low"}
+    agent.reasoning_override = {"enabled": True, "effort": "low"}
+    agent._fallback_activated = False
+    agent._fallback_index = 0
+    agent._fallback_chain = []
+    agent._fallback_model = None
+    agent._config_context_length = None
+    agent._transport_cache = {}
+    agent.context_compressor = None
+    agent._cached_system_prompt = None
+    agent._anthropic_api_key = ""
+    agent._anthropic_base_url = None
+    agent._is_anthropic_oauth = False
+    agent._anthropic_prompt_cache_policy = MagicMock(return_value=(False, False))
+    agent._ensure_lmstudio_runtime_loaded = MagicMock()
+    agent._create_openai_client = MagicMock(return_value=MagicMock())
+    try:
+        switch_model(agent, new_model="coding-model", new_provider="openrouter", api_key="k",
+                     base_url="", api_mode="chat_completions")
+    except Exception:
+        pass
+    assert agent.reasoning_config == HIGH
+
+
+@pytest.mark.parametrize("model", ["@coding", {"default": "@coding"}, {"model_preset": "coding"}])
+def test_cli_and_tui_start_on_the_preset_route(tmp_path, monkeypatch, model):
+    """Both authored forms resolve to the preset's model and provider at startup."""
+    from types import SimpleNamespace
+
+    from hermes_cli.cli_config_load import load_cli_config
+    from hermes_cli.cli_init_mixin import CLIInitMixin
+    from tui_gateway import server as tui_server
+
+    authored = _preset_high_agent_low()
+    authored["model"] = model
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(yaml.safe_dump(authored), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+    import cli as cli_mod
+    loaded = load_cli_config()
+    monkeypatch.setattr(cli_mod, "CLI_CONFIG", loaded)
+
+    cli = SimpleNamespace()
+    CLIInitMixin._init_model_and_provider(cli, None, None, None, None)
+    assert (cli.model, cli.requested_provider) == ("coding-model", "openrouter")
+    assert loaded["model"]["default"] == "coding-model"
+    assert loaded["model"]["provider"] == "openrouter"
+
+    monkeypatch.setattr(tui_server, "_load_cfg", lambda: authored)
+    assert tui_server._resolve_model() == "coding-model"
+    assert tui_server._config_model_target() == ("coding-model", "openrouter")
+
+
+def test_literal_at_model_id_passes_through_cli_and_tui_startup(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from hermes_cli.cli_init_mixin import CLIInitMixin
+    from tui_gateway import server as tui_server
+
+    cf = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    authored = {"model": {"default": cf, "provider": "custom"}}
+    home = tmp_path / "literal"
+    home.mkdir()
+    (home / "config.yaml").write_text(yaml.safe_dump(authored), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+    import cli as cli_mod
+    from hermes_cli.cli_config_load import load_cli_config
+    monkeypatch.setattr(cli_mod, "_hermes_home", home)
+    monkeypatch.setattr(cli_mod, "CLI_CONFIG", load_cli_config())
+
+    cli = SimpleNamespace()
+    CLIInitMixin._init_model_and_provider(cli, None, None, None, None)
+    assert cli.model == cf
+
+    monkeypatch.setattr(tui_server, "_load_cfg", lambda: authored)
+    assert tui_server._resolve_model() == cf
+    assert tui_server._config_model_target()[0] == cf
+
+
+def test_literal_at_model_id_does_not_take_the_default_preset_effort():
+    """A literal ``@cf/...`` model is not the default route, even beside a preset default."""
+    from hermes_constants import resolve_reasoning_config
+
+    authored = _preset_high_agent_low()
+    authored["agent"]["reasoning_overrides"]["@cf/meta/llama-3.3-70b"] = "medium"
+    assert resolve_reasoning_config(authored, "@cf/meta/llama-3.3-70b") == {
+        "enabled": True, "effort": "medium",
+    }
+    assert resolve_reasoning_config(authored, "@coding") == HIGH
+
+
+def test_oneshot_resolves_preset_model_and_effort(tmp_path, monkeypatch):
+    from hermes_cli.oneshot import _configured_model, _resolve_model_and_provider
+    from hermes_constants import resolve_reasoning_config
+
+    authored = _preset_high_agent_low()
+    choice = _resolve_model_and_provider(authored, None, None)
+    assert choice.model == "coding-model"
+    assert _configured_model(authored["model"], authored) == "coding-model"
+    assert resolve_reasoning_config(authored, choice.model) == HIGH
+
+
 def test_agent_reasoning_effort_survives_a_preset_without_one():
     authored = {
         "model": "@coding",

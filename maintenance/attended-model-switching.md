@@ -70,6 +70,46 @@ routing and the Telegram topic tool.
 resolves it from freshly read config at use time: gateway sessions per request,
 cron per fire. Nothing stores the resolved model at creation.
 
+## Preset-aware readers
+
+A reader is preset-aware when it builds the main-route model, provider, or
+reasoning through `resolve_default_route` or `resolve_reasoning_config`, not
+from the raw `model.default` string. After this change:
+
+| Reader | Preset-aware |
+|---|---|
+| `hermes_constants.resolve_reasoning_config` | yes |
+| `hermes_cli.cli_config_load.load_cli_config` | yes |
+| `hermes_cli.cli_init_mixin.HermesCLI._init_model_and_provider` | yes |
+| `hermes_cli.cli_init_mixin._init_prompt_and_reasoning` | yes |
+| `hermes_cli.cli_model_switch_mixin._resolve_cli_reasoning` | yes |
+| `hermes_cli.cli_session_mixin._reset_model_to_config_default` | yes |
+| `hermes_cli.oneshot._resolve_model_and_provider` | yes |
+| `hermes_cli.model_switch` (interactive `/model`) | yes, via `resolve_model_ref` |
+| `tui_gateway.server._resolve_model` | yes |
+| `tui_gateway.server._config_model_target` | yes |
+| `tui_gateway.server._load_reasoning_config` | yes |
+| `gateway.run._resolve_gateway_model` | yes |
+| `gateway.run_config_loaders._load_reasoning_config` | yes, delegates to the shared resolver |
+| `gateway.run_inbound` per-message default route | yes |
+| `gateway.slash_commands_model` default-route context | yes |
+| `cron.scheduler._load_cron_job_config` | yes |
+| `cron.scheduler._resolve_job_reasoning_config` | yes |
+| `cron.jobs._main_model_pin` | yes |
+| `agent.agent_runtime_helpers.switch_model` | yes |
+| `agent.chat_completion_helpers._reresolve_fallback_reasoning_config` | yes |
+| `agent.curator` review model | yes |
+| `agent.auxiliary_client` task routes | yes, via `expand_model_presets` |
+| `tools.delegate_tool_config._resolve_child_runtime` | yes, via expanded `delegation` |
+| `hermes_cli.status._configured_model_label` | yes |
+| `hermes_cli.profiles._read_config_model` | yes |
+| `hermes_cli.main` startup cost guard | yes |
+| `acp_adapter.session._make_agent` | yes |
+| `plugins/platforms/feishu` comment agent | yes, via `_resolve_gateway_model` |
+
+`/model --all attended` writes the converted sessions in one routing snapshot.
+A topic role edit reads reasoning from the same routed profile as the route.
+
 Fork-Patch-Backfill: cd3d18e27b6e7bf54a5f3bb22d81c571e3e2e95d; live-model-preset-roles
 
 The attended feature adds per-topic attended routing, idle expiry, persisted activity timestamps, and route re-evaluation at the real API-request boundary. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly. The topic tool commits through the gateway's existing model and reasoning persistence paths rather than adding a second store.

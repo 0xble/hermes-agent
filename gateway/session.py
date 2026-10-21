@@ -1004,20 +1004,34 @@ class SessionStore(
             return entry.model_role if entry else None
 
     def set_model_role(self, session_key: str, role: Optional[str], *, clear_overrides: bool = False) -> None:
+        self.set_model_roles([session_key], role, clear_overrides=clear_overrides)
+
+    def set_model_roles(self, session_keys, role: Optional[str], *, clear_overrides: bool = False) -> list[str]:
+        """Set one role on many sessions in a single routing snapshot and persist.
+
+        Returns the keys that existed and were updated. A missing key is skipped,
+        matching ``set_model_role``.
+        """
         from dataclasses import replace
         normalized = str(role).strip().lower() if role else None
+        updated_keys: list[str] = []
         with self._lock:
-            entry = self._entry_locked(session_key)
-            if entry is None:
-                return
+            self._ensure_loaded_locked()
             data, generation = self._snapshot_routing_locked()
-            updated = replace(entry, model_role=normalized)
-            if clear_overrides:
-                updated = replace(updated, model_override=None, reasoning_override=None,
-                                  model_override_scope="session", reasoning_override_scope="session")
-            data[session_key] = updated.to_dict()
-            self._persist_routing_data(data, generation)
-            self._entries[session_key] = updated
+            for session_key in session_keys:
+                entry = self._entries.get(session_key)
+                if entry is None:
+                    continue
+                updated = replace(entry, model_role=normalized)
+                if clear_overrides:
+                    updated = replace(updated, model_override=None, reasoning_override=None,
+                                      model_override_scope="session", reasoning_override_scope="session")
+                data[session_key] = updated.to_dict()
+                self._entries[session_key] = updated
+                updated_keys.append(session_key)
+            if updated_keys:
+                self._persist_routing_data(data, generation)
+        return updated_keys
 
     def has_any_sessions(self) -> bool:
         """Whether any session has ever been created. SQLite is the source of truth."""

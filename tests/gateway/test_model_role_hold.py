@@ -265,7 +265,7 @@ async def test_concrete_model_clears_role_except_once(tmp_path, monkeypatch, per
 async def test_model_role_rejects_flags(tmp_path, monkeypatch, flag):
     store = _store(tmp_path, monkeypatch)
     entry = store.get_or_create_session(_source())
-    runner, states = _runner(store)
+    runner, _states = _runner(store)
     monkeypatch.setattr("gateway.run._load_gateway_config", _attended_cfg)
 
     reply = await runner._handle_model_command_locked(_event(f"/model @fast {flag}"))
@@ -279,7 +279,7 @@ async def test_model_role_rejects_flags(tmp_path, monkeypatch, flag):
 async def test_model_role_alone_sets_hold(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch)
     entry = store.get_or_create_session(_source())
-    runner, states = _runner(store)
+    runner, _states = _runner(store)
     monkeypatch.setattr("gateway.run._load_gateway_config", _attended_cfg)
 
     reply = await runner._handle_model_command_locked(_event("/model @fast"))
@@ -409,6 +409,35 @@ async def test_migration_applies_role_through_the_shared_setter():
     assert key not in runner._session_model_overrides
     assert key not in runner._session_reasoning_overrides
     runner._evict_cached_agent.assert_called_once_with(key)
+
+
+@pytest.mark.asyncio
+async def test_migration_persists_every_conversion_in_one_routing_write():
+    """``/model --all attended`` snapshots and persists the routing index once."""
+    first = "agent:main:telegram:dm:-100:1"
+    second = "agent:main:telegram:dm:-100:2"
+    store = SimpleNamespace(
+        list_sessions=lambda: [
+            SimpleNamespace(session_key=first, platform=SimpleNamespace(value="telegram"),
+                            model_override={"model": "picked-a"}, model_role=None),
+            SimpleNamespace(session_key=second, platform=SimpleNamespace(value="telegram"),
+                            model_override={"model": "picked-b"}, model_role=None),
+        ],
+        set_model_roles=MagicMock(),
+        set_model_role=MagicMock(side_effect=AssertionError("per-session persist")),
+    )
+    runner, states = _runner(store)
+    states[first] = SimpleNamespace(conversation=ConversationState(model_override={"model": "picked-a"}))
+    states[second] = SimpleNamespace(conversation=ConversationState())
+
+    converted, failures = await runner._migrate_telegram_model_overrides_to_role("attended")
+
+    assert converted == [first, second]
+    assert failures == []
+    store.set_model_roles.assert_called_once_with([first, second], "attended", clear_overrides=True)
+    assert states[first].conversation.model_role == "attended"
+    assert states[first].conversation.model_override is None
+    assert states[second].conversation.model_role == "attended"
 
 
 def test_status_card_shows_role_marker():
