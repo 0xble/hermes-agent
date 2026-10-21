@@ -24,8 +24,10 @@ acceptance of the design. Reassess this divergence before adopting upstream work
 - All primary-route readers use `resolve_default_route` and the common reasoning
   resolver. Consumer-specific shims must not interpret references themselves.
 - `persist_model_selection` is the single shared CLI, TUI and gateway writer.
-  Concrete picks remove every authored reference spelling, preserve sibling
-  settings/comments and never persist runtime credentials.
+  Concrete picks remove every authored reference spelling in 1 atomic file
+  replacement, preserve sibling settings/comments and never persist runtime
+  credentials. Derive the full state from raw config and merge through the
+  shared round-trip writer, not a blind replacement of the `model:` block.
 - Unrelated saves preserve authored references, even after defaults merge.
 - Carry resolved main fallback entries to auxiliary request planning. Re-reading
   config per candidate can lose the selected route's reasoning effort.
@@ -42,8 +44,11 @@ reasoning precedence, including preset effort ahead of global effort.
 
 Run preset/persistence tests plus config, model-switch, CLI/TUI startup,
 gateway runtime, cron and auxiliary suites. The persistence regression uses all
-4 authored main-route shapes and all 3 command commit seams, then reloads real
-scratch config. `/new` with an invalid preset must remain best effort.
+4 authored main-route shapes, reloads after every actual atomic file replacement
+and requires exactly 1 complete new route, with no invalid or partial selection.
+All 3 command commit seams also reload real scratch config. Sibling comments,
+quoting, ambiguous YAML scalars and owner-only permissions survive. `/new` with an
+invalid preset must remain best effort.
 
 Retire when upstream covers flat references, every reader, round-trip
 preservation and shared concrete-selection persistence. Keep session policy

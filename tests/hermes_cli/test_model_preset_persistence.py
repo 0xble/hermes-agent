@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -30,7 +31,11 @@ def preset_config(request, tmp_path, monkeypatch):
         model = "model: '@fast'\n"
     else:
         key, value = {"canonical": ("model_preset", "fast"), "default": ("default", "'@fast'"), "model": ("model", "'@fast'")}[request.param]
-        model = f"model:\n  {key}: {value}\n  # Keep my route policy.\n  max_context_chars: 12345\n"
+        model = (
+            f"model:\n  {key}: {value}\n  # Keep my route policy.\n  max_context_chars: 12345\n"
+            "  model_slots:\n    fast: 'off'  # Keep my slot.\n"
+            '  model_fallback: ["no"]  # Keep my fallback.\n'
+        )
     path = home / "config.yaml"
     path.write_text(header + model + "display:\n  compact: true\n", encoding="utf-8")
     return path, request.param
@@ -49,16 +54,50 @@ def assert_concrete_reload(path, form):
     assert "ephemeral-not-for-config" not in raw_text
     if form != "string":
         assert raw["model"]["max_context_chars"] == 12345
+        assert raw["model"]["model_slots"] == {"fast": "off"}
+        assert raw["model"]["model_fallback"] == ["no"]
         assert "# Keep my route policy." in raw_text
+        assert "fast: 'off'  # Keep my slot." in raw_text
+        assert 'model_fallback: ["no"]  # Keep my fallback.' in raw_text
+    if os.name == "posix":
+        assert path.stat().st_mode & 0o777 == 0o600
     loaded = load_config()
     assert loaded["model"]["default"] == "gpt-5.5"
     assert loaded["model"]["provider"] == "openai"
     return loaded
 
 
-def test_shared_writer_replaces_every_reference_form(preset_config, concrete_pick):
+def test_shared_writer_replaces_every_reference_form(preset_config, concrete_pick, monkeypatch):
+    """Readers at every real file replacement see one complete, valid selection."""
+    from pathlib import Path
+    from hermes_cli.config import load_config
+    from hermes_cli.model_presets import ModelPresetError
+    import utils
+
     path, form = preset_config
+    snapshots = []
+
+    def read_snapshot():
+        try:
+            model = load_config()["model"]
+            snapshots.append(tuple(model.get(key) for key in ("default", "provider", "base_url", "api_mode")))
+        except ModelPresetError as exc:
+            snapshots.append(str(exc))
+
+    read_snapshot()
+    assert snapshots[0][0] == "fast-model"
+    replace = utils.os.replace
+
+    def replace_and_read(source, target):
+        replace(source, target)
+        if Path(target) == path:
+            read_snapshot()
+
+    monkeypatch.setattr(utils.os, "replace", replace_and_read)
     persist_model_selection(concrete_pick, config_path=path)
+    assert snapshots[1:] == [(
+        "gpt-5.5", "openai", "https://api.openai.com/v1", "responses",
+    )], snapshots
     assert_concrete_reload(path, form)
 
 
