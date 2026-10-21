@@ -66,6 +66,12 @@ state and `SessionEntry`, role reset, concrete-pick precedence, live preset
 follow, and the silent held-role card. The earlier identities cover attended
 routing and the Telegram topic tool.
 
+`@name` is accepted wherever a `model_preset` mapping is, and every consumer
+resolves it from freshly read config at use time: gateway sessions per request,
+cron per fire. Nothing stores the resolved model at creation.
+
+Fork-Patch-Backfill: cd3d18e27b6e7bf54a5f3bb22d81c571e3e2e95d; live-model-preset-roles
+
 The attended feature adds per-topic attended routing, idle expiry, persisted activity timestamps, and route re-evaluation at the real API-request boundary. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly. The topic tool commits through the gateway's existing model and reasoning persistence paths rather than adding a second store.
 
 The combined resolution is implemented in `gateway/run_turn.py` and
