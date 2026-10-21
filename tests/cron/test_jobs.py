@@ -610,7 +610,7 @@ class TestUpdateJob:
 
 
 class TestPauseResumeJob:
-    def test_pause_sets_state(self, tmp_cron_dir):
+    def test_pause_preserves_explicit_reason(self, tmp_cron_dir):
         job = create_job(prompt="Pause me", schedule="every 1h")
         paused = pause_job(job["id"], reason="user paused")
         assert paused is not None
@@ -618,6 +618,21 @@ class TestPauseResumeJob:
         assert paused["state"] == "paused"
         assert paused["paused_reason"] == "user paused"
         assert paused.get("paused_at")
+
+    def test_pause_uses_stable_fallback_for_missing_or_blank_reason(self, tmp_cron_dir):
+        for reason in (None, "", "   "):
+            job = create_job(prompt="Pause me", schedule="every 1h")
+            paused = pause_job(job["id"], reason=reason)
+            assert paused is not None
+            assert paused["paused_reason"] == "Paused by operator."
+            assert get_job(job["id"])["paused_reason"] == "Paused by operator."
+
+    def test_paused_creation_keeps_its_documented_fallback(self, tmp_cron_dir):
+        job = create_job(prompt="Start paused", schedule="every 1h", paused=True, paused_reason="  ")
+        assert job["paused_reason"] == "Created paused; awaiting operator approval."
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["paused_reason"] == "Created paused; awaiting operator approval."
 
     def test_pause_is_authoritative_due_jobs_do_not_fire(self, tmp_cron_dir):
         """Behavioural invariant: after pause, a past-due job must not be due.

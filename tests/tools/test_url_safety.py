@@ -141,9 +141,21 @@ class TestProxyEnvironmentDnsDelegation:
         with patch("tools.url_safety.urlparse", side_effect=ValueError("bad url")):
             assert is_safe_url("http://evil.com/") is False
 
-    def test_benchmark_ip_blocked_for_non_allowlisted_host(self):
+    def test_benchmark_range_is_public_when_resolved(self):
+        """RFC 2544 198.18.0.0/15 is a fake-IP proxy's DNS answer, not an internal host."""
         with _resolves_to("198.18.0.23"):
-            assert is_safe_url("https://example.com/file.jpg") is False
+            assert is_safe_url("https://example.com/file.jpg", allow_private=False) is True
+        with _resolves_to("198.18.4.162"):
+            assert is_safe_url("https://youtu.be/MgRynDGk-4Y", allow_private=False) is True
+
+    @pytest.mark.parametrize("host", ["198.18.0.23", "0xc6120017", "0306.022.0.027", "198.18.23"])
+    def test_literal_benchmark_host_stays_blocked(self, host):
+        assert is_safe_url(f"https://{host}/file.jpg", allow_private=False) is False
+
+    def test_private_addresses_stay_blocked(self):
+        for ip in ("127.0.0.1", "10.1.2.3", "192.168.1.9", "169.254.169.254"):
+            with _resolves_to(ip):
+                assert is_safe_url("https://example.com/", allow_private=False) is False
 
     @pytest.mark.parametrize("url, expected", [
         # the allowlisted host itself, over https
@@ -154,7 +166,9 @@ class TestProxyEnvironmentDnsDelegation:
         ("http://multimedia.nt.qq.com.cn/download?id=123", False),
     ])
     def test_qq_multimedia_hostname_exception(self, url, expected):
-        with _resolves_to("198.18.0.23"):
+        # 198.18.0.0/15 is public as a resolved answer (fake-IP proxies). The QQ exception is
+        # about other private answers, so pin the resolver there.
+        with _resolves_to("10.1.2.3"):
             assert is_safe_url(url) is expected
 
 
@@ -172,6 +186,11 @@ class TestAsyncIsSafeUrl:
 
 
 class TestSSRFGuardedHttpxClient:
+    @pytest.mark.parametrize("host", ["198.18.0.23", "0xc6120017", "0306.022.0.027", "198.18.23"])
+    def test_connect_blocks_literal_benchmark_host(self, host):
+        with pytest.raises(SSRFConnectionBlocked, match="benchmark address"):
+            _resolved_http_connect_ips(host, 443, "https")
+
     def test_connect_resolution_checks_private_ip_beyond_candidate_cap(self):
         answers = [
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"93.184.216.{idx}", 80))
@@ -252,7 +271,6 @@ class TestIsBlockedIp:
         "0.0.0.0",                  # unspecified
         "224.0.0.1",                # multicast (not is_private)
         "100.64.0.1",               # CGNAT boundary (not is_private)
-        "198.18.0.23",              # benchmark range
         "fd12::1",                  # IPv6 unique local
         "::ffff:169.254.169.254",   # IPv4-mapped IPv6 metadata
     ])
@@ -570,10 +588,12 @@ class TestDeclaredFakeIpSentinelRanges:
             assert is_safe_url("https://example.com/") is False
         with _resolves_to("169.254.169.254"):
             assert is_safe_url("http://example.com/") is False
-        # ...and the sentinel block itself is blocked again once the declaration is gone.
+        # ...and the sentinel block itself stays public once the declaration is gone: it is the
+        # range fake-IP proxies answer DNS from.
         _reset_allow_private_cache()
         with patch("hermes_cli.config.read_raw_config", dict), _resolves_to("198.18.0.23"):
-            assert is_safe_url("https://example.com/file.jpg") is False
+            assert is_safe_url("https://example.com/file.jpg") is True
+        assert is_safe_url("https://198.18.0.23/file.jpg") is False
 
     @pytest.mark.parametrize(
         ("declared", "ip"),

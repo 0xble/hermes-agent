@@ -172,6 +172,24 @@ class TestSweep:
         _record()  # owner = this (live) process
         assert dl.sweep_recoverable() == []
 
+    def test_zero_attempt_attempting_row_is_ambiguous_until_owner_dies(self):
+        """The initial send is not counted as a redelivery attempt. While its owner is live,
+        recovery must not touch it. Once that owner is dead, the ``attempting`` state proves only
+        that the platform may have seen the send, so recovery spends the first redelivery attempt
+        and adds the duplicate marker."""
+        _record()
+        dl.mark_attempting("ob-1")
+        assert _row("ob-1")["attempts"] == 0
+        assert dl.sweep_recoverable() == []
+
+        _orphan("ob-1")
+        claimed = dl.sweep_recoverable()
+
+        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
+        assert claimed[0]["attempts"] == 1
+        assert claimed[0]["needs_marker"] is True
+        assert _row("ob-1")["state"] == "attempting"
+
     def test_dead_owner_pending_claimed_without_marker(self):
         _record()
         _orphan("ob-1")
@@ -1073,3 +1091,167 @@ class TestFloodDeadlineExactness:
 
         assert dl.sweep_failed_for_runtime("telegram", now=1000.0 + 899) == []
         assert [r["obligation_id"] for r in dl.sweep_failed_for_runtime("telegram", now=1000.0 + 901)] == ["ob-1"]
+
+
+class _LedgerAdapter:
+    """Minimal adapter for the ledger bracket. Transport is injected per test."""
+
+    def __init__(self, send):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+        class _Concrete(BasePlatformAdapter):
+            async def connect(self, *, is_reconnect=False):
+                return True
+
+            async def disconnect(self):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                return SendResult(success=True, message_id="unused")
+
+        self._base = _Concrete(PlatformConfig(enabled=True), Platform.TELEGRAM)
+        self._base.gateway_runner = None
+        self._base.send = send
+        self._base._final_delivery_adapter = lambda source: self._base
+
+    def send_final_ledgered(self, *args, **kwargs):
+        return self._base.send_final_ledgered(*args, **kwargs)
+
+
+def _telegram_event(text="queued first response", message_id="m-queued"):
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.session import SessionSource
+    from gateway.config import Platform
+
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        message_id=message_id,
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="2027045491", chat_type="dm", thread_id="113596"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_successful_send_still_marks_delivered():
+    """A queued-lane interrupt after Telegram accepts must not leave attempts=0 attempting.
+
+    The live rows stayed attempting with attempts=0 after '[Telegram] Sending response'
+    and a confirmed topic message. The interrupt cancels the turn at the next await after
+    the platform returns, which used to skip the ledger write. The send already happened,
+    so the row must be delivered, not resent.
+    """
+    import asyncio
+    from gateway.platforms.base import SendResult
+
+    sent = []
+
+    async def send_then_cancel(**kwargs):
+        sent.append(kwargs["content"])
+        asyncio.current_task().cancel()
+        return SendResult(success=True, message_id="362092")
+
+    adapter = _LedgerAdapter(send_then_cancel)
+    event = _telegram_event()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.send_final_ledgered(
+            event, "agent:main:telegram:dm:2027045491:113596", "landed text", {}, reply_to=None,
+        )
+
+    assert sent == ["landed text"]
+    row = _row(dl.compute_obligation_id(
+        "agent:main:telegram:dm:2027045491:113596", "m-queued", "landed text"))
+    assert row is not None
+    assert row["state"] == "delivered"
+    assert row["attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_send_leaves_attempting_for_ambiguous_recovery():
+    """A cancel that lands inside the transport must not invent a delivery.
+
+    The platform may have accepted the request. Leaving the row attempting keeps the
+    boot sweep's duplicate-marked redelivery instead of a silent second copy or a
+    false delivered mark.
+    """
+    import asyncio
+    from gateway.platforms.base import SendResult
+
+    sent = []
+
+    async def send_and_raise_cancel(**kwargs):
+        sent.append(kwargs["content"])
+        raise asyncio.CancelledError()
+
+    adapter = _LedgerAdapter(send_and_raise_cancel)
+    event = _telegram_event(message_id="m-ambiguous")
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.send_final_ledgered(
+            event, "agent:main:telegram:dm:2027045491:113596", "maybe landed", {}, reply_to=None,
+        )
+
+    assert sent == ["maybe landed"]
+    row = _row(dl.compute_obligation_id(
+        "agent:main:telegram:dm:2027045491:113596", "m-ambiguous", "maybe landed"))
+    assert row["state"] == "attempting"
+    assert row["attempts"] == 0
+    assert dl.sweep_recoverable() == []  # live owner: do not resend while this process still holds it
+
+
+@pytest.mark.asyncio
+async def test_concurrent_final_sends_settle_only_their_own_obligation():
+    """One adapter serves many sessions. A cancel in one turn must settle that turn's row only."""
+    import asyncio
+    from gateway.platforms.base import SendResult
+
+    release_other = asyncio.Event()
+    other_started = asyncio.Event()
+
+    async def send(**kwargs):
+        if kwargs["content"] == "other text":
+            other_started.set()
+            await release_other.wait()
+            raise ConnectionError("network down")
+        await other_started.wait()
+        asyncio.current_task().cancel()
+        return SendResult(success=True, message_id="1")
+
+    adapter = _LedgerAdapter(send)
+    adapter._base._send_with_retry_body = lambda chat_id, content, **kw: send(content=content)
+    key_a = "agent:main:telegram:dm:2027045491:113596"
+    key_b = "agent:main:telegram:dm:2027045491:345546"
+    other = asyncio.create_task(adapter.send_final_ledgered(
+        _telegram_event(message_id="m-other"), key_b, "other text", {}, reply_to=None))
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.send_final_ledgered(
+            _telegram_event(message_id="m-landed"), key_a, "landed text", {}, reply_to=None)
+    assert _row(dl.compute_obligation_id(key_a, "m-landed", "landed text"))["state"] == "delivered"
+    assert _row(dl.compute_obligation_id(key_b, "m-other", "other text"))["state"] == "attempting"
+    release_other.set()
+    with pytest.raises(ConnectionError):
+        await other
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_failed_send_leaves_attempting_for_recovery():
+    """A refused send plus a cancel must not be marked failed without the finalizer's
+    refusal and redelivery handling. The row keeps today's ambiguous-recovery state."""
+    import asyncio
+    from gateway.platforms.base import SendResult
+
+    async def refuse_then_cancel(**kwargs):
+        asyncio.current_task().cancel()
+        return SendResult(success=False, error="Flood control exceeded. Retry in 30 seconds")
+
+    adapter = _LedgerAdapter(refuse_then_cancel)
+    adapter._base._send_with_retry_body = lambda chat_id, content, **kw: refuse_then_cancel(content=content)
+    key = "agent:main:telegram:dm:2027045491:113596"
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.send_final_ledgered(
+            _telegram_event(message_id="m-refused"), key, "refused text", {}, reply_to=None)
+    row = _row(dl.compute_obligation_id(key, "m-refused", "refused text"))
+    assert row["state"] == "attempting"
+    assert row["attempts"] == 0

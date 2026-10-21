@@ -1,6 +1,45 @@
 # Hindsight memory provider
 
-**Patch identity:** `hindsight-retain-visibility`.
+**Patch identity:** `hindsight-retain-visibility` and `evict-memory-shutdown`.
+
+Soft agent-cache eviction must drain and shut down the agent's memory manager
+(including Hindsight's writer and the mem-sync executor), then release clients
+off the gateway event loop. Eviction removes the cache entry first, so a refetched
+turn builds a fresh manager while retirement completes. Only idle-TTL, LRU-cap
+and memory-pressure evictions commit the transcript (`on_session_end`) first;
+same-session evictions (`/model`, fallback drift, config signature,
+cross-process) never do. Not covered yet: fallback drift and mid-turn `/model`
+evict while the agent is running, so they skip the soft release entirely.
+An agent whose `shutdown_memory_provider()` already ran
+(`_memory_provider_shutdown`, the `/new` and `/reset` cleanup) is detached without
+a second commit or shutdown: `shutdown_memory_provider()` sets that flag and
+captures the manager under a per-agent handoff lock (`memory_handoff_lock`) that
+eviction's detach also takes, so exactly one side owns `shutdown_all()`. The
+lock covers only those reads and writes. The captured local means a cleanup
+that outlived its 30s reset timeout still finishes with
+`shutdown_all()` after eviction nulls the attribute. `MemoryManager.shutdown_all()`
+is idempotent, so racing teardown paths retire providers once. A memory-pressure
+batch commits, detaches the manager, and calls `release_clients()` inline, then
+runs the deferred `shutdown_all()` on parallel daemon threads, so `malloc_trim` is
+not held behind their bounded joins. Releasing the agent's clients first is safe
+because no provider drain uses them: Hindsight's writer and shutdown use the
+provider's own `_client`, and query rewrite goes through the process-wide
+auxiliary client.
+Hindsight prefetch keeps one in-flight worker and one latest-wins pending query;
+discard and shutdown fence both the pending query and the worker's publication,
+and a `BaseException` leaving the worker clears its running flag.
+Proof: `scripts/run_tests.sh tests/gateway/test_agent_cache_memory_lifetime.py`
+and `scripts/run_tests.sh tests/plugins/memory/test_hindsight_prefetch_lifetime.py`.
+Retire when upstream soft eviction retires memory providers and Hindsight
+prefetch is single-flight. Roll back by reverting the commits carrying
+`Fork-Patch: evict-memory-shutdown`; evicted agents then keep their writer and
+mem-sync threads until process exit again.
+
+Follow up:
+- Fallback-drift and mid-turn `/model` eviction (`gateway/run_turn.py`
+  `_run_agent_evict_on_fallback`) reach `_evict_cached_agent` while the agent is
+  in `_running_agent_ids()`, which returns before the soft release, so that
+  agent's Hindsight writer and mem-sync executor still leak. Predates this patch.
 
 Accepted asynchronous retain operations remain tracked after the first prefetch
 visibility wait expires. Later prefetches do not repeat that wait. The existing

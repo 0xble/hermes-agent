@@ -2387,7 +2387,7 @@ class _CronRunScope:
             # so results return within the job's own turn. See declare_stateless_channel(). Upstream:
             # #53027, #63142.
             async_delivery=False,
-            cwd=self.workdir or "",
+            cwd=self.workdir or "", turn_origin="cron",
         )
         for name in _CRON_DELIVERY_VARS:
             _VAR_MAP[name].set("")

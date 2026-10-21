@@ -271,7 +271,7 @@ def _maybe_title_session_at_turn_start(
 
 
 def start_deferred_title_upgrade(agent: Any) -> None:
-    """Fire the title upgrade ``_maybe_title_session_at_turn_start`` held back; no-op when none."""
+    """Fire the title upgrade the turn start held back. The thread reads the reply itself. No-op when none."""
     upgrade = getattr(agent, "_deferred_title_upgrade", None)
     if upgrade is None:
         return
@@ -509,6 +509,7 @@ class TurnContext:
     plugin_user_context: str = ""  # ``pre_llm_call`` context (appended to user message)
     ext_prefetch_cache: str = ""  # external-memory prefetch, reused across iterations
     preflight_compression_blocked: bool = False  # immediate retry proved ineffective
+    turn_origin: str = "unknown"
 
 
 def _persist_under_lock(agent: Any, fn, failure_msg: str, pending_cli_message: Any) -> None:
@@ -814,7 +815,7 @@ def _ensure_session_row(agent: Any, pending_cli_message: Any) -> None:
 
 def _collect_pre_llm_call_context(
     agent: Any, *, effective_task_id: str, turn_id: str, original_user_message: Any,
-    messages: list[Any], conversation_history: Optional[list[Any]],
+    messages: list[Any], conversation_history: Optional[list[Any]], turn_origin: str = "unknown",
 ) -> str:
     """Run ``pre_llm_call`` plugins; their context is injected into the user message
     (never the system prompt). Oversized per-hook context is spilled to disk so a
@@ -835,6 +836,7 @@ def _collect_pre_llm_call_context(
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            turn_origin=turn_origin,
         )
         try:
             # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent
@@ -1063,7 +1065,7 @@ def build_turn_context(
     restore_or_build_system_prompt,
     install_safe_stdio, sanitize_surrogates, summarize_user_message_for_log, set_session_context,
     set_current_write_origin, ra, moa_active: bool=False,
-    title_user_message: Optional[str]=None,
+    title_user_message: Optional[str]=None, turn_origin: str = "unknown",
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
@@ -1212,7 +1214,7 @@ def build_turn_context(
     plugin_user_context = _collect_pre_llm_call_context(
         agent, effective_task_id=effective_task_id, turn_id=turn_id,
         original_user_message=original_user_message, messages=messages,
-        conversation_history=conversation_history,
+        conversation_history=conversation_history, turn_origin=turn_origin,
     )
     # Every turn, not only on a prompt restore: a long-lived agent (CLI, TUI, Desktop) keeps its
     # prompt in memory for the whole conversation and would never re-check its skills index.
@@ -1251,6 +1253,7 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx, should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context, ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=compaction.blocked,
+        turn_origin=turn_origin,
     )
 
 

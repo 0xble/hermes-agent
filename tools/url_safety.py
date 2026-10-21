@@ -121,6 +121,15 @@ _MAX_SSRF_CONNECT_IPS = 8
 # ipaddress — must be blocked explicitly (Tailscale/WireGuard, cloud internal nets).
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
+# RFC 2544 benchmarking space. ipaddress marks the whole /15 reserved, so it looks private, but
+# fake-IP TUN proxies (Surge enhanced mode, Clash/Mihomo) answer DNS from it for every public
+# name. The dial still goes to the local proxy, which resolves the real target. Treating the
+# range as public is unconditional: a declared ``security.fake_ip_ranges`` only helps hosts that
+# opted in, and a host behind such a proxy cannot fetch any public URL until someone notices.
+# Loopback, RFC 1918, link-local, CGNAT and metadata stay blocked. A literal URL whose host is
+# already an address in this range is still blocked: that is not a proxy's DNS answer.
+_BENCHMARK_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
 # RFC 2765 IPv4-translated wrapper ``::ffff:0:a.b.c.d`` — the second form resolvers may use to
 # answer an IPv4 name (on the reporting macOS host, fake-IP TUN DNS returns it alongside the
 # plain address). ``ip.ipv4_mapped`` does not read it; ``_embedded_ipv4`` handles it explicitly.
@@ -231,7 +240,13 @@ def _parse_ip(hostname: str) -> Optional[_IPAddress]:
     try:
         return ipaddress.ip_address(hostname)
     except ValueError:
-        return None
+        # ``inet_aton`` accepts the legacy hex, octal, and shortened IPv4 forms that
+        # resolvers and http clients may also accept. Treat them as literals for the
+        # benchmark-host guard, not as DNS names.
+        try:
+            return ipaddress.ip_address(socket.inet_aton(hostname))
+        except (OSError, ValueError):
+            return None
 
 
 def _iter_resolved_ips(addr_info: Any):
@@ -273,11 +288,18 @@ def _is_declared_fake_ip(ip: _IPAddress) -> bool:
     return any(ip in net for net in _global_fake_ip_ranges())
 
 
+def _is_benchmark_fake_ip(ip: _IPAddress) -> bool:
+    """RFC 2544 ``198.18.0.0/15``: a fake-IP proxy's DNS sentinel, not an internal host."""
+    return ip.version == 4 and ip in _BENCHMARK_FAKE_IP_NETWORK
+
+
 def _is_blocked_ip(ip: _IPAddress) -> bool:
     """Return True if the IP should be blocked for SSRF protection."""
     # IPv4-wrapped IPv6 (mapped ``::ffff:x.x.x.x`` or translated ``::ffff:0:x.x.x.x``) is
     # classified by its embedded IPv4.
     ip = _embedded_ipv4(ip)
+    if _is_benchmark_fake_ip(ip):
+        return False
     return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
             or ip.is_multicast or ip.is_unspecified or ip in _CGNAT_NETWORK)
 
@@ -359,6 +381,12 @@ def is_safe_url(url: str, *, allow_private: Optional[bool] = None) -> bool:
         allow_all_private = _global_allow_private_urls() if allow_private is None else allow_private
         allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
         allow_private = allow_all_private or allow_private_ip
+        # A URL that already names a benchmark address is not a proxy DNS answer. Refuse it even
+        # though resolved answers in that range are treated as public (see ``_is_blocked_ip``).
+        literal = _parse_ip(hostname)
+        if literal is not None and _is_benchmark_fake_ip(_embedded_ipv4(literal)) and not allow_private:
+            logger.warning("Blocked request to benchmark address used as a URL host: %s", hostname)
+            return False
         try:
             addr_info = _getaddrinfo(hostname)
         except socket.gaierror:
@@ -413,6 +441,11 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str, allow_private:
     if allow_private is None:
         allow_private = _global_allow_private_urls()
     allow_private = allow_private or _allows_private_ip_resolution(hostname, scheme)
+    # Same rule as ``is_safe_url``: a benchmark address written as the host is not a proxy DNS
+    # answer. Enforced here too, since redirects and direct guarded clients never re-run it.
+    literal = _parse_ip(hostname)
+    if literal is not None and _is_benchmark_fake_ip(_embedded_ipv4(literal)) and not allow_private:
+        raise SSRFConnectionBlocked(f"Blocked request to benchmark address used as a URL host: {hostname}")
     try:
         addr_info = _getaddrinfo(hostname, port)
     except socket.gaierror as exc:

@@ -27,6 +27,7 @@ class TurnFacadeMixin:
         persist_user_display_metadata: Optional[dict[str, Any]]=None,
         persist_user_platform_id: Optional[str]=None, moa_config: Optional[dict[str, Any]]=None,
         turn_author: Optional[dict[str, Any]] = None,
+        turn_origin: str = "unknown",
         relay_metadata: Optional[dict[str, Any]] = None,
         title_user_message: Optional[str]=None,
         prelude: Optional[Generator]=None,
@@ -153,6 +154,7 @@ class TurnFacadeMixin:
                         persist_user_display_metadata=persist_user_display_metadata,
                         persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
                         turn_author=turn_author,
+                        turn_origin=turn_origin,
                         title_user_message=title_user_message,
                         prelude=prelude,
                     )

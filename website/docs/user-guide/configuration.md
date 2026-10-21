@@ -1468,6 +1468,13 @@ verification, unsubscribe, invite) or carry credential-named query parameters. A
 failure titles from the text alone. Set `auxiliary.title_generation.link_context: false` to
 disable it.
 
+When the title model abstains, or its title is only a platform label, a raw ID, or a generic
+word such as `None`, `Investigation`, or `Unspecified`, the session keeps its placeholder.
+The title is retried once the turn ends, using the opening message plus a bounded excerpt of
+the assistant reply, and again after turns 2 and 3 if it still cannot tell. After turn 3 the
+best concrete title is kept. A manual `/title` always wins, and a real title is never renamed.
+Set `auxiliary.title_generation.hold_until_reply: false` to title from the opening message only.
+
 On a `custom` main provider (llama.cpp, Ollama, vLLM, LM Studio and other self-hosted
 OpenAI-compatible servers) the title model call is sent **after** the turn's reply has
 arrived, not concurrently with it, unless `auxiliary.title_generation` is pinned to another

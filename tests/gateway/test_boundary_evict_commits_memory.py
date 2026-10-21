@@ -52,6 +52,22 @@ def test_boundary_evict_commits_for_a_context_engine_without_a_provider(monkeypa
     assert calls == [('commit', [{'role': 'user', 'content': 'hi'}]), ('release', None)]
 
 
+@pytest.mark.parametrize('with_provider', [False, True])
+def test_boundary_evict_does_not_repeat_an_already_claimed_shutdown(monkeypatch, with_provider):
+    runner = _runner(monkeypatch)
+    calls = []
+    agent = _agent(calls)
+    if not with_provider:
+        agent._memory_manager = None
+    agent.context_compressor = MagicMock()
+    agent._memory_provider_shutdown = True
+    runner._agent_cache['route'] = (agent, 'sig')
+
+    runner._evict_cached_agent_at_boundary('route')
+
+    assert calls == [('release', None)]
+
+
 def test_evicts_with_nothing_to_notify_only_release(monkeypatch):
     """No provider and no engine: neither kind of evict has anything to commit. A resource evict with
     only an engine keeps the conversation open and does not end the engine's session either."""
