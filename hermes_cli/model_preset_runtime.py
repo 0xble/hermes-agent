@@ -3,7 +3,13 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Mapping
 
-from hermes_cli.model_presets import ModelPresetError, ModelPresetRoute, preset_ref_name
+from hermes_cli.model_presets import (
+    ModelPresetError, ModelPresetRoute, ReasoningEffort, normalize_route_reasoning_effort, preset_ref_name,
+)
+
+
+def _route_effort(site: Mapping[str, Any], inherited: ReasoningEffort = "") -> ReasoningEffort:
+    return normalize_route_reasoning_effort(site.get("reasoning_effort")) or inherited
 
 
 def resolve_model_ref(raw: Any, config: Mapping[str, Any] | None = None, *, _stack: tuple[str, ...] = ()) -> ModelPresetRoute:
@@ -40,8 +46,8 @@ def resolve_model_ref(raw: Any, config: Mapping[str, Any] | None = None, *, _sta
             nested_provider = str(raw_model.get("provider") or "") if isinstance(raw_model, Mapping) else ""
             outer_provider = str(model_cfg.get("provider") or "")
             return ModelPresetRoute(name, str(nested_provider or outer_provider or route.provider), route.model,
-                                    str(model_cfg.get("reasoning_effort") or route.reasoning_effort), route.fallbacks)
-        return ModelPresetRoute(name, str(model_cfg.get("provider") or ""), str(raw_model).strip(), str(model_cfg.get("reasoning_effort") or ""))
+                                    _route_effort(model_cfg, route.reasoning_effort), route.fallbacks)
+        return ModelPresetRoute(name, str(model_cfg.get("provider") or ""), str(raw_model).strip(), _route_effort(model_cfg))
     if name == "attended":
         attended_value = model_cfg.get("attended")
         attended: Mapping[str, Any] = attended_value if isinstance(attended_value, Mapping) else {}
@@ -49,14 +55,14 @@ def resolve_model_ref(raw: Any, config: Mapping[str, Any] | None = None, *, _sta
         if isinstance(raw_model, Mapping) or preset_ref_name(raw_model):
             route = resolve_model_ref(raw_model, cfg, _stack=(*_stack, name))
             return ModelPresetRoute(name, str(attended.get("provider") or route.provider), route.model,
-                                    str(attended.get("reasoning_effort") or route.reasoning_effort), route.fallbacks)
-        return ModelPresetRoute(name, str(attended.get("provider") or ""), str(raw_model), str(attended.get("reasoning_effort") or ""))
+                                    _route_effort(attended, route.reasoning_effort), route.fallbacks)
+        return ModelPresetRoute(name, str(attended.get("provider") or ""), str(raw_model), _route_effort(attended))
     from hermes_cli.model_presets import _definitions
     entry = _definitions(cfg).get(name)
     if entry is None:
         raise ModelPresetError(f"model_presets: unknown preset '{name}'")
     return ModelPresetRoute(
-        name, entry["provider"], entry["model"], str(entry.get("reasoning_effort") or ""),
+        name, entry["provider"], entry["model"], entry.get("reasoning_effort", ""),
         tuple(entry.get("fallbacks") or ()),
     )
 
@@ -84,7 +90,7 @@ def validate_model_refs(config: Mapping[str, Any] | None) -> list[str]:
 class DefaultRoute:
     model: str = ""
     provider: str = ""
-    reasoning_effort: str = ""
+    reasoning_effort: ReasoningEffort = ""
     base_url: str = ""
     name: str = ""
 

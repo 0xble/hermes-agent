@@ -126,7 +126,7 @@ class AttendedConfig:
     enabled: bool = False
     model: str = ""
     provider: str = ""
-    reasoning_effort: str = ""
+    reasoning_effort: str | dict[str, Any] = ""
     idle_revert_minutes: float = 15.0
     compact_before_switch_tokens: int = 80000
     start_new_sessions: bool = True
@@ -136,7 +136,7 @@ class AttendedConfig:
 class AttendedResolution:
     model: str
     provider: str
-    reasoning_effort: str
+    reasoning_effort: str | dict[str, Any]
     reason: str
     active: bool = False
     idle_model: str = ""  # route used once the attended window lapses; display only
@@ -144,7 +144,7 @@ class AttendedResolution:
     switched_back: bool = False  # this resolution crossed from attended to the idle route
 
     @property
-    def decision_key(self) -> tuple[str, str, str, str, bool]:
+    def decision_key(self) -> tuple[str, str, str | dict[str, Any], str, bool]:
         """Stable desired-route identity; never compare it with the live agent model.
 
         The gateway uses this key to distinguish a real attended decision change from
@@ -202,7 +202,8 @@ def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
         enabled = False
     model = str(attended_raw.get("model") or "").strip()
     provider = str(attended_raw.get("provider") or "").strip()
-    effort = str(attended_raw.get("reasoning_effort") or "").strip().lower()
+    from hermes_cli.model_presets import normalize_route_reasoning_effort
+    effort = normalize_route_reasoning_effort(attended_raw.get("reasoning_effort"))
     # The attended route is live too. Resolve @attended/model_preset at request time
     # from the raw config rather than freezing a concrete model in SessionStore.
     from hermes_cli.model_presets import preset_ref_name
@@ -212,13 +213,13 @@ def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
             route = resolve_model_ref(model or {"model_preset": attended_raw.get("model_preset")}, config or {})
             model = route.model
             provider = provider or route.provider
-            effort = effort or route.reasoning_effort
+            if effort == "":
+                effort = route.reasoning_effort
         except Exception as exc:
             logger.warning("Invalid attended model reference: %s", exc)
             model = ""
-    if effort and effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
-        logger.warning("model.attended.reasoning_effort=%r is invalid; ignoring it", effort)
-        effort = ""
+    if attended_raw.get("reasoning_effort") not in (None, "") and not effort:
+        logger.warning("model.attended.reasoning_effort=%r is invalid; ignoring it", attended_raw["reasoning_effort"])
     start_new_sessions = attended_raw.get("start_new_sessions", True)
     if not isinstance(start_new_sessions, bool):
         logger.warning("model.attended.start_new_sessions=%r must be a boolean; using true", start_new_sessions)
@@ -261,20 +262,18 @@ def is_active(last_user_activity_at: Any, *, now: Optional[float], idle_revert_m
     return 0 <= clock - stamp < idle_revert_minutes * 60.0
 
 
-def _effort_label(value: Any) -> str:
-    """Reduce a stored ``/reasoning`` pick to its effort name.
+def _effort_label(value: Any) -> str | dict[str, Any]:
+    """Keep ordinary effort labels compatible without dropping typed provider-specific policy."""
+    from hermes_cli.model_presets import normalize_route_reasoning_effort
+    from hermes_constants import parse_reasoning_effort
 
-    Overrides persist as ``{"enabled": bool, "effort": str}``. Callers parse the label back with
-    ``parse_reasoning_effort`` and render it in the switch card, so a dict must never be
-    stringified: ``"{'enabled': True, ...}"`` parses to ``None`` and silently drops the pick.
-    """
-    if not value:
-        return ""
-    if isinstance(value, Mapping):
-        if value.get("enabled", True) is False:
-            return "none"
-        return str(value.get("effort") or "").strip().lower()
-    return str(value).strip().lower()
+    effort = normalize_route_reasoning_effort(value)
+    if isinstance(effort, dict):
+        # Standard levels can round-trip through a label. Bespoke enabled levels cannot,
+        # so keep their dictionary for the same parser at the request boundary.
+        label = effort["effort"]
+        return label if parse_reasoning_effort(label) == effort else effort
+    return effort
 
 
 def resolve_attended_model(
@@ -324,14 +323,15 @@ def resolve_attended_model(
     if explicit_model:
         return AttendedResolution(
             str(explicit_model), str(explicit_provider or baseline_provider),
-            str(explicit_reasoning or explicit_model_reasoning), "explicit", active,
+            explicit_reasoning or explicit_model_reasoning, "explicit", active,
         )
 
     if active:
         model = cfg.model or channel_model or default_model
         provider = cfg.provider or channel_provider or default_provider
-        effort = _effort_label(
-            explicit_reasoning or cfg.reasoning_effort or get("attended_reasoning") or default_reasoning
+        effort = (
+            explicit_reasoning or cfg.reasoning_effort
+            or _effort_label(get("attended_reasoning")) or default_reasoning
         )
         return AttendedResolution(
             model, provider, effort, "attended", True, idle_model=channel_model or default_model,

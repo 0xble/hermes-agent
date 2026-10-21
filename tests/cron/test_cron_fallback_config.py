@@ -214,3 +214,89 @@ def test_main_model_pin_resolves_a_preset_default(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.get_hermes_home", lambda: tmp_path)
 
     assert _main_model_pin() == ("openrouter", "coding-model")
+
+
+@pytest.mark.parametrize("fallbacks", [None, [{"provider": "openai", "model": "backup"}]])
+def test_cron_setup_preflight_uses_the_same_resolved_preset_route(tmp_path, monkeypatch, fallbacks):
+
+    preset = {"provider": "openrouter", "model": "coding"}
+    if fallbacks is not None:
+        preset["fallbacks"] = fallbacks
+    raw_cfg = {
+        "model_presets": {"coding": preset},
+        "model": {"default": "main", "provider": "openai"},
+        "cron": {"preflight": True},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(raw_cfg))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job = {"id": "proof", "name": "proof", "model": "@coding", "prompt": "run", "deliver": "local"}
+    jc = scheduler._load_cron_job_config(job, "proof", "proof")
+    calls = []
+
+    def resolve(**kwargs):
+        calls.append((kwargs.get("requested"), kwargs.get("target_model")))
+        if kwargs.get("requested") is None or (fallbacks and kwargs.get("requested") == "openrouter"):
+            raise AuthError("fixture credential missing")
+        return {"provider": kwargs["requested"], "api_key": "fixture"}
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", resolve)
+    monkeypatch.setattr(scheduler, "_load_prefill_messages", lambda _cfg, _job_id: None)
+    monkeypatch.setattr(scheduler, "_load_credential_pool", lambda _runtime, _job_id: None)
+    monkeypatch.setattr(scheduler, "_init_cron_mcp_tools", lambda _job_id: None)
+
+    setup = scheduler._resolve_cron_agent_setup(job, "proof", "proof", jc)
+
+    assert setup.blocked is None
+    assert setup.model == ("backup" if fallbacks else "coding")
+    assert calls[0] == ("openrouter", "coding")
+    if fallbacks:
+        assert calls[1] == ("openai", "backup")
+    else:
+        assert calls == [("openrouter", "coding"), ("openrouter", "coding")]
+
+
+@pytest.mark.parametrize("site", ["job", "cron"])
+@pytest.mark.parametrize("override", [None, [], [{"provider": "anthropic", "model": "cron-backup"}]])
+def test_setup_and_standalone_preflight_share_preset_fallback_context(tmp_path, monkeypatch, site, override):
+    cfg = {
+        "model": {"default": "main", "provider": "openai"},
+        "model_presets": {"coding": {"provider": "openrouter", "model": "coding", "fallbacks": [{"provider": "openai", "model": "preset-backup"}]}},
+        "fallback_providers": [{"provider": "groq", "model": "never-borrow"}],
+        "cron": {},
+    }
+    if override is not None:
+        cfg["cron"]["fallback_providers"] = override
+    job = {"id": "proof", "name": "proof", "prompt": "run", "deliver": "local"}
+    if site == "job":
+        job["model"] = "@coding"
+    else:
+        cfg["cron"]["model"] = "@coding"
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    calls = []
+    def resolve(**kwargs):
+        calls.append((kwargs.get("requested"), kwargs.get("target_model")))
+        if kwargs.get("target_model") == "coding":
+            raise AuthError("fixture credential missing")
+        return {"provider": kwargs["requested"], "api_key": "fixture"}
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", resolve)
+    monkeypatch.setattr(scheduler, "_load_credential_pool", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_init_cron_mcp_tools", lambda *_args: None)
+    standalone = _preflight_check_provider_key(job, cfg)
+    if override == []:
+        assert standalone and "provider credential missing" in standalone
+        assert calls == [("openrouter", "coding")]
+    else:
+        assert standalone is None
+        assert calls == []  # no premature credential resolution when execution can rescue
+    calls.clear()
+    jc = scheduler._load_cron_job_config(job, "proof", "proof")
+    setup = scheduler._resolve_cron_agent_setup(job, "proof", "proof", jc)
+    if override == []:
+        assert setup.blocked is not None
+        assert calls == [("openrouter", "coding")]
+    else:
+        assert setup.blocked is None
+        backup = override[0] if override else cfg["model_presets"]["coding"]["fallbacks"][0]
+        assert setup.model == backup["model"]
+        assert calls == [("openrouter", "coding"), (backup["provider"], backup["model"])]

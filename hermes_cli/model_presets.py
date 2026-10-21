@@ -39,12 +39,31 @@ class ModelPresetError(ValueError):
     """A model preset cannot be expanded safely."""
 
 
+ReasoningEffort = str | dict[str, Any]
+
+
+def normalize_route_reasoning_effort(value: Any) -> ReasoningEffort:
+    """Keep valid route policy typed and make disabled values truthy, never absent.
+
+    Reuse the reasoning parser so YAML false and disabled dictionaries share the
+    same semantics. Enabled dictionaries retain provider-specific effort names.
+    """
+    from hermes_constants import parse_reasoning_effort
+
+    parsed = parse_reasoning_effort(value)
+    if parsed is None:
+        return ""
+    if not parsed["enabled"]:
+        return "none"
+    return parsed if isinstance(value, dict) else parsed["effort"]
+
+
 @dataclass(frozen=True)
 class ModelPresetRoute:
     name: str
     provider: str
     model: str
-    reasoning_effort: str = ""
+    reasoning_effort: ReasoningEffort = ""
     fallbacks: tuple[dict[str, Any], ...] = ()
 
 
@@ -80,7 +99,7 @@ def _validate_route(value: Any, path: str, *, allow_fallbacks: bool) -> dict[str
         raise _error(path, "preset routes must be flat, not nested @ references")
     if "reasoning_effort" in value:
         _validate_reasoning(value["reasoning_effort"], path)
-        route["reasoning_effort"] = value["reasoning_effort"]
+        route["reasoning_effort"] = normalize_route_reasoning_effort(value["reasoning_effort"])
     if "fallbacks" in value:
         if not allow_fallbacks:
             raise _error(path, "fallbacks are not supported in a fallback route")
@@ -209,18 +228,10 @@ def _expand_model(config: dict[str, Any], definitions: dict[str, dict[str, Any]]
         **{key: deepcopy(value) for key, value in model.items() if key not in {"model_preset", "fallbacks"}},
         "provider": route["provider"], "default": route["model"],
     }
-    agent = config.get("agent")
-    authored_agent_effort = isinstance(agent, dict) and "reasoning_effort" in agent
     if "reasoning_effort" in route:
-        # A preset that declares an effort owns the main route. agent.reasoning_effort
-        # stays authored and applies to other models; the live resolver prefers the preset.
-        if authored_agent_effort:
-            config["model"]["reasoning_effort"] = route["reasoning_effort"]
-        if not isinstance(agent, dict):
-            agent = {}
-            config["agent"] = agent
-        if "reasoning_effort" not in agent:
-            agent["reasoning_effort"] = route["reasoning_effort"]
+        # Keep the preset effort on the selected route. It must not become a global
+        # agent default, because that would affect unrelated models.
+        config["model"]["reasoning_effort"] = deepcopy(route["reasoning_effort"])
     if disabled_fallbacks:
         # Explicit opt-out must survive raw gateway loads and default/overlay inheritance.
         config["fallback_providers"] = []
@@ -430,17 +441,12 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             for key in _MAIN_FORBIDDEN_REFERENCE_FIELDS
         ) if isinstance(actual_model, dict) else True
         preset = _definitions(authored)[raw_model["model_preset"].strip()]
-        reasoning_unchanged = (
-            "reasoning_effort" not in preset
-            or (result.get("agent") or {}).get("reasoning_effort")
-            == (expanded_authored.get("agent") or {}).get("reasoning_effort")
-        )
         fallbacks_unchanged = (
             "fallbacks" not in preset and "fallbacks" not in raw_model
             or result.get("fallback_providers") == expanded_authored.get("fallback_providers")
         )
         if (isinstance(actual_model, dict) and not unsafe_model_fields
-                and reasoning_unchanged and fallbacks_unchanged
+                and fallbacks_unchanged
                 and actual_model.get("provider") == expected_model.get("provider") and actual_model.get("default") == expected_model.get("default")
                 and ("reasoning_effort" not in actual_model or actual_model.get("reasoning_effort") == preset.get("reasoning_effort"))):
             restored_model = deepcopy(actual_model)
@@ -455,11 +461,6 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             if raw_model.get("fallbacks") == []:
                 restored_model["fallbacks"] = []
             result["model"] = _in_authored_form(original_model, restored_model, ("default", "model"))
-            expected_agent = (expanded_authored.get("agent") or {}).get("reasoning_effort")
-            raw_agent = authored.get("agent")
-            if (expected_agent is not None and not (isinstance(raw_agent, dict) and "reasoning_effort" in raw_agent)
-                    and isinstance(result.get("agent"), dict) and result["agent"].get("reasoning_effort") == expected_agent):
-                result["agent"].pop("reasoning_effort", None)
             if (("fallbacks" in preset or "fallbacks" in raw_model)
                     and "fallback_providers" not in authored
                     and result.get("fallback_providers") == expanded_authored.get("fallback_providers")):

@@ -23,6 +23,15 @@ acceptance of the design. Reassess this divergence before adopting upstream work
   routes. Provider model IDs such as `@cf/vendor/model` stay literal.
 - All primary-route readers use `resolve_default_route` and the common reasoning
   resolver. Consumer-specific shims must not interpret references themselves.
+- Preset effort remains on the selected route, never projected into
+  `agent.reasoning_effort`. The matching default route outranks per-model/global
+  effort. Other models keep their own policy. Normalize disabled aliases through
+  the existing reasoning parser to `none`, retain enabled dictionaries (including
+  provider-specific tiers), and keep absent/null effort unspecified.
+- Cron preflight and execution consume the same `_CronJobConfig` and primary
+  provider kwargs. Standalone doctor checks use the config-only resolver, without
+  credential I/O until the existing preflight probe. Keep the exfil guard before
+  preflight and preserve cron override, preset and pinned fallback boundaries.
 - `persist_model_selection` is the single shared CLI, TUI and gateway writer.
   Concrete picks remove every authored reference spelling in 1 atomic file
   replacement, preserve sibling settings/comments and never persist runtime

@@ -14,7 +14,7 @@ def test_at_shorthand_expands_at_every_reference_site():
               "auxiliary": {"compression": {"model": "@fast", "timeout": 20}},
               "fallback_providers": ["@fast"]}
     expanded = expand_model_presets(config)
-    assert expanded["model"] == {"provider": "provider-c", "default": "model-c"}
+    assert expanded["model"] == {"provider": "provider-c", "default": "model-c", "reasoning_effort": "minimal"}
     assert expanded["delegation"]["provider"] == "provider-a"
     assert expanded["delegation"]["max_concurrent_children"] == 3
     assert expanded["auxiliary"]["compression"]["model"] == "model-c"
@@ -51,8 +51,9 @@ def test_expands_all_runtime_consumers_without_mutating_authored_routes():
     config = {**routes(), "model": {"model_preset": "fast"}, "delegation": {"model_preset": "primary", "max_concurrent_children": 3}, "auxiliary": {"compression": {"model_preset": "primary", "timeout": 20}}, "fallback_providers": [{"model_preset": "fast"}], "moa": {"presets": {"review": {"reference_models": [{"model_preset": "fast"}], "aggregator": {"model_preset": "fast"}}}}}
     authored = copy.deepcopy(config)
     expanded = expand_model_presets(config)
-    assert expanded["model"] == {"provider": "provider-c", "default": "model-c"}
-    assert expanded["agent"]["reasoning_effort"] == "minimal"
+    assert expanded["model"] == {"provider": "provider-c", "default": "model-c", "reasoning_effort": "minimal"}
+    assert expanded["model"]["reasoning_effort"] == "minimal"
+    assert "reasoning_effort" not in expanded.get("agent", {})
     assert expanded["fallback_providers"] == [{"provider": "provider-c", "model": "model-c", "reasoning_effort": "minimal"}]
     assert expanded["delegation"]["fallback_providers"][0]["provider"] == "provider-b"
     assert expanded["auxiliary"]["compression"]["fallback_chain"][0]["model"] == "model-b"
@@ -297,7 +298,7 @@ def test_main_preset_roundtrip_and_deliberate_projected_edits(tmp_path, monkeypa
     c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
     loaded = c.load_config()
     if edit == "reasoning":
-        loaded["agent"]["reasoning_effort"] = "low"
+        loaded["model"]["reasoning_effort"] = "low"
     elif edit == "fallbacks":
         loaded["fallback_providers"] = [{"provider": "edited", "model": "edited"}]
     c.save_config(loaded, strip_defaults=strip_defaults)
@@ -305,7 +306,13 @@ def test_main_preset_roundtrip_and_deliberate_projected_edits(tmp_path, monkeypa
     assert ("model_preset" in saved["model"]) == (edit == "unchanged")
     c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
     reloaded = c.load_config()
-    assert reloaded["agent"]["reasoning_effort"] == ("low" if edit == "reasoning" else "high")
+    from hermes_constants import resolve_reasoning_config
+    assert reloaded["model"]["reasoning_effort"] == ("low" if edit == "reasoning" else "high")
+    assert "reasoning_effort" not in reloaded.get("agent", {})
+    assert resolve_reasoning_config(reloaded, "model-a") == {
+        "enabled": True, "effort": "low" if edit == "reasoning" else "high",
+    }
+    assert resolve_reasoning_config(reloaded, "unrelated") is None
     assert reloaded["fallback_providers"] == loaded["fallback_providers"]
 
 
@@ -707,3 +714,65 @@ def test_nested_presets_fail_in_static_and_runtime_resolvers():
         expand_model_presets(cfg)
     with pytest.raises(ModelPresetError, match="flat"):
         resolve_model_ref("@outer", cfg)
+
+
+@pytest.mark.parametrize("model", ["@p", {"model_preset": "p"}, {"default": "@p"}, {"model": "@p"}])
+@pytest.mark.parametrize("agent", [None, {}, {"reasoning_overrides": {"m": "low", "other": "medium"}}, {"reasoning_effort": "low", "reasoning_overrides": {"m": "low"}}])
+def test_main_preset_effort_stays_route_local_without_global_projection(model, agent):
+    from hermes_constants import resolve_reasoning_config
+    from hermes_cli.model_presets import preserve_model_preset_references
+
+    raw = {
+        "model_presets": {"p": {"provider": "openrouter", "model": "m", "reasoning_effort": "high"}},
+        "model": model,
+        "unrelated": {"keep": True},
+    }
+    if agent is not None:
+        raw["agent"] = copy.deepcopy(agent)
+    expanded = expand_model_presets(raw)
+
+    assert expanded.get("agent") == raw.get("agent")
+    assert expanded["model"]["reasoning_effort"] == "high"
+    assert resolve_reasoning_config(raw, "m") == {"enabled": True, "effort": "high"}
+    assert resolve_reasoning_config(expanded, "m") == {"enabled": True, "effort": "high"}
+    assert resolve_reasoning_config(expanded, "other") == resolve_reasoning_config(raw, "other")
+    assert resolve_reasoning_config(expanded, "unconfigured") == resolve_reasoning_config(raw, "unconfigured")
+    assert preserve_model_preset_references(expanded, raw) == raw
+    expanded.setdefault("agent", {})["reasoning_effort"] = "medium"
+    saved = preserve_model_preset_references(expanded, raw)
+    assert saved["model"] == model
+    assert saved["agent"]["reasoning_effort"] == "medium"
+
+
+@pytest.mark.parametrize("model", ["@p", {"model_preset": "p"}, {"default": "@p"}, {"model": "@p"}])
+@pytest.mark.parametrize("effort", ["high", False, {"enabled": False}, {"enabled": True, "effort": "bespoke"}])
+def test_unrelated_file_save_preserves_route_effort_ownership(tmp_path, monkeypatch, model, effort):
+    from hermes_cli import config as config_mod
+    from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+    home = tmp_path / "home"
+    home.mkdir()
+    path = home / "config.yaml"
+    raw = {
+        "model": model,
+        "model_presets": {"p": {"provider": "openrouter", "model": "m", "reasoning_effort": effort}},
+        "agent": {"reasoning_overrides": {"m": "low"}},
+    }
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    loaded = config_mod.load_config()
+    import cli as cli_mod
+    from hermes_cli.cli_config_load import load_cli_config
+    monkeypatch.setattr(cli_mod, "_hermes_home", home)
+    cli_loaded = load_cli_config()
+    assert resolve_reasoning_config(cli_loaded, "m") == parse_reasoning_effort(effort)
+    assert resolve_reasoning_config(loaded, "m") == parse_reasoning_effort(effort)
+    assert resolve_reasoning_config(loaded, "unconfigured") is None
+    loaded["display"]["show_thinking"] = False
+    config_mod.save_config(loaded)
+    saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert saved["model"] == model
+    assert saved["model_presets"] == raw["model_presets"]
+    assert "reasoning_effort" not in saved.get("agent", {})
+    reloaded = config_mod.load_config()
+    assert resolve_reasoning_config(reloaded, "m") == parse_reasoning_effort(effort)
+    assert resolve_reasoning_config(reloaded, "unconfigured") is None

@@ -298,3 +298,96 @@ def test_attended_model_preset_resolves_to_named_route():
         "model_presets": {"fast": {"provider": "openrouter", "model": "fast-model"}},
     })
     assert (route.model, route.provider) == ("fast-model", "openrouter")
+
+
+@pytest.mark.parametrize("effort", [False, {"enabled": False}, {"enabled": True, "effort": "bespoke"}])
+@pytest.mark.parametrize("shape", ["named", "default", "attended"])
+def test_typed_preset_effort_survives_named_default_and_attended_routes(shape, effort):
+    from hermes_cli.model_preset_runtime import resolve_default_route, resolve_model_ref
+
+    cfg = {
+        "model_presets": {"p": {"provider": "openrouter", "model": "m", "reasoning_effort": effort}},
+        "model": "@p" if shape == "named" else {"model_preset": "p"} if shape == "default" else {
+            "default": "main",
+            "attended": {"model_preset": "p"},
+        },
+    }
+    raw = "@p" if shape == "named" else "@attended" if shape == "attended" else {"model_preset": "p"}
+    route = resolve_model_ref(raw, cfg)
+    from hermes_constants import parse_reasoning_effort
+    assert parse_reasoning_effort(route.reasoning_effort) == parse_reasoning_effort(effort)
+    if shape != "attended":
+        default_route = resolve_default_route(cfg)
+        assert parse_reasoning_effort(default_route.reasoning_effort) == parse_reasoning_effort(effort)
+
+
+@pytest.mark.parametrize("effort, expected", [
+    (False, {"enabled": False}),
+    ({"enabled": False}, {"enabled": False}),
+    ({"enabled": True, "effort": "bespoke"}, {"enabled": True, "effort": "bespoke"}),
+])
+def test_typed_preset_effort_matches_raw_and_expanded_reasoning(effort, expected):
+    from hermes_constants import resolve_reasoning_config
+    from hermes_cli.model_presets import expand_model_presets
+
+    raw = {
+        "model_presets": {"p": {"provider": "openrouter", "model": "m", "reasoning_effort": effort}},
+        "model": {"model_preset": "p"},
+        "agent": {"reasoning_effort": "high"},
+    }
+    expanded = expand_model_presets(raw)
+    from hermes_constants import parse_reasoning_effort
+    assert parse_reasoning_effort(expanded["model"]["reasoning_effort"]) == expected
+    assert resolve_reasoning_config(raw, "m") == expected
+    assert resolve_reasoning_config(expanded, "m") == expected
+
+
+@pytest.mark.parametrize("effort", [False, "false", "none", "disabled", {"enabled": False}, {"enabled": True, "effort": "bespoke"}, "high"])
+@pytest.mark.parametrize("reference", ["@p", {"model_preset": "p"}])
+def test_attended_consumers_preserve_typed_route_policy(effort, reference):
+    from gateway.attended_model import parse_attended_config, resolve_attended_model
+    from hermes_constants import parse_reasoning_effort
+    cfg = {
+        "model_presets": {"p": {"provider": "openrouter", "model": "m", "reasoning_effort": effort}},
+        "model": {"default": "main", "attended": {"model": reference} if isinstance(reference, str) else reference},
+    }
+    parsed = parse_attended_config(cfg)
+    result = resolve_attended_model({"new_session": True, "default_reasoning": "high"}, 1, cfg)
+    assert parse_reasoning_effort(parsed.reasoning_effort) == parse_reasoning_effort(effort)
+    assert parse_reasoning_effort(result.reasoning_effort) == parse_reasoning_effort(effort)
+    explicit = resolve_attended_model({"new_session": True, "session_model": "picked", "session_reasoning": "low"}, 1, cfg)
+    assert explicit.reasoning_effort == "low"
+    typed_override = {"enabled": True, "effort": "bespoke"}
+    explicit = resolve_attended_model({"new_session": True, "session_model": "picked", "session_reasoning": typed_override}, 1, cfg)
+    assert parse_reasoning_effort(explicit.reasoning_effort) == typed_override
+
+
+@pytest.mark.parametrize("effort", [False, {"enabled": False}, {"enabled": True, "effort": "bespoke"}, "high"])
+def test_concrete_default_and_attended_wrappers_keep_typed_policy(effort):
+    from hermes_cli.model_preset_runtime import resolve_model_ref
+    from gateway.attended_model import parse_attended_config
+    from hermes_constants import parse_reasoning_effort
+    cfg = {"model": {
+        "default": "m", "provider": "openrouter", "reasoning_effort": effort,
+        "attended": {"model": "a", "provider": "openrouter", "reasoning_effort": effort},
+    }}
+    expected = parse_reasoning_effort(effort)
+    assert parse_reasoning_effort(resolve_model_ref("@default", cfg).reasoning_effort) == expected
+    assert parse_reasoning_effort(resolve_model_ref("@attended", cfg).reasoning_effort) == expected
+    assert parse_reasoning_effort(parse_attended_config(cfg).reasoning_effort) == expected
+
+
+@pytest.mark.parametrize("effort", [None, ""])
+def test_null_route_effort_defers_instead_of_disabling(effort):
+    from hermes_cli.model_presets import expand_model_presets
+    from hermes_cli.model_preset_runtime import resolve_model_ref
+    from hermes_constants import resolve_reasoning_config
+    cfg = {
+        "model_presets": {"p": {"provider": "openrouter", "model": "m", "reasoning_effort": effort}},
+        "model": {"model_preset": "p"}, "agent": {"reasoning_effort": "high"},
+    }
+    if effort == "":
+        del cfg["model_presets"]["p"]["reasoning_effort"]
+    assert resolve_model_ref("@p", cfg).reasoning_effort == ""
+    for effective in (cfg, expand_model_presets(cfg)):
+        assert resolve_reasoning_config(effective, "m") == {"enabled": True, "effort": "high"}

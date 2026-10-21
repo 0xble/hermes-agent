@@ -1701,86 +1701,93 @@ class _CronJobConfig:
     route: Any = None  # ModelPresetRoute when the run's model came from an ``@preset`` reference
 
 
-def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConfig:
-    """Load config.yaml and resolve the run's model: per-job pin > cron.model (fleet default) >
-    the main agent model (config ``model:``, then HERMES_MODEL). Re-read every tick (no cache) so
-    ``hermes cron edit --model`` and ``hermes model`` both apply next tick."""
+def _resolve_cron_job_config(job: dict, cfg: dict) -> _CronJobConfig:
+    """Resolve config-only run inputs once, shared by dispatch and standalone preflight."""
     model = job.get("model") or cron_env_setting("HERMES_MODEL") or ""
+    _cfg = cfg
     _cron_default_provider = ""
-    _cfg: dict = {}
-    _effective_cfg: dict = {}
-    _model_cfg: Any = {}
-    _route = None
     _job_route_provider = ""
+    _route = None
+    from hermes_cli.model_preset_runtime import resolve_model_ref
+    # Resolve @ routes from the freshly read config on every fire. Do not persist the
+    # concrete model in the job or resolve it during cron creation.
+    from hermes_cli.model_presets import preset_ref_name
+    if preset_ref_name(model):
+        _route = resolve_model_ref(model.strip(), _cfg)
+        model = _route.model
+        if not job.get("provider"):
+            _cron_default_provider = _job_route_provider = _route.provider
+    from hermes_cli.model_presets import expand_model_presets
+    _runtime_cfg = expand_model_presets(_cfg)
+    _effective_cfg = _runtime_cfg
+    # Coerce null to {} so a falsy default never clobbers a resolved env value.
+    _model_cfg = _runtime_cfg.get("model") or {}
+    _cron_cfg_for_model = _runtime_cfg.get("cron") or {}
+    _cron_default_model = ""
+    if isinstance(_cron_cfg_for_model, dict):
+        _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
+        # A job's own @route provider outranks the fleet default; an unset
+        # cron.model_provider must never erase it.
+        _cron_provider_cfg = str(_cron_cfg_for_model.get("model_provider") or "").strip()
+        if _cron_provider_cfg and not _job_route_provider:
+            _cron_default_provider = _cron_provider_cfg
+        if preset_ref_name(_cron_default_model) and not job.get("model"):
+            _route = resolve_model_ref(_cron_default_model, _cfg)
+            _cron_default_model = _route.model
+            if not _cron_provider_cfg and not _job_route_provider:
+                _cron_default_provider = _route.provider
+    if not job.get("model"):
+        if _cron_default_model:
+            model = _cron_default_model
+        else:
+            # The main agent model: ``model: <name>`` shorthand or ``model.default``.
+            _main = _model_cfg if isinstance(_model_cfg, str) else (
+                _model_cfg.get("default") or _model_cfg.get("model") or _model_cfg.get("name")
+                if isinstance(_model_cfg, dict) else "")
+            model = str(_main or "").strip() or model
+    return _CronJobConfig(_effective_cfg, model, _model_cfg, _cron_default_provider, _route)
+
+
+def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConfig:
+    """Read fresh config each fire, then resolve the same route standalone checks use."""
+    cfg: dict = {}
     try:
         from hermes_cli.config_effective import load_user_config_effective
-        _cfg_path = str(_get_hermes_home() / "config.yaml")
-        if os.path.exists(_cfg_path):
-            _cfg = load_user_config_effective(Path(_cfg_path))
-            from hermes_cli.model_preset_runtime import resolve_model_ref
-            # Resolve @ routes from the freshly read config on every fire. Do not persist the
-            # concrete model in the job or resolve it during cron creation.
-            from hermes_cli.model_presets import preset_ref_name
-            if preset_ref_name(model):
-                _route = resolve_model_ref(model.strip(), _cfg)
-                model = _route.model
-                if not job.get("provider"):
-                    _cron_default_provider = _job_route_provider = _route.provider
-            from hermes_cli.model_presets import expand_model_presets
-            _runtime_cfg = expand_model_presets(_cfg)
-            _effective_cfg = _runtime_cfg
-            # Coerce null to {} so a falsy default never clobbers a resolved env value.
-            _model_cfg = _runtime_cfg.get("model") or {}
-            _cron_cfg_for_model = _runtime_cfg.get("cron") or {}
-            _cron_default_model = ""
-            if isinstance(_cron_cfg_for_model, dict):
-                _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
-                # A job's own @route provider outranks the fleet default; an unset
-                # cron.model_provider must never erase it.
-                _cron_provider_cfg = str(_cron_cfg_for_model.get("model_provider") or "").strip()
-                if _cron_provider_cfg and not _job_route_provider:
-                    _cron_default_provider = _cron_provider_cfg
-                if preset_ref_name(_cron_default_model) and not job.get("model"):
-                    _route = resolve_model_ref(_cron_default_model, _cfg)
-                    _cron_default_model = _route.model
-                    if not _cron_provider_cfg and not _job_route_provider:
-                        _cron_default_provider = _route.provider
-            if not job.get("model"):
-                if _cron_default_model:
-                    model = _cron_default_model
-                else:
-                    # The main agent model: ``model: <name>`` shorthand or ``model.default``.
-                    _main = _model_cfg if isinstance(_model_cfg, str) else (
-                        _model_cfg.get("default") or _model_cfg.get("model") or _model_cfg.get("name")
-                        if isinstance(_model_cfg, dict) else "")
-                    model = str(_main or "").strip() or model
-    except Exception as e:
-        from hermes_cli.model_presets import ModelPresetError
-        if isinstance(e, ModelPresetError):
-            # An unknown/invalid @preset must fail the run, not fall back to the literal '@name'.
-            raise
-        logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+        cfg_path = _get_hermes_home() / "config.yaml"
+        if cfg_path.exists():
+            cfg = load_user_config_effective(cfg_path)
+    except Exception as exc:
+        logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, exc)
+    jc = _resolve_cron_job_config(job, cfg)
 
     # Fail fast: an empty model otherwise reaches the provider as an opaque 400.
-    # See #23979.
-    if not (isinstance(model, str) and model.strip()):
+    if not (isinstance(jc.model, str) and jc.model.strip()):
         raise RuntimeError(
             f"Cron job '{job_name}' has no model configured "
             f"(job.model={job.get('model')!r}, "
             f"HERMES_MODEL={cron_env_setting('HERMES_MODEL')!r}, "
             "config.yaml model.default missing or empty). "
-            f"Set a per-job model via "
-            f"`hermes cron edit {job_id} --model <name>` or set a "
-            "default with `hermes model <name>`."
+            f"Set a per-job model via `hermes cron edit {job_id} --model <name>` "
+            "or set a default with `hermes model <name>`."
         )
-
     with contextlib.suppress(Exception):
         from hermes_constants import apply_ipv4_preference
-        _net_cfg = _cfg.get("network", {})
-        if isinstance(_net_cfg, dict) and _net_cfg.get("force_ipv4"):
+        net_cfg = cfg.get("network", {})
+        if isinstance(net_cfg, dict) and net_cfg.get("force_ipv4"):
             apply_ipv4_preference(force=True)
-    # Hand consumers the expanded config so a preset's reasoning_effort and fallbacks reach them.
-    return _CronJobConfig(_effective_cfg or _cfg, model, _model_cfg, _cron_default_provider, _route)
+    return jc
+
+
+def _cron_runtime_kwargs(job: dict, jc: _CronJobConfig) -> dict:
+    """The exact primary provider request for preflight and execution, without provider I/O."""
+    # Do not pass HERMES_INFERENCE_PROVIDER: persisted/profile config owns unpinned jobs.
+    kwargs = {
+        "requested": job.get("provider") or jc.cron_default_provider or None,
+        "target_model": jc.model,
+    }
+    if job.get("base_url"):
+        kwargs["explicit_base_url"] = job["base_url"]
+    return kwargs
 
 
 def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
@@ -1807,7 +1814,7 @@ def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
         return None
 
 
-def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Optional[tuple]:
+def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict, jc: _CronJobConfig | None = None) -> Optional[tuple]:
     """Pre-dispatch config validation: refuse unrunnable jobs (missing key, unready skill,
     unconfigured delivery) BEFORE AIAgent is built. run_one_job keys off BLOCKED_CONFIG_MARKER to
     record blocked_config and alert once (`preflight_alerted` bit). Must run after the wake gate so
@@ -1823,7 +1830,7 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
     _pf_reason = None
     try:
         if _cron_preflight_enabled(cfg):
-            _pf_reason = _preflight_job_config(job, cfg)
+            _pf_reason = _preflight_job_config(job, cfg, jc)
             if not _pf_reason and job.get("preflight_alerted"):
                 # Config healthy again: clear alert-once marker so a future break re-alerts.
                 with contextlib.suppress(Exception):
@@ -1876,17 +1883,9 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
     from hermes_cli.auth import AuthError
 
     model = jc.model
-    requested = job.get("provider") or jc.cron_default_provider or None
+    runtime_kwargs = _cron_runtime_kwargs(job, jc)
+    requested = runtime_kwargs["requested"]
     try:
-        # Do NOT pass HERMES_INFERENCE_PROVIDER as `requested`: it would override persisted config
-        # and resurrect stale providers for unpinned jobs.
-        runtime_kwargs = {
-            "requested": requested,
-            # api_mode must derive from the model actually run, not the stale persisted default.
-            "target_model": model,
-        }
-        if job.get("base_url"):
-            runtime_kwargs["explicit_base_url"] = job.get("base_url")
         return resolve_runtime_provider(**runtime_kwargs), model
     except Exception as resolve_exc:
         # Walk the fallback chain on AuthError AND transient network/DNS failures (e.g. during
@@ -2511,7 +2510,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     # that would ship a stored credential off-host; hand-written jobs bypass create-time checks.
     _guard_job_credential_exfil(job)
 
-    setup.blocked = _preflight_or_block(job, job_id, job_name, _cfg)
+    setup.blocked = _preflight_or_block(job, job_id, job_name, _cfg, jc)
     if setup.blocked is not None:
         return setup
 
