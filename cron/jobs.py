@@ -483,6 +483,7 @@ EMPTY_PAYLOAD_ERROR = (
     "Cron job has nothing to run: the prompt is blank and no script or "
     "skill(s) are set. Provide a prompt, a script, or at least one skill."
 )
+DEFAULT_PAUSE_REASON = "Paused by operator."
 
 NO_AGENT_WITHOUT_SCRIPT_ERROR = (
     "no_agent=True requires a script — with no agent and no script "
@@ -2409,11 +2410,12 @@ def pause_job(
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    effective_reason = reason.strip() if isinstance(reason, str) else ""
     updated = update_job(job["id"], {
         "enabled": False,
         "state": "paused",
         "paused_at": _hermes_now().isoformat(),
-        "paused_reason": reason,
+        "paused_reason": effective_reason or DEFAULT_PAUSE_REASON,
     })
     if updated is not None:
         marker = _self_removal_delivery.get()
