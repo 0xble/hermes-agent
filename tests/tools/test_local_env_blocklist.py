@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -711,6 +711,29 @@ def test_hermes_bin_resolution_and_unresolved_noop(child_env, monkeypatch):
     assert local._resolve_hermes_bin_dir() == str(bin_dir)
     monkeypatch.setattr(local, "_HERMES_BIN_DIR", None)
     assert local._prepend_hermes_bin_dir("/usr/bin") == "/usr/bin"
+
+
+@pytest.mark.usefixtures("child_env")
+@pytest.mark.parametrize("payload", [False, True])
+@pytest.mark.parametrize("client_env,is_local", [
+    (None, True),
+    ({}, True),
+    ({"PATH": "/client/bin"}, True),
+    ({"PATH": "/remote/bin"}, False),
+])
+def test_hermes_launcher_path_preserves_client_precedence_and_payload(
+    monkeypatch, payload, client_env, is_local,
+):
+    from agent.session_client_env import client_env_scope
+
+    monkeypatch.setattr(local, "_resolve_hermes_bin_dir", lambda: "/opt/hermes/bin")
+    monkeypatch.setattr(local, "_HERMES_BIN_DIR_IS_PAYLOAD", payload)
+    expected = (["/opt/hermes/bin", "/client/bin"] if payload or client_env is None
+                else ["/client/bin", "/opt/hermes/bin"])
+    with client_env_scope(client_env, local=is_local):
+        path = local._prepend_hermes_bin_dir("/client/bin")
+        assert path.split(os.pathsep) == expected
+        assert local._prepend_hermes_bin_dir(path) == path
 
 
 @pytest.mark.platforms("posix")

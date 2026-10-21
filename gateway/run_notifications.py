@@ -1800,6 +1800,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if callable(_prime):
                 _prime(synth_event)
             if getattr(self, "_draining", False):
+                # Heartbeats have their durable producer queue as the retry owner. Do not move a
+                # refused replacement into the adapter pending slot during teardown.
+                if evt.get("type") == "heartbeat":
+                    return False
                 # A wake started now would race adapter teardown. A delegation result already has
                 # a durable ledger row: refuse it so the claim is deferred and the row stays
                 # pending for the next boot's /new-aware replay. A process completion has no other
@@ -2174,7 +2178,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return claim.early_result
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission
-                if completion_admission(self, evt) is not None:
+                if await asyncio.to_thread(completion_admission, self, evt) is not None:
                     accepted = True  # Lost ACK: finish durable claims, never infer again.
                     return True
             if identity is not None:
@@ -2552,7 +2556,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 continue
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission
-                if completion_admission(self, evt) is not None:
+                if await asyncio.to_thread(completion_admission, self, evt) is not None:
                     acknowledged = await self._deliver_completion_notification(synth_text, evt) is True or acknowledged
                     continue
             parent = str(evt.get("parent_session_id") or "")
@@ -3125,7 +3129,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         try:
                             # The owning profile's authority, as on the delivery path.
                             async with self._completion_event_scope(completion_evt):
-                                committed = completion_admission(self, completion_evt) is not None
+                                committed = await asyncio.to_thread(completion_admission, self, completion_evt) is not None
                         except Exception:
                             # Failing open sends the notice; a dead watcher would send nothing.
                             logger.debug("Process watcher: admission recheck failed for %s", session_id,

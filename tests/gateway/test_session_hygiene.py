@@ -1074,10 +1074,13 @@ async def test_hygiene_skips_when_compression_already_in_flight(
         runner, _adapter, event = _make_cooldown_runner(
             monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
         )
-        runner._session_has_compression_in_flight = AsyncMock(return_value=True)
+        # The lock starts after inbound admission, so this tests hygiene rather than
+        # the admission path's intentional queue-and-retry behavior.
+        runner._session_has_compression_in_flight = AsyncMock(side_effect=[False, True])
         assert await runner._handle_message(event) == "ok"
         assert ShouldNotRunAgent.instances == 0
         assert runner._run_agent.await_count == 1
+        assert runner._session_has_compression_in_flight.await_count == 2
     finally:
         db.close()
 

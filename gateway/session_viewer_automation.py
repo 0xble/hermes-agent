@@ -161,7 +161,7 @@ async def automation(connection, ref, params):
         with _profile_runtime_scope(home), _session_workspace(runner, live.source):
             return invoke(runner, kind, target, call, args, kwargs)
     rows = lambda: tuple(authority.db.get_meta(f"{k}:{target}") for k in ("goal", "loop", "heartbeat"))
-    # A "read" can still write: is_waiting / goal_blocks_tick clear a satisfied goal barrier.
+    # Publish read-side writes if any, but pure barrier checks leave the wait for wake admission.
     before = rows() if call in _READS else None
     # The judge and gates block for seconds: off the loop, with the caller's context (profile scope).
     result = await asyncio.to_thread(run)

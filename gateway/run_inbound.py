@@ -273,11 +273,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         if reconnect_keys and not is_internal:
             normalized = await asyncio.to_thread(self._normalize_source_for_session_key, source)
             reconnect_key = self._session_key_for_source(normalized)
+        from gateway.session_ingress import executing_admission
         if (
             (getattr(self, "_startup_restore_in_progress", False)
              or (reconnect_keys and reconnect_keys.get(reconnect_key, 0)))
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
+            and not executing_admission.get()
         ):
             self._queue_startup_restore_event(event)
             return None
@@ -1765,6 +1767,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             # here would send it a second time.
             return None
         if self._draining and not self._hm_is_registered_command(event):
+            from gateway.session_retry_admission import refuse_deferred_retry
+            refuse_deferred_retry(event)
             self._preserve_drain_event(self._session_key_for_source(source), event)
             return None
         # Expand alias quick commands before the running-session split (fork patch: the idle

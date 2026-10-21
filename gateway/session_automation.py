@@ -109,10 +109,12 @@ async def prepare_heartbeat(runner, event):
     import asyncio
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
-    entry = runner.session_store.lookup_by_session_key(str(event.get('session_key') or '')) if authority else None
+    entry = await asyncio.to_thread(
+            runner.session_store.lookup_by_session_key, str(event.get('session_key') or '')) if authority else None
     if entry is None:
         return event
-    owner, process = _route_owner(authority, entry), str(event.get('session_id') or '')
+    owner = await asyncio.to_thread(_route_owner, authority, entry)
+    process = str(event.get('session_id') or '')
     if await asyncio.to_thread(_process_completed, runner, authority, owner, event):
         logger.debug("Dropped heartbeat %s of process %s: its completion is already admitted",
                      event.get('event_id'), process)
@@ -168,14 +170,15 @@ async def withdraw_process_ticks(runner, event):
     from gateway.session_authorities import active_authority
     try:
         authority = active_authority(runner)
-        entry = runner.session_store.lookup_by_session_key(str(event.get('session_key') or '')) if authority else None
+        entry = await asyncio.to_thread(
+            runner.session_store.lookup_by_session_key, str(event.get('session_key') or '')) if authority else None
         if entry is None:
             return
         finished = {identity[1] for identity in _identities(
             [producer_identity(runner, event), *(event.get('_automation_identities') or ())])
             if identity[0] == 'completion' and len(identity) > 1}
-        pending = await asyncio.to_thread(
-            list_session_admissions, authority.db, session_id=_route_owner(authority, entry))
+        owner = await asyncio.to_thread(_route_owner, authority, entry)
+        pending = await asyncio.to_thread(list_session_admissions, authority.db, session_id=owner)
         for row in pending:
             if any(_queued_tick(row, process, entry.session_key) for process in finished):
                 await _withdraw(authority, row)
@@ -340,7 +343,7 @@ def committed_route_envelope(authority, entry):
     return envelope if envelope is not None and 'provenance' in envelope else None
 
 
-def snapshot_automation(authority, adapter, event, identity):
+def snapshot_automation(authority, adapter, event, identity, captured=None):
     runner = authority.runner
     if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
             or not isinstance(event.text, str) or not identity
@@ -349,12 +352,13 @@ def snapshot_automation(authority, adapter, event, identity):
         raise RuntimeStoreError('invalid_params')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
                     | _tick_metadata(event.metadata))
-    entry = _owner(runner, event, authority)
+    entry = captured[0] if captured is not None else _owner(runner, event, authority)
     if event.source.platform == Platform.LOCAL:
-        return snapshot_local_automation(authority, adapter, event, identity, entry)
+        return snapshot_local_automation(authority, adapter, event, identity, entry,
+                                         ref=captured[1] if captured is not None else None)
     from gateway.session_envelope import restore_native
-    owner = authority.logical_owner(entry.session_id)
-    envelope = committed_route_envelope(authority, entry)
+    owner = captured[2] if captured is not None else authority.logical_owner(entry.session_id)
+    envelope = captured[1] if captured is not None else committed_route_envelope(authority, entry)
     if envelope is None:
         raise RuntimeStoreError('not_found')
     # Persisted origins deliberately omit relay trust. Borrow only an exact
@@ -403,9 +407,10 @@ def check_automation_route(runner, payload, session_id, available_source, adapte
     return event.source, entry.session_key
 
 
-def snapshot_local_automation(authority, adapter, event, identity, entry):
+def snapshot_local_automation(authority, adapter, event, identity, entry, *, ref=None):
     from gateway.session_local_recovery import restore_local_session
-    ref = restore_local_session(authority, event.source.chat_id)
+    if ref is None:
+        ref = restore_local_session(authority, event.source.chat_id)
     live = authority.sessions[ref.session_id]
     if (live.source is not event.source or not adapter.authorize_source(event.source)
             or authority.runner._adapter_for_source(live.source) is not adapter):
@@ -461,28 +466,46 @@ def restore_local_automation(authority, ref, row):
 
 
 async def admit_automation(authority, adapter, event, identity, replaces=None):
-    """``replaces``: a queued automation row of the same session this input supersedes (a liveness
-    tick carrying the output of the one still waiting). Its cancellation commits in this admission's
-    own transaction, so neither lands without the other."""
-    authority._require_admission_open()
-    payload, entry = snapshot_automation(authority, adapter, event, identity)
-    from gateway.session_authority import LiveSession
-    sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
-    ref = SessionRef(authority.profile_id, sid)
-    authority.sessions.setdefault(ref.session_id, LiveSession(event.source, entry.session_key))
+    """Capture and commit within the existing ordered tracked admission reservation.
+
+    ``replaces`` cancels a queued predecessor in this admission's own transaction.
+    """
+    import asyncio
     from functools import partial
+    from gateway.session_authority import LiveSession
     from gateway.session_runtime_workers import tracked_write
-    admitted, replaced = partial(authority._admitted, ref, event), []
-    if replaces is not None:
-        def admitted(row, admitted=admitted):
-            if replaced:  # the guard ran in the committed write; an exact replay runs no guard
-                authority._settle_cancelled(ref, replaces)
-            return admitted(row)
-    return await tracked_write(authority, partial(
-        admit_session_input, authority.db, epoch=authority.epoch, principal_id='automation:' + entry.session_key,
-        session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
-        _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))),
-        then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
+    authority._require_admission_open()
+    prepared, replaced = {}, []
+
+    async def prepare():
+        authority._require_admission_open()
+        entry = await asyncio.to_thread(_owner, authority.runner, event, authority)
+        owner = None
+        if event.source.platform == Platform.LOCAL:
+            from gateway.session_local_recovery import restore_local_session_async
+            captured = await restore_local_session_async(authority, event.source.chat_id)
+        else:
+            captured, owner = await asyncio.to_thread(
+                lambda: (committed_route_envelope(authority, entry), authority.logical_owner(entry.session_id)))
+        authority._require_admission_open()
+        # Provenance/adapter identity and all live publication remain on the owner loop.
+        payload, entry = snapshot_automation(authority, adapter, event, identity, (entry, captured, owner))
+        sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
+        ref = prepared['ref'] = SessionRef(authority.profile_id, sid)
+        authority.sessions.setdefault(sid, LiveSession(event.source, entry.session_key))
+        return partial(admit_session_input, authority.db, epoch=authority.epoch,
+            principal_id='automation:' + entry.session_key, session_id=sid, request_id=identity,
+            payload=deepcopy(payload),
+            _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, sid, replaced)))
+
+    def admitted(row):
+        ref = prepared['ref']
+        if replaced:  # An exact replay runs no guard and settles no replacement twice.
+            authority._settle_cancelled(ref, replaces)
+        return authority._admitted(ref, event, row)
+
+    return await tracked_write(authority, None, then=admitted, ordered=True, prepare=prepare,
+        after=lambda receipt: authority._schedule_admitted(prepared['ref'], receipt))
 
 
 _ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})

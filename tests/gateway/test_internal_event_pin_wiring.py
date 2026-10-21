@@ -422,7 +422,13 @@ def _synthetic_turn(runner, source, kind: str) -> MessageEvent:
         runner._adapter_and_key_for = lambda _event: (object(), KEY)
         runner._enqueue_fifo = lambda _key, turn, _adapter: enqueued.append(turn)
         command = MessageEvent(text="/goal resume", source=source, channel_prompt="Channel hint.")
-        runner._enqueue_goal_turn(command, "[goal] resume", label="resume", kickoff=False)
+        from hermes_cli.goals import GoalManager
+        manager = GoalManager("sess-wiring")
+        state = manager.set("Preserve the channel prompt pin")
+        runner._enqueue_goal_turn(
+            command, "[goal] resume", label="resume", kickoff=False,
+            goal_session_id=manager.session_id, goal_state=state,
+        )
         return enqueued[0]
     if kind == "heartbeat-rebuilt-route":
         # A watch route rebuilt from a stored origin can lack the chat/user names the human turn

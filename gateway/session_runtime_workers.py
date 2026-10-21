@@ -53,7 +53,7 @@ def track_mutation(authority, operation):
     return task
 
 
-async def tracked_write(authority, write, then=None, *, ordered=False, after=None):
+async def tracked_write(authority, write, then=None, *, ordered=False, after=None, prepare=None):
     """Run a synchronous ledger write (``write()``) in a worker thread, off the owner loop.
 
     A held SQLite writer (``_WRITE_PATIENCE_S``) must not freeze every session, timer, socket,
@@ -62,6 +62,10 @@ async def tracked_write(authority, write, then=None, *, ordered=False, after=Non
     retirement joins it, and shielded, so a cancelled caller cannot separate a commit from it.
     ``ordered`` writes (admissions) commit in call order, as they did on the loop: worker threads
     alone would let a later input take an earlier FIFO position.
+
+    ``prepare()`` may asynchronously capture a producer input and return its synchronous write.
+    It runs inside the SAME ordered reservation, before that write, and in the tracked/shielded
+    task: a slow capture cannot let a later admission pass it or be lost on caller cancellation.
 
     ``after(result)`` (an admission's drain scheduling) runs in the CALLER's own step once the
     write returns, as it did when admission was synchronous: the caller registers its delivery
@@ -72,12 +76,16 @@ async def tracked_write(authority, write, then=None, *, ordered=False, after=Non
     if ordered and order is None:
         order = authority._ordered_writes = asyncio.Lock()
 
+    async def commit():
+        operation = await prepare() if prepare is not None else write
+        return await asyncio.to_thread(operation)
+
     async def run():
         if ordered:
             async with order:
-                result = await asyncio.to_thread(write)
+                result = await commit()
         else:
-            result = await asyncio.to_thread(write)
+            result = await commit()
         if then is None:
             return result
         followed = then(result)

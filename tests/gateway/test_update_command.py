@@ -664,12 +664,12 @@ class TestUpdateCommandInstallMethodRefusal:
 
 
 # ---------------------------------------------------------------------------
-# Exit-code publication: the watcher polls .update_exit_code and reads "" as exit 1
+# Exit-code publication: the watcher reads the complete process-exit marker.
 # ---------------------------------------------------------------------------
 
 
 class TestDetachedUpdateExitCodePublication:
-    """The detached wrapper never exposes an empty ``.update_exit_code`` to the 2 s watcher poll."""
+    """The detached wrapper never exposes an empty ``.update_process_exit_code`` to the watcher."""
 
     @pytest.mark.platforms("linux", "macos")
     @pytest.mark.live_system_guard_bypass  # runs the wrapper around `sh -c 'exit 3'`, never hermes
@@ -677,10 +677,13 @@ class TestDetachedUpdateExitCodePublication:
         import subprocess
         from gateway.slash_commands import _spawn_detached_update
 
-        output, marker, seen = tmp_path / "out.log", tmp_path / ".update_exit_code", tmp_path / "seen.log"
+        output, seen = tmp_path / "out.log", tmp_path / "seen.log"
+        legacy_marker = tmp_path / ".update_exit_code"
+        marker = tmp_path / ".update_process_exit_code"
+        legacy_marker.write_text("stale", encoding="utf-8")
         spawned = MagicMock()
         with patch("shutil.which", return_value=None), patch("subprocess.Popen", spawned):
-            _spawn_detached_update(["sh", "-c", "exit 3"], output, marker)
+            _spawn_detached_update(["sh", "-c", "exit 3"], output, legacy_marker)
         # Poll the marker at the instant the wrapper's printf runs: a `printf > marker` redirect has
         # already truncated it by then (bash applies redirections before running the command).
         hook = tmp_path / "bash_env.sh"
@@ -690,13 +693,14 @@ class TestDetachedUpdateExitCodePublication:
         subprocess.run(spawned.call_args[0][0], env=env, check=True, timeout=60)
         assert not seen.exists() or "exists:\n" not in seen.read_text(encoding="utf-8")
         assert marker.read_text(encoding="utf-8") == "3"
+        assert not legacy_marker.exists()
 
     def test_windows_helper_never_exposes_an_empty_exit_code(self, tmp_path, monkeypatch):
         import sys
         from gateway.slash_commands import _WINDOWS_UPDATE_HELPER
         from tests.file_write_observer import observe_file_writes
 
-        output, marker = tmp_path / "out.log", tmp_path / ".update_exit_code"
+        output, marker = tmp_path / "out.log", tmp_path / ".update_process_exit_code"
         seen = []
         monkeypatch.setattr(sys, "argv", ["-c", str(output), str(marker),
                                           sys.executable, "-c", "raise SystemExit(4)"])

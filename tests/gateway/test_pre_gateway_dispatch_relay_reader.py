@@ -16,9 +16,10 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 
 def _hook(callback):
     from hermes_cli.plugins import get_plugin_manager
+    from tests.plugin_helpers import mark_plugin_discovery_complete
 
     manager = get_plugin_manager()
-    manager._discovered = True
+    mark_plugin_discovery_complete(manager)
     manager._hooks.setdefault("pre_gateway_dispatch", []).append(callback)
 
 

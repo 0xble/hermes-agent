@@ -1727,7 +1727,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         # metadata across resume and rebuilds (/new). Raw api_key is never persisted/restored.
         overrides["model_override"] = {
             "model": model, "provider": provider or None, "base_url": base_url or None, "api_mode": api_mode or None}
-    if provider:
+    if provider and provider.lower() not in _BARE_BILLING_PROVIDERS:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
         overrides["reasoning_config_override"] = reasoning_config

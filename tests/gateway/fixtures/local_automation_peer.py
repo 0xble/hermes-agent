@@ -27,7 +27,7 @@ def probe(base, source):
     model.gate = home / 'terminal-gate'
     threading.Thread(target=model.serve_forever, daemon=True).start()
     url = f'http://127.0.0.1:{model.server_port}/v1'
-    cfg = {'gateway': {'multiplex_profiles': False},
+    cfg = {'gateway': {'multiplex_profiles': False, 'completion_notification_batch_window_seconds': 0},
         'model': {'provider': 'custom', 'default': 'local-fixture', 'base_url': url},
         'terminal': {'cwd': str(home)}, 'approvals': {'mode': 'off'},
         'auxiliary': {'title_generation': {'enabled': False}}}

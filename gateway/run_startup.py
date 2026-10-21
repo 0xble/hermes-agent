@@ -751,8 +751,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     @staticmethod
     def _build_startup_resume_event(source: SessionSource, resume_marker: Optional[str]) -> MessageEvent:
         """Build the exact internal event used to auto-continue one restart marker."""
+        # This turn continues the original platform message, not a synthetic producer identity.
         event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
-                             message_id=getattr(source, "message_id", None), internal=True)
+                             message_id=getattr(source, "message_id", None), internal=True,
+                             reply_anchor_override=getattr(source, "message_id", None))
         if resume_marker:
             # Keep the transport reply anchor for threading, but admit each interruption marker
             # under its own outbox identity so one marker resumes at most once.

@@ -122,9 +122,8 @@ async def test_cli_driven_loop_changes_repaint_the_other_viewers(owner):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind, call', [('goal', 'is_waiting'), ('loop', 'goal_blocks_tick')])
-async def test_a_read_that_clears_a_goal_barrier_repaints_the_other_viewers(owner, kind, call):
-    """``is_waiting`` / ``goal_blocks_tick`` drop a satisfied barrier (the goal resumes, the loop defers to
-    it): that write must reach the other viewers even though an unchanged poll stays quiet."""
+async def test_a_lifted_goal_barrier_repaints_after_explicit_clear(owner, kind, call):
+    """Reads keep the lifted barrier available for wake admission. Its fenced clear repaints viewers."""
     import asyncio
     import sys
     child = await asyncio.create_subprocess_exec(sys.executable, '-c', 'import sys; sys.stdin.read()',
@@ -142,6 +141,11 @@ async def test_a_read_that_clears_a_goal_barrier_repaints_the_other_viewers(owne
     finally:
         child.stdin.close()
         await asyncio.wait_for(child.wait(), 10)
-    await owner.call(kind, call)
+    result = await owner.call(kind, call)
+    assert result['value'] is (kind == 'loop')
+    assert updates == []
+    parked = json.loads((await owner.call('goal', 'state'))['state'])
+    assert parked['waiting_on_pid'] == child.pid
+    assert (await owner.call('goal', 'clear_lifted_wait', parked['waiting_since']))['value'] is True
     assert len(updates) == 1 and 'wait_barrier' not in updates[0]['control']['goal']
     assert updates[0]['control']['loop']['deferred_by_goal'] is True

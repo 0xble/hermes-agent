@@ -31,7 +31,7 @@ from gateway.platforms.event import MessageEvent
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.response_filters import (
-    display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    display_kind_for_event, display_metadata_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
     strip_edge_silence_markers,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
@@ -2554,8 +2554,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         }
         if prepared.persist_user_display_kind:
             _user_entry["display_kind"] = prepared.persist_user_display_kind
-        if prepared.persistence_owner:
-            _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner}
+        display_metadata = {**({"gateway_input_owner": prepared.persistence_owner} if prepared.persistence_owner else {}),
+                            **display_metadata_for_event(event)}
+        if display_metadata:
+            _user_entry["display_metadata"] = display_metadata
         if getattr(event, "message_id", None):
             _user_entry["message_id"] = str(event.message_id)
         elif getattr(event, "_hermes_recovery_id", None):
@@ -2920,6 +2922,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 status_hint = t("gateway.errors.hint_usage_limit")
         elif status_code == 400:
             status_hint = t("gateway.errors.hint_rejected")
+        elif getattr(e, "reason", None) == "launch_credentials_unavailable" and getattr(e, "field", None):
+            # The session's own frozen route credential is gone or changed: name it, not the model.
+            status_hint = f" {e.reason} ({e.field}: {e.detail or 'unavailable'})."
         from gateway.session_results import record_unexecuted_failure
         return record_unexecuted_failure(self._hmwa_add_failed_turn_notice(
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
@@ -3202,7 +3207,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 reply_expected=event.reply_expected,
                 persist_user_display_metadata={
-                    "gateway_input_owner": prepared.persistence_owner,
+                    "gateway_input_owner": prepared.persistence_owner, **display_metadata_for_event(event),
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
@@ -4543,6 +4548,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         """Synthetic failed run dict for an inactivity timeout, with the activity-tracker diagnostic;
         interrupts the agent if it is still running so the thread pool worker is freed."""
         from gateway.run import _INTERRUPT_REASON_TIMEOUT, _INTERRUPT_TOOL_REASON_TIMEOUT, request_hard_interrupt
+        from gateway.session_results import record_terminal_failure
         session_key, result_holder, tools_holder = turn_ctx.session_key, turn_ctx.result_holder, turn_ctx.tools_holder
         _timed_out_agent = turn_ctx.agent_holder[0]
         _activity = self._agent_activity_summary(_timed_out_agent)
@@ -4573,14 +4579,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 "gateway.progress.timeout_last_activity",
                 activity=_last_desc, seconds=f"{_secs_ago:.0f}", progress=_iter_progress))
         _diag_lines.append(t("gateway.progress.timeout_hint"))
-        return {
+        return record_terminal_failure({
             "final_response": "\n".join(_diag_lines),
             "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
             "api_calls": _iter_n,
             "tools": tools_holder[0] or [],
             "history_offset": 0,
             "failed": True,
-        }
+        })
 
     async def _run_agent_await_turn_worker(
         self, worker: GatewayRunner._RunAgentWorker, turn_ctx: TurnContext,
@@ -4674,6 +4680,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         pending = None
         if result and adapter and session_key:
             pending_event = _dequeue_pending_event(adapter, session_key)
+            if result.get("compression_exhausted") and pending_event is not None:
+                self._defer_past_exhaustion_reset(result, adapter, source, session_key, pending_event)
+                return None, None
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)

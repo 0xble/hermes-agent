@@ -56,6 +56,14 @@ def unbind(token) -> None:
     _bound.reset(token)
 
 
+def refuse_deferred_retry(event) -> None:
+    """A bound re-send cannot be parked outside its rewrite's admission transaction."""
+    rewrite = _bound.get()
+    if (rewrite is not None and not rewrite.taken and not rewrite.applied
+            and getattr(event, 'source', None) is rewrite.source):
+        raise RuntimeStoreError('runtime_draining')
+
+
 def take(event, db) -> Optional[RetryRewrite]:
     """The bound rewrite for this native admission, once, and only for the re-send itself (the same
     source object on the same store). A drain task inheriting the context never takes it."""

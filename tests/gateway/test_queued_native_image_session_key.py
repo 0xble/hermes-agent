@@ -71,7 +71,7 @@ class CaptureQueuedNativeImageAgent:
 class CompressionExhaustedAgent(CaptureQueuedNativeImageAgent):
     pending_steer = None
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).calls.append(message)
         return {
             "final_response": "context exhausted",

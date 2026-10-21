@@ -480,9 +480,8 @@ class SessionAuthority:
                     if 'native_text_v1' in row['payload']:
                         await check_native_route(self.runner, row['payload'], target, available_source, adapter)
                     elif 'local_automation_v1' in row['payload']:
-                        from gateway.session_automation import check_local_automation
-                        check_local_automation(
-                            self, SessionRef(self.profile_id, sid), row, route=route)
+                        await self._check_local_automation(
+                            SessionRef(self.profile_id, sid), row, route=route)
                     else:
                         from gateway.session_operator import check_local_input
                         check_local_input(
@@ -848,6 +847,15 @@ class SessionAuthority:
                 raise RuntimeStoreError("invalid_params")
             return live.controls.respond(ref.session_id, generation, prompt_id, response, kind=kind)
 
+    async def _check_local_automation(self, ref, row, *, route):
+        """Read the route/store off-loop without transferring loop-owned authority state."""
+        from gateway.session_automation import check_local_automation
+        live = self.sessions.get(ref.session_id)
+        await asyncio.to_thread(check_local_automation, self, ref, row, route=route)
+        self._require_admission_open()
+        if self.sessions.get(ref.session_id) is not live or (live is not None and live.route != route):
+            raise RuntimeStoreError('admission_conflict')
+
     async def _claim_next(self, ref, live):
         # False asks the pump to re-read after a queued head changed during preflight.
         async with live.claim_gate, live.mutation_lock:
@@ -876,8 +884,12 @@ class SessionAuthority:
                     if current is None or current['status'] != 'queued':
                         return False, first
                 if 'local_automation_v1' in first['payload']:
-                    from gateway.session_automation import check_local_automation
-                    check_local_automation(self, ref, first)
+                    await self._check_local_automation(ref, first, route=live.route)
+                    # Cancellation may advance the FIFO while reauthorization reads the store.
+                    # Only this head earned the verdict, never its queued successor.
+                    current = get_session_admission(self.db, admission_id=first['admission_id'])
+                    if current is None or current['status'] != 'queued':
+                        return False, first
                 else:
                     from gateway.session_operator import check_local_input
                     check_local_input(self, ref, first)

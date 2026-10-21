@@ -135,6 +135,8 @@ async def test_a_drain_that_begins_after_the_precheck_leaves_the_exchange(served
     inside its admission write, and the rewrite in that same write rolls back with it."""
     runner, root = served
     source, sid, authority = await _admitting_exchange(runner, root)
+    preserved = []
+    monkeypatch.setattr(runner, '_preserve_drain_event', lambda key, event: preserved.append(event))
     original = type(runner)._retry_readmission_reply
 
     def precheck_then_drain(self, *args, **kwargs):
@@ -146,6 +148,7 @@ async def test_a_drain_that_begins_after_the_precheck_leaves_the_exchange(served
     reply = await _retry(runner, root, source)
 
     assert reply and '⏳' in reply
+    assert preserved == [], 'a bound retry must not become an unguarded deferred re-send'
     assert _contents(runner, sid) == ['retry me', 'old answer']
     assert _queued_texts(authority, sid) == []
 
@@ -200,6 +203,8 @@ async def test_a_refused_carrier_retry_keeps_the_carrier(served, monkeypatch):
     runner, root = served
     source, sid, authority = await _admitting_exchange(
         runner, root, rows=(_carrier(), {'role': 'assistant', 'content': 'failed answer'}))
+    preserved = []
+    monkeypatch.setattr(runner, '_preserve_drain_event', lambda key, event: preserved.append(event))
     original = type(runner)._retry_readmission_reply
 
     def precheck_then_drain(self, *args, **kwargs):
@@ -211,6 +216,7 @@ async def test_a_refused_carrier_retry_keeps_the_carrier(served, monkeypatch):
     reply = await _retry(runner, root, source)
 
     assert reply and '⏳' in reply
+    assert preserved == [], 'a bound retry must not become an unguarded deferred re-send'
     assert _contents(runner, sid) == [_carrier()['content'], 'failed answer']
     assert _queued_texts(authority, sid) == []
 
@@ -230,3 +236,37 @@ async def test_an_admitted_carrier_retry_keeps_the_scaffold_and_resends_the_ask(
     active = runner.session_store.load_transcript(sid)
     assert len(active) == 1 and active[0]['display_kind'] == 'hidden' and 'REAL ASK' not in active[0]['content']
     task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_message_during_drain_is_still_preserved(served, monkeypatch):
+    runner, root = served
+    source, sid, authority = await _admitting_exchange(runner, root)
+    runner._draining = True
+    preserved = []
+    monkeypatch.setattr(runner, '_preserve_drain_event', lambda key, event: preserved.append(event))
+    event = MessageEvent(text='a new human message', source=source)
+    assert await runner._handle_message(event) is None
+    assert preserved == [event]
+    assert _queued_texts(authority, sid) == []
+
+
+@pytest.mark.parametrize('taken', [False, True])
+def test_a_bound_retry_refuses_only_its_unadmitted_source(taken):
+    from types import SimpleNamespace
+    from gateway.session_retry_admission import RetryRewrite, bind, unbind, refuse_deferred_retry
+    from hermes_state_runtime import RuntimeStoreError
+
+    own_source = object()
+    rewrite = RetryRewrite(object(), 'sid', own_source, lambda conn: None, lambda: None)
+    rewrite.taken = taken
+    token = bind(rewrite)
+    try:
+        refuse_deferred_retry(SimpleNamespace(source=object()))
+        if taken:
+            refuse_deferred_retry(SimpleNamespace(source=own_source))
+        else:
+            with pytest.raises(RuntimeStoreError, match='runtime_draining'):
+                refuse_deferred_retry(SimpleNamespace(source=own_source))
+    finally:
+        unbind(token)

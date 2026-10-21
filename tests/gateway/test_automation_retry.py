@@ -33,13 +33,24 @@ async def test_coalesced_siblings_survive_lost_ack_and_owner_restart(tmp_path, m
     key = runner.session_store._generate_session_key(source)
     sid = runner.session_store.peek_session_id(key)
     events = [dict(pending(key, 'durable-sibling-' + str(i)), parent_session_id=sid) for i in range(2)]
-    assert await runner._deliver_async_delegation_group(events) is True
+    settle_claims = runner._settle_durable_claims
+
+    async def lose_completion_ack(operations):
+        # Admission commits, but its ACK is lost. Return the original claims for
+        # recovery without re-inserting dispatches or replacing cancellation state.
+        assert all(operation == 'complete' for operation, _did, _claim in operations)
+        await settle_claims([('defer', did, claim) for _operation, did, claim in operations])
+
+    with monkeypatch.context() as lost_ack:
+        lost_ack.setattr(runner, '_settle_durable_claims', lose_completion_ack)
+        assert await runner._deliver_async_delegation_group(events) is True
     rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
     assert len(rows) == 2 and all(e['delegation_id'] in rows[-1]['payload']['text'] for e in events)
-    # Simulate lost ACK of the committed producer handoff, then real new epoch.
     for event in events:
-        delegation._persist_dispatch(event)
-        delegation._persist_completion(event, {'status': 'completed', 'summary': event['summary']})
+        delegation_id = event['delegation_id']
+        assert delegation_id is not None
+        record = delegation.get_durable_delegation(delegation_id)
+        assert record is not None and record['delivery_state'] == 'pending'
     runner._completion_deliveries_delivered.clear()
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='after')
     duplicate = deepcopy(events[1])

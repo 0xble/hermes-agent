@@ -84,8 +84,6 @@ async def test_idle_loop_tick_runs_as_a_fifo_turn_not_beside_it(monkeypatch):
     """N44 sequence 2: an idle /loop tick started a classic turn outside the FIFO, so a drain
     claiming a user row meanwhile handed that row's text to the tick's turn and settled it
     ``completed`` without running it. The tick must commit as its own FIFO admission."""
-    from types import SimpleNamespace
-
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
@@ -126,26 +124,19 @@ async def test_idle_loop_tick_runs_as_a_fifo_turn_not_beside_it(monkeypatch):
         return list_session_admissions(authority.db, session_id=owner, pending_only=False) if owner else []
     await async_wait_until(lambda: [r['status'] for r in rows()] == ['terminal'] and not runner._is_session_running(key),
                            what='the first turn to settle and release the session')
+    await async_wait_until(lambda: key not in adapter._active_sessions, what='adapter delivery lifecycle to release')
     owner = runner.session_store.peek_session_id(key)
 
-    class Loop:
-        state = SimpleNamespace(ticks_fired=1)
-
-        def __init__(self, session_id=None):
-            pass
-
-        def is_due(self, now):
-            return True
-
-        def fire_tick(self):
-            return 'loop tick prompt'
-
-        def abandon_tick(self):
-            raise AssertionError('the tick was not admitted')
-    monkeypatch.setattr(loops, 'LoopManager', Loop)
-    monkeypatch.setattr(loops, 'goal_blocks_loop_tick', lambda sid: False)
     route = {'platform': 'discord', 'chat_id': '42', 'chat_type': 'dm', 'user_id': '42'}
-    await runner._loop_wakeup_fire_one(owner, SimpleNamespace(awaiting_response=False, next_due_at=0, route=route),
+    await runner._warm_goals_session_db('FIFO loop fixture')
+    manager = loops.LoopManager(session_id=owner)
+    manager.set('loop tick prompt', interval_seconds=300, route=route)
+    manager.state.next_due_at = 0
+    manager._save()
+    monkeypatch.setattr(loops, 'goal_blocks_loop_tick', lambda sid: False)
+    # Prompt formatting is not under test, but claim storage and every execution fence are real.
+    monkeypatch.setattr(loops, 'WAKEUP_PROMPT_TEMPLATE', '{prompt}')
+    await runner._loop_wakeup_fire_one(owner, manager.state,
                                        1e12, set())
     await async_wait_until(lambda: len(started) >= 2, what='the loop tick turn to start')
     assert started == [('hello', True), ('loop tick prompt', True)], 'the tick ran outside the FIFO'

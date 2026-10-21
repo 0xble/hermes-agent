@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock
 
@@ -125,8 +127,8 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
             return True
 
         async def stop(self):
-            self.session_store.close_all_db_handles()
-            self._session_db.close()
+            await asyncio.to_thread(self.session_store.close_all_db_handles)
+            await asyncio.to_thread(self._session_db.close)
 
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
@@ -318,8 +320,8 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
             return True
 
         async def stop(self):
-            self.session_store.close_all_db_handles()
-            self._session_db.close()
+            await asyncio.to_thread(self.session_store.close_all_db_handles)
+            await asyncio.to_thread(self._session_db.close)
 
     _pid_state = {"alive": True}
     def _mock_get_running_pid():
@@ -541,8 +543,8 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
             return True
 
         async def stop(self):
-            self.session_store.close_all_db_handles()
-            self._session_db.close()
+            await asyncio.to_thread(self.session_store.close_all_db_handles)
+            await asyncio.to_thread(self._session_db.close)
 
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)

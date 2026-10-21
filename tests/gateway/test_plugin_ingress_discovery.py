@@ -76,7 +76,9 @@ async def test_first_ingress_enforces_policy_after_discovery(monkeypatch, reload
         if action == "skip":
             assert result is None
         else:
-            assert result is event
+            assert result is not event
+            assert result.source is event.source
+            assert event.text == "sensitive"
             assert result.text == "redacted"
     finally:
         release.set()

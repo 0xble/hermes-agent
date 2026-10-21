@@ -70,6 +70,8 @@ class ConversationState:
     # Wall-clock start of the most recent turn of any kind. A routine completion result arriving
     # within the batch window of it is held for fan-in rather than waking the session again.
     last_turn_started_at: float = 0.0
+    # One notice per compression-in-flight episode, reset when the lock is absent.
+    compression_deferred_notice_sent: bool = False
 
     def clear(self) -> None:
         """Reset every field to its default, so new fields are cleared automatically."""

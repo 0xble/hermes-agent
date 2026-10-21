@@ -70,7 +70,7 @@ async def test_runtime_wait_observes_listener_exit(tmp_path, listener_failure):
 @pytest.mark.asyncio
 async def test_listener_failure_stops_bootstrap_background_threads(monkeypatch):
     import threading
-    from gateway import run_bootstrap, run_runtime
+    from gateway import run as gateway_run, run_bootstrap, run_runtime
     from gateway.config import GatewayConfig
     from hermes_constants import get_hermes_home
 
@@ -91,7 +91,7 @@ async def test_listener_failure_stops_bootstrap_background_threads(monkeypatch):
         publish(runner)
         runner.session_api.server.should_exit = True
 
-    monkeypatch.setattr(run_bootstrap, '_start_gateway_start_cron_and_housekeeping', start_owned_threads)
+    monkeypatch.setattr(gateway_run, '_start_gateway_start_cron_and_housekeeping', start_owned_threads)
     monkeypatch.setattr(run_runtime, 'publish_gateway_runtime_ready', fail_after_ready)
     try:
         with pytest.raises(RuntimeError, match='session API stopped unexpectedly'):

@@ -37,9 +37,7 @@ def local_source(authority, chat_id, user_id):
     return source
 
 
-def restore_local_session(authority, sid):
-    from gateway.session_authority import LiveSession
-    from gateway.session_local import LocalSessionAdapter
+def _read_local_session(authority, sid):
     from gateway.session_policy import restore_policy
     receipt = local_receipt(authority.db, sid)
     try:
@@ -70,6 +68,11 @@ def restore_local_session(authority, sid):
         if isinstance(exc, RuntimeStoreError):
             raise
         raise RuntimeStoreError('storage_unavailable') from exc
+    return receipt, source, policy, entry
+
+
+def _local_restore_adapter(authority):
+    from gateway.session_local import LocalSessionAdapter
     adapters = local_adapter_map(authority)
     adapter = adapters.get(Platform.LOCAL)
     if adapter is None:
@@ -77,34 +80,78 @@ def restore_local_session(authority, sid):
         adapters[Platform.LOCAL] = adapter
     if not isinstance(adapter, LocalSessionAdapter) or adapter.authority is not authority:
         raise RuntimeStoreError('runtime_draining')
-    live = authority.sessions.get(sid)
-    if live is None:
-        with store._lock:
+    return adapter
+
+
+def _check_restored_live(live, adapter, prepared):
+    _, source, policy, entry = prepared
+    if live is not None and (live.route != entry.session_key or not adapter.authorize_source(live.source)
+            or live.source.to_dict() != source.to_dict()
+            or adapter.policies.get(source.chat_id) != policy):
+        raise RuntimeStoreError('storage_unavailable')
+
+
+def _restore_local_entry(authority, prepared, *, existing):
+    receipt, source, _, entry = prepared
+    store, route, target = authority.runner.session_store, entry.session_key, entry.session_id
+    with store._lock:
+        if not existing:
             store._ensure_loaded_locked()
             current = store._entries.get(route)
             if current is not None and current.session_id != target:
                 raise RuntimeStoreError('admission_conflict')
-            # The receipt is the creation copy; a persisted entry for the same target keeps the
-            # route's explicit ``/yolo`` toggle (an OFF over a ``--yolo`` launch must survive a
-            # cold restore). An untoggled entry stays None and keeps following the launch policy.
+            # Keep an explicit /yolo toggle over the receipt's creation-time launch policy.
             if current is not None:
                 entry.yolo = current.yolo
             entry.origin = source
             store._entries[route] = entry
-        adapter.policies[chat_id] = policy
-        authority.sessions[sid] = LiveSession(source, route)
-        adapter.register_source(source)
-    elif (not adapter.authorize_source(live.source)
-          or live.source.to_dict() != source.to_dict()
-          or adapter.policies.get(chat_id) != policy):
-        raise RuntimeStoreError('storage_unavailable')
-    else:
-        with store._lock:
+        else:
             current = store._entry_locked(route)
-            if current is None or current.session_id not in receipt.get('lineage', [sid]):
+            if current is None or current.session_id not in receipt.get('lineage', [source.chat_id]):
                 raise RuntimeStoreError('admission_conflict')
             current.session_id = target
+
+
+def _publish_local_session(authority, sid, adapter, prepared, live):
+    from gateway.session_authority import LiveSession
+    _, source, policy, entry = prepared
+    if live is None:
+        adapter.policies[source.chat_id] = policy
+        authority.sessions[sid] = LiveSession(source, entry.session_key)
+        adapter.register_source(source)
     return SessionRef(authority.profile_id, sid)
+
+
+def restore_local_session(authority, sid):
+    prepared = _read_local_session(authority, sid)
+    adapter = _local_restore_adapter(authority)
+    live = authority.sessions.get(sid)
+    _check_restored_live(live, adapter, prepared)
+    _restore_local_entry(authority, prepared, existing=live is not None)
+    return _publish_local_session(authority, sid, adapter, prepared, live)
+
+
+async def restore_local_session_async(authority, sid):
+    """Producer restoration: blocking validation/store work off-loop, live publication on-loop.
+
+    The producer's tracked ordered admission owns this whole preparation, including cancellation.
+    Existing sessions still validate the durable receipt and lineage, never trust the live cache.
+    """
+    import asyncio
+    live = authority.sessions.get(sid)
+    prepared = await asyncio.to_thread(_read_local_session, authority, sid)
+    authority._require_admission_open()
+    if authority.sessions.get(sid) is not live:
+        raise RuntimeStoreError('admission_conflict')
+    adapter = _local_restore_adapter(authority)
+    _check_restored_live(live, adapter, prepared)
+    await asyncio.to_thread(_restore_local_entry, authority, prepared, existing=live is not None)
+    authority._require_admission_open()
+    if (authority.sessions.get(sid) is not live
+            or local_adapter_map(authority).get(Platform.LOCAL) is not adapter):
+        raise RuntimeStoreError('admission_conflict')
+    _check_restored_live(live, adapter, prepared)
+    return _publish_local_session(authority, sid, adapter, prepared, live)
 
 
 def transcript_target(authority, ref):

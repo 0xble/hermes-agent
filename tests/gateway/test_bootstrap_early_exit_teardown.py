@@ -31,7 +31,7 @@ async def test_refused_startup_keeps_startup_failed_and_crash_recovery(monkeypat
 
 @pytest.mark.asyncio
 async def test_ready_publication_failure_stops_cron_and_housekeeping(monkeypatch):
-    from gateway import run_bootstrap, run_runtime
+    from gateway import run as gateway_run, run_bootstrap, run_runtime
     from gateway.config import GatewayConfig
     from hermes_constants import get_hermes_home
 
@@ -49,7 +49,7 @@ async def test_ready_publication_failure_stops_cron_and_housekeeping(monkeypatch
     def refuse_ready(runner):
         raise RuntimeError('gateway stopped before session API readiness')
 
-    monkeypatch.setattr(run_bootstrap, '_start_gateway_start_cron_and_housekeeping', start_owned_threads)
+    monkeypatch.setattr(gateway_run, '_start_gateway_start_cron_and_housekeeping', start_owned_threads)
     monkeypatch.setattr(run_runtime, 'publish_gateway_runtime_ready', refuse_ready)
     try:
         with pytest.raises(RuntimeError, match='before session API readiness'):
