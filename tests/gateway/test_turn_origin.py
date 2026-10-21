@@ -158,3 +158,20 @@ async def test_queued_followup_runs_with_its_own_origin_and_restores_head(head, 
     finally:
         set_turn_origin("unknown")
         clear_session_vars(tokens)
+
+
+def test_relay_footer_on_owner_account_message_is_relay_not_user():
+    footer = "[relay from=hermes:default/20261020_142933_e1bb870f receipt=7ad08b87 task=reply-pacing-e2e]"
+    relayed = MessageEvent(
+        text=f"Title\nRun the checks.\nFrom: Reply Pacing\n{footer}\n",
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat", user_id="owner"),
+    )
+    assert turn_origin_for_event(relayed) == "relay"
+
+
+def test_relay_footer_quoted_mid_message_stays_user():
+    typed = MessageEvent(
+        text="why did [relay from=hermes:default/x receipt=y] show up?\nplease check",
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat", user_id="owner"),
+    )
+    assert turn_origin_for_event(typed) == "user"
