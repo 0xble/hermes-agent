@@ -27,7 +27,8 @@ from gateway.config import Platform
 from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, turn_origin_for_event
+from gateway.session_context import bound_turn_origin, set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.response_filters import (
@@ -2947,6 +2948,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        # Bound separately so _set_session_env keeps the one-argument shape test doubles stub.
+        set_turn_origin(turn_origin_for_event(event))
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
         persist_user_display_kind = display_kind_for_event(event)
         _redact_pii = False  # privacy.redact_pii, re-read per message
@@ -5049,20 +5052,28 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                         _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
                     return result
 
-            followup_result = await self._run_agent(
-                message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
-                source=next_source, session_id=session_id, session_key=next_session_key,
-                run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
-                event_message_id=next_message_id, inbound_message_id=next_inbound_id,
-                recovery_id=getattr(pending_event, "_hermes_recovery_id", None),
-                channel_prompt=next_channel_prompt, message_type=next_message_type,
-                persist_user_message=next_persist_message,
-                _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,
-                persist_user_display_kind=next_display_kind,
-                reply_expected=next_reply_expected,
-                persist_user_display_metadata={
-                    **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
-            )
+            # Each drained follow-up is its own turn: bind its origin, not the chain head's.
+            # Event-less interrupt/steer text continues the turn it follows, so it keeps that origin.
+            _head_origin = bound_turn_origin()
+            if pending_event is not None:
+                set_turn_origin(turn_origin_for_event(pending_event))
+            try:
+                followup_result = await self._run_agent(
+                    message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
+                    source=next_source, session_id=session_id, session_key=next_session_key,
+                    run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
+                    event_message_id=next_message_id, inbound_message_id=next_inbound_id,
+                    recovery_id=getattr(pending_event, "_hermes_recovery_id", None),
+                    channel_prompt=next_channel_prompt, message_type=next_message_type,
+                    persist_user_message=next_persist_message,
+                    _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,
+                    persist_user_display_kind=next_display_kind,
+                    reply_expected=next_reply_expected,
+                    persist_user_display_metadata={
+                        **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                )
+            finally:
+                set_turn_origin(_head_origin)
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))

@@ -1592,6 +1592,7 @@ def _run_conversation_turn(
     persist_user_display_metadata: Optional[dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     turn_author: Optional[dict[str, Any]] = None,
+    turn_origin: str = "unknown",
     moa_config: Optional[dict[str, Any]] = None,
     title_user_message: Optional[str] = None,
     prelude: Optional[Prelude] = None,
@@ -1648,6 +1649,7 @@ def _run_conversation_turn(
             # user message, so no byte-stable api_content sidecar can be stamped.
             moa_active=bool(moa_config),
             title_user_message=title_user_message,
+            turn_origin=turn_origin,
         )
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
@@ -1779,6 +1781,7 @@ def run_conversation(
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[dict[str, Any]] = None,
+    turn_origin: str = "unknown",
     title_user_message: Optional[str] = None,
     prelude: Optional[Prelude] = None,
 ) -> dict[str, Any]:
@@ -1792,6 +1795,15 @@ def run_conversation(
     from agent.turn_context import export_current_turn_boundary
     from agent.voice_turn_route import end_voice_turn_route
     from tools.vision_tools_history_budget import native_turn_images
+
+    if turn_origin == "unknown":
+        # Gateway and cron bind provenance in task-local session context rather than widening the
+        # run_conversation call shape, which test doubles and provider adapters also implement.
+        # Only the task-local binding counts: ambient os.environ must never grant user origin.
+        from gateway.session_context import bound_turn_origin
+        turn_origin = bound_turn_origin()
+    if turn_origin not in {"user", "relay", "process", "goal_loop", "cron", "unknown"}:
+        turn_origin = "unknown"
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
@@ -1813,6 +1825,7 @@ def run_conversation(
                 persist_user_platform_id=persist_user_platform_id,
                 moa_config=moa_config,
                 turn_author=turn_author,
+                turn_origin=turn_origin,
                 title_user_message=title_user_message,
                 prelude=prelude,
             )
