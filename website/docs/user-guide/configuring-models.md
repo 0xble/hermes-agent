@@ -53,7 +53,7 @@ name rather than the concrete model, and `/model @attended` follows the live `mo
 `/model reset` and a new session clear the role. Presets must define `provider` and `model`; unknown
 names, cycles, and conflicting inline route fields are rejected.
 
-
+## The Models page
 
 Open the dashboard and click **Models** in the sidebar. You get two sections:
 

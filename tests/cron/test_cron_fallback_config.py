@@ -163,3 +163,19 @@ def test_preflight_and_provider_recovery_obey_cron_chain(monkeypatch, chain, exp
         with pytest.raises(RuntimeError):
             scheduler._resolve_job_runtime(job, job["id"], jc)
         assert calls == [(job["provider"], job["model"])]
+
+
+@pytest.mark.parametrize("cfg,job_model", [
+    ({"model": {"default": "main"}}, "@missing"),
+    ({"model": {"default": "main"}, "cron": {"model": "@missing"}}, None),
+])
+def test_unknown_preset_fails_the_run_instead_of_using_literal(tmp_path, monkeypatch, cfg, job_model):
+    from hermes_cli.model_presets import ModelPresetError
+
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job = {"id": "m", "name": "m", "prompt": "hi"}
+    if job_model:
+        job["model"] = job_model
+    with pytest.raises(ModelPresetError, match="missing"):
+        scheduler._load_cron_job_config(job, "m", "m")

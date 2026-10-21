@@ -216,11 +216,15 @@ def test_explicit_model_beats_role_for_its_scope_and_leaves_the_role_stored():
 
 
 @pytest.mark.asyncio
-async def test_concrete_model_clears_role_except_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("persist_global", [False, True], ids=["session", "global_or_promoted"])
+async def test_concrete_model_clears_role_except_once(tmp_path, monkeypatch, persist_global):
     store = _store(tmp_path, monkeypatch)
     entry = store.get_or_create_session(_source())
     store.set_model_role(entry.session_key, "attended")
     runner, states = _runner(store)
+    runner._channel_override_for = lambda _source: None
+    persisted = AsyncMock()
+    monkeypatch.setattr("gateway.slash_commands_model._persist_model_switch_to_config", persisted)
     conversation = states.setdefault(
         entry.session_key,
         SimpleNamespace(
@@ -231,7 +235,8 @@ async def test_concrete_model_clears_role_except_once(tmp_path, monkeypatch):
     runner._session_state = lambda key: states[key]
     ctx = SimpleNamespace(
         session_key=entry.session_key,
-        persist_global=False,
+        persist_global=persist_global,
+        config_path=tmp_path / "config.yaml",
         restore_snapshot=None,
         model_override_scope="session",
         current_model="old-model",
@@ -246,9 +251,39 @@ async def test_concrete_model_clears_role_except_once(tmp_path, monkeypatch):
     assert conversation.model_role == "attended"
     assert store.get_model_role(entry.session_key) == "attended"
 
+    persisted.reset_mock()
     await runner._record_model_switch_locked(result, ctx, source=_source(), one_turn=False, picker=False)
+    assert persisted.await_count == (1 if persist_global else 0)
     assert conversation.model_role is None
     assert store.get_model_role(entry.session_key) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["--global", "--once", "--session", "--provider openrouter", "--reasoning high"])
+async def test_model_role_rejects_flags(tmp_path, monkeypatch, flag):
+    store = _store(tmp_path, monkeypatch)
+    entry = store.get_or_create_session(_source())
+    runner, states = _runner(store)
+    monkeypatch.setattr("gateway.run._load_gateway_config", _attended_cfg)
+
+    reply = await runner._handle_model_command_locked(_event(f"/model @fast {flag}"))
+
+    assert reply.startswith("❌")
+    assert "@role" in reply
+    assert store.get_model_role(entry.session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_model_role_alone_sets_hold(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    entry = store.get_or_create_session(_source())
+    runner, states = _runner(store)
+    monkeypatch.setattr("gateway.run._load_gateway_config", _attended_cfg)
+
+    reply = await runner._handle_model_command_locked(_event("/model @fast"))
+
+    assert "@fast" in reply and reply.startswith("✓")
+    assert store.get_model_role(entry.session_key) == "fast"
 
 
 @pytest.mark.asyncio
@@ -303,10 +338,9 @@ async def test_reset_all_clears_roles_in_memory_and_store(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_migration_returns_converted_keys_and_skips_roles_and_test_keys():
+async def test_migration_returns_converted_keys_and_skips_roles():
     converted_key = "agent:main:telegram:dm:-100:42"
     already = "agent:main:telegram:dm:-100:7"
-    fixture = "dm:123"
     discord = "agent:main:discord:dm:9"
 
     def entry(key, platform, *, model="picked", role=None):
@@ -321,7 +355,6 @@ async def test_migration_returns_converted_keys_and_skips_roles_and_test_keys():
         list_sessions=lambda: [
             entry(converted_key, "telegram"),
             entry(already, "telegram", role="fast"),
-            entry(fixture, "telegram"),
             entry(discord, "discord"),
             entry("agent:main:telegram:dm:-100:empty", "telegram", model=""),
         ],

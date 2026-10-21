@@ -310,7 +310,9 @@ class GatewayModelCommandsMixin:
                 )
             except Exception:
                 logger.debug("Failed to persist session model override", exc_info=True)
-            # A durable concrete pick replaces a role hold. --once is one turn only.
+        # A durable concrete pick (session or global) replaces a role hold: role outranks the
+        # default, so a surviving role would silently defeat the pick. --once keeps it.
+        if not one_turn:
             with contextlib.suppress(Exception):
                 await self._set_session_model_role(ctx.session_key, None)
         self._evict_cached_agent(ctx.session_key)  # next turn builds fresh from the override
@@ -697,12 +699,6 @@ class GatewayModelCommandsMixin:
             self._session_reasoning_overrides.pop(session_key, None)
         self._evict_cached_agent(session_key)
 
-    @staticmethod
-    def _is_test_session_key(session_key: str) -> bool:
-        """True for fixture keys such as ``dm:123`` that must not be migrated."""
-        parts = str(session_key or "").split(":")
-        return len(parts) == 2 and parts[0] == "dm" and parts[1].isdigit()
-
     async def _migrate_telegram_model_overrides_to_role(self, role: str) -> tuple[list[str], list[str]]:
         """Convert concrete model overrides on existing Telegram sessions in the live store.
 
@@ -720,8 +716,6 @@ class GatewayModelCommandsMixin:
             return [], [str(exc)]
         for entry in entries:
             if str(getattr(getattr(entry, "platform", None), "value", "")) != "telegram":
-                continue
-            if self._is_test_session_key(entry.session_key):
                 continue
             if getattr(entry, "model_role", None):
                 continue
@@ -835,8 +829,11 @@ class GatewayModelCommandsMixin:
         if request.target.strip().startswith("@"):
             from hermes_cli.model_preset_runtime import resolve_model_ref, ModelPresetError
             role = request.target.strip()[1:].strip().lower()
+            if (request.is_global or request.is_session or request.is_once
+                    or request.explicit_provider or request.reasoning_effort):
+                return t("gateway.model.role_flags_unsupported")
             if not role:
-                return "❌ model role cannot be empty"
+                return t("gateway.model.role_empty")
             try:
                 # Validate against the config of the profile that owns this session.
                 resolve_model_ref("@" + role, _load_gateway_config() if profile_home is None
@@ -844,7 +841,7 @@ class GatewayModelCommandsMixin:
             except ModelPresetError as exc:
                 return f"❌ {exc}"
             await self._set_session_model_role(session_key, role)
-            return f"✓ model role set to @{role} (next turn)"
+            return t("gateway.model.role_set", role=role)
         attended_enabled = parse_attended_config(_load_gateway_config()).enabled
         conversation = self._session_state(session_key).conversation
         role_set = bool(getattr(conversation, "model_role", None))

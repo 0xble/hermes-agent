@@ -1754,6 +1754,10 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
                         if isinstance(_model_cfg, dict) else "")
                     model = str(_main or "").strip() or model
     except Exception as e:
+        from hermes_cli.model_presets import ModelPresetError
+        if isinstance(e, ModelPresetError):
+            # An unknown/invalid @preset must fail the run, not fall back to the literal '@name'.
+            raise
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
     # Fail fast: an empty model otherwise reaches the provider as an opaque 400.
