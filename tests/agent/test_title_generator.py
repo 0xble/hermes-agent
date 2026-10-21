@@ -330,6 +330,10 @@ class TestGenerateTitle:
     ("Slack Billing Thread", False),
     ("Q3 Billing Dispute", False),
     ("Theo on Smarter Models", False),
+    # Plain hyphenated compounds are words, not IDs.
+    ("aux-from-main", False),
+    ("Sci-Fi Dark Ambiance", False),
+    ("Planning-to-Deploy Delays", False),
 ])
 def test_junk_title_detector(title, junk):
     assert is_junk_title(title) is junk

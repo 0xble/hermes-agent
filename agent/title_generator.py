@@ -695,7 +695,8 @@ _JUNK_ID_RE = re.compile(
     r"[a-z]{0,3}\d[a-z0-9]{5,}"
     r"|\d{6,}"
     r"|[a-f0-9]{8,}"
-    r"|[a-z0-9_]{0,12}[a-z][a-z0-9_]*-[a-z0-9_-]{3,}"
+    # A hyphenated token is an ID only with a digit in it; plain compounds ("sci-fi") are words.
+    r"|(?=[a-z0-9_-]*\d)[a-z0-9_]{0,12}[a-z][a-z0-9_]*-[a-z0-9_-]{3,}"
     r"|[a-z0-9_-]{6,}[a-z][a-z0-9_-]*\d[a-z0-9_-]*"
     r")(?![a-z0-9])"
 )
