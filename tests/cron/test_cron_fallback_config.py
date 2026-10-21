@@ -192,3 +192,25 @@ def test_cron_literal_at_model_id_is_not_treated_as_a_preset(tmp_path, monkeypat
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({"cron": {"model": cf}, "model": {"default": "base-model"}}))
     nojob = {"id": "cf2", "name": "cf2", "prompt": "hello"}
     assert scheduler._load_cron_job_config(nojob, nojob["id"], nojob["name"]).model == cf
+
+
+def test_main_model_pin_is_empty_when_the_resolved_route_has_no_model(tmp_path, monkeypatch):
+    """``_main_model_pin`` returns ``(None, None)`` when the resolved route model is empty."""
+    from cron.jobs import _main_model_pin
+
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"model": {"provider": "openrouter"}}))
+    monkeypatch.setattr("cron.jobs.get_hermes_home", lambda: tmp_path)
+
+    assert _main_model_pin() == (None, None)
+
+
+def test_main_model_pin_resolves_a_preset_default(tmp_path, monkeypatch):
+    from cron.jobs import _main_model_pin
+
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "model": "@coding",
+        "model_presets": {"coding": {"provider": "OpenRouter", "model": "coding-model"}},
+    }))
+    monkeypatch.setattr("cron.jobs.get_hermes_home", lambda: tmp_path)
+
+    assert _main_model_pin() == ("openrouter", "coding-model")

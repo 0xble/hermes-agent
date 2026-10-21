@@ -302,6 +302,7 @@ gateway:
     choice_show: "在回复中显示推理"
     choice_hide: "在回复中隐藏推理"
     set_global: "🧠 ✓ 推理强度已设置为 `{effort}`（已保存到配置）\n_（下一条消息生效）_"
+    preset_owns_effort: "预设 `{preset}` 将主路由的推理强度设为 `{preset_effort}`。`{effort}` 适用于其他模型。"
     set_global_save_failed: "🧠 ✓ 推理强度已设置为 `{effort}`（仅本会话 — 配置保存失败）\n_（下一条消息生效）_"
     set_session: "🧠 ✓ 推理强度已设置为 `{effort}`（仅本会话 — 添加 `--global` 以持久化）\n_（下一条消息生效）_"
     quote_label_discord: "-# 💭 推理"

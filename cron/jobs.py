@@ -1866,6 +1866,8 @@ def _main_model_pin() -> tuple[Optional[str], Optional[str]]:
     cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
     from hermes_cli.model_preset_runtime import resolve_default_route
     route = resolve_default_route(cfg)
+    if not route.model:
+        return None, None
     provider = _normalize_job_optional_text(route.provider)
     if not provider:
         with contextlib.suppress(Exception):

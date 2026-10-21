@@ -302,6 +302,7 @@ gateway:
     choice_show: "mostra il reasoning nelle risposte"
     choice_hide: "nascondi il reasoning dalle risposte"
     set_global: "🧠 ✓ Sforzo di reasoning impostato su `{effort}` (salvato nella configurazione)\n_(verrà applicato al prossimo messaggio)_"
+    preset_owns_effort: "Il preset `{preset}` imposta lo sforzo della route principale su `{preset_effort}`. `{effort}` si applica agli altri modelli."
     set_global_save_failed: "🧠 ✓ Sforzo di reasoning impostato su `{effort}` (solo per questa sessione — salvataggio della configurazione non riuscito)\n_(verrà applicato al prossimo messaggio)_"
     set_session: "🧠 ✓ Sforzo di reasoning impostato su `{effort}` (solo per questa sessione — aggiungi `--global` per renderlo permanente)\n_(verrà applicato al prossimo messaggio)_"
     quote_label_discord: "-# 💭 Ragionamento"

@@ -204,13 +204,17 @@ def _expand_model(config: dict[str, Any], definitions: dict[str, dict[str, Any]]
         "provider": route["provider"], "default": route["model"],
     }
     agent = config.get("agent")
+    authored_agent_effort = isinstance(agent, dict) and "reasoning_effort" in agent
     if "reasoning_effort" in route:
-        if isinstance(agent, dict) and "reasoning_effort" in agent:
-            raise _error("model", "preset reasoning_effort cannot be combined with agent.reasoning_effort")
+        # A preset that declares an effort owns the main route. agent.reasoning_effort
+        # stays authored and applies to other models; the live resolver prefers the preset.
+        if authored_agent_effort:
+            config["model"]["reasoning_effort"] = route["reasoning_effort"]
         if not isinstance(agent, dict):
             agent = {}
             config["agent"] = agent
-        agent["reasoning_effort"] = route["reasoning_effort"]
+        if "reasoning_effort" not in agent:
+            agent["reasoning_effort"] = route["reasoning_effort"]
     if disabled_fallbacks:
         # Explicit opt-out must survive raw gateway loads and default/overlay inheritance.
         config["fallback_providers"] = []
@@ -431,10 +435,13 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
         )
         if (isinstance(actual_model, dict) and not unsafe_model_fields
                 and reasoning_unchanged and fallbacks_unchanged
-                and actual_model.get("provider") == expected_model.get("provider") and actual_model.get("default") == expected_model.get("default")):
+                and actual_model.get("provider") == expected_model.get("provider") and actual_model.get("default") == expected_model.get("default")
+                and ("reasoning_effort" not in actual_model or actual_model.get("reasoning_effort") == preset.get("reasoning_effort"))):
             restored_model = deepcopy(actual_model)
             restored_model.pop("provider", None)
             restored_model.pop("default", None)
+            if restored_model.get("reasoning_effort") == preset.get("reasoning_effort"):
+                restored_model.pop("reasoning_effort", None)
             for key in _MAIN_FORBIDDEN_REFERENCE_FIELDS:
                 if key not in raw_model and restored_model.get(key) in (None, "", {}, []):
                     restored_model.pop(key, None)

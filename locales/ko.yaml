@@ -302,6 +302,7 @@ gateway:
     choice_show: "응답에 추론 표시"
     choice_hide: "응답에서 추론 숨기기"
     set_global: "🧠 ✓ 추론 노력이 `{effort}`(으)로 설정되었습니다 (설정에 저장됨)\n_(다음 메시지부터 적용됩니다)_"
+    preset_owns_effort: "프리셋 `{preset}`이 기본 경로의 추론 노력을 `{preset_effort}`(으)로 설정합니다. `{effort}`은 다른 모델에 적용됩니다."
     set_global_save_failed: "🧠 ✓ 추론 노력이 `{effort}`(으)로 설정되었습니다 (세션 한정 — 설정 저장 실패)\n_(다음 메시지부터 적용됩니다)_"
     set_session: "🧠 ✓ 추론 노력이 `{effort}`(으)로 설정되었습니다 (세션 한정 — 영구 저장하려면 `--global` 추가)\n_(다음 메시지부터 적용됩니다)_"
     quote_label_discord: "-# 💭 추론"

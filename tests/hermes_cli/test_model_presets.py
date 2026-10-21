@@ -437,6 +437,55 @@ def test_save_round_trip_keeps_authored_at_strings_and_injects_nothing(tmp_path,
     assert "reasoning_effort" not in (saved.get("agent") or {})
 
 
+def test_preset_effort_outranks_agent_reasoning_effort_on_every_reader(tmp_path, monkeypatch):
+    """A preset that declares reasoning_effort must load beside agent.reasoning_effort.
+
+    Precedence (session override aside): preset effort > agent.reasoning_overrides[model]
+    > agent.reasoning_effort. Expansion must not raise, and load_config, the live resolver,
+    and the gateway model reader must agree on the preset effort for the main route.
+    """
+    from gateway import run as gateway_run
+    from hermes_cli.config import load_config
+    from hermes_cli.model_preset_runtime import resolve_default_route
+
+    authored = {
+        "model": "@coding",
+        "model_presets": {"coding": {"provider": "openrouter", "model": "coding-model", "reasoning_effort": "medium"}},
+        "agent": {"reasoning_effort": "high", "reasoning_overrides": {"coding-model": "low"}},
+    }
+    expanded = expand_model_presets(authored)
+    assert expanded["model"] == {
+        "provider": "openrouter", "default": "coding-model", "reasoning_effort": "medium",
+    }
+    assert expanded["agent"]["reasoning_effort"] == "high"
+    assert resolve_default_route(authored).reasoning_effort == "medium"
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(yaml.safe_dump(authored), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    loaded = load_config()
+    assert loaded["model"]["default"] == "coding-model"
+    assert loaded["agent"]["reasoning_effort"] == "high"
+    assert resolve_default_route(loaded).reasoning_effort == "medium"
+
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: yaml.safe_load((home / "config.yaml").read_text()))
+    runtime = gateway_run._load_gateway_runtime_config()
+    assert gateway_run._resolve_gateway_model(runtime) == "coding-model"
+    assert runtime["agent"]["reasoning_effort"] == "high"
+    assert resolve_default_route(runtime).reasoning_effort == "medium"
+
+
+def test_agent_reasoning_effort_survives_a_preset_without_one():
+    authored = {
+        "model": "@coding",
+        "model_presets": {"coding": {"provider": "openrouter", "model": "coding-model"}},
+        "agent": {"reasoning_effort": "high"},
+    }
+    expanded = expand_model_presets(authored)
+    assert expanded["agent"]["reasoning_effort"] == "high"
+
+
 def test_save_round_trip_keeps_model_default_shorthand(tmp_path, monkeypatch):
     from hermes_cli import config as config_mod
     home = tmp_path / "home"; home.mkdir()

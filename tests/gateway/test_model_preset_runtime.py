@@ -191,6 +191,60 @@ def test_reasoning_config_propagates_invalid_preset_error():
         GatewayRunner._load_reasoning_config("", config=cfg)
 
 
+def test_reasoning_global_with_preset_default_loads_and_names_the_preset(tmp_path, monkeypatch):
+    """`/reasoning high --global` while a preset owns the default must not break config load.
+
+    The global value is saved, and the reply says the preset sets the main route's effort
+    and that the saved value applies elsewhere.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    from hermes_cli.config import load_config
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(yaml.safe_dump({
+        "model": "@coding",
+        "model_presets": {"coding": {"provider": "openrouter", "model": "coding-model", "reasoning_effort": "medium"}},
+        "agent": {"reasoning_effort": "low"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("gateway.run._hermes_home", home)
+    monkeypatch.setattr("gateway.run._gateway_config_home", lambda: home)
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {}
+    runner._session_reasoning_overrides = {}
+    runner._set_reasoning_override = lambda *args, **kwargs: None
+    runner._set_session_reasoning_override = lambda *args, **kwargs: None
+    runner._live_agent_for_session_control = lambda _key: None
+    runner._evict_cached_agent = lambda _key: None
+    runner._evict_idle_agent_after_session_control = lambda _key: None
+    runner._session_state = lambda _key: SimpleNamespace()
+    runner.config_path = home / "config.yaml"
+    runner._load_show_reasoning = lambda: False
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._session_key_for_source = lambda _source: "agent:main:telegram:dm:1"
+    event = MessageEvent(
+        text="/reasoning high --global", message_type=MessageType.TEXT,
+        source=SessionSource(platform=Platform.TELEGRAM, user_id="owner", chat_id="1", chat_type="dm"),
+    )
+
+    reply = asyncio.run(runner._handle_reasoning_command(event))
+
+    loaded = load_config()
+    assert loaded["model"]["default"] == "coding-model"
+    assert loaded["agent"]["reasoning_effort"] == "high"
+    assert "@coding" in reply
+    assert "medium" in reply
+    assert "high" in reply
+
+
 def test_resolve_default_route_accepts_all_authored_shapes():
     from hermes_cli.model_preset_runtime import resolve_default_route
 

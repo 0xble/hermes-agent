@@ -17,6 +17,7 @@ from typing import Any, Optional
 from agent.i18n import t
 from gateway.platforms.event import MessageEvent
 from hermes_cli.config import atomic_config_write
+from hermes_cli.model_presets import preset_ref_name
 from utils import base_url_host_matches
 
 logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
@@ -728,19 +729,10 @@ class GatewayModelCommandsMixin:
                 continue
             override = getattr(entry, "model_override", None) or {}
             model = str(override.get("model") or "").strip()
-            from hermes_cli.model_presets import preset_ref_name
             if not model or preset_ref_name(model):
                 continue
             try:
-                await asyncio.to_thread(store.set_model_role, entry.session_key, role, clear_overrides=True)
-                state = self._peek_session_state(entry.session_key)
-                if state is not None:
-                    state.conversation.model_role = role
-                    state.conversation.model_override = None
-                    state.conversation.reasoning_override = None
-                self._session_model_overrides.pop(entry.session_key, None)
-                self._session_reasoning_overrides.pop(entry.session_key, None)
-                self._evict_cached_agent(entry.session_key)
+                await self._set_session_model_role(entry.session_key, role)
                 converted.append(entry.session_key)
             except Exception as exc:
                 failures.append(f"{entry.session_key}: {exc}")
@@ -834,7 +826,6 @@ class GatewayModelCommandsMixin:
                          failures=len(failures), detail=detail)
             count = await self._reset_all_session_overrides()
             return t("gateway.model.reset_all_done", count=count)
-        from hermes_cli.model_presets import preset_ref_name
         if request.target.strip() == "@" or preset_ref_name(request.target):
             from hermes_cli.model_preset_runtime import resolve_model_ref, ModelPresetError
             role = request.target.strip()[1:].strip().lower()
@@ -1043,7 +1034,19 @@ class GatewayModelCommandsMixin:
         if persist_global:
             if self._save_gateway_config_key("agent.reasoning_effort", value):
                 self._set_reasoning_override(session_key, None)
-                return t("gateway.reasoning.set_global", effort=value)
+                reply = t("gateway.reasoning.set_global", effort=value)
+                from gateway.run import _load_gateway_config
+                from hermes_cli.model_preset_runtime import resolve_default_route
+                try:
+                    route = resolve_default_route(_load_gateway_config(config_path=self.config_path))
+                except Exception:
+                    route = None
+                if route and route.name and route.reasoning_effort:
+                    reply += "\n" + t(
+                        "gateway.reasoning.preset_owns_effort",
+                        preset="@" + route.name, preset_effort=route.reasoning_effort, effort=value,
+                    )
+                return reply
             self._set_reasoning_override(session_key, parsed)
             return t("gateway.reasoning.set_global_save_failed", effort=value)
         self._set_reasoning_override(session_key, parsed, scope=scope)

@@ -373,6 +373,44 @@ async def test_migration_returns_converted_keys_and_skips_roles():
     assert states[converted_key].conversation.model_role == "attended"
 
 
+@pytest.mark.asyncio
+async def test_migration_applies_role_through_the_shared_setter():
+    """The migration loop must use the shared role setter, including its in-memory pops."""
+    key = "agent:main:telegram:dm:-100:42"
+    store = SimpleNamespace(
+        list_sessions=lambda: [SimpleNamespace(
+            session_key=key, platform=SimpleNamespace(value="telegram"),
+            model_override={"model": "picked"}, model_role=None,
+        )],
+        set_model_role=MagicMock(),
+    )
+    runner, states = _runner(store)
+    states[key] = runner._session_state(key)
+    states[key].conversation.model_override = {"model": "picked"}
+    runner._session_model_overrides[key] = {"model": "picked"}
+    runner._session_reasoning_overrides[key] = {"effort": "high"}
+    calls = []
+
+    async def shared(session_key, role):
+        calls.append((session_key, role))
+        await asyncio.to_thread(store.set_model_role, session_key, role, clear_overrides=True)
+        states[session_key].conversation.model_role = role
+        runner._session_model_overrides.pop(session_key, None)
+        runner._session_reasoning_overrides.pop(session_key, None)
+        runner._evict_cached_agent(session_key)
+
+    runner._set_session_model_role = shared
+
+    converted, failures = await runner._migrate_telegram_model_overrides_to_role("attended")
+
+    assert converted == [key]
+    assert failures == []
+    assert calls == [(key, "attended")]
+    assert key not in runner._session_model_overrides
+    assert key not in runner._session_reasoning_overrides
+    runner._evict_cached_agent.assert_called_once_with(key)
+
+
 def test_status_card_shows_role_marker():
     from gateway.slash_commands_status import GatewayStatusCommandsMixin
 

@@ -80,7 +80,7 @@ The combined resolution is implemented in `gateway/run_turn.py` and
 `@role` holds live in `hermes_cli/model_preset_runtime.py` and on
 `SessionEntry.model_role`. `/model --all attended` converts concrete Telegram
 overrides to that role and returns the converted session keys, skipping keys
-already on a role and test keys such as `dm:123`.
+already on a role.
 This is a fork-only gateway feature that adds per-topic attended routing, idle
 expiry, persisted activity timestamps, and boundary-only idle expiry. A new genuine user message switches in at the next API call; idle expiry switches back to the default only when the session is quiet and the request fits the default route. A long autonomous turn that continues making API calls stays on the attended route. An active fallback is never undone. The deprecated `compact_before_switch_tokens` key remains accepted but is ignored; normal per-model preflight compression remains the only compaction path. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly.
 

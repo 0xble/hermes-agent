@@ -302,6 +302,7 @@ gateway:
     choice_show: "mostrar razonamiento en respuestas"
     choice_hide: "ocultar razonamiento en respuestas"
     set_global: "🧠 ✓ Esfuerzo de razonamiento ajustado a `{effort}` (guardado en la configuración)\n_(se aplica en el próximo mensaje)_"
+    preset_owns_effort: "El ajuste `{preset}` fija el esfuerzo de la ruta principal en `{preset_effort}`. `{effort}` se aplica a los demás modelos."
     set_global_save_failed: "🧠 ✓ Esfuerzo de razonamiento ajustado a `{effort}` (solo en la sesión — error al guardar la configuración)\n_(se aplica en el próximo mensaje)_"
     set_session: "🧠 ✓ Esfuerzo de razonamiento ajustado a `{effort}` (solo en la sesión — añade `--global` para persistir)\n_(se aplica en el próximo mensaje)_"
     quote_label_discord: "-# 💭 Razonamiento"

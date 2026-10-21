@@ -95,6 +95,7 @@ class DefaultRoute:
     provider: str = ""
     reasoning_effort: str = ""
     base_url: str = ""
+    name: str = ""
 
 
 def resolve_default_route(config: Mapping[str, Any] | None) -> DefaultRoute:
@@ -111,8 +112,8 @@ def resolve_default_route(config: Mapping[str, Any] | None) -> DefaultRoute:
         return DefaultRoute()
     if isinstance(raw, str):
         route = resolve_model_ref(raw, cfg)
-        return DefaultRoute(route.model, route.provider, route.reasoning_effort)
+        return DefaultRoute(route.model, route.provider, route.reasoning_effort, name=route.name)
     route = resolve_model_ref("@default", cfg)
     return DefaultRoute(
-        route.model, route.provider, route.reasoning_effort, str(raw.get("base_url") or ""),
+        route.model, route.provider, route.reasoning_effort, str(raw.get("base_url") or ""), route.name,
     )

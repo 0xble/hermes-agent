@@ -305,6 +305,7 @@ gateway:
     choice_show: "gondolkodás megjelenítése a válaszokban"
     choice_hide: "gondolkodás elrejtése a válaszokból"
     set_global: "🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (mentve a konfigurációba)\n_(a következő üzenettől lép életbe)_"
+    preset_owns_effort: "A `{preset}` előbeállítás a fő útvonal erőfeszítését `{preset_effort}` értékre állítja. A `{effort}` a többi modellre vonatkozik."
     set_global_save_failed: "🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (csak ebben a munkamenetben — a konfiguráció mentése sikertelen)\n_(a következő üzenettől lép életbe)_"
     set_session: "🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (csak ebben a munkamenetben — add hozzá a `--global` opciót a megőrzéshez)\n_(a következő üzenettől lép életbe)_"
     quote_label_discord: "-# 💭 Gondolatmenet"
