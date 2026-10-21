@@ -310,6 +310,9 @@ class GatewayModelCommandsMixin:
                 )
             except Exception:
                 logger.debug("Failed to persist session model override", exc_info=True)
+            # A durable concrete pick replaces a role hold. --once is one turn only.
+            with contextlib.suppress(Exception):
+                await self._set_session_model_role(ctx.session_key, None)
         self._evict_cached_agent(ctx.session_key)  # next turn builds fresh from the override
         return global_error
 
@@ -693,23 +696,34 @@ class GatewayModelCommandsMixin:
             self._session_model_overrides.pop(session_key, None)
             self._session_reasoning_overrides.pop(session_key, None)
         self._evict_cached_agent(session_key)
-    async def _migrate_telegram_model_overrides_to_role(self, role: str) -> str:
+
+    @staticmethod
+    def _is_test_session_key(session_key: str) -> bool:
+        """True for fixture keys such as ``dm:123`` that must not be migrated."""
+        parts = str(session_key or "").split(":")
+        return len(parts) == 2 and parts[0] == "dm" and parts[1].isdigit()
+
+    async def _migrate_telegram_model_overrides_to_role(self, role: str) -> tuple[list[str], list[str]]:
         """Convert concrete model overrides on existing Telegram sessions in the live store.
 
         This is deliberately not a snapshot/database scan. The store is the authority for
         the current routing keys, and each conversion clears the concrete override atomically.
         """
-        converted = 0
+        converted: list[str] = []
         failures: list[str] = []
         store = getattr(self, "session_store", None)
         if store is None:
-            return "converted=0 failures=1 (session store unavailable)"
+            return [], ["session store unavailable"]
         try:
             entries = await asyncio.to_thread(store.list_sessions)
         except Exception as exc:
-            return f"converted=0 failures=1 ({exc})"
+            return [], [str(exc)]
         for entry in entries:
             if str(getattr(getattr(entry, "platform", None), "value", "")) != "telegram":
+                continue
+            if self._is_test_session_key(entry.session_key):
+                continue
+            if getattr(entry, "model_role", None):
                 continue
             override = getattr(entry, "model_override", None) or {}
             model = str(override.get("model") or "").strip()
@@ -725,13 +739,10 @@ class GatewayModelCommandsMixin:
                 self._session_model_overrides.pop(entry.session_key, None)
                 self._session_reasoning_overrides.pop(entry.session_key, None)
                 self._evict_cached_agent(entry.session_key)
-                converted += 1
+                converted.append(entry.session_key)
             except Exception as exc:
                 failures.append(f"{entry.session_key}: {exc}")
-        suffix = f" failures={len(failures)}"
-        if failures:
-            suffix += " (" + "; ".join(failures[:3]) + ("; …" if len(failures) > 3 else "") + ")"
-        return f"converted={converted}{suffix}"
+        return converted, failures
 
     async def _reset_all_session_overrides(self) -> int:
         """Clear persisted and in-memory model/reasoning picks without changing a live turn's route."""
@@ -740,6 +751,8 @@ class GatewayModelCommandsMixin:
         if store is not None:
             with contextlib.suppress(Exception):
                 keys.update(await asyncio.to_thread(store.override_session_keys))
+            with contextlib.suppress(Exception):
+                keys.update(await asyncio.to_thread(store.role_session_keys))
         for mapping_name in ("_session_model_overrides", "_session_reasoning_overrides"):
             with contextlib.suppress(Exception):
                 keys.update(getattr(self, mapping_name, {}).keys())
@@ -751,6 +764,9 @@ class GatewayModelCommandsMixin:
             if session_key in running:
                 pending.add(session_key)
             await self._persist_session_model_override(session_key, None, scope="session")
+            if store is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(store.set_model_role, session_key, None)
             if session_key in running:
                 # Clear the persisted pick without touching the in-flight agent's reasoning.
                 self._set_session_reasoning_override(session_key, None, scope="session")
@@ -763,6 +779,7 @@ class GatewayModelCommandsMixin:
                     state.conversation.model_override_scope = "session"
                     state.conversation.reasoning_override = None
                     state.conversation.reasoning_override_scope = "session"
+                    state.conversation.model_role = None
             if session_key not in running:
                 self._evict_cached_agent(session_key)
         return len(keys)
@@ -807,7 +824,11 @@ class GatewayModelCommandsMixin:
             if not self._model_reset_all_is_authorized(source):
                 return t("gateway.model.reset_all_admin_only")
             if request.target.strip().lower() == "attended":
-                return await self._migrate_telegram_model_overrides_to_role("attended")
+                converted, failures = await self._migrate_telegram_model_overrides_to_role("attended")
+                suffix = f" failures={len(failures)}"
+                if failures:
+                    suffix += " (" + "; ".join(failures[:3]) + ("; …" if len(failures) > 3 else "") + ")"
+                return f"converted={len(converted)}{suffix}"
             count = await self._reset_all_session_overrides()
             return t("gateway.model.reset_all_done", count=count)
         if request.target.strip().startswith("@"):
@@ -822,11 +843,21 @@ class GatewayModelCommandsMixin:
             await self._set_session_model_role(session_key, role)
             return f"✓ model role set to @{role} (next turn)"
         attended_enabled = parse_attended_config(_load_gateway_config()).enabled
-        if attended_enabled and request.target.strip().lower() == "reset" and not request.explicit_provider:
+        conversation = self._session_state(session_key).conversation
+        role_set = bool(getattr(conversation, "model_role", None))
+        if not role_set:
+            store = getattr(self, "session_store", None)
+            if store is not None:
+                with contextlib.suppress(Exception):
+                    role_set = bool(await asyncio.to_thread(store.get_model_role, session_key))
+        if request.target.strip().lower() == "reset" and not request.explicit_provider and (
+            attended_enabled or role_set
+        ):
             async with self._session_model_override_lock(session_key):
                 await self._persist_session_model_override_locked(session_key, None)
+                await self._set_session_model_role(session_key, None)
             self._session_model_overrides.pop(session_key, None)
-            self._session_state(session_key).conversation.model_override_scope = "session"
+            conversation.model_override_scope = "session"
             self._evict_cached_agent(session_key)
             return t("gateway.model.reset_done")
         requested_global = request.is_global

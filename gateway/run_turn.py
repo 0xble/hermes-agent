@@ -477,7 +477,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         }
         target_model = cfg.model or decision.model
         session_last_model = last_model or conversation.last_resolved_model or ""
-        if not decision.new_session and (not session_last_model or session_last_model != target_model):
+        if (
+            decision.reason != "role"
+            and not decision.new_session
+            and (not session_last_model or session_last_model != target_model)
+        ):
             # Async resolution supplies config-derived reasoning in the detached snapshot.  Do not
             # fall back to _load_reasoning_config here: this method runs on the gateway loop.
             effort = decision.reasoning_effort or (

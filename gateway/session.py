@@ -992,6 +992,12 @@ class SessionStore(
                 if entry.model_override is not None or entry.reasoning_override is not None
             }
 
+    def role_session_keys(self) -> set[str]:
+        """Return every routing key holding a model role."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return {key for key, entry in self._entries.items() if entry.model_role}
+
     def get_model_role(self, session_key: str) -> Optional[str]:
         with self._lock:
             entry = self._entry_locked(session_key)

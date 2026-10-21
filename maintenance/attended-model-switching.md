@@ -11,11 +11,16 @@ When the attended configuration is unset or disabled, all attended activity trac
 ## Precedence and Telegram topic edits
 
 The gateway resolves a lane in this order: `--once`, explicit session picks,
-temporary picks, active `model.attended`, then the channel/global fallback. A
-session `/model reset` removes the persisted model pick; a `/reasoning
-default` or `/reasoning reset` removes the persisted reasoning pick. Plain
-picks remain temporary while attended switching is enabled and expire after the
-idle window.
+temporary picks, a held `@role`, active `model.attended`, then the
+channel/global fallback. A held role follows the live preset on every request
+and does not post a switch-in or switch-back card. A session `/model reset`
+removes the persisted model pick and the role, including when attended
+switching is unconfigured but a role is set. `/model reset --all` clears both
+on every session. A durable `/model X` or `/model X --session` replaces the
+role; `/model X --once` wins for that turn and leaves the role in place. A
+`/reasoning default` or `/reasoning reset` removes the persisted reasoning
+pick. Plain picks remain temporary while attended switching is enabled and
+expire after the idle window.
 
 `telegram_topic` model edits are explicit operator picks, not ambient topic
 configuration. They use the same session model-override store and default
@@ -32,14 +37,15 @@ attended/default resolver to run again.
 ## Administrative reset
 
 `/model reset --all` is an explicit gateway-admin operation. It clears every
-session's persisted and in-memory model override and reasoning override through
-the locked SessionStore/model persistence paths, including the `gateway_routing`
-state in `state.db` and the `sessions.json` mirror. It is available regardless
-of whether attended switching is enabled and reports the number of sessions
-that had an explicit pick. A session with an active turn is persisted as reset
-but its current agent route is left alone; the next turn resolves from the
-default route. With slash-admin gating disabled, the fallback authorization is
-limited to a configured owner's direct message; group messages are denied.
+session's persisted and in-memory model override, reasoning override, and
+model role through the locked SessionStore/model persistence paths, including
+the `gateway_routing` state in `state.db` and the `sessions.json` mirror. It
+is available regardless of whether attended switching is enabled and reports
+the number of sessions that had an explicit pick or a role. A session with an
+active turn is persisted as reset but its current agent route is left alone;
+the next turn resolves from the default route. With slash-admin gating
+disabled, the fallback authorization is limited to a configured owner's direct
+message; group messages are denied.
 
 The attended switch-in card is rendered by one helper in
 `gateway/attended_model.py` as a single sentence-style line, like the `/fast`
@@ -53,14 +59,23 @@ For example, with a `gpt-6.1-sol` default and a 15 minute window:
 
 ## Provenance and patch
 
-Fork patch identities: `attended-model-switching` and
-`gateway-telegram-topic-tool`.
+Fork patch identities: `attended-model-switching`,
+`gateway-telegram-topic-tool`, and `live-model-preset-roles`.
+
+`live-model-preset-roles` covers `@role` holds: the role field on conversation
+state and `SessionEntry`, role reset, concrete-pick precedence, live preset
+follow, and the silent held-role card. The earlier identities cover attended
+routing and the Telegram topic tool.
 
 The attended feature adds per-topic attended routing, idle expiry, persisted activity timestamps, and route re-evaluation at the real API-request boundary. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly. The topic tool commits through the gateway's existing model and reasoning persistence paths rather than adding a second store.
 
 The combined resolution is implemented in `gateway/run_turn.py` and
 `gateway/run_config_loaders.py`; the topic commit path is
 `gateway/telegram_topic_sessions.py` and `gateway/slash_commands_model.py`.
+`@role` holds live in `hermes_cli/model_preset_runtime.py` and on
+`SessionEntry.model_role`. `/model --all attended` converts concrete Telegram
+overrides to that role and returns the converted session keys, skipping keys
+already on a role and test keys such as `dm:123`.
 This is a fork-only gateway feature that adds per-topic attended routing, idle
 expiry, persisted activity timestamps, and boundary-only idle expiry. A new genuine user message switches in at the next API call; idle expiry switches back to the default only when the session is quiet and the request fits the default route. A long autonomous turn that continues making API calls stays on the attended route. An active fallback is never undone. The deprecated `compact_before_switch_tokens` key remains accepted but is ignored; normal per-model preflight compression remains the only compaction path. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly.
 

@@ -203,8 +203,6 @@ class GatewaySessionCommandsMixin:
             _reset_process_scoped_tool_state()
 
             new_entry = await self.async_session_store.reset_session(session_key)
-            if new_entry is not None:
-                await asyncio.to_thread(self.async_session_store.set_model_role, session_key, None)
         _old_sid = old_entry.session_id if old_entry else None
         await self._fire_session_reset_hooks(source, session_key, _old_sid,
                                              new_entry.session_id if new_entry else None)
@@ -218,7 +216,6 @@ class GatewaySessionCommandsMixin:
             default_header = t("gateway.reset.header_default")
         else:  # no existing session: create one
             new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
-            await asyncio.to_thread(self.async_session_store.set_model_role, new_entry.session_key, None)
             default_header = t("gateway.reset.header_new")
         header = await asyncio.to_thread(self._telegram_topic_new_header, source) or default_header
         _title_arg = event.get_command_args().strip()
