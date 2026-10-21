@@ -59,8 +59,7 @@ For example, with a `gpt-6.1-sol` default and a 15 minute window:
 
 ## Provenance and patch
 
-Fork patch identities: `attended-model-switching`,
-`gateway-telegram-topic-tool`, and `live-model-preset-roles`.
+Fork patch identities: `attended-model-switching`, `gateway-telegram-topic-tool`, `live-model-preset-roles`.
 
 `live-model-preset-roles` covers `@role` holds: the role field on conversation
 state and `SessionEntry`, role reset, concrete-pick precedence, live preset

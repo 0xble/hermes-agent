@@ -5,7 +5,8 @@ from __future__ import annotations
 import copy
 
 import pytest
-import yaml
+
+yaml = pytest.importorskip("yaml")
 
 
 def test_gateway_primary_session_expands_preset_for_model_provider_reasoning_and_context(tmp_path, monkeypatch):
