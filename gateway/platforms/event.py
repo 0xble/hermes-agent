@@ -28,7 +28,7 @@ def _event_chain(event: Any) -> list[Any]:
     """Return an event and any events merged into its turn, newest event first."""
     if event is None:
         return []
-    return [event, *getattr(event, "_hermes_absorbed_events", ())]
+    return [event, *(getattr(event, "_hermes_absorbed_events", None) or ())]
 
 
 # Machine ingress: deliveries from third-party systems, never a person typing.
@@ -46,6 +46,8 @@ def _is_machine_ingress(source: Any) -> bool:
 _NOTIFICATION_ORIGINS = frozenset({
     "relay_delivery", "cron_delivery", "process_registry_synthetic", "delegation_result",
 })
+# Boolean metadata stamps the gateway sets on synthetic turns.
+_SYNTHETIC_MARKERS = ("cron_delivery", "loop_wakeup", "hermes_loop_wakeup")
 
 
 def _is_human_event(event: Any) -> bool:
@@ -66,7 +68,9 @@ def _is_human_event(event: Any) -> bool:
     if getattr(event, "_heartbeat_session_id", None):
         return False
     metadata = getattr(event, "metadata", None) or {}
-    if metadata.get("notification_origin") in _NOTIFICATION_ORIGINS or metadata.get("cron_delivery"):
+    if metadata.get("notification_origin") in _NOTIFICATION_ORIGINS or any(
+        metadata.get(marker) for marker in _SYNTHETIC_MARKERS
+    ):
         return False
     return not is_goal_continuation_event(event)
 

@@ -86,6 +86,17 @@ def test_legacy_loop_wakeup_marker_is_goal_loop():
     assert turn_origin_for_event(_event(internal=True, metadata={"hermes_loop_wakeup": True})) == "goal_loop"
 
 
+def test_non_internal_loop_wakeup_marker_is_not_user():
+    for marker in ("loop_wakeup", "hermes_loop_wakeup"):
+        assert turn_origin_for_event(_event(metadata={marker: True})) == "goal_loop"
+
+
+def test_none_absorbed_events_are_ignored():
+    event = _event(metadata={"notification_origin": "process_registry_synthetic"})
+    event._hermes_absorbed_events = None  # type: ignore[attr-defined]
+    assert turn_origin_for_event(event) == "process"
+
+
 def test_non_internal_event_with_notification_origin_is_not_user():
     for origin, expected in (
         ("relay_delivery", "relay"),
