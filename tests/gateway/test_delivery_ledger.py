@@ -172,6 +172,24 @@ class TestSweep:
         _record()  # owner = this (live) process
         assert dl.sweep_recoverable() == []
 
+    def test_zero_attempt_attempting_row_is_ambiguous_until_owner_dies(self):
+        """The initial send is not counted as a redelivery attempt. While its owner is live,
+        recovery must not touch it. Once that owner is dead, the ``attempting`` state proves only
+        that the platform may have seen the send, so recovery spends the first redelivery attempt
+        and adds the duplicate marker."""
+        _record()
+        dl.mark_attempting("ob-1")
+        assert _row("ob-1")["attempts"] == 0
+        assert dl.sweep_recoverable() == []
+
+        _orphan("ob-1")
+        claimed = dl.sweep_recoverable()
+
+        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
+        assert claimed[0]["attempts"] == 1
+        assert claimed[0]["needs_marker"] is True
+        assert _row("ob-1")["state"] == "attempting"
+
     def test_dead_owner_pending_claimed_without_marker(self):
         _record()
         _orphan("ob-1")
