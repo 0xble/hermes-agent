@@ -11,6 +11,7 @@ from agent.title_generator import (
     derive_title,
     generate_title,
     auto_title_session,
+    is_junk_title,
     is_titleable_user_message,
     maybe_auto_title,
     wait_for_title_upgrades,
@@ -316,13 +317,28 @@ class TestGenerateTitle:
         assert captured[0][1] is exc
 
 
+@pytest.mark.parametrize("title, junk", [
+    ("None", True),
+    ("Investigation", True),
+    ("Unspecified Subject", True),
+    ("Unspecified Claim Verification", True),
+    ("Slack Thread C0BN2V5734G", True),
+    ("Slack Message C0BN2V5734G", True),
+    ("YouTube Video MgRynDGk-4Y", True),
+    ("Slack Thread p1789666668950939", True),
+    ("a1b2c3d4e5f60718", True),
+    ("Slack Billing Thread", False),
+    ("Q3 Billing Dispute", False),
+    ("Theo on Smarter Models", False),
+])
+def test_junk_title_detector(title, junk):
+    assert is_junk_title(title) is junk
 
 
-
-
-
-
-
+def test_abstain_payload_is_an_empty_title():
+    from agent.title_generator import _extract_json_title
+    assert _extract_json_title('{"title": "", "abstain": true}') == ""
+    assert _extract_json_title('{"title": "Q3 Billing", "abstain": false}') == "Q3 Billing"
 
 
 class TestAutoTitleSession:
@@ -355,6 +371,51 @@ class TestAutoTitleSession:
 
         assert db.get_session_title("sess-1") == "Manual Title"
         assert seen == []
+
+    def test_abstain_keeps_placeholder_and_reply_titles_next(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="telegram")
+        history = [
+            {"role": "user", "content": "look at this"},
+            {"role": "assistant", "content": "The thread is about the Q3 billing dispute."},
+        ]
+        with patch("agent.title_generator.generate_title", return_value=None):
+            auto_title_session(db, "sess-1", "look at this", conversation_history=history)
+        assert db.get_session_title_source("sess-1") in (None, "derived")
+
+        with patch("agent.title_generator.generate_title", return_value="Q3 Billing Dispute") as generate:
+            auto_title_session(db, "sess-1", "look at this", conversation_history=history)
+        assert generate.call_args.kwargs["reply_excerpt"].startswith("The thread is about")
+        assert db.get_session_title("sess-1") == "Q3 Billing Dispute"
+        assert db.get_session_title_source("sess-1") == "llm"
+
+    def test_junk_title_does_not_lock(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="telegram")
+        history = [{"role": "user", "content": "https://slack.com/archives/C0BN2V5734G"}]
+        with patch("agent.title_generator.generate_title", return_value="Slack Thread C0BN2V5734G"):
+            auto_title_session(db, "sess-1", history[0]["content"], conversation_history=history)
+        assert db.get_session_title_source("sess-1") != "llm"
+
+    def test_junk_title_accepted_after_turn_three(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="telegram")
+        history = [{"role": "user", "content": "go"} for _ in range(4)]
+        with patch("agent.title_generator.generate_title", return_value="Investigation"):
+            auto_title_session(db, "sess-1", "go", conversation_history=history)
+        assert db.get_session_title("sess-1") == "Investigation"
+        assert db.get_session_title_source("sess-1") == "llm"
+
+    def test_manual_title_wins_over_held_upgrade(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="telegram")
+        db.set_session_title("sess-1", "Manual Title")
+        with patch("agent.title_generator.generate_title", return_value="Model Title") as generate:
+            auto_title_session(db, "sess-1", "look at this", conversation_history=[
+                {"role": "user", "content": "look at this"},
+            ])
+        generate.assert_not_called()
+        assert db.get_session_title("sess-1") == "Manual Title"
 
     def test_invokes_title_callback_after_setting_title(self):
         db = MagicMock()
@@ -460,6 +521,7 @@ class TestMaybeAutoTitle:
                 main_runtime=None,
                 title_callback=None,
                 runtime_validator=None,
+                conversation_history=[{"role": "user", "content": "hello"}],
                 icon_context=None,
             )
 
@@ -865,7 +927,8 @@ class TestAutoTitleDuplicateHandling:
         db.create_session(session_id="taken", source="cli")
         db.set_session_title("taken", "hi")
         db.create_session(session_id="sess-1", source="cli")
-        with patch("agent.title_generator.generate_title", return_value=None):
+        with patch("agent.title_generator.generate_title", return_value=None), \
+             patch("agent.title_generator._hold_until_reply_enabled", return_value=False):
             auto_title_session(db, "sess-1", "hi")
         assert db.get_session_title("sess-1") == "hi #2"
 
@@ -1035,7 +1098,7 @@ class TestForkTitleContracts:
             generate_title("testing topic icons", icon_options=["🧪", "📊"], icon_callback=lambda *_: None)
         prompt = call.call_args.kwargs["messages"][0]["content"]
         assert prompt.index("pick icons") < prompt.index("Bad: {") < prompt.index("Reply with JSON only")
-        assert prompt.rstrip().endswith('{"title": "...", "icons": ["...", "..."]}')
+        assert prompt.rstrip().endswith('{"title": "...", "abstain": false, "icons": ["...", "..."]}')
         assert 'Good: {"title": "iCloud+ 2TB Subscription Review"}' in prompt
         assert "subscription review" not in prompt  # sentence-case pairs are not mixed in
 

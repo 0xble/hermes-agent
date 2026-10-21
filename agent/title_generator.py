@@ -127,6 +127,9 @@ _TITLE_PROMPT_TEMPLATE = (
     "- No emoji, no trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
     "- Never answer the message. Name it.\n"
     "- Always produce something, even for a bare greeting.\n"
+    "- When the message does not name a subject, artifact, event, decision, or review, set abstain to true "
+    "and leave title empty. Do not invent a subject from a platform name, a raw ID, or a generic word "
+    "such as Investigation, Unspecified, or None. A later reply will supply the subject.\n"
     "__LANGUAGE_RULE__\n"
     "__LINK_RULE__\n"
     "__INSTRUCTIONS__\n"
@@ -137,25 +140,30 @@ _TITLE_PROMPT_TEMPLATE = (
     'Too long: {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}\n\n'
     "__REPLY_RULE__"
 )
-_REPLY_TITLE_ONLY = 'Reply with JSON only: {"title": "..."}'
-_REPLY_TITLE_AND_ICON = 'Reply with JSON only: {"title": "...", "icons": ["...", "..."]}'
+_REPLY_TITLE_ONLY = 'Reply with JSON only: {"title": "...", "abstain": false}'
+_REPLY_TITLE_AND_ICON = 'Reply with JSON only: {"title": "...", "abstain": false, "icons": ["...", "..."]}'
 
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
 _LANGUAGE_RULE_PINNED = "- Write the title in {language}."
 
 # Constrains the response to a single title field ("model answered instead of titling" failure class).
+# ``abstain`` is the can't-tell answer: the opener does not name a subject yet. An enforcing
+# provider requires every listed property, so the field is required and defaults to false.
 _TITLE_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {"name": "session_title", "strict": True, "schema": {
-        "type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"], "additionalProperties": False}},
+        "type": "object",
+        "properties": {"title": {"type": "string"}, "abstain": {"type": "boolean"}},
+        "required": ["title", "abstain"], "additionalProperties": False}},
 }
 # With icons requested, a strict title-only schema would make enforcing providers drop the icons field.
 _TITLE_AND_ICONS_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {"name": "session_title_and_icons", "strict": True, "schema": {
         "type": "object",
-        "properties": {"title": {"type": "string"}, "icons": {"type": "array", "items": {"type": "string"}}},
-        "required": ["title", "icons"], "additionalProperties": False}},
+        "properties": {"title": {"type": "string"}, "abstain": {"type": "boolean"},
+                       "icons": {"type": "array", "items": {"type": "string"}}},
+        "required": ["title", "abstain", "icons"], "additionalProperties": False}},
 }
 
 # Control-tag wrappers around machine-authored content inside a nominal "user" message (Codex CLI's
@@ -276,6 +284,16 @@ def _link_context_enabled() -> bool:
     except Exception:
         logger.debug("Failed to read title_generation.link_context", exc_info=True)
         return False
+
+
+def _hold_until_reply_enabled() -> bool:
+    """``auxiliary.title_generation.hold_until_reply``: don't lock an llm title the opener cannot support."""
+    try:
+        from utils import is_truthy_value
+        return is_truthy_value(_title_config().get("hold_until_reply"), default=True)
+    except Exception:
+        logger.debug("Failed to read title_generation.hold_until_reply", exc_info=True)
+        return True
 
 
 def _model_title_upgrade_enabled() -> bool:
@@ -445,8 +463,9 @@ def _summarize_user_message(user_message: str) -> str:
     return strip_control_wrappers(user_message if described is None else described)
 
 
-def build_title_input(user_message: str, title_preview: str | None = None, link_context: str | None = None) -> str:
-    """Combine the opening text with a bounded Desktop-generated paste preview or link metadata.
+def build_title_input(user_message: str, title_preview: str | None = None, link_context: str | None = None,
+                      reply_excerpt: str | None = None) -> str:
+    """Combine the opening text with a bounded paste preview, link metadata, or the turn's reply.
 
     ``title_preview`` and ``link_context`` are deliberately explicit, auxiliary-only values: ordinary
     attachments never populate them, and they are never returned to the main turn. Keep enough of the
@@ -455,13 +474,22 @@ def build_title_input(user_message: str, title_preview: str | None = None, link_
     """
     message = _summarize_user_message(user_message)
     preview = title_preview.strip() if isinstance(title_preview, str) else ""
+    reply = " ".join(reply_excerpt.split()) if isinstance(reply_excerpt, str) else ""
+    reply_label = "\n\nAssistant reply (topic hint):\n"
     if not preview:
         link = link_context.strip() if isinstance(link_context, str) else ""
-        if not link:
+        if not link and not reply:
             return message[:MAX_TITLE_INPUT_CHARS]
         message_budget = min(len(message), MAX_TITLE_INPUT_CHARS // 2)
-        link_budget = MAX_TITLE_INPUT_CHARS - message_budget - len(_LINK_CONTEXT_LABEL)
-        return message[:message_budget] + _LINK_CONTEXT_LABEL + link[:link_budget]
+        remaining = MAX_TITLE_INPUT_CHARS - message_budget
+        body = message[:message_budget]
+        if link:
+            link_budget = remaining - len(_LINK_CONTEXT_LABEL) - (len(reply_label) + 160 if reply else 0)
+            body += _LINK_CONTEXT_LABEL + link[:max(0, link_budget)]
+            remaining = MAX_TITLE_INPUT_CHARS - len(body)
+        if reply and remaining > len(reply_label):
+            body += reply_label + reply[: remaining - len(reply_label)]
+        return body[:MAX_TITLE_INPUT_CHARS]
     # The titler sees the message AFTER @-reference expansion, so the generated ref drags a
     # warnings/attached-context footer along; the preview already carries the topic, so drop it.
     message = _CONTEXT_FOOTER_RE.sub("", message).strip()
@@ -530,14 +558,22 @@ def _first_line(text: str) -> str:
 
 
 def _extract_json_title(raw: str) -> Optional[str]:
-    """Title from a ``{"title": ...}`` payload — strict parse, then a loose ``"title": "..."`` scan; None when absent."""
+    """Title from a ``{"title": ...}`` payload — strict parse, then a loose ``"title": "..."`` scan; None when absent.
+
+    An explicit ``"abstain": true`` is the can't-tell answer and yields ``""`` (a real empty title, distinct
+    from a missing payload). A missing or false abstain keeps the previous title-only contract.
+    """
+    parsed = None
     try:
         parsed = json.loads(raw)
-        if isinstance(parsed, dict) and isinstance(parsed.get("title"), str):
-            return parsed["title"].strip()
     except (ValueError, TypeError):
         pass
-    match = re.search(r'"title\"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+    if isinstance(parsed, dict):
+        if parsed.get("abstain") is True:
+            return ""
+        if isinstance(parsed.get("title"), str):
+            return parsed["title"].strip()
+    match = re.search(r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
     if match:
         with suppress(ValueError):
             return json.loads(f'"{match.group(1)}"').strip()
@@ -642,6 +678,48 @@ def _notify_title(
         logger.debug("%s callback failed", label, exc_info=True)
 
 
+# Platform labels and generic words that have named real topics with no subject. A title that is
+# only one of these plus an ID, hash, or punctuation is junk; a subject that happens to contain
+# one of the words ("Slack Thread Design") is not.
+_JUNK_PLATFORM_WORDS = frozenset({
+    "slack", "thread", "message", "youtube", "video", "telegram", "topic", "twitter", "tweet",
+    "discord", "github", "link", "url", "http", "https", "www", "com",
+})
+_JUNK_GENERIC_TITLES = frozenset({
+    "none", "null", "undefined", "n/a", "na", "unknown", "untitled", "investigation",
+    "unspecified", "unspecified subject", "unspecified claim", "unspecified claim verification",
+    "claim verification", "new topic", "new chat", "chat",
+})
+_JUNK_ID_RE = re.compile(
+    r"(?i)(?<![a-z0-9])(?:"
+    r"[a-z]{0,3}\d[a-z0-9]{5,}"
+    r"|\d{6,}"
+    r"|[a-f0-9]{8,}"
+    r"|[a-z0-9_]{0,12}[a-z][a-z0-9_]*-[a-z0-9_-]{3,}"
+    r"|[a-z0-9_-]{6,}[a-z][a-z0-9_-]*\d[a-z0-9_-]*"
+    r")(?![a-z0-9])"
+)
+
+
+def is_junk_title(title: str) -> bool:
+    """True when a model title names no subject: a generic word, a platform label, or mostly an ID.
+
+    Deterministic backstop for the model's own abstain answer. A real subject that merely mentions
+    a platform ("Slack Billing Thread") is kept.
+    """
+    text = " ".join((title or "").split()).strip("\"'").strip()
+    if not text:
+        return True
+    lowered = text.lower().rstrip(".!,;:")
+    if lowered in _JUNK_GENERIC_TITLES or lowered.startswith("unspecified"):
+        return True
+    without_ids = _JUNK_ID_RE.sub(" ", lowered)
+    words = re.findall(r"[a-z][a-z'-]*", without_ids)
+    if not words:
+        return True
+    return all(word in _JUNK_PLATFORM_WORDS or word in _JUNK_GENERIC_TITLES for word in words)
+
+
 def _is_provisional_greeting_title(title: str) -> bool:
     """The prompt's greeting placeholder (also "Friendly greeting in chat" and quoted/bracketed variants)."""
     normalized = re.sub(r"^[\W_]+|[\W_]+$", "", title.strip(), flags=re.UNICODE).lower()
@@ -674,12 +752,13 @@ def generate_title(
     icon_callback: Optional[Callable[[Optional[str], str], None]] = None,
     title_preview: str | None = None,
     link_context: str | None = None,
+    reply_excerpt: str | None = None,
 ) -> Optional[str]:
-    """Title from the opening message alone (waiting for the assistant made this slow and bought
-    nothing). ``runtime_validator`` runs right before the request; False skips silently.
+    """Title from the opening message, plus the turn's reply when the opener did not name a subject.
 
-    If it returns False (e.g. the user's model was switched since the background thread captured its runtime
-    snapshot), the call is skipped silently — no request is sent, so a stale title request can't reload a
+    ``runtime_validator`` runs right before the request; False skips silently. If it returns False
+    (e.g. the user's model was switched since the background thread captured its runtime snapshot),
+    the call is skipped silently — no request is sent, so a stale title request can't reload a
     model the runtime already unloaded (#19027).
     """
     if not _auto_title_enabled():
@@ -691,7 +770,7 @@ def generate_title(
             return None
     except Exception:  # fail open: a broken validator must not disable titling
         logger.debug("Title runtime validator raised; proceeding", exc_info=True)
-    user_snippet = build_title_input(user_message, title_preview, link_context)
+    user_snippet = build_title_input(user_message, title_preview, link_context, reply_excerpt)
     if not user_snippet.strip() or (
         # An attachment-only opener (manual attach, no paste preview) reaches
         # here via auto_title_session, which lacks the instant-title guard:
@@ -929,6 +1008,8 @@ def auto_title_session(
     runtime_validator: Optional[RuntimeValidator] = None,
     icon_context: Optional[dict] = None,
     title_preview: str | None = None,
+    reply_excerpt: str | None = None,
+    conversation_history: Optional[list] = None,
 ) -> None:
     """Generate and store the model title (daemon-thread target); skips sessions already carrying an
     ``llm``/``user`` title (a ``derived`` one is expected — upgrading it is the point). Never lets an
@@ -961,13 +1042,24 @@ def auto_title_session(
                 icon_instructions=str(icon_context.get("instructions") or ""),
                 icon_callback=lambda icon, _how: chosen_icon.append(icon),
             )
-        # Off the critical path by construction: this thread starts after the instant title is stored.
+        # Off the critical path by construction: this thread starts after the instant title is stored,
+        # and for the opening turn only after the reply is in ``conversation_history``.
+        if reply_excerpt is None and _hold_until_reply_enabled():
+            reply_excerpt = _latest_assistant_excerpt(conversation_history)
         link_context = _title_link_context(user_message, title_preview)
-        title, source = generate_title(
+        title = generate_title(
             user_message, failure_callback=failure_callback, main_runtime=main_runtime,
             runtime_validator=runtime_validator, recent_titles=recent_titles, title_preview=title_preview,
-            link_context=link_context, **icon_kwargs,
-        ), "llm"
+            link_context=link_context, reply_excerpt=reply_excerpt, **icon_kwargs,
+        )
+        source = "llm"
+        # Can't-tell and junk are not names. Leave the placeholder and let the next turn's reply try,
+        # through turn 3. After that the best concrete title wins, even if it is generic.
+        if _hold_until_reply_enabled() and (not title or is_junk_title(title)):
+            if _real_user_turns(conversation_history) <= 3:
+                logger.debug("Auto-title held: opener does not name a subject yet")
+                return
+            title = title or derive_title(user_message, title_preview)
         if title and _is_provisional_greeting_title(title):
             source = "derived"
         if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
@@ -1033,6 +1125,41 @@ def _kanban_task_title() -> Optional[str]:
     return title or f"Kanban task {task_id}"
 
 
+_REPLY_EXCERPT_CHARS = 600
+
+
+def opener_needs_reply(user_message: str, title_preview: str | None = None) -> bool:
+    """True when the opener is a link or attachment whose subject is not in the typed text.
+
+    A link whose page metadata came back, or a paste preview, can be titled now. A bare link
+    or an attachment cannot: the page or the reply has the subject. Short prose is titled now;
+    a junk result is held by the title check, not by delaying every short opener.
+    """
+    if isinstance(title_preview, str) and title_preview.strip():
+        return False
+    text = first_link_text(user_message)
+    if not text.strip():
+        return True
+    from agent.title_link_context import first_link
+    if first_link(text):
+        return _title_link_context(user_message, title_preview) is None
+    return _attachment_only_opener(text)
+
+
+def _real_user_turns(messages: Optional[list]) -> int:
+    return sum(1 for message in (messages or []) if _is_real_user_turn(message))
+
+
+def _latest_assistant_excerpt(messages: Optional[list]) -> str:
+    """Bounded text of the latest assistant reply, for a title the opener could not support."""
+    for message in reversed(messages or []):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            text = flatten_message_text(message.get("content")).strip()
+            if text:
+                return text[:_REPLY_EXCERPT_CHARS]
+    return ""
+
+
 def maybe_auto_title(
     session_db,
     session_id: str,
@@ -1086,7 +1213,7 @@ def maybe_auto_title(
     # profile under multiplex, titling X's session with the default profile's model and billing its key.
     from agent.memory_provider import spawn_context_thread
     upgrade_kwargs = dict(failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback,
-                          runtime_validator=runtime_validator)
+                          runtime_validator=runtime_validator, conversation_history=conversation_history)
     if isinstance(title_preview, str) and title_preview.strip():
         upgrade_kwargs["title_preview"] = title_preview
     upgrade = spawn_context_thread(
@@ -1094,8 +1221,13 @@ def maybe_auto_title(
         args=(session_db, session_id, user_message),
         kwargs={**upgrade_kwargs, "icon_context": icon_context},
     )
-    if title_upgrade_must_wait_for_turn(main_runtime):
-        logger.debug("Auto-title upgrade deferred past the turn: shares the self-hosted endpoint with the main request")
+    # A self-hosted endpoint still waits for the turn. Otherwise only an opener that names no
+    # subject waits, so a clear request is titled immediately and a link or image can use the reply.
+    if title_upgrade_must_wait_for_turn(main_runtime) or (
+        _hold_until_reply_enabled() and _real_user_turns(conversation_history) <= 1
+        and opener_needs_reply(user_message, title_preview)
+    ):
+        logger.debug("Auto-title upgrade deferred past the turn")
         return upgrade
     start_title_upgrade(upgrade)
     return upgrade
