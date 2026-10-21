@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import contextlib
 import hashlib
 import os
 import re
@@ -287,6 +288,15 @@ class GatewayStatusCommandsMixin:
             lines.append(t("gateway.status.model_provider", model=fields["model"], provider=fields["provider"]))
         elif fields["model"]:
             lines.append(t("gateway.status.model", model=fields["model"]))
+        model_role = getattr(session_entry, "model_role", None)
+        if not model_role:
+            state = self._peek_session_state(session_key)
+            model_role = state.conversation.model_role if state is not None else None
+        if not model_role and getattr(self, "session_store", None) is not None:
+            with contextlib.suppress(Exception):
+                model_role = await asyncio.to_thread(self.session_store.get_model_role, session_key)
+        if model_role:
+            lines.append(t("gateway.status.model_role", role=model_role))
         from agent.context_breakdown import context_display_source
         mark = "~" if context_display_source(getattr(status_agent, "context_compressor", None)) != "provider_usage" else ""
         if context_total:

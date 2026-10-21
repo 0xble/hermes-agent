@@ -571,6 +571,10 @@ class GatewayAgentCacheMixin:
             except Exception:
                 # Never fails the boundary itself, but a surviving ON would come back after a restart.
                 logger.warning("Failed to clear persisted yolo for session boundary %s", session_key, exc_info=True)
+            try:
+                store.set_model_role(session_key, None)
+            except Exception:
+                logger.warning("Failed to clear model role for session boundary %s", session_key, exc_info=True)
 
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh, monotonically increasing run generation token (NEVER reset): a late result

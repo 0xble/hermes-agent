@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+from pathlib import Path
 from typing import Any, Optional, cast
 
 from gateway.platforms.event import MessageEvent, MessageType
@@ -130,9 +131,33 @@ def _reasoning_effort(config: Optional[dict]) -> Optional[str]:
     return config.get("effort") or "medium"
 
 
+def _resolve_topic_model_ref(raw: str, source: Optional[SessionSource] = None, runner=None):
+    """Resolve a topic role from the config that owns the topic's session: the routed profile's
+    under ``multiplex_profiles``, else the gateway's module-level loader."""
+    from gateway.run import _load_gateway_config
+    from hermes_cli.model_preset_runtime import resolve_model_ref
+    config_path = None
+    if (runner is not None and source is not None
+            and getattr(getattr(runner, "config", None), "multiplex_profiles", False)):
+        config_path = Path(runner._resolve_profile_home_for_source(source)) / "config.yaml"
+    try:
+        config = _load_gateway_config() if config_path is None else _load_gateway_config(config_path)
+        return resolve_model_ref(raw, config)
+    except (ValueError, TypeError) as exc:
+        raise TopicRequestError(str(exc)) from exc
+
+
 async def _resolve_model(runner, source: SessionSource, spec: TopicSpec, session_key: str = ""):
     if not (spec.model or spec.provider):
         return None
+    from hermes_cli.model_presets import preset_ref_name
+    if preset_ref_name(spec.model):
+        if spec.provider:
+            raise TopicRequestError(
+                f"model {spec.model.strip()!r} is a role, which carries its own provider. "
+                "Drop provider, or pass a concrete model.")
+        _resolve_topic_model_ref(spec.model.strip(), source, runner)
+        return ("role", spec.model.strip()[1:].strip().lower())
     ctx, result, error = await runner.resolve_session_model_selection(
         source, spec.model, spec.provider, session_key=session_key)
     if error is not None:
@@ -184,15 +209,21 @@ async def _apply_session_settings(
     # the overrides set here; ``/model`` consumes the flag for the same reason (#48031).
     entry.was_auto_reset = False
     if model is not None:
-        ctx, result = model
-        error, model_status = await runner.commit_session_model_selection_with_status(
-            ctx, result, dest, announce=announce,
-        )
-        if error is not None:
-            raise TopicRequestError(error)
-        model_effective_when = "next_turn"
-        if getattr(result, "warning_message", ""):
-            warnings.append(result.warning_message)
+        if isinstance(model, tuple) and model and model[0] == "role":
+            role = model[1]
+            await runner._set_session_model_role(entry.session_key, role)
+            model_status = "applied"
+            model_effective_when = "next_turn"
+        else:
+            ctx, result = model
+            error, model_status = await runner.commit_session_model_selection_with_status(
+                ctx, result, dest, announce=announce,
+            )
+            if error is not None:
+                raise TopicRequestError(error)
+            model_effective_when = "next_turn"
+            if getattr(result, "warning_message", ""):
+                warnings.append(result.warning_message)
     if effort is not None or reasoning_reset:
         runner._session_state(entry.session_key)
         previous = runner._session_reasoning_override(entry.session_key)
@@ -386,11 +417,19 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
                 f"Topic {thread_id} and session {entry.session_id} are set up, but the opening brief "
                 f"was not delivered: {exc}. Send it with relay to {relay}.") from exc
     profile_home = None
-    effective_model = getattr(model[1], "new_model", None) if model else None
-    effective_provider = getattr(model[1], "target_provider", None) if model else None
-    if model:
-        profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
+    if model and isinstance(model, tuple) and model and model[0] == "role":
+        route = _resolve_topic_model_ref("@" + model[1], dest, runner)
+        effective_model, effective_provider = route.model, route.provider
+        # The role was resolved from the routed profile; the reasoning readback
+        # must use that same profile, not the launch profile.
+        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
+                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
+            profile_home = runner._resolve_profile_home_for_source(dest)
     else:
+        effective_model = getattr(model[1], "new_model", None) if model else None
+        effective_provider = getattr(model[1], "target_provider", None) if model else None
+        if model:
+            profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
         if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
                 and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
             profile_home = runner._resolve_profile_home_for_source(dest)
@@ -463,11 +502,19 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
         )
         warnings = settings["warnings"]
     profile_home = None
-    effective_model = getattr(model[1], "new_model", None) if model else None
-    effective_provider = getattr(model[1], "target_provider", None) if model else None
-    if model:
-        profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
+    if model and isinstance(model, tuple) and model and model[0] == "role":
+        route = _resolve_topic_model_ref("@" + model[1], dest, runner)
+        effective_model, effective_provider = route.model, route.provider
+        # The role was resolved from the routed profile; the reasoning readback
+        # must use that same profile, not the launch profile.
+        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
+                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
+            profile_home = runner._resolve_profile_home_for_source(dest)
     else:
+        effective_model = getattr(model[1], "new_model", None) if model else None
+        effective_provider = getattr(model[1], "target_provider", None) if model else None
+        if model:
+            profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
         if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
                 and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
             profile_home = runner._resolve_profile_home_for_source(dest)

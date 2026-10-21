@@ -583,6 +583,7 @@ class SessionEntry:
     # Route the last API call committed to: True attended, False idle/explicit, None never committed.
     # Process memory loses the attended decision on restart; this keeps the idle switch-back card.
     attended_route_active: Optional[bool] = None
+    model_role: Optional[str] = None
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -626,6 +627,8 @@ class SessionEntry:
             result["last_user_activity_at"] = _iso(self.last_user_activity_at)
         if self.attended_route_active is not None:
             result["attended_route_active"] = self.attended_route_active
+        if self.model_role:
+            result["model_role"] = self.model_role
         if self.active_turn_token and self.active_turn_owner_pid and self.active_turn_owner_slot:
             result["active_turn_owner_pid"] = self.active_turn_owner_pid
             result["active_turn_owner_slot"] = self.active_turn_owner_slot
@@ -717,6 +720,7 @@ class SessionEntry:
             last_user_activity_at=_parse_iso(data.get("last_user_activity_at")),
             attended_route_active=data.get("attended_route_active")
             if isinstance(data.get("attended_route_active"), bool) else None,
+            model_role=str(data.get("model_role")).strip().lower() if data.get("model_role") else None,
             model_override_scope=data.get("model_override_scope", "session")
             if data.get("model_override_scope") in ("session", "temporary", "once") else "session",
             reasoning_override_scope=data.get("reasoning_override_scope", "session")
@@ -988,9 +992,49 @@ class SessionStore(
                 if entry.model_override is not None or entry.reasoning_override is not None
             }
 
+    def role_session_keys(self) -> set[str]:
+        """Return every routing key holding a model role."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return {key for key, entry in self._entries.items() if entry.model_role}
+
+    def get_model_role(self, session_key: str) -> Optional[str]:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return entry.model_role if entry else None
+
+    def set_model_role(self, session_key: str, role: Optional[str], *, clear_overrides: bool = False) -> None:
+        self.set_model_roles([session_key], role, clear_overrides=clear_overrides)
+
+    def set_model_roles(self, session_keys, role: Optional[str], *, clear_overrides: bool = False) -> list[str]:
+        """Set one role on many sessions in a single routing snapshot and persist.
+
+        Returns the keys that existed and were updated. A missing key is skipped,
+        matching ``set_model_role``.
+        """
+        from dataclasses import replace
+        normalized = str(role).strip().lower() if role else None
+        updated_keys: list[str] = []
+        with self._lock:
+            self._ensure_loaded_locked()
+            data, generation = self._snapshot_routing_locked()
+            for session_key in session_keys:
+                entry = self._entries.get(session_key)
+                if entry is None:
+                    continue
+                updated = replace(entry, model_role=normalized)
+                if clear_overrides:
+                    updated = replace(updated, model_override=None, reasoning_override=None,
+                                      model_override_scope="session", reasoning_override_scope="session")
+                data[session_key] = updated.to_dict()
+                self._entries[session_key] = updated
+                updated_keys.append(session_key)
+            if updated_keys:
+                self._persist_routing_data(data, generation)
+        return updated_keys
+
     def has_any_sessions(self) -> bool:
-        """Whether any session has ever been created. SQLite is the source of truth (ended sessions
-        count); the current session is already in the DB when this runs, hence ``> 1``."""
+        """Whether any session has ever been created. SQLite is the source of truth."""
         if self._db:
             try:
                 return self._db.session_count_ge(2)
@@ -1471,6 +1515,7 @@ class SessionStore(
                 # The user's activity belongs to the route, not the session row it points at.
                 last_user_activity_at=old_entry.last_user_activity_at,
                 attended_route_active=old_entry.attended_route_active,
+                model_role=old_entry.model_role,
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
                     if preserve_prompt_pin and old_entry.prompt_pin is not None else None
