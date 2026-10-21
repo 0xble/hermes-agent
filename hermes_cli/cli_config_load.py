@@ -282,7 +282,14 @@ def load_cli_config() -> dict[str, Any]:
     """
     from cli import _cli_config_defaults, _merge_file_config, _mirror_config_to_env
     from hermes_constants import get_hermes_home
-    config_path = get_hermes_home() / 'config.yaml'
+    # The import-time home is the seam tests patch (cli._hermes_home). Read it live, and fall
+    # back to the live home when the import-time value is stale so a redirected HERMES_HOME wins.
+    cli_home = getattr(_cli(), "_hermes_home", None)
+    config_path = (cli_home if cli_home is not None else get_hermes_home()) / 'config.yaml'
+    if not config_path.exists():
+        live_path = get_hermes_home() / 'config.yaml'
+        if live_path.exists():
+            config_path = live_path
     if not config_path.exists() or os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
         config_path = Path(__file__).parent / 'cli-config.yaml'
 

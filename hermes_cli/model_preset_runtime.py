@@ -41,7 +41,7 @@ def resolve_model_ref(raw: Any, config: Mapping[str, Any] | None = None, *, _sta
             outer_provider = str(model_cfg.get("provider") or "")
             return ModelPresetRoute(name, str(nested_provider or outer_provider or route.provider), route.model,
                                     str(model_cfg.get("reasoning_effort") or route.reasoning_effort), route.fallbacks)
-        return ModelPresetRoute(name, str(model_cfg.get("provider") or ""), str(raw_model), str(model_cfg.get("reasoning_effort") or ""))
+        return ModelPresetRoute(name, str(model_cfg.get("provider") or ""), str(raw_model).strip(), str(model_cfg.get("reasoning_effort") or ""))
     if name == "attended":
         attended_value = model_cfg.get("attended")
         attended: Mapping[str, Any] = attended_value if isinstance(attended_value, Mapping) else {}
