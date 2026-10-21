@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+from pathlib import Path
 from typing import Any, Optional, cast
 
 from gateway.platforms.event import MessageEvent, MessageType
@@ -130,12 +131,18 @@ def _reasoning_effort(config: Optional[dict]) -> Optional[str]:
     return config.get("effort") or "medium"
 
 
-def _resolve_topic_model_ref(raw: str):
-    """Resolve a topic role from the gateway's module-level config loader."""
+def _resolve_topic_model_ref(raw: str, source: Optional[SessionSource] = None, runner=None):
+    """Resolve a topic role from the config that owns the topic's session: the routed profile's
+    under ``multiplex_profiles``, else the gateway's module-level loader."""
     from gateway.run import _load_gateway_config
     from hermes_cli.model_preset_runtime import resolve_model_ref
+    config_path = None
+    if (runner is not None and source is not None
+            and getattr(getattr(runner, "config", None), "multiplex_profiles", False)):
+        config_path = Path(runner._resolve_profile_home_for_source(source)) / "config.yaml"
     try:
-        return resolve_model_ref(raw, _load_gateway_config())
+        config = _load_gateway_config() if config_path is None else _load_gateway_config(config_path)
+        return resolve_model_ref(raw, config)
     except (ValueError, TypeError) as exc:
         raise TopicRequestError(str(exc)) from exc
 
@@ -144,7 +151,11 @@ async def _resolve_model(runner, source: SessionSource, spec: TopicSpec, session
     if not (spec.model or spec.provider):
         return None
     if spec.model.strip().startswith("@"):
-        _resolve_topic_model_ref(spec.model.strip())
+        if spec.provider:
+            raise TopicRequestError(
+                f"model {spec.model.strip()!r} is a role, which carries its own provider. "
+                "Drop provider, or pass a concrete model.")
+        _resolve_topic_model_ref(spec.model.strip(), source, runner)
         return ("role", spec.model.strip()[1:].strip().lower())
     ctx, result, error = await runner.resolve_session_model_selection(
         source, spec.model, spec.provider, session_key=session_key)
@@ -406,7 +417,7 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
                 f"was not delivered: {exc}. Send it with relay to {relay}.") from exc
     profile_home = None
     if model and isinstance(model, tuple) and model and model[0] == "role":
-        route = _resolve_topic_model_ref("@" + model[1])
+        route = _resolve_topic_model_ref("@" + model[1], dest, runner)
         effective_model, effective_provider = route.model, route.provider
     else:
         effective_model = getattr(model[1], "new_model", None) if model else None
@@ -486,7 +497,7 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
         warnings = settings["warnings"]
     profile_home = None
     if model and isinstance(model, tuple) and model and model[0] == "role":
-        route = _resolve_topic_model_ref("@" + model[1])
+        route = _resolve_topic_model_ref("@" + model[1], dest, runner)
         effective_model, effective_provider = route.model, route.provider
     else:
         effective_model = getattr(model[1], "new_model", None) if model else None

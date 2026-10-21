@@ -71,6 +71,7 @@ gateway:
     usage_persist: "`/model <name> --global` — stoor permanent"
     reset_done: "✓ Model override reset."
     reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    attended_migrated: "✓ Moved {converted} sessions to @attended. Failures: {failures}{detail}"
     reset_all_usage: "Usage: `/model reset --all`"
     reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "Hierdie gateway loop kode van {boot_rev}, maar die uitcheck op skyf is nou {disk_rev}. Om modelle te wissel kan 'n verouderde-module-omval veroorsaak — herbegin die gateway om die nuwe kode te laai: hermes gateway restart"

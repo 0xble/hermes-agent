@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import pytest
 
-yaml = pytest.importorskip("yaml")
+import hermes_yaml as yaml
 
 from hermes_cli.model_presets import ModelPresetError, expand_model_presets
 

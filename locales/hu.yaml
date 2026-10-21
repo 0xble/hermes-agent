@@ -71,6 +71,7 @@ gateway:
     usage_persist: "`/model <name> --global` — megőrzés"
     reset_done: "✓ Model override reset."
     reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    attended_migrated: "✓ Moved {converted} sessions to @attended. Failures: {failures}{detail}"
     reset_all_usage: "Usage: `/model reset --all`"
     reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "Ez az átjáró a(z) {boot_rev} revízió kódját futtatja, de a lemezen már a(z) {disk_rev} van kicsekkolva. A modellváltás elavult modul miatti összeomlást kockáztatna — indítsd újra az átjárót az új kód betöltéséhez: hermes gateway restart"

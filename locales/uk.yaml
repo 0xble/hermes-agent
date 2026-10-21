@@ -71,6 +71,7 @@ gateway:
     usage_persist: "`/model <name> --global` — зберегти назавжди"
     reset_done: "✓ Model override reset."
     reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    attended_migrated: "✓ Moved {converted} sessions to @attended. Failures: {failures}{detail}"
     reset_all_usage: "Usage: `/model reset --all`"
     reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "Цей шлюз виконує код із {boot_rev}, але робоча копія на диску вже {disk_rev}. Перемикання моделі може призвести до збою через застарілі модулі — перезапустіть шлюз, щоб завантажити новий код: hermes gateway restart"

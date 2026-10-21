@@ -167,13 +167,15 @@ class GatewayConfigLoadersMixin:
                       else _load_gateway_config(profile_home / "config.yaml"))
         from hermes_cli.model_preset_runtime import resolve_model_ref
         if isinstance(config, dict):
-            model_cfg = config.get("model") if isinstance(config.get("model"), dict) else {}
-            raw_default = ("@" + str(model_cfg["model_preset"])
+            raw_model_cfg = config.get("model")
+            model_cfg = raw_model_cfg if isinstance(raw_model_cfg, dict) else {}
+            raw_default = (raw_model_cfg if isinstance(raw_model_cfg, str)
+                          else "@" + str(model_cfg["model_preset"])
                           if model_cfg.get("model_preset")
                           else model_cfg.get("default") or model_cfg.get("model"))
             try:
                 route = resolve_model_ref(raw_default, config)
-                if model and model in {raw_default, route.model} and route.reasoning_effort:
+                if (not model or model in {raw_default, route.model}) and route.reasoning_effort:
                     return {"enabled": route.reasoning_effort != "none", "effort": route.reasoning_effort}
             except Exception:
                 pass

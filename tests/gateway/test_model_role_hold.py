@@ -450,3 +450,11 @@ def test_role_activity_older_than_idle_window_is_not_a_switch_back():
     )
     assert result.reason == "role"
     assert result.switched_back is False
+
+
+def test_attended_migration_reply_is_localized_with_counts_and_failures():
+    from agent.i18n import t
+
+    text = t("gateway.model.attended_migrated", converted=2, failures=1, detail=" (boom)")
+    assert "2" in text and "1" in text and "(boom)" in text
+    assert text != "gateway.model.attended_migrated"

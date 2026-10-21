@@ -71,6 +71,7 @@ gateway:
     usage_persist: "`/model <name> --global` — conserver"
     reset_done: "✓ Model override reset."
     reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    attended_migrated: "✓ Moved {converted} sessions to @attended. Failures: {failures}{detail}"
     reset_all_usage: "Usage: `/model reset --all`"
     reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "Ce gateway exécute le code de {boot_rev}, mais le checkout sur disque est maintenant à {disk_rev}. Changer de modèle risquerait un plantage dû à des modules obsolètes — redémarrez le gateway pour charger le nouveau code : hermes gateway restart"

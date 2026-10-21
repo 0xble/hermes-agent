@@ -6,7 +6,7 @@ import copy
 
 import pytest
 
-yaml = pytest.importorskip("yaml")
+import hermes_yaml as yaml
 
 
 def test_gateway_primary_session_expands_preset_for_model_provider_reasoning_and_context(tmp_path, monkeypatch):
@@ -136,3 +136,18 @@ def test_gateway_explicit_context_rejects_invalid_preset(tmp_path, monkeypatch):
     with pytest.raises(ModelPresetError, match="unknown preset 'missing'"):
         gateway_run._resolve_gateway_model_context("explicit-model")
 
+
+
+def test_gateway_model_context_read_other_failure_fails_open(tmp_path, monkeypatch):
+    from gateway import run as gateway_run
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: (_ for _ in ()).throw(OSError("offline")))
+    context = gateway_run._resolve_gateway_model_context("explicit-model")
+    assert context.model == "explicit-model"
+
+
+def test_gateway_string_at_model_keeps_preset_reasoning_effort():
+    from gateway.run_config_loaders import GatewayConfigLoadersMixin
+    cfg = {"model_presets": {"primary": {"provider": "openrouter", "model": "m", "reasoning_effort": "high"}},
+           "model": "@primary"}
+    assert GatewayConfigLoadersMixin._load_reasoning_config(config=cfg) == {"enabled": True, "effort": "high"}

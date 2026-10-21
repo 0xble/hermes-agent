@@ -71,6 +71,7 @@ gateway:
     usage_persist: "`/model <name> --global` — 永久保存"
     reset_done: "✓ Model override reset."
     reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    attended_migrated: "✓ Moved {converted} sessions to @attended. Failures: {failures}{detail}"
     reset_all_usage: "Usage: `/model reset --all`"
     reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "此网关运行的是 {boot_rev} 的代码，但磁盘上的检出版本已是 {disk_rev}。此时切换模型可能因模块过期而崩溃——请重启网关以加载新代码：hermes gateway restart"

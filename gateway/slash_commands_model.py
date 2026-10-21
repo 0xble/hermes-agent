@@ -825,10 +825,11 @@ class GatewayModelCommandsMixin:
                 return t("gateway.model.reset_all_admin_only")
             if request.target.strip().lower() == "attended":
                 converted, failures = await self._migrate_telegram_model_overrides_to_role("attended")
-                suffix = f" failures={len(failures)}"
+                detail = ""
                 if failures:
-                    suffix += " (" + "; ".join(failures[:3]) + ("; …" if len(failures) > 3 else "") + ")"
-                return f"converted={len(converted)}{suffix}"
+                    detail = " (" + "; ".join(failures[:3]) + ("; …" if len(failures) > 3 else "") + ")"
+                return t("gateway.model.attended_migrated", converted=len(converted),
+                         failures=len(failures), detail=detail)
             count = await self._reset_all_session_overrides()
             return t("gateway.model.reset_all_done", count=count)
         if request.target.strip().startswith("@"):
@@ -837,7 +838,9 @@ class GatewayModelCommandsMixin:
             if not role:
                 return "❌ model role cannot be empty"
             try:
-                resolve_model_ref("@" + role, _load_gateway_config())
+                # Validate against the config of the profile that owns this session.
+                resolve_model_ref("@" + role, _load_gateway_config() if profile_home is None
+                                  else _load_gateway_config(profile_home / "config.yaml"))
             except ModelPresetError as exc:
                 return f"❌ {exc}"
             await self._set_session_model_role(session_key, role)

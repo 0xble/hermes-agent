@@ -2485,10 +2485,14 @@ def _resolve_gateway_model_context(
         return get_custom_provider_context_length(
             model=resolved_model, base_url=base_url, custom_providers=custom_providers)
 
-    if model is not None:
+    from hermes_cli.model_presets import ModelPresetError
+
+    try:
         _read_config()
-    else:
-        _best_effort(_read_config)
+    except ModelPresetError:
+        raise  # an invalid preset is an operator-visible config error, never a silent default
+    except Exception:
+        logger.debug("gateway model-context config read failed", exc_info=True)
     _best_effort(_read_runtime)
     if config_context_length is not None and not _best_effort(_pin_still_applies):
         config_context_length = None
@@ -3585,7 +3589,6 @@ class GatewayRunner(
         self._init_lifecycle_state()
         self._init_runtime_caches()
         self._init_session_db()
-        self._VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
         self._init_registries_and_clocks()
 
     def _init_runtime_settings(self) -> None:

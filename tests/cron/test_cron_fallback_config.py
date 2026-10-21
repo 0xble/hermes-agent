@@ -30,6 +30,64 @@ def test_cron_at_model_is_resolved_from_fresh_config_each_fire(tmp_path, monkeyp
     second = scheduler._load_cron_job_config(job, job["id"], job["name"])
     assert second.model == "coding-v2"
     assert job["model"] == "@coding"
+    # The route's provider must survive an unset cron.model_provider on every fire.
+    assert first.cron_default_provider == "openrouter"
+    assert second.cron_default_provider == "openrouter"
+
+
+def test_cron_model_provider_does_not_override_job_route_provider(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "model_presets": {"coding": {"provider": "openrouter", "model": "coding-v1"}},
+        "cron": {"model_provider": "nous"},
+    }))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job = {"id": "r", "name": "r", "prompt": "hi", "model": "@coding"}
+    assert scheduler._load_cron_job_config(job, "r", "r").cron_default_provider == "openrouter"
+
+
+def _preset_job_setup(tmp_path, monkeypatch, cfg, job):
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(scheduler, "_hermes_home", tmp_path)
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", lambda **kw: {
+        "provider": kw["requested"], "api_key": "test-key", "api_mode": "chat_completions",
+    })
+    monkeypatch.setattr(scheduler, "_load_credential_pool", lambda *a: None)
+    monkeypatch.setattr(scheduler, "_init_cron_mcp_tools", lambda *a: None)
+    jc = scheduler._load_cron_job_config(job, job["id"], job["name"])
+    return scheduler._resolve_cron_agent_setup(job, job["id"], job["name"], jc)
+
+
+PRESETS = {"fast": {"provider": "openrouter", "model": "fast-model", "reasoning_effort": "low",
+                    "fallbacks": [{"provider": "custom:fb", "model": "fb-model"}]}}
+TOP_LEVEL_PRESETS = {"fast": {"provider": "openrouter", "model": "fast-model", "reasoning_effort": "low"}}
+
+
+@pytest.mark.parametrize("model_cfg", [{"model_preset": "fast"}, "@fast"])
+def test_main_preset_reasoning_and_fallbacks_reach_unpinned_cron_job(tmp_path, monkeypatch, model_cfg):
+    job = {"id": "p", "name": "p", "prompt": "hi", "deliver": "local"}
+    setup = _preset_job_setup(tmp_path, monkeypatch, {"model_presets": PRESETS, "model": model_cfg}, job)
+    assert setup.blocked is None
+    assert setup.reasoning_config == {"enabled": True, "effort": "low"}
+    assert [f["model"] for f in setup.fallback_model] == ["fb-model"]
+
+
+def test_top_level_fallback_providers_at_reference_reaches_cron_job(tmp_path, monkeypatch):
+    cfg = {"model_presets": TOP_LEVEL_PRESETS, "model": {"provider": "openrouter", "default": "m"},
+           "fallback_providers": ["@fast"]}
+    job = {"id": "p", "name": "p", "prompt": "hi", "deliver": "local"}
+    setup = _preset_job_setup(tmp_path, monkeypatch, cfg, job)
+    assert [f["model"] for f in setup.fallback_model] == ["fast-model"]
+
+
+def test_job_at_route_applies_its_own_reasoning_and_fallbacks(tmp_path, monkeypatch):
+    cfg = {"model_presets": PRESETS, "model": {"provider": "nous", "default": "main"}}
+    job = {"id": "p", "name": "p", "prompt": "hi", "deliver": "local", "model": "@fast"}
+    setup = _preset_job_setup(tmp_path, monkeypatch, cfg, job)
+    assert setup.model == "fast-model"
+    assert setup.reasoning_config == {"enabled": True, "effort": "low"}
+    assert [f["model"] for f in setup.fallback_model] == ["fb-model"]
 
 
 GLOBAL = [{"provider": "openrouter", "model": "global-backup"}]

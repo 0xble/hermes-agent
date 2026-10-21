@@ -71,6 +71,7 @@ gateway:
     usage_persist: "`/model <name> --global` — 영구 저장"
     reset_done: "✓ Model override reset."
     reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    attended_migrated: "✓ Moved {converted} sessions to @attended. Failures: {failures}{detail}"
     reset_all_usage: "Usage: `/model reset --all`"
     reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "이 게이트웨이는 {boot_rev} 코드로 실행 중인데 디스크의 체크아웃은 현재 {disk_rev}이에요. 지금 모델을 전환하면 오래된 모듈 때문에 충돌할 수 있어요. 새 코드를 불러오려면 게이트웨이를 재시작하세요: hermes gateway restart"
