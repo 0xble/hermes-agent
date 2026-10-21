@@ -135,7 +135,8 @@ def test_soft_eviction_commit_serializes_with_session_shutdown(monkeypatch):
     manager.on_session_end.side_effect = lambda _messages: events.append("shutdown-hook")
     manager.shutdown_all.side_effect = lambda: events.append("shutdown")
 
-    commit_thread = threading.Thread(target=runner._commit_memory_before_soft_evict, args=(agent, "key"))
+    agent.release_clients = lambda: None
+    commit_thread = threading.Thread(target=runner._commit_then_release_soft, args=(agent, "key"))
     commit_thread.start()
     assert commit_started.wait(5)
     shutdown_thread = threading.Thread(target=agent.shutdown_memory_provider, args=([{"role": "user"}],))
@@ -147,7 +148,9 @@ def test_soft_eviction_commit_serializes_with_session_shutdown(monkeypatch):
     commit_thread.join(5)
     shutdown_thread.join(5)
 
-    assert events == ["commit-start", "commit-end", "shutdown-hook", "shutdown"]
+    # Eviction committed and detached atomically, so /new found no manager: session end ran exactly once.
+    assert events == ["commit-start", "commit-end", "shutdown"]
+    manager.on_session_end.assert_not_called()
 
 
 class _CountingProvider(MemoryProvider):

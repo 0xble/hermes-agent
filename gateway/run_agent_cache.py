@@ -1077,39 +1077,32 @@ class GatewayAgentCacheMixin:
     def _commit_memory_before_soft_evict(self, agent: Any, key: str) -> None:
         """Commit the live transcript to memory providers before resource-only eviction.
 
-        The lifecycle check and commit share the shutdown handoff lock. Otherwise /new or /reset can claim
-        shutdown after the check but before the commit, causing duplicate or failed on_session_end work.
+        Callers hold the shutdown handoff lock from the lifecycle check through the manager detach, so /new or
+        /reset either claims shutdown first (no commit here) or finds the manager already detached afterward.
         """
-        if agent is None or not hasattr(agent, "commit_memory_session"):
+        if not hasattr(agent, "commit_memory_session"):
             return
-        from agent.memory_manager import memory_handoff_lock
+        # No external memory provider (``_memory_manager`` None) — nothing to commit. An agent whose
+        # shutdown_memory_provider() already ran (/new cleanup) has fired on_session_end once already.
+        if getattr(agent, "_memory_manager", None) is None or getattr(agent, "_memory_provider_shutdown", False) is True:
+            return
         try:
-            lock = memory_handoff_lock(agent)
-        except Exception:  # no instance __dict__ (slotted test double)
-            lock = nullcontext()
-        with lock:
-            # No external memory provider (``_memory_manager`` None) — nothing to commit. An agent whose
-            # shutdown_memory_provider() already ran (/new cleanup) has fired on_session_end once already.
-            if getattr(agent, "_memory_manager", None) is None or getattr(agent, "_memory_provider_shutdown", False) is True:
-                return
-            try:
-                messages = getattr(agent, "_session_messages", None)
-                agent.commit_memory_session(messages if isinstance(messages, list) else None)
-                logger.debug(
-                    "Committed on_session_end extraction before soft-evicting "
-                    "session=%s (resource eviction)", key,
-                )
-            except Exception as _e:
-                logger.debug("Pre-evict memory commit failed for %s: %s", key, _e)
+            messages = getattr(agent, "_session_messages", None)
+            agent.commit_memory_session(messages if isinstance(messages, list) else None)
+            logger.debug(
+                "Committed on_session_end extraction before soft-evicting "
+                "session=%s (resource eviction)", key,
+            )
+        except Exception as _e:
+            logger.debug("Pre-evict memory commit failed for %s: %s", key, _e)
 
     def _commit_then_release_soft(self, agent: Any, key: str, *, retired: Optional[list] = None) -> None:
         """Commit end-of-session memory (if warranted), then soft-release — on the daemon eviction
-        thread. Order matters: commit needs the live memory manager before ``release_clients``."""
-        self._commit_memory_before_soft_evict(agent, key)
-        self._release_evicted_agent_soft(agent, retired=retired)
+        thread. Order matters: commit needs the live memory manager before ``release_clients``, and the
+        commit and detach are one handoff-lock critical section so on_session_end runs exactly once."""
+        self._release_evicted_agent_soft(agent, retired=retired, commit_key=key)
 
-    @staticmethod
-    def _detach_memory_manager(agent: Any) -> Any:
+    def _detach_memory_manager(self, agent: Any, commit_key: Optional[str] = None) -> Any:
         """Detach an evicted agent's memory manager; return it when it still needs ``shutdown_all()``.
 
         Already removed from the cache, so the next turn builds its own manager. Detaching first means a
@@ -1118,13 +1111,16 @@ class GatewayAgentCacheMixin:
         the manager locally and always finishes with ``shutdown_all()``, even when a timed-out /new cleanup is
         still inside ``on_session_end``. Shutting it down here instead would retire providers mid-session-end.
         The read, flag check and detach share shutdown_memory_provider()'s handoff lock, so exactly one side
-        calls ``shutdown_all()``."""
+        calls ``shutdown_all()``. With ``commit_key``, the session commit runs inside that same critical
+        section, so a racing /new or /reset cannot run on_session_end a second time between commit and detach."""
         from agent.memory_manager import memory_handoff_lock
         try:
             lock = memory_handoff_lock(agent)
         except Exception:  # no instance __dict__ (slotted test double): nothing can race the claim
             lock = nullcontext()
         with lock:
+            if commit_key is not None:
+                self._commit_memory_before_soft_evict(agent, commit_key)
             manager = getattr(agent, "_memory_manager", None)
             if manager is None:
                 return None
@@ -1139,13 +1135,15 @@ class GatewayAgentCacheMixin:
         except Exception:
             logger.warning("Evicted agent memory shutdown failed", exc_info=True)
 
-    def _release_evicted_agent_soft(self, agent: Any, *, retired: Optional[list] = None) -> None:
+    def _release_evicted_agent_soft(self, agent: Any, *, retired: Optional[list] = None,
+                                    commit_key: Optional[str] = None) -> None:
         """Soft cleanup for cache-evicted agents: unlike _cleanup_agent_resources, the session may
         resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance.
-        With ``retired``, the detached memory manager is appended for the caller to shut down."""
+        With ``retired``, the detached memory manager is appended for the caller to shut down. With
+        ``commit_key``, end-of-session memory is committed atomically with the detach."""
         if agent is None:
             return
-        manager = self._detach_memory_manager(agent)
+        manager = self._detach_memory_manager(agent, commit_key)
         if manager is not None:
             if retired is not None:
                 retired.append(manager)
