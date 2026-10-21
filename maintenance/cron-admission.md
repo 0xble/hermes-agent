@@ -1,0 +1,55 @@
+# Cron Admission
+
+**Patch identity:** `cron-protected-admission`.
+
+This unit extends the [fork contract](../MAINTENANCE.md). Load it for cron
+completion rearming, built-in ticker waits, or executor admission changes.
+Also preserve the process-exit ownership contract in
+[cron restart survival](cron-restart-survival.md).
+
+## Preserve
+
+Interval schedules of at most 120 seconds form the protected class, derived
+from schedule data rather than names, IDs, or job flags. Their completion-based
+next eligibility spends 30 seconds of headroom before the natural interval.
+All other schedules retain their existing rearm calculation.
+
+Each profile's existing FIFO general executor keeps `cron.max_parallel_jobs`
+(default 4). Add exactly 1 reserved worker, select the first protected job in
+store order, and never admit that selected job to the general executor.
+Additional protected jobs log an error once per loaded class and use the
+general executor best-effort in its unchanged FIFO order. A long protected run
+must not occupy a general worker or overlap another instance of itself.
+
+A finished waiter future or terminal execution row does not release the
+reservation while its detached process remains live. Only the existing
+owner-fenced running-job release returns it. The healthy built-in ticker
+waits to the earliest eligible deadline, bounded by its 60-second heartbeat,
+and checks worker-release wakes within 0.25 seconds. Retain fd-exhaustion
+backoff and shutdown responsiveness.
+
+## Update
+
+This is a fork scheduling policy, not an upstream release-baseline change.
+Its implementation belongs in `cron/scheduler_admission.py` and the existing
+job-run rearm helper, with narrow hooks at the scheduler and provider seams.
+Do not replace it with a higher general cap, a second reservation, job-specific
+identity matching, or an execution-terminal release shortcut. Retire it only
+when the selected upstream baseline preserves the same admission and timing
+contract under general-pool saturation.
+
+## Verify
+
+`tests/cron/test_reserved_admission.py` exercises actual `started_at` ledger
+stamps against a fake clock with all 4 general workers blocked, 2 protected
+jobs, FIFO overflow, long runs, completion rearming, per-job exclusion,
+profile deadlines, and both terminal-row and waiter-error process-exit fences.
+Also run the existing parallel-pool, scheduler-provider, restart-safe-worker,
+registration-ownership, cancellation, and multiplex-release regressions.
+Run immediate-run tool tests separately. Source qualification is not live
+acceptance: after separately authorized activation, verify the protected job's
+actual worker start is at most 120 seconds after its preceding `finished_at`.
+
+Rollback reverts this unit's admission and rearm hooks without weakening the
+existing detached-process fence. Do not change live config to imitate the
+reservation or deploy as part of source-only landing.

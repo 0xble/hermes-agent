@@ -14,6 +14,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from cron.scheduler_admission import begin_tick, wait_for_next_tick
+
 logger = logging.getLogger(__name__)
 
 # Cap for exponential tick backoff during fd exhaustion (interval doubled per failure).
@@ -428,7 +430,7 @@ def scheduler_for_profile_mode(
 
 
 class InProcessCronScheduler(CronScheduler):
-    """Default in-process 60s ticker; ``start()`` blocks until ``stop_event``. ``can_dispatch`` is
+    """Default deadline-driven ticker; ``start()`` blocks until ``stop_event``. ``can_dispatch`` is
     an optional drain gate; skipped ticks leave due jobs intact for the next allowed tick."""
 
     @property
@@ -485,6 +487,7 @@ class InProcessCronScheduler(CronScheduler):
         consecutive_failures = 0
         next_tick = time.monotonic()
         while not stop_event.is_set():
+            begin_tick()
             ok = False
             try:
                 if can_dispatch is not None and not can_dispatch():
@@ -529,7 +532,9 @@ class InProcessCronScheduler(CronScheduler):
                 # Tick overran interval or host was suspended; re-anchor to avoid
                 # burst-firing zero-length sleep cycles (#114467).
                 next_tick = now + wait_for
-            stop_event.wait(max(0.0, next_tick - now))
+            wait_for_next_tick(
+                stop_event, max(0.0, next_tick - now), max_wait=wait_for,
+                failures=consecutive_failures)
 
     def _start_multiplex(
         self, stop_event, *, profile_homes, adapters=None, loop=None, interval=60,
@@ -588,6 +593,7 @@ class InProcessCronScheduler(CronScheduler):
         consecutive_failures = 0
         next_tick = time.monotonic()
         while not stop_event.is_set():
+            begin_tick()
             ok = False
             _tick_error = None
             _profile_errors: dict[str, str] = {}
@@ -671,4 +677,6 @@ class InProcessCronScheduler(CronScheduler):
                 # Tick overran interval or host was suspended; re-anchor to avoid
                 # burst-firing zero-length sleep cycles (#114467).
                 next_tick = now + wait_for
-            stop_event.wait(max(0.0, next_tick - now))
+            wait_for_next_tick(
+                stop_event, max(0.0, next_tick - now), max_wait=wait_for,
+                failures=consecutive_failures, profile_homes=cycle_homes)

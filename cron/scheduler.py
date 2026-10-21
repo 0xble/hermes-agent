@@ -1,5 +1,5 @@
 # health: allow FILE_LINES -- security fix for #82010: distinguish an explicitly-empty toolset allowlist (fail closed, nothing allowed) from an absent one (no restriction); the added lines are minimal fail-closed branches at this existing chokepoint
-"""Cron job scheduler: tick() runs due jobs (gateway calls it every 60s from a background thread).
+"""Cron job scheduler: tick() runs due jobs on gateway deadline and worker-release wakes.
 A file lock (~/.hermes/cron/.tick.lock) keeps overlapping processes to one tick at a time.
 """
 
@@ -739,6 +739,7 @@ def _wedged_inflight_keys() -> frozenset[tuple]:
         allowances = {key: _running_allowance_s[key] for key in ages if key in _running_allowance_s}
     if not ages:
         return frozenset()
+    from cron.scheduler_admission import _inflight_min_allowance_minutes
     floor_seconds = _inflight_min_allowance_minutes() * 60.0
     unresolved = [key for key in ages if key not in allowances]
     if unresolved:
@@ -902,31 +903,8 @@ def release_running_job(
         # A later registration of this key must not inherit restart-safe classification.
         _restart_safe_waiter_job_ids.discard(key)
         _restart_safe_external_worker_job_ids.discard(key)
-
-
-def _inflight_min_allowance_minutes() -> float:
-    """Stale allowance floor (min): ``cron.inflight_max_minutes``, else env escape hatch/default."""
-    with contextlib.suppress(Exception):
-        _ucfg = load_config() or {}
-        _cfg_val = (
-            _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
-        ).get("inflight_max_minutes")
-        if _cfg_val is not None:
-            val = float(_cfg_val)
-            if val > 0:
-                return val
-    raw = cron_env_setting("HERMES_CRON_INFLIGHT_MAX_MINUTES").strip()
-    if raw:
-        try:
-            val = float(raw)
-            if val > 0:
-                return val
-        except (ValueError, TypeError):
-            logger.warning(
-                "Invalid HERMES_CRON_INFLIGHT_MAX_MINUTES=%r; using default %s",
-                raw,
-                _INFLIGHT_MIN_ALLOWANCE_MINUTES)
-    return _INFLIGHT_MIN_ALLOWANCE_MINUTES
+        from cron.scheduler_admission import worker_released
+        worker_released(key)
 
 
 # expr -> minutes; cadence never changes, so avoid re-evaluating croniter every tick.
@@ -1101,6 +1079,7 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
     global _forced_release_count
 
     by_id = {j.get("id"): j for j in (due_jobs or []) if isinstance(j, dict)}
+    from cron.scheduler_admission import _inflight_min_allowance_minutes
     floor_seconds = _inflight_min_allowance_minutes() * 60.0
     now = time.time()
     stale: list = []
@@ -1309,6 +1288,9 @@ def discard_parallel_pools(home_keys) -> None:
     home ever ticked, and a deleted profile's pool was never reclaimed. ``wait=False`` so the
     ticker is never blocked; queued work still drains before the executor dies.
     """
+    home_keys = list(home_keys)
+    from cron.scheduler_admission import discard_reserved_pools
+    discard_reserved_pools(home_keys)
     for key in list(home_keys):
         pool = _parallel_pools.pop(key, None)
         _parallel_pool_max_workers.pop(key, None)
@@ -1318,6 +1300,8 @@ def discard_parallel_pools(home_keys) -> None:
 
 def _shutdown_parallel_pool() -> None:
     """Shut down every profile's persistent pool on process exit."""
+    from cron.scheduler_admission import shutdown_reserved_pools
+    shutdown_reserved_pools()
     for pool in list(_parallel_pools.values()):
         pool.shutdown(wait=True, cancel_futures=False)
     _parallel_pools.clear()
