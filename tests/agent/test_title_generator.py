@@ -410,6 +410,18 @@ class TestAutoTitleSession:
         assert db.get_session_title("sess-1") == "Investigation"
         assert db.get_session_title_source("sess-1") == "llm"
 
+    def test_process_notifications_are_not_retry_turns(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="cli")
+        notice = "[IMPORTANT: Background process proc_1 exited (exit code 7).\nCommand: review]"
+        history = [{"role": "user", "content": "Run the background review"},
+                   {"role": "assistant", "content": "Coordinator finished."},
+                   {"role": "user", "content": notice},
+                   {"role": "user", "content": "[ASYNC DELEGATION BATCH COMPLETE — deleg_1]"}]
+        with patch("agent.title_generator.auto_title_session") as worker:
+            assert maybe_auto_title(db, "sess-1", notice, conversation_history=history) is None
+        worker.assert_not_called()
+
     def test_manual_title_wins_over_held_upgrade(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="sess-1", source="telegram")

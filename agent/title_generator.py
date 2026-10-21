@@ -185,6 +185,9 @@ _MACHINE_PREFIXES = (
     # message titled the session "[System: The active model for this chat has…" instead of the user's actual
     # question.
     "[System: The active model for this chat has changed to ",
+    # Background-process and delegation completions are persisted as role="user" too. Counted as
+    # real turns, a held title retried on them and sent the notification to the title model.
+    "[IMPORTANT: Background process ", "[ASYNC DELEGATION ",
 )
 
 
