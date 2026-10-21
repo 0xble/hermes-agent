@@ -65,23 +65,24 @@ def _private_runtime_dir() -> Optional[Path]:
 
 def _fallback_socket_path(home: Path, slot: str = SLOT_ACTIVE) -> Path:
     """Short path for homes whose direct socket path exceeds sun_path: private runtime first,
-    then shared temp locations using the authenticated ``hermes-gw-<hash>/control.sock`` shape.
+    then the temp directory, then ``/tmp`` (POSIX), using the flat slot-aware
+    ``hermes-gw-<hash>[.b].sock`` name that discovery authenticates through the private pointer.
     """
     name = slot_filename(f"hermes-gw-{_home_hash(home)}.sock", slot)
     runtime = _private_runtime_dir()
-    candidates = ([runtime / name] if runtime else []) + [Path(tempfile.gettempdir()) / name]
+    candidates = ([runtime / name] if runtime else []) + [Path(tempfile.gettempdir()) / name] + (
+        [] if _IS_WINDOWS else [Path("/tmp") / name])  # no-tmp: ok — AF_UNIX 104-byte path limit needs the short /tmp candidate
     return next((c for c in candidates if _fits_sun_path(c)), candidates[0])
 
 
 def _squat_proof_fallback(bind_path: Path) -> Path:
-    """Same ``hermes-gw-<hash>/control.sock`` leaf (what clients authenticate through the private
-    pointer), under a fresh ``mkdtemp`` root no other user can predict or pre-create."""
-    root = Path(tempfile.mkdtemp(prefix="hgw-", dir=bind_path.parent.parent))
-    path = root / bind_path.parent.name / bind_path.name
+    """Same flat socket name (what clients authenticate through the private pointer), inside a
+    fresh ``mkdtemp`` root in the shared directory that no other user can predict or pre-create."""
+    root = Path(tempfile.mkdtemp(prefix="hgw-", dir=bind_path.parent))
+    path = root / bind_path.name
     if not _fits_sun_path(path):
         root.rmdir()
-        raise PermissionError("fallback control directory is squatted and no private path fits sun_path")
-    path.parent.mkdir(mode=0o700)
+        raise PermissionError("fallback control directory is shared and no private path fits sun_path")
     return path
 
 
@@ -218,12 +219,14 @@ class GatewayControlServer:
                 # Some sandboxed temp roots deny metadata reads even though a child can be created.
                 # Treat that as unsafe and use the unpredictable private root below it.
                 private = False
-            if not private:
-                # Another local user pre-created the predictable shared-temp name; bootstrap treats
-                # a missing listener as fatal, so move to an unpredictable private root instead.
-                logger.warning("Fallback control directory %s is not private; using a fresh one", bind_path.parent)
+            foreign = os.path.lexists(bind_path) and (
+                bind_path.is_symlink() or bind_path.lstat().st_uid != os.getuid())  # windows-footgun: ok — POSIX listener
+            if not private or foreign:
+                # A shared temp root (or another user's node at the predictable name) must not stop the
+                # gateway: bootstrap treats a missing listener as fatal, so use an unpredictable private root.
+                logger.warning("Fallback control path %s is not private; using a fresh one", bind_path)
                 bind_path = _squat_proof_fallback(bind_path)
-                self._fallback_root = bind_path.parent.parent
+                self._fallback_root = bind_path.parent
         if bind_path.is_symlink():
             raise PermissionError("control socket cannot be a symlink")
         # We only get here after winning the PID-file O_EXCL race, so any existing
@@ -304,9 +307,6 @@ class GatewayControlServer:
         self._file_identities.clear()
         if self._fallback_root is not None:
             with contextlib.suppress(OSError):
-                leaf = self._bind_path.parent.name if self._bind_path is not None else (
-                    f"hermes-gw-{_home_hash(self._home)}" + ("" if self._slot == SLOT_ACTIVE else f"-{self._slot}"))
-                (self._fallback_root / leaf).rmdir()
                 self._fallback_root.rmdir()
             self._fallback_root = None
 
