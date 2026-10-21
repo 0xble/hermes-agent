@@ -48,6 +48,20 @@ _NOTIFICATION_ORIGINS = frozenset({
 })
 # Boolean metadata stamps the gateway sets on synthetic turns.
 _SYNTHETIC_MARKERS = ("cron_delivery", "loop_wakeup", "hermes_loop_wakeup")
+# Relay deliveries that arrive as ordinary chat messages (for example through the owner's own
+# Telegram account) carry only this footer, on their last non-empty line.
+_RELAY_FOOTER_RE = re.compile(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]")
+
+
+def _has_relay_footer(event: Any) -> bool:
+    lines = [line.strip() for line in str(getattr(event, "text", "") or "").splitlines() if line.strip()]
+    return bool(lines) and _RELAY_FOOTER_RE.fullmatch(lines[-1]) is not None
+
+
+def _is_relay_event(event: Any) -> bool:
+    return (bool(getattr(getattr(event, "source", None), "delivered_via_upstream_relay", False))
+            or (getattr(event, "metadata", None) or {}).get("notification_origin") == "relay_delivery"
+            or _has_relay_footer(event))
 
 
 def _is_human_event(event: Any) -> bool:
@@ -57,7 +71,7 @@ def _is_human_event(event: Any) -> bool:
     source = getattr(event, "source", None)
     if source is None:
         return False
-    if getattr(source, "delivered_via_upstream_relay", False):
+    if _is_relay_event(event):
         return False
     if _is_machine_ingress(source):
         return False
@@ -80,9 +94,7 @@ def turn_origin_for_event(event: Any) -> str:
     events = _event_chain(event)
     if any(_is_human_event(candidate) for candidate in events):
         return "user"
-    if any(getattr(getattr(candidate, "source", None), "delivered_via_upstream_relay", False)
-           or (getattr(candidate, "metadata", None) or {}).get("notification_origin") == "relay_delivery"
-           for candidate in events):
+    if any(_is_relay_event(candidate) for candidate in events):
         return "relay"
     if any(is_goal_continuation_event(candidate)
            or bool((getattr(candidate, "metadata", None) or {}).get("loop_wakeup"))
