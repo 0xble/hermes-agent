@@ -154,6 +154,13 @@ def set_turn_origin(turn_origin: str) -> None:
     _TURN_ORIGIN.set(turn_origin if turn_origin in _TURN_ORIGINS else "unknown")
 
 
+def bound_turn_origin() -> str:
+    """This task's bound turn provenance, never ``os.environ``: an ambient or stale
+    ``HERMES_TURN_ORIGIN`` must not grant human-turn treatment. Unbound is ``unknown``."""
+    value = _TURN_ORIGIN.get()
+    return value if value is not _UNSET and value in _TURN_ORIGINS else "unknown"
+
+
 def clear_session_vars(tokens: list) -> None:
     """Mark session context variables as explicitly cleared (``""``, not ``_UNSET``), so
     ``get_session_env`` returns empty instead of stale ``os.environ`` values.  Async-delivery

@@ -65,3 +65,19 @@ def test_run_conversation_without_bound_origin_is_unknown(monkeypatch):
     finally:
         clear_session_vars(tokens)
     assert seen["turn_origin"] == "unknown"
+
+
+def test_run_conversation_ignores_ambient_env_origin(monkeypatch):
+    import contextvars
+
+    from gateway.session_context import reset_session_vars
+
+    conversation_loop, seen = _capture_turn_origin(monkeypatch)
+    monkeypatch.setenv("HERMES_TURN_ORIGIN", "user")
+
+    def run_unbound():
+        reset_session_vars()
+        conversation_loop.run_conversation(SimpleNamespace(), "hello")
+
+    contextvars.copy_context().run(run_unbound)
+    assert seen["turn_origin"] == "unknown"
