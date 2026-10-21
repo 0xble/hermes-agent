@@ -176,6 +176,30 @@ class TestOriginalUrlDetection:
         assert agent.api_mode == "chat_completions"
 
 
+class TestNamedProviderDeclaredWire:
+    """A fallback entry naming a ``providers.<name>`` block inherits the block's declared
+    ``api_mode``/``transport`` instead of host re-detection."""
+
+    def test_named_block_anthropic_messages_inherited_on_plain_host(self):
+        fbs = [{"provider": "custom:claude-proxy", "model": "claude-opus-5-5"}]
+        agent = _make_agent(fallback_model=fbs)
+        with patch(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            return_value={"name": "claude-proxy", "base_url": "http://127.0.0.1:8317",
+                          "api_key": "k", "api_mode": "anthropic_messages"},
+        ):
+            mock_rpc = _activate(agent, "http://127.0.0.1:8317", "claude-opus-5-5")
+        assert agent.api_mode == "anthropic_messages"
+        assert mock_rpc.call_args.kwargs["api_mode"] == "anthropic_messages"
+
+    def test_entry_transport_alias_is_honored(self):
+        fbs = [{"provider": "custom", "model": "custom/responses", "base_url": "https://gateway.example.com/v1",
+                "api_key": "k", "transport": "responses"}]
+        agent = _make_agent(fallback_model=fbs)
+        _activate(agent, "https://gateway.example.com/v1", "custom/responses")
+        assert agent.api_mode == "codex_responses"
+
+
 class TestPlainFallbackUnchanged:
     def test_plain_openrouter_fallback_stays_chat_completions(self):
         fbs = [{

@@ -172,13 +172,24 @@ class TurnRunner:
         ctx = self._ctx
         status = kwargs.get("status")
         try:
+            from gateway.warning_notifications import render_notification
             from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
             if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current():
                 line = format_subagent_failure_line(
                     kwargs.get("goal"), status, error=kwargs.get("summary") or preview,
                     duration_seconds=kwargs.get("duration_seconds"),
                 )
-                self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error")
+                # Same rail as other diagnostics: a platform that suppresses warning
+                # notifications never sees the failure line. The child result still
+                # reaches the parent model.
+                render_notification(
+                    lambda: self._schedule(
+                        self._runner._deliver_platform_notice(ctx.source, line),
+                        "subagent failure notice scheduling error",
+                    ),
+                    platform=ctx.source.platform,
+                    user_config=ctx.user_config,
+                )
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
 
