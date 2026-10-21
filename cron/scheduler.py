@@ -1705,6 +1705,14 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
         _cfg_path = str(_get_hermes_home() / "config.yaml")
         if os.path.exists(_cfg_path):
             _cfg = load_user_config_effective(Path(_cfg_path))
+            from hermes_cli.model_preset_runtime import resolve_model_ref
+            # Resolve @ routes from the freshly read config on every fire. Do not persist the
+            # concrete model in the job or resolve it during cron creation.
+            if isinstance(model, str) and model.strip().startswith("@"):
+                _route = resolve_model_ref(model.strip(), _cfg)
+                model = _route.model
+                if not job.get("provider"):
+                    _cron_default_provider = _route.provider
             from hermes_cli.model_presets import expand_model_presets
             _runtime_cfg = expand_model_presets(_cfg)
             # Coerce null to {} so a falsy default never clobbers a resolved env value.
@@ -1714,6 +1722,11 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             if isinstance(_cron_cfg_for_model, dict):
                 _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
                 _cron_default_provider = str(_cron_cfg_for_model.get("model_provider") or "").strip()
+                if _cron_default_model.startswith("@"):
+                    _route = resolve_model_ref(_cron_default_model, _cfg)
+                    _cron_default_model = _route.model
+                    if not _cron_default_provider:
+                        _cron_default_provider = _route.provider
             if not job.get("model"):
                 if _cron_default_model:
                     model = _cron_default_model

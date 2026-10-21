@@ -74,6 +74,41 @@ def _runner(store, *, config=None, states=None):
     return runner, states
 
 
+def test_attended_model_preset_resolves_to_named_route():
+    from hermes_cli.model_preset_runtime import resolve_model_ref
+
+    route = resolve_model_ref("@attended", {
+        "model": {"attended": {"model_preset": "fast"}},
+        "model_presets": {"fast": {"provider": "openrouter", "model": "fast-model"}},
+    })
+    assert route.model == "fast-model"
+    assert route.provider == "openrouter"
+
+
+def test_role_preset_reasoning_applies_when_attended_is_unconfigured(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+
+    cfg = {
+        "model": {"default": "gpt-6.1-sol", "provider": "nous"},
+        "model_presets": {
+            "fast": {"provider": "openrouter", "model": "fast-model", "reasoning_effort": "minimal"},
+        },
+    }
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda *a, **k: cfg)
+    store = _store(tmp_path, monkeypatch)
+    entry = store.get_or_create_session(_source())
+    store.set_model_role(entry.session_key, "fast")
+    runner, _states = _runner(store)
+    runner._session_reasoning_override = lambda _key: None
+    runner._session_model_override = lambda _key: None
+
+    result = runner._resolve_session_reasoning_config(
+        source=_source(), session_key=entry.session_key, model="gpt-6.1-sol",
+    )
+
+    assert result == {"enabled": True, "effort": "minimal"}
+
+
 def test_conversation_clear_drops_model_role():
     conversation = ConversationState(model_role="attended", model_override={"model": "picked"})
     conversation.clear()

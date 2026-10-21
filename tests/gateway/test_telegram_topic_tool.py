@@ -106,6 +106,28 @@ async def _seed_caller(runner, home, thread_id="297206", title="Calling Topic", 
 
 
 @pytest.mark.asyncio
+async def test_named_role_create_and_edit_use_gateway_loader_not_runner(home, monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {
+        "model": {"default": "main", "attended": {"model": "attended-model", "provider": "openrouter"}},
+    })
+    adapter = FakeTelegram()
+    adapter.get_forum_topic_icon_options = AsyncMock(return_value=list(ICONS))
+    runner = _runner(home, adapter)
+    await _seed_caller(runner, home)
+    assert not hasattr(runner, "_load_gateway_config")
+
+    created = await create_topic_session(runner, _source(), TopicSpec(name="Held", icon="💡", model="@attended"))
+    assert created["model"] == "attended-model"
+    assert created["provider"] == "openrouter"
+
+    edited = await edit_topic_session(runner, _source(), created["thread_id"], TopicSpec(model="@attended"))
+    assert edited["model"] == "attended-model"
+    assert edited["provider"] == "openrouter"
+
+
+@pytest.mark.asyncio
 async def test_create_binds_a_new_session_with_every_setting_and_starts_it(home):
     adapter = FakeTelegram()
     adapter.get_forum_topic_icon_options = AsyncMock(return_value=list(ICONS))

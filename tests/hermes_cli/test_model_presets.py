@@ -9,6 +9,29 @@ yaml = pytest.importorskip("yaml")
 from hermes_cli.model_presets import ModelPresetError, expand_model_presets
 
 
+def test_at_shorthand_expands_at_every_reference_site():
+    config = {**routes(), "model": "@fast", "delegation": {"model": "@primary", "max_concurrent_children": 3},
+              "auxiliary": {"compression": {"model": "@fast", "timeout": 20}},
+              "fallback_providers": ["@fast"]}
+    expanded = expand_model_presets(config)
+    assert expanded["model"] == {"provider": "provider-c", "default": "model-c"}
+    assert expanded["delegation"]["provider"] == "provider-a"
+    assert expanded["delegation"]["max_concurrent_children"] == 3
+    assert expanded["auxiliary"]["compression"]["model"] == "model-c"
+    assert expanded["auxiliary"]["compression"]["timeout"] == 20
+    assert expanded["fallback_providers"] == [{"provider": "provider-c", "model": "model-c", "reasoning_effort": "minimal"}]
+    assert config["model"] == "@fast"
+
+
+def test_load_config_expands_at_model_shorthand(tmp_path, monkeypatch):
+    home = tmp_path / "home"; home.mkdir()
+    (home / "config.yaml").write_text(yaml.safe_dump({**routes(), "model": "@fast"}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli.config import load_config
+    cfg = load_config()
+    assert (cfg["model"]["provider"], cfg["model"]["default"]) == ("provider-c", "model-c")
+
+
 def test_documented_preset_example_expands():
     from pathlib import Path
     doc = Path(__file__).resolve().parents[2] / "website/docs/user-guide/configuring-models.md"

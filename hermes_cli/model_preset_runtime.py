@@ -39,8 +39,9 @@ def resolve_model_ref(raw: Any, config: Mapping[str, Any] | None = None, *, _sta
                                     str(model_cfg.get("reasoning_effort") or route.reasoning_effort), route.fallbacks)
         return ModelPresetRoute(name, str(model_cfg.get("provider") or ""), str(raw_model), str(model_cfg.get("reasoning_effort") or ""))
     if name == "attended":
-        attended = model_cfg.get("attended") if isinstance(model_cfg.get("attended"), dict) else {}
-        raw_model = attended.get("model") or attended.get("model_preset") or ""
+        attended_value = model_cfg.get("attended")
+        attended: Mapping[str, Any] = attended_value if isinstance(attended_value, Mapping) else {}
+        raw_model = attended.get("model") or ("@" + str(attended.get("model_preset")) if attended.get("model_preset") else "")
         if isinstance(raw_model, (Mapping, str)) and (isinstance(raw_model, Mapping) or str(raw_model).startswith("@")):
             route = resolve_model_ref(raw_model, cfg, _stack=(*_stack, name))
             return ModelPresetRoute(name, str(attended.get("provider") or route.provider), route.model,

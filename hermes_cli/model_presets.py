@@ -94,6 +94,10 @@ def _definitions(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _reference(site: Any, path: str, definitions: dict[str, dict[str, Any]], *, conflicts: set[str]) -> dict[str, Any] | None:
+    # String references are the shorthand accepted at every reference site. Normalize them
+    # here so all sites retain identical validation, conflict, and expansion behavior.
+    if isinstance(site, str) and site.strip().startswith("@"):
+        site = {"model_preset": site.strip()[1:]}
     if not isinstance(site, dict) or "model_preset" not in site:
         return None
     name = _text(site["model_preset"], path, "model_preset")
@@ -125,8 +129,31 @@ def _route_fields(route: dict[str, Any], *, fallback_key: str | None = None) -> 
     return result
 
 
+def _lift_model_shorthand(site: Any) -> Any:
+    """Treat ``@name`` (bare, or as the ``model`` value of a mapping) as ``{model_preset: name}``."""
+    if isinstance(site, str) and site.strip().startswith("@"):
+        return {"model_preset": site.strip()[1:]}
+    if isinstance(site, dict) and "model_preset" not in site:
+        value = site.get("model")
+        if isinstance(value, str) and value.strip().startswith("@"):
+            lifted = {k: v for k, v in site.items() if k != "model"}
+            lifted["model_preset"] = value.strip()[1:]
+            return lifted
+    return site
+
+
 def _expand_model(config: dict[str, Any], definitions: dict[str, dict[str, Any]]) -> None:
     model = config.get("model")
+    if isinstance(model, str) and model.strip().startswith("@"):
+        model = {"model_preset": model.strip()[1:]}
+        config["model"] = model
+    if isinstance(model, dict):
+        for key in ("default", "model"):
+            value = model.get(key)
+            if "model_preset" not in model and isinstance(value, str) and value.strip().startswith("@"):
+                model["model_preset"] = value.strip()[1:]
+                model.pop(key, None)
+                break
     if not isinstance(model, dict):
         return
     disabled_fallbacks = _fallbacks_disabled(model, "model")
@@ -160,6 +187,7 @@ def _expand_model(config: dict[str, Any], definitions: dict[str, dict[str, Any]]
 
 def _expand_delegation(config: dict[str, Any], definitions: dict[str, dict[str, Any]]) -> None:
     site = config.get("delegation")
+    site = _lift_model_shorthand(site)
     disabled_fallbacks = _fallbacks_disabled(site, "delegation")
     route = _reference(site, "delegation", definitions, conflicts={"provider", "model", "base_url", "api_key", "reasoning_effort", "fallback_providers", "fallback_chain"})
     if route is not None:
@@ -173,6 +201,8 @@ def _expand_delegation(config: dict[str, Any], definitions: dict[str, dict[str, 
         return
     roles = delegation["subagents"]
     for name, role in list(roles.items()):
+        role = _lift_model_shorthand(role)
+        roles[name] = role
         path = f"delegation.subagents.{name}"
         disabled_fallbacks = _fallbacks_disabled(role, path)
         route = _reference(
@@ -201,6 +231,8 @@ def _expand_auxiliary(config: dict[str, Any], definitions: dict[str, dict[str, A
         return
     for task, site in list(auxiliary.items()):
         path = f"auxiliary.{task}"
+        site = _lift_model_shorthand(site)
+        auxiliary[task] = site
         disabled_fallbacks = _fallbacks_disabled(site, path)
         route = _reference(site, path, definitions, conflicts={"provider", "model", "base_url", "api_key", "api_mode", "reasoning_effort", "fallback_chain", "fallback_providers"})
         if route is not None:
@@ -214,11 +246,12 @@ def _expand_auxiliary(config: dict[str, Any], definitions: dict[str, dict[str, A
 def _expand_fallback_entries(config: dict[str, Any], definitions: dict[str, dict[str, Any]]) -> None:
     for key in ("fallback_providers", "fallback_model"):
         raw = config.get(key)
-        entries = raw if isinstance(raw, list) else [raw] if isinstance(raw, dict) else None
+        entries = raw if isinstance(raw, list) else [raw] if isinstance(raw, (dict, str)) else None
         if entries is None:
             continue
         expanded = []
         for index, entry in enumerate(entries):
+            entry = _lift_model_shorthand(entry)
             route = _reference(entry, f"{key}[{index}]", definitions, conflicts={"provider", "model", "base_url", "api_key", "key_env", "api_key_env", "reasoning_effort", "fallbacks", "fallback_chain", "fallback_providers"})
             if route is not None:
                 if "fallbacks" in route:

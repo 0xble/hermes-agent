@@ -130,13 +130,21 @@ def _reasoning_effort(config: Optional[dict]) -> Optional[str]:
     return config.get("effort") or "medium"
 
 
+def _resolve_topic_model_ref(raw: str):
+    """Resolve a topic role from the gateway's module-level config loader."""
+    from gateway.run import _load_gateway_config
+    from hermes_cli.model_preset_runtime import resolve_model_ref
+    try:
+        return resolve_model_ref(raw, _load_gateway_config())
+    except (ValueError, TypeError) as exc:
+        raise TopicRequestError(str(exc)) from exc
+
+
 async def _resolve_model(runner, source: SessionSource, spec: TopicSpec, session_key: str = ""):
     if not (spec.model or spec.provider):
         return None
     if spec.model.strip().startswith("@"):
-        # Named routes are persisted as roles, not expanded into a concrete session override.
-        from hermes_cli.model_preset_runtime import resolve_model_ref
-        resolve_model_ref(spec.model.strip(), runner._load_gateway_config())
+        _resolve_topic_model_ref(spec.model.strip())
         return ("role", spec.model.strip()[1:].strip().lower())
     ctx, result, error = await runner.resolve_session_model_selection(
         source, spec.model, spec.provider, session_key=session_key)
@@ -398,8 +406,7 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
                 f"was not delivered: {exc}. Send it with relay to {relay}.") from exc
     profile_home = None
     if model and isinstance(model, tuple) and model and model[0] == "role":
-        from hermes_cli.model_preset_runtime import resolve_model_ref
-        route = resolve_model_ref("@" + model[1], runner._load_gateway_config())
+        route = _resolve_topic_model_ref("@" + model[1])
         effective_model, effective_provider = route.model, route.provider
     else:
         effective_model = getattr(model[1], "new_model", None) if model else None
@@ -479,8 +486,7 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
         warnings = settings["warnings"]
     profile_home = None
     if model and isinstance(model, tuple) and model and model[0] == "role":
-        from hermes_cli.model_preset_runtime import resolve_model_ref
-        route = resolve_model_ref("@" + model[1], runner._load_gateway_config())
+        route = _resolve_topic_model_ref("@" + model[1])
         effective_model, effective_provider = route.model, route.provider
     else:
         effective_model = getattr(model[1], "new_model", None) if model else None

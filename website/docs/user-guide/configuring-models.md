@@ -24,9 +24,9 @@ On a brand-new install the bundled default config has `model: ""` (an empty stri
 ## Reusing a named route
 
 Use `model_presets` to name a provider/model route and refer to it with the canonical
-`model_preset: NAME` form or the `@NAME` shorthand. Presets are resolved when a new request,
-cron job, auxiliary task, or delegated child is created, so editing a preset affects future calls.
-Already-running or resumed children keep the route snapshot from launch.
+`model_preset: NAME` form or the `@NAME` shorthand. Presets are expanded at the point each consumer runs.
+Cron jobs re-read and resolve their route at fire time, while live gateway roles resolve on each request.
+Editing a preset therefore affects future calls without rewriting the stored job or session role.
 
 ```yaml
 model_presets:

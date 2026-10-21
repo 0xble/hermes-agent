@@ -239,10 +239,8 @@ class GatewayConfigLoadersMixin:
             try:
                 from gateway.attended_model import parse_attended_config
                 attended_cfg = parse_attended_config(user_config)
-                if not attended_cfg.enabled:
-                    return baseline
                 attended_baseline = {}
-                if attended_cfg.model:
+                if attended_cfg.enabled and attended_cfg.model:
                     attended_baseline = (
                         loader(attended_cfg.model, profile_home=profile_home, config=user_config)
                     ) or {}

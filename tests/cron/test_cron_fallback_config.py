@@ -14,6 +14,24 @@ from hermes_cli.auth import AuthError
 from hermes_cli.fallback_config import get_fallback_chain
 
 
+def test_cron_at_model_is_resolved_from_fresh_config_each_fire(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({
+        "model_presets": {"coding": {"provider": "openrouter", "model": "coding-v1"}},
+    }))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job = {"id": "at-route", "name": "at route", "prompt": "hello", "model": "@coding"}
+
+    first = scheduler._load_cron_job_config(job, job["id"], job["name"])
+    assert first.model == "coding-v1"
+    cfg_path.write_text(yaml.safe_dump({
+        "model_presets": {"coding": {"provider": "openrouter", "model": "coding-v2"}},
+    }))
+    second = scheduler._load_cron_job_config(job, job["id"], job["name"])
+    assert second.model == "coding-v2"
+    assert job["model"] == "@coding"
+
+
 GLOBAL = [{"provider": "openrouter", "model": "global-backup"}]
 LEGACY = {"provider": "anthropic", "model": "legacy-backup"}
 CRON = [{"provider": "custom:cron-backup", "model": "cron-backup", "reasoning_effort": "high"}]

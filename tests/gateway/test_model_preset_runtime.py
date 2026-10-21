@@ -80,6 +80,51 @@ def test_gateway_primary_session_expands_preset_for_model_provider_reasoning_and
         gateway_run._resolve_gateway_model(unknown)
 
 
+def test_gateway_string_at_model_reaches_session_runtime_with_provider(tmp_path, monkeypatch):
+    from gateway import run as gateway_run
+    from gateway.config import GatewayConfig
+
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    authored = {
+        "model_presets": {"coding": {"provider": "custom:gateway-test", "model": "coding-model"}},
+        "model": "@coding",
+        "providers": {"gateway-test": {
+            "base_url": "https://gateway-test.invalid/v1", "api_key": "test-key", "api_mode": "chat_completions",
+        }},
+    }
+    (home / "config.yaml").write_text(yaml.safe_dump(authored), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(gateway_run, "_hermes_home", home)
+
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    model, runtime = runner._resolve_session_agent_runtime(user_config=gateway_run._load_gateway_config())
+
+    assert model == "coding-model"
+    assert runtime["requested_provider"] == "custom:gateway-test"
+    assert runtime["base_url"] == "https://gateway-test.invalid/v1"
+
+
+def test_gateway_resolves_at_reference_string_and_provider():
+    from gateway import run as gateway_run
+
+    config = {
+        "model_presets": {"coding": {"provider": "openrouter", "model": "coding-model"}},
+        "model": "@coding",
+    }
+    assert gateway_run._resolve_gateway_model(config) == "coding-model"
+
+
+def test_gateway_resolves_model_mapping_at_reference_string():
+    from gateway import run as gateway_run
+
+    config = {
+        "model_presets": {"coding": {"provider": "openrouter", "model": "coding-model"}},
+        "model": {"default": "@coding"},
+    }
+    assert gateway_run._resolve_gateway_model(config) == "coding-model"
+
+
 def test_gateway_explicit_context_rejects_invalid_preset(tmp_path, monkeypatch):
     from gateway import run as gateway_run
     from hermes_cli.model_presets import ModelPresetError
@@ -90,3 +135,4 @@ def test_gateway_explicit_context_rejects_invalid_preset(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *args, **kwargs: 8192)
     with pytest.raises(ModelPresetError, match="unknown preset 'missing'"):
         gateway_run._resolve_gateway_model_context("explicit-model")
+
