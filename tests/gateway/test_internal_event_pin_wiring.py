@@ -728,3 +728,125 @@ async def test_strict_queued_followup_runs_only_in_its_pinned_session(monkeypatc
         assert [call["session_id"] for call in calls] == ["sess-wiring"]
     else:
         assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome", ["primary", "model-fallback", "provider-fallback"],
+)
+async def test_held_role_cache_lifetime_through_real_turns(monkeypatch, outcome):
+    """A held role is primary, but falling back from that role still ends its cache lifetime."""
+    import gateway.run as gr
+
+    user_config = {
+        "model": {"default": "base", "provider": "openrouter"},
+        "model_presets": {"fast": {"model": "first", "provider": "openrouter"}},
+    }
+    config = GatewayConfig()
+    config.platforms[Platform.DISCORD] = PlatformConfig(enabled=True)
+    monkeypatch.setattr(gr, "_load_gateway_config", lambda *a, **k: user_config)
+    monkeypatch.setattr(gr, "_resolve_gateway_model", lambda config=None: "base")
+    runner = _make_runner(monkeypatch, config)
+    runner._session_db = None
+    runner.session_store._entries = {}
+    store = runner.session_store
+    store.get_model_override.return_value = None
+    store.get_model_override_scope.return_value = "session"
+    store.get_model_role.return_value = "fast"
+    store.get_reasoning_override.return_value = None
+    store.get_reasoning_override_scope.return_value = "session"
+    store.get_last_user_activity_at.return_value = None
+    store.get_attended_route_active.return_value = False
+
+    runtime = {"api_key": "fake", "provider": "openrouter", "api_mode": "chat_completions"}
+    monkeypatch.setattr(gr, "_resolve_runtime_agent_kwargs", lambda: dict(runtime))
+    monkeypatch.setattr(
+        gr, "_resolve_runtime_agent_kwargs_for_provider",
+        lambda provider, **kw: dict(runtime, provider=provider),
+    )
+    monkeypatch.setattr(gr, "_credential_pool_for_provider", lambda provider: None)
+    created = []
+    seen = []
+
+    class RoleTurnAgent(_TurnAgent):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.api_mode = kwargs.get("api_mode")
+            self.ephemeral_system_prompt = kwargs.get("ephemeral_system_prompt")
+            self._fallback_activated = False
+            self._provider_fallback_active = False
+            created.append(self)
+
+        def run_conversation(self, *args, **kwargs):
+            # Exercise the callbacks wired by TurnRunner, without sending a provider request.
+            self._gateway_before_api_call(None)
+            self._gateway_after_preflight(None)
+            seen.append({
+                "agent": self,
+                "model": self.model,
+                "provider": self.provider,
+                "decision": self._gateway_attended_decision,
+                "prompt": self.ephemeral_system_prompt,
+                "pin": runner._peek_session_state(KEY).conversation.ephemeral_pin,
+            })
+            if len(seen) == 1 and outcome != "primary":
+                # The provider stand-in reports the runtime transition a successful fallback leaves.
+                # Falling back to the GLOBAL model must not make it primary for this held role.
+                self._fallback_activated = True
+                if outcome == "model-fallback":
+                    self.model = "base"
+                else:
+                    # Same model name, different provider: model equality cannot excuse this drift.
+                    self.provider = "fallback-provider"
+                    self._provider_fallback_active = True
+            return super().run_conversation(*args, **kwargs)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RoleTurnAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    try:
+        await runner._set_session_model_role(KEY, "fast")
+        await _drive(runner, ((False, _human_source()),))
+
+        assert len(seen) == 1, "the real turn did not reach the provider stand-in"
+        first = seen[0]
+        agent = first["agent"]
+        assert (first["model"], first["provider"]) == ("first", "openrouter")
+        assert (first["decision"].reason, first["decision"].role) == ("role", "fast")
+        assert first["pin"] is not None
+        assert "Guild / #general" in first["prompt"]
+        assert runner._session_model_override(KEY) is None
+
+        if outcome == "primary":
+            assert runner._agent_cache.get(KEY) is not None, "successful held-role turn evicted its agent"
+            assert runner._agent_cache[KEY][0] is agent
+            assert runner._peek_session_state(KEY).conversation.ephemeral_pin is first["pin"]
+            assert not getattr(agent, "_evicted_on_fallback", False)
+
+            for internal, source in ((True, _wake_source()), (False, _human_source())):
+                await _drive(runner, ((internal, source),))
+                assert runner._agent_cache.get(KEY) is not None, "successful held-role turn evicted its agent"
+                assert runner._agent_cache[KEY][0] is agent
+                assert runner._peek_session_state(KEY).conversation.ephemeral_pin is first["pin"]
+                assert not getattr(agent, "_evicted_on_fallback", False)
+
+            assert len(created) == 1
+            assert len(seen) == 3
+            assert all(turn["agent"] is agent for turn in seen)
+            assert all(turn["prompt"] == first["prompt"] for turn in seen)
+            assert all(turn["pin"] is first["pin"] for turn in seen)
+        else:
+            assert getattr(agent, "_evicted_on_fallback", None) == KEY
+            assert KEY not in runner._agent_cache, "actual fallback kept the held-role agent cached"
+            assert runner._peek_session_state(KEY).conversation.ephemeral_pin is None
+
+            await _drive(runner, ((False, _human_source()),))
+            assert len(created) == 2
+            assert len(seen) == 2
+            assert seen[1]["agent"] is not agent
+            assert (seen[1]["model"], seen[1]["provider"]) == ("first", "openrouter")
+            assert (seen[1]["decision"].reason, seen[1]["decision"].role) == ("role", "fast")
+    finally:
+        if runner._executor is not None:
+            runner._executor.shutdown(wait=True)

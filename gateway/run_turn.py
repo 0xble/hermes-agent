@@ -826,20 +826,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         activity_stamp = _NO_ATTENDED_ACTIVITY_STAMP
         attended_snapshot = {}
         if skey:
+            await self._rehydrate_session_model_selection_async(skey)
             state = self._session_state(skey)
-            async with self._session_model_override_lock(skey):
-                if state.conversation.model_role is None:
-                    # Serialize hydration with edits, just like concrete route hydration.
-                    state.conversation.model_role = await asyncio.to_thread(
-                        self.session_store.get_model_role, skey)
             attended_enabled = parse_attended_config(user_config or {}).enabled
             if attended_enabled:
                 state.conversation.pre_agent_fallback_notice = None
-            async with self._session_model_override_lock(skey):
-                if self._session_model_override(skey) is None:
-                    epoch = self._session_model_override_epoch(skey)
-                    hydrated = await asyncio.to_thread(self._load_session_model_override, skey)
-                    self._commit_session_model_override(skey, hydrated, epoch)
             if attended_enabled:
                 current_override = self._session_model_override(skey) or {}
                 attended_cfg = parse_attended_config(user_config or {})
@@ -5571,6 +5562,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         from run_agent import AIAgent
 
         disp = self._run_agent_display_settings(source)
+        from gateway.session_policy import policy_for_source
+        if session_key and policy_for_source(self, source) is None:
+            await self._rehydrate_session_model_selection_async(session_key)
+            await self._expire_attended_temporary_picks_async(session_key, disp.user_config)
         cron_review = (event_metadata or {}).get("_cron_review_capture") is not None
         if scheduled_heartbeat or cron_review:
             # A heartbeat is proactive work: tool chrome, drafts, thinking and periodic

@@ -1235,6 +1235,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         """Apply a changed desired route at the real request boundary, never on fallback retries."""
         runner = self._runner
         ctx = self._ctx
+        from gateway.session_policy import policy_for_source
+        # Launch-policy sessions resolve their own frozen or followed route and effort.
+        # Messaging attended routing must not replace that owner's explicit choices.
+        if policy_for_source(runner, ctx.source) is not None:
+            return
         if getattr(agent, "is_subagent", False) or getattr(agent, "_is_auxiliary", False):
             return
         if ctx.session_key in (getattr(runner, "_bulk_reset_pending_sessions", set()) or set()):
@@ -2229,6 +2234,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         try:
             model, runtime_kwargs = runner._resolve_session_agent_runtime(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+                assignment=getattr(self, "_model_assignment", None),
             )
             # Stashed by _resolve_session_agent_runtime when the primary's credentials failed and a
             # fallback was resolved before any agent exists (#74349); one-shot per turn.
@@ -2264,7 +2270,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.session_worker_construct import session_routing
         pr = session_routing(active_authority(runner), policy) if policy else runner._provider_routing
         reasoning_config = (policy.current_reasoning_config(runner, ctx.session_key) if policy else
-            runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model))
+            runner._resolve_session_reasoning_config(
+                source=ctx.source, session_key=ctx.session_key, model=model, user_config=ctx.user_config,
+                assignment=getattr(self, "_model_assignment", None)))
         runner._service_tier = (policy.current_service_tier(runner, ctx.session_key) if policy else
             runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key))
         from gateway.session_api_turn import api_execution

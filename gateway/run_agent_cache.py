@@ -278,6 +278,18 @@ class GatewayAgentCacheMixin:
             return
         self._commit_session_model_override(session_key, loaded, epoch)
 
+    async def _rehydrate_session_model_selection_async(self, session_key: str) -> None:
+        """Restore role and concrete picks before capturing a turn's assignment."""
+        async with self._session_model_override_lock(session_key):
+            state = self._session_state(session_key)
+            if state.conversation.model_role is None:
+                state.conversation.model_role = await asyncio.to_thread(
+                    self.session_store.get_model_role, session_key)
+            if self._session_model_override(session_key) is None:
+                epoch = self._session_model_override_epoch(session_key)
+                loaded = await asyncio.to_thread(self._load_session_model_override, session_key)
+                self._commit_session_model_override(session_key, loaded, epoch)
+
     def _load_session_model_override(self, session_key: str) -> tuple[Optional[dict], str]:
         """Load non-secret persisted fields, scope, and credentials; never mutate runner state."""
         from gateway.run import _resolve_runtime_agent_kwargs_for_provider
@@ -387,7 +399,7 @@ class GatewayAgentCacheMixin:
         if override is not None and override.get("model") == agent.model:
             return True
         decision = getattr(agent, "_gateway_attended_decision", None)
-        if getattr(decision, "reason", None) == "attended" and getattr(decision, "model", None) == agent.model:
+        if getattr(decision, "reason", None) in {"attended", "role"} and getattr(decision, "model", None) == agent.model:
             return True
         # Exactly the recorded move (alias -> backing): a later fallback onto some other model is
         # ordinary drift and still evicts.
@@ -405,7 +417,7 @@ class GatewayAgentCacheMixin:
         provider = primary.get("provider", getattr(agent, "provider", "")) or ""
         decision = getattr(agent, "_gateway_attended_decision", None)
         decision_model = getattr(decision, "model", None)
-        if getattr(decision, "reason", None) == "attended" and decision_model:
+        if getattr(decision, "reason", None) in {"attended", "role"} and decision_model:
             return decision_model
         override = self._session_model_override(session_key) or {}
         if override.get("model") and override.get("provider") in (None, "", provider):

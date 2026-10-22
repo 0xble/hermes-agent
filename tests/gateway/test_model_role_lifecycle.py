@@ -80,6 +80,105 @@ def _turn(lane):
     return turn, agent
 
 
+def _wire_role_provider(lane, monkeypatch, server):
+    """Keep turn assembly, construction and request callbacks real, with loopback inference."""
+    import run_agent
+    import agent.model_metadata as metadata
+
+    lane.cfg["model"].update(provider="custom", attended={})
+    for preset in lane.cfg["model_presets"].values():
+        preset["provider"] = "custom"
+    lane.cfg["platform_toolsets"] = {"telegram": ["memory"]}
+    lane.path.write_text(yaml.safe_dump(lane.cfg))
+    runtime = {"provider": "custom", "api_key": "fake-loopback", "base_url": server.base_url,
+               "api_mode": "chat_completions"}
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda *_a, **_k: lane.cfg)
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: dict(runtime))
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", lambda *_a, **_k: dict(runtime))
+    monkeypatch.setattr(metadata, "get_model_context_length", lambda *_a, **_k: 128000)
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-loopback")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    actual_agent = run_agent.AIAgent
+    built = []
+
+    class RouteAgent(actual_agent):
+        def __init__(self, **kwargs):
+            kwargs.update(skip_context_files=True, skip_memory=True, load_soul_identity=False)
+            super().__init__(**kwargs)
+            built.append((self, dict(kwargs)))
+
+    monkeypatch.setattr(run_agent, "AIAgent", RouteAgent)
+    return built
+
+
+async def _run_role_message(lane):
+    return await lane.runner._run_agent(
+        message="CANARY role route", context_prompt="", history=[], source=lane.source,
+        session_id=lane.entry.session_id, session_key=lane.key,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ["role", "concrete"])
+async def test_cold_selection_reaches_first_real_request(lane, monkeypatch, selection):
+    from tests.fakes.fake_llm_provider import FakeLLMServer
+
+    with FakeLLMServer(default_text="COLD-ROUTE") as server:
+        built = _wire_role_provider(lane, monkeypatch, server)
+        if selection == "role":
+            lane.runner.session_store.set_model_role(lane.key, "fast")
+        else:
+            lane.runner.session_store.set_model_override(lane.key, {"model": "first", "provider": "custom"})
+        try:
+            result = await _run_role_message(lane)
+            assert result["final_response"] == "COLD-ROUTE", result
+            assert [request["model"] for request in server.main_requests()] == ["first"]
+            assert built[0][1]["model"] == "first"
+        finally:
+            for agent, _ in built:
+                agent.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_role_edit_does_not_change_worker_startup(lane, monkeypatch):
+    from tests.fakes.fake_llm_provider import FakeLLMServer
+
+    with FakeLLMServer(default_text="QUEUED-ROUTE") as server:
+        built = _wire_role_provider(lane, monkeypatch, server)
+        assembled, release = asyncio.Event(), threading.Event()
+        start = lane.runner._run_agent_start_turn_worker
+
+        def delayed_start(ctx, work):
+            def paused():
+                assert release.wait(10), "worker release missing"
+                return work()
+            assembled.set()
+            return start(ctx, paused)
+
+        monkeypatch.setattr(lane.runner, "_run_agent_start_turn_worker", delayed_start)
+        lane.runner._running_agents[lane.key] = SimpleNamespace()
+        task = asyncio.create_task(_run_role_message(lane))
+        try:
+            await asyncio.wait_for(assembled.wait(), 5)
+            status = await _apply_session_settings(lane.runner, lane.source, lane.entry, ("role", "fast"), None)
+            assert status["model_status"] == "queued"
+            assert status["model_effective_when"] == "next_turn"
+            release.set()
+            first = await task
+            second = await _run_role_message(lane)
+            assert first["final_response"] == second["final_response"] == "QUEUED-ROUTE"
+            assert [kwargs["model"] for _, kwargs in built] == ["base", "first"]
+            assert [request["model"] for request in server.main_requests()] == ["base", "first"]
+        finally:
+            release.set()
+            if not task.done():
+                await task
+            for agent, _ in built:
+                agent.close()
+
+
 def _switch(agent, model, provider, *_args):
     agent.model, agent.provider = model, provider
 
