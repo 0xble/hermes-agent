@@ -668,8 +668,9 @@ _MEDIA_NATIVE = (
 # Only platforms in gateway.copy_blocks.PLAIN_COPY_PLATFORMS send blocks separately; elsewhere they
 # render inline, so the promise lives in those hints alone.
 _COPY_BLOCKS_SEPARATE = (
-    "For text the user should copy exactly, wrap it in [[copy]] and [[/copy]] on separate lines; "
-    "each copy block is sent as its own plain-text message. "
+    "For text the user should copy exactly, use top-level blocks with [[copy]] and [[/copy]] "
+    "on standalone lines, never inside numbered lists, bullet lists, or quotes. "
+    "Each copy block is sent as its own plain-text message. "
 )
 
 _LOCAL_CRON_DELIVERY_NOTE = (
