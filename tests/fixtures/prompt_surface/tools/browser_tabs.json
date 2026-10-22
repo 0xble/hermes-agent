@@ -1,0 +1,14 @@
+{
+  "description": "List this task's browser tabs and OAuth/payment popups. Pass tab_id from the list to select a tab for subsequent browser actions, then call browser_snapshot for fresh refs. Other tasks' tabs cannot be selected. Requires browser_navigate or browser_handoff first. Available with Camofox only.",
+  "name": "browser_tabs",
+  "parameters": {
+    "properties": {
+      "tab_id": {
+        "description": "Tab ID from browser_tabs to select. Omit to list this task's tabs.",
+        "type": "string"
+      }
+    },
+    "required": [],
+    "type": "object"
+  }
+}
