@@ -4241,6 +4241,7 @@
                 "browser_press",
                 "browser_scroll",
                 "browser_snapshot",
+                "browser_tabs",
                 "browser_type",
                 "browser_upload",
                 "browser_vault",
