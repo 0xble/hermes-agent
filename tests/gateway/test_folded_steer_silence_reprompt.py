@@ -28,6 +28,7 @@ def harness(monkeypatch, tmp_path):
     from run_agent import AIAgent
 
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"default": "test/model", "provider": "openrouter"},
         "display": {"tool_progress": "off", "interim_assistant_messages": False},
         "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
     }))
@@ -38,7 +39,8 @@ def harness(monkeypatch, tmp_path):
         patch("model_tools.check_toolset_requirements", return_value={}),
         patch("agent.process_bootstrap.OpenAI"),
     ):
-        agent = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
+        agent = AIAgent(model="test/model", api_key="test-key-1234567890",
+                        base_url="https://openrouter.ai/api/v1", quiet_mode=True,
                         skip_context_files=True, skip_memory=True)
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
@@ -61,6 +63,9 @@ def harness(monkeypatch, tmp_path):
 
     monkeypatch.setattr(adapter, "delete_message", delete)
     runner = _make_runner(adapter)
+    # This resolver double reuses one agent, so retain its cache ownership like
+    # the production resolver. An uncached agent is retired after the outer turn.
+    runner._agent_cache = {SESSION_KEY: (agent, "silence-test", 0, "silence-test")}
     runner._draining = False
     state = runner._session_state(SESSION_KEY)
     state.persistent.run_generation = 1
@@ -90,7 +95,7 @@ def harness(monkeypatch, tmp_path):
 
     def resolve(turn_runner, route, platform_key, ephemeral, *args):
         ctx = turn_runner._ctx
-        ctx.agent_holder[0] = agent
+        ctx.bind_agent_lifetime(agent)
         ctx.tools_holder[0] = agent.tools
         agent.ephemeral_system_prompt = ephemeral
         agent.session_id = ctx.session_id
