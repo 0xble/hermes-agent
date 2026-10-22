@@ -91,6 +91,140 @@ def test_moa_executes_declared_backup(moa_transport, consumer):
     assert calls[-1].get("extra_body", {}).get("reasoning", {}).get("enabled") is False
 
 
+@pytest.mark.parametrize("consumer", ["reference", "aggregator", "streaming"])
+@pytest.mark.parametrize("recovery", ["rotation", "refresh", "transient"])
+@pytest.mark.parametrize("effort", ["none", False])
+def test_moa_selected_destination_survives_same_route_recovery(moa_transport, monkeypatch, consumer, recovery, effort):
+    from agent import auxiliary_client as aux, moa_loop as moa
+    _cfg, calls, progress, agent = moa_transport
+    recovered = []
+    # Streaming uses the existing pre-emission rate-limit rung, not completion backoff.
+    stream_retry = consumer == "streaming" and recovery == "transient"
+    class Failure(RuntimeError):
+        status_code = (429 if stream_retry else 500) if recovery == "transient" else 401
+    monkeypatch.setattr(aux._aux_progress, "hook", lambda: progress.append("progress"), raising=False)
+    def create(**kw):
+        calls.append(deepcopy(kw))
+        if len(calls) == 1:
+            raise Failure("fixture selected destination recovery")
+        aux._notify_aux_progress()
+        return SimpleNamespace(model=kw["model"], choices=[SimpleNamespace(
+            message=SimpleNamespace(role="assistant", content="done", tool_calls=None), finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=2, total_tokens=7))
+    client = SimpleNamespace(base_url="https://openrouter.ai/api/v1", api_key="fixture",
+                             chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(aux, "_get_cached_client", lambda provider, model=None, **kw:
+                        (None, None) if model == "primary" else (client, model))
+    monkeypatch.setattr(aux, "resolve_provider_client", lambda provider, model=None, **kw: (client, model))
+    monkeypatch.setattr(aux, "_refresh_provider_credentials", lambda provider, **kw:
+                        recovered.append(provider) is None if recovery == "refresh" else False)
+    monkeypatch.setattr(aux, "_recoverable_pool_provider", lambda *a, **kw: "openrouter" if recovery == "rotation" or stream_retry else None)
+    monkeypatch.setattr(aux, "_recover_provider_pool", lambda provider, *a, **kw: recovered.append(provider) is None)
+    monkeypatch.setattr(aux, "_transient_retry_count", lambda: 1)
+    monkeypatch.setattr(aux, "_TRANSIENT_RETRY_BACKOFF_BASE", 0)
+    monkeypatch.setattr(moa, "_slot_runtime", lambda slot: {"provider": slot["provider"], "model": slot["model"]})
+    monkeypatch.setattr(moa, "_reference_context_length", lambda slot, *a: 100000 if slot["model"] == "primary" else 1500)
+    slot = {"provider": "anthropic", "model": "primary", "reasoning_effort": "high",
+            "fallback_models": [{**BACKUP, "reasoning_effort": effort}]}
+    messages = [{"role": "user", "content": "old " * 2500}, {"role": "assistant", "content": "old answer " * 2500},
+                {"role": "user", "content": "latest"}]
+    if consumer == "reference":
+        _, text, acct = moa._run_reference(slot, messages, max_tokens=64, agent=agent)
+        assert text == "done"
+        assert (acct.model, acct.provider) == ("backup", "openrouter")
+        assert acct.messages == calls[-1]["messages"]
+        assert acct.usage.input_tokens == 5
+        assert len(str(calls[0]["messages"])) < len(str(messages))
+    else:
+        facade = moa.MoAChatCompletions("default", agent=agent)
+        response = facade._call_prepared_aggregator(
+            {"aggregator": slot, "messages": messages, "guidance": None, "aggregator_temperature": None},
+            {"stream": consumer == "streaming", "max_tokens": 64})
+        text = "".join(str(c.choices[0].delta.content or "") for c in response) if consumer == "streaming" else moa._extract_text(response)
+        assert text == "done"
+        assert (facade.last_aggregator_slot["model"], facade.last_aggregator_slot["provider"]) == ("backup", "openrouter")
+    assert len(calls) == 2
+    assert all(c["model"] == "backup" and c["extra_body"]["reasoning"]["enabled"] is False for c in calls)
+    assert calls[0]["messages"] == calls[1]["messages"]
+    assert calls[0].get("tools") == calls[1].get("tools")
+    assert recovered == ([] if recovery == "transient" else ["openrouter"])
+    assert progress
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("recovery", ["rotation", "refresh", "transient"])
+@pytest.mark.parametrize("next_destination", [False, True])
+def test_selected_recovery_keeps_destination_plan_but_next_hop_uses_logical_input(
+    moa_transport, monkeypatch, async_mode, recovery, next_destination,
+):
+    import asyncio
+    from agent import auxiliary_client as aux
+    from agent.auxiliary_call_policy import CallFallbackPolicy, scoped_fallback_policy
+    _cfg, calls, _progress, _agent = moa_transport
+    planned, recovered = [], []
+    messages = [{"role": "user", "content": "canonical input"}]
+    tools = [{"type": "function", "function": {"name": "canonical_tool", "parameters": {"type": "object"}}}]
+    chain = [{**BACKUP, "timeout": 11}, {"provider": "openai", "model": "gpt-5-mini", "reasoning_effort": "low"}]
+    class Failure(RuntimeError):
+        status_code = 500 if recovery == "transient" else 401
+    class Unavailable(RuntimeError):
+        status_code = 402
+    def create(**kw):
+        calls.append(deepcopy(kw))
+        if len(calls) == 1:
+            raise Failure("fixture recovery")
+        if kw["model"] == "backup" and next_destination:
+            raise Unavailable("fixture destination exhausted")
+        return SimpleNamespace(model=kw["model"], choices=[SimpleNamespace(
+            message=SimpleNamespace(role="assistant", content="done", tool_calls=None), finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=2, total_tokens=7))
+    async def acreate(**kw):
+        return create(**kw)
+    client = SimpleNamespace(base_url="https://openrouter.ai/api/v1", api_key="fixture",
+                             chat=SimpleNamespace(completions=SimpleNamespace(create=acreate if async_mode else create)))
+    second = SimpleNamespace(base_url="https://api.openai.com/v1", api_key="fixture",
+                             chat=client.chat)
+    monkeypatch.setattr(aux, "_get_cached_client", lambda provider, model=None, **kw:
+                        (None, None) if model == "primary" else (second if model == "gpt-5-mini" else client, model))
+    monkeypatch.setattr(aux, "resolve_provider_client", lambda provider, model=None, **kw:
+                        (second if model == "gpt-5-mini" else client, model))
+    monkeypatch.setattr(aux, "_to_async_client", lambda client, model, **kw: (client, model))
+    monkeypatch.setattr(aux, "_refresh_provider_credentials", lambda provider, **kw:
+                        recovered.append(provider) is None if recovery == "refresh" else False)
+    monkeypatch.setattr(aux, "_recoverable_pool_provider", lambda *a, **kw: "openrouter" if recovery == "rotation" else None)
+    monkeypatch.setattr(aux, "_recover_provider_pool", lambda provider, *a, **kw: recovered.append(provider) is None)
+    monkeypatch.setattr(aux, "_transient_retry_count", lambda: 1)
+    monkeypatch.setattr(aux, "_TRANSIENT_RETRY_BACKOFF_BASE", 0)
+    cache = aux._replan_synchronous_cache_sections
+    def replan(messages, tools, *, destination):
+        planned.append((destination.model, deepcopy(messages), deepcopy(tools)))
+        return cache(messages, tools, destination=destination)
+    monkeypatch.setattr(aux, "_replan_synchronous_cache_sections", replan)
+    def prepare(destination, original_messages, original_tools, reasoning, entry):
+        assert original_messages == messages and original_tools == tools
+        return [{"role": "user", "content": destination.model + " input"}], [], reasoning
+    route = {}
+    kwargs: dict = dict(task="moa_reference", provider="anthropic", model="primary", messages=messages,
+                        tools=tools, reasoning_config={"enabled": True, "effort": "high"}, timeout=37, route_info=route)
+    with scoped_fallback_policy(CallFallbackPolicy("moa_reference", chain, prepare)):
+        result = asyncio.run(aux.async_call_llm(**kwargs)) if async_mode else aux.call_llm(
+            **kwargs, extra_headers={"x-initiator": "user"}, fallback_chain=chain, fallback_request_transform=prepare)
+    assert result.choices[0].message.content == "done"
+    assert [c["model"] for c in calls] == (["backup", "backup", "gpt-5-mini"] if next_destination else ["backup", "backup"])
+    assert all(c["messages"] == [{"role": "user", "content": "backup input"}]
+               and c["extra_body"]["reasoning"]["enabled"] is False and c["timeout"] == 11 for c in calls[:2])
+    assert calls[0].get("tools") == calls[1].get("tools")
+    if not async_mode:
+        assert calls[0]["extra_headers"] == calls[1]["extra_headers"] == {"x-initiator": "user"}
+    assert all(m == messages and t == tools for _, m, t in planned)
+    if next_destination:
+        assert calls[-1]["messages"] == [{"role": "user", "content": "gpt-5-mini input"}]
+        assert calls[-1]["extra_body"]["reasoning"]["effort"] == "low"
+    assert route == {"provider": "openai" if next_destination else "openrouter",
+                     "model": "gpt-5-mini" if next_destination else "backup"}
+    assert recovered == ([] if recovery == "transient" else ["openrouter"] * (2 if recovery == "rotation" and next_destination else 1))
+
+
 @pytest.mark.parametrize("shape", [{"model_preset": "p", "fallbacks": []}, {"default": "@p", "fallbacks": []}])
 def test_cron_default_optout_reaches_setup_and_execution(tmp_path, monkeypatch, shape):
     from cron import scheduler

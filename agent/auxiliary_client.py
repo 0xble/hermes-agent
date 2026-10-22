@@ -3810,6 +3810,8 @@ def _prepare_same_provider_retry(
     max_tokens: Optional[int], tools: Optional[list], effective_timeout: float,
     effective_extra_body: dict, reasoning_config: Optional[dict], async_mode: bool,
     extra_headers: Optional[dict[str, str]] = None,
+    rebuild: Optional[Callable[[str, Any, Optional[str]], tuple["_FallbackDestination", dict[str, Any]]]] = None,
+    no_progress_timeout: Optional[float] = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Rebuild (client, request kwargs) for a same-provider retry after credential recovery."""
     if task == "vision":
@@ -3824,22 +3826,22 @@ def _prepare_same_provider_retry(
         )
         effective_provider = _effective_provider_for_client(retry_client, resolved_provider)
     if retry_client is None:
-        raise RuntimeError(
-            f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
-        )
+        raise RuntimeError(f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery")
     retry_base = str(getattr(retry_client, "base_url", "") or "")
-    retry_kwargs = _build_call_kwargs(
-        effective_provider or resolved_provider, retry_model or final_model, messages,
-        temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
-        extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=retry_base or resolved_base_url, task=task,
-    )
-    # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
+    if rebuild is not None:
+        # The selected destination owns recovery, not the unavailable primary.
+        _, retry_kwargs = rebuild(effective_provider or resolved_provider, retry_client, retry_model)
+    else:
+        retry_kwargs = _build_call_kwargs(
+            effective_provider or resolved_provider, retry_model or final_model, messages,
+            temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
+            extra_body=effective_extra_body, reasoning_config=reasoning_config,
+            base_url=retry_base or resolved_base_url, task=task,
+        )
+    if no_progress_timeout is not None and isinstance(retry_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        retry_kwargs["no_progress_timeout"] = no_progress_timeout
+    # Retain per-request capability gating (e.g. Copilot ``x-initiator``) after recovery (#60293).
     if extra_headers:
-        # Copilot's ``x-initiator: user``) across the rebuilt-client retry — dropping them here would let a
-        # recovery retry silently lose capability gating (#60293).
-        # Preserve per-request attribution headers across the rebuilt-client retry — see the sync variant
-        # above (#60293).
         retry_kwargs["extra_headers"] = dict(extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
@@ -4116,7 +4118,7 @@ def _fallback_request_kwargs(
 def _plan_fallback_candidate(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str],
     effective_timeout: float, apply_fast_lane: bool, **request,
-) -> tuple[_FallbackDestination, dict[str, Any], Callable[[str, Any, Optional[str]], dict[str, Any]]]:
+) -> tuple[_FallbackDestination, dict[str, Any], Callable[[str, Any, Optional[str]], tuple[_FallbackDestination, dict[str, Any]]]]:
     """Resolve the destination + first-attempt kwargs for a fallback candidate.
 
     Returns ``(destination, kwargs, rebuild)`` where ``rebuild(provider, client, model)`` produces
@@ -7521,6 +7523,7 @@ class _PreparedAuxRequest(NamedTuple):
     effective_timeout: float
     effective_extra_body: dict[str, Any]
     base_info: str
+    rebuild: Optional[Callable[[str, Any, Optional[str]], tuple[_FallbackDestination, dict[str, Any]]]] = None
 
 
 def _prepare_aux_request(
@@ -7531,9 +7534,8 @@ def _prepare_aux_request(
     extra_headers: Optional[dict[str, str]], api_mode: Optional[str],
     route_info: Optional[dict[str, str]], async_mode: bool,
 ) -> _PreparedAuxRequest:
-    """Shared head of call_llm/async_call_llm: resolve route + client, publish it, build request kwargs.
-    Sync-only: compression fast lane, per-request ``extra_headers``, and ``base_info`` falling
-    back to the resolved base_url when the client exposes none."""
+    """Resolve and publish the route and prepare kwargs for call_llm/async_call_llm.
+    Sync-only: compression fast lane, extra_headers and base_info fallback to resolved_base_url."""
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -7563,18 +7565,15 @@ def _prepare_aux_request(
             extra_body=effective_extra_body,
         )
 
-    if async_mode:
-        base_info = str(getattr(client, "base_url", "") or "")
-    else:
-        base_info = str(getattr(client, "base_url", resolved_base_url) or "")
-        if task:
-            logger.info("Auxiliary %s: using %s (%s)%s",
-                         task, request_provider or "auto", final_model or "default",
-                         f" at {base_info}" if base_info and "openrouter" not in base_info else "")
-    # Client's actual base_url so endpoint-specific temperature overrides work on
-    # auto-detected routes (api.moonshot.ai vs api.kimi.com/coding).
+    base_info = str(getattr(client, "base_url", "" if async_mode else resolved_base_url) or "")
+    if not async_mode and task:
+        logger.info("Auxiliary %s: using %s (%s)%s",
+                    task, request_provider or "auto", final_model or "default",
+                    f" at {base_info}" if base_info and "openrouter" not in base_info else "")
+    # Use the actual endpoint for temperature overrides on auto-detected routes.
+    rebuild = None
     if fallback_label:
-        destination, kwargs, _ = _plan_fallback_candidate(
+        destination, kwargs, rebuild = _plan_fallback_candidate(
             client, final_model, fallback_label, task=task, effective_timeout=effective_timeout,
             apply_fast_lane=not async_mode, messages=messages, tools=tools, temperature=temperature,
             max_tokens=max_tokens, effective_extra_body=effective_extra_body, reasoning_config=reasoning_config)
@@ -7601,7 +7600,7 @@ def _prepare_aux_request(
     return _PreparedAuxRequest(
         client, final_model, kwargs, resolved_provider, request_provider, resolved_model,
         resolved_base_url, resolved_api_key, resolved_api_mode, effective_timeout,
-        effective_extra_body, base_info)
+        effective_extra_body, base_info, rebuild)
 
 
 class _LadderStep(NamedTuple):
@@ -8154,10 +8153,8 @@ def _plan_aux_call(
     extra_headers: Optional[dict[str, str]], api_mode: Optional[str],
     route_info: Optional[dict[str, str]],
 ) -> tuple[_PreparedAuxRequest, dict[str, Any], dict[str, Any]]:
-    """Shared head of both call impls: prepare the request and bundle the kwargs the recovery
-    drivers pass to ``_retry_same_provider_*`` / ``_call_fallback_candidate_*``. One immutable
-    runtime snapshot for keying/resolution/retries/fallbacks, so a concurrent /model switch
-    can't mix key and client from different runtimes."""
+    """Prepare same-route retry inputs separately from next-destination logical inputs.
+    One runtime snapshot prevents concurrent /model switches mixing route credentials."""
     main_runtime = _normalize_main_runtime(main_runtime)
     req = _prepare_aux_request(
         task, provider=provider, model=model, base_url=base_url, api_key=api_key,
@@ -8175,6 +8172,7 @@ def _plan_aux_call(
         candidate_kwargs, resolved_base_url=req.resolved_base_url,
         resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
         main_runtime=main_runtime, final_model=req.final_model, extra_headers=extra_headers,
+        rebuild=req.rebuild, no_progress_timeout=req.kwargs.get("no_progress_timeout"),
     )
     return req, retry_kwargs, candidate_kwargs
 

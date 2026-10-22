@@ -92,6 +92,11 @@ reasoning precedence, including preset effort ahead of global effort.
   cached client tag, so a later primary call cannot inherit fallback transforms.
   Destination preparation re-trims canonical reference input, re-plans cache
   markers/tools and reasoning, and records the actual selected accounting route.
+  Retain the selected destination planner on the prepared request for credential
+  refresh and pool rotation. Same-route recovery must keep that destination's
+  input, reasoning (including `none` and `false`) and timeout, never restore the
+  unavailable primary's controls. A different fallback destination still plans
+  from the original logical input, not an already-trimmed or decorated request.
   Streaming recovery is allowed only before a chunk has escaped. Dispatch remains
   eager. Completed adapter responses retain identity and release permits with the
   call, even when the SDK response is iterable. Only actual stream iterators carry
