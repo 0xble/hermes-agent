@@ -3,7 +3,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 
 BACKUP = {"provider": "openai", "model": "backup-model", "reasoning_effort": "none"}
