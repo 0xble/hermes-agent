@@ -3403,7 +3403,9 @@ def _log_skip_unhealthy(
         )
 
 
-def _warn_auxiliary_route_once(route: Any, reason: str, error: BaseException) -> None:
+def _warn_auxiliary_route_once(
+    route: Any, reason: str, error: BaseException, *, strict_chain: bool = False,
+) -> None:
     provider = _effective_provider_for_client(route.client, route.resolved_provider)
     if provider in {"", "auto"}:
         provider = _provider_for_host(route.base_info or "", _POOL_PROVIDER_BY_HOST) or provider
@@ -3413,8 +3415,9 @@ def _warn_auxiliary_route_once(route: Any, reason: str, error: BaseException) ->
         return
     logger.warning(
         "Auxiliary %s%s: %s on %s and all fallbacks exhausted "
-        "(fallback_chain + main agent model). Raising the primary error.",
+        "(%s). Raising the primary error.",
         route.task or "call", route.tag, reason, route.resolved_provider,
+        "per-call fallback_chain" if strict_chain else "fallback_chain + main agent model",
     )
 
 
@@ -8241,7 +8244,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
             task_chain_only=explicit_auth_with_task_chain or strict_chain)
     # All fallback layers exhausted — emit one user-visible warning for this route-health epoch.
-    _warn_auxiliary_route_once(route, reason, first_err)
+    _warn_auxiliary_route_once(route, reason, first_err, strict_chain=strict_chain)
     return None
 
 

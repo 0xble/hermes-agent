@@ -162,7 +162,8 @@ def test_route_health_store_errors_fail_open(monkeypatch):
     aux._reset_aux_unhealthy_cache()
 
 
-def test_exhaustion_warning_is_not_suppressed_when_route_health_store_fails(monkeypatch, caplog):
+@pytest.mark.parametrize("strict_chain", [False, True])
+def test_exhaustion_warning_is_not_suppressed_when_route_health_store_fails(monkeypatch, caplog, strict_chain):
     """A local-only quarantine still emits its exhaustion warning when shared state is unavailable."""
     def unavailable(*args, **kwargs):
         raise OSError("read-only state directory")
@@ -182,9 +183,13 @@ def test_exhaustion_warning_is_not_suppressed_when_route_health_store_fails(monk
     key = aux._unhealthy_cache_key("custom", route.base_info, "model")
     aux._aux_unhealthy_reason[key] = "invalid provider response"
 
-    aux._warn_auxiliary_route_once(route, "provider unavailable", RuntimeError("offline"))
+    aux._warn_auxiliary_route_once(route, "provider unavailable", RuntimeError("offline"), strict_chain=strict_chain)
 
-    assert any("all fallbacks exhausted" in record.getMessage() for record in caplog.records)
+    expected_chain = "per-call fallback_chain" if strict_chain else "fallback_chain + main agent model"
+    assert any(
+        f"all fallbacks exhausted ({expected_chain})" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_primary_rate_limit_uses_short_lane_hold(monkeypatch):
