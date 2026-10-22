@@ -298,6 +298,7 @@ gateway:
     choice_show: "yanıtlarda akıl yürütmeyi göster"
     choice_hide: "yanıtlarda akıl yürütmeyi gizle"
     set_global: "🧠 ✓ Akıl yürütme gücü `{effort}` olarak ayarlandı (yapılandırmaya kaydedildi)\n_(sonraki mesajda etkili)_"
+    preset_owns_effort: "`{preset}` ön ayarı ana rotanın çabasını `{preset_effort}` olarak belirler. `{effort}` diğer modellere uygulanır."
     set_global_save_failed: "🧠 ✓ Akıl yürütme gücü `{effort}` olarak ayarlandı (yalnızca bu oturum — yapılandırma kaydedilemedi)\n_(sonraki mesajda etkili)_"
     set_session: "🧠 ✓ Akıl yürütme gücü `{effort}` olarak ayarlandı (yalnızca bu oturum — kalıcı yapmak için `--global` ekleyin)\n_(sonraki mesajda etkili)_"
     quote_label_discord: "-# 💭 Akıl yürütme"

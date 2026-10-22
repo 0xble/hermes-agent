@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.auxiliary_client import call_llm
+from agent.auxiliary_call_policy import completed_response_as_stream_chunk
+from agent.moa_fallback import slot_fallback_kwargs
 from agent.message_content import flatten_message_text
 from agent.moa_alternation import destination_key, is_role_alternation_rejection, merge_same_role_messages
 from agent.transports import get_transport
@@ -403,7 +405,8 @@ def _run_reference(
     """Call one reference model; return ``(label, text, accounting)``. Never raises:
     a failed reference becomes a labelled ``[failed: …]`` note. Runs in a thread pool."""
     label = _slot_label(slot)
-    runtime = _slot_runtime(slot)
+    runtime = dict(_slot_runtime(slot))
+    selected = dict(slot)
     trace_fields = {"model": slot.get("model"), "provider": runtime.get("provider") or slot.get("provider"), "temperature": temperature}
     # The advisory view already stripped the agent's system prompt; this is the only one.
     messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
@@ -420,29 +423,26 @@ def _run_reference(
         )
         trimmed = _maybe_apply_moa_cache_control(trimmed, _with_cache_disabled(runtime, cache_disabled), cache_ttl=cache_ttl)
 
-        # Copilot gates premium models on request attribution; MoA fan-out serves the
-        # user's current turn, so mirror the main agent's x-initiator header.
-        from agent.auxiliary_client import _normalize_aux_provider
-        is_copilot = _normalize_aux_provider(str(runtime.get("provider") or "")) in ("copilot", "copilot-acp")
-        if agent is not None:
-            from agent.auxiliary_client import aux_progress_hook
+        def prepare_fallback(candidate, destination):
+            nonlocal trimmed
+            candidate_messages = _trim_messages_for_reference(
+                messages, candidate, destination, reserve_output_tokens=max_tokens, context_length_cache=context_length_cache)
+            trimmed = _maybe_apply_moa_cache_control(
+                candidate_messages, _with_cache_disabled(destination, cache_disabled), cache_ttl=cache_ttl)
+            return trimmed, None
 
-            with aux_progress_hook(_reference_liveness_hook(agent, label)):
-                response = call_llm(
-                    task="moa_reference", messages=trimmed, temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
-                    extra_headers={"x-initiator": "user"} if is_copilot else None, **runtime,
-                )
-        else:
+        from agent.auxiliary_client import _normalize_aux_provider, aux_progress_hook
+        is_copilot = _normalize_aux_provider(str(runtime.get("provider") or "")) in ("copilot", "copilot-acp")
+        with aux_progress_hook(_reference_liveness_hook(agent, label)):
             response = call_llm(
                 task="moa_reference", messages=trimmed, temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
-                extra_headers={"x-initiator": "user"} if is_copilot else None, **runtime,
+                max_tokens=max_tokens, timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
+                extra_headers={"x-initiator": "user"} if is_copilot else None,
+                **slot_fallback_kwargs(slot, selected, runtime, prepare_fallback), **runtime,
             )
+        trace_fields.update(model=selected.get("model"), provider=runtime.get("provider"))
         output_text = _extract_text(response) or "(empty response)"
-        acct = _RefAccounting(*_price_reference_response(response, slot, runtime), messages=trimmed, output=output_text, **trace_fields)
+        acct = _RefAccounting(*_price_reference_response(response, selected, runtime), messages=trimmed, output=output_text, **trace_fields)
         return label, output_text, acct
     except Exception as exc:
         logger.warning("MoA reference model %s failed: %s", label, exc)
@@ -975,36 +975,6 @@ def aggregate_moa_context(
     )
 
 
-def _completed_response_as_stream_chunk(response: Any) -> Any:
-    """Adapt a completed response into one delta stream chunk (facade boundary only)."""
-    choices = getattr(response, "choices", None)
-    first_choice = choices[0] if isinstance(choices, (list, tuple)) and choices else None
-    message = getattr(first_choice, "message", None)
-    raw_tool_calls = getattr(message, "tool_calls", None)
-    tool_call_deltas = None
-    if isinstance(raw_tool_calls, (list, tuple)) and raw_tool_calls:
-        tool_call_deltas = [
-            SimpleNamespace(
-                index=getattr(tc, "index", index), id=getattr(tc, "id", None), type=getattr(tc, "type", None) or "function",
-                function=SimpleNamespace(
-                    name=getattr(getattr(tc, "function", None), "name", None),
-                    arguments=getattr(getattr(tc, "function", None), "arguments", None),
-                ),
-            )
-            for index, tc in enumerate(raw_tool_calls)
-        ]
-    delta = SimpleNamespace(
-        content=getattr(message, "content", None), tool_calls=tool_call_deltas,
-        **{k: getattr(message, k, None) for k in ("reasoning_content", "reasoning", "reasoning_details")},
-    )
-    choice = SimpleNamespace(
-        index=getattr(first_choice, "index", 0), delta=delta, finish_reason=getattr(first_choice, "finish_reason", None) or "stop",
-    )
-    return SimpleNamespace(
-        id=getattr(response, "id", None), model=getattr(response, "model", None), choices=[choice], usage=getattr(response, "usage", None),
-    )
-
-
 def _attach_reference_guidance(agg_messages: list[dict[str, Any]], guidance: str) -> None:
     """Attach the per-turn reference block as its OWN trailing user message.
 
@@ -1196,7 +1166,8 @@ class MoAChatCompletions:
         aggregator = prepared["aggregator"]
         if aggregator.get("provider") == "moa":
             raise RuntimeError("MoA aggregator cannot be another MoA preset")
-        agg_runtime = _slot_runtime(aggregator)
+        agg_runtime = dict(_slot_runtime(aggregator))
+        selected = self.last_aggregator_slot = dict(aggregator)
         agg_messages, tools = self._plan_aggregator_cache(
             prepared["messages"], api_kwargs.get("tools"), prepared.get("guidance"), agg_runtime
         )
@@ -1222,8 +1193,16 @@ class MoAChatCompletions:
         merged = destination in remembered
         if merged:
             agg_messages = merge_same_role_messages(agg_messages)
+        def prepare_fallback(candidate, destination):
+            if trace is not None:
+                trace["aggregator_slot"] = dict(candidate)
+                trace["aggregator_label"] = _slot_label(candidate)
+            return self._plan_aggregator_cache(
+                prepared["messages"], api_kwargs.get("tools"), prepared.get("guidance"), destination)
+
         send = functools.partial(
             call_llm, task="moa_aggregator", temperature=prepared["aggregator_temperature"],
+            **slot_fallback_kwargs(aggregator, selected, agg_runtime, prepare_fallback, aggregator=True),
             max_tokens=api_kwargs.get("max_tokens"), tools=tools, extra_body=agg_extra_body,
             reasoning_config=_aggregator_reasoning_config(aggregator),  # same policy as direct create()
             **stream_kwargs, **agg_runtime,
@@ -1258,7 +1237,7 @@ class MoAChatCompletions:
         if stream and hasattr(agg_response, "choices"):
             # Some adapters (openai-codex Responses) return a completed response even
             # when streaming was requested; hand the loop a one-chunk iterator.
-            return iter((_completed_response_as_stream_chunk(agg_response),))
+            return iter((completed_response_as_stream_chunk(agg_response),))
         return agg_response
 
     def _fanout_cache_key(

@@ -224,7 +224,11 @@ def _cli_config_defaults():
 
 def _merge_file_config(defaults: dict[str, Any], file_config: dict[str, Any]) -> None:
     """Overlay a parsed config file onto *defaults* in place (model normalization, deep merge, legacy keys)."""
-    # model: string (new format) or dict (old format with default/base_url)
+    from hermes_cli.model_presets import expand_model_presets
+    # Expand the whole user route before merging loses its authored identity.
+    # Resolving only the primary model here drops its implicit fallback policy.
+    file_config = expand_model_presets(file_config)
+    # model: string (new format) or dict (old format with default/base_url).
     if "model" in file_config:
         if isinstance(file_config["model"], str):
             defaults["model"]["default"] = file_config["model"]
@@ -260,8 +264,16 @@ def load_cli_config() -> dict[str, Any]:
 
     ``HERMES_IGNORE_USER_CONFIG=1`` skips the user config entirely (``.env`` still loads).
     """
-    from cli import _cli_config_defaults, _hermes_home, _merge_file_config, _mirror_config_to_env
-    config_path = _hermes_home / 'config.yaml'
+    from cli import _cli_config_defaults, _merge_file_config, _mirror_config_to_env
+    from hermes_constants import get_hermes_home
+    # The import-time home is the seam tests patch (cli._hermes_home). Read it live, and fall
+    # back to the live home when the import-time value is stale so a redirected HERMES_HOME wins.
+    cli_home = getattr(_cli(), "_hermes_home", None)
+    config_path = (cli_home if cli_home is not None else get_hermes_home()) / 'config.yaml'
+    if not config_path.exists():
+        live_path = get_hermes_home() / 'config.yaml'
+        if live_path.exists():
+            config_path = live_path
     if not config_path.exists() or os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
         config_path = Path(__file__).parent / 'cli-config.yaml'
 
@@ -280,6 +292,9 @@ def load_cli_config() -> dict[str, Any]:
             _file_has_terminal_config = "terminal" in file_config
             _merge_file_config(defaults, file_config)
         except Exception as e:
+            from hermes_cli.model_presets import ModelPresetError
+            if isinstance(e, ModelPresetError):
+                raise
             logger.warning("Failed to load cli-config.yaml: %s", e)
 
     # Expand ${ENV_VAR} references before bridging to env vars.

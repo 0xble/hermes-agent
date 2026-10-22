@@ -946,6 +946,7 @@ def get_missing_skill_config_vars() -> list[dict[str, Any]]:
 # defaults are accepted automatically. These optional/legacy roots are valid on disk but
 # intentionally absent from DEFAULT_CONFIG (omitted when unused / alternate schema forms).
 _EXTRA_KNOWN_ROOT_KEYS = {
+    "model_presets",
     "custom_providers",  # legacy list form; modern equivalent is providers: {}
     "fallback_model",    # optional single dict or chain list; omitted when disabled
     "mcp_servers",       # MCP server definitions written by setup/tools flows
@@ -2375,6 +2376,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
 
+                from hermes_cli.model_presets import expand_model_presets
+                user_config = expand_model_presets(user_config)
                 config = _deep_merge(config, user_config)
                 from hermes_cli.moa_config import apply_user_moa_presets
                 apply_user_moa_presets(config, user_config)
@@ -2384,6 +2387,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                 from hermes_cli.config_backups import backup_config
                 backup_config(config_path, "good")
             except Exception as e:
+                from hermes_cli.model_presets import ModelPresetError
+                if isinstance(e, ModelPresetError):
+                    raise
                 lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
                 if lkg_copy is not None:
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
@@ -2508,6 +2514,8 @@ def save_config(
         current_normalized = _canonicalize_config(config)
         normalized = current_normalized
         if _raw_for_paths:
+            from hermes_cli.model_presets import preserve_model_preset_references
+            normalized = preserve_model_preset_references(normalized, _raw_for_paths)
             normalized = _preserve_env_ref_templates(
                 normalized, _canonicalize_config(_raw_for_paths),
                 _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))

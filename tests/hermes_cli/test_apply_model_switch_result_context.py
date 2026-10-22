@@ -131,8 +131,8 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
     writes = []
     monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        "utils.atomic_roundtrip_yaml_update",
-        lambda path, key, value: writes.append((key, value)),
+        "hermes_cli.config.atomic_config_replace",
+        lambda path, config: writes.append(config),
     )
     cli = _StubCLI()
     cli.model = "shared-model"
@@ -172,4 +172,6 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
     ):
         cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
 
-    assert ("model.context_length", None) in writes
+    assert len(writes) == 1
+    assert "context_length" not in writes[0]["model"]
+    assert writes[0]["model"]["base_url"] == "https://small.example/v1"

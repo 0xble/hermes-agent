@@ -120,6 +120,10 @@ def aux_probe_mode():
 
 
 from agent.credential_pool import load_pool
+from agent.auxiliary_call_policy import (
+    CallFallbackPolicy, call_fallback_chain, has_call_fallback_chain, prepare_fallback_request, resolve_unavailable_client,
+    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response,
+)
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -3806,6 +3810,8 @@ def _prepare_same_provider_retry(
     max_tokens: Optional[int], tools: Optional[list], effective_timeout: float,
     effective_extra_body: dict, reasoning_config: Optional[dict], async_mode: bool,
     extra_headers: Optional[dict[str, str]] = None,
+    rebuild: Optional[Callable[[str, Any, Optional[str]], tuple["_FallbackDestination", dict[str, Any]]]] = None,
+    no_progress_timeout: Optional[float] = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Rebuild (client, request kwargs) for a same-provider retry after credential recovery."""
     if task == "vision":
@@ -3820,22 +3826,22 @@ def _prepare_same_provider_retry(
         )
         effective_provider = _effective_provider_for_client(retry_client, resolved_provider)
     if retry_client is None:
-        raise RuntimeError(
-            f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
-        )
+        raise RuntimeError(f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery")
     retry_base = str(getattr(retry_client, "base_url", "") or "")
-    retry_kwargs = _build_call_kwargs(
-        effective_provider or resolved_provider, retry_model or final_model, messages,
-        temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
-        extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=retry_base or resolved_base_url, task=task,
-    )
-    # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
+    if rebuild is not None:
+        # The selected destination owns recovery, not the unavailable primary.
+        _, retry_kwargs = rebuild(effective_provider or resolved_provider, retry_client, retry_model)
+    else:
+        retry_kwargs = _build_call_kwargs(
+            effective_provider or resolved_provider, retry_model or final_model, messages,
+            temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
+            extra_body=effective_extra_body, reasoning_config=reasoning_config,
+            base_url=retry_base or resolved_base_url, task=task,
+        )
+    if no_progress_timeout is not None and isinstance(retry_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        retry_kwargs["no_progress_timeout"] = no_progress_timeout
+    # Retain per-request capability gating (e.g. Copilot ``x-initiator``) after recovery (#60293).
     if extra_headers:
-        # Copilot's ``x-initiator: user``) across the rebuilt-client retry — dropping them here would let a
-        # recovery retry silently lose capability gating (#60293).
-        # Preserve per-request attribution headers across the rebuilt-client retry — see the sync variant
-        # above (#60293).
         retry_kwargs["extra_headers"] = dict(extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
@@ -3971,7 +3977,7 @@ def _fallback_chain_entry(task: Optional[str], fb_label: str) -> Optional[dict[s
     if not m:
         return None
     try:
-        chain = _get_auxiliary_task_config(task).get("fallback_chain")
+        chain = call_fallback_chain(task, _get_auxiliary_task_config(task).get("fallback_chain"))
         entry = chain[int(m.group(1))] if isinstance(chain, list) else None
     except Exception:
         return None
@@ -4065,11 +4071,29 @@ def _replan_synchronous_cache_sections(
     )
 
 
+def _fallback_reasoning_config(
+    task: Optional[str], fb_label: str, reasoning_config: Optional[dict],
+    fallback_entry: Optional[dict[str, Any]] = None,
+) -> Optional[dict]:
+    """Apply a configured fallback route's reasoning effort to its wire request."""
+    fallback_entry = fallback_entry or _fallback_chain_entry(task, fb_label)
+    if not isinstance(fallback_entry, dict) or "reasoning_effort" not in fallback_entry:
+        return reasoning_config
+    from hermes_constants import parse_reasoning_effort
+    policy = parse_reasoning_effort(fallback_entry.get("reasoning_effort"))
+    if policy is None:
+        return reasoning_config
+    result = {**(reasoning_config or {}), **policy}
+    if not policy["enabled"]:
+        result.pop("effort", None)
+    return result
+
+
 def _fallback_request_kwargs(
     destination: _FallbackDestination, *, task: Optional[str], messages: list,
     tools: Optional[list], temperature: Optional[float], max_tokens: Optional[int],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
-    fallback_entry: dict, task_config: dict, apply_fast_lane: bool,
+    fallback_entry: dict, task_config: dict, apply_fast_lane: bool, fb_label: str = "",
 ) -> dict[str, Any]:
     """Build request kwargs for one fallback destination (cache-section replan + fast-lane cap)."""
     fallback_max_tokens, fallback_extra_body = max_tokens, effective_extra_body
@@ -4081,6 +4105,9 @@ def _fallback_request_kwargs(
             leak_guard_config=task_config, max_tokens=max_tokens, extra_body=effective_extra_body,
         )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(messages, tools, destination=destination)
+    reasoning_config = _fallback_reasoning_config(task, fb_label, reasoning_config, fallback_entry)
+    fallback_messages, fallback_tools, reasoning_config = prepare_fallback_request(
+        task, destination, fallback_messages, fallback_tools, reasoning_config, fallback_entry)
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
@@ -4091,7 +4118,7 @@ def _fallback_request_kwargs(
 def _plan_fallback_candidate(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str],
     effective_timeout: float, apply_fast_lane: bool, **request,
-) -> tuple[_FallbackDestination, dict[str, Any], Callable[[str, Any, Optional[str]], dict[str, Any]]]:
+) -> tuple[_FallbackDestination, dict[str, Any], Callable[[str, Any, Optional[str]], tuple[_FallbackDestination, dict[str, Any]]]]:
     """Resolve the destination + first-attempt kwargs for a fallback candidate.
 
     Returns ``(destination, kwargs, rebuild)`` where ``rebuild(provider, client, model)`` produces
@@ -4108,10 +4135,14 @@ def _plan_fallback_candidate(
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
     task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
-    fallback_entry = _fallback_chain_entry(task, fb_label) or {}
-    common = dict(
+    # Main-chain selection already resolved this entry. Carry its effort to the
+    # wire request instead of re-reading config and reconstructing the route.
+    fallback_entry = getattr(fb_client, "_hermes_fallback_entry", None)
+    if not isinstance(fallback_entry, dict):
+        fallback_entry = _fallback_chain_entry(task, fb_label) or {}
+    common: dict[str, Any] = dict(
         task=task, effective_timeout=effective_timeout, fallback_entry=fallback_entry,
-        task_config=task_config, apply_fast_lane=apply_fast_lane, **request,
+        task_config=task_config, apply_fast_lane=apply_fast_lane, fb_label=fb_label, **request,
     )
 
     def _rebuild(provider: str, client: Any, model: Optional[str]) -> tuple[_FallbackDestination, dict[str, Any]]:
@@ -4435,7 +4466,7 @@ def _context_too_small(
 
 
 def _try_configured_fallback_chain(
-    task: str, failed_provider: str, reason: str = "error", failed_model: Optional[str] = None, *,
+    task: Optional[str], failed_provider: str, reason: str = "error", failed_model: Optional[str] = None, *,
     failed_base_url: str = "", failure_scope: Any = None,
 ) -> tuple[Optional[Any], Optional[str], str]:
     """Try auxiliary.<task>.fallback_chain entries in order (each needs ``provider``; model/base_url/api_key optional).
@@ -4443,7 +4474,7 @@ def _try_configured_fallback_chain(
     run after a model-scoped failure). Returns (client, model, provider_label) or (None, None, "")."""
     if not task:
         return None, None, ""
-    chain = _get_auxiliary_task_config(task).get("fallback_chain")
+    chain = call_fallback_chain(task, _get_auxiliary_task_config(task).get("fallback_chain"))
     if not chain or not isinstance(chain, list):
         return None, None, ""
     skip = _failed_backend_skip(
@@ -4569,6 +4600,9 @@ def _try_main_fallback_chain(
             if too_small:
                 tried.append(too_small)
                 continue
+            # Keep the selected route's controls with this candidate, including
+            # when config is edited before its request is planned.
+            fb_client._hermes_fallback_entry = dict(entry)
             logger.info("Auxiliary %s: %s on %s — main fallback chain to %s (%s)",
                         task or "call", reason, failed_provider or "auto", label, resolved_model or fb_model)
             return fb_client, resolved_model or fb_model, fb_provider
@@ -7432,6 +7466,7 @@ class _ResolvedAuxRoute(NamedTuple):
     final_model: Optional[str]
     resolved_provider: str
     effective_provider: str
+    fallback_label: str = ""
 
 
 def _resolve_call_client(
@@ -7443,6 +7478,7 @@ def _resolve_call_client(
     """Resolve the client for one aux call: vision chain, or cached text client with the
     explicit-provider fallback_chain / auto-chain rescue; RuntimeError when nothing is configured."""
     effective_provider = resolved_provider
+    fallback_label = ""
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
@@ -7464,34 +7500,14 @@ def _resolve_call_client(
             task=task)
         effective_provider = _effective_provider_for_client(client, resolved_provider)
         if client is None:
-            # Explicit provider with no credentials: honor the task fallback_chain before
-            # raising (fallback entries may use OAuth / credential-pool auth).
-            _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit)
-                if fb_client is None:
-                    nous_detail = nous_credential_failure_detail() if _explicit == "nous" else None
-                    raise AuxiliaryClientUnavailable(
-                        nous_detail or missing_provider_credentials_message(_explicit))
-                client, final_model = fb_client, fb_model
-                if async_mode:
-                    client, final_model = _to_async_client(
-                        fb_client, fb_model or "", is_vision=(task == "vision"))
-                resolved_provider = fb_label or resolved_provider
-                effective_provider = resolved_provider
-            # Auto/custom with no credentials: walk the full auto chain (not just OpenRouter).
-            # model=None so each provider uses its own default.
-            if client is None and not resolved_base_url:
-                logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
-                            task or "call", resolved_provider)
-                client, final_model = _get_cached_client(
-                    "auto", async_mode=async_mode, main_runtime=main_runtime, task=task)
-                effective_provider = _effective_provider_for_client(client, "auto")
+            client, final_model, effective_provider, fallback_label = resolve_unavailable_client(
+                task, resolved_provider, resolved_model, resolved_base_url, main_runtime, async_mode=async_mode)
+            if fallback_label:
+                resolved_provider = effective_provider
     if client is None:
         raise AuxiliaryClientUnavailable(f"No LLM provider configured for task={task} "
                                          f"provider={resolved_provider}. Run: hermes setup")
-    return _ResolvedAuxRoute(client, final_model, resolved_provider, effective_provider)
+    return _ResolvedAuxRoute(client, final_model, resolved_provider, effective_provider, fallback_label)
 
 
 class _PreparedAuxRequest(NamedTuple):
@@ -7507,6 +7523,7 @@ class _PreparedAuxRequest(NamedTuple):
     effective_timeout: float
     effective_extra_body: dict[str, Any]
     base_info: str
+    rebuild: Optional[Callable[[str, Any, Optional[str]], tuple[_FallbackDestination, dict[str, Any]]]] = None
 
 
 def _prepare_aux_request(
@@ -7517,16 +7534,15 @@ def _prepare_aux_request(
     extra_headers: Optional[dict[str, str]], api_mode: Optional[str],
     route_info: Optional[dict[str, str]], async_mode: bool,
 ) -> _PreparedAuxRequest:
-    """Shared head of call_llm/async_call_llm: resolve route + client, publish it, build request kwargs.
-    Sync-only: compression fast lane, per-request ``extra_headers``, and ``base_info`` falling
-    back to the resolved base_url when the client exposes none."""
+    """Resolve and publish the route and prepare kwargs for call_llm/async_call_llm.
+    Sync-only: compression fast lane, extra_headers and base_info fallback to resolved_base_url."""
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
-    client, final_model, resolved_provider, effective_provider = _resolve_call_client(
+    client, final_model, resolved_provider, effective_provider, fallback_label = _resolve_call_client(
         task, provider=provider, model=model, base_url=base_url, api_key=api_key,
         resolved_provider=resolved_provider, resolved_model=resolved_model,
         resolved_base_url=resolved_base_url, resolved_api_key=resolved_api_key,
@@ -7548,23 +7564,33 @@ def _prepare_aux_request(
             leak_guard_config=compression_config, max_tokens=max_tokens,
             extra_body=effective_extra_body,
         )
+
+    base_info = str(getattr(client, "base_url", "" if async_mode else resolved_base_url) or "")
+    if not async_mode and task:
+        logger.info("Auxiliary %s: using %s (%s)%s",
+                    task, request_provider or "auto", final_model or "default",
+                    f" at {base_info}" if base_info and "openrouter" not in base_info else "")
+    # Use the actual endpoint for temperature overrides on auto-detected routes.
+    rebuild = None
+    if fallback_label:
+        destination, kwargs, rebuild = _plan_fallback_candidate(
+            client, final_model, fallback_label, task=task, effective_timeout=effective_timeout,
+            apply_fast_lane=not async_mode, messages=messages, tools=tools, temperature=temperature,
+            max_tokens=max_tokens, effective_extra_body=effective_extra_body, reasoning_config=reasoning_config)
+        resolved_provider = request_provider = destination.provider
+        resolved_model = final_model = destination.model
+        resolved_base_url = base_info = destination.base_url
+        resolved_api_key = getattr(client, "api_key", None)
+        resolved_api_mode = destination.api_mode
+    else:
+        kwargs = _build_call_kwargs(
+            request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
+            tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+            reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task)
+    if no_progress_timeout is not None:
+        kwargs["no_progress_timeout"] = no_progress_timeout
     _set_relay_auxiliary_route(request_provider, final_model, resolved_api_mode)
     _record_route_info(route_info, _fallback_provider_from_label(request_provider), final_model)
-    if async_mode:
-        base_info = str(getattr(client, "base_url", "") or "")
-    else:
-        base_info = str(getattr(client, "base_url", resolved_base_url) or "")
-        if task:
-            logger.info("Auxiliary %s: using %s (%s)%s",
-                         task, request_provider or "auto", final_model or "default",
-                         f" at {base_info}" if base_info and "openrouter" not in base_info else "")
-    # Client's actual base_url so endpoint-specific temperature overrides work on
-    # auto-detected routes (api.moonshot.ai vs api.kimi.com/coding).
-    kwargs = _build_call_kwargs(
-        request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
-        reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task,
-        no_progress_timeout=no_progress_timeout)
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
@@ -7574,7 +7600,7 @@ def _prepare_aux_request(
     return _PreparedAuxRequest(
         client, final_model, kwargs, resolved_provider, request_provider, resolved_model,
         resolved_base_url, resolved_api_key, resolved_api_mode, effective_timeout,
-        effective_extra_body, base_info)
+        effective_extra_body, base_info, rebuild)
 
 
 class _LadderStep(NamedTuple):
@@ -7898,7 +7924,10 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
     is_capacity_error = any(
         predicate(first_err) for predicate, label in _FALLBACK_REASONS if label != "auth error")
-    task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
+    strict_chain = has_call_fallback_chain(task)
+    task_chain = call_fallback_chain(task, _get_auxiliary_task_config(task).get("fallback_chain")) if task else None
+    if strict_chain and not task_chain:
+        return None
     has_task_fallback_chain = isinstance(task_chain, list) and bool(task_chain)
     explicit_auth_with_task_chain = (
         reason == "auth error" and not is_auto and has_task_fallback_chain
@@ -7935,7 +7964,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
         failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
-    if fb_client is None and is_auto:
+    if fb_client is None and is_auto and not strict_chain:
         fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
@@ -7943,7 +7972,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason, failed_base_url=route.base_info,
                 failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
-    elif fb_client is None and not explicit_auth_with_task_chain:
+    elif fb_client is None and not explicit_auth_with_task_chain and not strict_chain:
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
@@ -7964,14 +7993,11 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             return fb_resp
         fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
             task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
-            task_chain_only=explicit_auth_with_task_chain)
-    # All fallback layers exhausted — one user-visible warning, then re-raise.
+            task_chain_only=explicit_auth_with_task_chain or strict_chain)
+    # All fallback layers exhausted: warn once before re-raising the primary error.
     logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
-                   # All fallback layers exhausted — emit a single user-visible warning so the operator
-                   # knows aux task is about to fail. (#26882) The error itself is re-raised below.
-                   # (#26882)
-                   "(fallback_chain + main agent model). Raising the primary error.",
-                   task or "call", tag, reason, resolved_provider)
+                   "(%s). Raising the primary error.", task or "call", tag, reason, resolved_provider,
+                   "per-call fallback_chain" if strict_chain else "fallback_chain + main agent model")
     return None
 
 
@@ -8073,8 +8099,9 @@ def call_llm(
     extra_headers: Optional[dict[str, str]] = None, api_mode: str | None = None, stream: bool = False,
     stream_options: dict | None = None, route_info: Optional[dict[str, str]] = None,
     latency_info: Optional[dict[str, int]] = None,
+    fallback_chain: Optional[list[dict[str, Any]]] = None, fallback_request_transform: Optional[Callable] = None,
 ) -> Any:
-    """Run an auxiliary LLM request, applying the configured task limit."""
+    """Run an auxiliary request. ``fallback_chain=None`` inherits task policy, ``[]`` disables hops."""
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -8083,9 +8110,10 @@ def call_llm(
     if latency_info is not None:
         latency_info["queue_wait_ms"] = _elapsed_ms(queue_started_at, request_started_at)
     prior_progress_hook = getattr(_aux_progress, "hook", None)
+    policy = CallFallbackPolicy(task, fallback_chain, fallback_request_transform)
     try:
         with (
-            scoped_runtime_main(main_runtime),
+            scoped_fallback_policy(policy), scoped_runtime_main(main_runtime),
             aux_progress_hook(
                 prior_progress_hook
                 if callable(prior_progress_hook)
@@ -8103,28 +8131,17 @@ def call_llm(
                 reasoning_config=reasoning_config, extra_headers=extra_headers, api_mode=api_mode,
                 stream=stream, stream_options=stream_options, route_info=route_info,
             )
-        if stream and semaphore is not None:
+        if stream and is_stream_response(response):
+            response = scoped_fallback_stream(response, policy, prior_progress_hook, main_runtime)
+        if stream and is_stream_response(response) and semaphore is not None:
             stream_semaphore = semaphore
             semaphore = None
-            return _release_sync_semaphore_after_stream(response, stream_semaphore)
+            return release_sync_semaphore_after_stream(response, stream_semaphore)
         return response
     finally:
         if latency_info is not None:
             latency_info["summary_generation_ms"] = _elapsed_ms(request_started_at)
         if semaphore is not None:
-            semaphore.release()
-
-
-def _release_sync_semaphore_after_stream(stream: Any, semaphore: threading.BoundedSemaphore):
-    """Release a permit only after a streaming response is consumed or closed."""
-    try:
-        yield from stream
-    finally:
-        try:
-            close = getattr(stream, "close", None)
-            if callable(close):
-                close()
-        finally:
             semaphore.release()
 
 
@@ -8136,10 +8153,8 @@ def _plan_aux_call(
     extra_headers: Optional[dict[str, str]], api_mode: Optional[str],
     route_info: Optional[dict[str, str]],
 ) -> tuple[_PreparedAuxRequest, dict[str, Any], dict[str, Any]]:
-    """Shared head of both call impls: prepare the request and bundle the kwargs the recovery
-    drivers pass to ``_retry_same_provider_*`` / ``_call_fallback_candidate_*``. One immutable
-    runtime snapshot for keying/resolution/retries/fallbacks, so a concurrent /model switch
-    can't mix key and client from different runtimes."""
+    """Prepare same-route retry inputs separately from next-destination logical inputs.
+    One runtime snapshot prevents concurrent /model switches mixing route credentials."""
     main_runtime = _normalize_main_runtime(main_runtime)
     req = _prepare_aux_request(
         task, provider=provider, model=model, base_url=base_url, api_key=api_key,
@@ -8157,6 +8172,7 @@ def _plan_aux_call(
         candidate_kwargs, resolved_base_url=req.resolved_base_url,
         resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
         main_runtime=main_runtime, final_model=req.final_model, extra_headers=extra_headers,
+        rebuild=req.rebuild, no_progress_timeout=req.kwargs.get("no_progress_timeout"),
     )
     return req, retry_kwargs, candidate_kwargs
 
@@ -8221,17 +8237,27 @@ def _call_llm_impl(
         extra_headers=extra_headers, api_mode=api_mode, route_info=route_info,
     )
     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
-    # Streaming path (MoA aggregator): return the raw SDK stream, skipping validation and
-    # the fallback chain (they assume a complete response); the caller owns reassembly/fallback.
+    def _recover(first_err: Exception) -> Any:
+        def _perform(step: _LadderStep) -> Any:
+            kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
+            if kind == "call":
+                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
+            if kind == "retry":
+                return _retry_same_provider_sync(**kw)
+            return _call_fallback_candidate_sync(*args, **kw)
+        return _drive_ladder(
+            _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
+            _perform)
+
     if stream:
-        kwargs["stream"] = True
+        stream_kwargs = {**kwargs, "stream": True}
         if stream_options:
-            kwargs["stream_options"] = stream_options
-        if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
-            # Responses-shim clients consume the stream internally and return a completed
-            # object Relay's managed stream would iterate; the MoA facade wraps it as one chunk.
-            return client.chat.completions.create(**kwargs)
-        return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
+            stream_kwargs["stream_options"] = stream_options
+        def _send_stream():
+            if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
+                return client.chat.completions.create(**stream_kwargs)
+            return _relay_sync_stream(client, stream_kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
+        return stream_with_recovery(_send_stream, _recover)
 
     def _primary(**validate_kw: Any) -> Any:
         # Retry on the same provider for a transient transport blip (connection reset / streaming-close /
@@ -8281,16 +8307,7 @@ def _call_llm_impl(
                     _last_transient = retry_transient
             raise _last_transient
     except Exception as first_err:
-        def _perform(step: _LadderStep) -> Any:
-            kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
-            if kind == "call":
-                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
-            if kind == "retry":
-                return _retry_same_provider_sync(**kw)
-            return _call_fallback_candidate_sync(*args, **kw)
-        return _drive_ladder(
-            _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
-            _perform)
+        return _recover(first_err)
 
 
 def _coerce_llm_message(response):

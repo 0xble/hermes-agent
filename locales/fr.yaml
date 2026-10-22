@@ -326,6 +326,7 @@ gateway:
     choice_show: "afficher le raisonnement dans les réponses"
     choice_hide: "masquer le raisonnement dans les réponses"
     set_global: "🧠 ✓ Effort de raisonnement défini sur `{effort}` (enregistré dans la configuration)\n_(prend effet au prochain message)_"
+    preset_owns_effort: "Le préréglage `{preset}` fixe l'effort de la route principale à `{preset_effort}`. `{effort}` s'applique aux autres modèles."
     set_global_save_failed: "🧠 ✓ Effort de raisonnement défini sur `{effort}` (session uniquement — échec de l'enregistrement de la configuration)\n_(prend effet au prochain message)_"
     set_session: "🧠 ✓ Effort de raisonnement défini sur `{effort}` (session uniquement — ajoutez `--global` pour persister)\n_(prend effet au prochain message)_"
     quote_label_discord: "-# 💭 Raisonnement"

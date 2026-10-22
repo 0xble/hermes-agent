@@ -15,6 +15,7 @@ synchronous.
 """
 
 import threading
+import time
 from types import SimpleNamespace
 
 from hermes_cli.model_switch import ModelSwitchResult
@@ -100,6 +101,15 @@ def _patch_deps(monkeypatch, printed):
     return cli_mod
 
 
+def _wait_for(predicate, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def test_confirm_runs_off_main_thread_when_tui_present(monkeypatch):
     """With ``_app`` set, the confirm modal must not block the caller's
     thread: the switch is dispatched on a worker thread and the command
@@ -132,6 +142,8 @@ def test_confirm_runs_off_main_thread_when_tui_present(monkeypatch):
     # The worker thread performs the confirm and completes the apply.
     assert ready.wait(timeout=10)
     assert called_on["is_main"] is False
+    # Confirm returns before the swap. Wait for the apply, not just the modal.
+    assert _wait_for(lambda: stub.agent.calls)
 
     # Apply still lands on CLI + agent state.
     assert stub.model == "claude-sonnet-4.6"
