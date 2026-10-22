@@ -122,17 +122,14 @@ def test_session_entry_role_round_trips_and_resume_repoint_keeps_it(tmp_path, mo
     assert store.get_model_role(entry.session_key) == "attended"
 
 
-def test_new_clears_persisted_role(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_new_clears_persisted_role(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch)
     entry = store.get_or_create_session(_source())
     store.set_model_role(entry.session_key, "attended")
-    runner = object.__new__(GatewayRunner)
-    runner.session_store = store
-    runner._peek_session_state = lambda _key: SimpleNamespace(
-        conversation=ConversationState(model_role="attended"), persistent=SimpleNamespace(),
-    )
+    runner, _states = _runner(store)
 
-    runner._clear_conversation_scope(entry.session_key, reason="session_reset")
+    await runner._clear_conversation_scope_async(entry.session_key, reason="session_reset")
 
     assert store.get_model_role(entry.session_key) is None
 
@@ -273,6 +270,10 @@ async def test_model_role_alone_sets_hold(tmp_path, monkeypatch):
     runner, _states = _runner(store)
     monkeypatch.setattr("gateway.run._load_gateway_config", _attended_cfg)
 
+    runner._perform_model_switch = AsyncMock(return_value=(SimpleNamespace(
+        new_model="fast-model", target_provider="openrouter", model_info=None, api_key="", base_url="",
+    ), None))
+    runner._model_selection_warning = AsyncMock(return_value=None)
     reply = await runner._handle_model_command_locked(_event("/model @fast"))
 
     assert "@fast" in reply and reply.startswith("✓")
@@ -354,7 +355,8 @@ async def test_migration_returns_converted_keys_and_skips_roles():
         set_model_role=MagicMock(),
     )
     runner, states = _runner(store)
-    states[converted_key] = SimpleNamespace(conversation=ConversationState(model_override={"model": "picked"}))
+    states[converted_key] = runner._session_state(converted_key)
+    states[converted_key].conversation.model_override = {"model": "picked"}
 
     converted, failures = await runner._migrate_telegram_model_overrides_to_role("attended")
 
@@ -418,8 +420,9 @@ async def test_migration_persists_every_conversion_in_one_routing_write():
         set_model_role=MagicMock(side_effect=AssertionError("per-session persist")),
     )
     runner, states = _runner(store)
-    states[first] = SimpleNamespace(conversation=ConversationState(model_override={"model": "picked-a"}))
-    states[second] = SimpleNamespace(conversation=ConversationState())
+    states[first] = runner._session_state(first)
+    states[first].conversation.model_override = {"model": "picked-a"}
+    states[second] = runner._session_state(second)
 
     converted, failures = await runner._migrate_telegram_model_overrides_to_role("attended")
 

@@ -84,6 +84,15 @@ class TurnRunner:
     def __init__(self, runner: GatewayRunner, ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        # Bind assignment to the turn, not its config. Role destinations reload per API call.
+        state = runner._peek_session_state(ctx.session_key)
+        self._model_assignment = {
+            **runner._snapshot_session_model_override(ctx.session_key),
+            "model_role": state.conversation.model_role if state is not None else None,
+            "model_scope": runner._session_model_override_scope(ctx.session_key),
+            "reasoning_override": runner._session_reasoning_override(ctx.session_key),
+            "reasoning_scope": state.conversation.reasoning_override_scope if state is not None else "session",
+        }
         from gateway.status_delivery import StatusDelivery
         self._status_delivery = StatusDelivery(ctx, lambda: runner._delivery_adapter_for(ctx.source))
         ctx._status_delivery = self._status_delivery
@@ -1391,39 +1400,6 @@ class TurnRunner:
         agent.request_overrides = overrides
         agent._gateway_turn_request_overrides = turn_overrides
 
-    def _attended_request_context_too_large(self, agent, loop_state, *, model, runtime) -> bool:
-        """Return whether the current request is already at the default route's compaction trigger."""
-        compressor = getattr(agent, "context_compressor", None)
-        if compressor is None or loop_state is None:
-            return False
-        try:
-            request_tokens = getattr(loop_state, "request_pressure_tokens", None)
-            if not isinstance(request_tokens, int) or request_tokens <= 0:
-                from agent.model_metadata import estimate_request_tokens_rough
-                request_tokens = int(estimate_request_tokens_rough(
-                    getattr(loop_state, "messages", []) or [],
-                    system_prompt=getattr(loop_state, "active_system_prompt", "") or "",
-                    tools=getattr(agent, "tools", None) or None,
-                ))
-            context_length = int(runtime.get("context_length", 0) or 0)
-            if context_length <= 0:
-                from agent.model_metadata import get_model_context_length
-                context_length = int(get_model_context_length(
-                    model, base_url=runtime.get("base_url", "") or "",
-                    api_key=runtime.get("api_key", "") or "",
-                    provider=runtime.get("provider", "") or "",
-                    api_mode=runtime.get("api_mode", "") or "",
-                ))
-            preview = getattr(compressor, "preview_threshold_tokens", None)
-            if callable(preview):
-                threshold = int(preview(model, context_length, runtime.get("provider", "") or ""))
-            else:
-                threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
-            return threshold > 0 and request_tokens >= threshold
-        except Exception:
-            logger.debug("attended destination context threshold lookup failed", exc_info=True)
-            return False
-
     def _apply_attended_before_api_call(self, agent, loop_state=None, *, commit=True):
         """Apply a changed desired route at the real request boundary, never on fallback retries."""
         runner = self._runner
@@ -1445,10 +1421,15 @@ class TurnRunner:
                     setattr(runner, name, value)
 
         try:
+            from gateway.run import _load_gateway_config
+            profile_home = (runner._resolve_profile_home_for_source(ctx.source)
+                            if getattr(getattr(runner, "config", None), "multiplex_profiles", False) else None)
+            boundary_config = _load_gateway_config(profile_home / "config.yaml") if profile_home else _load_gateway_config()
+            assignment = getattr(self, "_model_assignment", None)
             decision = runner._attended_resolution_for_session(
-                source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+                source=ctx.source, session_key=ctx.session_key, user_config=boundary_config,
                 override=(runner._session_model_override(ctx.session_key) if ctx.session_key else None),
-                allow_switch_back=commit,
+                allow_switch_back=commit, assignment=assignment,
             )
             if decision is None:
                 return
@@ -1482,20 +1463,24 @@ class TurnRunner:
                 snapshot = getattr(runner, "_snapshot_session_runtime_state", None)
                 if callable(snapshot):
                     _override, _last_model, _ = snapshot(ctx.session_key)
+                    _override = (assignment or {}).get("override", _override)
                     model, runtime, _notice, _cache_model = runner._load_session_agent_runtime(
-                        source=ctx.source, skey=ctx.session_key, user_config=ctx.user_config,
+                        source=ctx.source, skey=ctx.session_key, user_config=boundary_config,
                         config=getattr(runner, "config", None), override=_override,
                         last_model=_last_model, attended_route=None,
                     )
                 else:
                     model, runtime = runner._resolve_session_agent_runtime(
-                        source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+                        source=ctx.source, session_key=ctx.session_key, user_config=boundary_config,
+                        assignment=assignment,
                     )
             else:
                 model, runtime = runner._resolve_session_agent_runtime(
-                    source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+                    source=ctx.source, session_key=ctx.session_key, user_config=boundary_config,
+                    assignment=assignment,
                 )
-            if commit and decision.switched_back and self._attended_request_context_too_large(
+            from gateway.attended_model import attended_request_context_too_large
+            if commit and decision.switched_back and attended_request_context_too_large(
                 agent, loop_state, model=model, runtime=runtime,
             ):
                 log_decision = getattr(runner, "_log_attended_decision", None)
@@ -1543,7 +1528,7 @@ class TurnRunner:
                     agent, model, runtime.get("provider", agent.provider), runtime.get("api_key", ""),
                     runtime.get("base_url", ""), runtime.get("api_mode", ""), runtime.get("capabilities"),
                 )
-            if decision.switched_back and decision.reasoning_effort:
+            if decision.reasoning_effort:
                 # The committed decision already carries the destination effort. Re-resolving here
                 # would read session state whose handoff to the gateway loop may not have landed yet,
                 # and could pair the default model with the attended route's effort.
@@ -1552,6 +1537,7 @@ class TurnRunner:
             else:
                 agent.reasoning_config = runner._resolve_session_reasoning_config(
                     source=ctx.source, session_key=ctx.session_key, model=model,
+                    user_config=boundary_config, assignment=assignment,
                 )
             _persist_committed_route_marker()
             agent._gateway_attended_decision_key = desired_key

@@ -309,8 +309,9 @@ def resolve_attended_model(
                 raise ValueError("role has no configured model")
         except (ValueError, TypeError) as exc:
             logger.warning("model_role @%s fallback=default: %s", model_role, exc)
-            model_role = ""
-    active = cfg.enabled and (new_session or is_active(
+            role_route = None
+    # An invalid hold has an explicit default fallback, not automatic attended routing.
+    active = not (model_role and role_route is None) and cfg.enabled and (new_session or is_active(
         get("last_user_activity_at"), now=now_value, idle_revert_minutes=cfg.idle_revert_minutes
     ))
 
@@ -391,6 +392,40 @@ def is_genuine_user_message(event: Any) -> bool:
     if str(getattr(platform, "value", platform) or "").lower() in {"automation", "cron", "goal_wakeup", "kanban", "subagent", "system"}:
         return False
     return True
+
+
+def attended_request_context_too_large(agent, loop_state, *, model, runtime) -> bool:
+    """Return whether the current request is already at the default route's compaction trigger."""
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None or loop_state is None:
+        return False
+    try:
+        request_tokens = getattr(loop_state, "request_pressure_tokens", None)
+        if not isinstance(request_tokens, int) or request_tokens <= 0:
+            from agent.model_metadata import estimate_request_tokens_rough
+            request_tokens = int(estimate_request_tokens_rough(
+                getattr(loop_state, "messages", []) or [],
+                system_prompt=getattr(loop_state, "active_system_prompt", "") or "",
+                tools=getattr(agent, "tools", None) or None,
+            ))
+        context_length = int(runtime.get("context_length", 0) or 0)
+        if context_length <= 0:
+            from agent.model_metadata import get_model_context_length
+            context_length = int(get_model_context_length(
+                model, base_url=runtime.get("base_url", "") or "",
+                api_key=runtime.get("api_key", "") or "",
+                provider=runtime.get("provider", "") or "",
+                api_mode=runtime.get("api_mode", "") or "",
+            ))
+        preview = getattr(compressor, "preview_threshold_tokens", None)
+        if callable(preview):
+            threshold = int(preview(model, context_length, runtime.get("provider", "") or ""))
+        else:
+            threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
+        return threshold > 0 and request_tokens >= threshold
+    except Exception:
+        logger.debug("attended destination context threshold lookup failed", exc_info=True)
+        return False
 
 
 def expiry_time(last_user_activity_at: Any, idle_revert_minutes: float) -> Optional[float]:

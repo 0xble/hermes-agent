@@ -1015,6 +1015,7 @@ class SessionStore(
         from dataclasses import replace
         normalized = str(role).strip().lower() if role else None
         updated_keys: list[str] = []
+        replacements = {}
         with self._lock:
             self._ensure_loaded_locked()
             data, generation = self._snapshot_routing_locked()
@@ -1026,11 +1027,15 @@ class SessionStore(
                 if clear_overrides:
                     updated = replace(updated, model_override=None, reasoning_override=None,
                                       model_override_scope="session", reasoning_override_scope="session")
+                if updated == entry:
+                    continue
                 data[session_key] = updated.to_dict()
-                self._entries[session_key] = updated
+                replacements[session_key] = updated
                 updated_keys.append(session_key)
             if updated_keys:
+                # Keep live and durable routing on the old snapshot if both writers fail.
                 self._persist_routing_data(data, generation)
+                self._entries.update(replacements)
         return updated_keys
 
     def has_any_sessions(self) -> bool:

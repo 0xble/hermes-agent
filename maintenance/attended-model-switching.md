@@ -20,7 +20,31 @@ on every session. A durable `/model X` or `/model X --session` replaces the
 role; `/model X --once` wins for that turn and leaves the role in place. A
 `/reasoning default` or `/reasoning reset` removes the persisted reasoning
 pick. Plain picks remain temporary while attended switching is enabled and
-expire after the idle window.
+expire after the idle window. Temporary picks preserve a named hold and expire
+back to it, just as `--once` preserves it.
+
+Role assignment is bound to a turn, not to its starting config snapshot. Busy
+topic edits and bulk conversions take effect next turn. At each real request,
+the current assignment follows fresh model, provider and reasoning config from
+the owning profile through the existing preset loaders. An empty `@attended`
+or deleted preset falls back coherently to the configured channel/default
+route, without triggering automatic attended routing or deferring to a prior
+attended decision.
+
+Role destinations pass the existing cost, data-training and context-cache
+selection guards before publication. Slash confirmation retains the role
+reference, not the transiently resolved concrete destination.
+
+Role writes share the concrete override lock, epoch fences and cancellation
+settlement path. A successful role edit invalidates pending one-turn restores.
+Bulk conversion locks eligible routing keys in stable order, rechecks their
+eligibility after waiting, then persists one staged snapshot before publishing
+live replacements. If authoritative and fallback persistence both fail, neither
+memory nor durable routing changes, including on a later unrelated save.
+
+New/reset boundaries await changed role persistence off-loop. Resume and
+compression repoints preserve the hold. Unchanged role state is not rewritten,
+and compression-exhaustion reset reuses its already-held override lock.
 
 `telegram_topic` model edits are explicit operator picks, not ambient topic
 configuration. They use the same session model-override store and default
@@ -89,6 +113,9 @@ expiry, persisted activity timestamps, and boundary-only idle expiry. A new genu
 
 ## Verification
 
+Run `tests/gateway/test_model_role_lifecycle.py` for request-boundary profile
+edits, busy assignment timing, stale hydration/one-turn restores, failed
+snapshot publication, transient selection guards and guarded async boundaries.
 Run the role-hold lifecycle suite, topic tool suite, session and session-store suites,
 and the attended model unit and turn-runner tests together with the gateway regression tests that exercise session limits, Telegram topic admission, reaped-session recovery, cron estop, fallback notices, reasoning flags, and status rehydration. Run `scripts/check_fork_patches.py --repo . --source-only` to verify trailer ownership.
 

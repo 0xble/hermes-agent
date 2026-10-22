@@ -156,7 +156,13 @@ async def _resolve_model(runner, source: SessionSource, spec: TopicSpec, session
             raise TopicRequestError(
                 f"model {spec.model.strip()!r} is a role, which carries its own provider. "
                 "Drop provider, or pass a concrete model.")
-        _resolve_topic_model_ref(spec.model.strip(), source, runner)
+        route = _resolve_topic_model_ref(spec.model.strip(), source, runner)
+        if route.model:
+            _ctx, _result, error = await runner.resolve_session_model_selection(
+                source, route.model, route.provider, session_key=session_key,
+            )
+            if error:
+                raise TopicRequestError(error)
         return ("role", spec.model.strip()[1:].strip().lower())
     ctx, result, error = await runner.resolve_session_model_selection(
         source, spec.model, spec.provider, session_key=session_key)
@@ -212,7 +218,7 @@ async def _apply_session_settings(
         if isinstance(model, tuple) and model and model[0] == "role":
             role = model[1]
             await runner._set_session_model_role(entry.session_key, role)
-            model_status = "applied"
+            model_status = "queued" if runner._is_session_running(entry.session_key) else "applied"
             model_effective_when = "next_turn"
         else:
             ctx, result = model
