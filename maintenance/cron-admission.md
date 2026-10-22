@@ -15,8 +15,9 @@ next eligibility spends 30 seconds of headroom before the natural interval.
 All other schedules retain their existing rearm calculation.
 
 Each profile's existing FIFO general executor keeps `cron.max_parallel_jobs`
-(default 4). Add exactly 1 reserved worker, select the first protected job in
-store order, and never admit that selected job to the general executor.
+(default 4). Add exactly 1 reserved worker, select the first enabled, unpaused,
+nonterminal protected job in store order, and never admit that selected job to
+the general executor.
 Additional protected jobs log an error once per loaded class and use the
 general executor best-effort in its unchanged FIFO order. A long protected run
 must not occupy a general worker or overlap another instance of itself.

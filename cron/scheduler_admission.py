@@ -20,7 +20,11 @@ _SLOT_WAKE_CHECK_SECONDS = 0.25
 
 def reserved_job_id(jobs: list[dict], home) -> str | None:
     """Select in store order, not due order, so a later deadline cannot steal the reservation."""
-    eligible = tuple(str(job["id"]) for job in jobs if is_protected_interval(job))
+    from cron.jobs import is_job_runnable, is_terminal_job
+
+    eligible = tuple(
+        str(job["id"]) for job in jobs
+        if is_protected_interval(job) and is_job_runnable(job) and not is_terminal_job(job))
     key = hermes_home_key(home)
     if _loaded_protected.get(key) != eligible:
         _loaded_protected[key] = eligible
@@ -87,7 +91,7 @@ def _release_unsubmitted(key, token) -> None:
 
 
 def worker_released(inflight_key: tuple) -> None:
-    """Called only AFTER release_running_job has passed the detached-process exit fence."""
+    """Called only AFTER the running claim passes the detached-process exit fence."""
     with _lock:
         claim = _reserved_claims.get(inflight_key[0])
         if claim is not None and claim[0] == inflight_key[1]:
@@ -120,9 +124,10 @@ def next_due_wait(max_wait: float) -> float:
 
     wait = max_wait
     now = jobs._hermes_now().timestamp()
+    # Reload after dispatch: workers may have completed and rearmed since reservation selection.
     for job in jobs.load_jobs():
-        if (not job.get("enabled", True) or jobs._has_pause_marker(job)
-                or jobs.is_terminal_job(job) or scheduler.is_job_running(job["id"])):
+        if (not jobs.is_job_runnable(job) or jobs.is_terminal_job(job)
+                or scheduler.is_job_running(job["id"])):
             continue
         due = jobs._parse_aware(job.get("next_run_at"))
         if due is not None and due.timestamp() > now:
@@ -174,34 +179,6 @@ def wait_for_tick(stop_event, timeout: float) -> None:
         if remaining <= 0:
             return
         stop_event.wait(min(remaining, _SLOT_WAKE_CHECK_SECONDS))
-
-
-def _inflight_min_allowance_minutes() -> float:
-    """Stale allowance floor (min): ``cron.inflight_max_minutes``, else env escape hatch/default."""
-    import contextlib
-    from cron import scheduler as _sched
-
-    with contextlib.suppress(Exception):
-        _ucfg = _sched.load_config() or {}
-        _cfg_val = (
-            _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
-        ).get("inflight_max_minutes")
-        if _cfg_val is not None:
-            val = float(_cfg_val)
-            if val > 0:
-                return val
-    raw = _sched.cron_env_setting("HERMES_CRON_INFLIGHT_MAX_MINUTES").strip()
-    if raw:
-        try:
-            val = float(raw)
-            if val > 0:
-                return val
-        except (ValueError, TypeError):
-            _sched.logger.warning(
-                "Invalid HERMES_CRON_INFLIGHT_MAX_MINUTES=%r; using default %s",
-                raw,
-                _sched._INFLIGHT_MIN_ALLOWANCE_MINUTES)
-    return _sched._INFLIGHT_MIN_ALLOWANCE_MINUTES
 
 
 def completion_next_run(job: dict, next_run: str | None) -> str | None:

@@ -739,7 +739,6 @@ def _wedged_inflight_keys() -> frozenset[tuple]:
         allowances = {key: _running_allowance_s[key] for key in ages if key in _running_allowance_s}
     if not ages:
         return frozenset()
-    from cron.scheduler_admission import _inflight_min_allowance_minutes
     floor_seconds = _inflight_min_allowance_minutes() * 60.0
     unresolved = [key for key in ages if key not in allowances]
     if unresolved:
@@ -890,21 +889,51 @@ def release_running_job(
                 except Exception:
                     # Unknown liveness remains fenced; the reaper owns the forced path.
                     return
-        _running_registration_owners.pop(key, None)
-        _running_job_ids.discard(key)
-        _running_since.pop(key, None)
-        _running_allowance_s.pop(key, None)
-        _running_futures.pop(key, None)
-        _running_cancel_events.pop(key, None)
-        _running_worker_pids.pop(key, None)
-        _external_worker_claims.pop(key, None)
-        _scope_isolated_job_ids.discard(key)
-        _external_worker_modes.pop(key, None)
-        # A later registration of this key must not inherit restart-safe classification.
-        _restart_safe_waiter_job_ids.discard(key)
-        _restart_safe_external_worker_job_ids.discard(key)
-        from cron.scheduler_admission import worker_released
-        worker_released(key)
+        _drop_running_claim(key)
+
+
+def _drop_running_claim(key) -> None:
+    """Drop a fenced claim under ``_running_lock`` and return its admission slot."""
+    _running_registration_owners.pop(key, None)
+    _running_job_ids.discard(key)
+    _running_since.pop(key, None)
+    _running_allowance_s.pop(key, None)
+    _running_futures.pop(key, None)
+    _running_cancel_events.pop(key, None)
+    _running_worker_pids.pop(key, None)
+    _external_worker_claims.pop(key, None)
+    _scope_isolated_job_ids.discard(key)
+    _external_worker_modes.pop(key, None)
+    # A later registration of this key must not inherit restart-safe classification.
+    _restart_safe_waiter_job_ids.discard(key)
+    _restart_safe_external_worker_job_ids.discard(key)
+    from cron.scheduler_admission import worker_released
+    worker_released(key)
+
+
+def _inflight_min_allowance_minutes() -> float:
+    """Stale allowance floor (min): ``cron.inflight_max_minutes``, else env escape hatch/default."""
+    with contextlib.suppress(Exception):
+        _ucfg = load_config() or {}
+        _cfg_val = (
+            _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
+        ).get("inflight_max_minutes")
+        if _cfg_val is not None:
+            val = float(_cfg_val)
+            if val > 0:
+                return val
+    raw = cron_env_setting("HERMES_CRON_INFLIGHT_MAX_MINUTES").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_INFLIGHT_MAX_MINUTES=%r; using default %s",
+                raw,
+                _INFLIGHT_MIN_ALLOWANCE_MINUTES)
+    return _INFLIGHT_MIN_ALLOWANCE_MINUTES
 
 
 # expr -> minutes; cadence never changes, so avoid re-evaluating croniter every tick.
@@ -1079,7 +1108,6 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
     global _forced_release_count
 
     by_id = {j.get("id"): j for j in (due_jobs or []) if isinstance(j, dict)}
-    from cron.scheduler_admission import _inflight_min_allowance_minutes
     floor_seconds = _inflight_min_allowance_minutes() * 60.0
     now = time.time()
     stale: list = []
@@ -1130,22 +1158,7 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
                 reason = "age"
             else:
                 continue
-            _running_registration_owners.pop(key, None)
-            _running_job_ids.discard(key)
-            _running_since.pop(key, None)
-            _running_allowance_s.pop(key, None)
-            _running_futures.pop(key, None)
-            _running_cancel_events.pop(key, None)
-            # The worker behind any external claim has exited (checked above). Drop all of its
-            # worker metadata so a successor neither stays blocked by the dead claim's owner nor
-            # inherits its restart-safe mode, scope or PID.
-            if external_claim is not None:
-                _external_worker_claims.pop(key, None)
-                _external_worker_modes.pop(key, None)
-                _scope_isolated_job_ids.discard(key)
-                _restart_safe_waiter_job_ids.discard(key)
-                _restart_safe_external_worker_job_ids.discard(key)
-                _running_worker_pids.pop(key, None)
+            _drop_running_claim(key)
             _forced_release_count += 1
             stale.append((job_id, age, allowance, fut, reason))
 

@@ -166,6 +166,59 @@ def test_second_protected_job_is_logged_and_uses_general_fifo(clock_home, monkey
         release.set()
 
 
+@pytest.mark.parametrize("inactive", [
+    {"enabled": False}, {"state": "paused"}, {"paused_at": "2030-01-01T00:00:00+00:00"},
+    {"state": "completed"}, {"state": "error"},
+])
+def test_inactive_protected_job_does_not_take_reservation(clock_home, monkeypatch, caplog, inactive):
+    first, active = make_job(), make_job()
+    first.update(inactive)
+    monkeypatch.setattr(jobs, "load_jobs", lambda: [first, active])
+    started = []
+    futures = admission.submit_due_jobs(
+        [active], scheduler._get_parallel_pool(4),
+        lambda item: started.append(threading.current_thread().name))
+    assert len(futures) == 1
+    futures[0].result(5)
+    assert started[0].startswith("cron-reserved")
+    assert not any("only 1 reserved worker" in record.message for record in caplog.records)
+
+
+def test_sweep_returns_reserved_slot_after_detached_process_exit(clock_home):
+    protected = make_job()
+    exited = threading.Event()
+    process = _process_until_exit(exited)
+    key = scheduler._inflight_key(protected["id"])
+    owners = []
+
+    def handed_off(item):
+        with scheduler._running_lock:
+            owner = scheduler._running_registration_owners[key]
+            owners.append(owner)
+            scheduler._external_worker_claims[key] = (owner, process)
+        executions.finish_execution(item["execution_id"], success=True)
+        return True
+
+    try:
+        future = admission.submit_reserved(protected, handed_off)
+        assert future is not None
+        assert future.result(5)
+        # A finished waiter and terminal ledger row still cannot release a live process.
+        assert scheduler.sweep_stale_inflight([protected]) == []
+        assert admission.submit_reserved(protected, lambda item: True) is None
+        exited.set()
+        assert scheduler.sweep_stale_inflight([protected]) == [protected["id"]]
+        assert not scheduler.is_job_running(protected["id"])
+        # The late reaper sees no matching owner after the sweep has removed the claim.
+        scheduler.release_running_job(protected["id"], owner=owners[0], force=True)
+        successor = admission.submit_reserved(protected, lambda item: True)
+        assert successor is not None
+        assert successor.result(5)
+    finally:
+        exited.set()
+        scheduler.release_running_job(protected["id"], owner=owners[0], force=True)
+
+
 def test_long_protected_run_has_one_instance_and_rearms_from_completion(clock_home, monkeypatch):
     protected = set_due(make_job(), clock_home.now)
     release, started = threading.Event(), threading.Event()
