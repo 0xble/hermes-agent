@@ -244,6 +244,7 @@ def install(clock: VirtualClock, control: Control, setattr_fn=setattr) -> None:
     from cron import executions
     from cron import jobs
     from cron import scheduler
+    from cron import scheduler_admission
     import hermes_time
     from tools import send_message_tool
 
@@ -251,6 +252,8 @@ def install(clock: VirtualClock, control: Control, setattr_fn=setattr) -> None:
     proxy = _TimeProxy(clock)
     for module in (jobs, scheduler, executions):
         setattr_fn(module, "time", proxy)
+    # Gates step whole ticker waits, not the interruptible wait's polling slices.
+    setattr_fn(scheduler_admission, "wait_for_tick", lambda stop, timeout: stop.wait(timeout))
     setattr_fn(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", HEARTBEAT_REAL_SECONDS)
     setattr_fn(scheduler, "run_job", FakeAgent(clock, control))
     setattr_fn(send_message_tool, "_send_to_platform", FakeSink(clock, control))
