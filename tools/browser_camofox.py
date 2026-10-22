@@ -662,6 +662,8 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
                 _release_protected_tab_binding(task_id, session)
                 return session
         camofox_cfg = _get_camofox_config()
+        # Positive provenance only: external userIds and their groups may belong to another app.
+        hermes_identity = identity is not None
         managed, adopt, adopt_any = True, True, False  # Hermes-derived identities own their tabs
         if identity is None:
             identity = _camofox_identity_override(task_id, camofox_cfg)
@@ -669,15 +671,17 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
                 adopt = adopt_any = _flag("CAMOFOX_ADOPT_EXISTING_TAB", camofox_cfg, "adopt_existing_tab")
         if identity is None and _managed_persistence_enabled(camofox_cfg):
             identity = get_camofox_identity(task_id)
+            hermes_identity = True
         if identity is None:
             identity = {"user_id": f"hermes_{uuid.uuid4().hex[:10]}", "session_key": f"task_{task_id[:16]}"}
+            hermes_identity = True
             managed, adopt = False, False
         # ``fresh``: never bound in this process (new task or gateway restart), so a page action
         # may adopt its tab. A binding cleared later (stale tab, quarantine, release, another
         # task's handoff) is rebound only by navigation, never silently replaced.
         session = {"user_id": identity["user_id"], "tab_id": None, "session_key": identity["session_key"],
                    "task_id": task_id or "default", "managed": managed, "adopt_existing_tab": adopt,
-                   "adopt_any": adopt_any, "account": account, "fresh": True}
+                   "adopt_any": adopt_any, "hermes_identity": hermes_identity, "account": account, "fresh": True}
         _sessions[task_id] = session
         return session
 
@@ -1328,9 +1332,10 @@ def camofox_tabs(tab_id: Optional[str] = None, task_id: Optional[str] = None) ->
                 if key[:3] == (hermes_home_key(), task, get_camofox_url())
                 and record["user_id"] == session["user_id"]}
             eligible = (roots & by_id.keys()) - refused
-            # Only our unique task group is safe without explicit opener metadata.
+            # A group proves affinity only under a positively Hermes-derived identity.
             group = session.get("session_key")
-            if group and group not in {SHARED_IDENTITY_GROUP, "__popups__"} and not session.get("adopt_any"):
+            if (session.get("hermes_identity") and group
+                    and group not in {SHARED_IDENTITY_GROUP, "__popups__"} and not session.get("adopt_any")):
                 eligible |= {tid for tid, tab in by_id.items()
                              if tab.get("listItemId") == group and tid not in refused}
             while descendants := {tid for tid, tab in by_id.items()
