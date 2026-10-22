@@ -172,6 +172,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Backup, state, and tooling | Truthful backups, schema rehearsal, per-job timezone, fork maintenance scripts | Backup, cron scheduling, context ports, or maintenance script changes | [Backup and tooling](maintenance/backup-and-tooling.md) |
 | Quick snapshot recovery | Bound partial captures while retaining verified recovery generations | Quick-snapshot capture, pruning, or restore changes; read Backup and tooling too | [Quick snapshot recovery](maintenance/quick-snapshot-recovery.md) |
 | Hindsight memory provider | Keep the provider constructible before `initialize()`, retire memory workers on soft agent eviction, and coalesce Hindsight prefetch | Memory plugin lifecycle, retain strategy, cron-exclusion, agent-cache eviction, or prefetch changes | [Hindsight memory](maintenance/hindsight-memory.md) |
+| Auxiliary fallback configuration | Recognize runtime-read fallback chains without config backfill or invalid preset saves | Auxiliary config defaults, fallback chains, or preset reference persistence | [Auxiliary fallback configuration](maintenance/auxiliary-fallback-config.md) |
 | Auxiliary overload fallback | Route status-less provider overloads through configured auxiliary fallback | Auxiliary error classification or fallback-chain changes | [Auxiliary overload fallback](maintenance/auxiliary-overload-fallback.md) |
 | Compression route deadline | Preserve auxiliary compression fallback at the shared route deadline | Compression worker cancellation, deadline, or fallback changes | [Compression route deadline](maintenance/compression-route-deadline.md) |
 | Compression pool saturation | A full compression pool defers instead of spending a compression attempt | Pool admission, transient compression signals, or preflight attempt accounting | [Compression pool saturation](maintenance/compression-pool-saturation.md) |
@@ -414,6 +415,15 @@ Fork patch identity: `internal-followup-retirement`.
 - **Source surfaces:** `gateway/run_pending_recovery.py`, `gateway/run_restart_recovery.py`, `gateway/run_turn.py`, `locales/*.yaml` (`followup_declined_notice`, `followup_possible_duplicate_notice`), `gateway/platforms/base.py`, `gateway/session_transcript.py`, `hermes_state_messages.py`, `gateway/shutdown_flush.py`, `tests/gateway/test_shutdown_followup_restart.py`, and `tests/gateway/test_proxy_mode.py`.
 - **Focused regression:** `uv run --offline --group dev pytest -q -p no:cacheprovider tests/gateway/test_restart_recovery_outcomes.py tests/gateway/test_restart_resume_admission_identity.py tests/gateway/test_restart_resume_pending.py tests/gateway/test_restart_resume_policy.py tests/gateway/test_restart_resume_real_adapter.py tests/gateway/test_shutdown_followup_restart.py`.
 - **Rollback:** Revert the commit carrying `Fork-Patch: internal-followup-retirement`.
+
+Fork-Patch: web-search-cost-controls.
+
+- **Patch identity:** `web-search-cost-controls`.
+- **Behavior:** Deduplicate successful paid web searches across concurrent Hermes processes with route-aware cache identity, keep rescued or failed responses out of the cache, and surface warn-only per-session request thresholds. Keyed and keyless ring routes, opt-in Tavily tiers, Parallel search modes, and direct and managed Perplexity routes remain isolated. Billed managed Firecrawl fallback attempts count toward the same session warning budget.
+- **Source surfaces:** `tools/web_tools.py`, `tools/web_result_cache.py`, `tools/web_tools_rescue.py`, and focused web-tool tests.
+- **Focused regression:** `scripts/run_tests.sh tests/tools/test_web_result_cache.py tests/tools/test_web_keyless_rescue.py tests/tools/test_web_providers.py`.
+- **Retirement:** Remove when released upstream provides equivalent cross-process paid-search deduplication, route-aware cache identity, and visible warning behavior.
+- **Rollback:** Revert the commit carrying `Fork-Patch: web-search-cost-controls`.
 
 ## Update
 

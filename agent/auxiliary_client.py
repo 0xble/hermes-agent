@@ -4457,7 +4457,7 @@ def _try_configured_fallback_chain(
     task: Optional[str], failed_provider: str, reason: str = "error", failed_model: Optional[str] = None, *,
     failed_base_url: str = "", failure_scope: Any = None,
 ) -> tuple[Optional[Any], Optional[str], str]:
-    """Try auxiliary.<task>.fallback_chain entries in order (each needs ``provider``; model/base_url/api_key optional).
+    """Try auxiliary.<task>.fallback_chain entries in order (each needs ``provider`` and ``model``; base_url/api_key optional).
     ``failed_model`` scoping per ``_failed_backend_skip`` (sibling models on the same provider still
     run after a model-scoped failure). Returns (client, model, provider_label) or (None, None, "")."""
     if not task:
