@@ -1704,7 +1704,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                 ),
                 timeout=budget,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "Interrupted-agent memory flush exceeded %.2fs; queued provider writes may be lost",
                 budget,
@@ -2728,7 +2728,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         return max(0.1, bound - min(1.0, max(0.5, bound / 3.0)))
 
     async def _stop_finalize_agents_and_adapters(
-        self, ctx: "GatewayShutdownMixin._StopContext",
+        self, ctx: GatewayShutdownMixin._StopContext,
         *, stop_event: Optional[threading.Event] = None,
         deadline: Optional[float] = None,
         agent_deadline: Optional[float] = None,
@@ -2802,7 +2802,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                         await _cleanup
                     else:
                         await asyncio.wait_for(_cleanup, timeout=_remaining)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pre_teardown_cancelled = True
                     logger.warning("Shutdown idle-cache cleanup reached its agent deadline")
                     break
@@ -3028,9 +3028,6 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         from utils import atomic_json_write
         if getattr(self, "_startup_cleanup_only", False):  # start never ran: keep startup_failed + crash markers
             return _shutdown_gateway_health_export(self)
-        from gateway.status import remove_pid_file, release_gateway_runtime_lock
-        remove_pid_file()
-        release_gateway_runtime_lock()
         # Clean-shutdown marker skips crash recovery; timed-out drains leave no marker.
         if not ctx.timed_out and not getattr(self, "_suppress_clean_shutdown_receipt", False):
             from gateway.zero_cut_standby import is_standby

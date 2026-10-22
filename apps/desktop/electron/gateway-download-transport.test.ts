@@ -1,13 +1,13 @@
 import fs from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
-import os from 'node:os'
 import path from 'node:path'
 
 import { expect, test } from 'vitest'
 
 import { destroyKeepaliveAgents } from './api-transport'
 import { downloadViaTokenToFile } from './gateway-download-transport'
+import { shortSocketTmpDir } from './local-gateway.test-helpers'
 
 test('download transport never follows redirects or retries after the save phase begins', async () => {
   let requests = 0
@@ -112,7 +112,7 @@ test('a body that stalls mid-stream is destroyed after the idle deadline, but th
 }, 3_000)
 
 test.skipIf(process.platform === 'win32')('download retries mint a new private grant for every wire attempt and preserve remote auth', async () => {
-  const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'download-auth-')))
+  const home = await shortSocketTmpDir('download-auth-')
   const grants: string[] = []
   const wire: http.IncomingHttpHeaders[] = []
   const controls: any[] = []

@@ -26,7 +26,7 @@ class _MeasuredModel(CatalogModel):
             self.server.blocked.set()
             self.server.release.wait(60)
         message = {'role': 'assistant', 'content': 'ACK ' + str(text)}
-        usage = {'prompt_tokens': 250000, 'completion_tokens': 10, 'total_tokens': 250010}
+        usage = {'prompt_tokens': 2500, 'completion_tokens': 10, 'total_tokens': 2510}
         if body.get('stream'):
             payload = ('data: ' + json.dumps({'id': 'probe', 'choices': [{'index': 0, 'delta': message, 'finish_reason': 'stop'}],
                                               'usage': usage}) + '\n\ndata: [DONE]\n\n').encode()

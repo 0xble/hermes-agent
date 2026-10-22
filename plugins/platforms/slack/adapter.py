@@ -292,11 +292,11 @@ def _sdk_supports_agent_sessions() -> bool:
 
 
 def _session_status_method(client: Any):
-    """Return Agent Sessions status API when the installed SDK exposes it, else legacy."""
-    if _sdk_supports_agent_sessions():
-        method = getattr(client, "agents_sessions_setStatus", None)
-        if method is not None:
-            return method
+    """Keep free-text working phrases and the empty-string clear on the legacy API.
+
+    ``agents.sessions.setStatus`` only accepts a closed enum, not these payloads.
+    Titles can use ``agents.sessions.rename`` without changing their protocol.
+    """
     return client.assistant_threads_setStatus
 
 

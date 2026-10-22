@@ -50,7 +50,7 @@ async def _pick_during_a_turn(acp, sid, model_peer):
     model_peer.blocked, model_peer.release = threading.Event(), threading.Event()
     running = asyncio.create_task(acp.rpc('session/prompt', sessionId=sid,
                                           prompt=[{'type': 'text', 'text': 'WS_SHARED BLOCK_FIFO'}]))
-    await asyncio.to_thread(model_peer.blocked.wait, 30)
+    assert await asyncio.to_thread(model_peer.blocked.wait, 30), (model_peer.requests, acp.frames)
     start = len(acp.frames)
     picked = await acp.rpc('session/set_model', sessionId=sid, modelId='custom:second:second-model')
     assert 'result' in picked, picked
@@ -124,7 +124,7 @@ def _measured(model_peer):
                 def with_usage(data):
                     if data.startswith(b'data: {') and b'"finish_reason": "stop"' in data:
                         chunk = json.loads(data[6:])
-                        chunk['usage'] = {'prompt_tokens': 250000, 'completion_tokens': 5, 'total_tokens': 250005}
+                        chunk['usage'] = {'prompt_tokens': 2500, 'completion_tokens': 5, 'total_tokens': 2505}
                         data = ('data: ' + json.dumps(chunk) + '\n\n').encode()
                     return write(data)
                 self.wfile.write = with_usage

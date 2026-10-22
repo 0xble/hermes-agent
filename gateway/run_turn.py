@@ -178,7 +178,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
             from gateway.run_turn_prepare import _resolve_policy_agent_runtime
-            return _resolve_policy_agent_runtime(self, policy, fallback=fallback)
+            return _resolve_policy_agent_runtime(
+                self, policy, fallback=fallback,
+                session_key=self._resolve_session_key_or_none(source, session_key))
         skey = self._resolve_session_key_or_none(source, session_key)
         self._last_attended_decision = None
         self._pre_agent_fallback_notice = None

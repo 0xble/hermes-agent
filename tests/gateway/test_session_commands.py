@@ -94,22 +94,27 @@ def test_ordinary_daemon_slash_skill_uses_durable_fifo(tmp_path):
                                   input_id=marker, text=directive['result']['message'])
                 assert retry['result']['admission_id'] == admitted['result']['admission_id']
             assert [r[:2] for r in rows()] == [('warm', 'terminal'), ('block', 'started'), ('TASK_ONE', 'queued'), ('TASK_TWO', 'queued')]
-            busy_title = await command(command='title forbidden-while-busy')
-            assert 'mid-turn' in busy_title['result']['output'], busy_title
+            busy_title = await command(command='title Busy slash title')
+            assert 'Busy slash title' in busy_title['result']['output'], busy_title
+            listing = await rpc(ws, 'session.list')
+            assert next(r for r in listing['result']['sessions'] if r['id'] == sid)['title'] == 'Busy slash title'
+            refused = await command(command='codex-runtime')
+            from agent.i18n import t
+            assert refused['result']['output'] == t('gateway.busy.reject_codex_runtime'), refused
             for params, reason in [({'command': 'help', 'profile': 'foreign'}, 'profile_mismatch'),
                                    ({'command': 'help', 'source': 'telegram'}, 'invalid_params'),
                                    ({'command': 'restart'}, 'unsupported_command'),
                                    ({'command': 'sethome'}, 'unsupported_command')]:
                 denied = await command(**params)
                 assert denied['error']['message'] == reason, denied
-            # A second dashboard operator shares access but still obeys the busy fence.
+            # A second authenticated dashboard operator shares access and the same registry policy.
             other_url = desc['api_origin'].replace('http:', 'ws:') + '/api/ws?token=owned-slash-negative'
             async with connect(other_url) as other:
-                for method, payload in [('slash.exec', {'command': 'title stolen'}),
-                                        ('command.dispatch', {'name': 'title', 'arg': 'stolen'})]:
+                for method, payload in [('slash.exec', {'command': 'title Shared operator title'}),
+                                        ('command.dispatch', {'name': 'title', 'arg': 'Shared operator title'})]:
                     result = await rpc(other, method, session_id=sid, **payload)
                     receipts.append(result)
-                    assert 'mid-turn' in result.get('result', {}).get('output', ''), result
+                    assert 'Shared operator title' in result.get('result', {}).get('output', ''), result
             peer.release.set()
             await async_wait_until(lambda: all(row[1] == 'terminal' for row in rows()), timeout=45, interval=.05,
                                    what='every admission to settle')

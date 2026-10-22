@@ -111,7 +111,8 @@ def test_setup_gateway_service_step_skips_install_for_served_profile(served_root
     from hermes_cli.gateway_setup_service import ensure_gateway_service
 
     calls: list[str] = []
-    # The orchestrator reads every service primitive through ``hermes_cli.gateway``; patch that binding.
+    # Model a service-capable host, independent of the CI runner's container.
+    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
     monkeypatch.setattr(gw, "supports_systemd_services", lambda: True)
     monkeypatch.setattr(gw, "_is_service_running", lambda: False)
     monkeypatch.setattr(gw, "_is_service_installed", lambda: "install" in calls)

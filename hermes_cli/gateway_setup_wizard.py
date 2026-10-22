@@ -452,49 +452,10 @@ def _wizard_platform_loop() -> None:
 
 
 def _wizard_install_service(backend: str) -> None:
-    """Fresh install from the wizard: ask start-now / start-on-login once, install, then start.
+    """Keep the facade seam while sharing the explicit-consent service owner."""
+    from hermes_cli.gateway_setup_service import _wizard_install_service as install_service
 
-    The Windows installer owns its start decision (Scheduled Task and Startup-folder
-    paths start the gateway themselves when start_now is true, and a UAC hand-off
-    installs and starts in the elevated child), so the wizard forwards the answers
-    and returns without a second start. Each install-intent question is asked exactly
-    once per setup run."""
-    wsl_note = " (note: services may not survive WSL restarts)" if _gw().is_wsl() else ""
-    start_now = _gw().prompt_yes_no("  Start the gateway now?", True)
-    start_on_login = _gw().prompt_yes_no(
-        f"  Start the gateway automatically on login/boot as a {_WIZARD_BACKEND_LABELS[backend]} service?"
-        f"{wsl_note}",
-        True,
-    )
-    if not (start_now or start_on_login):
-        _gw().print_info("  Skipped start and auto-start setup.")
-        _gw().print_info("  You can install later: hermes gateway install")
-        if _gw().supports_systemd_services():
-            _gw().print_info("  Or as a boot-time service: sudo hermes gateway install --system")
-        _gw().print_info("  Or run in foreground:  hermes gateway run")
-        return
-    try:
-        installed_scope, did_install = None, True
-        if backend == "systemd":
-            installed_scope, did_install = _gw().install_linux_gateway_from_setup(
-                force=False, enable_on_startup=start_on_login
-            )
-        elif backend == "launchd":
-            _gw().launchd_install(force=False, start_now=start_now)
-        else:
-            _gw()._gw_windows().install(force=False, start_now=start_now, start_on_login=start_on_login)
-            return
-        print()
-        if did_install and start_now:
-            _gw()._setup_service_action("start", failed_label="Start failed", system=installed_scope == "system")
-    except subprocess.CalledProcessError as e:
-        _gw().print_error(f"  Install failed: {e}")
-        _gw().print_info("  You can try manually: hermes gateway install")
-    except SystemExit:
-        # The backend installers exit non-zero on a refused write (a unit pinning another home);
-        # setup reports it and goes on rather than ending the wizard.
-        _gw().print_warning("  Gateway service install did not complete.")
-        _gw().print_info("  You can try manually: hermes gateway install")
+    install_service(backend)
 
 
 def _wizard_post_setup() -> None:

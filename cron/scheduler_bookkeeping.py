@@ -65,6 +65,8 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
     journal = journal_path(job['id'], execution_id)
     if not job.get('no_agent'):
         mark_kwargs['execution_id'] = execution_id
+    if not d.success and job.pop("_session_store_unavailable", False):
+        mark_kwargs["run_not_started"] = True
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.

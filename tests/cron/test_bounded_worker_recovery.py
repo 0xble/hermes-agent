@@ -35,7 +35,7 @@ assert executions.finish_execution(run, success=True, delivery_outcome='queued')
         env = {**os.environ, "HERMES_HOME": str(home_a)}
         result = subprocess.run([sys.executable, "-c", worker, run["id"]], env=env,
                                 cwd=Path(__file__).resolve().parents[2],
-                                start_new_session=True, capture_output=True, text=True, timeout=20)
+                                start_new_session=True, capture_output=True, text=True, timeout=20, check=False)
         assert result.returncode == 0, result.stderr
         queued = delivery_queue.get_status(run["id"])
         assert queued["status"] == "pending"
@@ -57,7 +57,6 @@ assert executions.finish_execution(run, success=True, delivery_outcome='queued')
             assert get_hermes_home().resolve() == home_a.resolve()
             assert adapters == {"owner": "a"}
             sent.append((job["id"], content))
-            return None
         monkeypatch.setattr(scheduler, "_deliver_result", send)
         assert scheduler.drain_delivery_queue({"owner": "a"}, None) == 1
         assert sent == [("brief", "finished")]
@@ -210,8 +209,13 @@ def test_external_worker_hard_wall_survives_abandoned_inactivity_future(tmp_path
     code = """import concurrent.futures,json,sys,threading,time
 from pathlib import Path
 from types import SimpleNamespace
-from cron import scheduler
+from cron import scheduler, scheduler_authority
+from tests.cron.test_sessiondb_init_hang import _run_owned_job
 import run_agent
+
+owner_home = Path(json.loads(Path(sys.argv[1]).read_text())['profile_home'])
+owner_store = SimpleNamespace()
+scheduler_authority.run_canonical_job = lambda job, **kw: _run_owned_job(job, owner_home, owner_store, **kw)
 
 # Keep the real run_one_job -> run_job -> executor/inactivity-watchdog path;
 # replace only unrelated agent construction, policy and delivery dependencies.

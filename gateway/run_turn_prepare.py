@@ -39,7 +39,7 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
-def _resolve_policy_agent_runtime(runner, policy, *, fallback=True) -> tuple[str, dict]:
+def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=None) -> tuple[str, dict]:
     """``_resolve_session_agent_runtime`` for a session bound to a launch policy: the route's FROZEN
     config and launch credential, walking its own fallback chain on an AuthError unless
     ``fallback=False`` (a session control asking which route the session itself runs). Module-level
@@ -54,14 +54,22 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True) -> tuple[str
     provider = (frozen.get('model') or {}).get('provider')
     runtime, fallback_entry = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen),
                                             fallback=fallback)
+    notice = None
     if fallback_entry is not None:
         from hermes_cli.fallback_config import pre_agent_fallback_notice
-        runner._pre_agent_fallback_notice = pre_agent_fallback_notice(
+        notice = pre_agent_fallback_notice(
             provider or '', model or '',
             runtime.get('provider') or fallback_entry.get('provider') or 'unknown',
             fallback_entry.get('model') or 'default')
-        return fallback_entry['model'], _runtime_agent_kwargs(runtime)
-    return model, _runtime_agent_kwargs(runtime)
+        model = fallback_entry['model']
+    kwargs = _runtime_agent_kwargs(runtime)
+    if session_key:
+        # Use the same session-scoped publication as ordinary resolution. The turn consumes this
+        # notice before choosing its model, so a runner-global notice would reapply the primary model
+        # to the fallback endpoint. Do not update the frozen policy or the last-good-model cache.
+        return runner._commit_session_agent_runtime(session_key, (model, kwargs, notice, False))
+    runner._pre_agent_fallback_notice = notice
+    return model, kwargs
 
 
 def _recover_or_remember_model(runner, skey, model):
@@ -107,7 +115,9 @@ class GatewayTurnPrepareMixin:
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
             from gateway.run_turn_prepare import _resolve_policy_agent_runtime
-            return _resolve_policy_agent_runtime(self, policy, fallback=fallback)
+            return _resolve_policy_agent_runtime(
+                self, policy, fallback=fallback,
+                session_key=self._resolve_session_key_or_none(source, session_key))
         skey = self._resolve_session_key_or_none(source, session_key)
         self._last_attended_decision = None
         self._pre_agent_fallback_notice = None

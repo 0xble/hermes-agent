@@ -93,9 +93,9 @@ def _startup(monkeypatch, tmp_path):
     monkeypatch.setattr(ledger, "record_startup", lambda: state["evidence"])
     monkeypatch.setattr(ledger, "run_deferred_integrity_check", scan)
     monkeypatch.setattr(memory_provider, "spawn_context_thread", spawn)
-    monkeypatch.setattr(run_bootstrap, "_start_gateway_start_cron_and_housekeeping",
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping",
                         lambda runner: (threading.Event(), None, None, None))
-    monkeypatch.setattr(run_bootstrap, "_start_gateway_shutdown_tail", AsyncMock(return_value=True))
+    monkeypatch.setattr("gateway.run._start_gateway_shutdown_tail", AsyncMock(return_value=True))
     monkeypatch.setattr(run_runtime, "publish_gateway_runtime_ready", lambda runner: events.append("ready"))
     monkeypatch.setattr(run_runtime, "wait_gateway_runtime", wait_runtime)
     monkeypatch.setattr(run_api, "warm_gateway_dashboard", lambda runner: None)

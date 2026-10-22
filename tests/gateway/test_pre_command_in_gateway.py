@@ -398,10 +398,8 @@ def test_a_command_ink_answers_itself_fires_once_in_the_gateway_when_observed(tm
 
 @pytest.mark.platforms("linux")
 def test_commands_refused_during_a_turn_fire_nothing(tmp_path):
-    """``/reasoning`` is a settings control the busy dispatcher rejects during a turn (default
-    ``busy_policy``): through ``slash.exec`` and ``command.dispatch`` it is refused and fires nothing.
-    A mid-run variant that refuses its arguments (``/goal <new text>``, ``/loop <new loop>``) fires
-    nothing either; the same variant accepting a control verb (``/goal status``) fires once."""
+    """Safe settings dispatch while busy and fire once per command. A rejecting registry command
+    (``/codex-runtime``) and rejecting goal/loop arguments fire nothing, while ``/goal status`` fires."""
     from agent.i18n import t
     with _gateway(tmp_path) as (_proc, desc, home, work, _env, log, peer):
         wire = _Wire(home, desc)
@@ -411,6 +409,8 @@ def test_commands_refused_during_a_turn_fire_nothing(tmp_path):
             assert peer.blocked.wait(30)
             replies = [wire.call('slash.exec', session_id=sid, command='/reasoning high'),
                        wire.call('command.dispatch', session_id=sid, name='reasoning', arg='high')]
+            refused = [wire.call('slash.exec', session_id=sid, command='/codex-runtime'),
+                       wire.call('command.dispatch', session_id=sid, name='codex-runtime', arg='')]
             variants = [wire.call('slash.exec', session_id=sid, command='/goal ship the release'),
                         wire.call('command.dispatch', session_id=sid, name='loop', arg='every 5m check ci')]
             wire.call('slash.exec', session_id=sid, command='/goal status')
@@ -419,9 +419,11 @@ def test_commands_refused_during_a_turn_fire_nothing(tmp_path):
             peer.release.set()
         finally:
             wire.close()
-    assert [r['output'] for r in replies] == [t('gateway.busy.slash_rejected', command='reasoning')] * 2
+    assert all('high' in r['output'] for r in replies), replies
+    assert [r['output'] for r in refused] == [t('gateway.busy.reject_codex_runtime')] * 2
     assert [r['output'] for r in variants] == [t('gateway.busy.reject_goal'), t('gateway.busy.reject_loop')]
-    assert [(r['command'], r['args_raw']) for r in fired] == [('goal', 'status'), ('history', '')], fired
+    assert [(r['command'], r['args_raw']) for r in fired] == [
+        ('reasoning', 'high'), ('reasoning', 'high'), ('goal', 'status'), ('history', '')], fired
 
 
 def test_commands_the_cli_refuses_on_the_gateway_fire_nothing(monkeypatch, capsys):

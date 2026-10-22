@@ -1192,7 +1192,16 @@ class GatewayAdapterLifecycleMixin:
         with _log_suppressed(logging.DEBUG, "could not record served_profiles", exc_info=True):
             from gateway.status import publish_runtime_status
             from gateway.pairing import PairingStore
-            served = [active] + sorted(name for name, _home in profile_homes if name != active)
+            # Configuration includes parked profiles. Only authorities accepting work are served,
+            # the same set the runtime descriptor and attach-ticket store publish.
+            registry = getattr(self, "session_authorities", None)
+            if registry is not None:
+                from hermes_constants import hermes_home_key
+                admitted = {hermes_home_key(home) for home in registry.profile_ids()}
+                profile_homes = [(name, home) for name, home in profile_homes
+                                 if hermes_home_key(home) in admitted]
+            served = sorted({name for name, _home in profile_homes},
+                            key=lambda name: (name != active, name))
             self._note_served_profiles(profile_homes)
             for name in served:
                 if name and name not in self.pairing_stores:

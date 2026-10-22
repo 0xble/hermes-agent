@@ -134,7 +134,7 @@ def _wizard_install_service(backend: str) -> None:
         if backend == "systemd":
             scope, did_install = gw.install_linux_gateway_from_setup(force=False, enable_on_startup=True)
         elif backend == "launchd":
-            gw.launchd_install(force=False)
+            gw.launchd_install(force=False, start_now=start_now)
         else:
             gw._gw_windows().install(force=False, start_now=start_now, start_on_login=True)
         if not did_install or not gw._is_service_installed():

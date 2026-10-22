@@ -15,6 +15,9 @@ from hermes_cli import gateway_setup_service as setup_service
 
 @pytest.fixture
 def supervisor(tmp_path, monkeypatch):
+    # The fake supervisor models a host, not the container running this test.
+    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
+    monkeypatch.setattr(gateway, "is_container", lambda: False)
     # The installer intentionally rejects /tmp profiles. A disposable RAM-backed
     # home exercises that real guard without disabling it or touching user state.
     with tempfile.TemporaryDirectory(prefix="hermes-choice-", dir="/dev/shm") as directory:
@@ -190,3 +193,42 @@ def test_wizard_start_does_not_spawn_over_reserved_owner(supervisor, monkeypatch
         assert not spawned
     finally:
         owner.close()
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("start_now", [False, True])
+@pytest.mark.parametrize("consent", [False, True])
+def test_gateway_wizard_service_choice_controls_installation(tmp_path, monkeypatch, start_now, consent):
+    """Exercise the live facade, not only the extracted consent helper."""
+    from types import SimpleNamespace
+    from hermes_cli import gateway_runtime
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    config_api.save_config({"gateway": {"service_install_choice": None}})
+    stream = io.StringIO()
+    stream.isatty = lambda: True
+    monkeypatch.setattr(sys, "stdin", stream)
+    answers = iter([start_now, consent])
+    monkeypatch.setattr(gateway, "prompt_yes_no", lambda *args: next(answers))
+    calls = []
+    install_options = []
+
+    def install(**kwargs):
+        calls.append("install")
+        install_options.append(kwargs)
+
+    def runtime(*args, **kwargs):
+        calls.append("runtime")
+        return SimpleNamespace(state="ready")
+
+    monkeypatch.setattr(gateway, "launchd_install", install)
+    monkeypatch.setattr(gateway, "_is_service_installed", lambda: "install" in calls)
+    monkeypatch.setattr(gateway, "_setup_service_action", lambda *args, **kwargs: calls.append("start"))
+    monkeypatch.setattr(gateway_runtime, "ensure_gateway_runtime", runtime)
+    gateway._wizard_install_service("launchd")
+    assert ("install" in calls) is consent
+    assert install_options == ([{"force": False, "start_now": start_now}] if consent else [])
+    assert ("start" in calls) is (start_now and consent)
+    assert ("runtime" in calls) is (start_now and not consent)
+    assert config_api.load_config()["gateway"]["service_install_choice"] == ("install" if consent else "decline")

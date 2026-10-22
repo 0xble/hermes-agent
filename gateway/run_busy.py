@@ -577,7 +577,7 @@ class GatewayBusySessionMixin:
         from gateway.cron_review import fail_busy_review
         if fail_busy_review(event):
             return False  # a hidden review cannot outlive this process; the original report goes out
-        setattr(event, "_drain_deferred", True)
+        event._drain_deferred = True
         if self._queue_or_replace_pending_event(session_key, event):
             return True
         # No adapter or a full FIFO: use the same durable shutdown spool rather than lose
@@ -1215,6 +1215,10 @@ class GatewayBusySessionMixin:
 
     async def _send_command_ack(self, source, text: str, label: str) -> None:
         """Best-effort acknowledgment for a slash command that falls through to agent processing."""
+        from gateway.session_command_sink import active_sink
+        if (sink := active_sink()) is not None:
+            sink.notices.append(text)
+            return
         try:
             adapter = self._delivery_adapter_for(source)
             if adapter:

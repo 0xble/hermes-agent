@@ -2265,8 +2265,8 @@ def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
     """Run every pre-agent gate of an agent job and build the prompt. Returns
-    ``(early_result, prompt)``: an early result short-circuits ``run_job`` (empty payload, monitor
-    gate, wake gate, injection block, empty prompt); otherwise ``prompt`` is set."""
+    ``(early_result, prompt)``: an early result short-circuits ``run_job`` (monitor gate, wake
+    gate, injection block, empty prompt); otherwise ``prompt`` is set."""
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs never reach here. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     from hermes_cli.config import InvalidUserConfigError, require_parseable_user_config
@@ -2276,12 +2276,6 @@ def _prepare_job_prompt(
     except InvalidUserConfigError as exc:
         logger.error("Job '%s': refusing to run — %s", job_id, exc)
         return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
-
-    # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
-    from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
-
-    if job_payload_is_empty(job):
-        return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None
 
     _early, extra_prompt, monitor_context = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
     if _early is not None:
@@ -2581,20 +2575,26 @@ def run_job(
     ``extra_prompt``: optional per-run context from ``cronjob(action='run', prompt=...)`` (#57331). Appended
     to the stored prompt for this fire only — never persisted to the job definition.
     """
-    from gateway.session_cron import current_execution
-    owner_execution = current_execution()
-    if owner_execution is not None and owner_execution[2:] != (job['id'], execution_id):
-        owner_execution = None
-    if not job.get("no_agent") and owner_execution is None:
-        from cron.scheduler_authority import run_canonical_job
-        return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
-                                 execution_id=execution_id)
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
         return _run_no_agent_job(job, job_id, job_name, cancel_event)
+    # Malformed jobs need no agent admission. Pause in the firing context so its
+    # run-local ownership marker can still authorize the one blocked-run alert.
+    from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
+
+    if job_payload_is_empty(job):
+        return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR)
+    from gateway.session_cron import current_execution
+    owner_execution = current_execution()
+    if owner_execution is not None and owner_execution[2:] != (job['id'], execution_id):
+        owner_execution = None
+    if owner_execution is None:
+        from cron.scheduler_authority import run_canonical_job
+        return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
+                                 execution_id=execution_id)
     job.pop("_session_store_unavailable", None)
     prompt = str(job.get("prompt") or "")
 
@@ -3304,20 +3304,6 @@ def _finish_completed_run(
 ) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
     job = d.job
-    if job.get("last_delivery_queued"):
-        # The gateway drain may win the enqueue/bookkeeping race. Reconcile its terminal
-        # writeback before this run projects the stale provisional ``delivery_queued`` state.
-        from cron.jobs import get_job
-        refreshed = get_job(job["id"])
-        if refreshed and not refreshed.get("last_delivery_queued"):
-            terminal_status = refreshed.get("last_status")
-            if terminal_status in {"ok", "delivery_failed", "suppressed"}:
-                job.update({
-                    "last_status": terminal_status,
-                    "last_delivery_error": refreshed.get("last_delivery_error"),
-                    "last_delivery_queued": None,
-                })
-                d.delivery_error = refreshed.get("last_delivery_error")
     if not d.should_deliver and job.get("last_delivery_queued"):
         from cron.jobs import update_job
         update_job(job["id"], {"last_delivery_queued": None})

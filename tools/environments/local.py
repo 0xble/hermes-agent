@@ -1134,14 +1134,36 @@ class LocalEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
-        # Login invocations (init_session's env snapshot) source the user's rc /
-        # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
+        run_env = _make_run_env(self.env)
+        # Login invocations still load shell functions and custom init files. A login
+        # profile may reset PATH, so carry the selected toolchain separately through it.
         if login:
+            if not _IS_WINDOWS:
+                from agent.session_client_env import bound_client_env
+                run_env['_HERMES_LOCAL_LAUNCH_PATH'] = run_env.get('PATH', '')
+                if bound_client_env() is not None or 'PATH' in self.env:
+                    path_script = 'export PATH="$_HERMES_LOCAL_LAUNCH_PATH"\n'
+                else:
+                    # Unbound shells retain login-selected precedence (nvm/asdf/pyenv),
+                    # but must not lose tools inherited from the gateway's launcher.
+                    path_script = '''while [ -n "$_HERMES_LOCAL_LAUNCH_PATH" ]; do
+    __hermes_path_entry=${_HERMES_LOCAL_LAUNCH_PATH%%:*}
+    case ":$PATH:" in
+        *":$__hermes_path_entry:"*) ;;
+        *) export PATH="${PATH:+$PATH:}$__hermes_path_entry" ;;
+    esac
+    case $_HERMES_LOCAL_LAUNCH_PATH in
+        *:*) _HERMES_LOCAL_LAUNCH_PATH=${_HERMES_LOCAL_LAUNCH_PATH#*:} ;;
+        *) break ;;
+    esac
+done
+'''
+                cmd_string = path_script + 'unset _HERMES_LOCAL_LAUNCH_PATH __hermes_path_entry\n' + cmd_string
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
         proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,

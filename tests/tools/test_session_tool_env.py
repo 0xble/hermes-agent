@@ -24,6 +24,47 @@ def _parts(env):
     return env['PATH'].split(os.pathsep)
 
 
+@pytest.mark.platforms('linux', 'macos')
+@pytest.mark.parametrize('client,backend_path,first', [
+    ({'PATH': '/client/bin:/usr/bin:/bin'}, None, '/client/bin'),
+    ({}, None, '/daemon/bin'),
+    (None, None, '/login/bin'),
+    ({'PATH': '/client/bin:/usr/bin:/bin'}, '/configured/bin:/usr/bin:/bin', '/configured/bin'),
+])
+def test_login_startup_cannot_discard_the_selected_path(tmp_path, monkeypatch, client, backend_path, first):
+    from pathlib import Path
+    from agent.session_client_env import client_env_scope
+    from tools.environments import local
+    rc = tmp_path / 'login.rc'
+    rc.write_text('export PATH=/login/bin:/usr/bin:/bin\n'
+                  'export LOGIN_INIT_PROOF=loaded\n'
+                  'login_function() { printf function; }\n')
+    monkeypatch.setattr(local, '_resolve_shell_init_files', lambda: [str(rc)])
+    monkeypatch.setenv('PATH', '/daemon/bin:/usr/bin:/bin')
+    backend = {} if backend_path is None else {'PATH': backend_path}
+    with client_env_scope(client):
+        terminal = local.LocalEnvironment(cwd=str(tmp_path), env=backend)
+        try:
+            for _ in range(2):
+                result = terminal.execute('printf "%s|%s|%s|%s" "$PATH" "$LOGIN_INIT_PROOF" '
+                                          '"$(login_function)" "${_HERMES_LOCAL_LAUNCH_PATH+x}"')
+                assert result['returncode'] == 0, result
+                path, loaded, function, marker = result['output'].split('|')
+                entries = path.split(os.pathsep)
+                assert entries[0] == first, result
+                assert loaded == 'loaded' and function == 'function' and marker == ''
+                if client is None:
+                    assert '/daemon/bin' in entries
+                elif client.get('PATH') or backend_path:
+                    assert '/daemon/bin' not in entries
+            assert '_HERMES_LOCAL_LAUNCH_PATH' not in Path(terminal._snapshot_path).read_text()
+            # PATH remains normal persistent shell state after startup, not a per-command reset.
+            assert terminal.execute('export PATH="/turn/bin:$PATH"')['returncode'] == 0
+            assert terminal.execute('printf "%s" "$PATH"')['output'].split(os.pathsep)[0] == '/turn/bin'
+        finally:
+            terminal.cleanup()
+
+
 def test_terminal_run_env_starts_from_the_sessions_toolchain(daemon_env):
     from agent.session_client_env import client_env_scope
     from tools.environments.local import _make_run_env

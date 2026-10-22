@@ -177,5 +177,3 @@ def test_ordinary_daemon_keeps_control_auth_and_loop_witness(tmp_path, layout):
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=5)
-                if control_path is not None and control_path.parent != home:
-                    control_path.parent.rmdir()

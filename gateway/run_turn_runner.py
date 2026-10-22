@@ -2409,7 +2409,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 display_response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
             # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
             # defaults agent_persisted differently when the key is absent.
-            return {"final_response": display_response, "delivery_text": display_response, **common, **viewer_meta,
+            return {"final_response": final_response or "", "delivery_text": display_response, **common, **viewer_meta,
                     "response_previewed": previewed,
                     "response_transformed": bool(result.get("response_transformed"))}
         final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)

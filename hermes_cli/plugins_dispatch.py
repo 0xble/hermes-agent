@@ -237,7 +237,7 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
-    modified_args: Optional[Dict[str, Any]] = None
+    modified_args: Optional[dict[str, Any]] = None
 
 
 def _policy_error_block_directive(hook_name: str, cb: Callable, exc: BaseException) -> dict[str, str]:
@@ -349,7 +349,7 @@ def _hook_call_identity(kwargs: dict[str, Any], hook_name: str = "") -> Optional
     carries many tool calls, which would re-collapse the keys. Session lifecycle hooks use ``session_id`` as
     the last fallback because they carry neither a tool nor turn id.
     """
-    for field in _HOOK_CALL_IDENTITY_FIELDS.get(hook_name, ("tool_call_id", "turn_id")):
+    for field in _HOOK_CALL_IDENTITY_FIELDS.get(hook_name, ("tool_call_id", "turn_id", "session_id")):
         value = kwargs.get(field)
         if isinstance(value, str) and value:
             return value

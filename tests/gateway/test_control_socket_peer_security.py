@@ -35,7 +35,9 @@ def test_restart_heals_a_world_readable_pointer_left_by_an_older_gateway(tmp_pat
         server = GatewayControlServer(home)
         assert await server.start()
         try:
-            assert _socket_path(home).name == "control.sock"
+            discovered = _socket_path(home)
+            assert discovered == server._bind_path
+            assert pointer.stat().st_mode & 0o777 == 0o600
         finally:
             await server.stop()
     asyncio.run(run())
@@ -100,12 +102,20 @@ def test_clients_refuse_a_control_listener_run_by_another_uid(tmp_path, monkeypa
 
 
 def test_long_home_survives_a_squatted_shared_fallback_socket(tmp_path, monkeypatch):
-    # Any local user can pre-create the predictable shared-temp socket path; that must not stop the
-    # gateway from publishing its control socket (the bootstrap treats that as fatal).
+    # The temp root must actually be shared. CI's TMPDIR is private, where our own stale
+    # file is safe to replace and is not a squatting attack.
     import asyncio
+    import tempfile
     from gateway.control_socket import GatewayControlServer, resolve_server_socket_path
     from hermes_cli.gateway_runtime_discovery import _socket_path
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    temp = Path(tempfile.gettempdir())
+    # A sibling keeps the AF_UNIX address short under CI's isolated TMPDIR. With
+    # a system /tmp, stay inside it rather than trying to allocate at filesystem root.
+    base = temp.parent if temp.parent != Path(temp.anchor) and os.access(temp.parent, os.W_OK) else temp
+    shared = Path(tempfile.mkdtemp(prefix="s-", dir=base))
+    shared.chmod(0o777)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(shared))
     home = tmp_path / ("p" * 90) / ".hermes"
     home.mkdir(parents=True, mode=0o700)
     squatted = resolve_server_socket_path(home)[0]
@@ -115,13 +125,19 @@ def test_long_home_survives_a_squatted_shared_fallback_socket(tmp_path, monkeypa
         server = GatewayControlServer(home, verb_handlers={"identify": lambda: {"pid": 1}})
         assert await server.start()
         try:
-            assert _socket_path(home).parent != squatted.parent
+            discovered = _socket_path(home)
+            assert discovered.parent != squatted.parent
+            assert discovered.parent.stat().st_mode & 0o077 == 0
+            assert squatted.read_text() == "not yours"
         finally:
             await server.stop()
+        assert not discovered.exists()
+        assert not discovered.parent.exists()
     try:
         asyncio.run(run())
     finally:
         squatted.unlink()
+        shared.rmdir()
 
 
 def test_long_home_prefers_the_private_runtime_dir(tmp_path, monkeypatch):
@@ -132,8 +148,8 @@ def test_long_home_prefers_the_private_runtime_dir(tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
         home = tmp_path / ("p" * 90) / ".hermes"
         home.mkdir(parents=True, mode=0o700)
-        assert resolve_server_socket_path(home)[0].parent.parent == runtime
+        assert resolve_server_socket_path(home)[0].parent == runtime
         runtime.chmod(0o755)  # not a private runtime dir: never trusted
-        assert resolve_server_socket_path(home)[0].parent.parent != runtime
+        assert resolve_server_socket_path(home)[0].parent != runtime
     finally:
         runtime.rmdir()

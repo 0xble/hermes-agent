@@ -75,6 +75,7 @@ async def test_chat_restart_after_long_drain_exempts_next_boot(tmp_path, monkeyp
     monkeypatch.setattr(guard, "_state_path", lambda: tmp_path / "gateway" / "restart_loop.json")
     clock = [1000.0]
     monkeypatch.setattr(guard.time, "time", lambda: clock[0])
+    monkeypatch.setenv("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "1")
     monkeypatch.setattr("gateway.restart.is_gateway_supervisor_process", lambda: True)
     monkeypatch.setattr(status, "remove_pid_file", lambda: None)
     monkeypatch.setattr(status, "release_gateway_runtime_lock", lambda: None)
