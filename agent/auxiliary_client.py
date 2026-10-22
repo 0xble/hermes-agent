@@ -120,6 +120,10 @@ def aux_probe_mode():
 
 
 from agent.credential_pool import load_pool
+from agent.auxiliary_call_policy import (
+    CallFallbackPolicy, call_fallback_chain, has_call_fallback_chain, prepare_fallback_request,
+    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream,
+)
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -3971,7 +3975,7 @@ def _fallback_chain_entry(task: Optional[str], fb_label: str) -> Optional[dict[s
     if not m:
         return None
     try:
-        chain = _get_auxiliary_task_config(task).get("fallback_chain")
+        chain = call_fallback_chain(task, _get_auxiliary_task_config(task).get("fallback_chain"))
         entry = chain[int(m.group(1))] if isinstance(chain, list) else None
     except Exception:
         return None
@@ -4100,6 +4104,8 @@ def _fallback_request_kwargs(
         )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(messages, tools, destination=destination)
     reasoning_config = _fallback_reasoning_config(task, fb_label, reasoning_config, fallback_entry)
+    fallback_messages, fallback_tools, reasoning_config = prepare_fallback_request(
+        task, destination, fallback_messages, fallback_tools, reasoning_config, fallback_entry)
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
@@ -4466,7 +4472,7 @@ def _try_configured_fallback_chain(
     run after a model-scoped failure). Returns (client, model, provider_label) or (None, None, "")."""
     if not task:
         return None, None, ""
-    chain = _get_auxiliary_task_config(task).get("fallback_chain")
+    chain = call_fallback_chain(task, _get_auxiliary_task_config(task).get("fallback_chain"))
     if not chain or not isinstance(chain, list):
         return None, None, ""
     skip = _failed_backend_skip(
@@ -7924,7 +7930,10 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
     is_capacity_error = any(
         predicate(first_err) for predicate, label in _FALLBACK_REASONS if label != "auth error")
-    task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
+    strict_chain = has_call_fallback_chain(task)
+    task_chain = call_fallback_chain(task, _get_auxiliary_task_config(task).get("fallback_chain")) if task else None
+    if strict_chain and not task_chain:
+        return None
     has_task_fallback_chain = isinstance(task_chain, list) and bool(task_chain)
     explicit_auth_with_task_chain = (
         reason == "auth error" and not is_auto and has_task_fallback_chain
@@ -7961,7 +7970,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
         failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
-    if fb_client is None and is_auto:
+    if fb_client is None and is_auto and not strict_chain:
         fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
@@ -7969,7 +7978,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason, failed_base_url=route.base_info,
                 failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
-    elif fb_client is None and not explicit_auth_with_task_chain:
+    elif fb_client is None and not explicit_auth_with_task_chain and not strict_chain:
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
@@ -7990,14 +7999,11 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             return fb_resp
         fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
             task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
-            task_chain_only=explicit_auth_with_task_chain)
-    # All fallback layers exhausted — one user-visible warning, then re-raise.
+            task_chain_only=explicit_auth_with_task_chain or strict_chain)
+    # All fallback layers exhausted: warn once before re-raising the primary error.
     logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
-                   # All fallback layers exhausted — emit a single user-visible warning so the operator
-                   # knows aux task is about to fail. (#26882) The error itself is re-raised below.
-                   # (#26882)
-                   "(fallback_chain + main agent model). Raising the primary error.",
-                   task or "call", tag, reason, resolved_provider)
+                   "(%s). Raising the primary error.", task or "call", tag, reason, resolved_provider,
+                   "per-call fallback_chain" if strict_chain else "fallback_chain + main agent model")
     return None
 
 
@@ -8099,8 +8105,9 @@ def call_llm(
     extra_headers: Optional[dict[str, str]] = None, api_mode: str | None = None, stream: bool = False,
     stream_options: dict | None = None, route_info: Optional[dict[str, str]] = None,
     latency_info: Optional[dict[str, int]] = None,
+    fallback_chain: Optional[list[dict[str, Any]]] = None, fallback_request_transform: Optional[Callable] = None,
 ) -> Any:
-    """Run an auxiliary LLM request, applying the configured task limit."""
+    """Run an auxiliary request. ``fallback_chain=None`` inherits task policy, ``[]`` disables hops."""
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -8109,9 +8116,10 @@ def call_llm(
     if latency_info is not None:
         latency_info["queue_wait_ms"] = _elapsed_ms(queue_started_at, request_started_at)
     prior_progress_hook = getattr(_aux_progress, "hook", None)
+    policy = CallFallbackPolicy(task, fallback_chain, fallback_request_transform)
     try:
         with (
-            scoped_runtime_main(main_runtime),
+            scoped_fallback_policy(policy), scoped_runtime_main(main_runtime),
             aux_progress_hook(
                 prior_progress_hook
                 if callable(prior_progress_hook)
@@ -8129,28 +8137,17 @@ def call_llm(
                 reasoning_config=reasoning_config, extra_headers=extra_headers, api_mode=api_mode,
                 stream=stream, stream_options=stream_options, route_info=route_info,
             )
+        if stream:
+            response = scoped_fallback_stream(response, policy, prior_progress_hook, main_runtime)
         if stream and semaphore is not None:
             stream_semaphore = semaphore
             semaphore = None
-            return _release_sync_semaphore_after_stream(response, stream_semaphore)
+            return release_sync_semaphore_after_stream(response, stream_semaphore)
         return response
     finally:
         if latency_info is not None:
             latency_info["summary_generation_ms"] = _elapsed_ms(request_started_at)
         if semaphore is not None:
-            semaphore.release()
-
-
-def _release_sync_semaphore_after_stream(stream: Any, semaphore: threading.BoundedSemaphore):
-    """Release a permit only after a streaming response is consumed or closed."""
-    try:
-        yield from stream
-    finally:
-        try:
-            close = getattr(stream, "close", None)
-            if callable(close):
-                close()
-        finally:
             semaphore.release()
 
 
@@ -8247,17 +8244,27 @@ def _call_llm_impl(
         extra_headers=extra_headers, api_mode=api_mode, route_info=route_info,
     )
     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
-    # Streaming path (MoA aggregator): return the raw SDK stream, skipping validation and
-    # the fallback chain (they assume a complete response); the caller owns reassembly/fallback.
+    def _recover(first_err: Exception) -> Any:
+        def _perform(step: _LadderStep) -> Any:
+            kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
+            if kind == "call":
+                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
+            if kind == "retry":
+                return _retry_same_provider_sync(**kw)
+            return _call_fallback_candidate_sync(*args, **kw)
+        return _drive_ladder(
+            _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
+            _perform)
+
     if stream:
-        kwargs["stream"] = True
+        stream_kwargs = {**kwargs, "stream": True}
         if stream_options:
-            kwargs["stream_options"] = stream_options
-        if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
-            # Responses-shim clients consume the stream internally and return a completed
-            # object Relay's managed stream would iterate; the MoA facade wraps it as one chunk.
-            return client.chat.completions.create(**kwargs)
-        return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
+            stream_kwargs["stream_options"] = stream_options
+        def _send_stream():
+            if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
+                return client.chat.completions.create(**stream_kwargs)
+            return _relay_sync_stream(client, stream_kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
+        return stream_with_recovery(_send_stream, _recover)
 
     def _primary(**validate_kw: Any) -> Any:
         # Retry on the same provider for a transient transport blip (connection reset / streaming-close /
@@ -8307,16 +8314,7 @@ def _call_llm_impl(
                     _last_transient = retry_transient
             raise _last_transient
     except Exception as first_err:
-        def _perform(step: _LadderStep) -> Any:
-            kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
-            if kind == "call":
-                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
-            if kind == "retry":
-                return _retry_same_provider_sync(**kw)
-            return _call_fallback_candidate_sync(*args, **kw)
-        return _drive_ladder(
-            _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
-            _perform)
+        return _recover(first_err)
 
 
 def _coerce_llm_message(response):

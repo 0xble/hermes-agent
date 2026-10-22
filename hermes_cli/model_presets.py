@@ -321,6 +321,7 @@ def _expand_fallback_entries(config: dict[str, Any], definitions: dict[str, dict
 def _expand_moa_slot(
     site: Any, path: str, definitions: dict[str, dict[str, Any]], *, fallback: bool = False,
 ) -> Any:
+    site = _lift_model_shorthand(site)
     if not isinstance(site, dict):
         return site
     if "model_preset" not in site:
@@ -330,7 +331,7 @@ def _expand_moa_slot(
                 for index, candidate in enumerate(site["fallback_models"])
             ]
         return site
-    disabled_fallbacks = False
+    disabled_fallbacks = _fallbacks_disabled(site, path)
     if "fallback_models" in site:
         if site["fallback_models"] != []:
             raise _error(path, "'fallback_models' may only be [] with model_preset (to disable preset fallbacks)")

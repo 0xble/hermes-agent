@@ -22,6 +22,10 @@ def resolve_model_ref(raw: Any, config: Mapping[str, Any] | None = None, *, _sta
     cfg = dict(config or {})
     model_value = cfg.get("model")
     model_cfg: Mapping[str, Any] = model_value if isinstance(model_value, Mapping) else {}
+    from hermes_cli.model_presets import _fallbacks_disabled, _lift_main_model
+    site = _lift_main_model(raw)
+    disabled_fallbacks = _fallbacks_disabled(site, "model reference")
+    raw = site
     explicit_name: str | None = None
     if isinstance(raw, Mapping):
         if "model_preset" in raw:
@@ -37,8 +41,8 @@ def resolve_model_ref(raw: Any, config: Mapping[str, Any] | None = None, *, _sta
     if name in _stack:
         raise ModelPresetError("model reference cycle: " + " -> ".join((*_stack, name)))
     if name == "default":
-        if model_cfg.get("model_preset"):
-            raw_model = "@" + str(model_cfg["model_preset"])
+        if model_cfg.get("model_preset") or preset_ref_name(model_cfg.get("default")) or preset_ref_name(model_cfg.get("model")):
+            raw_model = model_cfg
         else:
             raw_model = model_value if isinstance(model_value, str) else (
                 model_cfg.get("default") or model_cfg.get("model") or "")
@@ -47,16 +51,18 @@ def resolve_model_ref(raw: Any, config: Mapping[str, Any] | None = None, *, _sta
             nested_provider = str(raw_model.get("provider") or "") if isinstance(raw_model, Mapping) else ""
             outer_provider = str(model_cfg.get("provider") or "")
             return ModelPresetRoute(name, str(nested_provider or outer_provider or route.provider), route.model,
-                                    _route_effort(model_cfg, route.reasoning_effort), route.fallbacks)
-        return ModelPresetRoute(name, str(model_cfg.get("provider") or ""), str(raw_model).strip(), _route_effort(model_cfg))
+                                    _route_effort(model_cfg, route.reasoning_effort), () if disabled_fallbacks else route.fallbacks)
+        from hermes_cli.fallback_config import get_fallback_chain
+        return ModelPresetRoute(name, str(model_cfg.get("provider") or ""), str(raw_model).strip(),
+                                _route_effort(model_cfg), () if disabled_fallbacks else tuple(get_fallback_chain(cfg) or ()))
     if name == "attended":
         attended_value = model_cfg.get("attended")
         attended: Mapping[str, Any] = attended_value if isinstance(attended_value, Mapping) else {}
-        raw_model = attended.get("model") or ("@" + str(attended.get("model_preset")) if attended.get("model_preset") else "")
+        raw_model = attended if attended.get("model_preset") or preset_ref_name(attended.get("model")) else attended.get("model", "")
         if isinstance(raw_model, Mapping) or preset_ref_name(raw_model):
             route = resolve_model_ref(raw_model, cfg, _stack=(*_stack, name))
             return ModelPresetRoute(name, str(attended.get("provider") or route.provider), route.model,
-                                    _route_effort(attended, route.reasoning_effort), route.fallbacks)
+                                    _route_effort(attended, route.reasoning_effort), () if disabled_fallbacks else route.fallbacks)
         return ModelPresetRoute(name, str(attended.get("provider") or ""), str(raw_model), _route_effort(attended))
     from hermes_cli.model_presets import _definitions
     entry = _definitions(cfg).get(name)
@@ -64,7 +70,7 @@ def resolve_model_ref(raw: Any, config: Mapping[str, Any] | None = None, *, _sta
         raise ModelPresetError(f"model_presets: unknown preset '{name}'")
     return ModelPresetRoute(
         name, entry["provider"], entry["model"], entry.get("reasoning_effort", ""),
-        tuple(entry.get("fallbacks") or ()),
+        () if disabled_fallbacks else tuple(entry.get("fallbacks") or ()),
     )
 
 

@@ -2454,6 +2454,11 @@ def _resolve_gateway_model_context(
             custom_providers = get_compatible_custom_providers(data)
         except Exception:
             custom_providers = data.get("custom_providers")
+        if not configured_base_url:
+            from hermes_cli.providers import resolve_custom_provider
+            named = resolve_custom_provider(configured_provider or "", custom_providers)
+            if named is not None:
+                configured_base_url = named.base_url or None
 
     def _read_runtime() -> None:
         nonlocal provider, base_url, api_key, api_mode
@@ -2475,17 +2480,9 @@ def _resolve_gateway_model_context(
     def _pin_still_applies() -> bool:
         # Drop a configured context_length pin when the effective route no longer matches (or on error).
         from hermes_cli.route_identity import should_clear_context_pin
-        from hermes_cli.providers import normalize_provider
-        configured_route_provider = normalize_provider(configured_provider or "")
-        active_route_provider = normalize_provider(provider or "")
-        if str(configured_provider or "").lower().startswith("custom:"):
-            configured_route_provider = "custom"
-        if not configured_base_url:
-            return (not configured_model or configured_model == str(resolved_model or "").strip()) and (
-                not configured_provider or configured_route_provider == active_route_provider)
         return not should_clear_context_pin(
             configured_model, resolved_model, configured_base_url, base_url,
-            configured_route_provider, active_route_provider)
+            configured_provider, provider)
 
     def _custom_ctx() -> Optional[int]:
         from hermes_cli.config import get_custom_provider_context_length

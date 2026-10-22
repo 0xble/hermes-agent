@@ -76,6 +76,26 @@ switch guard, and cron jobs/scheduler. Secondary readers: delegation config,
 auxiliary tasks/fallbacks and supported MoA slots. `hermes_constants` owns shared
 reasoning precedence, including preset effort ahead of global effort.
 
+### Consumer Boundaries
+
+- MoA authors: `_expand_moa_slot` uses the same shorthand lifting for primary
+  and fallback slots. `resolve_moa_preset` retains normalized `fallback_models`,
+  including an explicit empty list. Expansion is not execution proof.
+- MoA execution: references and completion/streaming aggregators pass slot chains
+  to `auxiliary_client.call_llm`. A request-local chain uses the existing shared
+  recovery ladder, not a MoA retry engine. `None` inherits task policy, `[]`
+  disables provider hops, and a declared chain never appends unrelated routes.
+  Destination preparation re-trims canonical reference input, re-plans cache
+  markers/tools and reasoning, and records the actual selected accounting route.
+  Streaming recovery is allowed only before a chunk has escaped.
+- Runtime references: raw mappings and builtin `@default`/`@attended` wrappers
+  use the same site-level fallback opt-out as static expansion. Cron preflight,
+  provider setup and in-agent execution must see the same empty chain.
+- Gateway context pins: resolve named custom endpoints through the existing
+  provider registry, then compare with `route_identity.should_clear_context_pin`.
+  A matching preset route retains its pin. An identical model on another
+  endpoint does not own that pin.
+
 ## Proof And Retirement
 
 Run preset/persistence tests plus config, model-switch, CLI/TUI startup,
@@ -89,6 +109,16 @@ exercises raw/expanded fallback equivalence, idempotence and legacy order, real
 CLI/TUI initialization and file-backed turn refresh, scalar/named `@default`
 through cron, typed auxiliary OpenRouter wire kwargs, and cron auth fallback
 reasoning with and without explicit job pins.
+
+`tests/hermes_cli/test_model_presets.py` primarily proves expansion/validation.
+`tests/hermes_cli/test_model_preset_failure_consumers.py` crosses runtime
+normalization and then forces mocked transport failures to execute reference,
+completion aggregator and streaming aggregator backups. It also proves empty
+chains suppress execution, streaming never replays emitted content, destination
+context trimming and liveness survive, raw/builtin opt-outs agree, cron setup
+and provider resolution never visit an opted-out backup, and named-endpoint pins
+are retained only on the identical route. These are failure-path consumer
+proofs, not assertions that expanded kwargs happen to contain a list.
 
 Retire when upstream covers flat references, every reader, round-trip
 preservation and shared concrete-selection persistence. Keep session policy
