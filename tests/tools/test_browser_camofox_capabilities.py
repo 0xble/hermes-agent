@@ -33,6 +33,20 @@ def test_unbound_release_never_sends_unscoped_request(camofox):
     assert len(camofox.server.calls) == before
 
 
+def test_legacy_release_refusal_never_falls_back_to_account_wide(camofox, monkeypatch):
+    session = navigate(camofox)
+    response = requests.Response()
+    response.status_code = 400
+    response._content = b'{"error": "Scoped release requires parking mode"}'
+    post = Mock(side_effect=requests.HTTPError(response=response))
+    monkeypatch.setattr(camofox.cf, "_post", post)
+    result = _dispatch("browser_handoff", {"account": "brianle", "release": True}, "owner")
+    assert not result["success"]
+    post.assert_called_once()
+    assert post.call_args.args[1] == {"tabId": session["tab_id"]}
+    assert "all" not in post.call_args.args[1]
+
+
 def test_console_capture_is_unsupported_but_evaluation_works(camofox, monkeypatch):
     session = navigate(camofox)
     result = _dispatch("browser_console", {"clear": True}, "owner")
