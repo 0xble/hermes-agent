@@ -6,6 +6,8 @@ Load this unit when changing the typed `session_state` tool, its Telegram bundle
 
 The opt-in `session_state` tool exposes only three bounded read-only actions: `resolve_topic`, `inspect_session`, and `inspect_delivery`. It is profile-scoped, uses the active Hermes state path, rejects SQL-shaped selectors, caps fields and serialized output, and does not create, migrate, or write `state.db`. Under multiplexed routing, delivery inspection reads the process-home shared ledger filtered by adapter profile, while session selectors resolve in the served profile's state. Delivery content is omitted unless explicitly requested and remains capped. Session transcript messages are never returned. `session_search` remains the owner of conversational recall.
 
+Session inspection includes boolean `archived` and, when the column exists, `auto_archived` provenance. Legacy NULL/blank session owners resolve only to the profile owning their store, while legacy NULL/blank delivery adapter owners resolve to `default`. Delivery text fields retain the existing per-field caps, and oversized row sets are reduced repeatedly before the fixed byte-cap error is returned.
+
 Raw commands that target Hermes `state.db` are neutralized in progress previews without hiding unrelated SQLite commands.
 
 ## Provenance and patches

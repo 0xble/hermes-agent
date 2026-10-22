@@ -91,11 +91,13 @@ def _bounded(value: Any) -> Any:
     if isinstance(value, dict):
         reduced = dict(value)
         reduced["truncated"] = True
-        if isinstance(reduced.get("rows"), list):
-            reduced["rows"] = reduced["rows"][:5]
-        encoded = json.dumps(reduced, ensure_ascii=False, separators=(",", ":"))
-        if len(encoded.encode("utf-8")) <= _MAX_BYTES:
-            return reduced
+        rows = reduced.get("rows")
+        while isinstance(rows, list) and len(rows) > 1:
+            rows = rows[: len(rows) // 2]
+            reduced["rows"] = rows
+            encoded = json.dumps(reduced, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) <= _MAX_BYTES:
+                return reduced
     return {"ok": False, "error": "result exceeds fixed byte cap", "truncated": True}
 
 
@@ -109,7 +111,10 @@ def _session_for_profile(db: SessionDB, session_id: str, profile: str) -> dict[s
     row = db.get_session(session_id)
     if not row:
         return None
-    row_profile = str(row.get("profile_name") or "default").strip() or "default"
+    row_profile = str(row.get("profile_name") or "").strip()
+    if not row_profile:
+        # Legacy rows belong to their store, not the caller's bound profile.
+        row_profile = profile_name_for_home(Path(db.db_path).parent) or "default"
     return row if row_profile == profile else None
 
 
@@ -122,7 +127,10 @@ def _inspect_session(db: SessionDB, session_id: str, profile: str) -> dict[str, 
         "ended_at", "end_reason", "message_count", "thread_id", "chat_id", "model", "parent_session_id",
     )
     session = {key: _clip(row.get(key)) for key in fields}
-    session["profile_name"] = str(session.get("profile_name") or "default").strip() or "default"
+    session["profile_name"] = _clip(str(row.get("profile_name") or "").strip() or profile)
+    session["archived"] = bool(row.get("archived"))
+    if "auto_archived" in row:
+        session["auto_archived"] = bool(row["auto_archived"])
     return {"ok": True, "action": "inspect_session", "found": True, "session": session}
 
 
@@ -180,7 +188,8 @@ def _inspect_delivery(
     if selector is None:
         return _empty("inspect_delivery", "session_not_found")
     selector_name, selector_value = selector
-    profile_clause = " AND adapter_profile = ?"
+    # The ledger's legacy NULL owner is the default adapter, as is a blank stamp.
+    profile_clause = " AND COALESCE(NULLIF(TRIM(adapter_profile), ''), 'default') = ?"
     params: list[Any] = [selector_value, profile, _MAX_ROWS]
     rows = delivery_db._read_all(
         "SELECT " + ", ".join(selected) + " FROM delivery_obligations WHERE " + selector_name + " = ?"
@@ -190,11 +199,9 @@ def _inspect_delivery(
     if not rows:
         return _empty("inspect_delivery", "delivery_not_found")
     safe_rows = []
+    limits = {"last_error": _MAX_ERROR_CHARS, "content": _MAX_CONTENT_CHARS}
     for row in rows:
-        safe = {column: row[column] for column in selected}
-        safe["last_error"] = _clip(safe.get("last_error"), _MAX_ERROR_CHARS)
-        if "content" in safe:
-            safe["content"] = _clip(safe["content"], _MAX_CONTENT_CHARS)
+        safe = {column: _clip(row[column], limits.get(column, _MAX_FIELD_CHARS)) for column in selected}
         safe_rows.append(safe)
     return {"ok": True, "action": "inspect_delivery", "found": True, "rows": safe_rows}
 
