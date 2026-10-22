@@ -186,7 +186,7 @@ class GatewayConfigLoadersMixin:
 
     def _resolve_session_reasoning_config(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
-        model: str = "", profile_home=None,
+        model: str = "", profile_home=None, user_config=None, assignment=None,
     ) -> dict | None:
         """Session ``/reasoning --session`` > per-model ``agent.reasoning_overrides`` > global.
 
@@ -194,7 +194,8 @@ class GatewayConfigLoadersMixin:
         empty uses ``model.default``.
         """
         resolved_session_key = self._resolve_session_key_or_none(source, session_key)
-        override = self._session_reasoning_override(resolved_session_key)
+        override = (assignment.get("reasoning_override") if assignment is not None
+                    else self._session_reasoning_override(resolved_session_key))
         if override is not None:
             return override
         resolve_profile_home = getattr(self, "_resolve_profile_home_for_source", None)
@@ -206,14 +207,14 @@ class GatewayConfigLoadersMixin:
         native_loader = getattr(type(self), "_load_reasoning_config", None)
         native_loader = getattr(native_loader, "__func__", native_loader)
         loader_func = getattr(loader, "__func__", loader)
-        user_config = None
         if loader_func is native_loader:
             from gateway.run import _load_gateway_config
-            user_config = (
-                _load_gateway_config()
-                if profile_home is None
-                else _load_gateway_config(profile_home / "config.yaml")
-            )
+            if user_config is None:
+                user_config = (
+                    _load_gateway_config()
+                    if profile_home is None
+                    else _load_gateway_config(profile_home / "config.yaml")
+                )
             baseline = loader(model, profile_home=profile_home, config=user_config) or {}
         else:
             # Tests and integrations replace this loader with small lambdas. Preserve their
@@ -230,10 +231,8 @@ class GatewayConfigLoadersMixin:
             try:
                 from gateway.attended_model import parse_attended_config
                 attended_cfg = parse_attended_config(user_config)
-                if not attended_cfg.enabled:
-                    return baseline
                 attended_baseline = {}
-                if attended_cfg.model:
+                if attended_cfg.enabled and attended_cfg.model:
                     attended_baseline = (
                         loader(attended_cfg.model, profile_home=profile_home, config=user_config)
                     ) or {}
@@ -242,7 +241,7 @@ class GatewayConfigLoadersMixin:
                     user_config=user_config,
                     override=self._session_model_override(resolved_session_key),
                     default_reasoning=baseline or {},
-                    attended_reasoning=attended_baseline,
+                    attended_reasoning=attended_baseline, assignment=assignment,
                 )
                 effort = getattr(decision, "reasoning_effort", "") if decision is not None else ""
                 if effort:

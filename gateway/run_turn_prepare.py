@@ -101,7 +101,7 @@ def _recover_or_remember_model(runner, skey, model):
 class GatewayTurnPrepareMixin:
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
-        user_config: Optional[dict] = None, fallback: bool = True,
+        user_config: Optional[dict] = None, fallback: bool = True, assignment=None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
@@ -121,16 +121,18 @@ class GatewayTurnPrepareMixin:
         skey = self._resolve_session_key_or_none(source, session_key)
         self._last_attended_decision = None
         self._pre_agent_fallback_notice = None
-        if skey:
+        if skey and assignment is None:
             self._rehydrate_session_model_override(skey)
             self._expire_attended_temporary_picks(skey, user_config)
             if parse_attended_config(user_config or {}).enabled:
                 state = self._session_state(skey)
                 state.conversation.pre_agent_fallback_notice = None
         override, last_model, _ = self._snapshot_session_runtime_state(skey)
+        if assignment is not None:
+            override = assignment.get("override")
         attended_route = self._attended_route_for_session(
             source=source, session_key=skey, user_config=user_config, override=override,
-            last_model=last_model,
+            last_model=last_model, assignment=assignment,
         )
         resolved = self._load_session_agent_runtime(
             source=source, skey=skey, user_config=user_config, config=getattr(self, "config", None),
@@ -361,7 +363,7 @@ class GatewayTurnPrepareMixin:
             # dict in one funnel call so the fresh session does not inherit the previous conversation's
             # model/reasoning overrides, a queued "/model switched" note, or a stale resolved-model cache
             # (#48031, #58403). See _CONVERSATION_SCOPED_STATE.
-            self._clear_conversation_scope(session_key, reason="auto_reset")
+            await self._clear_conversation_scope_async(session_key, reason="auto_reset")
             self._evict_cached_agent(session_key)
             session_entry.was_auto_reset = False
 

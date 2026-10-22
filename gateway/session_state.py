@@ -54,6 +54,7 @@ class ConversationState:
     last_user_activity_at: Optional[float] = None  # durable mirror lives on SessionEntry
     last_api_call_at: Optional[float] = None  # process-local quiet-window guard; absent after restart means quiet
     pending_attended_notice: Optional[str] = None  # one switching-in line for this turn
+    model_role: Optional[str] = None  # @role hold; cleared with the conversation so /new drops it
     last_attended_decision: Any = None  # route precedence decision for this session's current turn
     attended_new_session: bool = False  # consumed by the first attended route resolution or turn finalization
     pre_agent_fallback_notice: Optional[str] = None  # one-shot fallback notice for this session

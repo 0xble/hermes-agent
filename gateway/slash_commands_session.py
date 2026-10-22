@@ -194,7 +194,7 @@ class GatewaySessionCommandsMixin:
         # Conversation boundary: ALL conversation-scoped per-session state + security state in one
         # funnel call (see _CONVERSATION_SCOPED_STATE in gateway/run.py).
         async with self._session_model_override_lock(session_key):
-            self._clear_conversation_scope(session_key, reason="session_reset")
+            await self._clear_conversation_scope_locked_async(session_key, reason="session_reset")
             # In-flight async delegations end WITH the conversation: once the id rotates their
             # completions have no live owner. Expire by durable id, routing key as legacy fallback.
             with contextlib.suppress(Exception):
@@ -1150,7 +1150,7 @@ class GatewaySessionCommandsMixin:
             # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
             # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
             # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
-            self._clear_conversation_scope(session_key, reason="resume")
+            await self._clear_conversation_scope_locked_async(session_key, reason="resume")
             # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
             # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
             # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.

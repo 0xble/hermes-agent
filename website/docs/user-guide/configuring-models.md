@@ -59,6 +59,28 @@ The names `attended` and `default` are reserved for the runtime config resolver.
 nested references and conflicting inline route fields are rejected. A concrete `/model` selection
 replaces the preset reference while preserving unrelated settings and comments.
 
+## Topic Model Roles
+
+In the gateway, `/model @coding` stores the role name, not a concrete route.
+`/model @attended` follows `model.attended`, and `/model @default` follows the
+configured default. Every API boundary resolves the role from the topic's
+current profile config. Changes to presets take effect on the next request,
+including within a long turn, without rewriting sessions. Fallback routes never
+replace the stored role.
+
+A held role is immune to attended idle expiry and does not emit switch cards.
+Explicit session and one-turn picks take precedence. A durable concrete pick
+replaces the role, while `--once` leaves it available after that turn. `/model
+reset`, `/model reset --all` and `/new` clear role state. Role picks cannot be
+combined with model-selection flags.
+
+The `telegram_topic` tool accepts the same `@NAME` values for create and edit.
+It reads route and reasoning from the routed profile, not the gateway's launch
+profile. `/status` shows the held role. The admin command `/model --all attended`
+converts existing concrete Telegram topic picks to `@attended` under the session
+store lock, writes one routing snapshot, and returns the converted session keys.
+It skips sessions already following a role and does not interrupt active agents.
+
 ## The Models page
 
 Open the dashboard and click **Models** in the sidebar. You get two sections:
