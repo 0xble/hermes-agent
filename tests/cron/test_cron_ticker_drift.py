@@ -47,10 +47,15 @@ def _drive(loop, tmp_path, monkeypatch, *, tick_cost, cycles):
         _FakeTime.now += tick_cost
         return 0
 
+    def logical_wait(stopped, timeout):
+        # Advance a whole ticker wait, not the interruptible wait's polling slices.
+        return stopped.wait(timeout)
+
     (tmp_path / "cron").mkdir(exist_ok=True)
     profile_homes = None if loop == "single" else [("p1", tmp_path)]
     with patch.object(provider, "recover_interrupted", return_value=0), \
          patch("cron.scheduler.tick", side_effect=fake_tick), \
+         patch("cron.scheduler_admission.wait_for_tick", side_effect=logical_wait), \
          patch("cron.jobs.record_ticker_heartbeat"), \
          patch("cron.jobs.clear_ticker_error"):
         provider.start(stop, interval=INTERVAL, profile_homes=profile_homes)

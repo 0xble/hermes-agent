@@ -145,25 +145,31 @@ def test_real_config_loader_expands_and_save_keeps_authored_reference(tmp_path, 
     assert saved["auxiliary"]["vision"]["model_preset"] == "fast"
 
 
-def test_save_without_default_stripping_reloads_preset_and_removes_injected_route_defaults(tmp_path, monkeypatch):
+@pytest.mark.parametrize("task", ["vision", "goal_judge", "compression", "title_generation"])
+@pytest.mark.parametrize("aux_preset", ["fast", "primary"])
+def test_save_without_default_stripping_reloads_preset_and_removes_injected_route_defaults(tmp_path, monkeypatch, task, aux_preset):
     from hermes_cli import config as config_mod
     home = tmp_path / "hermes-home"; home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     raw = {**routes(), "model": {"model_preset": "fast", "context_length": 12345},
-           "auxiliary": {"vision": {"model_preset": "fast"}}}
+           "auxiliary": {task: {"model_preset": aux_preset}}}
+    expected_auxiliary = expand_model_presets(raw)["auxiliary"][task]
     (home / "config.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
     config_mod._RAW_CONFIG_CACHE.clear(); config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
     loaded = config_mod.load_config()
     # Simulate defaults injected by provider/auxiliary normalization before an all-default save.
     loaded["model"].update({"base_url": "", "api_key": "", "api_mode": ""})
-    loaded["auxiliary"]["vision"].update({"base_url": "", "api_key": "", "api_mode": ""})
+    loaded["auxiliary"][task].update({"base_url": "", "api_key": "", "api_mode": ""})
     config_mod.save_config(loaded, strip_defaults=False)
     saved = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
     assert saved["model"] == {"model_preset": "fast", "context_length": 12345}
-    assert saved["auxiliary"]["vision"]["model_preset"] == "fast"
-    assert not {"base_url", "api_key", "api_mode"} & set(saved["auxiliary"]["vision"])
+    assert saved["auxiliary"][task]["model_preset"] == aux_preset
+    assert not {"base_url", "api_key", "api_mode", "fallback_chain"} & set(saved["auxiliary"][task])
     config_mod._RAW_CONFIG_CACHE.clear(); config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
-    assert config_mod.load_config()["model"]["default"] == "model-c"
+    reloaded = config_mod.load_config()
+    assert reloaded["model"]["default"] == "model-c"
+    assert reloaded["auxiliary"][task]["model"] == expected_auxiliary["model"]
+    assert reloaded["auxiliary"][task]["fallback_chain"] == expected_auxiliary.get("fallback_chain", [])
 
 
 def test_main_reference_preserves_context_and_authored_global_route_settings():

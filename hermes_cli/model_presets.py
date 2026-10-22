@@ -480,7 +480,8 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             for route_key in ("provider", "model", "reasoning_effort"):
                 if isinstance(expected_site, dict) and route_key in expected_site:
                     restored.pop(route_key, None)
-            if fallback_key and isinstance(expected_site, dict) and fallback_key in expected_site:
+            # Matching empty fallback defaults are also inert expansion output.
+            if fallback_key:
                 restored.pop(fallback_key, None)
             # strip_defaults=False exposes empty provider-owned defaults which would otherwise
             # become inline route fields and make a saved reference fail on its next load.

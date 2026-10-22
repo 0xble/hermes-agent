@@ -1,5 +1,5 @@
 # health: allow FILE_LINES -- security fix for #82010: distinguish an explicitly-empty toolset allowlist (fail closed, nothing allowed) from an absent one (no restriction); the added lines are minimal fail-closed branches at this existing chokepoint
-"""Cron job scheduler: tick() runs due jobs (gateway calls it every 60s from a background thread).
+"""Cron job scheduler: tick() runs due jobs on gateway deadline and worker-release wakes.
 A file lock (~/.hermes/cron/.tick.lock) keeps overlapping processes to one tick at a time.
 """
 
@@ -874,6 +874,7 @@ def try_register_running_job(job_id: str, *, owner=None, future=_FUTURE_PENDING)
 
 def release_running_job(
     job_id: str, home: Optional[Path | str] = None, *, owner=None, force: bool = False,
+    wake: bool = True,
 ) -> None:
     """Remove the registration unless an explicit ``owner`` has been replaced.
 
@@ -901,19 +902,26 @@ def release_running_job(
                 except Exception:
                     # Unknown liveness remains fenced; the reaper owns the forced path.
                     return
-        _running_registration_owners.pop(key, None)
-        _running_job_ids.discard(key)
-        _running_since.pop(key, None)
-        _running_allowance_s.pop(key, None)
-        _running_futures.pop(key, None)
-        _running_cancel_events.pop(key, None)
-        _running_worker_pids.pop(key, None)
-        _external_worker_claims.pop(key, None)
-        _scope_isolated_job_ids.discard(key)
-        _external_worker_modes.pop(key, None)
-        # A later registration of this key must not inherit restart-safe classification.
-        _restart_safe_waiter_job_ids.discard(key)
-        _restart_safe_external_worker_job_ids.discard(key)
+        _drop_running_claim(key, wake=wake)
+
+
+def _drop_running_claim(key, *, wake: bool = True) -> None:
+    """Drop a fenced claim under ``_running_lock`` and return its admission slot."""
+    owner = _running_registration_owners.pop(key, None)
+    _running_job_ids.discard(key)
+    _running_since.pop(key, None)
+    _running_allowance_s.pop(key, None)
+    _running_futures.pop(key, None)
+    _running_cancel_events.pop(key, None)
+    _running_worker_pids.pop(key, None)
+    _external_worker_claims.pop(key, None)
+    _scope_isolated_job_ids.discard(key)
+    _external_worker_modes.pop(key, None)
+    # A later registration of this key must not inherit restart-safe classification.
+    _restart_safe_waiter_job_ids.discard(key)
+    _restart_safe_external_worker_job_ids.discard(key)
+    from cron.scheduler_admission import worker_released
+    worker_released(key, owner, wake=wake)
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -1163,22 +1171,7 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
                 reason = "age"
             else:
                 continue
-            _running_registration_owners.pop(key, None)
-            _running_job_ids.discard(key)
-            _running_since.pop(key, None)
-            _running_allowance_s.pop(key, None)
-            _running_futures.pop(key, None)
-            _running_cancel_events.pop(key, None)
-            # The worker behind any external claim has exited (checked above). Drop all of its
-            # worker metadata so a successor neither stays blocked by the dead claim's owner nor
-            # inherits its restart-safe mode, scope or PID.
-            if external_claim is not None:
-                _external_worker_claims.pop(key, None)
-                _external_worker_modes.pop(key, None)
-                _scope_isolated_job_ids.discard(key)
-                _restart_safe_waiter_job_ids.discard(key)
-                _restart_safe_external_worker_job_ids.discard(key)
-                _running_worker_pids.pop(key, None)
+            _drop_running_claim(key)
             _forced_release_count += 1
             stale.append((job_id, age, allowance, fut, reason))
 
@@ -1321,6 +1314,9 @@ def discard_parallel_pools(home_keys) -> None:
     home ever ticked, and a deleted profile's pool was never reclaimed. ``wait=False`` so the
     ticker is never blocked; queued work still drains before the executor dies.
     """
+    home_keys = list(home_keys)
+    from cron.scheduler_admission import discard_reserved_pools
+    discard_reserved_pools(home_keys)
     for key in list(home_keys):
         pool = _parallel_pools.pop(key, None)
         _parallel_pool_max_workers.pop(key, None)
@@ -1330,6 +1326,8 @@ def discard_parallel_pools(home_keys) -> None:
 
 def _shutdown_parallel_pool() -> None:
     """Shut down every profile's persistent pool on process exit."""
+    from cron.scheduler_admission import shutdown_reserved_pools
+    shutdown_reserved_pools()
     for pool in list(_parallel_pools.values()):
         pool.shutdown(wait=True, cancel_futures=False)
     _parallel_pools.clear()
@@ -4676,7 +4674,9 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
-def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job):
+def _submit_with_guard(
+    job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job, *, registration_owner=None,
+):
     """Submit with the in-flight dedup guard; None if a prior tick's run is still in flight.
     Running-set membership is released in the worker's finally."""
     job_id = job["id"]
@@ -4721,7 +4721,8 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         _not_dispatched_shutdown()
         _clear_run_claim_best_effort()
         return None
-    registration_owner = object()
+    if registration_owner is None:
+        registration_owner = object()
     if not try_register_running_job(job_id, owner=registration_owner):
         logger.info("Job '%s' already running — skipping", job_label)
         try:
@@ -4746,7 +4747,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         _ctx = contextvars.copy_context()
     except Exception as execution_err:
         # Release the claim so the next tick retries instead of wedging "already running".
-        release_running_job(job_id, home=_claim_home, owner=registration_owner)
+        release_running_job(job_id, home=_claim_home, owner=registration_owner, wake=False)
         _clear_run_claim_best_effort()
         if execution is not None:  # the receipt was persisted; a later step failed
             settle_unstarted_execution(execution["id"], job_id, (
@@ -4765,7 +4766,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     try:
         fut = pool.submit(_run_and_release)
     except Exception as submit_err:
-        release_running_job(job_id, home=_claim_home, owner=registration_owner)
+        release_running_job(job_id, home=_claim_home, owner=registration_owner, wake=False)
         _clear_run_claim_best_effort()
         finish_execution(
             execution["id"], success=False, error=f"Executor dispatch failed: {submit_err}")
