@@ -45,6 +45,8 @@ async def test_zero_cut_teardown_does_not_cancel_disconnect_before_updater_stop(
     adapter.cancel_background_tasks = AsyncMock()
     adapter._platform_lock_identity = None
     adapter._platform_lock_nonce = None
+    adapter._platform_lock_retirement_task = None
+    adapter._handover_polling_stop_task = None
     adapter._release_platform_lock = lambda: (lock_released.append(True), released.set())
 
     async def disconnect(**_kwargs):
