@@ -3,9 +3,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource, SessionStore
+from gateway.session import AsyncSessionStore, SessionSource, SessionStore
 
 
 def _runner_for_bulk_reset(keys, *, running=()):
@@ -109,6 +109,97 @@ def test_reset_all_dm_fallback_uses_adapter_config_extra_allowlist(monkeypatch):
 
     group_source = SessionSource(platform=Platform.TELEGRAM, user_id="owner", chat_id="group", chat_type="group")
     assert GatewayModelCommandsMixin._model_reset_all_is_authorized(runner, group_source) is False
+
+
+@pytest.mark.parametrize(
+    "env,extra,user_id,chat_type,expected",
+    [
+        ({"TELEGRAM_ALLOWED_USERS": "owner"}, {}, "owner", "dm", True),
+        ({"TELEGRAM_ALLOWED_USERS": "owner"}, {}, "stranger", "dm", False),
+        ({"GATEWAY_ALLOWED_USERS": "owner"}, {}, "owner", "dm", True),
+        ({"TELEGRAM_ALLOWED_USERS": "owner"}, {}, "owner", "group", False),
+        ({"GATEWAY_ALLOW_ALL_USERS": "true"}, {}, "stranger", "dm", False),
+        ({"TELEGRAM_ALLOW_ALL_USERS": "true"}, {}, "stranger", "dm", False),
+        ({"TELEGRAM_ALLOWED_USERS": "*"}, {}, "stranger", "dm", False),
+        ({"GATEWAY_ALLOWED_USERS": "*"}, {}, "stranger", "dm", False),
+        ({}, {"allow_from": ["*"]}, "stranger", "dm", True),
+        ({"TELEGRAM_ALLOWED_USERS": "owner"}, {"allow_admin_from": ["admin"]}, "owner", "dm", False),
+        ({}, {"allow_admin_from": ["admin"]}, "admin", "dm", True),
+    ],
+)
+def test_reset_all_dm_authorization_uses_shared_allowlist_without_promoting_open_access(
+    monkeypatch, env, extra, user_id, chat_type, expected,
+):
+    for key in (
+        "TELEGRAM_ALLOWED_USERS", "TELEGRAM_ALLOW_ALL_USERS", "TELEGRAM_ALLOW_BOTS",
+        "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    runner = object.__new__(GatewayRunner)
+    platform_config = PlatformConfig(extra=extra)
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: platform_config})
+    adapter = SimpleNamespace(config=platform_config)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._delivery_adapter_for = lambda _source: adapter
+    source = SessionSource(platform=Platform.TELEGRAM, user_id=user_id, chat_id=user_id, chat_type=chat_type)
+
+    assert runner._model_reset_all_is_authorized(source) is expected
+
+
+@pytest.mark.asyncio
+async def test_reset_all_clears_sqlite_routing_picks_after_restart(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    import sqlite3
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(write_sessions_json=False)
+    store = SessionStore(tmp_path / "sessions", config)
+    entries = {}
+    for name in ("model-only", "reasoning-only", "running"):
+        entry = store.get_or_create_session(
+            SessionSource(platform=Platform.TELEGRAM, user_id="owner", chat_id=name, chat_type="dm")
+        )
+        entries[name] = entry
+        if name != "reasoning-only":
+            store.set_model_override(entry.session_key, {"model": "picked", "provider": "nous"})
+        if name != "model-only":
+            store.set_reasoning_override(entry.session_key, {"enabled": True, "effort": "high"})
+    keys = {entry.session_key for entry in entries.values()}
+    running_key = entries["running"].session_key
+    assert store.override_session_keys() == keys
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        before = [json.loads(row[0]) for row in db.execute("SELECT entry_json FROM gateway_routing")]
+    assert any(row.get("model_override") for row in before)
+    assert any(row.get("reasoning_override") for row in before)
+
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._evict_cached_agent = Mock()
+    live_agent = SimpleNamespace(reasoning_config={"enabled": True, "effort": "high"})
+    runner._running_agents = {running_key: live_agent}
+
+    assert await runner._reset_all_session_overrides() == len(keys)
+    assert await asyncio.to_thread(store.override_session_keys) == set()
+    assert live_agent.reasoning_config == {"enabled": True, "effort": "high"}
+    assert runner._bulk_reset_pending_sessions == {running_key}
+    await asyncio.to_thread(store.close_all_db_handles)
+
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        after = [json.loads(row[0]) for row in db.execute("SELECT entry_json FROM gateway_routing")]
+    assert len(after) == len(keys)
+    assert all(row.get("model_override") is None and row.get("reasoning_override") is None for row in after)
+    restarted = SessionStore(tmp_path / "sessions", config)
+    try:
+        assert await asyncio.to_thread(restarted.override_session_keys) == set()
+        for key in keys:
+            assert await asyncio.to_thread(restarted.get_model_override, key) is None
+            assert await asyncio.to_thread(restarted.get_reasoning_override, key) is None
+    finally:
+        await asyncio.to_thread(restarted.close_all_db_handles)
 
 
 def test_turn_release_drains_pending_bulk_reset():

@@ -673,8 +673,21 @@ class GatewayModelCommandsMixin:
         chat_type = str(getattr(source, "chat_type", "") or "").lower()
         if chat_type not in {"dm", "direct", "private"}:
             return False
-        # This check is intentionally local to the destructive reset command. Do not widen the
-        # shared inbound-chat authorization path with adapter implementation details.
+        # An open inbound policy is not an owner grant for this destructive command. Reuse the
+        # canonical checker for restricted env allowlists, including adapter-resolved user IDs.
+        from gateway.authz_mixin import (
+            _ALLOWED_USERS_ENV, _ALLOW_ALL_ENV, _auth_env, _coerce_allow_set, _env_truthy, _registry_entry,
+        )
+
+        platform = getattr(source, "platform", None)
+        entry = _registry_entry(platform)
+        allow_env = _ALLOWED_USERS_ENV.get(platform) or getattr(entry, "allowed_users_env", "")
+        allow_all_env = _ALLOW_ALL_ENV.get(platform) or getattr(entry, "allow_all_env", "")
+        configured = _coerce_allow_set(_auth_env(allow_env)) | _coerce_allow_set(_auth_env("GATEWAY_ALLOWED_USERS"))
+        if configured and "*" not in configured and not _env_truthy(allow_all_env) and self._is_user_authorized(source):
+            return True
+        # Adapter attribute fallbacks stay local. Do not widen shared inbound authorization with
+        # adapter implementation details.
         adapter = self._delivery_adapter_for(source)
         extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
         raw_allow = extra.get("allow_from")
