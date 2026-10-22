@@ -24,6 +24,7 @@ from gateway.status import get_process_start_time
 from hermes_cli import dashboard_procs, gateway, process_identity, update_cmd_windows
 from hermes_cli import update_pause_record as pause_record
 from hermes_cli.update_cmd_windows import _pause_windows_gateways_for_update, _unmapped_ready_filter
+from tests.waiting import wait_until
 
 
 @pytest.fixture
@@ -41,6 +42,12 @@ def homes_and_spawn(tmp_path):
     def spawn(home) -> subprocess.Popen:
         proc = subprocess.Popen(argv, env={**os.environ, "HERMES_HOME": str(home)})
         procs.append(proc)
+        child = psutil.Process(proc.pid)
+        # Verify real metadata before snapshots or negative home checks.
+        wait_until(
+            lambda: child.cmdline() == argv and child.environ().get("HERMES_HOME") == str(home),
+            what=f"child {proc.pid} gateway argv and home to be readable",
+        )
         return proc
 
     yield home_a, home_b, spawn
