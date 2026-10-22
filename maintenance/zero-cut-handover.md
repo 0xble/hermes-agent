@@ -18,13 +18,18 @@ rather than releasing it through the ordinary disconnect timeout path.
 
 External drain is engaged before stopping cron reviews or polling. Keep that order:
 `gateway/run.py`'s cron `can_dispatch` closure reads `_external_drain_active`.
-Moving the flag until after transport settlement would reopen cron dispatch. While
-this existing handover owns the old Telegram transport, its live received events
-remain admissible through the normal auth and session admission path. The allowance
-requires a registered receiving Telegram adapter via `_transport_owner`, not a
-restored source, relay event or profile-name guess. It ends on failure or real stop.
-Starting a handover inside an ordinary drain is refused, not converted to this
-allowance. Ordinary external-drain new-turn refusal remains unchanged.
+This is best-effort early cron quiescence, not a persistent handover-owned fence:
+`gateway/run_shutdown.py`'s dashboard marker watcher clears the shared flag when
+no marker exists. The early flag still closes the cron gate when observed, and
+`stop_reviews()` separately stops review admission. While this existing handover
+owns the old Telegram transport, its live received events remain admissible through
+the normal auth and session admission path. The allowance requires a registered
+receiving Telegram adapter via `_transport_owner`, not a restored source, relay
+event or profile-name guess. Failed-handover recovery keeps that allowance until
+late queue, batch and held-redispatch owners have dispatched their received input.
+It does not override a real stop. Starting a handover inside an ordinary drain is
+refused, not converted to this allowance. Ordinary external-drain new-turn refusal
+remains unchanged.
 
 Stop and settle every served Telegram adapter, including secondary profile bots.
 Join PTB's unfinished update queue because a dequeued update need not have entered
@@ -41,10 +46,32 @@ or service is introduced.
 
 A failed popped batch is retained by the existing held-input owner. A handover with
 held input reports failure, never successful idle, and does not release the token
-lock. Cancellation marks the handover failed and enters the existing drain/spool
-path so a late admission remains owned instead of receiving maintenance. Held and
-adapter-pending events remain in memory until the existing shutdown spool runs.
-This is not a new arbitrary-process-kill durability or exactly-once guarantee.
+lock. Before full token transfer, failure or cancellation restores normal old-runner
+admission, preserves a concurrent dashboard marker and resumes stopped pollers only
+after a successful PTB stop and proof of the original lock nonce. Held input uses
+the existing redispatch path. Served adapters recover independently. A partial token
+release can be reclaimed only while no other acquire owns it. An uncertain stop or
+lost lock keeps the old polling fence and notifies the existing retryable-fatal
+adapter recovery owner, rather than starting a competing old poller. A pending
+PTB stop remains owned even after `updater.running` becomes false: its final
+getUpdates cleanup must finish before normal disconnect can close its app or
+release its token. The adapter publishes that shielded retirement task before
+fatal notification. Both primary and secondary reconnects join the predecessor's
+actual retirement task inside the existing bounded connect owner, because the
+scoped lock intentionally permits same-PID reacquisition. Disconnect and connect
+deadlines detach their waits, not that retirement owner. Late completion releases
+the old nonce-protected lock and allows the retained reconnect queue to rebuild
+and transfer held input. Other adapters without an outstanding retirement owner
+keep their existing queue-before-disconnect recovery behavior. After full
+transfer, cancellation leaves the old fence intact and continues waiting for its
+turns to finish. It does not report a failure that would tell the control client to
+boot out the promoted standby. Review admission remains stopped, as there is no
+existing review-resume lifecycle hook. A failed handover remains a failed control
+operation, not an in-process retry of that operation.
+
+Held and adapter-pending events remain in memory until dispatched or the existing
+shutdown spool runs. This is not a new arbitrary-process-kill durability or
+exactly-once guarantee.
 
 ### Source Evidence And Regression
 
@@ -60,13 +87,24 @@ No particular lost real user request has been established.
 `tests/plugins/test_received_handover.py` exercises original native message ID/text
 execution once across text/photo/album batching, primary/secondary transports,
 pre-admission identity recovery, both handover admission phases, cancellation and
-failed popped dispatch. Its cancellation case checks existing pending ownership.
+failed popped dispatch. Cancellation before transfer checks that the old owner
+resumes admission and executes the original ask once, instead of remaining in an
+unserviced drain spool. Failure regressions also cover held redispatch, multiple
+served bots, dashboard markers, partial release, ambiguous stop recovery and
+post-transfer cancellation without reopening polling. Real PTB stop regressions
+also drive production primary/secondary fatal retirement and bounded reconnect
+while a cancellation-resistant final cleanup is pending. They check foreign-PID
+lock refusal (identifying the pytest owner as the test gateway), no same-process
+replacement consumer before late cleanup finishes, then original event identity
+and one execution after normal recovery. No test contacts Telegram.
 `tests/gateway/test_zero_cut_handover_verb.py` also refuses pre-existing ordinary
 drains. Run through `scripts/run_tests.sh`, alongside external-drain, reconnect,
-Telegram update-admission, batching and multiplex/profile-isolation suites. Network,
-model execution and token-lock I/O are replaced at their boundaries, not the runner
-admission guards or PTB queue/processor. The test belongs under `tests/plugins/`
-because `tests/gateway/conftest.py` replaces PTB modules with MagicMocks.
+Telegram update-admission, batching and multiplex/profile-isolation suites. Network
+and model execution are replaced at their boundaries, not the runner admission
+guards or PTB queue/processor. Partial-release regressions use real scoped locks in
+a temporary rendezvous directory. The test belongs under `tests/plugins/` because
+`tests/gateway/conftest.py` replaces PTB modules with MagicMocks. The optional PTB
+imports skip collection cleanly when the messaging extra is absent.
 
 Falsifier: an existing supported route that durably replays the same maintenance-
 refused native input exactly once would invalidate the loss diagnosis. A successful
@@ -99,7 +137,9 @@ external drain, Telegram batch shutdown and held input. Related, not equivalent:
 No equivalent solution was found within those bounded searches. Upstream guidance
 supports joining existing task owners and preserving the ordered admission path.
 The intentional fork divergence is the existing opt-in handover state granting its
-registered old Telegram transport an admission allowance while cron stays closed.
+registered old Telegram transport an admission allowance. The early shared drain
+flag gates cron when observed, but the dashboard watcher can clear it as described
+above. This extension does not add a persistent handover-owned cron fence.
 Retire this extension with the handover owner, or when upstream provides equivalent
 lossless cooperative transfer and these regressions pass without the fork patch.
 Rollback is the source repair commit with `Fork-Patch: zero-cut-handover`, not a
@@ -158,8 +198,11 @@ When B is ready, the updater sends `handover` over A's control socket. A then:
 
 B acquires the lock and starts polling only after A releases it. A continues
 sending its own final responses through the existing outbox and exits `0` once
-idle. A failed or timed-out `updater.stop()` is logged and the bounded teardown
-still releases the lock; the handover path must not deadlock.
+idle. A failed or timed-out `updater.stop()` reports handover failure. A pending
+stop remains owned, and fatal retirement joins its token-using cleanup before
+disconnect or lock release. Supported gateway reconnect owners wait for that
+retirement before starting a replacement consumer. Gateway-facing waits remain
+bounded without treating their deadline as completed cleanup.
 
 A follow-up for a session with a turn still running on A remains queued behind
 that owner rather than starting on B. New sessions may be admitted by B after

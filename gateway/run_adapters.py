@@ -222,7 +222,7 @@ class GatewayAdapterLifecycleMixin:
         return _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT if initial else _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT
 
     async def _connect_adapter_with_timeout(
-        self, adapter, platform, *, is_reconnect: bool = False, initial: bool = False
+        self, adapter, platform, *, is_reconnect: bool = False, initial: bool = False, predecessor=None
     ) -> bool:
         """Connect with a bound so one platform can't block others. ``is_reconnect``: cold boot
         drops the stale server-side queue, a reconnect keeps it. ``initial``: capped budget.
@@ -235,18 +235,30 @@ class GatewayAdapterLifecycleMixin:
         to spend before the gateway reaches ``running`` (#85993 — Telegram's 180s).
         """
         try:
-            ok = await self._connect_adapter_bounded(adapter, platform, is_reconnect=is_reconnect, initial=initial)
+            ok = await self._connect_adapter_bounded(
+                adapter, platform, is_reconnect=is_reconnect, initial=initial, predecessor=predecessor)
         except Exception as exc:
             record_platform_connect(adapter, platform, is_reconnect=is_reconnect, ok=False, exc=exc)
             raise
         record_platform_connect(adapter, platform, is_reconnect=is_reconnect, ok=bool(ok))
         return ok
 
-    async def _connect_adapter_bounded(self, adapter, platform, *, is_reconnect: bool, initial: bool) -> bool:
+    @staticmethod
+    async def _connect_after_retirement(adapter, is_reconnect: bool, predecessor) -> bool:
+        # Queuing before teardown remains essential for wedged closes. An adapter
+        # that still owns credential-using cleanup supplies its actual retirement
+        # task: a same-PID lock reacquire alone cannot exclude that old consumer.
+        retirement = getattr(predecessor, "_platform_lock_retirement_task", None)
+        if asyncio.isfuture(retirement):
+            await asyncio.gather(asyncio.shield(retirement), return_exceptions=True)
+        return await adapter.connect(is_reconnect=is_reconnect)
+
+    async def _connect_adapter_bounded(self, adapter, platform, *, is_reconnect: bool, initial: bool, predecessor=None) -> bool:
         timeout = self._platform_connect_timeout_secs(platform, initial=initial)
+        connect = self._connect_after_retirement(adapter, is_reconnect, predecessor)
         if timeout <= 0:
-            return await adapter.connect(is_reconnect=is_reconnect)
-        task = asyncio.ensure_future(adapter.connect(is_reconnect=is_reconnect))
+            return await connect
+        task = asyncio.ensure_future(connect)
         if await self._wait_or_detach(task, timeout):
             return bool(await task)
         raise TimeoutError(f"{platform.value} connect timed out after {timeout:g}s")
@@ -884,7 +896,8 @@ class GatewayAdapterLifecycleMixin:
             carry_inbound_dedup(info.get("predecessor"), adapter)
             self._wire_adapter_handlers(adapter)
             # is_reconnect keeps the server-side update queue so offline-period messages are delivered.
-            success = await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
+            success = await self._connect_adapter_with_timeout(
+                adapter, platform, is_reconnect=True, predecessor=info.get("predecessor"))
             if success:
                 await self._install_reconnected_adapter(platform, adapter)
             elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
@@ -1609,7 +1622,8 @@ class GatewayAdapterLifecycleMixin:
             carry_inbound_dedup(predecessor, adapter)
             try:
                 self._configure_profile_adapter(adapter, profile_name, platform)
-                success = await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
+                success = await self._connect_adapter_with_timeout(
+                    adapter, platform, is_reconnect=True, predecessor=predecessor)
             except BaseException:
                 # Caller never sees this adapter; release its partial resources and return its held inbound.
                 await self._safe_adapter_disconnect(adapter, platform)
