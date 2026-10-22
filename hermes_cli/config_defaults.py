@@ -122,11 +122,10 @@ DEFAULT_CONFIG = {
         # 0 = opt out.
         "cron_drain_timeout": 30,
         # In-band restart (/restart, SIGUSR1): refuse new work, then wait up to this many seconds
-        # for in-flight agents/cron/api runs to finish before stop(). 0 = enter stop() at once. 30
-        # min is a safety valve for wedged agents, not a target; raise for long unattended turns.
-        # Default 30 min is a safety valve for wedged agents, not a target latency — an interactive `hermes
-        # gateway restart` must never block for hours on a turn that wedged (#79133).
-        "restart_after_turn_timeout": 1800,
+        # for in-flight agents/cron/api runs to finish before stop(). 0 = enter stop() at once.
+        # The 15-minute cap is a safety valve for wedged agents, not a target latency. Service reloads
+        # use this same wait BEFORE bootout, because launchd's ExitTimeOut only covers final shutdown.
+        "restart_after_turn_timeout": 900,
         # Max seconds a submitted prompt waits for the deferred agent build (MCP discovery, model
         # metadata, skills scan) before failing visibly. The prompt is delivered as soon as the
         # build completes (progress notice past 30s), so this only fires on a hung build. Raise for

@@ -2205,7 +2205,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         return True
 
     def request_restart(self, *, detached: bool = False, via_service: bool = False,
-                        reason: Optional[str] = None) -> bool:
+                        reason: Optional[str] = None, service_reload: bool = False) -> bool:
         if self._restart_task_started:
             return False
         self._restart_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
@@ -2221,6 +2221,10 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
 
         async def _run_restart() -> None:
             await self._await_active_work_before_restart()
+            if service_reload:
+                from gateway.service_restart import reload_service_after_wait
+                await reload_service_after_wait(self)
+                return
             # Detached helper only AFTER the after-turn wait, or its drain_timeout+5 deadline fires mid-turn.
             if detached:
                 with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart helper: %s"):

@@ -5777,6 +5777,7 @@ async def _start_gateway_start_control_socket(runner):
             unserve_profile_verb, serve_profile_verb,
         )
         from gateway.run_plugin_rewire import reload_plugins_verb
+        from gateway.service_restart import make_service_reload_handler
         # pause-for-update asks the updater to drain and exit cleanly; marshal socket-thread calls onto the loop.
         _main_loop = asyncio.get_running_loop()
 
@@ -5832,6 +5833,7 @@ async def _start_gateway_start_control_socket(runner):
             verb_handlers={"cron-review": _cron_review_control.submit,
                            "cron-review-result": _cron_review_control.result,
                            "pause-for-update": _pause_for_update_handler,
+                           "reload-service": make_service_reload_handler(runner, _main_loop),
                            "agent-update": _agent_update_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "unserve-profile": unserve_profile_verb(runner),

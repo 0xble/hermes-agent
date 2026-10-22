@@ -140,17 +140,19 @@ Windows already paused its gateways before the update (they lock files the depen
 
 ### Why the gateway restart can take a while
 
-The restart is drain-first: the running gateway refuses new turns, then waits for in-flight work (chat turns, cron jobs, API runs) to finish before exiting, capped by `agent.restart_after_turn_timeout` (30 minutes by default). Background delegations have an independent wait budget, `gateway.restart_delegation_timeout` (15 minutes by default, `0` skips their wait), and do not extend the turn budget. While that wait is in progress the gateway logs the remaining budgets every 10 seconds; the updater also displays the work the gateway is still holding for, for example:
+The restart is drain-first: the running gateway refuses new turns, then waits for in-flight work (chat turns, cron jobs, API runs) to finish before exiting, capped by `agent.restart_after_turn_timeout` (15 minutes by default). Background delegations have an independent wait budget, `gateway.restart_delegation_timeout` (15 minutes by default, `0` skips their wait), and do not extend the turn budget. While that wait is in progress the gateway logs the remaining budgets every 10 seconds; the updater also displays the work the gateway is still holding for, for example:
 
 ```
-  → hermes-gateway: draining (up to 1875s)...
-  ⏳ still draining — 1560s left before the forced restart
+  → hermes-gateway: draining (up to 975s)...
+  ⏳ still draining — 660s left before the forced restart
      waiting on 1 active work unit(s):
        • cron job 6ba19dab68df (nightly-scout) in external worker pid 573597, running 6m40s
      finish or kill the work above to release the drain now; agent.restart_after_turn_timeout in config.yaml caps this wait
 ```
 
 Chat turns show their session key, model and current tool; cron jobs show the job id, name and the process running them (an external restart-safe worker on systemd installs, otherwise the gateway itself). `hermes gateway status` lists the same units while the gateway is draining. To stop waiting, finish or kill the listed work, or lower `agent.restart_after_turn_timeout` in `config.yaml` (`0` skips waiting for non-delegation work). Once neither kind has work within its own budget, the forced drain starts immediately and interrupts any remaining work.
+
+On macOS, an updater that also reloads the launchd service definition uses the same bounded wait **before** sending `bootout`. New work is refused during that wait. The final SIGTERM shutdown still has its own short watchdog because launchd's stop deadline cannot cover a long active-work wait. A gateway running an older version without the reload control verb uses the legacy bounded shutdown with a warning, so the first activation of this feature can still interrupt work.
 
 Wedged work does not hold the restart: a chat turn idle past `agent.gateway_timeout`, or a cron run older than the scheduler's in-flight allowance (`max(2 × the job's interval, cron.inflight_max_minutes)`, 30 minutes by default), is excluded from the wait and interrupted by the restart instead.
 

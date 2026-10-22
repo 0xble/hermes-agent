@@ -671,7 +671,7 @@ def refresh_launchd_plist_if_needed() -> bool | str:
     return _reload_installed_launchd_plist(plist_path)
 
 
-def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
+def _reload_installed_launchd_plist(plist_path: Path, *, wait_for_active_work: bool = True) -> bool | str:
     """Re-register the installed bytes (including a saved source-checkout plist)."""
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
@@ -684,6 +684,17 @@ def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
         gateway_pid = get_running_pid()
     except Exception:
         gateway_pid = None
+
+    if gateway_pid is not None and wait_for_active_work:
+        from gateway.control_socket import query_gateway_control
+        result = query_gateway_control(_gw().get_hermes_home(), "reload-service", timeout=10.0)
+        if result is not None:
+            if result.get("accepted") and result.get("pid") == gateway_pid:
+                print("→ Service reload requested; gateway is draining in-flight work before launchd bootout")
+                return "deferred"
+            raise RuntimeError("Gateway is already stopping or refused its service reload; no bootout sent")
+        # Older or unresponsive gateways cannot perform the pre-bootout wait.
+        _gw().logger.warning("Gateway service-reload control unavailable; using bounded launchd shutdown")
 
     # POSIX ancestry is NOT a reliable "bootout will kill us" test (coalition membership survives
     # reparenting), so always prefer the detached helper; in-process is only the spawn-failure fallback.

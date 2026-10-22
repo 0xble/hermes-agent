@@ -29,6 +29,35 @@ or how an interrupted child reports why it stopped.
   `gateway.restart_resume_policy`. Neither unit resumes a killed child
   automatically; explicit parent-driven recovery is the section below.
 
+## Updater Service Reload Wait
+
+Fork patch identity: `updater-active-work-wait`.
+
+A launchd plist reload must wait **before** `bootout`. Its planned SIGTERM path
+still enters the bounded `stop(restart=True, service_restart=True)` directly:
+launchd clamps `ExitTimeOut`, so a 900-second wait inside that handler would be
+SIGKILLed before it finished. Preserve that stop path and its shutdown watchdog.
+
+The updater asks the control socket for `reload-service`. Acceptance runs
+`request_restart(via_service=True, service_reload=True)` on the gateway loop,
+freezes admission, and reuses `_await_active_work_before_restart`, including async
+delegations. The gateway dispatches the existing independent reload helper only
+after work finishes or its entry-fixed budget expires. The helper then marks the
+planned restart and boots out the gateway as before. A failed helper dispatch
+falls back to the normal watched service shutdown, not an indefinite drain.
+
+Both before-stop budgets default to 900 seconds. Explicit zero budgets dispatch
+the helper immediately. An explicit refusal does not send bootout. An older
+gateway without the control verb retains the bounded legacy reload with a
+warning, so the first activation from an older runtime cannot acquire this wait.
+The control call acknowledges admission freeze, not completion of the reload.
+
+Focused coverage: `tests/gateway/test_service_restart.py` exercises the real
+socket, updater reload entry, active-delegation accounting and admission fence
+with completion, expiry and zero budgets. `tests/hermes_cli/test_service_reload_drain.py`
+guards the updater handoff and the default budgets. Existing planned-signal and
+launchd exit-budget tests protect the final shutdown envelope.
+
 ## Explicit one-shot recovery (slice 2, narrow form)
 
 - `delegate_task(action='resume', subagent_id=<delegation_id>)` is a control
