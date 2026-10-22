@@ -27,8 +27,11 @@ async def handover_stop_polling(adapter) -> dict[str, object]:
     updater = getattr(app, "updater", None)
     try:
         if updater is not None and (not hasattr(updater, "running") or updater.running):
+            # Retain the actual operation, not the deadline wrapper. A timed-out/cancelled
+            # stop can still own PTB's lifecycle lock and must never race an in-place start.
+            adapter._handover_polling_stop_task = asyncio.create_task(updater.stop())
             await _await_with_thread_deadline(
-                updater.stop(), timeout=_UPDATER_STOP_TIMEOUT,
+                adapter._handover_polling_stop_task, timeout=_UPDATER_STOP_TIMEOUT,
                 label="telegram handover updater.stop()")
         remaining = max(0.0, deadline - asyncio.get_running_loop().time())
         await asyncio.wait_for(_wait_for_dispatch_settle(adapter, app), timeout=remaining)
@@ -38,6 +41,57 @@ async def handover_stop_polling(adapter) -> dict[str, object]:
         logger.warning("Telegram handover polling stop failed: %s", exc, exc_info=True)
         return {"settled": False, "reason": type(exc).__name__}
     return {"settled": True}
+
+
+def _restore_handover_lock(adapter, ownership) -> bool:
+    """Reclaim a partial release, never replacing a different live acquire (even same PID)."""
+    scope, identity, nonce = ownership
+    if not identity:
+        return True  # no scoped credential (also supports adapters built without connect())
+    from gateway.status import _get_scope_lock_path, _read_json_file, acquire_scoped_lock
+    path = _get_scope_lock_path(scope, identity)
+    record = _read_json_file(path)
+    if record is not None:
+        if (record.get("metadata") or {}).get("nonce") != nonce:
+            return False
+    elif path.exists():
+        return False  # unreadable is not proof that ownership is available
+    else:
+        acquired, _ = acquire_scoped_lock(scope, identity, metadata={"platform": "telegram", "nonce": nonce})
+        if not acquired:
+            return False
+    adapter._platform_lock_identity = identity
+    return True
+
+
+async def resume_handover_polling(adapter, ownership) -> None:
+    """Undo only a settled, still-owned handover fence. Ambiguous PTB teardown uses its
+    existing retryable-fatal/reconnect owner rather than starting a second lifecycle."""
+    if not getattr(adapter, "_polling_teardown_started", False):
+        return
+    stop = getattr(adapter, "_handover_polling_stop_task", None)
+    safe_stop = stop is None or (stop.done() and not stop.cancelled() and stop.exception() is None)
+    if not safe_stop or not _restore_handover_lock(adapter, ownership):
+        # Publish the real retirement owner before fatal notification can queue a
+        # same-process reconnect. PTB running=False is not completion of its cleanup.
+        _start_disconnect(adapter, adapter._disconnect)
+        await adapter._go_fatal_network(
+            "Telegram handover could not safely resume its poller; rebuilding via gateway recovery.",
+            "[%s] %s", adapter.name,
+            "handover rollback requires adapter recovery")
+        return
+    adapter._polling_teardown_started = False
+    adapter._schedule_held_inbound_redispatch()
+    app = getattr(adapter, "_app", None)
+    updater = getattr(app, "updater", None)
+    if updater is not None and not updater.running:
+        try:
+            await adapter._start_polling_resilient(
+                drop_pending_updates=False, error_callback=adapter._polling_error_callback_ref)
+        except Exception:
+            await adapter._go_fatal_network(
+                "Telegram handover polling restoration failed; rebuilding via gateway recovery.",
+                "[%s] %s", adapter.name, "handover polling restoration failed")
 
 
 async def _wait_for_dispatch_settle(adapter, app) -> None:
@@ -101,40 +155,50 @@ def release_handover_lock(adapter) -> None:
         adapter._platform_lock_identity = None
 
 
-async def run_disconnect(adapter, disconnect: Callable[..., Awaitable[None]]) -> None:
-    """Keep the token lock through updater stop, even if the gateway detaches teardown.
-
-    The gateway's disconnect budget may stop waiting while the shielded teardown keeps running. A
-    successor adapter in this process can re-acquire the same lock file meanwhile (same-PID
-    self-reacquire), so a late release only unlinks the record this adapter acquired, identified
-    by the nonce it wrote at acquire time.
-    """
-    runner_config = getattr(getattr(adapter, "gateway_runner", None), "config", None)
-    if not is_zero_cut_handover_enabled(runner_config):
-        await disconnect(zero_cut_handover=None)
-        return
-    own = getattr(adapter, "_platform_lock_nonce", None)  # captured now: a later reacquire must not count
+def _start_disconnect(adapter, disconnect: Callable[..., Awaitable[None]]) -> asyncio.Future:
+    """One shielded credential-retirement owner, also joined by runner reconnects."""
+    existing = getattr(adapter, "_platform_lock_retirement_task", None)
+    if existing is not None:
+        return existing
+    own = getattr(adapter, "_platform_lock_nonce", None)
 
     def release() -> None:
         current = _lock_owner_nonce(adapter)
         if own is None or current == own:
             adapter._release_platform_lock()
         elif current is not None and getattr(adapter, "_platform_lock_nonce", None) == own:
-            adapter._platform_lock_identity = None  # another adapter re-acquired the record
-        # Unreadable record, or this adapter re-acquired: leave the identity for its later release.
+            adapter._platform_lock_identity = None
+        # An unreadable record is not proof that a successor no longer owns it.
 
-    def release_after(task: asyncio.Future) -> None:
+    async def retire() -> None:
+        stop = getattr(adapter, "_handover_polling_stop_task", None)
+        if stop is not None:
+            # A deadline/cancel only ended the handover's wait. PTB's final getUpdates
+            # can still be live, even with running=False. Neither stop it twice nor
+            # close its app/release its token until the actual operation finishes.
+            await asyncio.gather(asyncio.shield(stop), return_exceptions=True)
+        await disconnect(zero_cut_handover=release)
+
+    def finished(task: asyncio.Future) -> None:
         _DETACHED_TEARDOWNS.discard(task)
         if not task.cancelled():
             task.exception()
         release()
 
-    task = asyncio.ensure_future(disconnect(zero_cut_handover=release))
-    try:
-        await asyncio.shield(task)
-    finally:
-        if task.done():
-            release()
-        else:
-            _DETACHED_TEARDOWNS.add(task)
-            task.add_done_callback(release_after)
+    task = adapter._platform_lock_retirement_task = asyncio.create_task(retire())
+    _DETACHED_TEARDOWNS.add(task)
+    task.add_done_callback(finished)
+    return task
+
+
+async def run_disconnect(adapter, disconnect: Callable[..., Awaitable[None]]) -> None:
+    """A gateway deadline detaches its wait, not the old token user's lifetime.
+
+    Repeated retirement callers join the same operation. Keep the original nonce
+    release check: unrelated same-PID reacquisition must never be unlinked late.
+    """
+    runner_config = getattr(getattr(adapter, "gateway_runner", None), "config", None)
+    if not is_zero_cut_handover_enabled(runner_config):
+        await disconnect(zero_cut_handover=None)
+        return
+    await asyncio.shield(_start_disconnect(adapter, disconnect))
