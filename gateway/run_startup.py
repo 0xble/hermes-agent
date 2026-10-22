@@ -37,9 +37,6 @@ from gateway.restart import (
 #: restartable exit introduces: a permanently dead backend looping forever unnoticed.
 _TRANSIENT_EXIT_STREAK_LIMIT = 5
 from gateway.run_shutdown import _log_suppressed, _send_error
-from gateway.replay_scheduler import (
-    REPLAY_PRIORITY_STARTUP, REPLAY_PRIORITY_RESUME, REPLAY_PRIORITY_SYNTHETIC,
-)
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
@@ -48,9 +45,7 @@ from typing import Any, Dict, Optional, Tuple
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
-# A restart resumes every interrupted session at once. Their turn openings (history load, prompt
-# build, first writes) all hit the shared state.db writer, so admit a few at a time: each slot is
-# held until its turn ends or the opening window passes, so long turns never hold later sessions.
+# Long turns release opening admission after this window, without releasing session ownership.
 _STARTUP_RESUME_CONCURRENCY = 4
 _STARTUP_RESUME_OPENING_S = 15.0
 
@@ -99,7 +94,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     def _serving_state(self) -> str:
         return "degraded" if self._startup_parked_platforms else "running"
 
-    def _queue_startup_restore_event(self, event: MessageEvent, *, front: bool = False) -> None:
+    def _queue_startup_restore_event(
+        self, event: MessageEvent, *, front: bool = False, session_key: Optional[str] = None,
+    ) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             queue = self._startup_restore_queue = []
@@ -113,6 +110,13 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             if claimed is None:
                 claimed = self._restart_followup_keys = set()
             claimed.add(key)
+        key = session_key or key or self._session_key_for_source(
+            self._normalize_source_for_session_key(event.source)
+        )
+        restore_keys = getattr(self, "_startup_restore_keys", None)
+        if restore_keys is None:
+            restore_keys = self._startup_restore_keys = {}
+        restore_keys[key] = restore_keys.get(key, 0) + 1
         with suppress(Exception):
             source = event.source
             kind = (
@@ -123,7 +127,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             logger.info(
                 "Queued replay source: kind=%s session_key=%s",
                 kind,
-                session_key or self._session_key_for_source(self._normalize_source_for_session_key(source)),
+                key,
                 extra={"replay_scheduler": "source_queued", "kind": kind},
             )
 
@@ -152,7 +156,19 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         scheduler = getattr(self, "_replay_scheduler", None)
         if scheduler is not None and getattr(scheduler, "_closed", False):
             return
-        task = asyncio.create_task(self._drain_startup_restore_queue(wait=False))
+        current = getattr(self, "_startup_restore_drain_task", None)
+        if current is not None and not current.done():
+            return
+
+        async def drain() -> None:
+            while queue := getattr(self, "_startup_restore_queue", None):
+                before = {id(event) for event in queue}
+                await self._drain_startup_restore_queue(wait=True)
+                if before.issubset({id(event) for event in queue}):
+                    break
+
+        task = asyncio.create_task(drain())
+        self._startup_restore_drain_task = task
         self._retain_background_task(task)
         task.add_done_callback(
             self._late_failure_callback("background startup restore drain failed", level=logging.DEBUG)
@@ -767,6 +783,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     async def _drop_queued_resume(self, session_key: str) -> None:
         """Release a shutdown-dropped resume sentinel and keep the durable marker recoverable."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        getattr(self, "_startup_resume_inflight", set()).discard(session_key)
         state = self._peek_session_state(session_key)
         if state is None or state.turn.agent is not _AGENT_PENDING_SENTINEL:
             return
@@ -1944,7 +1961,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         # The boot decision survives the async refresh and reconnect path. Never evade the
         # breaker merely because an interruption-note send is unavailable or ambiguous.
         self._restart_resume_breaker_tripped = breaker_tripped
-        self._schedule_resume_pending_sessions(candidates=candidates, allow_resume=not breaker_tripped)
+        self._schedule_resume_pending_sessions(
+            candidates=candidates, allow_resume=not breaker_tripped, start_scheduler=False,
+        )
         await self._finish_startup_restore()
         # Queue bounded parent-facing recovery notices after adapters/session restore are ready.
         # The async delegation watcher performs the route/authorization preflight and durable

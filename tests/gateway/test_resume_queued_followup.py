@@ -740,10 +740,13 @@ async def test_startup_release_does_not_overtake_other_session_deferred_followup
     runner._queue_startup_restore_event(live_b, session_key=other_key)
 
     seen = []
+    live_dispatched = asyncio.Event()
 
     async def handle(event):
         seen.append(event.text)
         event._gateway_accepted = True
+        if event is live_b:
+            live_dispatched.set()
 
     adapter.handle_message = handle
     assert await runner._drain_startup_restore_queue(
@@ -753,7 +756,8 @@ async def test_startup_release_does_not_overtake_other_session_deferred_followup
     assert seen == ["human:A-older"]
 
     resume_b.set_result(None)
-    await asyncio.sleep(0)
+    # Completion can enqueue a successor after a snapshot of background tasks.
+    await asyncio.wait_for(live_dispatched.wait(), 5)
     await asyncio.gather(*(tuple(runner._background_tasks)), return_exceptions=True)
     assert seen == ["human:A-older", "human:B-older", "human:B-live"]
 
@@ -776,9 +780,11 @@ async def test_shutdown_spools_restore_items_dropped_behind_replay_cap(tmp_path,
     release = asyncio.Event()
 
     async def handle(event):
+        # The first item belongs to an accepted adapter turn. Only the waiting
+        # items must return to the source queue on cancellation.
+        event._gateway_accepted = True
         started.set()
         await release.wait()
-        event._gateway_accepted = True
 
     adapter.handle_message = handle
     await runner._drain_startup_restore_queue(wait=False)
@@ -916,6 +922,8 @@ async def test_startup_records_one_boot_and_preserves_breaker_verdict(tmp_path, 
     runner._schedule_resume_pending_sessions = schedule
 
     await asyncio.wait_for(runner._start_finish_wiring(0), timeout=5)
+    await asyncio.gather(*tuple(runner._background_tasks), return_exceptions=True)
+    await asyncio.wait_for(runner._get_replay_scheduler().wait_idle(), 5)
 
     recorded_after = guard._load_boots()
     assert len(recorded_after) == prior_boots + 1

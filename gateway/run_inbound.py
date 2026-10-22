@@ -51,6 +51,17 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+def _is_restore_control_event(event: MessageEvent) -> bool:
+    """Let recognized gateway controls bypass replay fences and reach the busy fast path."""
+    if not getattr(event, "allow_gateway_control", False):
+        return False
+    command = event.get_command()
+    if not command:
+        return False
+    from hermes_cli.commands import should_bypass_active_session
+    return should_bypass_active_session(command)
+
+
 def discord_triggering_note(message_id: Any) -> str:
     """Model-facing routing note for a Discord turn (rides the API-bound user message only)."""
     return (
@@ -261,7 +272,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         # pre_gateway_dispatch hook runs only after this gate and must not rewrite
         # the routing identity of an already admitted event.
         reconnect_key = None
-        if (reconnect_keys or startup_restore_keys) and not is_internal:
+        if (reconnect_keys or startup_restore_keys or getattr(self, "_startup_restore_in_progress", False)) and not is_internal:
             normalized = await asyncio.to_thread(self._normalize_source_for_session_key, source)
             reconnect_key = self._session_key_for_source(normalized)
         if (

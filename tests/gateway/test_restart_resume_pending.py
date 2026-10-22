@@ -650,7 +650,7 @@ async def test_reconnect_reschedule_is_platform_scoped():
     runner.adapters = {Platform.TELEGRAM: adapter}
 
     scheduled = runner._schedule_resume_pending_sessions(platform=Platform.TELEGRAM)
-    await asyncio.sleep(0)
+    await asyncio.wait_for(runner._get_replay_scheduler().wait_idle(), 2)
 
     # Only the telegram session is resumed; the discord session waits for its
     # own reconnect.
@@ -709,7 +709,7 @@ async def test_startup_auto_resume_freshness_survives_spring_forward(monkeypatch
         else:
             os.environ["TZ"] = original_tz
         time.tzset()
-    await asyncio.sleep(0)
+    await asyncio.wait_for(runner._get_replay_scheduler().wait_idle(), 2)
 
     assert scheduled == 1
     adapter.handle_message.assert_awaited_once()
@@ -989,9 +989,34 @@ async def test_stop_drops_queued_resume_after_sentinel_release():
     event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
     adapter.handle_message = AsyncMock()
 
-    await runner._run_startup_resume_event(adapter, event, key)
+    await runner._admit_startup_resume_event(adapter, event, key)
 
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retains_active_unaccepted_human_replay():
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = False
+    runner._startup_restore_queue = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+    source = make_restart_source(chat_id="active-unaccepted")
+    key = runner._session_key_for_source(source)
+    event = MessageEvent(text="keep this input", message_type=MessageType.TEXT, source=source)
+
+    async def handle(event):
+        started.set()
+        await release.wait()
+
+    adapter.handle_message = handle
+    runner._queue_startup_restore_event(event, session_key=key)
+    await runner._drain_startup_restore_queue(wait=False)
+    await asyncio.wait_for(started.wait(), 2)
+    await runner._get_replay_scheduler().close(timeout=0)
+    await asyncio.gather(*tuple(runner._background_tasks), return_exceptions=True)
+    assert runner._startup_restore_queue == [event]
+    assert runner._startup_restore_keys == {key: 1}
 
 
 @pytest.mark.asyncio

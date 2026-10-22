@@ -123,3 +123,62 @@ def test_restart_replay_concurrency_config_parses_and_defaults():
     assert GatewayConfig.from_dict({"restart_replay_concurrency": 5}).restart_replay_concurrency == 5
     assert GatewayConfig.from_dict({"restart_replay_concurrency": 0}).restart_replay_concurrency == 2
     assert GatewayConfig.from_dict({"restart_replay_concurrency": "bad"}).restart_replay_concurrency == 2
+
+
+@pytest.mark.asyncio
+async def test_replay_scheduler_restarts_workers_after_idle():
+    scheduler = ReplayScheduler(1)
+
+    async def work():
+        return "ok"
+
+    scheduler.start()
+    for _ in range(2):
+        handle = scheduler.enqueue(priority=1, kind="human", session_key="s", dispatch=work)
+        assert await scheduler.wait_for(handle) == "ok"
+        await scheduler.wait_idle()
+        await asyncio.sleep(0)  # Allow the worker's completion callback to retire it.
+        assert not scheduler._workers
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_replay_dispatch_and_drop_share_captured_profile(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+    from contextvars import ContextVar
+    from gateway.run import GatewayRunner
+
+    current = ContextVar("replay_test_home", default=None)
+    seen = []
+
+    @asynccontextmanager
+    async def scope(home):
+        token = current.set(home)
+        try:
+            yield
+        finally:
+            current.reset(token)
+
+    monkeypatch.setattr("gateway.run._async_profile_runtime_scope", scope)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True, restart_replay_concurrency=1)
+    scheduler = runner._get_replay_scheduler()
+
+    async def dispatch():
+        seen.append(("dispatch", current.get()))
+
+    first = runner._enqueue_replay(
+        priority=1, kind="human", session_key="s", dispatch=dispatch, profile_home=tmp_path,
+    )
+    scheduler.start()
+    await scheduler.wait_for(first)
+    await scheduler.wait_idle()
+    # This synchronous enqueue cannot yield to a worker before close drops it.
+    dropped = runner._enqueue_replay(
+        priority=2, kind="resume", session_key="s", dispatch=dispatch, profile_home=tmp_path,
+        on_drop=lambda: seen.append(("drop", current.get())),
+    )
+    await scheduler.close()
+    assert dropped.future.cancelled()
+    assert seen == [("dispatch", tmp_path), ("drop", tmp_path)]
+    assert current.get() is None

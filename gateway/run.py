@@ -3607,20 +3607,23 @@ class GatewayRunner(
         captured_home = profile_home
         scheduler = self._get_replay_scheduler()
 
-        async def _scoped_dispatch() -> Any:
+        async def _scoped_call(callback) -> Any:
+            from contextlib import nullcontext
+            from inspect import isawaitable
+            scope = nullcontext()
             if captured_home is not None and getattr(self.config, "multiplex_profiles", False):
-                from gateway.run import _async_profile_runtime_scope
-                async with _async_profile_runtime_scope(captured_home):
-                    return await dispatch()
-            return await dispatch()
+                scope = _async_profile_runtime_scope(captured_home)
+            async with scope:
+                result = callback()
+                return await result if isawaitable(result) else result
 
         return scheduler.enqueue(
             priority=priority,
             kind=kind,
             session_key=session_key,
             profile_home=captured_home,
-            dispatch=_scoped_dispatch,
-            on_drop=on_drop,
+            dispatch=lambda: _scoped_call(dispatch),
+            on_drop=(lambda: _scoped_call(on_drop)) if on_drop is not None else None,
         )
 
     def _init_replay_scheduler(self) -> None:

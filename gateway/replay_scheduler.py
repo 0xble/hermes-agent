@@ -151,9 +151,8 @@ class ReplayScheduler:
     async def _worker(self) -> None:
         while True:
             async with self._condition:
-                while not self._queue and not self._closed:
-                    await self._condition.wait()
-                if self._closed and not self._queue:
+                # A drained batch owns no idle workers. A later enqueue recreates the pool.
+                if not self._queue:
                     return
                 item = heapq.heappop(self._queue)
                 self._active += 1
@@ -209,6 +208,11 @@ class ReplayScheduler:
     async def wait_for(self, handle: ReplayHandle) -> Any:
         """Wait for one admission/turn without changing its retry semantics."""
         return await handle.future
+
+    async def wait_idle(self) -> None:
+        """Wait until all currently queued admissions and active dispatches have completed."""
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._queue and not self._active)
 
     async def close(self, timeout: float = 1.0) -> None:
         """Drop queued work and bounded-wait active workers during shutdown."""
