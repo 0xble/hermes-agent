@@ -59,6 +59,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
+| Browser vault alias authorization | Retain alias refusals independently of prompt preferences and revalidate aliases before resolution and injection | Alias consent, vault fill, or OTP authorization changes | [Browser vault alias authorization](maintenance/browser-vault-alias-authorization.md) |
 | Delivered steer observer | Give native mid-turn insertions a stable plugin delivery identity | Steer insertion, turn identity or plugin lifecycle changes | [Steer delivery observer](maintenance/steer-delivery-observer.md) |
 | Turn-origin provenance | Give plugins and session context a default-deny per-turn provenance value | Gateway turn identity, plugin hook context, or session environment changes | [Turn-origin provenance](maintenance/turn-origin-provenance.md) |
 | Fork CI | Reproducible patch proof surfaces, hermetic Git fixtures, and complete-suite access on bounded runners | CI, test harness, Git fixture, or proof-surface changes | [Fork CI](maintenance/fork-ci.md) |

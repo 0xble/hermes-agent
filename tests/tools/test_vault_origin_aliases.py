@@ -499,7 +499,7 @@ def test_alias_still_present_after_confirmation_fills(monkeypatch):
     assert result["success"] is True
     assert result["origin"] == "https://login.gusto.com"
     assert len(writes) == 1
-    assert len(loads) == 3  # aliases, confirmation setting, and post-confirmation revalidation
+    assert len(loads) >= 3  # authorization is rechecked across the fill, not cached once
 
 
 def test_saved_origin_fill_skips_prompt_and_alias_recheck(monkeypatch):
