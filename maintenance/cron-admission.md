@@ -31,10 +31,13 @@ owner-fenced running-job release returns it. The healthy built-in ticker
 waits to the earliest eligible deadline, bounded by its 60-second heartbeat,
 and checks worker-release wakes within 0.25 seconds. Due-time and release wakes
 add scans without shifting the fixed-period heartbeat deadline. An eligible
-non-running job already due after a tick gets a 1-second rescan rather than
-waiting for the heartbeat. Failed dispatch cleanup does not signal a worker
-release wake. Overruns rebaseline instead of bursting. Retain fd-exhaustion
-backoff and shutdown responsiveness.
+non-running job whose deadline crossed after an ungated due scan gets a
+1-second rescan rather than waiting for the heartbeat. Already-due jobs left
+intact by ESTOP, drain, an unwritable store, tick-lock contention, or a live
+cross-process claim retain heartbeat cadence. Scan timing is scoped to each
+home and consumed once per ticker cycle. Failed dispatch cleanup does not
+signal a worker release wake. Overruns rebaseline instead of bursting. Retain
+fd-exhaustion backoff and shutdown responsiveness.
 
 ## Update
 

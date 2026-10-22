@@ -361,7 +361,7 @@ def test_worker_release_interrupts_deadline_wait(clock_home):
         thread.join(5)
 
 
-def _run_clocked_ticker(clock, monkeypatch, tick, stopped, *, home=None):
+def _run_clocked_ticker(clock, monkeypatch, tick, stopped, *, home=None, can_dispatch=None):
     fake_time = SimpleNamespace(monotonic=lambda: clock.elapsed)
     monkeypatch.setattr(admission, "time", fake_time)
     monkeypatch.setattr("cron.scheduler_provider.time", fake_time)
@@ -380,7 +380,52 @@ def _run_clocked_ticker(clock, monkeypatch, tick, stopped, *, home=None):
             return self.is_set()
 
     homes = [("test", home)] if home is not None else None
-    InProcessCronScheduler().start(Stop(), interval=60, profile_homes=homes)
+    InProcessCronScheduler().start(
+        Stop(), interval=60, profile_homes=homes, can_dispatch=can_dispatch)
+
+
+@pytest.mark.parametrize("loop", ["single", "multiplex"])
+@pytest.mark.parametrize("gate", ["estop", "dispatch_blocked", "drain", "tick_lock", "run_claim"])
+def test_gated_overdue_job_retains_heartbeat_cadence(clock_home, tmp_path, monkeypatch, loop, gate):
+    from agent import estop
+    from cron import store_health
+
+    item = set_due(make_job("in 2m" if gate == "run_claim" else "every 2m"), clock_home.now)
+    can_dispatch = None
+    if gate == "estop":
+        monkeypatch.setattr(estop, "_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(estop, "_canonical_root", lambda: tmp_path)
+        estop.engage()
+    elif gate == "dispatch_blocked":
+        monkeypatch.setattr(store_health, "dispatch_blocked", lambda due: True)
+    elif gate == "drain":
+        can_dispatch = lambda: False
+    elif gate == "tick_lock":
+        monkeypatch.setattr(scheduler, "_acquire_tick_lock", lambda path: None)
+    else:
+        jobs.update_job(item["id"], {
+            "run_claim": {"at": clock_home.now.isoformat(), "by": "another-process"}})
+    heartbeat, clear_error, run = Mock(), Mock(), Mock()
+    monkeypatch.setattr(jobs, "record_ticker_heartbeat", heartbeat)
+    monkeypatch.setattr(jobs, "clear_ticker_error", clear_error)
+    monkeypatch.setattr(scheduler, "run_one_job", run)
+    ticks = []
+    original_tick = scheduler.tick
+
+    def tick(**kwargs):
+        ticks.append(clock_home.elapsed)
+        return original_tick(**kwargs)
+
+    _run_clocked_ticker(
+        clock_home, monkeypatch, tick, lambda: clock_home.elapsed >= 60,
+        home=tmp_path if loop == "multiplex" else None, can_dispatch=can_dispatch)
+    assert len(ticks) <= 2, f"{len(ticks)} ticks in 60s while {gate}: {ticks[:5]}"
+    assert heartbeat.call_count <= 3  # startup plus at most 2 periodic ticks
+    assert clear_error.call_count <= 2
+    run.assert_not_called()
+    stored = jobs.get_job(item["id"])
+    assert stored is not None
+    assert stored["next_run_at"] == item["next_run_at"]
 
 
 @pytest.mark.parametrize("stage", ["create_execution", "note_cron_execution", "submit"])

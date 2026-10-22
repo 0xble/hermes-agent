@@ -15,6 +15,7 @@ _reserved_claims: dict[str, tuple[str, object]] = {}
 _loaded_protected: dict[str, tuple[str, ...]] = {}
 _lock = threading.Lock()
 _wake = threading.Event()
+_tick_scans = threading.local()
 _SLOT_WAKE_CHECK_SECONDS = 0.25
 
 
@@ -28,15 +29,15 @@ def reserved_job_id(jobs: list[dict], home) -> str | None:
     key = hermes_home_key(home)
     with _lock:
         held = _reserved_claims.get(key)
-    loaded = eligible
-    if held is not None and held[0] not in eligible:
-        loaded = (held[0], *eligible)
-    if _loaded_protected.get(key) != loaded:
-        _loaded_protected[key] = loaded
-        if len(loaded) > 1:
-            logger.error(
-                "Cron has %d protected interval jobs but only 1 reserved worker; "
-                "%s use the general pool best-effort (FIFO)", len(loaded), ", ".join(loaded[1:]))
+        loaded = eligible
+        if held is not None and held[0] not in eligible:
+            loaded = (held[0], *eligible)
+        if _loaded_protected.get(key) != loaded:
+            _loaded_protected[key] = loaded
+            if len(loaded) > 1:
+                logger.error(
+                    "Cron has %d protected interval jobs but only 1 reserved worker; "
+                    "%s use the general pool best-effort (FIFO)", len(loaded), ", ".join(loaded[1:]))
     return eligible[0] if eligible else None
 
 
@@ -45,6 +46,7 @@ def submit_due_jobs(due_jobs: list[dict], pool, process_job) -> list:
     from cron import jobs, scheduler
 
     home = scheduler._get_hermes_home()
+    # The due subset omits future protected jobs, so reservation needs the full store order.
     reserved_id = reserved_job_id(jobs.load_jobs(), home)
     with _lock:
         held = _reserved_claims.get(hermes_home_key(home))
@@ -128,16 +130,27 @@ def shutdown_reserved_pools() -> None:
     _reserved_pools.clear()
 
 
+def note_due_scan(started_at: datetime) -> None:
+    """Only an ungated scan can leave a newly crossed deadline needing a prompt rescan."""
+    from cron import scheduler
+
+    if not hasattr(_tick_scans, "started"):
+        _tick_scans.started = {}
+    _tick_scans.started[hermes_home_key(scheduler._get_hermes_home())] = started_at
+
+
 def next_due_wait(max_wait: float) -> float:
     """Read, never claim/advance, the active home's next eligible deadline.
 
-    In-flight records rely on release wakes. An eligible deadline crossed during the
-    tick gets a bounded rescan, not a heartbeat delay or a zero-delay failure spin.
+    In-flight records rely on release wakes. Only deadlines crossed since this tick's
+    ungated scan get a bounded rescan. Already-due records were deliberately skipped.
     """
     from cron import jobs, scheduler
 
     wait = max_wait
     now = jobs._hermes_now().timestamp()
+    scanned_at = getattr(_tick_scans, "started", {}).pop(
+        hermes_home_key(scheduler._get_hermes_home()), None)
     # Reload after dispatch: workers may have completed and rearmed since reservation selection.
     for job in jobs.load_jobs():
         if (not jobs.is_job_runnable(job) or jobs.is_terminal_job(job)
@@ -146,7 +159,10 @@ def next_due_wait(max_wait: float) -> float:
         due = jobs._parse_aware(job.get("next_run_at"))
         if due is not None:
             remaining = due.timestamp() - now
-            wait = min(wait, remaining if remaining > 0 else 1.0)
+            if remaining > 0:
+                wait = min(wait, remaining)
+            elif scanned_at is not None and due > scanned_at:
+                wait = min(wait, 1.0)
     return wait
 
 
@@ -168,6 +184,7 @@ def due_wait_for_homes(max_wait: float, profile_homes=None) -> float:
 def begin_tick() -> None:
     # Releases before this tick are already visible to its due scan.
     _wake.clear()
+    _tick_scans.started = {}
 
 
 def wait_for_next_tick(stop_event, timeout, *, max_wait, failures=0, profile_homes=None):
