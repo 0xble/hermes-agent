@@ -237,7 +237,8 @@ class TestRunJobScript:
         script.write_text(
             "import json, os\n"
             "print(json.dumps({name: os.environ.get(name) for name in "
-            "('HERMES_SESSION_ID', 'HERMES_SESSION_KEY', 'HERMES_SESSION_PROFILE')}))\n"
+            "('HERMES_SESSION_ID', 'HERMES_SESSION_KEY', 'HERMES_SESSION_PROFILE', "
+            "'HERMES_CRON_SESSION')}))\n"
         )
 
         success, output = _run_job_script("sender_probe.py", cron_job_id="fleet-checker")
@@ -247,6 +248,7 @@ class TestRunJobScript:
             "HERMES_SESSION_ID": "cron_fleet-checker",
             "HERMES_SESSION_KEY": None,
             "HERMES_SESSION_PROFILE": "default",
+            "HERMES_CRON_SESSION": "1",
         }
 
     @pytest.mark.platforms("windows")
