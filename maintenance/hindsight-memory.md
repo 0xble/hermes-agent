@@ -14,7 +14,11 @@ work and the outer turn cleanup have drained, including errors and cancellation.
 The worker and turn completion events bind during agent lookup, before publication
 in the cache. Completion checks cache identity without removing a successor or
 clearing its generation. A per-agent handoff-lock claim prevents duplicate soft
-release when idle eviction races turn completion.
+release when idle eviction races turn completion. Resolver doubles that reuse an
+agent across turns must model cache ownership and match the configured default
+model. Otherwise outer-turn cleanup correctly retires their uncached client.
+Silence-retry coverage keeps its call-count, retry-budget and history assertions
+with that ownership modeled in the shared fixture.
 An agent whose `shutdown_memory_provider()` already ran
 (`_memory_provider_shutdown`, the `/new` and `/reset` cleanup) is detached without
 a second commit or shutdown: `shutdown_memory_provider()` sets that flag and
