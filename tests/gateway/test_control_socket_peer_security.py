@@ -43,6 +43,46 @@ def test_restart_heals_a_world_readable_pointer_left_by_an_older_gateway(tmp_pat
     asyncio.run(run())
 
 
+def test_a_client_polling_during_pointer_publication_never_sees_an_invalid_pointer(tmp_path):
+    # The listener already accepts while clients poll, so the pointer must go from absent
+    # to complete. An empty pointer is a fatal refusal, not "still starting".
+    import asyncio
+    import sys
+    from gateway.control_socket import GatewayControlServer
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError, _socket_path
+    home = tmp_path / ("p" * 90) / ".hermes"
+    home.mkdir(parents=True, mode=0o700)
+    seen, state = [], {"armed": False}
+
+    def poll_at_every_syscall(event, _args):
+        if not state["armed"] or not event.startswith(("open", "os.")):
+            return
+        state["armed"] = False  # discovery's own syscalls must not recurse
+        try:
+            seen.append(_socket_path(home))
+        except FileNotFoundError:
+            seen.append(None)
+        except DiscoveryError as exc:
+            seen.append(exc.reason)
+        finally:
+            state["armed"] = True
+    sys.addaudithook(poll_at_every_syscall)  # cannot be removed, disarmed outside start()
+
+    async def run():
+        server = GatewayControlServer(home)
+        state["armed"] = True
+        try:
+            assert await server.start()
+        finally:
+            state["armed"] = False
+        try:
+            assert _socket_path(home) == server._bind_path
+            assert None in seen and set(seen) <= {None, server._bind_path}, seen
+        finally:
+            await server.stop()
+    asyncio.run(run())
+
+
 def test_group_bits_that_are_an_acl_mask_never_count_as_a_private_group(tmp_path, monkeypatch):
     # With a POSIX ACL (setfacl u:nobody:rwx) the stat group bits are the mask: a 0770 home whose
     # group is the owner's private one may still grant another named user write.
