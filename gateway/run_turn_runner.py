@@ -79,20 +79,12 @@ class _ExecApprovalDeclined(RuntimeError):
 
 
 class TurnRunner:
-    """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
+    """Per-turn callbacks, with routing assignment supplied by gateway turn assembly."""
 
-    def __init__(self, runner: GatewayRunner, ctx: TurnContext) -> None:
+    def __init__(self, runner: GatewayRunner, ctx: TurnContext, *, model_assignment: Optional[dict] = None) -> None:
         self._runner = runner
         self._ctx = ctx
-        # Bind assignment to the turn, not its config. Role destinations reload per API call.
-        state = runner._peek_session_state(ctx.session_key)
-        self._model_assignment = {
-            **runner._snapshot_session_model_override(ctx.session_key),
-            "model_role": state.conversation.model_role if state is not None else None,
-            "model_scope": runner._session_model_override_scope(ctx.session_key),
-            "reasoning_override": runner._session_reasoning_override(ctx.session_key),
-            "reasoning_scope": state.conversation.reasoning_override_scope if state is not None else "session",
-        }
+        self._model_assignment = model_assignment
         from gateway.status_delivery import StatusDelivery
         self._status_delivery = StatusDelivery(ctx, lambda: runner._delivery_adapter_for(ctx.source))
         ctx._status_delivery = self._status_delivery

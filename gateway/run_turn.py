@@ -4152,7 +4152,17 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
-        turn_runner = TurnRunner(self, turn_ctx)
+        # Capture assignment synchronously during turn assembly, before yielding to busy edits.
+        # Callback-only TurnRunner consumers need no routing state. Config stays live per request.
+        state = self._peek_session_state(session_key)
+        model_assignment = {
+            **self._snapshot_session_model_override(session_key),
+            "model_role": state.conversation.model_role if state is not None else None,
+            "model_scope": self._session_model_override_scope(session_key),
+            "reasoning_override": self._session_reasoning_override(session_key),
+            "reasoning_scope": state.conversation.reasoning_override_scope if state is not None else "session",
+        }
+        turn_runner = TurnRunner(self, turn_ctx, model_assignment=model_assignment)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
         # Agent tool-lifecycle callbacks live on the runner (bound methods, same signatures).

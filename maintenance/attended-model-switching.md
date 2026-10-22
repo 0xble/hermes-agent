@@ -24,7 +24,10 @@ expire after the idle window. Temporary picks preserve a named hold and expire
 back to it, just as `--once` preserves it.
 
 Role assignment is bound to a turn, not to its starting config snapshot. Busy
-topic edits and bulk conversions take effect next turn. At each real request,
+topic edits and bulk conversions take effect next turn, even before the current
+turn's first API request. Gateway turn assembly captures assignment synchronously
+and supplies it to TurnRunner. Callback-only construction does not read routing
+state. At each real request,
 the current assignment follows fresh model, provider and reasoning config from
 the owning profile through the existing preset loaders. An empty `@attended`
 or deleted preset falls back coherently to the configured channel/default
@@ -116,6 +119,16 @@ expiry, persisted activity timestamps, and boundary-only idle expiry. A new genu
 Run `tests/gateway/test_model_role_lifecycle.py` for request-boundary profile
 edits, busy assignment timing, stale hydration/one-turn restores, failed
 snapshot publication, transient selection guards and guarded async boundaries.
+The lifecycle suite builds turns through the gateway assembly boundary. Run it
+with `test_cached_agent_history_guard.py`, `test_local_model_connection_reply.py`,
+`test_multiplex_session_db_profile_scope.py`, `test_native_stream_warning_composition.py`,
+`test_slack.py`, `test_streaming_tts_consumer.py`, `test_subagent_failure_notice.py`,
+`test_task_card_destination_preflight.py`, `test_telegram_progress_literals.py`,
+`test_turn_context.py` and `test_context_ref_expansion_runtime.py` under
+`tests/gateway/`. These cover callback-only construction and inbound reference
+expansion through real persisted routing. Also run
+`tests/tui_gateway/test_tui_gateway_server.py` separately to distinguish its
+background-worker timing failures from gateway routing regressions.
 Run the role-hold lifecycle suite, topic tool suite, session and session-store suites,
 and the attended model unit and turn-runner tests together with the gateway regression tests that exercise session limits, Telegram topic admission, reaped-session recovery, cron estop, fallback notices, reasoning flags, and status rehydration. Run `scripts/check_fork_patches.py --repo . --source-only` to verify trailer ownership.
 

@@ -15,7 +15,7 @@ from gateway.attended_model import resolve_attended_model
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
-from gateway.run_turn_runner import TurnRunner
+from gateway.turn_context import TurnContext
 from gateway.session import SessionSource
 from gateway.telegram_topic_sessions import (
     TopicRequestError, TopicSpec, _apply_session_settings, _resolve_model,
@@ -68,8 +68,12 @@ def armed_loop_guard():
 
 
 def _turn(lane):
-    ctx = SimpleNamespace(session_key=lane.key, source=lane.source, user_config=copy.deepcopy(lane.cfg))
-    turn = TurnRunner(lane.runner, ctx)
+    display = SimpleNamespace(**vars(TurnContext(
+        user_config=copy.deepcopy(lane.cfg), resolve_display_setting=lambda *_: False,
+    )), platform_key="telegram")
+    _, turn, _ = lane.runner._run_agent_build_turn_context(
+        display, None, message="hi", source=lane.source, session_key=lane.key, run_generation=None,
+    )
     turn._emit_persistent_attended_notice = lambda _: None
     agent = SimpleNamespace(model="base", provider="baseline", api_mode="chat_completions",
                             _fallback_activated=False, _provider_fallback_active=False)
@@ -130,6 +134,8 @@ async def test_busy_role_assignment_waits_for_next_turn_but_config_stays_live(la
     turn, agent = _turn(lane)
     monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", _switch)
     initial = await _boundary(turn, agent)
+    # Assemble another turn, then edit while it is busy but before its first API call.
+    turn, agent = _turn(lane)
     runner._running_agents[lane.key] = agent
     status = {}
     if bulk:
