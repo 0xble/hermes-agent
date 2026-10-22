@@ -6,8 +6,119 @@ Published commit `c016f92bbbca7b37162d17ac3384df47d181ae29` (PR #630) omitted it
 
 Fork-Patch-Backfill: adf8f9ace4f2f1c05c2230edef450a41edf71d06; zero-cut-handover
 
-**Status:** design only. The flag remains disabled; this document does not start or
-migrate a gateway.
+**Status:** opt-in source implementation. This record does not activate or migrate
+a gateway. The design sections after the received-work repair are historical.
+
+## Received Telegram Work During Handover
+
+The active-side handover implementation is in `gateway/zero_cut_handover_drain.py`.
+The original design below is historical, not an activation receipt. In particular,
+cooperative polling settlement failure retains the token lock and reports failure,
+rather than releasing it through the ordinary disconnect timeout path.
+
+External drain is engaged before stopping cron reviews or polling. Keep that order:
+`gateway/run.py`'s cron `can_dispatch` closure reads `_external_drain_active`.
+Moving the flag until after transport settlement would reopen cron dispatch. While
+this existing handover owns the old Telegram transport, its live received events
+remain admissible through the normal auth and session admission path. The allowance
+requires a registered receiving Telegram adapter via `_transport_owner`, not a
+restored source, relay event or profile-name guess. It ends on failure or real stop.
+Starting a handover inside an ordinary drain is refused, not converted to this
+allowance. Ordinary external-drain new-turn refusal remains unchanged.
+
+Stop and settle every served Telegram adapter, including secondary profile bots.
+Join PTB's unfinished update queue because a dequeued update need not have entered
+the concurrent processor yet. Also join existing batch and held-redispatch tasks:
+text, photo and album dictionaries are popped before identity recovery or dispatch
+finishes. Adapter session guards count as outstanding work even before the runner
+has claimed an agent slot and while it delivers a final or starts a follow-up.
+Those old-owner tasks may finish after token transfer without being mistaken for
+fresh external admissions. Use the existing `_polling_teardown_started` fence while
+stopping polling, without setting the delayed-delivery drop guard. Otherwise 2
+stopped-updater heartbeat probes schedule recovery during a long old-owner turn.
+No new ingress queue, synthetic delivery/turn identity, registry, schema, dependency
+or service is introduced.
+
+A failed popped batch is retained by the existing held-input owner. A handover with
+held input reports failure, never successful idle, and does not release the token
+lock. Cancellation marks the handover failed and enters the existing drain/spool
+path so a late admission remains owned instead of receiving maintenance. Held and
+adapter-pending events remain in memory until the existing shutdown spool runs.
+This is not a new arbitrary-process-kill durability or exactly-once guarantee.
+
+### Source Evidence And Regression
+
+On frozen fork base `9c465b1d10085f3d57ce33599f58ca84096be1c2`, a real PTB
+Application queue/processor plus real Telegram batching, `handle_message` and runner
+admission returns `draining_maintenance` for the original message during polling
+settlement. Admission parked until after token transfer takes the ordinary drain
+path instead of executing. Secondary bots are not settled or counted by the old
+primary-only enumeration. An exception after a batch pop also loses its held-input
+ownership. These reproduce in isolated homes without a bot network or model call.
+No particular lost real user request has been established.
+
+`tests/plugins/test_received_handover.py` exercises original native message ID/text
+execution once across text/photo/album batching, primary/secondary transports,
+pre-admission identity recovery, both handover admission phases, cancellation and
+failed popped dispatch. Its cancellation case checks existing pending ownership.
+`tests/gateway/test_zero_cut_handover_verb.py` also refuses pre-existing ordinary
+drains. Run through `scripts/run_tests.sh`, alongside external-drain, reconnect,
+Telegram update-admission, batching and multiplex/profile-isolation suites. Network,
+model execution and token-lock I/O are replaced at their boundaries, not the runner
+admission guards or PTB queue/processor. The test belongs under `tests/plugins/`
+because `tests/gateway/conftest.py` replaces PTB modules with MagicMocks.
+
+Falsifier: an existing supported route that durably replays the same maintenance-
+refused native input exactly once would invalidate the loss diagnosis. A successful
+outbox admission alone does not: the maintenance response is terminal admission
+output without agent execution.
+
+### Upstream Preflight (2026-10-22)
+
+The independent proposal was recorded before tracker searches. Governing guidance
+was compared at NousResearch `main` pin
+`3d7e687462ca8edfa52142a4dafad12def723bd7`: extend the existing owner, keep the core
+admission narrow waist, use real imports/temp homes and invariant regressions, and
+retain the repository test runner. The pinned subtree instructions were read with
+the fork's current instructions. Fork PM setup and CI delivery differences remain
+unchanged. This repair extends the existing fork-only zero-cut owner, not a claimed
+upstream zero-cut defect.
+
+Read-only open/closed/merged issue and PR searches covered handover, zero-cut,
+external drain, Telegram batch shutdown and held input. Related, not equivalent:
+
+- [#140135](https://github.com/NousResearch/hermes-agent/pull/140135), open: journals
+  inbound intent before admission awaits. Its diff does not preserve an input that
+  reaches a terminal maintenance refusal instead of executing.
+- [#138760](https://github.com/NousResearch/hermes-agent/pull/138760), open: cron
+  worker waits for gateway readiness across a swap, not old-bot received admission.
+- [#138795](https://github.com/NousResearch/hermes-agent/pull/138795), open: serial
+  PTB dispatch stall/rebuild work, not the fork's handover drain gate. No code was
+  borrowed from these proposals.
+
+No equivalent solution was found within those bounded searches. Upstream guidance
+supports joining existing task owners and preserving the ordered admission path.
+The intentional fork divergence is the existing opt-in handover state granting its
+registered old Telegram transport an admission allowance while cron stays closed.
+Retire this extension with the handover owner, or when upstream provides equivalent
+lossless cooperative transfer and these regressions pass without the fork patch.
+Rollback is the source repair commit with `Fork-Patch: zero-cut-handover`, not a
+configuration migration. Stack fit: existing Python/asyncio and adapter/runner
+ownership, no dependencies.
+
+This source repair authorizes no runtime activation. Later activation still needs
+the parent-owned exact-head gate, review, authorized integration and runtime-owner
+procedure. In particular, replacing a live home plugin can affect separately
+running cron interpreters before gateway reload. Account for every old gateway,
+cron worker and other importer before plugin deployment or storage migration.
+The regression covers registered live transports, not already-parked reconnect
+entries or arbitrary concurrent gateway-level adapter replacement. Those transport
+owners still need separate runtime preflight, not an inference from chat idle.
+Gateway chat idle or a terminal execution row is not process-exit proof. The old
+owner must already run this repair for its handover to gain this behavior. Starting
+a fixed successor does not repair the currently unpatched owner's drain path, so
+this candidate alone is not a lossless first-activation procedure. Do not use
+withdrawn `gateway.forward_only_handover` as an activation route.
 
 ## Scope
 

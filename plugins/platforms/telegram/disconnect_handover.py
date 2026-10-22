@@ -17,9 +17,10 @@ _DETACHED_TEARDOWNS: set[asyncio.Future] = set()
 
 async def handover_stop_polling(adapter) -> dict[str, object]:
     """Stop Telegram polling and settle PTB dispatch without tearing down the Bot."""
+    # Reuse the polling lifecycle fence so watchdog/recovery cannot restart this old poller.
+    # This is separate from the delayed-delivery drop guard: fetched batches must still dispatch.
+    adapter._polling_teardown_started = True
     app = getattr(adapter, "_app", None)
-    if app is None:
-        return {"settled": True}
     from plugins.platforms.telegram.adapter import _UPDATER_STOP_TIMEOUT, _await_with_thread_deadline
 
     deadline = asyncio.get_running_loop().time() + _UPDATER_STOP_TIMEOUT
@@ -40,7 +41,25 @@ async def handover_stop_polling(adapter) -> dict[str, object]:
 
 
 async def _wait_for_dispatch_settle(adapter, app) -> None:
+    # PTB dequeues before its concurrent processor starts. Its queue join spans that gap, unlike
+    # empty()/processor counters, and updater.stop() above has already stopped new fetches.
+    queue = getattr(app, "update_queue", None)
+    if queue is not None and hasattr(queue, "join"):
+        await queue.join()
     while True:
+        if getattr(adapter, "_held_inbound_events", None):
+            raise RuntimeError("telegram received input remains held")
+        # Batch dictionaries are popped before awaiting handle_message (identity recovery), and
+        # held redispatch pops its queue before dispatch too. Join their existing task owners.
+        tasks = [task for name in (
+            "_pending_text_batch_tasks", "_pending_photo_batch_tasks", "_media_group_tasks"
+        ) for task in (getattr(adapter, name, {}) or {}).values() if not task.done()]
+        redispatch = getattr(adapter, "_held_inbound_redispatch_task", None)
+        if redispatch is not None and not redispatch.done():
+            tasks.append(redispatch)
+        if tasks:
+            await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
+            continue
         queue = getattr(app, "update_queue", None)
         queue_empty = queue is None or bool(getattr(queue, "empty", lambda: True)())
         processor = getattr(app, "update_processor", None)

@@ -8309,8 +8309,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         self._accept_update()
 
     async def _flush_buffered(self, pending: dict, tasks: dict, key: str, delay: float, where: str, log_fn=None) -> None:
-        """Shared delayed-flush body: sleep, pop, hold if teardown started, else dispatch. A cancel after
-        the pop but before durable dispatch re-holds the event (never lose it)."""
+        """Shared delayed-flush body: sleep, pop, hold if teardown started, else dispatch. A cancel or
+        failure after the pop but before durable dispatch re-holds the event (never lose it)."""
         current_task = asyncio.current_task()
         committed = self.__dict__.setdefault("_committed_flush_tasks", {})
         event = None
@@ -8339,9 +8339,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 log_fn(event)
             await self.handle_message(event)
             event = None
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception) as exc:
             if event is not None:
-                self._hold_inbound_event(event, where=f"{where}-flush-cancelled")
+                self._hold_inbound_event(event, where=f"{where}-flush-{'cancelled' if isinstance(exc, asyncio.CancelledError) else 'failed'}")
             raise
         finally:
             if committed.get((where, key)) is current_task:
