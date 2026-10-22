@@ -1007,7 +1007,7 @@ class TestAutoTitleDuplicateHandling:
             auto_title_session(db, "sess-1", "hi")
         assert db.get_session_title("sess-1") == "hi #2"
 
-    def test_dedupes_duplicate_title_via_lineage(self):
+    def test_collision_at_persistence_never_notifies_unsuffixed_title(self):
         db = MagicMock()
         db.get_session_title_source.return_value = None
         # Atomic write path: collision raises ValueError, retry persists.
@@ -1033,9 +1033,9 @@ class TestAutoTitleDuplicateHandling:
             "sess-1",
             "Debugging Import Error #2",
         )
-        # callback receives the persisted alias plus the original visible title
+        # The concurrent winner was not in the earlier snapshot. Show only the persisted alias.
         assert seen == [
-            ("Debugging Import Error #2", "llm", "Debugging Import Error")
+            ("Debugging Import Error #2", "llm", "Debugging Import Error #2")
         ]
 
 
