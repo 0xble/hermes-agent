@@ -1776,6 +1776,10 @@ Subcommands:
 | Subcommand | Description |
 |------------|-------------|
 | `list` | List recent sessions. |
+| `search <query> [--limit N] [--after X] [--before Y]` | Non-interactive, read-only session-search discovery as JSON. |
+| `state resolve-topic --chat-id X --thread-id Y` | Resolve a Telegram topic binding as bounded JSON. |
+| `state inspect --session-id S` | Inspect session metadata, including archive provenance, without transcript messages. |
+| `state delivery (--session-id S \| --session-key K \| --obligation-id O) [--include-content]` | Inspect delivery obligations as bounded JSON. Exactly one selector is required. |
 | `browse` | Interactive session picker with search and resume. Each row shows a lifecycle status tag (`done` / `intr` / `err` / `empty`, derived from the session's final message) and its message count. Press `d` on a highlighted row (while the search filter is empty) to delete that session after a y/N confirmation; while a filter is active, `d` types into the search instead. |
 | `export <output> [--session-id ID]` | Export sessions to JSONL. |
 | `delete <session-id>` | Delete one session. |
@@ -1791,6 +1795,21 @@ Subcommands:
 | `repair-profiles` | Settle session, routing, Telegram-topic and voice-mode state that landed under the wrong profile (rows in another profile's store, labels disagreeing with the session key, parent links crossing profiles, index rows for deleted profiles). Dry-run by default; `--apply` performs the repairs after snapshotting every store (stop the gateway first); `--legacy-main rekey\|move` decides what `agent:main` rows inside a named profile's store are; `--json` for automation. See [Sessions → Repair State Crossed Between Profiles](../user-guide/sessions.md#repair-state-crossed-between-profiles). |
 | `recover` | Offline, non-destructive recovery of a damaged `state.db` into a separate clean database. |
 | `retitle-skills` | Regenerate titles for sessions opened with a `/skill`, using what the user actually typed; lists changes unless `--apply` is passed. |
+
+### Non-Interactive Session Inspection
+
+These commands use the current profile selected by `hermes -p NAME` or `HERMES_HOME`, require no toolset to be enabled, and never create or migrate the session database:
+
+```bash
+hermes sessions search "release routing" --limit 5 --after 7d
+hermes sessions state resolve-topic --chat-id 123 --thread-id 456
+hermes sessions state inspect --session-id SESSION_ID
+hermes sessions state delivery --session-key SESSION_KEY --include-content
+```
+
+`search` calls the existing `session_search` discovery handler against the current store in read-only mode. It prints that handler's JSON, without building another index. `--limit` defaults to 3 and is clamped to 1-10. `--after` is inclusive and `--before` exclusive, using the tool's ISO-8601/date or relative-duration bounds, such as `2026-01-01` or `7d`. No matches return a successful empty result. An unavailable store or invalid time bound returns an error and a nonzero exit status.
+
+`state` calls the same handlers as the `session_state` tool, with identical profile scoping, selector validation, per-field clipping, and 64 KiB serialized-result cap. Delivery content is omitted unless `--include-content` is supplied. Session transcript messages are never returned. Successful reads, including not-found results, exit 0. Handler validation/read errors exit nonzero with JSON on stdout, while malformed command syntax exits 2 with argparse usage on stderr. There is no SQL argument.
 
 ## `hermes insights`
 

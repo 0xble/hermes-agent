@@ -270,6 +270,156 @@ def test_session_state_legacy_optional_table_is_not_migrated(monkeypatch, tmp_pa
         db.close()
 
 
+@pytest.mark.parametrize("archived,auto_archived", [(0, 0), (1, 0), (1, 1)])
+@pytest.mark.parametrize("has_auto_archived", [False, True])
+def test_session_state_exposes_archive_provenance(
+    monkeypatch, tmp_path, archived, auto_archived, has_auto_archived
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_profile(monkeypatch, "default")
+    from hermes_state import SessionDB
+    from tools.registry import discover_builtin_tools, registry
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("archive-id", "telegram", profile_name="default")
+        db._write_sql(
+            "UPDATE sessions SET archived = ?, auto_archived = ? WHERE id = ?",
+            (archived, auto_archived, "archive-id"),
+        )
+        if not has_auto_archived:
+            db._write_sql("ALTER TABLE sessions DROP COLUMN auto_archived", ())
+        discover_builtin_tools()
+        result = _dispatch(registry, {"action": "inspect_session", "session_id": "archive-id"})
+        assert result["session"]["archived"] is bool(archived)
+        if has_auto_archived:
+            assert result["session"]["auto_archived"] is bool(auto_archived)
+        else:
+            assert "auto_archived" not in result["session"]
+            columns = {row[1] for row in db._read_all("PRAGMA table_info(sessions)", ())}
+            assert "auto_archived" not in columns
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("legacy_profile", [None, "", "   "])
+@pytest.mark.parametrize("store_profile", ["default", "work"])
+def test_session_state_legacy_session_owner_is_its_store(
+    monkeypatch, tmp_path, legacy_profile, store_profile
+):
+    home = tmp_path if store_profile == "default" else tmp_path / "profiles" / store_profile
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _set_profile(monkeypatch, store_profile)
+    from hermes_state import SessionDB
+    from tools.registry import discover_builtin_tools, registry
+
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        db.create_session("legacy-id", "telegram", profile_name=store_profile, session_key="agent:legacy:1")
+        db._write_sql("UPDATE sessions SET profile_name = ? WHERE id = ?", (legacy_profile, "legacy-id"))
+        _seed_delivery(db, session_key="agent:legacy:1", adapter_profile=store_profile)
+        discover_builtin_tools()
+        result = _dispatch(registry, {"action": "inspect_session", "session_id": "legacy-id"})
+        assert result["found"] is True
+        assert result["session"]["profile_name"] == store_profile
+        delivery = _dispatch(registry, {"action": "inspect_delivery", "session_id": "legacy-id"})
+        assert delivery["found"] is True
+
+        _set_profile(monkeypatch, "other" if store_profile == "default" else "default")
+        hidden = _dispatch(registry, {"action": "inspect_session", "session_id": "legacy-id"})
+        assert hidden["found"] is False
+        hidden_delivery = _dispatch(registry, {"action": "inspect_delivery", "session_id": "legacy-id"})
+        assert hidden_delivery["found"] is False
+        stored = db.get_session("legacy-id")
+        assert stored is not None and stored["profile_name"] == legacy_profile
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("legacy_profile", [None, "", "   "])
+def test_session_state_legacy_delivery_is_default_only(monkeypatch, tmp_path, legacy_profile):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_profile(monkeypatch, "default")
+    from hermes_state import SessionDB
+    from tools.registry import discover_builtin_tools, registry
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        _seed_delivery(db, adapter_profile=legacy_profile)
+        discover_builtin_tools()
+        for selector in ({"obligation_id": "ob-1"}, {"session_key": "agent:alpha:1"}):
+            result = _dispatch(registry, {"action": "inspect_delivery", **selector})
+            assert result["found"] is True
+            assert result["rows"][0]["obligation_id"] == "ob-1"
+            _set_profile(monkeypatch, "alpha")
+            hidden = _dispatch(registry, {"action": "inspect_delivery", **selector})
+            assert hidden["found"] is False
+            _set_profile(monkeypatch, "default")
+        stored = db._read_one("SELECT adapter_profile FROM delivery_obligations WHERE obligation_id = ?", ("ob-1",))
+        assert stored is not None and stored[0] == legacy_profile
+    finally:
+        db.close()
+
+
+def test_session_state_delivery_clips_all_text_fields(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_profile(monkeypatch, "alpha")
+    from hermes_state import SessionDB
+    from tools.registry import discover_builtin_tools, registry
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        _seed_delivery(db, content="文" * 10000)
+        fields = (
+            "obligation_id", "session_key", "platform", "chat_id", "thread_id", "state",
+            "resume_marker_session_id", "resume_marker_token", "resume_marker_marked_at", "resume_turn_id",
+        )
+        db._write_sql(
+            "UPDATE delivery_obligations SET " + ", ".join(f"{field} = ?" for field in fields),
+            tuple("文" * 10000 for _ in fields),
+        )
+        discover_builtin_tools()
+        result = _dispatch(registry, {
+            "action": "inspect_delivery", "obligation_id": "文" * 10000, "include_content": True,
+        })
+        assert result["ok"] is True
+        row = result["rows"][0]
+        for field in fields:
+            assert row[field] == "文" * 511 + "…"
+        assert len(row["content"]) == 8192
+        assert len(row["last_error"]) == 4096
+        assert row["attempts"] == 2
+        assert row["owner_pid"] is None
+    finally:
+        db.close()
+
+
+def test_session_state_large_delivery_keeps_rows_under_byte_cap(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_profile(monkeypatch, "alpha")
+    from hermes_state import SessionDB
+    from tools.registry import discover_builtin_tools, registry
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        for index in range(12):
+            _seed_delivery(db, obligation_id=f"ob-{index:02d}", content="文" * 10000)
+        discover_builtin_tools()
+        raw = registry.dispatch("session_state", {
+            "action": "inspect_delivery", "session_key": "agent:alpha:1", "include_content": True,
+        })
+        assert isinstance(raw, str)
+        result = _json_result(raw)
+        assert result["ok"] is True
+        assert result["truncated"] is True
+        assert 0 < len(result["rows"]) < 5
+        assert result["rows"][0]["obligation_id"] == "ob-11"
+        assert len(raw.encode("utf-8")) <= 64 * 1024
+    finally:
+        db.close()
+
+
 def test_session_state_errors_are_bounded(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from hermes_state import SessionDB
