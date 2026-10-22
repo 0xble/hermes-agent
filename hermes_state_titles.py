@@ -204,16 +204,17 @@ class SessionTitlesMixin:
         row = self._read_one("SELECT title FROM sessions WHERE id = ?", (session_id,))
         return row["title"] if row else None
 
-    def list_recent_session_titles(self, exclude_session_id: Optional[str] = None, limit: int = 20):
-        """Return recent non-empty titles, newest first, excluding the active session."""
+    def list_recent_session_titles(self, exclude_session_id: Optional[str] = None, limit: Optional[int] = 20):
+        """Return non-empty titles, newest first, excluding the active session. None reads all titles."""
         params = []
         where = "title IS NOT NULL AND TRIM(title) != ''"
         if exclude_session_id:
             where += " AND id != ?"
             params.append(str(exclude_session_id))
-        params.append(max(1, min(100, int(limit))))
+        if limit is not None:
+            params.append(max(1, min(100, int(limit))))
         rows = self._read_all(
-            f"SELECT title FROM sessions WHERE {where} ORDER BY started_at DESC LIMIT ?",
+            f"SELECT title FROM sessions WHERE {where} ORDER BY started_at DESC" + (" LIMIT ?" if limit is not None else ""),
             tuple(params),
         )
         return [row["title"] for row in rows if row["title"]]

@@ -38,9 +38,8 @@ its optional icon, and the durable alias can be observed through one Telegram to
   sampling the configured title model on real opening messages against the live catalog.
 - `/title X` on a Telegram topic stores the user's exact text, or the next free lineage alias
   such as `X #2` only when that exact text is held by another session; the visible Telegram
-  topic is renamed to the unsuffixed label. Auto-titles that collide likewise keep the visible
-  label unsuffixed while the session row carries the alias. Non-Telegram collision behavior
-  remains upstream behavior.
+  topic is renamed to the unsuffixed label. Model-generated titles that match another session's name are rejected before persistence, ignoring case and a trailing ` #N`. Derived fallback
+  titles use their persisted alias on Telegram so they do not show a duplicate label.
 - `/title X` also re-picks the icon from `X` when `auto_topic_icons` is on, through the same
   selection helper as automatic renames, and replaces a manual icon (automatic renames never do).
   Any icon Hermes writes clears the adapter's remembered manual icon for that topic; see
@@ -66,7 +65,7 @@ its optional icon, and the durable alias can be observed through one Telegram to
   the previous opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
   multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. The opening
-  turn's subject-less opener is the exception: `auxiliary.title_generation.hold_until_reply`
+  turn's bare-link or attachment-only opener is the exception: `auxiliary.title_generation.hold_until_reply`
   (default true) waits for that turn's reply before the first model title. Other openers
   start immediately and receive the bounded completion retry described above.
   Upstream #117296 defers the title until the turn settles whenever both share a self-hosted base URL,

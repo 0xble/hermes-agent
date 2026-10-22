@@ -576,6 +576,8 @@ def _extract_json_title(raw: str) -> Optional[str]:
             return ""
         if isinstance(parsed.get("title"), str):
             return parsed["title"].strip()
+    if re.search(r'"abstain"\s*:\s*true\b', raw):
+        return ""
     match = re.search(r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
     if match:
         with suppress(ValueError):
@@ -760,7 +762,7 @@ def generate_title(
     link_context: str | None = None,
     reply_excerpt: str | None = None,
 ) -> Optional[str]:
-    """Title from the opening message, plus the turn's reply when the opener did not name a subject.
+    """Title from the opener and reply, ``""`` for abstention, or None for an unusable/failed response.
 
     ``runtime_validator`` runs right before the request; False skips silently. If it returns False
     (e.g. the user's model was switched since the background thread captured its runtime snapshot),
@@ -839,8 +841,8 @@ def generate_title(
                 fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
                 payload = json.loads(fence.group(1) if fence else candidate)
 
-        if icon_allowed and isinstance(payload, dict) and payload.get("abstain") is True:
-            return None
+        if _extract_json_title(str(raw_content)) == "":
+            return ""
         title_value = payload.get("title") if isinstance(payload, dict) else None
         title = _clean_title(_extract_title_text(title_value or raw_content) or _title_from_reasoning(choice.message))
         if icon_allowed and icon_callback is not None:
@@ -1061,13 +1063,21 @@ def auto_title_session(
             link_context=link_context, reply_excerpt=reply_excerpt, **icon_kwargs,
         )
         source = "llm"
-        # Can't-tell and junk are not names. Leave the placeholder and let the next turn's reply try.
-        # Turn 3 is the last attempt ``maybe_auto_title`` allows, so there the best concrete title wins.
-        if _hold_until_reply_enabled() and (not title or is_junk_title(title)):
-            if _real_user_turns(conversation_history) < 3:
-                logger.debug("Auto-title held: opener does not name a subject yet")
-                return
-            title = title or derive_title(user_message, title_preview)
+        # The prompt's recent-name sample is not a uniqueness check: older topics still exist.
+        duplicate = False
+        if title:
+            with suppress(Exception):
+                titles = session_db.list_recent_session_titles(exclude_session_id=session_id, limit=None)
+                normalized = re.sub(r" #\d+$", "", title).casefold()
+                duplicate = any(re.sub(r" #\d+$", "", other).casefold() == normalized for other in titles)
+        # Empty string is an explicit abstention. None is a failed/unusable provider response,
+        # which must keep the existing derived fallback rather than hold the topic nameless.
+        rejected = title == "" or bool(title and is_junk_title(title)) or duplicate
+        if rejected and _hold_until_reply_enabled() and _real_user_turns(conversation_history) < 3:
+            logger.debug("Auto-title held: unsupported or duplicate subject")
+            return
+        if duplicate or (rejected and _hold_until_reply_enabled()):
+            title, source = derive_title(user_message, title_preview), "derived"
         if title and _is_provisional_greeting_title(title):
             source = "derived"
         if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
@@ -1082,7 +1092,7 @@ def auto_title_session(
         if persisted is not None:
             logger.debug("Auto-generated session title: %s", persisted)
             _notify_title(
-                title_callback, persisted, source, "Auto-title", display_title=title,
+                title_callback, persisted, source, "Auto-title", display_title=(persisted if source == "derived" else title),
                 icon=(chosen_icon[0] if chosen_icon and source == "llm" else None),
             )
     except Exception as e:

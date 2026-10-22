@@ -345,6 +345,58 @@ def test_abstain_payload_is_an_empty_title():
     from agent.title_generator import _extract_json_title
     assert _extract_json_title('{"title": "", "abstain": true}') == ""
     assert _extract_json_title('{"title": "Q3 Billing", "abstain": false}') == "Q3 Billing"
+    assert _extract_json_title('Result: {"title": "Generic Title", "abstain": true}') == ""
+
+
+@pytest.mark.parametrize("result", ["abstain", "loose_abstain", "failure", "truncated"])
+def test_title_worker_distinguishes_abstention_from_provider_failure(tmp_path, result):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="active", source="telegram")
+    response = MagicMock()
+    response.choices[0].finish_reason = "length" if result == "truncated" else "stop"
+    payload = '{"title": "Generic Title", "abstain": true}'
+    response.choices[0].message.content = ("Result: " if result == "loose_abstain" else "") + payload
+    with patch("agent.title_generator.call_llm", return_value=response,
+               side_effect=RuntimeError("provider unavailable") if result == "failure" else None):
+        auto_title_session(db, "active", "Investigate billing dispute", conversation_history=[
+            {"role": "user", "content": "Investigate billing dispute"},
+        ])
+    if result in {"abstain", "loose_abstain"}:
+        assert db.get_session_title("active") is None
+    else:
+        assert db.get_session_title("active") == "Investigate billing dispute"
+        assert db.get_session_title_source("active") == "derived"
+
+
+@pytest.mark.parametrize("existing, generated", [
+    ("Influence and Persuasion", "Influence and Persuasion"),
+    ("INFLUENCE AND PERSUASION #2", "Influence and Persuasion"),
+    ("Influence and Persuasion", "influence and persuasion #3"),
+])
+@pytest.mark.parametrize("turns, hold", [(1, True), (3, True), (1, False)])
+def test_duplicate_model_title_is_held_or_replaced_by_derived(tmp_path, existing, generated, turns, hold):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="taken", source="telegram")
+    db.set_session_title("taken", existing)
+    # The collision must not disappear merely because many newer topics exist.
+    for index in range(101):
+        db.create_session(session_id=f"other-{index}", source="telegram")
+        db.set_session_title(f"other-{index}", f"Other Subject {index}")
+    db.create_session(session_id="active", source="telegram")
+    opener = "Relay to the owner of the influence and persuasion topic"
+    seen = []
+    with patch("agent.title_generator.generate_title", return_value=generated), \
+         patch("agent.title_generator._hold_until_reply_enabled", return_value=hold):
+        auto_title_session(db, "active", opener,
+                           conversation_history=[{"role": "user", "content": opener}] * turns,
+                           title_callback=lambda *args, **kwargs: seen.append((args, kwargs)))
+    if turns < 3 and hold:
+        assert db.get_session_title("active") is None
+        assert seen == []
+    else:
+        assert db.get_session_title("active") == derive_title(opener)
+        assert db.get_session_title_source("active") == "derived"
+        assert seen[0][1]["display_title"] == derive_title(opener)
 
 
 class TestAutoTitleSession:
@@ -385,7 +437,7 @@ class TestAutoTitleSession:
             {"role": "user", "content": "look at this"},
             {"role": "assistant", "content": "The thread is about the Q3 billing dispute."},
         ]
-        with patch("agent.title_generator.generate_title", return_value=None):
+        with patch("agent.title_generator.generate_title", return_value=""):
             auto_title_session(db, "sess-1", "look at this", conversation_history=history)
         assert db.get_session_title_source("sess-1") in (None, "derived")
 
@@ -403,14 +455,14 @@ class TestAutoTitleSession:
             auto_title_session(db, "sess-1", history[0]["content"], conversation_history=history)
         assert db.get_session_title_source("sess-1") != "llm"
 
-    def test_junk_title_accepted_after_turn_three(self, tmp_path):
+    def test_junk_title_uses_derived_at_turn_three(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="sess-1", source="telegram")
-        history = [{"role": "user", "content": "go"} for _ in range(4)]
+        history = [{"role": "user", "content": "go"} for _ in range(3)]
         with patch("agent.title_generator.generate_title", return_value="Investigation"):
             auto_title_session(db, "sess-1", "go", conversation_history=history)
-        assert db.get_session_title("sess-1") == "Investigation"
-        assert db.get_session_title_source("sess-1") == "llm"
+        assert db.get_session_title("sess-1") == "go"
+        assert db.get_session_title_source("sess-1") == "derived"
 
     def test_process_notifications_are_not_retry_turns(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
@@ -1115,7 +1167,7 @@ class TestForkTitleContracts:
         response.choices[0].message.content = '{"title": "Unspecified Subject", "abstain": true, "icons": []}'
         with patch("agent.title_generator.call_llm", return_value=response), \
              patch("agent.title_generator._title_link_context", return_value=None):
-            assert generate_title("look at this", icon_options=["🧪"], icon_callback=lambda *_: None) is None
+            assert generate_title("look at this", icon_options=["🧪"], icon_callback=lambda *_: None) == ""
 
     def test_icon_request_precedes_examples_and_title_contract_closes_the_prompt(self):
         """The icon block rides inside the rules so the title examples and reply contract stay last;
