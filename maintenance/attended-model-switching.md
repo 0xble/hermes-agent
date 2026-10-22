@@ -32,7 +32,13 @@ the current assignment follows fresh model, provider and reasoning config from
 the owning profile through the existing preset loaders. An empty `@attended`
 or deleted preset falls back coherently to the configured channel/default
 route, without triggering automatic attended routing or deferring to a prior
-attended decision.
+attended decision. Inherited reasoning is resolved for that destination from
+the same fresh profile snapshot. Explicit session effort wins over preset
+effort, then destination per-model policy and global effort. Keep the canonical
+reasoning dictionaries until effort normalization so disabled values and
+provider-specific tiers survive the decision key and subsequent requests.
+Channel fallbacks use the gateway's existing typed channel overrides, just as
+runtime route setup does.
 
 Role destinations pass the existing cost, data-training and context-cache
 selection guards before publication. Slash confirmation retains the role

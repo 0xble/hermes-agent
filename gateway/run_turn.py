@@ -291,6 +291,20 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         else:
             apply()
 
+    def _load_attended_reasoning_config(self, model_name, config, *, model_role=None):
+        """Resolve inherited effort for a destination from the request's profile snapshot."""
+        if model_role:
+            from hermes_cli.model_preset_runtime import resolve_model_ref
+            with suppress(ValueError, TypeError):
+                route = resolve_model_ref("@" + model_role, config=config or {})
+                model_name = route.model or model_name
+        loader = getattr(self, "_load_reasoning_config", lambda _model, **_kwargs: {})
+        native_loader = getattr(type(self), "_load_reasoning_config", None)
+        native_loader = getattr(native_loader, "__func__", native_loader)
+        if getattr(loader, "__func__", loader) is native_loader:
+            return loader(model_name, config=config) or {}
+        return loader(model_name) or {}
+
     def _attended_resolution_for_session(
         self, *, source, session_key, user_config=None, override=None,
         activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, new_session=False,
@@ -326,29 +340,32 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
         channel_model = ""
         channel_provider = ""
-        if source is not None:
+        gateway_config = getattr(self, "config", None)
+        if source is not None and gateway_config is not None:
             with suppress(Exception):
                 ch = _get_channel_override(
-                    user_config or {}, source.platform, str(source.chat_id) if source.chat_id else "",
+                    gateway_config, source.platform, str(source.chat_id) if source.chat_id else "",
                     thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
                     parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
                 )
                 channel_model = getattr(ch, "model", "") or ""
                 channel_provider = getattr(ch, "provider", "") or ""
         default_model = _resolve_gateway_model(user_config)
-        model_value = (override or {}).get("model") if override else None
-        model_provider = (override or {}).get("provider") if override else None
-        loader = getattr(self, "_load_reasoning_config", lambda _model: {})
-        if default_reasoning is None:
+        model_value = (override or {}).get("model")
+        model_provider = (override or {}).get("provider")
+        # A held role may differ even when setup supplied a default baseline.
+        if default_reasoning is None or (model_role and not model_value):
             default_reasoning = {}
             with suppress(Exception):
-                reasoning_model = str(model_value or default_model or "")
-                default_reasoning = loader(reasoning_model) or {}
+                default_reasoning = self._load_attended_reasoning_config(
+                    str(model_value or channel_model or default_model or ""), user_config,
+                    model_role=model_role if not model_value else None,
+                )
         if attended_reasoning is None:
             attended_reasoning = {}
             with suppress(Exception):
                 if cfg.model:
-                    attended_reasoning = loader(cfg.model) or {}
+                    attended_reasoning = self._load_attended_reasoning_config(cfg.model, user_config)
         model_scope = assignment.get("model_scope", getattr(conversation, "model_override_scope", "session"))
         if "reasoning_override" in assignment:
             reasoning_value = assignment["reasoning_override"]
@@ -381,9 +398,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 "last_user_activity_at": stamp,
                 "new_session": new_session,
                 "model_role": model_role,
-                "default_reasoning": (default_reasoning or {}).get("effort", ""),
-                "explicit_model_reasoning": (default_reasoning or {}).get("effort", ""),
-                "attended_reasoning": (attended_reasoning or {}).get("effort", ""),
+                "default_reasoning": default_reasoning,
+                "explicit_model_reasoning": default_reasoning,
+                "attended_reasoning": attended_reasoning,
                 "session_reasoning": reasoning_value if reasoning_scope == "session" else None,
                 "temporary_reasoning": reasoning_value if reasoning_scope == "temporary" else None,
             },
