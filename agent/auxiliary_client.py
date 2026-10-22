@@ -122,7 +122,7 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.auxiliary_call_policy import (
     CallFallbackPolicy, call_fallback_chain, has_call_fallback_chain, prepare_fallback_request,
-    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream,
+    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response,
 )
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
@@ -8137,9 +8137,9 @@ def call_llm(
                 reasoning_config=reasoning_config, extra_headers=extra_headers, api_mode=api_mode,
                 stream=stream, stream_options=stream_options, route_info=route_info,
             )
-        if stream:
+        if stream and is_stream_response(response):
             response = scoped_fallback_stream(response, policy, prior_progress_hook, main_runtime)
-        if stream and semaphore is not None:
+        if stream and is_stream_response(response) and semaphore is not None:
             stream_semaphore = semaphore
             semaphore = None
             return release_sync_semaphore_after_stream(response, stream_semaphore)

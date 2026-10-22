@@ -1,10 +1,12 @@
 """Request-local fallback policy shared by synchronous auxiliary consumers."""
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable
+from weakref import finalize
 
 
 @dataclass(frozen=True)
@@ -45,64 +47,104 @@ def prepare_fallback_request(
     return messages, tools, reasoning_config
 
 
+def is_stream_response(response: Any) -> bool:
+    """Completed SDK models may be iterable, but their choices still belong to the consumer."""
+    return not hasattr(response, "choices") and isinstance(response, Iterator)
+
+
+class _OwnedStream(Iterator):
+    """Own cleanup at construction, including close before the first next()."""
+
+    def __init__(self, iterator: Iterator, on_close: Callable):
+        self._iterator = iterator
+        self._finalizer = finalize(self, self._close_resource, iterator, on_close)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._finalizer.alive:
+            raise StopIteration
+        try:
+            return next(self._iterator)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        self._finalizer()
+
+    @staticmethod
+    def _close_resource(iterator, on_close):
+        try:
+            _close_stream(iterator)
+        finally:
+            on_close()
+
+
 def scoped_fallback_stream(stream: Any, policy: CallFallbackPolicy, progress_hook: Any, main_runtime: Any):
-    """Bind only while advancing the iterator, never while control belongs to its consumer."""
-    from agent.auxiliary_client import aux_progress_hook, scoped_runtime_main
-    iterator = iter(stream)
-    try:
+    """Bind only while advancing/closing, never while control belongs to its consumer."""
+    from agent.auxiliary_client import _RELAY_AUX_CALL_CONTEXT, aux_progress_hook, scoped_runtime_main
+    relay_context = _RELAY_AUX_CALL_CONTEXT.get()
+
+    @contextmanager
+    def scope():
+        token = _RELAY_AUX_CALL_CONTEXT.set(relay_context)
+        try:
+            with scoped_fallback_policy(policy), aux_progress_hook(progress_hook), scoped_runtime_main(main_runtime):
+                yield
+        finally:
+            _RELAY_AUX_CALL_CONTEXT.reset(token)
+
+    def advance():
         while True:
-            with (
-                scoped_fallback_policy(policy), aux_progress_hook(progress_hook), scoped_runtime_main(main_runtime),
-            ):
+            with scope():
                 try:
-                    chunk = next(iterator)
+                    chunk = next(stream)
                 except StopIteration:
                     return
             yield chunk
-    finally:
-        close = getattr(iterator, "close", None)
-        if callable(close):
-            with scoped_fallback_policy(policy):
-                close()
+
+    def close():
+        with scope():
+            _close_stream(stream)
+
+    return _OwnedStream(advance(), close)
 
 
 def release_sync_semaphore_after_stream(stream: Any, semaphore: Any):
-    """Release a permit only after a streaming response is consumed or closed."""
-    try:
-        yield from stream
-    finally:
-        try:
-            close = getattr(stream, "close", None)
-            if callable(close):
-                close()
-        finally:
-            semaphore.release()
+    """Release a permit exactly once after consumption, error, or explicit close."""
+    return _OwnedStream(iter(stream), semaphore.release)
 
 
 def stream_with_recovery(send: Callable, recover: Callable):
-    """Use the completion recovery ladder only before any delta has escaped.
-
-    Even role/usage-only frames count as emitted. Once a caller has seen any
-    chunk, replaying the request could duplicate tool calls or partial content.
-    """
-    emitted = False
-    stream = None
+    """Dispatch eagerly, using the completion ladder only before any chunk escapes."""
     try:
         stream = send()
-        if hasattr(stream, "choices"):
-            yield completed_response_as_stream_chunk(stream)
-            return
-        for chunk in stream:
-            emitted = True
-            yield chunk
     except Exception as exc:
-        if emitted:
-            raise
-        yield completed_response_as_stream_chunk(recover(exc))
-    finally:
-        close = getattr(stream, "close", None)
-        if callable(close):
-            close()
+        return recover(exc)
+    if not is_stream_response(stream):
+        return stream
+
+    def advance():
+        emitted = False
+        try:
+            for chunk in stream:
+                # Even role/usage-only frames forbid replay of the request.
+                emitted = True
+                yield chunk
+        except Exception as exc:
+            if emitted:
+                raise
+            yield completed_response_as_stream_chunk(recover(exc))
+
+    return _OwnedStream(advance(), lambda: _close_stream(stream))
+
+
+def _close_stream(stream: Any):
+    close = getattr(stream, "close", None)
+    if callable(close):
+        close()
 
 
 def completed_response_as_stream_chunk(response: Any) -> Any:

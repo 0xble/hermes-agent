@@ -87,7 +87,13 @@ reasoning precedence, including preset effort ahead of global effort.
   disables provider hops, and a declared chain never appends unrelated routes.
   Destination preparation re-trims canonical reference input, re-plans cache
   markers/tools and reasoning, and records the actual selected accounting route.
-  Streaming recovery is allowed only before a chunk has escaped.
+  Streaming recovery is allowed only before a chunk has escaped. Dispatch remains
+  eager. Completed adapter responses retain identity and release permits with the
+  call, even when the SDK response is iterable. Only actual stream iterators carry
+  request-local policy and permits across pulls. Scope fallback/runtime/progress
+  and Relay identity during advancement and close, never while yielding control
+  to the consumer. Explicit close, exhaustion, failure and abandonment release
+  stream resources and permits exactly once, including before the first pull.
 - Runtime references: raw mappings and builtin `@default`/`@attended` wrappers
   use the same site-level fallback opt-out as static expansion. Cron preflight,
   provider setup and in-agent execution must see the same empty chain.
@@ -119,6 +125,12 @@ context trimming and liveness survive, raw/builtin opt-outs agree, cron setup
 and provider resolution never visit an opted-out backup, and named-endpoint pins
 are retained only on the identical route. These are failure-path consumer
 proofs, not assertions that expanded kwargs happen to contain a list.
+`tests/agent/test_auxiliary_stream_contract.py` crosses the real `call_llm`
+boundary with isolated config and mocked transports. It proves completed-response
+identity (including eager recovery), eager dispatch/options, permit lifetime,
+close-before-pull, cleanup failure, abandonment, scoped Relay identity and no
+replay after even a role-only chunk. Keep the preexisting auxiliary client,
+relay, concurrency and MoA streaming assertions unchanged alongside this proof.
 
 Retire when upstream covers flat references, every reader, round-trip
 preservation and shared concrete-selection persistence. Keep session policy
