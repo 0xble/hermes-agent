@@ -19,12 +19,17 @@ def _controls(page):
     return [LoginControl.from_dict(raw) for raw in json.loads(inspected)]
 
 
-def test_ghl_anonymous_boxes_through_real_browser_and_secure_prompt():
+@pytest.mark.parametrize("heading", [
+    "Verify Security Code", "Verification code sent to your phone",
+    "Verification code expires in 10 minutes",
+])
+def test_ghl_anonymous_boxes_through_real_browser_and_secure_prompt(heading):
     playwright = pytest.importorskip("playwright.sync_api", reason="real-browser fixture needs Playwright")
     try:
         with playwright.sync_playwright() as p, p.chromium.launch(headless=True) as browser:
             page = browser.new_page()
             page.goto(FIXTURE.as_uri())
+            page.locator("h2").evaluate("(el, text) => { el.textContent = text; }", heading)
             controls = _controls(page)
             classified = classify_otp_controls(controls)
             assert len(classified) == 6
@@ -94,10 +99,39 @@ def test_ghl_shape_rejects_unsafe_variants_in_real_dom(variant):
         raise
 
 
-def test_anonymous_classifier_guard_matrix_and_code_length():
+@pytest.mark.parametrize("context, expected", [
+    ("Verification code", 6),
+    ("Verification code sent to your phone", 6),
+    ("Verification code sent to your mobile", 6),
+    ("Verification code delivered to your telephone", 6),
+    ("Verification code expires in 10 minutes", 6),
+    ("Verification code expires in 30 seconds", 6),
+    ("Verification code sent to your email", 6),
+    ("Card verification code", 0),
+    ("Postal verification code", 0),
+    ("Phone verification", 0),
+    ("Verification code for phone number", 0),
+    ("Verification code expiry date", 0),
+    ("Card verification code sent to your phone", 0),
+    ("Postal verification code expires in 10 minutes", 0),
+])
+def test_anonymous_otp_delivery_and_expiry_context(context, expected):
+    boxes = [LoginControl(index=i, autocomplete="", form_index=0, label="", name="",
+                         type="number", empty=True, width=40, height=40,
+                         container_index=1, container_input_count=6, nearby_text=context)
+             for i in range(6)]
+    assert len(classify_otp_controls(boxes)) == expected
+
+
+@pytest.mark.parametrize("context", [
+    "Verify Security Code Use Authenticator App",
+    "Verification code sent to your phone",
+    "Verification code expires in 10 minutes",
+])
+def test_anonymous_classifier_guard_matrix_and_code_length(context):
     base = dict(autocomplete="", form_index=0, label="", name="", type="number", empty=True,
                 width=40, height=40, container_index=1, container_input_count=6,
-                nearby_text="Verify Security Code Use Authenticator App")
+                nearby_text=context)
     boxes = [LoginControl(index=i, **base) for i in range(6)]
     assert len(classify_otp_controls(boxes)) == 6
     assert build_otp_fills(classify_otp_controls(boxes), "12345") == []
