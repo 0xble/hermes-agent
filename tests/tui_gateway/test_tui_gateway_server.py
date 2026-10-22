@@ -6668,6 +6668,8 @@ def test_prompt_submit_refuses_unconfirmed_nonempty_truncation(monkeypatch):
 
 def test_prompt_submit_truncates_by_message_id(monkeypatch):
     """#82756: truncate_before_message_id resolves target message and cuts history accurately."""
+    # This test ends at truncation admission, not model execution.
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     replaced = []
 
     class _FakeDB:
@@ -6713,6 +6715,10 @@ def test_prompt_submit_truncates_by_message_id(monkeypatch):
         assert len(replaced) == 1
         assert replaced[0][1] == history[:2]
     finally:
+        worker = server._sessions["msg-id-trunc-sid"].get("_run_thread")
+        if worker is not None:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
         server._sessions.pop("msg-id-trunc-sid", None)
 
 
@@ -6925,6 +6931,8 @@ def test_prompt_submit_refuses_ordinal_only_when_durable_history_is_unstamped(mo
 
 def test_prompt_submit_truncates_by_row_id(monkeypatch):
     """#82959: prompt.submit with truncate_before_row_id must cut at the target row id."""
+    # This test ends at truncation admission, not model execution.
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     replaced = []
 
     class _FakeDB:
@@ -6972,11 +6980,17 @@ def test_prompt_submit_truncates_by_row_id(monkeypatch):
         assert len(replaced) == 1
         assert replaced[0][1] == history[:2]
     finally:
+        worker = server._sessions["row-id-trunc-sid"].get("_run_thread")
+        if worker is not None:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
         server._sessions.pop("row-id-trunc-sid", None)
 
 
 def test_prompt_submit_truncates_by_string_row_id(monkeypatch):
     """#82959: String row IDs in history match correctly against integer truncate_before_row_id."""
+    # This test ends at truncation admission, not model execution.
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     replaced = []
 
     class _FakeDB:
@@ -7017,6 +7031,10 @@ def test_prompt_submit_truncates_by_string_row_id(monkeypatch):
         assert resp.get("error") is None
         assert len(sess["history"]) == 2
     finally:
+        worker = server._sessions["str-row-id-trunc-sid"].get("_run_thread")
+        if worker is not None:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
         server._sessions.pop("str-row-id-trunc-sid", None)
 
 

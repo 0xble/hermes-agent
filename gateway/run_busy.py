@@ -1312,16 +1312,19 @@ class GatewayBusySessionMixin:
 
     async def _busy_start_command(self, event: MessageEvent, quick_key: str, source):
         # Telegram's /start is a platform ping (bot launch/deep-link), not a user command.
+        await _busy_accepted()
         logger.info("Ignoring /start platform ping for active session %s", quick_key)
         return ""
 
     async def _busy_egress_command(self, event: MessageEvent, quick_key: str, source):
         from hermes_cli.proxy_cli import format_status_text
+        await _busy_accepted()
         return format_status_text()
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
         # Hard-kill: a soft interrupt can't reach a truly hung executor thread.
         from gateway.run import _INTERRUPT_REASON_STOP
+        await _busy_accepted()
         await self._interrupt_and_clear_session(
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="stop_command",
         )
@@ -1332,6 +1335,7 @@ class GatewayBusySessionMixin:
         # /reset and /new bypass the running-agent guard (else they'd queue as user text and replay
         # into the same broken history); clear pending messages so the old text doesn't replay.
         from gateway.run import _INTERRUPT_REASON_RESET
+        await _busy_accepted()
         # Interrupt the agent first, then clear the adapter's pending queue so the stale "/reset" text
         # doesn't get re-processed as a user message after the interrupt completes. See #2170.
         await self._interrupt_and_clear_session(
@@ -1346,6 +1350,7 @@ class GatewayBusySessionMixin:
         has_media = bool(getattr(event, "media_urls", None))
         if not queued_text and not has_media:
             return t("gateway.queue.usage")
+        await _busy_accepted()
         adapter = self._delivery_adapter_for(source)
         if adapter:
             queued_event = MessageEvent(
@@ -1375,6 +1380,7 @@ class GatewayBusySessionMixin:
         steer_text = event.get_command_args().strip()
         if not steer_text:
             return t("gateway.steer.usage")
+        await _busy_accepted()
         _steer_state = self._peek_session_state(quick_key)
         running_agent = _steer_state.turn.agent if _steer_state else None
 
@@ -1423,6 +1429,7 @@ class GatewayBusySessionMixin:
         from hermes_cli.goal_command import is_goal_control
 
         if is_goal_control(event.get_command_args() or ""):
+            await _busy_accepted()
             return await self._handle_goal_command(event)
         return t("gateway.busy.reject_goal")
 
@@ -1430,6 +1437,7 @@ class GatewayBusySessionMixin:
         # Mirrors /goal: control verbs are safe mid-run; a new loop is rejected.
         _loop_arg = (event.get_command_args() or "").strip().lower()
         if not _loop_arg or _loop_arg in {"status", "pause", "resume", "stop", "clear", "cancel", "help", "--help", "-h"}:
+            await _busy_accepted()
             return await self._handle_loop_command(event)
         return t("gateway.busy.reject_loop")
 

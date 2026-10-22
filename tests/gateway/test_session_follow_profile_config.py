@@ -6,8 +6,6 @@ so the frozen request says "follow" and each turn re-reads the profile's model s
 included). Real SessionStore/SessionAuthority and a real config.yaml; ``_load_gateway_config`` is not
 patched.
 """
-from types import SimpleNamespace
-
 import pytest
 import json
 
@@ -19,15 +17,22 @@ def _profile(home, model, port, key):
 
 def _owner(home):
     from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
     from gateway.session import SessionStore
     from gateway.session_authority import SessionAuthority
     from gateway.session_controls import AuthorityConnection
     import hermes_state_runtime as rt
     store = SessionStore(home / 'sessions', GatewayConfig())
     db = store._db
-    runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
-                             _evict_cached_agent=lambda route: None, _cached_agent_for=lambda route: None,
-                             _handle_message=None)
+    # Keep real session-key derivation and scoped runtime publication without starting a gateway.
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._session_db = db
+    runner.adapters = {}
+    runner._draining = False
+    runner._evict_cached_agent = lambda route: None
+    runner._cached_agent_for = lambda route: None
+    runner._handle_message = None
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
                                  epoch=rt.begin_runtime_epoch(db, instance_id='owner'))

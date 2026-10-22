@@ -414,6 +414,7 @@ def test_commands_refused_during_a_turn_fire_nothing(tmp_path):
             variants = [wire.call('slash.exec', session_id=sid, command='/goal ship the release'),
                         wire.call('command.dispatch', session_id=sid, name='loop', arg='every 5m check ci')]
             wire.call('slash.exec', session_id=sid, command='/goal status')
+            wire.call('command.dispatch', session_id=sid, name='loop', arg='status')
             assert wire.call('command.observe', session_id=sid, name='history', arg='') == {'queued': True}
             fired = _hooks_through(log, 'history')
             peer.release.set()
@@ -423,7 +424,8 @@ def test_commands_refused_during_a_turn_fire_nothing(tmp_path):
     assert [r['output'] for r in refused] == [t('gateway.busy.reject_codex_runtime')] * 2
     assert [r['output'] for r in variants] == [t('gateway.busy.reject_goal'), t('gateway.busy.reject_loop')]
     assert [(r['command'], r['args_raw']) for r in fired] == [
-        ('reasoning', 'high'), ('reasoning', 'high'), ('goal', 'status'), ('history', '')], fired
+        ('reasoning', 'high'), ('reasoning', 'high'), ('goal', 'status'), ('loop', 'status'),
+        ('history', '')], fired
 
 
 def test_commands_the_cli_refuses_on_the_gateway_fire_nothing(monkeypatch, capsys):

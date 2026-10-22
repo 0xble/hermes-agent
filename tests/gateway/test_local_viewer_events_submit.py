@@ -204,7 +204,8 @@ def test_a_classic_cli_receipt_carries_the_run_conversation_keys(classic):
         assert "pending_steer" not in stored and "billing_block" not in stored
         assert ctx.result_holder[0]["pending_steer"] == "also check the logs"
     # The delivered reply (message.complete text) keeps the gateway's own copy either way.
-    assert delivered["final_response"] and stored["failed"] is True
+    assert delivered["final_response"] == ""
+    assert delivered["delivery_text"] and stored["failed"] is True
 
 
 def test_only_a_classic_cli_surface_session_is_a_classic_cli_turn():

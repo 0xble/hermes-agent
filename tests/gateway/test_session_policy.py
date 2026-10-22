@@ -359,7 +359,9 @@ def test_frozen_route_keeps_its_endpoint_after_live_config_edit(tmp_path, monkey
     policy = bind_launch_key(authority, 'sid', policy, None, config_secrets=private)
     write('http://127.0.0.1:2/v1', 'sk-new-endpoint-two')
     monkeypatch.setattr('gateway.session_policy.policy_for_source', lambda runner, source: policy)
-    runner = SimpleNamespace(session_authority=authority)
+    from gateway.run import GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    runner.session_authority = authority
     _, runtime = GatewayTurnPrepareMixin._resolve_session_agent_runtime(runner, source=SimpleNamespace())
     assert (runtime['base_url'], runtime['api_key']) == ('http://127.0.0.1:1/v1', 'sk-frozen-endpoint-one')
 
@@ -383,7 +385,9 @@ def test_frozen_bare_custom_route_keeps_its_endpoint_pool_and_launch_key_wins(tm
         'provider': 'custom', 'api_mode': 'chat_completions', 'base_url': base_url, 'api_key': 'sk-pooled',
         'source': 'pool:custom', 'credential_pool': pool} if base_url.rstrip('/') == url else None)
     authority = SimpleNamespace(instance_id='i', epoch=1, profile_id='p', db=None)
-    runner = SimpleNamespace(session_authority=authority)
+    from gateway.run import GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    runner.session_authority = authority
     runtimes = []
     for sid, launch in (('config-keyed', None), ('launch-keyed', 'sk-launch-explicit')):
         private = {}
@@ -423,7 +427,9 @@ def _frozen_fixture_routes(tmp_path, monkeypatch, *launches):
         policy = build_policy(params, load_user_config_effective(home / 'config.yaml'), private_secrets=private)
         policies.append(bind_launch_key(authority, f's{n}', policy, None, config_secrets=private))
     write('https://b.fixture.example/v1')
-    runner = SimpleNamespace(session_authority=authority)
+    from gateway.run import GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    runner.session_authority = authority
     runtimes = []
     for policy in policies:
         monkeypatch.setattr('gateway.session_policy.policy_for_source', lambda runner, source, p=policy: p)

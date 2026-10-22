@@ -1,4 +1,4 @@
-"""Slack adapter routing onto the slack-sdk Agent Sessions API (agents.sessions.*)."""
+"""Slack status preserves free text while titles use the Agent Sessions API."""
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -21,9 +21,9 @@ def _pin_legacy_assistant_threads_api():
 class TestAgentSessionsApiRouting:
     """slack-sdk 3.44.0 Agent Sessions API (assistant_view deprecation Feb 2027).
 
-    When the installed slack-sdk ships agents.sessions.* typed methods, status
-    and title calls route through them; older SDKs keep using the legacy
-    assistant.threads.* methods (compat bridge on Slack's side).
+    Titles use agents.sessions.rename when available. Status stays on
+    assistant.threads.setStatus because free-text phrases and the empty clear
+    are not valid Agent Sessions status enum values.
     """
 
     def _adapter(self):
@@ -34,35 +34,37 @@ class TestAgentSessionsApiRouting:
         return a
 
     @pytest.mark.asyncio
-    async def test_typing_uses_agent_sessions_when_supported(self):
-        _slack_mod._AGENT_SESSIONS_SUPPORTED = True
+    @pytest.mark.parametrize("supported", [False, True])
+    async def test_typing_keeps_free_text_on_legacy_api(self, supported):
+        _slack_mod._AGENT_SESSIONS_SUPPORTED = supported
         a = self._adapter()
         a._app.client.agents_sessions_setStatus = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
         await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.agents_sessions_setStatus.assert_called_once_with(
+        a._app.client.assistant_threads_setStatus.assert_awaited_once_with(
             channel_id="C123",
             thread_ts="parent_ts",
             status="is thinking...",
         )
-        a._app.client.assistant_threads_setStatus.assert_not_called()
+        a._app.client.agents_sessions_setStatus.assert_not_called()
 
 
     @pytest.mark.asyncio
-    async def test_stop_typing_clears_via_agent_sessions(self):
-        _slack_mod._AGENT_SESSIONS_SUPPORTED = True
+    @pytest.mark.parametrize("supported", [False, True])
+    async def test_stop_typing_clears_via_legacy_api(self, supported):
+        _slack_mod._AGENT_SESSIONS_SUPPORTED = supported
         a = self._adapter()
         a._app.client.agents_sessions_setStatus = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
         await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.agents_sessions_setStatus.reset_mock()
+        a._app.client.assistant_threads_setStatus.reset_mock()
         await a.stop_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.agents_sessions_setStatus.assert_called_once_with(
+        a._app.client.assistant_threads_setStatus.assert_awaited_once_with(
             channel_id="C123",
             thread_ts="parent_ts",
             status="",
         )
-        a._app.client.assistant_threads_setStatus.assert_not_called()
+        a._app.client.agents_sessions_setStatus.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_thread_title_uses_agents_sessions_rename(self):
