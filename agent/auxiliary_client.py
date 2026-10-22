@@ -121,7 +121,7 @@ def aux_probe_mode():
 
 from agent.credential_pool import load_pool
 from agent.auxiliary_call_policy import (
-    CallFallbackPolicy, call_fallback_chain, has_call_fallback_chain, prepare_fallback_request,
+    CallFallbackPolicy, call_fallback_chain, has_call_fallback_chain, prepare_fallback_request, resolve_unavailable_client,
     scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response,
 )
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
@@ -4464,7 +4464,7 @@ def _context_too_small(
 
 
 def _try_configured_fallback_chain(
-    task: str, failed_provider: str, reason: str = "error", failed_model: Optional[str] = None, *,
+    task: Optional[str], failed_provider: str, reason: str = "error", failed_model: Optional[str] = None, *,
     failed_base_url: str = "", failure_scope: Any = None,
 ) -> tuple[Optional[Any], Optional[str], str]:
     """Try auxiliary.<task>.fallback_chain entries in order (each needs ``provider``; model/base_url/api_key optional).
@@ -7464,6 +7464,7 @@ class _ResolvedAuxRoute(NamedTuple):
     final_model: Optional[str]
     resolved_provider: str
     effective_provider: str
+    fallback_label: str = ""
 
 
 def _resolve_call_client(
@@ -7475,6 +7476,7 @@ def _resolve_call_client(
     """Resolve the client for one aux call: vision chain, or cached text client with the
     explicit-provider fallback_chain / auto-chain rescue; RuntimeError when nothing is configured."""
     effective_provider = resolved_provider
+    fallback_label = ""
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
@@ -7496,34 +7498,14 @@ def _resolve_call_client(
             task=task)
         effective_provider = _effective_provider_for_client(client, resolved_provider)
         if client is None:
-            # Explicit provider with no credentials: honor the task fallback_chain before
-            # raising (fallback entries may use OAuth / credential-pool auth).
-            _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit)
-                if fb_client is None:
-                    nous_detail = nous_credential_failure_detail() if _explicit == "nous" else None
-                    raise AuxiliaryClientUnavailable(
-                        nous_detail or missing_provider_credentials_message(_explicit))
-                client, final_model = fb_client, fb_model
-                if async_mode:
-                    client, final_model = _to_async_client(
-                        fb_client, fb_model or "", is_vision=(task == "vision"))
-                resolved_provider = fb_label or resolved_provider
-                effective_provider = resolved_provider
-            # Auto/custom with no credentials: walk the full auto chain (not just OpenRouter).
-            # model=None so each provider uses its own default.
-            if client is None and not resolved_base_url:
-                logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
-                            task or "call", resolved_provider)
-                client, final_model = _get_cached_client(
-                    "auto", async_mode=async_mode, main_runtime=main_runtime, task=task)
-                effective_provider = _effective_provider_for_client(client, "auto")
+            client, final_model, effective_provider, fallback_label = resolve_unavailable_client(
+                task, resolved_provider, resolved_model, resolved_base_url, main_runtime, async_mode=async_mode)
+            if fallback_label:
+                resolved_provider = effective_provider
     if client is None:
         raise AuxiliaryClientUnavailable(f"No LLM provider configured for task={task} "
                                          f"provider={resolved_provider}. Run: hermes setup")
-    return _ResolvedAuxRoute(client, final_model, resolved_provider, effective_provider)
+    return _ResolvedAuxRoute(client, final_model, resolved_provider, effective_provider, fallback_label)
 
 
 class _PreparedAuxRequest(NamedTuple):
@@ -7558,7 +7540,7 @@ def _prepare_aux_request(
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
-    client, final_model, resolved_provider, effective_provider = _resolve_call_client(
+    client, final_model, resolved_provider, effective_provider, fallback_label = _resolve_call_client(
         task, provider=provider, model=model, base_url=base_url, api_key=api_key,
         resolved_provider=resolved_provider, resolved_model=resolved_model,
         resolved_base_url=resolved_base_url, resolved_api_key=resolved_api_key,
@@ -7580,8 +7562,7 @@ def _prepare_aux_request(
             leak_guard_config=compression_config, max_tokens=max_tokens,
             extra_body=effective_extra_body,
         )
-    _set_relay_auxiliary_route(request_provider, final_model, resolved_api_mode)
-    _record_route_info(route_info, _fallback_provider_from_label(request_provider), final_model)
+
     if async_mode:
         base_info = str(getattr(client, "base_url", "") or "")
     else:
@@ -7592,11 +7573,25 @@ def _prepare_aux_request(
                          f" at {base_info}" if base_info and "openrouter" not in base_info else "")
     # Client's actual base_url so endpoint-specific temperature overrides work on
     # auto-detected routes (api.moonshot.ai vs api.kimi.com/coding).
-    kwargs = _build_call_kwargs(
-        request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
-        reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task,
-        no_progress_timeout=no_progress_timeout)
+    if fallback_label:
+        destination, kwargs, _ = _plan_fallback_candidate(
+            client, final_model, fallback_label, task=task, effective_timeout=effective_timeout,
+            apply_fast_lane=not async_mode, messages=messages, tools=tools, temperature=temperature,
+            max_tokens=max_tokens, effective_extra_body=effective_extra_body, reasoning_config=reasoning_config)
+        resolved_provider = request_provider = destination.provider
+        resolved_model = final_model = destination.model
+        resolved_base_url = base_info = destination.base_url
+        resolved_api_key = getattr(client, "api_key", None)
+        resolved_api_mode = destination.api_mode
+    else:
+        kwargs = _build_call_kwargs(
+            request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
+            tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+            reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task)
+    if no_progress_timeout is not None:
+        kwargs["no_progress_timeout"] = no_progress_timeout
+    _set_relay_auxiliary_route(request_provider, final_model, resolved_api_mode)
+    _record_route_info(route_info, _fallback_provider_from_label(request_provider), final_model)
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)

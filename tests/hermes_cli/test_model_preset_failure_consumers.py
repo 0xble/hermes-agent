@@ -71,7 +71,7 @@ def test_moa_executes_declared_backup(moa_transport, consumer):
     preset = resolve_moa_preset(expand_model_presets(cfg)["moa"])
     messages = [{"role": "user", "content": "run"}]
     if consumer == "reference":
-        label, text, acct = moa._run_reference(preset["reference_models"][0], messages, agent=agent)
+        _label, text, acct = moa._run_reference(preset["reference_models"][0], messages, agent=agent)
         assert text == "backup executed"
         assert (acct.model, acct.provider) == ("backup", "openrouter")
         assert acct.usage.input_tokens == 5
@@ -133,7 +133,7 @@ def test_gateway_context_pin_belongs_to_named_endpoint(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("consumer", ["reference", "aggregator", "streaming"])
 def test_moa_empty_chain_disables_backup_execution(moa_transport, consumer):
-    cfg, calls, progress, agent = moa_transport
+    cfg, calls, _progress, agent = moa_transport
     cfg["moa"]["reference_models"][0]["fallbacks"] = []
     cfg["moa"]["aggregator"]["fallbacks"] = []
     from agent import moa_loop as moa
@@ -158,7 +158,7 @@ def test_moa_empty_chain_disables_backup_execution(moa_transport, consumer):
 
 def test_streaming_fallback_never_replays_emitted_content(moa_transport, monkeypatch):
     from agent import auxiliary_client as aux, moa_loop as moa
-    cfg, calls, progress, agent = moa_transport
+    _cfg, calls, _progress, agent = moa_transport
     def stream(*a, **kw):
         calls.append({"model": "primary"})
         yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="already emitted"))])
@@ -175,7 +175,7 @@ def test_streaming_fallback_never_replays_emitted_content(moa_transport, monkeyp
 
 def test_moa_fallback_retrims_for_destination_and_keeps_liveness(moa_transport, monkeypatch):
     from agent import moa_loop as moa
-    cfg, calls, progress, agent = moa_transport
+    _cfg, calls, progress, agent = moa_transport
     checked = []
     def context(slot, runtime, cache):
         checked.append(slot["model"])
@@ -204,7 +204,7 @@ def test_raw_mapping_and_builtin_wrappers_share_fallback_optout(reference):
 
 def test_auxiliary_per_call_chain_inherits_only_when_none(moa_transport, monkeypatch):
     from agent import auxiliary_client as aux
-    cfg, calls, progress, agent = moa_transport
+    cfg, calls, _progress, _agent = moa_transport
     cfg["auxiliary"]["moa_reference"] = {"fallback_chain": [BACKUP]}
     from pathlib import Path
     import os
@@ -221,3 +221,100 @@ def test_auxiliary_per_call_chain_inherits_only_when_none(moa_transport, monkeyp
     calls.clear()
     assert aux.call_llm(**kwargs).choices[0].message.content == "backup executed"
     assert [call["model"] for call in calls] == ["primary", "backup"]
+
+
+@pytest.mark.parametrize("consumer", ["reference", "aggregator", "streaming"])
+@pytest.mark.parametrize("provider", ["openrouter", "anthropic"])
+@pytest.mark.parametrize("policy", ["empty", "exhausted", "declared", "inherited"])
+def test_moa_unavailable_primary_obeys_policy_and_prepares_destination(moa_transport, monkeypatch, tmp_path, consumer, provider, policy):
+    from agent import auxiliary_client as aux, moa_loop as moa
+    cfg, calls, progress, agent = moa_transport
+    visited, planned, cache_routes = [], [], []
+    client = SimpleNamespace(base_url="https://openrouter.ai/api/v1", api_key="fixture")
+    def create(**kw):
+        calls.append(kw)
+        aux._notify_aux_progress()
+        return SimpleNamespace(model=kw["model"], choices=[SimpleNamespace(
+            message=SimpleNamespace(role="assistant", content="executed", tool_calls=None), finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=2, total_tokens=7))
+    client.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+    def cached(provider, model=None, **kw):
+        visited.append((provider, model))
+        return (client, "unrelated") if provider == "auto" else (None, None)
+    def resolve(provider, model=None, **kw):
+        visited.append((provider, model))
+        return (None, None) if model == "unusable" else (client, model)
+    monkeypatch.setattr(aux, "_get_cached_client", cached)
+    monkeypatch.setattr(aux, "resolve_provider_client", resolve)
+    monkeypatch.setattr(moa, "_slot_runtime", lambda slot: {"provider": slot["provider"], "model": slot["model"]})
+    monkeypatch.setattr(moa, "_reference_context_length", lambda slot, *a: 100000 if slot["model"] == "primary" else 1500)
+    replan = aux._replan_synchronous_cache_sections
+    def cache(messages, tools, *, destination):
+        planned.append(destination)
+        return replan(messages, tools, destination=destination)
+    monkeypatch.setattr(aux, "_replan_synchronous_cache_sections", cache)
+    cache_aggregator = moa.MoAChatCompletions._plan_aggregator_cache
+    def aggregator_cache(self, messages, tools, guidance, runtime):
+        cache_routes.append(dict(runtime))
+        return cache_aggregator(self, messages, tools, guidance, runtime)
+    monkeypatch.setattr(moa.MoAChatCompletions, "_plan_aggregator_cache", aggregator_cache)
+    chain = [{"provider": "custom:missing", "model": "unusable"}]
+    if policy != "exhausted":
+        chain.append(BACKUP)
+    task = "moa_reference" if consumer == "reference" else "moa_aggregator"
+    cfg["auxiliary"][task] = {"fallback_chain": chain}
+    write_config(tmp_path, monkeypatch, cfg)
+    slot = {"provider": provider, "model": "primary", "reasoning_effort": "high"}
+    if policy != "inherited":
+        slot["fallback_models"] = [] if policy == "empty" else chain
+    messages = [{"role": "user", "content": "old " * 2500}, {"role": "assistant", "content": "old answer " * 2500},
+                {"role": "user", "content": "latest"}]
+    # Inherited OpenRouter discovery is intentionally preserved. Declared policy is never discovery.
+    expected = "unrelated" if policy == "inherited" and provider == "openrouter" else "backup"
+    if consumer == "reference":
+        _, text, acct = moa._run_reference(slot, messages, max_tokens=64, agent=agent)
+        if policy in {"empty", "exhausted"}:
+            assert text.startswith("[failed:")
+        else:
+            assert text == "executed"
+            assert (acct.model, acct.provider) == ("primary" if expected == "unrelated" else expected, "openrouter")
+            assert acct.usage.input_tokens == 5
+            assert acct.messages == calls[-1]["messages"]
+    else:
+        facade = moa.MoAChatCompletions("default", agent=agent)
+        def execute():
+            result = facade._call_prepared_aggregator({"aggregator": slot, "messages": messages,
+                "guidance": None, "aggregator_temperature": None}, {"stream": consumer == "streaming", "max_tokens": 64})
+            assert calls  # provider dispatch remains eager
+            return "".join(str(c.choices[0].delta.content or "") for c in result) if consumer == "streaming" else moa._extract_text(result)
+        if policy in {"empty", "exhausted"}:
+            with pytest.raises(aux.AuxiliaryClientUnavailable):
+                execute()
+        else:
+            assert execute() == "executed"
+            assert facade.last_aggregator_slot["model"] == ("primary" if expected == "unrelated" else expected)
+            assert facade.last_aggregator_slot["provider"] == "openrouter"
+            if expected == "backup":
+                assert facade.last_aggregator_slot["reasoning_effort"] == "none"
+    assert visited[0] == (provider, "primary")
+    if policy == "empty":
+        assert visited == [(provider, "primary")]
+        assert not calls and not planned
+    elif policy == "exhausted":
+        assert visited == [(provider, "primary"), ("custom:missing", "unusable")]
+        assert not calls and not planned
+    elif expected == "unrelated":
+        assert visited == [(provider, "primary"), ("auto", None)]
+        assert calls[-1]["model"] == "unrelated"
+    elif expected == "backup":
+        assert visited == [(provider, "primary"), ("custom:missing", "unusable"), ("openrouter", "backup")]
+        assert planned[-1].model == "backup"
+        assert calls[-1]["extra_body"]["reasoning"] == {"enabled": False}
+        if consumer == "reference":
+            assert len(str(calls[-1]["messages"])) < len(str(messages))
+        else:
+            assert calls[-1]["messages"] == messages
+            assert cache_routes[-1] == {"provider": "openrouter", "model": "backup",
+                "base_url": "https://openrouter.ai/api/v1", "api_mode": "chat_completions"}
+        assert "latest" in str(calls[-1]["messages"][-1])
+        assert progress or consumer != "reference"

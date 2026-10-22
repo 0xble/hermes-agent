@@ -60,8 +60,20 @@ def test_completed_response_keeps_identity_and_releases_permit(transport, comple
     assert create.call_count == (2 if recover_on_send else 1)
 
 
-@pytest.mark.parametrize("ending", ["close_unread", "exhaust", "error_unread", "error_emitted", "close_emitted", "close_error", "recover_unread", "abandon_unread", "abandon_emitted"])
+_STREAM_ENDINGS = ["close_unread", "exhaust", "error_unread", "error_emitted", "close_emitted", "close_error", "recover_unread", "abandon_unread", "abandon_emitted"]
+
+
+@pytest.mark.parametrize("ending", _STREAM_ENDINGS)
 def test_stream_dispatch_scope_recovery_and_permit_lifetime(transport, ending):
+    _assert_stream_contract(transport, ending)
+
+
+@pytest.mark.parametrize("ending", _STREAM_ENDINGS)
+def test_unavailable_primary_preserves_stream_contract(transport, ending):
+    _assert_stream_contract(transport, ending, unavailable_primary=True)
+
+
+def _assert_stream_contract(transport, ending, unavailable_primary=False):
     from agent.auxiliary_call_policy import call_fallback_chain
 
     aux, create = transport
@@ -69,6 +81,11 @@ def test_stream_dispatch_scope_recovery_and_permit_lifetime(transport, ending):
     chunk = SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None))])
     backup = {"provider": "openrouter", "model": "backup"}
     chain = [backup] if ending == "recover_unread" else []
+    if unavailable_primary:
+        # Fixture teardown restores its original monkeypatch, including on eager failure.
+        aux._get_cached_client = lambda *a, **kw: (None, None)
+        first = {"provider": "openrouter", "model": "first-backup"}
+        chain.insert(0, first)
     runtime = {"provider": "openrouter", "model": "runtime"}
     request_id = None
 
@@ -152,3 +169,62 @@ def test_stream_dispatch_scope_recovery_and_permit_lifetime(transport, ending):
     if stream is not None:
         with pytest.raises(StopIteration):
             next(stream)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_unavailable_selection_is_local_and_cached_primary_is_not_a_fallback(transport, tmp_path, monkeypatch, async_mode):
+    import asyncio
+    from agent.auxiliary_call_policy import call_fallback_chain
+
+    aux, create = transport
+    client, _ = aux._get_cached_client("openrouter", "unused")
+    backup = {"provider": "openrouter", "model": "backup", "reasoning_effort": "none"}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "auxiliary": {"moa_aggregator": {"fallback_chain": [backup]}},
+    }))
+    completed = _IterableCompleted(choices=[SimpleNamespace(
+        message=SimpleNamespace(content="done", tool_calls=None), finish_reason="stop")])
+    seen, transforms = [], []
+    def dispatch(**kw):
+        seen.append(kw)
+        return completed
+    create.side_effect = dispatch
+    if async_mode:
+        async def async_dispatch(**kw):
+            return dispatch(**kw)
+        client.chat.completions.create = async_dispatch
+        monkeypatch.setattr(aux, "_to_async_client", lambda client, model, **kw: (client, model))
+    primary_available = False
+    monkeypatch.setattr(aux, "_get_cached_client", lambda provider, model=None, **kw:
+                        (client, model) if primary_available else (None, None))
+    def transform(destination, messages, tools, reasoning, entry):
+        transforms.append(destination.model)
+        return messages, tools, reasoning
+    def invoke(**policy):
+        route = {}
+        kwargs = dict(task="moa_aggregator", provider="anthropic", model="primary",
+                      messages=[{"role": "user", "content": "q"}], route_info=route,
+                      reasoning_config={"enabled": True, "effort": "high"})
+        if async_mode:
+            result = asyncio.run(aux.async_call_llm(**kwargs))
+        else:
+            result = aux.call_llm(**kwargs, stream=True, **policy)
+        assert result is completed
+        return route
+    assert invoke(**({} if async_mode else {"fallback_chain": [backup], "fallback_request_transform": transform})) == {
+        "provider": "openrouter", "model": "backup"}
+    assert seen[-1]["extra_body"]["reasoning"]["enabled"] is False
+    assert client._hermes_fallback_destination.model == "backup"
+    primary_available = True
+    assert invoke(**({} if async_mode else {"fallback_request_transform": transform})) == {
+        "provider": "anthropic", "model": "primary"}
+    assert seen[-1]["model"] == "primary"
+    assert seen[-1]["extra_body"]["reasoning"]["effort"] == "high"
+    assert transforms == ([] if async_mode else ["backup"])
+    assert call_fallback_chain("moa_aggregator", None) is None
+    if not async_mode:
+        primary_available = False
+        with pytest.raises(aux.AuxiliaryClientUnavailable):
+            invoke(fallback_chain=[])
+        assert invoke() == {"provider": "openrouter", "model": "backup"}
+        assert transforms == ["backup"]

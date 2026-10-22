@@ -47,6 +47,38 @@ def prepare_fallback_request(
     return messages, tools, reasoning_config
 
 
+def resolve_unavailable_client(
+    task: str | None, provider: str, model: str | None, base_url: str | None,
+    main_runtime: dict | None, *, async_mode: bool,
+) -> tuple[Any, str | None, str, str]:
+    """Use the existing chain selector, without discovery beyond a request-local policy."""
+    from agent import auxiliary_client as aux
+
+    explicit = (provider or "").strip().lower()
+    local_chain = has_call_fallback_chain(task)
+    label = ""
+    if local_chain:
+        client, final_model, label = aux._try_configured_fallback_chain(
+            task, provider, reason="provider unavailable", failed_model=model,
+            failed_base_url=base_url or "")
+    elif explicit and explicit not in {"auto", "openrouter", "custom"}:
+        client, final_model, label = aux._try_configured_fallback_for_unavailable_client(task, explicit)
+        if client is None:
+            detail = aux.nous_credential_failure_detail() if explicit == "nous" else None
+            raise aux.AuxiliaryClientUnavailable(detail or aux.missing_provider_credentials_message(explicit))
+    else:
+        client, final_model = None, None
+    if client is not None:
+        if async_mode:
+            client, final_model = aux._to_async_client(client, final_model or "", is_vision=(task == "vision"))
+        return client, final_model, label, label
+    if not local_chain and not base_url:
+        aux.logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain", task or "call", provider)
+        client, final_model = aux._get_cached_client("auto", async_mode=async_mode, main_runtime=main_runtime, task=task)
+        return client, final_model, aux._effective_provider_for_client(client, "auto"), ""
+    return None, None, provider, ""
+
+
 def is_stream_response(response: Any) -> bool:
     """Completed SDK models may be iterable, but their choices still belong to the consumer."""
     return not hasattr(response, "choices") and isinstance(response, Iterator)

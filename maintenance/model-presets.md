@@ -83,8 +83,13 @@ reasoning precedence, including preset effort ahead of global effort.
   including an explicit empty list. Expansion is not execution proof.
 - MoA execution: references and completion/streaming aggregators pass slot chains
   to `auxiliary_client.call_llm`. A request-local chain uses the existing shared
-  recovery ladder, not a MoA retry engine. `None` inherits task policy, `[]`
-  disables provider hops, and a declared chain never appends unrelated routes.
+  recovery ladder, not a MoA retry engine. Apply it before dispatch when the primary
+  has no usable client, as well as after a transport failure. `None` inherits task
+  policy, `[]` disables provider hops, and a declared chain never appends unrelated
+  routes or starts autodetection. Unusable declared entries are skipped in order.
+  A selected pre-dispatch fallback goes through the same destination request planner
+  as transport recovery. Carry its selection provenance on the request, not just a
+  cached client tag, so a later primary call cannot inherit fallback transforms.
   Destination preparation re-trims canonical reference input, re-plans cache
   markers/tools and reasoning, and records the actual selected accounting route.
   Streaming recovery is allowed only before a chunk has escaped. Dispatch remains
