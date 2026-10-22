@@ -112,9 +112,20 @@ def _tick_admitted(
         except Exception as _wt_exc:
             _sched.logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
+        from cron import jobs
+        from cron.scheduler_admission import note_due_scan
+
+        scan_started = jobs._hermes_now()
         due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 
+        if due_jobs and store_health.dispatch_blocked(due_jobs):
+            # Known-unwritable store, re-probed at most once a minute: every advance/claim would
+            # fail, so skip them (the skip is recorded) and keep the tick's housekeeping alive.
+            _sched._sweep_mcp_orphans()
+            return 0
+
+        note_due_scan(scan_started)
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
             if verbose:
@@ -125,12 +136,6 @@ def _tick_admitted(
                 # due.
                 _sched.logger.info("%s - No jobs due", _sched._hermes_now().strftime('%H:%M:%S'))
             store_health.recheck_idle()
-            _sched._sweep_mcp_orphans()
-            return 0
-
-        if store_health.dispatch_blocked(due_jobs):
-            # Known-unwritable store, re-probed at most once a minute: every advance/claim would
-            # fail, so skip them (the skip is recorded) and keep the tick's housekeeping alive.
             _sched._sweep_mcp_orphans()
             return 0
 
@@ -157,16 +162,10 @@ def _tick_admitted(
 
         # Persistent pool, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
         # re-arms next_run_at on completion, so no catch-up queue is needed.
-        _results: list = []
-        _all_futures: list = []
+        from cron.scheduler_admission import submit_due_jobs
         pool = _sched._get_parallel_pool(_max_workers)
-        for job in due_jobs:
-            fut = _sched._submit_with_guard(job, pool, _process_job)
-            if fut is None:
-                continue
-            _all_futures.append(fut)
-            if not sync:
-                _results.append(True)  # optimistically counted
+        _all_futures = submit_due_jobs(due_jobs, pool, _process_job)
+        _results: list = [] if sync else [True] * len(_all_futures)
 
         if sync:
             for f in concurrent.futures.as_completed(_all_futures):
