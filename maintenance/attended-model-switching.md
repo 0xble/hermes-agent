@@ -23,7 +23,18 @@ pick. Plain picks remain temporary while attended switching is enabled and
 expire after the idle window. Temporary picks preserve a named hold and expire
 back to it, just as `--once` preserves it.
 
-Without slash-admin gating, `/model reset --all` accepts a human DM principal explicitly listed in the platform or gateway env allowlist. Reuse canonical principal matching and platform-only adapter-resolved IDs. Role, relay, upstream adapter, bot and pairing admission do not confer gateway ownership. Explicit slash-admin gating remains authoritative. The pre-existing adapter `allow_from` fallback, including its wildcard behavior, remains unchanged for compatibility.
+Without slash-admin gating, the restricted env path for `/model reset --all`
+accepts a human DM principal listed in the platform or gateway env allowlist.
+It reuses canonical principal matching and platform-only adapter-resolved IDs.
+Role, relay, upstream adapter, bot and pairing-store admission alone do not
+satisfy this path. Pairing approvals mirrored into a configured env allowlist
+count as listed principals after reload, indistinguishable from manually added
+IDs. A wildcard in either env list, or the platform's allow-all flag, disables
+this env path even for an explicitly listed owner.
+
+Explicit slash-admin gating remains authoritative. The pre-existing adapter
+`allow_from` fallback remains unchanged for compatibility. Its wildcard admits
+any DM sender, including bots and non-owners, independently of the env path.
 
 Role assignment is bound to a turn, not to its starting config snapshot. Busy
 topic edits and bulk conversions take effect next turn, even before the current
