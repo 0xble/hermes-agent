@@ -531,6 +531,10 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str, route: Any =
         parsed = parse_reasoning_effort(route_effort)
         if parsed is not None:
             return parsed
+    if route is not None:
+        # A selected route without effort defers to per-model/global policy,
+        # not the primary preset, even when both providers use the same model ID.
+        cfg = {**cfg, "model": {"default": route.model, "provider": route.provider}}
     return resolve_reasoning_config(cfg if isinstance(cfg, dict) else {}, str(model))
 
 
@@ -1931,6 +1935,10 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
                 runtime["_fallback_notice"] = pre_agent_fallback_notice(
                     requested or (jc.model_cfg.get("provider") if isinstance(jc.model_cfg, dict) else ""),
                     model, runtime.get("provider"), fb_model)
+                from hermes_cli.model_presets import ModelPresetRoute, normalize_route_reasoning_effort
+                runtime["_selected_route"] = ModelPresetRoute(
+                    "", runtime["provider"], fb_model,
+                    normalize_route_reasoning_effort(entry.get("reasoning_effort")))
                 return runtime, fb_model
             except Exception as fb_exc:
                 logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
@@ -2517,7 +2525,8 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.runtime, setup.model = _resolve_job_runtime(job, job_id, jc)
     setup.fallback_notice = setup.runtime.pop("_fallback_notice", None)
     setup.reasoning_config = _resolve_job_reasoning_config(
-        job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model), jc.route
+        job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model),
+        setup.runtime.pop("_selected_route", jc.route)
     )
     # Mid-run provider ladder: same rule as resolution above. A pinned job cannot
     # borrow the global chain, but may use the explicitly declared cron chain.

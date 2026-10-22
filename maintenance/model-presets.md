@@ -40,6 +40,33 @@ acceptance of the design. Reassess this divergence before adopting upstream work
 - Unrelated saves preserve authored references, even after defaults merge.
 - Carry resolved main fallback entries to auxiliary request planning. Re-reading
   config per candidate can lose the selected route's reasoning effort.
+- `get_fallback_chain` is the shared preset-aware fallback boundary. Feed it the
+  complete effective user config, not just a detached list of named references.
+  Raw and already-expanded inputs must yield identical ordered concrete routes.
+  Cron overrides carry the registry but never borrow global or legacy routes.
+- Expand the complete CLI user route before defaults merge destroys its authored
+  identity. Do not independently resolve just the primary model. Turn refreshes
+  and TUI readers use the shared fallback boundary without their own parser.
+- Keep a pre-agent cron fallback's `ModelPresetRoute` beside its resolved runtime
+  until setup consumes its reasoning. Absent fallback effort defers to per-model
+  and global policy, even for the same model ID on a different provider. A valid
+  per-job reasoning pin still wins.
+
+## Boundary Rationale
+
+The recurring failure class was partial normalization: a reader replaced a
+preset's model/provider while discarding its fallback or typed reasoning policy.
+Deleting references or narrowing their supported forms would break the reuse
+contract. Adding more independent reader patches would leave the same loss
+possible at the next consumer. The existing `expand_model_presets` therefore
+owns fallback expansion at `get_fallback_chain`, where the full config and preset
+registry are available. CLI initialization additionally expands before defaults
+merge because that merge irreversibly replaces the primary reference. Raw
+write-back primitives remain unexpanded so references, siblings and comments
+survive unrelated saves. No parallel parser or configuration mechanism is added.
+The auxiliary boundary parses the original reasoning value with
+`parse_reasoning_effort`, and cron carries the selected route instead of
+reconstructing its policy from the old primary.
 
 ## Reader Inventory
 
@@ -57,7 +84,11 @@ gateway runtime, cron and auxiliary suites. The persistence regression uses all
 and requires exactly 1 complete new route, with no invalid or partial selection.
 All 3 command commit seams also reload real scratch config. Sibling comments,
 quoting, ambiguous YAML scalars and owner-only permissions survive. `/new` with an
-invalid preset must remain best effort.
+invalid preset must remain best effort. `tests/hermes_cli/test_model_preset_route_consumers.py`
+exercises raw/expanded fallback equivalence, idempotence and legacy order, real
+CLI/TUI initialization and file-backed turn refresh, scalar/named `@default`
+through cron, typed auxiliary OpenRouter wire kwargs, and cron auth fallback
+reasoning with and without explicit job pins.
 
 Retire when upstream covers flat references, every reader, round-trip
 preservation and shared concrete-selection persistence. Keep session policy

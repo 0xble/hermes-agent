@@ -4073,12 +4073,13 @@ def _fallback_reasoning_config(
     fallback_entry = fallback_entry or _fallback_chain_entry(task, fb_label)
     if not isinstance(fallback_entry, dict) or "reasoning_effort" not in fallback_entry:
         return reasoning_config
-    effort = str(fallback_entry.get("reasoning_effort") or "").strip().lower()
-    if not effort:
+    from hermes_constants import parse_reasoning_effort
+    policy = parse_reasoning_effort(fallback_entry.get("reasoning_effort"))
+    if policy is None:
         return reasoning_config
-    result = dict(reasoning_config or {})
-    result["enabled"] = effort != "none"
-    result["effort"] = effort
+    result = {**(reasoning_config or {}), **policy}
+    if not policy["enabled"]:
+        result.pop("effort", None)
     return result
 
 
