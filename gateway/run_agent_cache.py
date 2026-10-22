@@ -193,8 +193,6 @@ class GatewayAgentCacheMixin:
         self, session_key: str, override: Optional[dict], *, scope: Optional[str] = None,
     ) -> None:
         """Caller holds the route lock; publish memory only after successful persistence."""
-        self._bump_session_model_override_epoch(session_key)
-        epoch = self._session_model_override_epoch(session_key)
         resolved_scope = scope or self._session_model_override_scope(session_key)
         if override is not None and resolved_scope != "session":
             write = asyncio.create_task(
@@ -203,6 +201,26 @@ class GatewayAgentCacheMixin:
         else:
             # Keep the historical call shape for existing callers/tests and for old SessionStore adapters.
             write = asyncio.create_task(self.async_session_store.set_model_override(session_key, override))
+        def publish(_key):
+            if override is None:
+                self._session_model_overrides.pop(session_key, None)
+                self._session_state(session_key).conversation.model_override_scope = "session"
+            else:
+                self._session_model_overrides[session_key] = dict(override)
+                self._session_state(session_key).conversation.model_override_scope = resolved_scope
+        await self._persist_model_route_edit_locked([session_key], write, publish)
+
+    async def _persist_model_route_edit_locked(self, session_keys, write, publish) -> None:
+        """Fence hydration and retain all held route locks until the storage worker settles.
+
+        Concrete and role writes share this cancellation/publication lifecycle. Callers acquire
+        the per-session locks in sorted order for a multi-session snapshot.
+        """
+        epochs = {}
+        for key in session_keys:
+            self._bump_session_model_override_epoch(key)
+            epochs[key] = self._session_model_override_epoch(key)
+        write = asyncio.ensure_future(write)
         cancelled = None
         try:
             while not write.done():
@@ -214,15 +232,11 @@ class GatewayAgentCacheMixin:
                     cancelled = exc
             await write
         finally:
-            if (not write.cancelled() and write.done() and write.exception() is None
-                    and self._session_model_override_epoch(session_key) == epoch):
-                if override is None:
-                    self._session_model_overrides.pop(session_key, None)
-                    self._session_state(session_key).conversation.model_override_scope = "session"
-                else:
-                    self._session_model_overrides[session_key] = dict(override)
-                    self._session_state(session_key).conversation.model_override_scope = resolved_scope
-            self._bump_session_model_override_epoch(session_key)
+            succeeded = not write.cancelled() and write.done() and write.exception() is None
+            for key, epoch in epochs.items():
+                if succeeded and self._session_model_override_epoch(key) == epoch:
+                    publish(key)
+                self._bump_session_model_override_epoch(key)
         if cancelled is not None:
             raise cancelled
 
@@ -511,6 +525,18 @@ class GatewayAgentCacheMixin:
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False
 
+    async def _clear_conversation_scope_async(self, session_key: str, *, reason: str) -> None:
+        """Persist changed role state off-loop before publishing a fresh conversation."""
+        async with self._session_model_override_lock(session_key):
+            await self._clear_conversation_scope_locked_async(session_key, reason=reason)
+
+    async def _clear_conversation_scope_locked_async(self, session_key: str, *, reason: str) -> None:
+        if reason != "resume":
+            role = await asyncio.to_thread(self.session_store.get_model_role, session_key)
+            if role:
+                await self._set_session_model_role_locked(session_key, None)
+        self._clear_conversation_scope(session_key, reason=reason)
+
     def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
         """THE single conversation-boundary funnel (/new, /resume, suspension replacement,
         compression-exhausted reset). New conversation-scoped dicts go in _CONVERSATION_SCOPED_STATE
@@ -530,7 +556,9 @@ class GatewayAgentCacheMixin:
         self._bump_session_model_override_epoch(session_key)
         state = self._peek_session_state(session_key)
         if state is not None:
+            model_role = state.conversation.model_role if reason == "resume" else None
             state.conversation.clear()
+            state.conversation.model_role = model_role
         # Legacy plain-dict stores still in _CONVERSATION_SCOPED_STATE (not yet folded into
         # SessionState), e.g. _pending_model_notes. SessionState-backed names resolve to MutableMapping
         # views (not dict), so the isinstance(dict) guard skips them — already handled above.

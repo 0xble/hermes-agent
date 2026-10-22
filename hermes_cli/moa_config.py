@@ -155,6 +155,12 @@ def _clean_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] |
 
     if include_enabled:
         clean["enabled"] = _coerce_bool(slot.get("enabled"), True)
+    if isinstance(slot.get("fallback_models"), list):
+        clean["fallback_models"] = [
+            candidate for raw in slot["fallback_models"]
+            if isinstance(raw, dict)
+            and (candidate := _clean_slot({k: v for k, v in raw.items() if k != "fallback_models"})) is not None
+        ]
     return clean
 
 

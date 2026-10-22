@@ -1797,6 +1797,13 @@ def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg:
         "default": result.new_model, "provider": result.target_provider,
         "base_url": result.base_url or None, "api_mode": result.api_mode or None,
     }
+    # A concrete selection replaces the authored reference, regardless of its
+    # spelling. Keeping one beside the inline route makes the next load invalid.
+    if "model_preset" in model_cfg:
+        updates["model_preset"] = None
+    from hermes_cli.model_presets import preset_ref_name
+    if preset_ref_name(model_cfg.get("model")):
+        updates["model"] = None
     if "context_length" in model_cfg:
         from hermes_cli.route_identity import should_clear_context_pin
         if should_clear_context_pin(
@@ -1838,15 +1845,16 @@ def persist_model_selection(result: ModelSwitchResult, config_path: Any = None) 
     """Write a successful :func:`switch_model` result to ``config_path`` (default:
     ``HERMES_HOME/config.yaml`` — the context override or ``HERMES_HOME`` at call time).
 
-    Targeted key writes, not a whole-``model:`` rewrite: a block rewrite destroys sibling keys the
-    user set there (``model_slots``, ``model_fallback``, ...). ``should_clear_context_pin`` can do
-    cold-start disk I/O — async callers run this on a worker thread."""
+    Merge a raw-derived full state, not a replacement ``model:`` block: sibling settings
+    (``model_slots``, ``model_fallback``, ...) must survive. One atomic replacement keeps readers
+    from observing a preset reference beside a partial concrete route. ``should_clear_context_pin``
+    can do cold-start disk I/O, so async callers run this on a worker thread."""
     from pathlib import Path
-    from hermes_cli.config import get_config_path, read_user_config_raw
-    from utils import atomic_roundtrip_yaml_update
+    from hermes_cli.config import atomic_config_replace, get_config_path, read_user_config_raw
     path = Path(config_path) if config_path else get_config_path()
-    for key, value in model_selection_config_updates(result, read_user_config_raw(path).get("model")).items():
-        atomic_roundtrip_yaml_update(path, f"model.{key}", value)
+    config = read_user_config_raw(path)
+    config["model"] = apply_model_selection(config.get("model"), result)
+    atomic_config_replace(path, config)
     try:  # owner-only: config files contain API keys
         os.chmod(path, 0o600)
     except (OSError, NotImplementedError):

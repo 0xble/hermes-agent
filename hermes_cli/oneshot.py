@@ -365,7 +365,24 @@ class _ModelChoice:
     api_mode: str | None = None
 
 
-def _configured_model(model_cfg: object) -> str:
+def _configured_model(model_cfg: object, cfg: dict | None = None) -> str:
+    """Concrete configured model. ``@name`` and ``{model_preset: name}`` resolve; a literal ``@cf/...`` does not."""
+    from hermes_cli.model_preset_runtime import resolve_default_route
+    from hermes_cli.model_presets import ModelPresetError, preset_ref_name
+
+    source = cfg if isinstance(cfg, dict) else {"model": model_cfg}
+    looks_like_ref = preset_ref_name(model_cfg) or (
+        isinstance(model_cfg, dict) and (
+            model_cfg.get("model_preset") or preset_ref_name(model_cfg.get("default")) or preset_ref_name(model_cfg.get("model"))
+        )
+    )
+    if looks_like_ref:
+        try:
+            route = resolve_default_route(source)
+        except ModelPresetError:
+            route = None
+        if route is not None and route.model:
+            return route.model
     if isinstance(model_cfg, str):
         return model_cfg
     raw = model_cfg.get("default") or model_cfg.get("model") or ""
@@ -388,7 +405,7 @@ def _resolve_model_and_provider(cfg: dict, model: Optional[str], provider: Optio
     model_cfg = cfg.get("model") or {}
     env_model = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
     explicit_model = (model or "").strip() or env_model
-    choice = _ModelChoice(explicit_model or _configured_model(model_cfg), (provider or "").strip() or None)
+    choice = _ModelChoice(explicit_model or _configured_model(model_cfg, cfg), (provider or "").strip() or None)
     if choice.provider is not None or not explicit_model:
         return choice
 

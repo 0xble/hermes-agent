@@ -2073,26 +2073,26 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         _msg_custom_providers = []
         with suppress(Exception):
             _msg_cfg = _load_gateway_config()
-            _msg_model_cfg = _msg_cfg.get("model", {})
-            if isinstance(_msg_model_cfg, dict):
-                _msg_raw_ctx = _msg_model_cfg.get("context_length")
-                if _msg_raw_ctx is not None:
-                    _msg_config_ctx = int(_msg_raw_ctx)
-            try:
-                from hermes_cli.config import get_compatible_custom_providers
+        _msg_cfg = _msg_cfg or {}
+        _msg_model_cfg = _msg_cfg.get("model", {})
+        from hermes_cli.model_preset_runtime import resolve_default_route
+        _msg_default_route = resolve_default_route(_msg_cfg)
+        if isinstance(_msg_model_cfg, dict):
+            _msg_raw_ctx = _msg_model_cfg.get("context_length")
+            if _msg_raw_ctx is not None:
+                _msg_config_ctx = int(_msg_raw_ctx)
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
 
-                _msg_custom_providers = get_compatible_custom_providers(_msg_cfg)
-            except Exception:
-                _msg_custom_providers = _msg_cfg.get("custom_providers") or []
+            _msg_custom_providers = get_compatible_custom_providers(_msg_cfg)
+        except Exception:
+            _msg_custom_providers = _msg_cfg.get("custom_providers") or []
         # GatewayRunner has no self._model/self._base_url; resolve the session's actual runtime.
         _msg_model, _msg_runtime = await self._resolve_session_agent_runtime_async(
             source=source, session_key=session_key, user_config=_msg_cfg,
         )
         _msg_base_url = _msg_runtime.get("base_url") or ""
-        if isinstance(_msg_model_cfg, dict):
-            _msg_configured_model = _msg_model_cfg.get("default") or _msg_model_cfg.get("model")
-        else:
-            _msg_configured_model = _msg_model_cfg  # (no dict → no pin was read; ctx is already None)
+        _msg_configured_model = _msg_default_route.model
         if _msg_model != _msg_configured_model:
             _msg_config_ctx = None
         if _msg_config_ctx is not None:
@@ -2101,8 +2101,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
                 if await should_clear_context_pin_async(
                     None, None,  # model match already checked above
-                    _msg_model_cfg.get("base_url"), _msg_base_url,
-                    _msg_model_cfg.get("provider"), _msg_runtime.get("provider"),
+                    _msg_default_route.base_url, _msg_base_url,
+                    _msg_default_route.provider, _msg_runtime.get("provider"),
                 ):
                     _msg_config_ctx = None
             except Exception:

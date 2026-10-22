@@ -65,13 +65,23 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
     Best-effort — an unreachable default must never block /new. Module-level helper (like
     ``_apply_new_session_title``): tests drive ``new_session`` unbound on a SimpleNamespace."""
     from cli import CLI_CONFIG, _cprint, _split_model_config_default, logger
-    _model_config = CLI_CONFIG.get("model", {})
-    if isinstance(_model_config, dict):
-        _raw_default = _model_config.get("default") or _model_config.get("model") or ""
-        _config_provider = _model_config.get("provider", "")
+    from hermes_cli.model_preset_runtime import resolve_default_route
+    from hermes_cli.model_presets import ModelPresetError
+    try:
+        _route = resolve_default_route(CLI_CONFIG)
+    except ModelPresetError:
+        logger.debug("Config default is unavailable during /new", exc_info=True)
+        return
+    if _route.name and _route.model:
+        _config_model, _config_provider = _route.model, _route.provider
     else:
-        _raw_default, _config_provider = (_model_config or ""), ""
-    _config_model, _ = _split_model_config_default(_raw_default)
+        _model_config = CLI_CONFIG.get("model", {})
+        if isinstance(_model_config, dict):
+            _raw_default = _model_config.get("default") or _model_config.get("model") or ""
+            _config_provider = _model_config.get("provider", "")
+        else:
+            _raw_default, _config_provider = (_model_config or ""), ""
+        _config_model, _ = _split_model_config_default(_raw_default)
     if not _config_model or _config_model == getattr(cli, "model", None):
         return
     try:
