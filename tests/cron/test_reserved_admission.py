@@ -63,6 +63,27 @@ def set_due(job, when):
     return result
 
 
+def test_general_release_cannot_clear_fresh_reservation_for_same_job(clock_home, monkeypatch):
+    job = make_job()
+    key = hermes_home_key(scheduler._get_hermes_home())
+    general_owner = object()
+    assert scheduler.try_register_running_job(job["id"], owner=general_owner)
+    original_submit = scheduler._submit_with_guard
+
+    def submit(item, pool, process_job, **kwargs):
+        # A newly selected reservation exists before its running registration. The
+        # prior overflow run can finish in that gap without owning the reservation.
+        scheduler.release_running_job(item["id"], owner=general_owner)
+        assert key in admission._reserved_claims
+        return original_submit(item, pool, process_job, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_submit_with_guard", submit)
+    future = admission.submit_reserved(job, lambda item: True)
+    assert future is not None
+    assert future.result(timeout=5) is True
+    assert key not in admission._reserved_claims
+
+
 def test_saturated_general_workers_start_protected_by_completion_deadline(clock_home, monkeypatch):
     """Run the real ticker, store, claims, executors and started_at ledger against a fake clock."""
     clock = clock_home
@@ -140,9 +161,9 @@ def test_second_protected_job_is_logged_and_uses_general_fifo(clock_home, monkey
     submissions = []
     original_submit = scheduler._submit_with_guard
 
-    def submit(item, pool, process_job):
+    def submit(item, pool, process_job, **kwargs):
         submissions.append(item["id"])
-        return original_submit(item, pool, process_job)
+        return original_submit(item, pool, process_job, **kwargs)
 
     monkeypatch.setattr(scheduler, "_submit_with_guard", submit)
 
@@ -505,9 +526,9 @@ def test_reselected_protected_job_uses_general_fifo_while_reserve_is_held(clock_
     starts, submissions = {}, []
     original_submit = scheduler._submit_with_guard
 
-    def submit(item, pool, process_job):
+    def submit(item, pool, process_job, **kwargs):
         submissions.append(item["id"])
-        return original_submit(item, pool, process_job)
+        return original_submit(item, pool, process_job, **kwargs)
 
     def run(item, **kwargs):
         starts[item["id"]] = threading.current_thread().name

@@ -13,7 +13,7 @@ Interval schedules of at most 120 seconds form the protected class, derived
 from schedule data rather than names, IDs, or job flags. Their completion-based
 next eligibility spends 30 seconds of headroom before the natural interval.
 An `every 1m` job therefore rearms 30 seconds after completion and runs more
-often than once per minute. Today only the `every 2m` inbox job qualifies.
+often than once per minute.
 All other schedules retain their existing rearm calculation.
 
 Each profile's existing FIFO general executor keeps `cron.max_parallel_jobs`

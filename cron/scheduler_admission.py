@@ -88,7 +88,7 @@ def submit_reserved(job: dict, process_job):
             _reserved_pools[key] = pool
         _reserved_claims[key] = (job["id"], token)
     try:
-        future = scheduler._submit_with_guard(job, pool, process_job)
+        future = scheduler._submit_with_guard(job, pool, process_job, registration_owner=token)
     except BaseException:
         _release_unsubmitted(key, token)
         raise
@@ -104,11 +104,11 @@ def _release_unsubmitted(key, token) -> None:
             _reserved_claims.pop(key)
 
 
-def worker_released(inflight_key: tuple, *, wake: bool = True) -> None:
+def worker_released(inflight_key: tuple, owner, *, wake: bool = True) -> None:
     """Called only AFTER the running claim passes the detached-process exit fence."""
     with _lock:
         claim = _reserved_claims.get(inflight_key[0])
-        if claim is not None and claim[0] == inflight_key[1]:
+        if claim is not None and claim[0] == inflight_key[1] and claim[1] is owner:
             _reserved_claims.pop(inflight_key[0])
     # Failed dispatches return their claim too, but have freed no worker capacity.
     if wake:

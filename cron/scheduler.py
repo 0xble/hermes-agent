@@ -907,7 +907,7 @@ def release_running_job(
 
 def _drop_running_claim(key, *, wake: bool = True) -> None:
     """Drop a fenced claim under ``_running_lock`` and return its admission slot."""
-    _running_registration_owners.pop(key, None)
+    owner = _running_registration_owners.pop(key, None)
     _running_job_ids.discard(key)
     _running_since.pop(key, None)
     _running_allowance_s.pop(key, None)
@@ -921,7 +921,7 @@ def _drop_running_claim(key, *, wake: bool = True) -> None:
     _restart_safe_waiter_job_ids.discard(key)
     _restart_safe_external_worker_job_ids.discard(key)
     from cron.scheduler_admission import worker_released
-    worker_released(key, wake=wake)
+    worker_released(key, owner, wake=wake)
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -4674,7 +4674,9 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
-def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job):
+def _submit_with_guard(
+    job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job, *, registration_owner=None,
+):
     """Submit with the in-flight dedup guard; None if a prior tick's run is still in flight.
     Running-set membership is released in the worker's finally."""
     job_id = job["id"]
@@ -4719,7 +4721,8 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         _not_dispatched_shutdown()
         _clear_run_claim_best_effort()
         return None
-    registration_owner = object()
+    if registration_owner is None:
+        registration_owner = object()
     if not try_register_running_job(job_id, owner=registration_owner):
         logger.info("Job '%s' already running — skipping", job_label)
         try:
