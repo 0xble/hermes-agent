@@ -707,8 +707,8 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[l
                 max_tool_calls=max_tool_calls, reset=bool(reset),
                 idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
             )
-        except Exception:
-            logger.warning("remote session-kernel path failed; falling back to per-call", exc_info=True)
+        except Exception:  # health: allow BLE001 -- spawn-only fail-open must not log credentials from transport exceptions.
+            logger.warning("remote session-kernel path failed; falling back to per-call (details omitted)")
             kernel_result = None
         if kernel_result is not None:
             return _finish_remote_kernel_result(kernel_result, timeout=timeout, exec_start=exec_start)
@@ -829,12 +829,12 @@ def _kill_process_group(proc, escalate: bool = False):
         try:
             from agent.deadline import kill_process_tree
             kill_process_tree(proc.pid, sig=sig)
-        except Exception as e:
-            logger.debug("Could not terminate process tree: %s", e, exc_info=True)
+        except Exception:  # health: allow BLE001 -- cleanup must fall back without exposing subprocess arguments in exception text.
+            logger.debug("Could not terminate process tree (details omitted)")
             try:
                 proc.kill()
-            except Exception as e2:
-                logger.debug("Could not kill process: %s", e2, exc_info=True)
+            except Exception:  # health: allow BLE001 -- best-effort cleanup must not log process/transport secrets from kill errors.
+                logger.debug("Could not kill process (details omitted)")
     _tree_signal(getattr(_signal, "SIGTERM", None))
     if escalate:
         try:
