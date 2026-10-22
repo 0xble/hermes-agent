@@ -22,6 +22,7 @@ from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pi
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
+from hermes_state_keys import profile_from_session_key_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -569,7 +570,8 @@ class SessionEntry:
     prompt_pin: Optional[dict[str, Any]] = None
     # Gateway ``/yolo`` bypass for this lane, mirrored from ``tools.approval``'s in-memory set so a restart
     # keeps it; cleared with it at every conversation boundary (``_clear_session_boundary_security_state``).
-    yolo: bool = False
+    # None means no explicit toggle; True/False are explicit ON/OFF choices.
+    yolo: Optional[bool] = None
     # When a resumed successor is interrupted before its predecessor preview can be re-keyed,
     # retain the predecessor token so recovery can adopt only that exact chained row. Appended to
     # preserve older positional SessionEntry construction.
@@ -610,6 +612,8 @@ class SessionEntry:
             "chat_type": self.chat_type, "metadata": self.metadata,
         }
         result.update((name, getattr(self, name)) for name in self._PLAIN_FIELDS)
+        # Preserve legacy readers' boolean view while the tri-state value is authoritative.
+        result["yolo"], result["yolo_toggle"] = self.yolo is True, self.yolo
         if self.restart_notes:
             result["restart_notes"] = [
                 {
@@ -678,6 +682,11 @@ class SessionEntry:
         defaults = {f.name: f.default for f in fields(cls)}
         plain = {n: data.get(n, defaults[n]) for n in cls._PLAIN_FIELDS + cls._RESET_FIELDS}
         plain["expiry_finalized"] = data.get("expiry_finalized", data.get("memory_flushed", False))
+        # Legacy rows stored bare yolo=False for both "off" and "never toggled"; only True
+        # is an explicit old toggle. New rows use yolo_toggle as the authoritative tri-state.
+        plain["yolo"] = data["yolo_toggle"] if "yolo_toggle" in data else (
+            True if data.get("yolo") is True else None
+        )
         raw_notes = plain.get("restart_notes") or []
         if not isinstance(raw_notes, list):
             raw_notes = []
@@ -773,14 +782,6 @@ def _session_key_namespace(profile: Optional[str]) -> str:
     if not profile or profile == "default":
         return "agent:main"
     return "agent:main~" if profile == "main" else f"agent:{profile}"
-
-
-def profile_from_session_key_namespace(namespace: str) -> str:
-    """Inverse of :func:`_session_key_namespace` for the ``<ns>`` slot of a key: ``"default"`` for
-    ``main``, ``"main"`` for the marked ``main~``, else the slot is the profile id."""
-    if namespace == "main":
-        return "default"
-    return "main" if namespace == "main~" else namespace
 
 
 def _canonical_participant(source: SessionSource) -> Optional[str]:
@@ -1383,6 +1384,9 @@ class SessionStore(
                 return None
             now = _now()
             session_id = _new_session_id(now)
+            if old_entry.origin and old_entry.origin.platform == Platform.LOCAL:
+                from gateway.session_local_recovery import reset_local_session
+                return reset_local_session(self, old_entry, session_id, now, display_name)
             new_entry = self._replace_route_locked(
                 session_key, old_entry, session_id, now,
                 display_name=display_name if display_name is not None else old_entry.display_name,
@@ -1553,8 +1557,9 @@ class SessionStore(
             entries = list(self._entries.values())
         if active_minutes is not None:
             cutoff = _now() - timedelta(minutes=active_minutes)
-            entries = [e for e in entries if e.updated_at >= cutoff]
-        entries.sort(key=lambda e: e.updated_at, reverse=True)
+            entries = [e for e in entries if e.updated_at.timestamp() >= cutoff.timestamp()]
+        # Legacy local timestamps and canonical UTC timestamps can coexist after recovery.
+        entries.sort(key=lambda e: e.updated_at.timestamp(), reverse=True)
         return entries
 
     def lookup_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
@@ -1597,5 +1602,6 @@ def build_session_context(
     if session_entry:
         context.session_key = session_entry.session_key
         context.session_id = session_entry.session_id
-        context.created_at, context.updated_at = session_entry.created_at, session_entry.updated_at
+        context.created_at = getattr(session_entry, "created_at", None)
+        context.updated_at = getattr(session_entry, "updated_at", None)
     return context

@@ -412,7 +412,6 @@ def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a
     ``slot="b"`` renders the zero-cut standby job: the ``.b`` label plus ``HERMES_GATEWAY_SLOT=b``;
     the default active slot is byte-identical to the historical output.
     """
-    from html import escape
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
     working_dir = str(_gw().get_hermes_home() / "current") if release_target else _gw()._stable_service_working_dir()
     hermes_home = str(_gw().get_hermes_home().resolve())
@@ -1034,28 +1033,12 @@ def wait_for_launchd_gateway_supervision(
         return True
 
     label = label or _gw().get_launchd_label()
-    # ``timeout`` measures launchd's respawn, so it starts once the old process is gone. Until then
-    # the old gateway is still draining, which is bounded by its own restart budget, not by ours:
-    # a busy gateway's graceful shutdown alone can outlast ``timeout`` (a 33s drain failed a 20s
-    # window although launchd respawned it at once).
-    now = time.monotonic()
-    shutdown_deadline = None
-    if old_pid is not None:
-        if shutdown_timeout is None:
-            shutdown_timeout = _gw()._get_restart_exit_wait_budget() + LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S
-        shutdown_deadline = now + max(shutdown_timeout, 0.0)
-    deadline = now + max(timeout, 0.0)
+    deadline = time.monotonic() + max(timeout, 0.0)
     while True:
         pid = _gw()._launchctl_supervised_pid(label)
         if pid is not None and pid != old_pid:
             return True
-        now = time.monotonic()
-        if shutdown_deadline is not None:
-            if pid == old_pid and now < shutdown_deadline:
-                deadline = now + max(timeout, 0.0)  # old gateway still exiting: respawn clock not started
-            else:
-                shutdown_deadline = None  # old pid gone (or out of budget): the respawn clock runs
-        if now >= deadline:
+        if time.monotonic() >= deadline:
             return False
         time.sleep(max(poll_interval, 0.01))
 

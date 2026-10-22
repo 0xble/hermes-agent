@@ -115,6 +115,23 @@ class LocalEditSnapshot:
 _tool_preview_max_len: int = 0  # 0 = unlimited
 _friendly_tool_labels: bool = True
 
+_JSON_ESCAPE_RE = re.compile(r"\\(.)")
+
+
+def verbose_tool_args_text(args: dict, max_len: int, code_block: bool) -> str:
+    """Verbose tool-progress args: compact JSON (capped at ``max_len``; 0 = no cap). On markdown
+    platforms it goes in a code block so the formatter keeps it verbatim (``**x**``/``a_b`` are
+    otherwise rendered as markup), with JSON's ``\\n``/``\\t`` shown as real line breaks. Args
+    holding ``` stay plain: Slack and Discord end a code block at any ``` inside it."""
+    import json
+    text = json.dumps(args, ensure_ascii=False, default=str)
+    if max_len > 0 and len(text) > max_len:
+        text = text[:max_len - 3] + "..."
+    if not code_block or "```" in text:
+        return text
+    decoded = _JSON_ESCAPE_RE.sub(lambda m: {"n": "\n", "t": "\t"}.get(m.group(1), m.group(0)), text)
+    return f"```\n{decoded}\n```"
+
 
 def set_tool_preview_max_len(n: int) -> None:
     """Set the global max length for tool call previews. 0 = no limit."""
@@ -288,7 +305,7 @@ def _is_hermes_state_db_command(command: str) -> bool:
         return False
     if any(_shell_head_word(segment) == "sqlite3" for segment in _split_shell_compound(original)):
         return True
-    return bool(_SQLITE_STATE_RE.search(original) and re.search(r"(?:sqlite3|SessionDB|mode=ro|mode=rw|connect)", original, re.I))
+    return bool(_SQLITE_STATE_RE.search(original) and re.search(r"(?:sqlite3|SessionDB|mode=ro|mode=rw|connect)", original, re.IGNORECASE))
 
 
 def summarize_shell_command(command: str) -> str:
@@ -590,7 +607,7 @@ def progress_tool_label(tool_name: str, default: str = "⚡") -> tuple[str, str]
         try:
             from tools.tool_labels import label_for_tool_name
             label = label_for_tool_name(tool_name)
-        except Exception as exc:  # noqa: BLE001 — display must never abort a turn
+        except Exception as exc:
             logger.debug("progress label failed for %s: %s", tool_name, exc)
             label = None
         if label is not None and label.kind in ("mcp", "connector"):

@@ -25,14 +25,12 @@ import subprocess
 import pytest
 
 import hermes_cli.gateway as gateway_cli
-from gateway.restart import LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S
 from hermes_cli import update_cmd
 
 LABEL = "ai.hermes.gateway"
 
 # Captured at import so a test can re-install the real verifier over a fixture's stub.
 _REAL_WAIT_FOR_SUPERVISION = gateway_cli.wait_for_launchd_gateway_supervision
-_REAL_LAUNCHCTL_SUPERVISED_PID = gateway_cli._launchctl_supervised_pid
 
 class _FakeClock:
     """Monotonic clock that only advances when the code under test sleeps.
@@ -148,45 +146,6 @@ class TestWaitForLaunchdGatewaySupervision:
         assert gateway_cli.wait_for_launchd_gateway_supervision(label=LABEL) is True
         assert probe.calls == []
 
-    def test_slow_graceful_shutdown_does_not_consume_the_respawn_window(self, monkeypatch, clock):
-        """A busy gateway's drain can outlast the respawn window by itself.
-
-        Field timeline: the old gateway (pid 61224) took 32.7s to drain 4 agents, 6 tool subprocesses
-        and 3 delegations; launchd respawned pid 740 the moment it exited. A window measured from the
-        restart request reported that healthy restart as "launchd is not supervising a new process".
-        """
-        old, new = 61224, 740
-        # 0.5s polls: ~33s of the old pid still draining, a 2s pid-less gap, then the replacement.
-        probe = _supervision_returning(*([old] * 66 + [False] * 4 + [new]))
-        monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", probe)
-
-        assert gateway_cli.wait_for_launchd_gateway_supervision(
-            label=LABEL, old_pid=old, timeout=20.0, shutdown_timeout=120.0
-        ) is True
-
-    def test_respawn_window_still_bounds_a_job_that_never_comes_back(self, monkeypatch, clock):
-        """Once the old pid is gone, the unchanged respawn window applies: a helper that dies before
-        its bootstrap (#88848) still fails in ``timeout``, not after the shutdown budget."""
-        old = 61224
-        probe = _supervision_returning(*([old] * 10 + [False]))
-        monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", probe)
-
-        assert gateway_cli.wait_for_launchd_gateway_supervision(
-            label=LABEL, old_pid=old, timeout=20.0, shutdown_timeout=120.0
-        ) is False
-        assert sum(clock.slept) == pytest.approx(5.0 + 20.0, abs=0.6)
-
-    def test_old_pid_that_never_exits_fails_after_the_shutdown_budget(self, monkeypatch, clock):
-        """A restart that never happened is still a failure, bounded by shutdown budget + window."""
-        old = 61224
-        probe = _supervision_returning(old)
-        monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", probe)
-
-        assert gateway_cli.wait_for_launchd_gateway_supervision(
-            label=LABEL, old_pid=old, timeout=20.0, shutdown_timeout=60.0
-        ) is False
-        assert sum(clock.slept) == pytest.approx(60.0 + 20.0, abs=0.6)
-
 def _patch_launchd_env(
     monkeypatch,
     *,
@@ -194,7 +153,6 @@ def _patch_launchd_env(
     registered=True,
     restart=None,
     supervised=True,
-    ancestor=False,
 ):
     """Drive ``_restart_macos_launchd_gateways`` through the invoking profile only.
 
@@ -215,11 +173,10 @@ def _patch_launchd_env(
     monkeypatch.setattr(
         gateway_cli, "launchd_gateway_labels_for_install", lambda: [LABEL]
     )
-    # Hermetic supervision and ancestry: the host's real LaunchAgent pid is an ancestor of pytest
-    # when the suite runs under the gateway, which takes the in-gateway self-restart branch.
-    monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", lambda label: 4242)
+    # The gateway under test is never this updater's ancestor; a real ancestry walk would make it one
+    # whenever a fake pid (4242) happens to be a live ancestor of the worker on the host.
     monkeypatch.setattr(
-        gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: ancestor
+        gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: False
     )
 
     calls = {"restart": 0, "verify": 0, "label": None}
@@ -305,14 +262,11 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         the seam is plain Python, so the fake pins the behaviour on any host.
         """
         calls = _patch_launchd_env(monkeypatch, supervised=True)
-        # ...but exercise the REAL verifier and pid probe, not _patch_launchd_env's stubs.
+        # ...but exercise the REAL verifier, not _patch_launchd_env's stub.
         monkeypatch.setattr(
             gateway_cli,
             "wait_for_launchd_gateway_supervision",
             _REAL_WAIT_FOR_SUPERVISION,
-        )
-        monkeypatch.setattr(
-            gateway_cli, "_launchctl_supervised_pid", _REAL_LAUNCHCTL_SUPERVISED_PID
         )
         listings = []
 
@@ -329,28 +283,9 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         assert restarted == []
         assert failed_or_stale == [LABEL]
         assert LABEL in capsys.readouterr().out
-        # One pre-restart snapshot, then the bounded poll for a different pid. The old pid never goes
-        # away, so the wait is bounded by the shutdown budget plus the respawn window, not unbounded.
+        # One pre-restart snapshot, then the bounded poll for a different pid.
         assert len(listings) > 1
-        assert sum(clock.slept) <= (
-            gateway_cli._get_restart_exit_wait_budget()
-            + LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S
-            + gateway_cli.LAUNCHD_SUPERVISION_VERIFY_TIMEOUT
-            + 1.0
-        )
-
-    def test_restart_handed_to_the_enclosing_gateway_skips_verification(
-        self, monkeypatch
-    ):
-        """An update running inside the gateway it restarts cannot see a fresh pid before it exits."""
-        calls = _patch_launchd_env(monkeypatch, supervised=False, ancestor=True)
-
-        restarted, failed_or_stale = _run_fleet_restart()
-
-        assert calls["restart"] == 1
-        assert calls["verify"] == 0
-        assert restarted == [LABEL]
-        assert failed_or_stale == []
+        assert sum(clock.slept) <= gateway_cli.LAUNCHD_SUPERVISION_VERIFY_TIMEOUT
 
     def test_verification_budget_clears_the_respawn_throttle(self):
         """A budget under launchd's ~10s respawn throttle would false-alarm.

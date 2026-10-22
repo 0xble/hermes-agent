@@ -479,18 +479,24 @@ def test_exhaustion_is_rechecked_after_acquiring_repair_lock(tmp_path, monkeypat
     """A queued repairer must not start surgery on a newly exhausted ledger."""
     db = tmp_path / "state.db"
     _make_repair_test_db(db)
-    exhaustion_checks = []
+    for _ in range(hermes_state_repair._MAX_PERSISTENT_REPAIR_ATTEMPTS - 1):
+        hermes_state_repair._record_repair_outcome(db, repaired=False)
+    assert not hermes_state_repair._persistent_repair_attempts_exhausted(db)
+    original_bytes = db.read_bytes()
+    real_lock = hermes_state_repair._cross_process_repair_lock
 
-    def exhaustion_probe(_db_path):
-        exhaustion_checks.append(True)
-        # The first caller's pre-lock view is stale; the queued view is
-        # terminal because another repairer just recorded the final failure.
-        return len(exhaustion_checks) >= 2
+    @contextlib.contextmanager
+    def lock_after_final_failure(path):
+        with real_lock(path) as acquired:
+            assert acquired
+            # A prior repairer can exhaust the persisted budget while this caller queues.
+            hermes_state_repair._record_repair_outcome(path, repaired=False)
+            assert hermes_state_repair._persistent_repair_attempts_exhausted(path)
+            yield acquired
 
     monkeypatch.setattr(
-        hermes_state_repair, "_persistent_repair_attempts_exhausted", exhaustion_probe
+        hermes_state_repair, "_cross_process_repair_lock", lock_after_final_failure
     )
-    monkeypatch.setattr(hermes_state_repair, "_live_writer_holds_db", lambda _path: False)
     surgery_calls = []
 
     def unexpected_surgery(_db_path, *, backup, report):
@@ -501,12 +507,13 @@ def test_exhaustion_is_rechecked_after_acquiring_repair_lock(tmp_path, monkeypat
         hermes_state_repair, "_repair_state_db_schema_locked", unexpected_surgery
     )
 
-    report = repair_state_db_schema(db, backup=False)
+    report = repair_state_db_schema(db, backup=True)
 
     assert report["repaired"] is False
     assert "automatic repair has already failed" in report["error"]
-    assert len(exhaustion_checks) == 2
     assert surgery_calls == [], "surgery ran despite the under-lock exhaustion recheck"
+    assert db.read_bytes() == original_bytes
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
 
 
 def test_scratch_budget_counts_sidecars_in_vacuum_multiplier(tmp_path, monkeypatch):

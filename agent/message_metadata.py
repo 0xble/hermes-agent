@@ -18,6 +18,7 @@ from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_
 # Transcript-repair bookkeeping riding on batch rows / live dicts (agent/transcript_repair.py): the
 # stored-row CAS digest and the durable row adopted onto the live dict. Never transcript payload.
 DB_ROW_SNAPSHOT = "_db_row_snapshot"
+REPLAY_PERSISTED_CONTENT = "_replay_persisted_content"
 CANONICAL_ROW = "_canonical_row"
 REPAIR_BOOKKEEPING_FIELDS = frozenset({DB_ROW_SNAPSHOT, CANONICAL_ROW})
 # Unanswered text a merged user row held before the current turn was absorbed
@@ -50,7 +51,7 @@ PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset(
      "effect_disposition", "_compressed_summary", REPLAY_PERSISTED_CONTENT, "_row_id", "_submit_row_session_id",
      MERGED_TURN_PREFIX, MESSAGE_UID, ABSORBED_MESSAGE_UIDS, TOOL_CALL_UIDS, TOOL_CALL_UID,
      # The alternation repair's row counts: an in-place compaction reads them off the live dict.
-     MERGED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS, RETIRED_DURABLE_ROWS}
+     MERGED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, REPLAY_PERSISTED_CONTENT}
 ) | REPAIR_BOOKKEEPING_FIELDS
 
 
@@ -95,6 +96,32 @@ def stamp_message_uid(msg: MutableMapping[str, Any]) -> str:
     if uid is None:
         uid = msg[MESSAGE_UID] = mint_uid()
     return uid
+
+
+# Producer-owned provenance for the compressor's standalone in-flight-task restatement. It rides in
+# display_metadata (persisted by SessionDB, popped from every wire copy) so gateway replay can send the
+# row unstamped, as the compaction turn did; a human pasting the header text carries no flag.
+INFLIGHT_TASK_RESTATEMENT = "compaction_inflight_task_restatement"
+
+
+def mark_inflight_restatement(msg: MutableMapping[str, Any]) -> None:
+    metadata = msg.get("display_metadata")
+    msg["display_metadata"] = {**(metadata if isinstance(metadata, dict) else {}), INFLIGHT_TASK_RESTATEMENT: True}
+
+
+def scaffolding_replay_fields(msg: Mapping[str, Any]) -> dict:
+    """The compaction-provenance fields replay keeps (summary flag, restatement flag), else ``{}``. A proactive
+    prune re-persists the replayed view, so a dropped flag would get the row stamped on the next replay."""
+    metadata = msg.get("display_metadata")
+    fields: dict = {"_compressed_summary": True} if msg.get("_compressed_summary") else {}
+    if isinstance(metadata, dict) and metadata.get(INFLIGHT_TASK_RESTATEMENT):
+        fields["display_metadata"] = {INFLIGHT_TASK_RESTATEMENT: True}
+    return fields
+
+
+def is_compaction_scaffolding(msg: Mapping[str, Any]) -> bool:
+    """Compaction sent its summary and restatement rows unstamped; a replay stamp would break the cached prefix."""
+    return bool(scaffolding_replay_fields(msg))
 
 
 _IDENTITY_FIELD_TYPES = ((MESSAGE_UID, str), (ABSORBED_MESSAGE_UIDS, list), (TOOL_CALL_UIDS, dict), (TOOL_CALL_UID, str))

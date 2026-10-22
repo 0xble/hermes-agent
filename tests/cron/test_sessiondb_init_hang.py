@@ -25,6 +25,8 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cron.scheduler import run_job
 
 # Hold the real class: patching cron.scheduler.concurrent.futures.ThreadPoolExecutor
@@ -37,6 +39,20 @@ _RUNTIME = {
     "provider": "openrouter",
     "api_mode": "chat_completions",
 }
+
+
+def _run_owned_job(job, home, db, *, execution_id=None, **kwargs):
+    """Exercise run_job under the production owner-execution binding, not its RPC client."""
+    from types import SimpleNamespace
+    from gateway import session_cron
+
+    db.db_path = home / "state.db"
+    token = session_cron.bind_execution(
+        SimpleNamespace(db=db), "canonical-cron-session", job["id"], execution_id)
+    try:
+        return run_job(job, execution_id=execution_id, **kwargs)
+    finally:
+        session_cron._execution.reset(token)
 
 
 def _session_db_executor(timeouts: list, *, instant_timeout: bool = True):
@@ -112,7 +128,7 @@ class TestSessionDbInitTimeout:
                 mock_agent.run_conversation.return_value = {"final_response": "ok"}
                 mock_agent_cls.return_value = mock_agent
 
-                success, _output, final_response, error = run_job(job)
+                success, _output, final_response, error = _run_owned_job(job, profile_home, fake_db)
         finally:
             reset_hermes_home_override(profile_token)
 
@@ -131,7 +147,7 @@ class TestSessionDbInitTimeout:
              patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state_registry.acquire"), \
+             patch("hermes_state_registry.acquire") as acquire_store, \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value=_RUNTIME,
@@ -145,7 +161,7 @@ class TestSessionDbInitTimeout:
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            success, _output, final_response, error = run_job(job)
+            success, _output, final_response, error = _run_owned_job(job, tmp_path, acquire_store.return_value)
 
         # Env-resolved bound was passed to Future.result — not the 10s default,
         # and not an unbounded call.
@@ -173,7 +189,7 @@ class TestSessionDbInitTimeout:
              patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state_registry.acquire"), \
+             patch("hermes_state_registry.acquire") as acquire_store, \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value=_RUNTIME,
@@ -187,7 +203,7 @@ class TestSessionDbInitTimeout:
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            success, _output, _final_response, error = run_job(job)
+            success, _output, _final_response, error = _run_owned_job(job, tmp_path, acquire_store.return_value)
         assert timeouts == [0.2] * 3
         assert success is False
         assert "session store unavailable; run not started" in error
@@ -216,13 +232,19 @@ class TestDispatchGuardReleasedAfterHang:
             "deliver": "local",
         }
         timeouts: list = []
+        owner_db = MagicMock()
+
+        def admitted(fired, **kwargs):
+            return _run_owned_job(fired, tmp_path, owner_db, **kwargs)
 
         try:
             with patch("cron.scheduler._hermes_home", tmp_path), \
                  patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state_registry.acquire"), \
+                 patch("hermes_state_registry.acquire", return_value=owner_db), \
+                 patch("cron.scheduler_authority.run_canonical_job", side_effect=admitted), \
+                 patch("cron.scheduler_authority.reconcile_pending"), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value=_RUNTIME,
@@ -269,56 +291,53 @@ class TestLateSessionDbClosedAfterTimeout:
     abandoned worker, the orphaned result must be closed (#72782)."""
 
     def test_late_session_db_result_is_closed(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.2")
-        never_set = threading.Event()
-        late_db_holder = []  # captures the SessionDB returned by the late init
+        """Each timed-out borrow is returned, without closing the owner's live store."""
+        import hermes_state_registry as registry
 
-        def _hanging_then_capture():
-            never_set.wait(timeout=30)
-            db = MagicMock()
+        monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.02")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        release = threading.Event()
+        late_db_holder = []
+        owner_db = registry.acquire(tmp_path / "state.db")
+        real_acquire = registry.acquire
+        refs_before = registry.stats()["total_refcounts"]
+
+        def hanging_borrow(path):
+            assert release.wait(timeout=10)
+            db = real_acquire(path)
             late_db_holder.append(db)
             return db
 
         job = {"id": "late-close-test", "name": "test", "prompt": "hello"}
-
         try:
             with patch("cron.scheduler._hermes_home", tmp_path), \
                  patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state_registry.acquire", side_effect=_hanging_then_capture), \
-                 patch(
-                     "hermes_cli.runtime_provider.resolve_runtime_provider",
-                     return_value={
-                         "api_key": "test-key",
-                         "base_url": "https://example.invalid/v1",
-                         "provider": "openrouter",
-                         "api_mode": "chat_completions",
-                     },
-                 ), \
-                 patch("run_agent.AIAgent") as mock_agent_cls:
-                mock_agent = MagicMock()
-                mock_agent.run_conversation.return_value = {"final_response": "ok"}
-                mock_agent_cls.return_value = mock_agent
-
-                success, _output, _final_response, _error = run_job(job)
-                # run_job returned promptly without constructing a sessionless agent.
-                assert success is False
-                mock_agent_cls.assert_not_called()
-
-                # Release the hanging init so the abandoned worker completes.
-                never_set.set()
-                # Wait for the done-callback to fire and close the late result.
-                for _ in range(50):
-                    if len(late_db_holder) == 3 and all(db.close.called for db in late_db_holder):
-                        break
-                    time.sleep(0.1)
+                 patch("hermes_state_registry.acquire", side_effect=hanging_borrow), \
+                 patch("hermes_state_registry.release_or_close", wraps=registry.release_or_close) as returned, \
+                 patch("run_agent.AIAgent") as agent_cls:
+                success, _, response, error = _run_owned_job(job, tmp_path, owner_db)
+                assert not success and response == ""
+                assert "session store unavailable; run not started" in error
+                agent_cls.assert_not_called()
+                assert late_db_holder == []
+                release.set()
+                from tests.waiting import wait_until
+                wait_until(
+                    lambda: returned.call_count == 3 and registry.stats()["total_refcounts"] == refs_before,
+                    timeout=5, what="timed-out store borrows to return",
+                )
+                assert len(late_db_holder) == 3
+                assert all(db is owner_db for db in late_db_holder)
+                assert returned.call_count == 3
+                assert all(call.args == (owner_db,) for call in returned.call_args_list)
+                assert registry.stats()["total_refcounts"] == refs_before
+                owner_db.create_session("owner-still-open", source="cron")
+                assert owner_db.get_session("owner-still-open") is not None
         finally:
-            never_set.set()
-
-        assert len(late_db_holder) == 3
-        for db in late_db_holder:
-            db.close.assert_called_once()
+            release.set()
+            registry.release(owner_db)
 
 
 # ===========================================================================
@@ -347,9 +366,39 @@ class TestSessionDbEarlyReturnCleanup:
                  return_value=(True, '{"wakeAgent": false}'),
              ), \
              patch("run_agent.AIAgent") as mock_agent_cls:
-            success, _output, _final_response, _error = run_job(job)
+            success, _output, _final_response, _error = _run_owned_job(job, tmp_path, mock_db_cls.return_value)
 
         assert success is True
         mock_db_cls.assert_called_once()
         mock_db_cls.return_value.close.assert_called_once()
         mock_agent_cls.assert_not_called()
+
+
+
+@pytest.mark.parametrize("wrong_store", [False, True], ids=["unavailable", "noncanonical"])
+def test_owner_store_failure_never_runs_unpersisted_agent(tmp_path, monkeypatch, wrong_store):
+    """An acquisition failure stops before constructing an unpersisted agent."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    owner_db = MagicMock()
+    other_db = MagicMock()
+    job = {"id": "owner-db", "name": "test", "prompt": "hello"}
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch("hermes_state_registry.acquire", return_value=other_db,
+               side_effect=None if wrong_store else OSError("store unavailable")) as acquire_store, \
+         patch(
+             "hermes_cli.runtime_provider.resolve_runtime_provider",
+             return_value=_RUNTIME,
+         ), \
+         patch("run_agent.AIAgent") as mock_agent_cls:
+        success, _output, response, error = _run_owned_job(job, tmp_path, owner_db)
+
+    assert success is False
+    assert response == ""
+    assert error and "store unavailable" in error
+    mock_agent_cls.assert_not_called()
+    assert acquire_store.call_count == 3
+    owner_db.close.assert_not_called()
+    assert other_db.close.call_count == (3 if wrong_store else 0)

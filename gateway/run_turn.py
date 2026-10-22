@@ -19,7 +19,7 @@ import threading
 import time
 from agent.i18n import t
 from agent.error_classifier import is_context_overflow_reason
-from agent.session_activity import format_iteration_progress
+from agent.session_activity import AwakeIdleMeter, format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
@@ -32,7 +32,7 @@ from gateway.session_context import bound_turn_origin, set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.response_filters import (
-    display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    display_kind_for_event, display_metadata_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
     strip_edge_silence_markers,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
@@ -47,7 +47,7 @@ from gateway.attended_model import (
     is_active, parse_attended_config, resolve_attended_model,
 )
 from gateway.session_transcript import TranscriptReadError
-from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
+from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
@@ -165,12 +165,22 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
 
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
-        user_config: Optional[dict] = None, assignment=None,
+        user_config: Optional[dict] = None, fallback: bool = True, assignment=None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
-        Priority (highest first): session ``/model`` → ``channel_overrides`` → global config/env
-        (``_resolve_gateway_model(user_config)`` and default provider resolution)."""
+        Priority (highest first): launch policy → session ``/model`` → ``channel_overrides`` → global
+        config/env (``_resolve_gateway_model(user_config)`` and default provider resolution).
+        ``fallback=False`` keeps a launch-policy session on its own route (see
+        ``_resolve_policy_agent_runtime``)."""
+        from gateway.session_policy import policy_for_source
+        self._pre_agent_fallback_notice = None
+        policy = policy_for_source(self, source) if source is not None else None
+        if policy is not None:
+            from gateway.run_turn_prepare import _resolve_policy_agent_runtime
+            return _resolve_policy_agent_runtime(
+                self, policy, fallback=fallback,
+                session_key=self._resolve_session_key_or_none(source, session_key))
         skey = self._resolve_session_key_or_none(source, session_key)
         self._last_attended_decision = None
         self._pre_agent_fallback_notice = None
@@ -805,25 +815,22 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         user_config: Optional[dict] = None,
     ) -> tuple[str, dict]:
         """Off-loop reads/credentials, on-loop snapshots and compare-and-set commits."""
+        from gateway.session_policy import policy_for_source
+        policy = policy_for_source(self, source) if source is not None else None
+        if policy is not None:
+            # A launch-policy session runs its frozen route; resolution may read credentials.
+            return await asyncio.to_thread(
+                self._resolve_session_agent_runtime, source=source, session_key=session_key, user_config=user_config)
         skey = self._resolve_session_key_or_none(source, session_key)
         self._pre_agent_fallback_notice = None
         activity_stamp = _NO_ATTENDED_ACTIVITY_STAMP
         attended_snapshot = {}
         if skey:
+            await self._rehydrate_session_model_selection_async(skey)
             state = self._session_state(skey)
-            async with self._session_model_override_lock(skey):
-                if state.conversation.model_role is None:
-                    # Serialize hydration with edits, just like concrete route hydration.
-                    state.conversation.model_role = await asyncio.to_thread(
-                        self.session_store.get_model_role, skey)
             attended_enabled = parse_attended_config(user_config or {}).enabled
             if attended_enabled:
                 state.conversation.pre_agent_fallback_notice = None
-            async with self._session_model_override_lock(skey):
-                if self._session_model_override(skey) is None:
-                    epoch = self._session_model_override_epoch(skey)
-                    hydrated = await asyncio.to_thread(self._load_session_model_override, skey)
-                    self._commit_session_model_override(skey, hydrated, epoch)
             if attended_enabled:
                 current_override = self._session_model_override(skey) or {}
                 attended_cfg = parse_attended_config(user_config or {})
@@ -2546,26 +2553,23 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             )
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
             logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
+            from gateway.session_automation import move_route_wakes, reset_and_rehome_messages
             async with self._session_model_override_lock(session_key):
-                new_entry = await self.async_session_store.reset_session(session_key)
-                self._evict_cached_agent(session_key)
-                # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
-                await self._clear_conversation_scope_locked_async(session_key, reason="compression_exhausted_reset")
-            if new_entry is not None:
-                # Re-point the Telegram topic binding at the fresh session, or the binding-heal walk
-                # switches the next message back onto the bloated child and re-triggers exhaustion
-                # forever. No-op on non-topic lanes.
-                # Compression rotated session_entry.session_id to the oversized compressed child earlier
-                # this turn (the agent-result sync above), and that _sync also rewrote the (chat_id,
-                # thread_id) -> bloated-child binding. reset_session swaps in a clean, parentless session,
-                # but without re-syncing the binding the next inbound message in this topic gets
-                # switch_session'd back onto the bloated child by the binding-heal walk, reloads the
-                # oversized transcript, and re-triggers compression exhaustion forever (#35809 — regression
-                # of the #9893/#10063 auto-reset).
-                session_entry = new_entry
-                await asyncio.to_thread(
-                    self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
-                )
+                new_entry, release_fresh = await reset_and_rehome_messages(self, session_key, session_entry.session_id)
+                try:
+                    await move_route_wakes(self, session_key, session_entry.session_id)
+                    self._evict_cached_agent(session_key)
+                    queued = list(self._overflow_queue(session_key) or ())
+                    await self._clear_conversation_scope_locked_async(session_key, reason="compression_exhausted_reset")
+                    if queued:
+                        self._session_state(session_key).conversation.queued_events.extend(queued)
+                    if new_entry is not None:
+                        session_entry = new_entry
+                        await asyncio.to_thread(
+                            self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
+                        )
+                finally:
+                    release_fresh()
             response = (response or "") + t("gateway.session.auto_reset_context_exhausted")
         return response, session_entry
 
@@ -2586,8 +2590,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         }
         if prepared.persist_user_display_kind:
             _user_entry["display_kind"] = prepared.persist_user_display_kind
-        if prepared.persistence_owner:
-            _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner}
+        display_metadata = {**({"gateway_input_owner": prepared.persistence_owner} if prepared.persistence_owner else {}),
+                            **display_metadata_for_event(event)}
+        if display_metadata:
+            _user_entry["display_metadata"] = display_metadata
         if getattr(event, "message_id", None):
             _user_entry["message_id"] = str(event.message_id)
         elif getattr(event, "_hermes_recovery_id", None):
@@ -2687,9 +2693,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if is_context_overflow_failure:
             pass  # Skip all transcript writes — don't grow a broken session
         else:
-            if not history:
+            if not history and source.platform != Platform.LOCAL:
                 # Fresh session: the tool definitions (as sent in the API request) make the transcript
-                # self-describing.
+                # self-describing. A LOCAL route (one-shot, chat -q, ACP, TUI attach) keeps the classic
+                # in-process CLI's transcript shape: the marker is gateway bookkeeping every local
+                # reader filters out, and the session row already carries model/model_config.
                 await store.append_to_transcript(sid, {
                     "role": "session_meta",
                     "tools": agent_result.get("tools", []) or [],
@@ -2909,7 +2917,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
             # no-grow rule as the persist path (#1630) — nothing is written into an oversized session.
             from gateway.run import _context_overflow_reply
-            return _context_overflow_reply()
+            from gateway.session_results import record_unexecuted_failure
+            return record_unexecuted_failure(_context_overflow_reply())
         # Replay can coalesce inputs; only this input's durable marker establishes ownership.
         try:
             if prepared.message_text is not None and session_entry is not None:
@@ -2949,9 +2958,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 status_hint = t("gateway.errors.hint_usage_limit")
         elif status_code == 400:
             status_hint = t("gateway.errors.hint_rejected")
-        return self._hmwa_add_failed_turn_notice(
+        elif getattr(e, "reason", None) == "launch_credentials_unavailable" and getattr(e, "field", None):
+            # The session's own frozen route credential is gone or changed: name it, not the model.
+            status_hint = f" {e.reason} ({e.field}: {e.detail or 'unavailable'})."
+        from gateway.session_results import record_unexecuted_failure
+        return record_unexecuted_failure(self._hmwa_add_failed_turn_notice(
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
-        )
+        ))
 
     def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
         """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
@@ -2999,11 +3012,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
 
         # The context prompt render is pinned per session, keyed by a hash of the renderer inputs, so
         # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
-        if event.internal and session_key:
+        _reuse_pins = event.internal or getattr(event, "inherit_channel_pin", False)
+        if source.platform != Platform.LOCAL and _reuse_pins and session_key:
             await self._rehydrate_prompt_pins(session_key, session_entry.session_id)
-        context_prompt = self._pinned_session_context_prompt(
-            context, _redact_pii, session_key, internal=event.internal,
-        )
+        context_prompt = "" if source.platform == Platform.LOCAL else \
+            self._pinned_session_context_prompt(context, _redact_pii, session_key, internal=_reuse_pins)
 
         # Per-turn notes ride the user message via the api_content sidecar, NOT context_prompt
         # (appending to the ephemeral system prompt forced a full agent rebuild).
@@ -3050,7 +3063,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             event=event, source=source, history=history, session_key=session_key,
         )
         if message_text is None:
-            return None, _session_env_tokens
+            # A refused local turn answers with its refusal (session_context_refs.turn_references).
+            return getattr(event, "_gateway_turn_refusal", None), _session_env_tokens
 
         message_text, persist_user_message, persist_user_timestamp = (
             self._hmwa_apply_message_timestamp(event, message_text)
@@ -3199,7 +3213,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             event._heartbeat_execution_started = True
             # Internal events reuse the last human turn's channel inputs (see _pinned_channel_inputs).
             _turn_channel_prompt, _turn_source = self._pinned_channel_inputs(
-                session_key, event.channel_prompt, source, internal=event.internal,
+                session_key, event.channel_prompt, source,
+                internal=event.internal or getattr(event, "inherit_channel_pin", False),
             )
             if not event.internal:
                 # Persist the coherent context+channel pair before execution: a crash during the
@@ -3230,7 +3245,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 reply_expected=event.reply_expected,
                 persist_user_display_metadata={
-                    "gateway_input_owner": prepared.persistence_owner,
+                    "gateway_input_owner": prepared.persistence_owner, **display_metadata_for_event(event),
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
@@ -3689,10 +3704,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             lines = [t("gateway.reload_mcp.header")] + [
                 t(key, names=", ".join(sorted(names))) for _label, key, names in changes if names
             ]
+            from tools.mcp_tool_discovery import mcp_servers_not_connected
+            failed = await self._run_in_executor_with_context(mcp_servers_not_connected)
             if not connected_servers:
                 lines.append(t("gateway.reload_mcp.none_connected"))
             else:
                 lines.append(t("gateway.reload_mcp.tools_available", tools=len(new_tools), servers=len(connected_servers)))
+            if failed:  # a configured server that did not connect is named, never passed over as success
+                lines.append(t("gateway.reload_mcp.failed", error=f"did not connect: {', '.join(failed)}"))
 
             self._mcp_reload_refresh_cached_agents(multiplex, event.source.profile)
 
@@ -3941,6 +3960,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                             if _consume_sse_line(line):
                                 saw_done = True
                                 break
+                        if saw_done:
+                            break
                         if len(buffer) > _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS:
                             raise ValueError("Proxy SSE stream exceeded max buffer size without a line boundary")
                     # The final SSE frame may not be newline-terminated: flush the residual
@@ -4011,9 +4032,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         from agent.secret_scope import get_secret
         from gateway.display_config import resolve_display_setting, resolve_tool_progress
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
-        user_config = _load_gateway_config()
-        platform_key = _platform_config_key(source.platform)
+        from gateway.session_policy import policy_for_source
+        policy = policy_for_source(self, source)
+        from gateway.session_authorities import active_authority
+        user_config = policy.config(active_authority(self), secrets=False) if policy else _load_gateway_config()
+        platform_key = policy.platform if policy else _platform_config_key(source.platform)
         enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
+        if policy:
+            enabled_toolsets = list(policy.current_toolsets(user_config))
         adapter = self._delivery_adapter_for(source)
         # Tool preview length (0 = no limit) and friendly tool labels (default on), per-platform.
         for _setter, _setting, _default, _cast in (
@@ -4570,6 +4596,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         """Synthetic failed run dict for an inactivity timeout, with the activity-tracker diagnostic;
         interrupts the agent if it is still running so the thread pool worker is freed."""
         from gateway.run import _INTERRUPT_REASON_TIMEOUT, _INTERRUPT_TOOL_REASON_TIMEOUT, request_hard_interrupt
+        from gateway.session_results import record_terminal_failure
         session_key, result_holder, tools_holder = turn_ctx.session_key, turn_ctx.result_holder, turn_ctx.tools_holder
         _timed_out_agent = turn_ctx.agent_holder[0]
         _activity = self._agent_activity_summary(_timed_out_agent)
@@ -4600,14 +4627,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 "gateway.progress.timeout_last_activity",
                 activity=_last_desc, seconds=f"{_secs_ago:.0f}", progress=_iter_progress))
         _diag_lines.append(t("gateway.progress.timeout_hint"))
-        return {
+        return record_terminal_failure({
             "final_response": "\n".join(_diag_lines),
             "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
             "api_calls": _iter_n,
             "tools": tools_holder[0] or [],
             "history_offset": 0,
             "failed": True,
-        }
+        })
 
     async def _run_agent_await_turn_worker(
         self, worker: GatewayRunner._RunAgentWorker, turn_ctx: TurnContext,
@@ -4628,7 +4655,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             if worker.agent_timeout is not None:
                 if worker.timeout_fired.is_set():
                     break
-                _idle_secs = self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0)
+                _idle_secs = turn_ctx.awake_idle.measure(self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0))
                 if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
                     _warning_fired = True
                     await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
@@ -4652,12 +4679,21 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if _agent is None or not hasattr(_agent, 'model') or (_result_for_fb and _result_for_fb.get("failed")):
             return
         # A provider fallback is drift even when it serves the configured model name on another endpoint.
-        if getattr(_agent, "_provider_fallback_active", False) is True:
-            self._evict_cached_agent(session_key)
-            return
-        _cfg_model = self._fallback_baseline_model(session_key, turn_ctx.source, _agent)
-        if _agent.model != _cfg_model and not self._is_intentional_model_switch(session_key, _agent, _cfg_model):
-            self._evict_cached_agent(session_key)
+        if getattr(_agent, "_provider_fallback_active", False) is not True:
+            # A LOCAL session runs its frozen launch policy's model, not the gateway's configured one.
+            from gateway.session_authorities import active_authority
+            from gateway.session_policy import policy_for_source
+            policy = policy_for_source(self, turn_ctx.source)
+            _cfg_model = self._fallback_baseline_model(
+                session_key, turn_ctx.source, _agent,
+                policy_model=policy.current_model(active_authority(self)) if policy and policy.model else None,
+            )
+            if _agent.model == _cfg_model or self._is_intentional_model_switch(session_key, _agent, _cfg_model):
+                return
+        # Keep the evicted parent identifiable so its still-running children remain visible to the
+        # replacement session, but only when the fallback eviction actually belongs to this route.
+        _agent._evicted_on_fallback = session_key or True
+        self._evict_cached_agent(session_key)
 
     async def _run_agent_finalize_streaming_tts(self, turn_ctx: TurnContext, adapter: Any) -> None:
         """Finalize the streaming-TTS consumer on the outer event-loop thread (covers early returns
@@ -4692,6 +4728,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         pending = None
         if result and adapter and session_key:
             pending_event = _dequeue_pending_event(adapter, session_key)
+            if result.get("compression_exhausted") and pending_event is not None:
+                self._defer_past_exhaustion_reset(result, adapter, source, session_key, pending_event)
+                return None, None
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
@@ -4804,7 +4843,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     replace_source(source, user_id=None, user_name=None, user_id_alt=None))
                 spool_value = MessageEvent(text=spool_value, source=spool_source,
                                            user_id=getattr(spool_source, "user_id", None))
-                setattr(spool_value, "_hermes_recovery_id", f"hermes-recovery-{uuid.uuid4().hex}")
+                spool_value._hermes_recovery_id = f"hermes-recovery-{uuid.uuid4().hex}"
             elif (spool_value is not None and _bind_turn_author
                     and not getattr(spool_value, "internal", False)):
                 event_source = getattr(spool_value, "source", None) or source
@@ -5046,7 +5085,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
             next_channel_prompt, next_source = self._pinned_channel_inputs(
-                next_session_key, pending_event.channel_prompt, next_source, internal=pending_event.internal,
+                next_session_key, pending_event.channel_prompt, next_source,
+                internal=pending_event.internal or getattr(pending_event, "inherit_channel_pin", False),
             )
             if not pending_event.internal:
                 # A drained human turn re-pins its channel inputs; make them durable like a first turn.
@@ -5522,6 +5562,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         from run_agent import AIAgent
 
         disp = self._run_agent_display_settings(source)
+        from gateway.session_policy import policy_for_source
+        if session_key and policy_for_source(self, source) is None:
+            await self._rehydrate_session_model_selection_async(session_key)
+            await self._expire_attended_temporary_picks_async(session_key, disp.user_config)
         cron_review = (event_metadata or {}).get("_cron_review_capture") is not None
         if scheduled_heartbeat or cron_review:
             # A heartbeat is proactive work: tool chrome, drafts, thinking and periodic

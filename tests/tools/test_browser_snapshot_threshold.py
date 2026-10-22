@@ -1,6 +1,7 @@
 """Behavior tests for config-driven browser snapshot thresholds."""
 
 import json
+import os
 from unittest.mock import Mock
 
 import pytest
@@ -27,14 +28,14 @@ def isolated_snapshot_threshold(tmp_path, monkeypatch):
 
 
 def _write_threshold(hermes_home, value):
-    # Match atomic config replacement: rapid same-size in-place writes can share
-    # a filesystem timestamp and legitimately hit the raw-config stat cache.
-    pending = hermes_home / "config.pending.yaml"
-    pending.write_text(
+    # Atomic replace, like the real config writers: an in-place same-size rewrite within one coarse
+    # kernel timestamp tick keeps (mtime, size, ino, ctime), so read_raw_config's cache can't see it.
+    tmp = hermes_home / "config.yaml.tmp"
+    tmp.write_text(
         f"browser:\n  snapshot_threshold: {value}\n",
         encoding="utf-8",
     )
-    pending.replace(hermes_home / "config.yaml")
+    os.replace(tmp, hermes_home / "config.yaml")
 
 
 def _long_snapshot(chars: int) -> str:

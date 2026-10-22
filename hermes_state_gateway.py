@@ -19,6 +19,11 @@ from hermes_state_common import (
 # Log-record parity with the origin module (caplog tests pin "hermes_state").
 logger = logging.getLogger("hermes_state")
 
+# Retired-session fence lookup on a bound entry_json (bind it twice). Non-throwing: a routing
+# value that is not a JSON object names no session, so it is never fenced and never aborts the
+# whole replace with "malformed JSON".
+_RETIRED_FENCE_SESSION_ID = _sql_json_extract("?", "$.session_id")
+
 # Recursive CTE naming a session plus its compression ancestors (rows a
 # resume must keep on one routing peer); branch/delegate/tool/reset rows stop it
 # (same membership rule as get_compression_lineage / _CHAIN_STEP_SQL, #114271).
@@ -299,12 +304,13 @@ class SessionGatewayMixin:
         if not session_key or not entry_json:
             return
         self._write_sql(
-            """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
-               VALUES (?, ?, ?, ?)
+            f"""INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+               SELECT ?, ?, ?, ? WHERE NOT EXISTS (
+                   SELECT 1 FROM state_meta WHERE key='gateway.retired_session.v1.' || {_RETIRED_FENCE_SESSION_ID})
                ON CONFLICT(scope, session_key) DO UPDATE SET
                    entry_json = excluded.entry_json,
                    updated_at = excluded.updated_at""",
-            (scope, session_key, entry_json, time.time()),
+            (scope, session_key, entry_json, time.time(), entry_json, entry_json),
         )
 
     def load_gateway_routing_entry(self, session_key: str, *, scope: str = "") -> Optional[str]:
@@ -361,12 +367,13 @@ class SessionGatewayMixin:
             changed = [(scope, k, v, now) for k, v in wanted.items() if current.get(k) != v]
             if changed:
                 conn.executemany(
-                    """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
-                       VALUES (?, ?, ?, ?)
+                    f"""INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                       SELECT ?, ?, ?, ? WHERE NOT EXISTS (
+                           SELECT 1 FROM state_meta WHERE key='gateway.retired_session.v1.' || {_RETIRED_FENCE_SESSION_ID})
                        ON CONFLICT(scope, session_key) DO UPDATE SET
                            entry_json = excluded.entry_json,
                            updated_at = excluded.updated_at""",
-                    changed)
+                    [(*row, row[2], row[2]) for row in changed])
         self._execute_write(_do)
 
     def load_gateway_routing_entries(self, *, scope: str = "") -> dict[str, str]:
@@ -427,6 +434,44 @@ class SessionGatewayMixin:
                 return entry
         return None
 
+    def _routing_entries_for_sessions(self, session_ids: set[str]) -> list[tuple[str, str, str]]:
+        """``(scope, session_key, session_id)`` of ``gateway_routing`` rows pointing at any of
+        *session_ids*; the target id lives only inside ``entry_json``, so matching is in Python."""
+        found: list[tuple[str, str, str]] = []
+        if not session_ids:
+            return found
+        for row in self._read_all("SELECT scope, session_key, entry_json FROM gateway_routing"):
+            try:
+                entry = json.loads(row["entry_json"] or "{}")
+            except (ValueError, TypeError, RecursionError):  # malformed / non-text / over-nested entry
+                continue
+            if isinstance(entry, dict) and entry.get("session_id") in session_ids:
+                found.append((row["scope"], row["session_key"], entry["session_id"]))
+        return found
+
+
+    def retire_gateway_routes(self, session_ids) -> None:
+        """Publish deletion fences for *session_ids* in THIS (routing) database and drop the
+        routes naming them, in one transaction. Routing saves skip any entry whose session id
+        carries a marker here, so a whole-index snapshot taken before a delete in another
+        profile's store cannot restore the route when it is saved after it."""
+        ids = sorted({str(sid) for sid in session_ids if sid})
+        if not ids:
+            return
+
+        def _do(conn):
+            from hermes_state_mutation_retirement import RETIRED_PREFIX, entry_session_id
+            retired = json.dumps({"retired_at": time.time()})
+            conn.executemany("INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,?)",
+                             [(RETIRED_PREFIX + sid, retired) for sid in ids])
+            targets = set(ids)
+            doomed = [(row[0], row[1]) for row in conn.execute(
+                "SELECT scope, session_key, entry_json FROM gateway_routing").fetchall()
+                if entry_session_id(row[2]) in targets]
+            conn.executemany("DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?", doomed)
+        self._execute_write(_do)
+
+
     def _delete_routing_entries_for_sessions(self, session_ids: set[str]) -> int:
         """Drop ``gateway_routing`` rows pointing at any of *session_ids*; the target id
         lives only inside ``entry_json``, so matching is done in Python over all scopes."""
@@ -446,7 +491,8 @@ class SessionGatewayMixin:
         return len(doomed)
 
     def prune_never_active_keyed_sessions(
-        self, *, older_than_days: float, sessions_dir: Optional[Path] = None) -> tuple[int, int, int]:
+        self, *, older_than_days: float, sessions_dir: Optional[Path] = None,
+        deleted_ids: Optional[list] = None) -> tuple[int, int, int]:
         """Delete never-active keyed rows and the routing entries naming them; returns
         ``(sessions_deleted, routing_entries_deleted, sessions_skipped)``. Deletion goes through
         :meth:`delete_sessions` (one transaction; delegate cascade, FTS, transcripts).
@@ -457,15 +503,28 @@ class SessionGatewayMixin:
         candidate except the guarded ones: rows that vanished concurrently are gone too,
         and a stale entry outliving its target would have the gateway resume a
         nonexistent id. The row sweep is one transaction; routing entries are dropped in a
-        second write after it commits. ``sessions_skipped`` counts only the guarded rows."""
+        second write after it commits. ``sessions_skipped`` counts only the guarded rows.
+        ``deleted_ids`` (the owning gateway) receives every candidate id that was not kept."""
         candidates = self.list_never_active_keyed_sessions(older_than_days=older_than_days)
-        if not candidates:
+        # A fresh local reset tip is its conversation's current target, not a never-active chat:
+        # the conversation holds the earlier segments' history and the owner's queued work.
+        from hermes_state_local import owned_lineage_ids
+        with self._read_ctx() as conn:
+            ids = {str(row["id"]) for row in candidates if owned_lineage_ids(conn, str(row["id"])) == [str(row["id"])]}
+        if not ids:
             return (0, 0, 0)
-        ids = {str(row["id"]) for row in candidates}
         skipped: list[str] = []
+        # ``delete_sessions`` retires the deleted rows' routing entries inside its own transaction
+        # (``retire_routes``), so count what pointed at the candidates before it commits; the
+        # follow-up sweep then only catches entries a concurrent writer re-added.
+        routed_before = self._routing_entries_for_sessions(ids)
         deleted = self.delete_sessions(
             list(ids), sessions_dir=sessions_dir, exclude_active_write_guards=True, skipped_ids=skipped)
-        routing_deleted = self._delete_routing_entries_for_sessions(ids - set(skipped))
+        kept = set(skipped)
+        self._delete_routing_entries_for_sessions(ids - kept)
+        routing_deleted = sum(1 for _, _, sid in routed_before if sid not in kept)
+        if deleted_ids is not None:
+            deleted_ids.extend(sorted(ids - kept))
         return (deleted, routing_deleted, len(skipped))
 
     def list_gateway_sessions(
@@ -877,8 +936,15 @@ class SessionGatewayMixin:
         # record for sessions that never ran /model. Bare buckets ("auto"/"custom") are not
         # routable identities; filter them so resume falls back to the ambient default.
         billing_provider = str((session_meta or {}).get("billing_provider") or "").strip()
+        billing_base_url = str((session_meta or {}).get("billing_base_url") or "").strip()
         if billing_provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
             top_level.setdefault("provider", billing_provider)
+        elif billing_provider.lower() == "custom" and billing_base_url:
+            # Older CLI rows persisted the billing class and endpoint rather than
+            # a routable custom identity. Keep both so resume can heal the
+            # endpoint to the current custom entry.
+            top_level.setdefault("provider", billing_provider)
+            top_level.setdefault("base_url", billing_base_url)
         if top_level:
             return top_level
         if not isinstance(runtime, dict):

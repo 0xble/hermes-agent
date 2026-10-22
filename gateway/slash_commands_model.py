@@ -440,15 +440,43 @@ class GatewayModelCommandsMixin:
 
     async def _commit_model_switch_locked(self, result, ctx: _ModelSwitchContext, *, source, picker: bool) -> str:
         one_turn = False if picker else ctx.one_turn
-        error = self._switch_cached_agent_model(result, ctx, picker)
-        if error is not None:
-            return error
-        self._record_switch_metrics(result, ctx, source)
-        global_error = await self._record_model_switch(result, ctx, source=source, one_turn=one_turn, picker=picker)
+        from gateway.session_setting_commands import defer_local_model_pick, local_authority_live
+        authority, live = local_authority_live(self, source)
+        level = ""
+        if live is not None:
+            # A local session runs its frozen policy: the owner's canonical model mutation is the
+            # only commit, landing at the next turn boundary (this command is the running turn).
+            if one_turn:
+                return t("gateway.model.error_prefix", error=t("gateway.model.err_once_local"))
+            from hermes_constants import parse_reasoning_effort
+            effort = (ctx.reasoning_effort or "").strip().lower()
+            level = effort if parse_reasoning_effort(effort) is not None else ""
+            await asyncio.to_thread(defer_local_model_pick, authority, live, result, level)
+            self._record_switch_metrics(result, ctx, source)
+            global_error = None
+            if ctx.persist_global:
+                try:
+                    await _persist_model_switch_to_config(result, ctx.config_path)
+                except Exception as e:
+                    logger.warning("Failed to persist model switch", exc_info=True)
+                    global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
+        else:
+            error = self._switch_cached_agent_model(result, ctx, picker)
+            if error is not None:
+                return error
+            self._record_switch_metrics(result, ctx, source)
+            global_error = await self._record_model_switch(
+                result, ctx, source=source, one_turn=one_turn, picker=picker)
         reply = await self._model_switch_confirmation(
             result, ctx, one_turn=one_turn, picker=picker, global_error=global_error,
         )
-        if ctx.reasoning_effort and not one_turn:
+        if level:
+            # Committed with the local pick: only the config write-through and the reply remain.
+            saved = (ctx.persist_global and global_error is None
+                     and self._save_gateway_config_key("agent.reasoning_effort", level))
+            reply += "\n" + t("gateway.reasoning.set_global" if saved else "gateway.reasoning.set_session",
+                              effort=level)
+        elif ctx.reasoning_effort and not one_turn:
             # `/model X --reasoning <level>`: same applier as /reasoning, same scope as the pick.
             # The record step already evicted the cached agent, so the pin lands on the rebuild.
             from gateway.run import _platform_config_key
@@ -460,7 +488,7 @@ class GatewayModelCommandsMixin:
                 reply += "\n" + await self._apply_reasoning_selection_off_loop(
                     ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
                     persist_global=ctx.persist_global and global_error is None)
-        return reply
+        return reply + ("\n" + t("gateway.model.local_next_turn") if live is not None else "")
 
     def _model_switch_context(
         self, source, session_key: str, *, profile_home=None, **fields,
@@ -1081,9 +1109,13 @@ class GatewayModelCommandsMixin:
         from hermes_constants import parse_reasoning_effort
 
         value = (value or "").strip().lower()
+        from gateway.session_setting_commands import local_live_for_route
+        live = local_live_for_route(self, session_key)
         show = _REASONING_DISPLAY_TOGGLES.get(value)
         if show is not None:  # per-platform display toggle
             self._show_reasoning = show
+            if live is not None:
+                live.show_reasoning = show  # what this local session's viewers stream (config.get show_reasoning)
             self._save_gateway_config_key(f"display.platforms.{platform_key}.show_reasoning", show)
             key = "gateway.reasoning.display_set_on" if show else "gateway.reasoning.display_set_off"
             return t(key, platform=platform_key)
@@ -1100,7 +1132,8 @@ class GatewayModelCommandsMixin:
         self._reasoning_config = parsed
         if persist_global:
             if self._save_gateway_config_key("agent.reasoning_effort", value):
-                self._set_reasoning_override(session_key, None)
+                # A local session runs its frozen level, not config.yaml's: it takes the level too.
+                self._set_reasoning_override(session_key, parsed if live is not None else None)
                 reply = t("gateway.reasoning.set_global", effort=value)
                 from gateway.run import _load_gateway_config
                 from hermes_cli.model_preset_runtime import resolve_default_route
@@ -1155,6 +1188,9 @@ class GatewayModelCommandsMixin:
         _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(_reasoning_source)
         self._show_reasoning = self._load_show_reasoning()
+        from gateway.session_setting_commands import local_live
+        if (_live := local_live(self, event.source)) is not None:
+            self._show_reasoning = getattr(_live, "show_reasoning", None) is True
         # Effective model (session /model override wins) so per-model reasoning_overrides display.
         _session_model = str(
             ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model") or ""
@@ -1260,8 +1296,13 @@ class GatewayModelCommandsMixin:
         tier, saved_value, label_key = selection
         label = t(label_key) if label_key else value.upper()
         self._service_tier = tier
+        from gateway.session_setting_commands import local_live_for_route
         if persist and self._save_gateway_config_key("agent.service_tier", saved_value):
-            self._set_session_service_tier_override(session_key, None, clear=True)  # global wins
+            if local_live_for_route(self, session_key) is not None:
+                # A local session runs its frozen tier, not config.yaml's: it takes the tier too.
+                self._set_session_service_tier_override(session_key, tier)
+            else:
+                self._set_session_service_tier_override(session_key, None, clear=True)  # global wins
             self._apply_live_service_tier(session_key, tier)
             return t("gateway.fast.saved", label=label) + self._fast_route_ignored_note(session_key, tier)
         # Session override — also the fallback after a failed config write (as /reasoning --global).

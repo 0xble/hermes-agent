@@ -14,7 +14,7 @@ import os
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 from gateway.config import Platform
 from gateway.restart import (
@@ -94,8 +94,9 @@ class GatewayConfigLoadersMixin:
     @staticmethod
     def _load_ephemeral_system_prompt() -> str:
         """HERMES_EPHEMERAL_SYSTEM_PROMPT env first, then ``display.personality`` / ``agent.system_prompt``."""
+        from agent.session_client_env import session_env
         from gateway.run import _load_gateway_config
-        prompt = os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
+        prompt = session_env("HERMES_EPHEMERAL_SYSTEM_PROMPT")
         if prompt:
             return prompt
         return resolve_ephemeral_system_prompt_from_config(_load_gateway_config())
@@ -202,7 +203,7 @@ class GatewayConfigLoadersMixin:
                 and getattr(getattr(self, "config", None), "multiplex_profiles", False)
                 and source is not None and callable(resolve_profile_home)):
             profile_home = resolve_profile_home(source)
-        loader = getattr(self, "_load_reasoning_config")
+        loader = self._load_reasoning_config
         native_loader = getattr(type(self), "_load_reasoning_config", None)
         native_loader = getattr(native_loader, "__func__", native_loader)
         loader_func = getattr(loader, "__func__", loader)
@@ -255,10 +256,20 @@ class GatewayConfigLoadersMixin:
         if not session_key:
             return None
         self._apply_pending_bulk_reset_if_idle(session_key)
-        _r_state = self._peek_session_state(session_key)
-        if _r_state is not None and _r_state.conversation.reasoning_override is not None:
-            return _r_state.conversation.reasoning_override
+        state_loader = getattr(self, "_peek_session_state", None)
+        if callable(state_loader):
+            state = state_loader(session_key)
+            value = getattr(getattr(state, "conversation", None), "reasoning_override", None)
+        else:  # Bare test doubles carry only the legacy mapping.
+            value = (getattr(self, "_session_reasoning_overrides", None) or {}).get(session_key)
+        if value is not None:
+            return value
+        value = (getattr(self, "_session_reasoning_overrides", None) or {}).get(session_key)
+        if value is not None:
+            return value
+
         # After a gateway restart the in-memory pick is gone; rehydrate it from the routing entry
+
         # (written through by _set_session_reasoning_override), the same way /model overrides are.
         store = getattr(self, "session_store", None)
         if store is None:
@@ -341,7 +352,16 @@ class GatewayConfigLoadersMixin:
         conversation.service_tier_override_expiry_seconds = 0.0
         from agent.fast_mode import STATIC_TIERS
         if not clear and service_tier in STATIC_TIERS:
-            seconds = self._load_fast_expiry_seconds() if expiry_seconds is None else expiry_seconds
+            if expiry_seconds is None:
+                loader = getattr(self, "_load_fast_expiry_seconds", None)
+                if not callable(loader):
+                    loader = type(self)._load_fast_expiry_seconds if hasattr(type(self), "_load_fast_expiry_seconds") else None
+                if not callable(loader):
+                    from gateway.run_config_loaders import GatewayConfigLoadersMixin
+                    loader = GatewayConfigLoadersMixin._load_fast_expiry_seconds
+                seconds = float(cast(float, loader()))
+            else:
+                seconds = expiry_seconds
             if seconds > 0:
                 conversation.service_tier_override_expires_at = time.time() + seconds
                 conversation.service_tier_override_expiry_seconds = seconds

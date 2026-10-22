@@ -23,6 +23,13 @@ def clean_git_env():
 
 
 class PortableGateTests(unittest.TestCase):
+    def test_fork_history_email_scan_stays_on_first_parent(self):
+        with patch.object(ci, 'git', return_value='fork@example.invalid\n') as git:
+            self.assertEqual(ci.fork_commit_emails('base', 'release'), ['fork@example.invalid'])
+        git.assert_called_once_with(
+            'log', '--first-parent', 'base..HEAD', '^release', '--format=%ae', '--no-merges',
+        )
+
     def test_shards_cover_every_ordinary_python_and_safe_e2e_file_once(self):
         from scripts.run_tests_parallel import _discover_files
 
@@ -73,6 +80,22 @@ class PortableGateTests(unittest.TestCase):
                         ),
                         f'{workflow_name}:{job_name} must configure Git safe.directory before checkout',
                     )
+
+    def test_python_shards_install_tmux_for_classic_cli_pty_clients(self):
+        import hermes_yaml as yaml
+
+        workflows = Path(__file__).resolve().parents[3] / '.github' / 'workflows'
+        for workflow_name in ('gate.yml', 'nightly.yml'):
+            document = yaml.safe_load((workflows / workflow_name).read_text(encoding='utf-8-sig'))
+            shard_jobs = [job for job in document['jobs'].values()
+                          if any('--shard' in step.get('run', '') for step in job.get('steps', []))]
+            self.assertTrue(shard_jobs, f'{workflow_name} must contain a Python shard job')
+            for job in shard_jobs:
+                profile_index = next(index for index, step in enumerate(job['steps'])
+                                     if '--shard' in step.get('run', ''))
+                preceding = '\n'.join(step.get('run', '') for step in job['steps'][:profile_index])
+                self.assertRegex(preceding, r'\bapt-get install[^\n]*\btmux\b',
+                                 f'{workflow_name} Python shards need tmux for classic CLI PTY tests')
 
     def test_nightly_reaps_orphans_and_runs_python_suite_as_nonroot(self):
         import hermes_yaml as yaml
@@ -157,8 +180,7 @@ class PortableGateTests(unittest.TestCase):
             result = subprocess.run(
                 [sys.executable, '-m', 'unittest',
                  'scripts.ci.tests.test_portable.PortableGateTests.test_exact_checkout_rejects_malformed_wrong_and_mutated_sha'],
-                cwd=ci.ROOT, env=poisoned, capture_output=True, text=True,
-            )
+                cwd=ci.ROOT, env=poisoned, capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             after = {name: (git_dir / name).read_bytes() for name in ('HEAD', 'index', 'config') if (git_dir / name).exists()}
             self.assertEqual(after, before, 'preflight fixture modified the inherited repository')
@@ -287,8 +309,7 @@ class PortableGateTests(unittest.TestCase):
             result = subprocess.run(
                 ['bash', 'scripts/run_tests.sh', '-j', '1', '--file-retries', '0', str(test_file)],
                 cwd=ci.ROOT, env=env, capture_output=True, text=True,
-                encoding='utf-8', errors='replace',
-            )
+                encoding='utf-8', errors='replace', check=False)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_external_fixture_has_no_git_or_node_dependency_ancestry(self):
@@ -312,17 +333,17 @@ try {
 }
 """
             env = clean_git_env()
-            old_git = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=contaminated, env=env, capture_output=True)
+            old_git = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=contaminated, env=env, capture_output=True, check=False)
             old_node = subprocess.run(['node', '-e', script], cwd=contaminated,
-                                      env={k: v for k, v in env.items() if not k.startswith('NODE_')}, capture_output=True)
+                                      env={k: v for k, v in env.items() if not k.startswith('NODE_')}, capture_output=True, check=False)
             self.assertEqual(old_git.returncode, 0)
             self.assertEqual(old_node.returncode, 5)
             with ci.external_temporary_directory('home-', parent=base) as home:
                 child_env = ci.environment(home)
                 fixture = Path(child_env['TMPDIR']) / 'plain'
                 fixture.mkdir()
-                clean_git = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=fixture, env=child_env, capture_output=True)
-                clean_node = subprocess.run(['node', '-e', script], cwd=fixture, env=child_env, capture_output=True)
+                clean_git = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=fixture, env=child_env, capture_output=True, check=False)
+                clean_node = subprocess.run(['node', '-e', script], cwd=fixture, env=child_env, capture_output=True, check=False)
                 self.assertNotEqual(clean_git.returncode, 0)
                 self.assertEqual(clean_node.returncode, 0, clean_node.stderr)
             self.assertFalse(home.exists())
@@ -610,7 +631,7 @@ try {
                 if argv[:2] == ['npm', 'install']:
                     npm_package = toolchain / 'node_modules' / 'npm' / 'package.json'
                     npm_package.parent.mkdir(parents=True, exist_ok=True)
-                    npm_package.write_text('{"version": "%s"}' % ci.PINS['npm'], encoding='utf-8')
+                    npm_package.write_text(f'{{"version": "{ci.PINS["npm"]}"}}', encoding='utf-8')
                     npm_bin = toolchain / 'node_modules' / '.bin' / 'npm'
                     npm_bin.parent.mkdir(parents=True, exist_ok=True)
                     write_executable(npm_bin, ci.PINS['npm'])
@@ -637,7 +658,7 @@ try {
                 commands.append(argv)
                 package = toolchain / 'node_modules' / 'npm' / 'package.json'
                 package.parent.mkdir(parents=True, exist_ok=True)
-                package.write_text('{"version": "%s"}' % ci.PINS['npm'], encoding='utf-8')
+                package.write_text(f'{{"version": "{ci.PINS["npm"]}"}}', encoding='utf-8')
 
             stack.enter_context(patch.object(ci, 'run', side_effect=install))
             ci.provision_npm({})
@@ -796,7 +817,7 @@ try {
             interactive_env['HERMES_PYTHON'] = sys.executable
             result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', str(test_file)],
                                     cwd=ci.ROOT, env=interactive_env,
-                                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace', check=False)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(attempts.read_text(encoding='utf-8-sig'), '2')
 
@@ -832,10 +853,10 @@ with ci.checkout_lock():
     def test_entrypoint_is_independent_of_cwd_and_rejects_bad_workers(self):
         with tempfile.TemporaryDirectory() as directory:
             command = [sys.executable, str(ci.ROOT / 'bin/ci')]
-            result = subprocess.run([*command, 'list'], cwd=directory, capture_output=True, text=True, encoding='utf-8', errors='replace')
+            result = subprocess.run([*command, 'list'], cwd=directory, capture_output=True, text=True, encoding='utf-8', errors='replace', check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('python', result.stdout)
-            bad = subprocess.run([*command, 'check', '--workers', '0'], cwd=directory, capture_output=True, text=True, encoding='utf-8', errors='replace')
+            bad = subprocess.run([*command, 'check', '--workers', '0'], cwd=directory, capture_output=True, text=True, encoding='utf-8', errors='replace', check=False)
             self.assertNotEqual(bad.returncode, 0)
             self.assertIn('positive', bad.stderr)
 

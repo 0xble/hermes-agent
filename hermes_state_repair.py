@@ -880,16 +880,6 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> dict[str, A
     if not db_path.exists():
         report["error"] = f"{db_path} does not exist"
         return report
-    # Cross-restart cap: the in-memory claim bounds one process, but unhealable b-tree damage used to re-run
-    # surgery + a fresh backup on EVERY restart.
-    # Cross-restart attempt cap (#86747): the in-memory claim bounds one process, but a corruption class the
-    # strategies below cannot heal (b-tree page damage) previously re-ran the whole surgery — and took a
-    # fresh multi-hundred-MB forensic backup — on EVERY restart, forever. After
-    # _MAX_PERSISTENT_REPAIR_ATTEMPTS failures against the same damaged file, stop retrying and surface a
-    # terminal, actionable error.
-    if _persistent_repair_attempts_exhausted(db_path):
-        return _repair_skip(report, "skipped", _persistent_repair_exhausted_error(db_path))
-
     with _cross_process_repair_lock(db_path) as holding_lock:
         if not holding_lock:
             # Another process holds the lock (or the lock file was unopenable); it may have healed the file
@@ -902,8 +892,9 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> dict[str, A
             return report
 
         result = report
-        # Recheck exhaustion after acquisition: a queued repairer can have recorded the final failure while
-        # this process waited.
+        # The cross-restart cap (#86747) must be checked under the repair lock: fingerprinting opens the
+        # database, so a pre-lock probe makes a queued repairer look like a foreign holder to its sibling.
+        # This also sees any failure recorded while waiting, before a backup or strategy can run.
         if _persistent_repair_attempts_exhausted(db_path):
             _repair_skip(report, "skipped", _persistent_repair_exhausted_error(db_path))
         # WAL-holder preflight: fail closed for active readers before a backup is taken. Not the race defence — the

@@ -44,13 +44,16 @@ def test_agent_update_reaches_owner_socket_with_requesting_profile(
             "agent-update": accept,
         })
         assert await server.start()
-        assert host_rendezvous.publish_record(host_rendezvous.ROLE_GATEWAY, home=str(root))
         try:
+            outcome, error = host_rendezvous.claim_host_lock(host_rendezvous.ROLE_GATEWAY)
+            assert outcome is host_rendezvous.HostLockOutcome.ACQUIRED, error
+            assert host_rendezvous.publish_record(host_rendezvous.ROLE_GATEWAY, home=str(root))
             assert resolve_client_socket_path(root) is not None
             assert resolve_client_socket_path(satellite) is None
             return await asyncio.to_thread(_cmd_update, SimpleNamespace(reason="Apply owner routing fix"))
         finally:
             await server.stop()
+            host_rendezvous.release_host_lock(host_rendezvous.ROLE_GATEWAY)
             host_attach.invalidate_host_gateway_cache()
 
     result = asyncio.run(scenario())

@@ -74,6 +74,9 @@ def _make_runner():
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(streaming=None, multiplex_profiles=False)
     runner.session_store = SimpleNamespace(
+        get_model_role=lambda _key: None,
+        get_model_override=lambda _key: None,
+        get_model_override_scope=lambda _key: "session",
         get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
         load_transcript=lambda session_id: [],
     )
