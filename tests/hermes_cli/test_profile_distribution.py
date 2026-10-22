@@ -88,6 +88,35 @@ def _symlink_file_or_skip(link: Path, target: Path) -> None:
         pytest.skip(f"symlinks unavailable in test environment: {exc}")
 
 
+@pytest.mark.parametrize("local_value, authored_value", [(None, True), (True, False), (False, True)])
+def test_distribution_preserves_authored_pinned_lane(profile_env, local_value, authored_value):
+    """Installed definitions own lane protection, not the target's scheduler state."""
+    from cron.jobs import get_job, list_jobs, update_job, use_cron_store
+
+    staged = _make_staging_dir(profile_env, "pinned_lane")
+    with use_cron_store(staged):
+        shipped = list_jobs()[0]
+        update_job(shipped["id"], {"keep_pinned_lane": authored_value})
+
+    plan = install_distribution(str(staged), name="pinned_lane")
+    with use_cron_store(plan.target_dir):
+        installed = get_job(shipped["id"])
+        assert installed is not None
+        if local_value is not None:
+            update_job(shipped["id"], {"keep_pinned_lane": local_value})
+    if local_value is not None:
+        update_distribution("pinned_lane")
+
+    with use_cron_store(plan.target_dir):
+        updated = get_job(shipped["id"])
+        assert updated is not None
+        assert updated["keep_pinned_lane"] is authored_value
+        assert updated["state"] == installed["state"] == "paused"
+        assert updated["enabled"] is False
+        assert updated["paused_reason"] == installed["paused_reason"]
+        assert updated["next_run_at"] == installed["next_run_at"]
+
+
 # ===========================================================================
 # Manifest parsing
 # ===========================================================================

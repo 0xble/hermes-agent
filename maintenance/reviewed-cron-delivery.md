@@ -27,6 +27,8 @@ Relay is not involved. Its existing presentation path creates a user message, wh
 
 The external router skips `output_local_only: true`. The lane converter excludes local delivery itself, but a pinned `failure_deliver` remains eligible, so rollout must also set failure delivery to local. Those owners stay in the scripts repository.
 
+`keep_pinned_lane` is an authored job-definition field. Distribution imports preserve it on new jobs and replace either boolean value on updates without changing scheduler-owned state. Cron CLI create and edit expose `--keep-pinned-lane` and `--no-keep-pinned-lane` through the existing job API. Omitting the flag on edit preserves the current value.
+
 ## Proof and Retirement
 
 Run the checkout-owned test interpreter against `tests/cron/test_review*.py`, `tests/gateway/test_cron_review.py`, `tests/hermes_cli/test_cron_review.py`, and `tests/tools/test_cronjob_review.py`, plus the full cron suite and affected delivery, wake, and turn tests. Preserve the exact-head gate receipt. Source tests do not prove live gateway adoption or Telegram delivery.

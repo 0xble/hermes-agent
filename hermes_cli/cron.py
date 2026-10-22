@@ -771,7 +771,8 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
                    ("job_timezone", "job_timezone"), ("interpreter", "interpreter"),
                    ("hard_wall_timeout_seconds", "hard_wall_timeout_seconds"),
-                   ("review_json", "review_json"), ("clear_review", "clear_review"))
+                   ("review_json", "review_json"), ("clear_review", "clear_review"),
+                   ("keep_pinned_lane", "keep_pinned_lane"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:
