@@ -344,11 +344,12 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
     """A secondary profile with no ACTIVE loop must not get its runtime scope entered on
     every tick (each entry re-parses the profile's config/secrets — the dominant idle-CPU
     cost on multiplex gateways); a profile holding an active loop must still be scanned."""
-    from hermes_state import SessionDB
+    from hermes_state_registry import acquire, release
 
     work_home = tmp_path / "profiles" / "work"
     work_home.mkdir(parents=True)
-    work_db = SessionDB(db_path=work_home / "state.db")
+    # goals' cache requires a registry-owned handle, not a bare SessionDB.
+    work_db = acquire(work_home / "state.db")
     goals._DB_CACHE[str(work_home)] = work_db
 
     scopes = [(None, None), ("work", work_home)]
@@ -427,4 +428,5 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
         assert entered == [work_home], (
             f"unavailable store must fall back to the historical scan; got {entered}")
     finally:
-        work_db.close()
+        goals._DB_CACHE.pop(str(work_home), None)
+        release(work_db)
