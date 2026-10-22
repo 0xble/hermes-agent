@@ -24,7 +24,8 @@ def _aux(timeout, *, reasoning_effort=True, **extra):
     reasoning_effort=False omits that key (MoA blocks configure depth per slot);
     ``extra`` keys are appended after the standard ones.
     """
-    d = {"provider": "auto", "model": "", "base_url": "", "api_key": "", "timeout": timeout, "extra_body": {}}
+    d = {"provider": "auto", "model": "", "base_url": "", "api_key": "", "timeout": timeout, "extra_body": {},
+         "fallback_chain": []}
     if reasoning_effort:
         d["reasoning_effort"] = ""
     d.update(extra)
@@ -804,6 +805,7 @@ DEFAULT_CONFIG = {
             "prefer_fast_model": False,
             "base_url": "",
             "api_key": "",
+            "fallback_chain": [],
             "timeout": 30,
             "extra_body": {},
             "reasoning_effort": "",

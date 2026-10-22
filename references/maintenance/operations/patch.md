@@ -85,3 +85,12 @@
 - **Rollback and retirement:** Revert the durability commit to restore #494's opener-local gate.
   Retire when upstream's warm-open implementation both retries blocked initial checkpoints and
   skips settled checkpoints, verified by the same reader-held/main-file-only regression.
+
+## Auxiliary Fallback Config Recognition
+
+- **Identity:** `auxiliary-fallback-config`.
+- **Contract:** `auxiliary.<task>.fallback_chain` is a recognized list setting for side-LLM tasks, including the separately declared `title_generation` block. Empty chains remain inert and are supplied at read time, never backfilled by config check or migration. The `review` subagent block is not a side-LLM consumer and is intentionally unchanged.
+- **Placement:** Extend the existing `_aux()` defaults registry and title-generation defaults, not the key validator or a plugin. Correct the fallback helper docstring to require both provider and model, matching its resolver.
+- **Upstream evidence:** Guidance inspected at `92663ae8054ae81f207f46d83512d3f879dc698d`. Related open [upstream PR #122364](https://github.com/NousResearch/hermes-agent/pull/122364) proposes the same default declarations along with other runtime-read keys. Keep this delivery scoped to fallback chains. No upstream contribution is opened because that PR already owns the broader fix.
+- **Verification:** `scripts/run_tests.sh tests/hermes_cli/test_auxiliary_fallback_config.py tests/hermes_cli/test_set_config_value.py tests/hermes_cli/test_config.py tests/hermes_cli/test_config_check_diagnostics.py tests/agent/test_auxiliary_client.py -q`: 526 passed, 4 platform skips. The new CLI regression fails before the defaults change. Config check/migrate leave a current sparse config byte-identical.
+- **Rollback and retirement:** Revert the `Fork-Patch: auxiliary-fallback-config` commit. Retire the declarations once the accepted upstream release includes equivalent fallback-chain recognition, retaining the CLI and no-backfill regression coverage.
