@@ -1092,7 +1092,7 @@ def auto_title_session(
         if persisted is not None:
             logger.debug("Auto-generated session title: %s", persisted)
             _notify_title(
-                title_callback, persisted, source, "Auto-title", display_title=(persisted if source == "derived" else title),
+                title_callback, persisted, source, "Auto-title", display_title=persisted,
                 icon=(chosen_icon[0] if chosen_icon and source == "llm" else None),
             )
     except Exception as e:
