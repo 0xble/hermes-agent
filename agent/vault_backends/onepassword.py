@@ -436,7 +436,7 @@ class OnePasswordLoginBackend(LoginBackend):
                                                    for f in fields):
                 return None
             available = any(f["type"] == "OTP" for f in fields)
-        except Exception:
+        except (RuntimeError, UnlockRequired, OSError, ValueError, TypeError, AttributeError):
             # A lookup failure is unknown, not evidence that the item has no OTP.
             return None
         row["_hermes_otp_available"] = available
