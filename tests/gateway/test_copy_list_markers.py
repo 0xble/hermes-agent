@@ -67,13 +67,19 @@ def test_list_markers_at_message_boundaries_do_not_leak_or_swallow_text(prefix, 
     assert "".join(stream.feed(ch) for ch in prefix + close) == ""
     stream.message_boundary()
     assert stream.feed("After") + stream.flush() == "After"
+    # A genuinely partial marker, unlike a list token, still spans messages.
+    stream = CopyMarkerStreamFilter(drop_bodies=True)
+    assert stream.feed(prefix + "[[co") == ""
+    stream.message_boundary()
+    assert stream.feed("py]]\nexact\n[[/copy]]\nAfter") + stream.flush() == "After"
+
     # Incomplete or ordinary list text is released unchanged at end of response.
     for tail in (prefix, prefix + "[[co", prefix + "[[copy]] with explanation", "123", "-body"):
         stream = CopyMarkerStreamFilter(drop_bodies=True)
         assert "".join(stream.feed(ch) for ch in tail) + stream.flush() == tail
 
 
-@pytest.mark.parametrize("tail", ["42", "-", "3.", "+", "•", " * ", " 27) "])
+@pytest.mark.parametrize("tail", ["42", "-", "3.", "+", "•", " * ", " 27) ", "- 42", "1. 2", "* -", "1. ", "- ", " \t"])
 @pytest.mark.parametrize("drop_bodies", [True, False])
 def test_list_token_at_message_end_cannot_absorb_next_copy_marker(tail, drop_bodies):
     stream = CopyMarkerStreamFilter(drop_bodies=drop_bodies)

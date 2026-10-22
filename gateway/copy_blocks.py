@@ -214,7 +214,9 @@ class CopyMarkerStreamFilter:
         if self._pending and self._is_marker(self._pending):
             self._on_marker(self._pending)
             self._pending = ""
-        elif self._pending and _LIST_TOKEN_RE.fullmatch(self._pending.strip()):
+        elif self._pending and (
+            not (token := _marker_text(self._pending).strip()) or _LIST_TOKEN_RE.fullmatch(token)
+        ):
             if self._emit():
                 self._boundary_text += self._pending
             self._pending = ""
