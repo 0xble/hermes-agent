@@ -120,6 +120,8 @@ def _check_vault_available() -> bool:
 
 _check_vault_available = no_cache_check_fn(_check_vault_available)
 
+_check_vault_available = no_cache_check_fn(_check_vault_available)
+
 # ---------------------------------------------------------------------------
 # JS evaluation plumbing (server-side; results never carry secret values)
 # ---------------------------------------------------------------------------
@@ -367,6 +369,9 @@ def _browser_account_refusal(backend, task_id: str) -> Optional[str]:
 def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None) -> str:
     """List filtered vault handles + metadata across enabled backends. Passwords are never included.
 
+    Login ``otp_available`` is true/false when known, null when unknown. One
+    unambiguous origin-filtered CLI login may lazily inspect field metadata;
+    unfiltered listings only reuse cached availability.
     A locked external manager contributes no items; instead it is reported under ``locked`` so the
     agent knows to call browser_vault_fill (which prompts the user to unlock) or tell the user.
     """
@@ -404,23 +409,37 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
         except Exception as exc:
             errors.append({"backend": backend.name, "error": str(exc)[:200]})
             continue
+        metas = [meta for meta in metas
+                 if (kind is None or meta.kind == kind)
+                 and (origin is None or not (meta.origin or meta.allowed_origins)
+                      or origin in (meta.allowed_origins or (meta.origin,)))]
+        # One origin-selected login may need a detail lookup. An unfiltered or
+        # ambiguous listing must not turn into account-wide field reads.
+        from agent.vault_backends.onepassword import OnePasswordLoginBackend
+        selected_logins = [meta for meta in metas if meta.kind == "login"]
         for meta in metas:
-            if kind is not None and meta.kind != kind:
-                continue
-            if origin is not None and (meta.origin or meta.allowed_origins) and origin not in (
-                    meta.allowed_origins or (meta.origin,)):
-                continue
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
                      "origin": meta.origin,
                      # A manager's card has no origin of its own; it binds to the current page at fill time.
                      "available": meta.kind == "login" or bool(meta.origin) or (meta.kind == "payment" and backend.binds_cards_to_page)}
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
-            if meta.has_otp or backend.needs_unlock:
-                entry["two_factor"] = ("automatic" if meta.has_otp else
+            otp_available = meta.has_otp
+            if meta.kind == "login":
+                if not otp_available and isinstance(backend, OnePasswordLoginBackend):
+                    otp_available = backend.otp_availability(
+                        meta.id, fetch=(origin is not None and len(selected_logins) == 1
+                                        and origin in (meta.allowed_origins or (meta.origin,))))
+                elif not otp_available and backend.needs_unlock:
+                    otp_available = None
+                entry["otp_available"] = otp_available
+            if meta.kind == "login" or otp_available or backend.needs_unlock:
+                entry["two_factor"] = ("automatic" if otp_available else
                                         "automatic if the manager stores a TOTP seed, else fetch the newest matching code "
                                         "from the intended 1Password item, mailbox, or phone; ask the user only when no "
                                         "supported source exists")
+                if meta.kind == "login" and otp_available is False:
+                    entry["two_factor"] = "No stored TOTP field; fetch the newest matching code from the intended mailbox or phone."
             if meta.identifier:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type
