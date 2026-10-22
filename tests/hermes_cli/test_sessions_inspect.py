@@ -64,6 +64,71 @@ def test_state_cli_matches_tool_json(monkeypatch, tmp_path, capsys, argv, tool_a
         db.close()
 
 
+@pytest.mark.parametrize("inherited_profile", ["default", "other"])
+@pytest.mark.parametrize("explicit_profile", [False, True])
+def test_state_cli_selected_home_owns_profile(monkeypatch, tmp_path, inherited_profile, explicit_profile):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from gateway.delivery_ledger import _initialize_schema
+    from hermes_state import SessionDB
+    from tools.environments.local import build_subprocess_env
+
+    root = tmp_path / ".hermes"
+    home = root / "profiles" / "work"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        db.create_session("topic-id", "telegram", profile_name="work", session_key="agent:work:1")
+        db.create_session("foreign-id", "telegram", profile_name="other", session_key="agent:other:1")
+        db.apply_telegram_topic_migration()
+        db.bind_telegram_topic(
+            chat_id="42", thread_id="7", user_id="user", session_key="agent:work:1",
+            session_id="topic-id", profile_name="work",
+        )
+        db._execute_write(_initialize_schema)
+        db._write_sql(
+            "INSERT INTO delivery_obligations "
+            "(obligation_id, session_key, platform, chat_id, content, state, attempts, "
+            "created_at, updated_at, adapter_profile) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("ob-1", "agent:work:1", "telegram", "42", "private", "pending", 0, 1, 1, "work"),
+        )
+    finally:
+        db.close()
+
+    env = build_subprocess_env(extra={
+        "HOME": str(tmp_path / "user"), "HERMES_HOME": str(root if explicit_profile else home),
+        "HERMES_SESSION_PROFILE": inherited_profile,
+    })
+    prefix = [sys.executable, "-m", "hermes_cli.main"]
+    if explicit_profile:
+        prefix += ["-p", "work"]
+    cases = [
+        (["resolve-topic", "--chat-id", "42", "--thread-id", "7"], "binding", "profile_name", "work"),
+        (["inspect", "--session-id", "topic-id"], "session", "profile_name", "work"),
+        (["delivery", "--session-id", "topic-id"], "rows", "adapter_profile", "work"),
+        (["delivery", "--session-key", "agent:work:1"], "rows", "adapter_profile", "work"),
+        (["delivery", "--obligation-id", "ob-1"], "rows", "adapter_profile", "work"),
+        (["inspect", "--session-id", "foreign-id"], None, None, None),
+    ]
+    for argv, field, owner_key, owner in cases:
+        result = subprocess.run(
+            [*prefix, "sessions", "state", *argv], env=env,
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        assert payload["found"] is (field is not None), (argv, payload)
+        if field:
+            rows = payload[field] if field == "rows" else [payload[field]]
+            assert rows and all(row[owner_key] == owner for row in rows)
+            assert all("content" not in row for row in rows)
+
+
 def test_state_cli_not_found_does_not_create_store(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     code, result = _run_cli(capsys, "state", "inspect", "--session-id", "missing")

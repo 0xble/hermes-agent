@@ -11,6 +11,7 @@ def _print_result(result: str) -> int:
 
 
 def cmd_session_state(args) -> int:
+    from hermes_constants import get_hermes_home, profile_name_for_home
     from tools.session_state_tool import session_state_tool
 
     selectors = {
@@ -18,7 +19,8 @@ def cmd_session_state(args) -> int:
         ("chat_id", "thread_id", "session_id", "session_key", "obligation_id", "include_content")
         if getattr(args, name, None) is not None
     }
-    return _print_result(session_state_tool({"action": args.state_action, **selectors}))
+    profile = profile_name_for_home(get_hermes_home()) or "default"
+    return _print_result(session_state_tool({"action": args.state_action, **selectors}, profile=profile))
 
 
 def cmd_session_search(args) -> int:

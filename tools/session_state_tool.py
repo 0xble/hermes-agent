@@ -240,7 +240,7 @@ _ACTION_HANDLERS = {
 }
 
 
-def session_state_tool(args: dict, **_kwargs: Any) -> str:
+def session_state_tool(args: dict, *, profile: str | None = None, **_kwargs: Any) -> str:
     action = str(args.get("action") or "").strip().lower()
     if action not in _ACTIONS:
         return tool_error("action must be resolve_topic, inspect_session, or inspect_delivery")
@@ -256,7 +256,8 @@ def session_state_tool(args: dict, **_kwargs: Any) -> str:
         )
         if len(selectors) > 1:
             return tool_error("inspect_delivery accepts exactly one of obligation_id, session_key, or session_id")
-    profile = _profile()
+    # Native calls keep the bound turn scope. A standalone CLI supplies its selected home owner.
+    profile = _profile() if profile is None else profile
     profile_path = _db_path()
     delivery_path = _delivery_db_path() if action == "inspect_delivery" else profile_path
     if not delivery_path.is_file():
