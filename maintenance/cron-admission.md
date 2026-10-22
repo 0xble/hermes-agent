@@ -25,8 +25,10 @@ A finished waiter future or terminal execution row does not release the
 reservation while its detached process remains live. Only the existing
 owner-fenced running-job release returns it. The healthy built-in ticker
 waits to the earliest eligible deadline, bounded by its 60-second heartbeat,
-and checks worker-release wakes within 0.25 seconds. Retain fd-exhaustion
-backoff and shutdown responsiveness.
+and checks worker-release wakes within 0.25 seconds. Due-time and release wakes
+add scans without shifting the fixed-period heartbeat deadline. Overruns
+rebaseline instead of bursting. Retain fd-exhaustion backoff and shutdown
+responsiveness.
 
 ## Update
 
@@ -44,8 +46,11 @@ contract under general-pool saturation.
 stamps against a fake clock with all 4 general workers blocked, 2 protected
 jobs, FIFO overflow, long runs, completion rearming, per-job exclusion,
 profile deadlines, and both terminal-row and waiter-error process-exit fences.
-Also run the existing parallel-pool, scheduler-provider, restart-safe-worker,
-registration-ownership, cancellation, and multiplex-release regressions.
+`tests/cron/test_admission_wakes.py` checks periodic phase, early overruns,
+and failure backoff in both ticker modes, plus zero-wait stop observation.
+Also run ticker drift, virtual-clock soak, parallel-pool, scheduler-provider,
+restart-safe-worker, registration-ownership, cancellation, and multiplex-release
+regressions.
 Run immediate-run tool tests separately. Source qualification is not live
 acceptance: after separately authorized activation, verify the protected job's
 actual worker start is at most 120 seconds after its preceding `finished_at`.

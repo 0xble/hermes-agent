@@ -1,5 +1,6 @@
 """Completion-cadence admission with saturated general workers and detached-process fencing."""
 
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -34,6 +35,20 @@ def clock_home(tmp_path, monkeypatch):
         admission._reserved_claims.clear()
         admission._loaded_protected.clear()
         admission._wake.clear()
+
+
+def _process_until_exit(exited):
+    process = Mock(pid=4321)
+    process.poll.side_effect = lambda: 0 if exited.is_set() else None
+
+    def wait(timeout=None):
+        if not exited.wait(timeout):
+            assert timeout is not None
+            raise subprocess.TimeoutExpired("cron-worker", timeout)
+        return 0
+
+    process.wait.side_effect = wait
+    return process
 
 
 def make_job(schedule="every 2m"):
@@ -200,9 +215,7 @@ def test_reserved_slot_survives_post_handoff_waiter_error_until_process_exit(clo
     """A terminal ledger row and a finished future must not free the reserved worker."""
     protected = make_job()
     exited = threading.Event()
-    process = Mock(pid=4321)
-    process.poll.side_effect = lambda: 0 if exited.is_set() else None
-    process.wait.side_effect = lambda timeout=None: 0 if exited.wait(timeout) else None
+    process = _process_until_exit(exited)
     monkeypatch.setattr(scheduler, "get_execution", Mock(side_effect=RuntimeError("ledger read failed")))
 
     def launch(item):
@@ -232,9 +245,7 @@ def test_reserved_slot_survives_post_handoff_waiter_error_until_process_exit(clo
 def test_terminal_row_keeps_reserved_worker_until_process_exit(clock_home, monkeypatch):
     protected = make_job()
     exited, observed_terminal = threading.Event(), threading.Event()
-    process = Mock(pid=4321)
-    process.poll.side_effect = lambda: 0 if exited.is_set() else None
-    process.wait.side_effect = lambda timeout=None: 0 if exited.wait(timeout) else None
+    process = _process_until_exit(exited)
 
     def terminal_row(execution_id):
         observed_terminal.set()
@@ -252,6 +263,8 @@ def test_terminal_row_keeps_reserved_worker_until_process_exit(clock_home, monke
     try:
         future = admission.submit_reserved(protected, launch)
         assert observed_terminal.wait(5)
+        assert process.poll() is None
+        assert scheduler.is_job_running(protected["id"])
         assert not future.done()
         assert admission.submit_reserved(make_job(), lambda item: True) is None
         exited.set()

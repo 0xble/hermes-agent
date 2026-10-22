@@ -487,6 +487,7 @@ class InProcessCronScheduler(CronScheduler):
         consecutive_failures = 0
         next_tick = time.monotonic()
         while not stop_event.is_set():
+            tick_started = time.monotonic()
             begin_tick()
             ok = False
             try:
@@ -526,7 +527,11 @@ class InProcessCronScheduler(CronScheduler):
                 _guarded_store_write(clear_ticker_error, "error clear")
                 consecutive_failures = 0
             wait_for = _backoff_wait_seconds(interval, consecutive_failures)
-            next_tick += wait_for
+            if consecutive_failures:
+                next_tick = tick_started
+            # Due-time and release wakes add scans without moving the periodic deadline.
+            if tick_started >= next_tick:
+                next_tick += wait_for
             now = time.monotonic()
             if next_tick < now:
                 # Tick overran interval or host was suspended; re-anchor to avoid
@@ -593,6 +598,7 @@ class InProcessCronScheduler(CronScheduler):
         consecutive_failures = 0
         next_tick = time.monotonic()
         while not stop_event.is_set():
+            tick_started = time.monotonic()
             begin_tick()
             ok = False
             _tick_error = None
@@ -671,7 +677,11 @@ class InProcessCronScheduler(CronScheduler):
             if ok:
                 consecutive_failures = 0
             wait_for = _backoff_wait_seconds(interval, consecutive_failures)
-            next_tick += wait_for
+            if consecutive_failures:
+                next_tick = tick_started
+            # Due-time and release wakes add scans without moving the periodic deadline.
+            if tick_started >= next_tick:
+                next_tick += wait_for
             now = time.monotonic()
             if next_tick < now:
                 # Tick overran interval or host was suspended; re-anchor to avoid

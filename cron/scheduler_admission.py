@@ -152,13 +152,19 @@ def begin_tick() -> None:
 
 def wait_for_next_tick(stop_event, timeout, *, max_wait, failures=0, profile_homes=None):
     wait = min(timeout, max_wait)
-    if not failures:
-        wait = due_wait_for_homes(wait, profile_homes)
+    if failures:
+        # Slot releases must not turn fd-exhaustion backoff into a retry burst.
+        stop_event.wait(wait)
+        return
+    wait = due_wait_for_homes(wait, profile_homes)
     wait_for_tick(stop_event, wait)
 
 
 def wait_for_tick(stop_event, timeout: float) -> None:
     """Slot releases interrupt the deadline wait. Keep stop_event's shutdown bound small too."""
+    if timeout <= 0:
+        stop_event.wait(0)
+        return
     deadline = time.monotonic() + timeout
     while not stop_event.is_set():
         if _wake.is_set():
