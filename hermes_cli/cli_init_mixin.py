@@ -177,9 +177,24 @@ class CLIInitMixin:
         _model_config = CLI_CONFIG["model"]
         # A dict-valued default carries its own provider, which must feed requested_provider
         # instead of being replaced by the merged model.provider (typically "auto").
-        _config_model, _nested_provider = _split_model_config_default(
-            _model_config.get("default") or _model_config.get("model") or ""
-        )
+        # @name and {model_preset: name} resolve through the shared default route so
+        # startup never treats the reference itself as a model id.
+        from hermes_cli.model_preset_runtime import resolve_default_route
+        from hermes_cli.model_presets import ModelPresetError
+
+        _route = None
+        try:
+            _route = resolve_default_route(CLI_CONFIG)
+        except ModelPresetError:
+            _route = None
+        if _route is not None and _route.name and _route.model:
+            _config_model, _nested_provider = _route.model, _route.provider
+            if _nested_provider and _nested_provider != _model_config.get("provider"):
+                _model_config["provider"] = _nested_provider
+        else:
+            _config_model, _nested_provider = _split_model_config_default(
+                _model_config.get("default") or _model_config.get("model") or ""
+            )
         # resume must not clobber an explicit -m with the session's stored model.
         self._explicit_model_override = bool(model)
         self.model = model or _config_model or ""

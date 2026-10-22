@@ -209,7 +209,7 @@ def explicit_parent_reasoning(parent_agent) -> Any:
     return override
 
 
-def _resolve_child_service_tier(parent_agent, explicit_overrides: Optional[Dict[str, Any]]) -> Optional[str]:
+def _resolve_child_service_tier(parent_agent, explicit_overrides: Optional[dict[str, Any]]) -> Optional[str]:
     """The child's Fast mode: the parent's mode verbatim when inheritance is on.
 
     The mode, not the parent's wire fields, crosses to the child, so a pinned
@@ -232,9 +232,9 @@ def _resolve_child_request_overrides(
     child_model: Optional[str],
     child_provider: Optional[str],
     child_base_url: Optional[str],
-    explicit_overrides: Optional[Dict[str, Any]],
+    explicit_overrides: Optional[dict[str, Any]],
     inherit_parent_route: bool,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Resolve child request overrides without leaking transient parent fast state.
 
     Non-fast parent overrides remain available when the child stays on the parent's
@@ -542,8 +542,10 @@ def _load_config() -> dict:
             cfg = load_config_readonly().get("delegation") or {}
             if isinstance(cfg, dict):
                 return cfg
-        except Exception:
-            pass
+        except Exception as exc:
+            from hermes_cli.model_presets import ModelPresetError
+            if isinstance(exc, ModelPresetError):
+                raise
     try:
         from cli import CLI_CONFIG
         cfg = CLI_CONFIG.get("delegation") or {}

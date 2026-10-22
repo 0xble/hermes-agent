@@ -12,7 +12,11 @@ def _env_model_seed() -> str:
 def _resolve_model() -> str:
     if env := _env_model_seed():
         return env
-    m = _load_cfg().get("model", "")
+    cfg = _load_cfg()
+    route = _default_route(cfg)
+    if route is not None and route.model:
+        return route.model
+    m = cfg.get("model", "")
     if isinstance(m, dict):
         return str(m.get("default", "") or "").strip()
     if isinstance(m, str) and m:
@@ -22,6 +26,24 @@ def _resolve_model() -> str:
         from hermes_cli.models import get_preferred_silent_default_model
         return get_preferred_silent_default_model()
     return "z-ai/glm-5.2"
+
+
+def _default_route(cfg: dict):
+    """Concrete default route, or None when the config has no preset to resolve.
+
+    A literal ``@cf/...`` model id is not a preset reference and stays as written.
+    An unknown preset fails open here: startup still has the raw config to read.
+    """
+    with contextlib.suppress(Exception):
+        from hermes_cli.model_preset_runtime import resolve_default_route
+        from hermes_cli.model_presets import ModelPresetError
+        try:
+            route = resolve_default_route(cfg)
+        except ModelPresetError:
+            return None
+        if route.model:
+            return route
+    return None
 
 
 def _resolve_session_platform() -> str:
@@ -44,8 +66,16 @@ def _resolve_agent_platform(source: str | None) -> str:
 def _config_model_target() -> tuple[str, str]:
     """(model, provider) selected by config.yaml — and ONLY config: the HERMES_MODEL launch seed fed into
     the per-turn sync would be replayed as a /model switch and persisted globally, or pin the session so
-    dashboard/CLI model changes never reach an open chat. Empty model = "no preference" → no-op sync."""
-    cfg_model = _load_cfg().get("model")
+    dashboard/CLI model changes never reach an open chat. Empty model = "no preference" → no-op sync.
+
+    ``@name`` and ``{model_preset: name}`` resolve to the preset's model and provider.
+    """
+    cfg = _load_cfg()
+    route = _default_route(cfg)
+    if route is not None and route.name and route.model:
+        provider = route.provider
+        return route.model, "" if provider.lower() == "auto" else provider
+    cfg_model = cfg.get("model")
     if isinstance(cfg_model, dict):
         provider = str(cfg_model.get("provider") or "").strip()
         return str(cfg_model.get("default", "") or "").strip(), "" if provider.lower() == "auto" else provider
@@ -268,10 +298,10 @@ def _display_mouse_tracking(display: dict) -> str:
 
 
 def _load_reasoning_config(model: str = "") -> dict | None:
-    """Via the shared chokepoint :func:`hermes_constants.resolve_reasoning_config` (per-model override >
-    global ``agent.reasoning_effort``; YAML False = disabled).
+    """Via the shared chokepoint :func:`hermes_constants.resolve_reasoning_config`.
 
-    Closes #21256.
+    Precedence lives there: the default route's declared preset effort, then the
+    per-model override, then global ``agent.reasoning_effort``. YAML False = disabled.
     """
     from hermes_constants import resolve_reasoning_config
     return resolve_reasoning_config(_load_cfg(), model)

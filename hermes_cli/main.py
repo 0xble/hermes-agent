@@ -1193,6 +1193,7 @@ def _confirm_startup_expensive_model_override(args) -> None:
 
     try:
         from hermes_cli.config import load_config
+        from hermes_cli.model_preset_runtime import resolve_default_route
         from hermes_cli.model_selection_guards import (
             combined_message,
             selection_warnings,
@@ -1211,7 +1212,7 @@ def _confirm_startup_expensive_model_override(args) -> None:
     model_cfg = _dict(config.get("model"))
     security_cfg = _dict(config.get("security"))
 
-    model = explicit_model or (model_cfg.get("default") or "").strip()
+    model = explicit_model or resolve_default_route(config).model or (model_cfg.get("default") or "").strip()
     if not model:
         return
     provider = (explicit_provider or model_cfg.get("provider") or "").strip()

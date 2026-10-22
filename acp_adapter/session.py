@@ -508,12 +508,16 @@ class SessionManager:
         from hermes_constants import resolve_reasoning_config
 
         config = load_config()
-        model_cfg = config.get("model")
-        default_model, config_provider = "", None
-        if isinstance(model_cfg, dict):
-            default_model, config_provider = str(model_cfg.get("default") or ""), model_cfg.get("provider")
-        elif isinstance(model_cfg, str):
-            default_model = model_cfg.strip()
+        from hermes_cli.model_preset_runtime import resolve_default_route
+        route = resolve_default_route(config)
+        default_model = route.model
+        config_provider = route.provider or None
+        if not default_model:
+            model_cfg = config.get("model")
+            if isinstance(model_cfg, dict):
+                default_model, config_provider = str(model_cfg.get("default") or ""), model_cfg.get("provider")
+            elif isinstance(model_cfg, str):
+                default_model = model_cfg.strip()
 
         if enabled_toolsets is None:
             # The same per-platform resolver as the gateway/cron/api_server: platform_toolsets.acp wins, else

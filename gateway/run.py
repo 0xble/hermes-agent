@@ -2369,9 +2369,15 @@ def _resolve_runtime_agent_kwargs() -> dict:
 
     # Capture primary provider/model from config before the try block so we
     # can include it in the fallback notice if the primary fails (#74349).
-    _model_cfg = _get_model_config()
-    _primary_model = (_model_cfg.get("default") or "").strip()
-    _primary_provider = (_model_cfg.get("provider") or "").strip()
+    from hermes_cli.model_preset_runtime import resolve_default_route
+    _primary_route = resolve_default_route(_load_gateway_config())
+    if not _primary_route.model and not _primary_route.provider:
+        _legacy_route = _get_model_config()
+        _primary_model = str(_legacy_route.get("default") or _legacy_route.get("model") or "").strip()
+        _primary_provider = str(_legacy_route.get("provider") or "").strip()
+    else:
+        _primary_model = _primary_route.model.strip()
+        _primary_provider = _primary_route.provider.strip()
 
     try:
         runtime, fallback_entry = resolve_runtime_with_fallback(_load_gateway_config())
@@ -2443,23 +2449,30 @@ def _resolve_gateway_model_context(
     def _read_config() -> None:
         nonlocal config_context_length, provider, base_url, custom_providers
         nonlocal configured_model, configured_provider, configured_base_url
-        data = _load_gateway_config()
+        data = _load_gateway_runtime_config()
         if not data:
             return
         model_cfg = data.get("model", {})
         if isinstance(model_cfg, dict):
-            configured_model = model_cfg.get("default") or model_cfg.get("model")
-            raw_ctx = model_cfg.get("context_length")
-            if raw_ctx is not None:
+            _raw_ctx = model_cfg.get("context_length")
+            if _raw_ctx is not None:
                 with suppress(TypeError, ValueError):
-                    config_context_length = int(raw_ctx)
-            configured_provider = provider = model_cfg.get("provider") or None
-            configured_base_url = base_url = model_cfg.get("base_url") or None
+                    config_context_length = int(_raw_ctx)
+        from hermes_cli.model_preset_runtime import resolve_default_route
+        route = resolve_default_route(data)
+        configured_model = route.model or None
+        configured_provider = provider = route.provider or None
+        configured_base_url = base_url = route.base_url or None
         try:
             from hermes_cli.config import get_compatible_custom_providers
             custom_providers = get_compatible_custom_providers(data)
         except Exception:
             custom_providers = data.get("custom_providers")
+        if not configured_base_url:
+            from hermes_cli.providers import resolve_custom_provider
+            named = resolve_custom_provider(configured_provider or "", custom_providers)
+            if named is not None:
+                configured_base_url = named.base_url or None
 
     def _read_runtime() -> None:
         nonlocal provider, base_url, api_key, api_mode
@@ -2482,14 +2495,22 @@ def _resolve_gateway_model_context(
         # Drop a configured context_length pin when the effective route no longer matches (or on error).
         from hermes_cli.route_identity import should_clear_context_pin
         return not should_clear_context_pin(
-            configured_model, resolved_model, configured_base_url, base_url, configured_provider, provider)
+            configured_model, resolved_model, configured_base_url, base_url,
+            configured_provider, provider)
 
     def _custom_ctx() -> Optional[int]:
         from hermes_cli.config import get_custom_provider_context_length
         return get_custom_provider_context_length(
             model=resolved_model, base_url=base_url, custom_providers=custom_providers)
 
-    _best_effort(_read_config)
+    from hermes_cli.model_presets import ModelPresetError
+
+    try:
+        _read_config()
+    except ModelPresetError:
+        raise  # an invalid preset is an operator-visible config error, never a silent default
+    except Exception:
+        logger.debug("gateway model-context config read failed", exc_info=True)
     _best_effort(_read_runtime)
     if config_context_length is not None and not _best_effort(_pin_still_applies):
         config_context_length = None
@@ -2973,16 +2994,28 @@ def _checkpoint_agent_kwargs(config: dict | None) -> dict:
         "checkpoint_max_file_size_mb": cp_cfg.get("max_file_size_mb", defaults["max_file_size_mb"])}
 
 
+def _load_gateway_runtime_config(config: dict | None = None) -> dict:
+    """Load a raw gateway config and expand model presets at the runtime boundary."""
+    cfg = _load_gateway_config() if config is None else config
+    if (not isinstance(cfg, dict) or not cfg) and config is None:
+        config_path = _gateway_config_home() / "config.yaml"
+        if config_path.is_file():
+            from hermes_cli.config_effective import load_user_config_effective
+            cfg = load_user_config_effective(config_path, fail_closed=True)
+    if not isinstance(cfg, dict) or not cfg:
+        return {}
+    from hermes_cli.config import _expand_env_vars
+    from hermes_cli.model_presets import expand_model_presets
+    expanded = _expand_env_vars(cfg)
+    return expand_model_presets(expanded) if isinstance(expanded, dict) else {}
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml (single source of truth), else temporary AIAgents (e.g. /compress)
     use the hardcoded default, which fails under openai-codex."""
-    cfg = config if config is not None else _load_gateway_config()
-    model_cfg = cfg.get("model", {})
-    if isinstance(model_cfg, str):
-        return model_cfg
-    elif isinstance(model_cfg, dict):
-        return model_cfg.get("default") or model_cfg.get("model") or ""
-    return ""
+    cfg = _load_gateway_runtime_config(config)
+    from hermes_cli.model_preset_runtime import resolve_default_route
+    return resolve_default_route(cfg).model
 
 
 def _channel_override_lookup_keys(
@@ -4063,7 +4096,7 @@ class GatewayRunner(
     # Command-specific mid-run reject texts (busy_policy == "reject" with a busy_handler naming an
     # entry here); all other rejected commands get the generic text in _dispatch_busy_slash_command.
     # Values are catalog keys; ``run_busy._dispatch_busy_slash_command`` resolves them with ``t()``.
-    _BUSY_REJECT_TEXT: Dict[str, str] = {
+    _BUSY_REJECT_TEXT: dict[str, str] = {
         "codex-runtime": "gateway.busy.reject_codex_runtime"}
 
     def _active_profile_name(self) -> str:

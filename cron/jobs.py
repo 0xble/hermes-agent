@@ -1217,7 +1217,7 @@ def _cron_zone(timezone_name: Optional[str]):
     return get_timezone()
 
 
-def _in_job_zone(dt: datetime, job: Dict[str, Any]) -> datetime:
+def _in_job_zone(dt: datetime, job: dict[str, Any]) -> datetime:
     """*dt* expressed in a zoned job's own cron zone; unchanged for a job that follows the profile.
 
     The due scan compares stored wall clocks and cron lattices. A zoned job's stored offset is its
@@ -1230,7 +1230,7 @@ def _in_job_zone(dt: datetime, job: Dict[str, Any]) -> datetime:
 
 
 def compute_next_run(
-    schedule: Dict[str, Any], last_run_at: Optional[str] = None, job_timezone: Optional[str] = None,
+    schedule: dict[str, Any], last_run_at: Optional[str] = None, job_timezone: Optional[str] = None,
 ) -> Optional[str]:
     """Compute the next run time for a schedule as an ISO string, or None if no more runs.
     ``job_timezone`` is the job's own IANA zone for cron expressions (see normalize_job_timezone)."""
@@ -1590,7 +1590,7 @@ def _unlink_quiet(path: Optional[str]) -> None:
 
 
 def _stage_jobs_payload(
-    jobs_file: Path, jobs: List[Dict[str, Any]], *, document: Optional[Any] = None,
+    jobs_file: Path, jobs: list[dict[str, Any]], *, document: Optional[Any] = None,
 ) -> str:
     """Serialize the store payload to a fsynced temp file beside *jobs_file*; return its path.
 
@@ -1634,16 +1634,16 @@ def _parse_removed_at(value: Any) -> Optional[datetime]:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
-def _read_removed_jobs_lines(path: Path) -> List[str]:
+def _read_removed_jobs_lines(path: Path) -> list[str]:
     """Read the delete journal while preserving every decodable line."""
     return path.read_bytes().decode("utf-8-sig", errors="replace").splitlines()
 
 
-def get_removed_job_ids(since: Optional[datetime] = None) -> Set[str]:
+def get_removed_job_ids(since: Optional[datetime] = None) -> set[str]:
     """Return intentionally removed job ids, optionally limited to a time window.
 
     This is a best-effort read of the small per-profile journal used by the
@@ -1664,9 +1664,9 @@ def get_removed_job_ids(since: Optional[datetime] = None) -> Set[str]:
     boundary = since
     if boundary is not None:
         if boundary.tzinfo is None:
-            boundary = boundary.replace(tzinfo=timezone.utc)
-        boundary = boundary.astimezone(timezone.utc)
-    removed: Set[str] = set()
+            boundary = boundary.replace(tzinfo=UTC)
+        boundary = boundary.astimezone(UTC)
+    removed: set[str] = set()
     for line in lines:
         try:
             record = json.loads(line)
@@ -1688,10 +1688,10 @@ def _record_removed_jobs_unlocked(removed_ids: Collection[str]) -> None:
     removed_file = _removed_jobs_file()
     now = _hermes_now()
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    now_utc = now.astimezone(timezone.utc)
+        now = now.replace(tzinfo=UTC)
+    now_utc = now.astimezone(UTC)
     cutoff = now_utc - _REMOVED_JOBS_RETENTION
-    retained: List[Dict[str, str]] = []
+    retained: list[dict[str, str]] = []
     try:
         existing = _read_removed_jobs_lines(removed_file)
     except FileNotFoundError:
@@ -1720,7 +1720,7 @@ _SAVE_JOBS_MERGE_ATTEMPTS = 5
 
 
 def _save_jobs_unlocked(
-    jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
+    jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
     replace: bool = False, document: Optional[Any] = None,
 ):
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
@@ -1864,16 +1864,16 @@ def _main_model_pin() -> tuple[Optional[str], Optional[str]]:
 
     cfg_path = get_hermes_home() / "config.yaml"
     cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
-    model_cfg = cfg.get("model") or {}
-    model = model_cfg.get("default") or model_cfg.get("model") if isinstance(model_cfg, dict) else model_cfg
-    model = _normalize_job_optional_text(model)
-    if not model:
+    from hermes_cli.model_preset_runtime import resolve_default_route
+    route = resolve_default_route(cfg)
+    if not route.model:
         return None, None
-    provider = None
-    with contextlib.suppress(Exception):
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        provider = _normalize_job_optional_text(resolve_runtime_provider(requested=None).get("provider"))
-    return (provider.lower() if provider else None), model
+    provider = _normalize_job_optional_text(route.provider)
+    if not provider:
+        with contextlib.suppress(Exception):
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            provider = _normalize_job_optional_text(resolve_runtime_provider(requested=None).get("provider"))
+    return (provider.lower() if provider else None), route.model
 
 
 def _normalize_job_optional_text(
@@ -1982,7 +1982,7 @@ def _oneshot_past_grace_error(run_at: Any) -> ValueError:
 
 
 def _next_run_or_reject_past_oneshot(
-    parsed_schedule: Dict[str, Any], label: str, fallback_run_at: Any, what: str,
+    parsed_schedule: dict[str, Any], label: str, fallback_run_at: Any, what: str,
     job_timezone: Optional[str] = None,
 ) -> Optional[str]:
     """``compute_next_run`` that raises (after a warning log) for a one-shot outside the grace
@@ -2020,14 +2020,14 @@ def create_job(
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
     keep_pinned_lane: bool = False,
-    review: Optional[Dict[str, Any]] = None,
+    review: Optional[dict[str, Any]] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
     job_timezone: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
     hard_wall_timeout_seconds: Optional[float] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
     deliver defaults to "origin" when ``origin`` is given, else "local"; repeat None = forever.
@@ -2177,7 +2177,7 @@ def resolve_job_ref(ref: str) -> Optional[dict[str, Any]]:
     return _normalize_job_record(name_matches[0])
 
 
-def job_running_state(job: Dict[str, Any]) -> dict:
+def job_running_state(job: dict[str, Any]) -> dict:
     """Best-effort visibility without booting the scheduler in listing/tool processes."""
     if sys.modules.get("cron.scheduler") is not None:
         try:
@@ -2191,7 +2191,7 @@ def job_running_state(job: Dict[str, Any]) -> dict:
             "run_started_at": claim.get("started_at", claim.get("at")) if live else None}
 
 
-def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
+def list_jobs(include_disabled: bool = False) -> list[dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
@@ -2383,7 +2383,7 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
 def pause_job(
     job_id: str, reason: Optional[str] = None, *, run_result: Optional[dict] = None,
     interrupt_running: bool = True,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
     if not job:

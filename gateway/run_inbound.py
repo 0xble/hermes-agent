@@ -83,13 +83,13 @@ async def _admit_outbox_event(runner, event, source):
     )
     import uuid
 
-    home = getattr(runner, "_resolve_profile_home_for_source")(source)
+    home = runner._resolve_profile_home_for_source(source)
     profile = getattr(source, "profile", None) or "default"
     kind = event_kind(event)
     event_id = transport_id(event)
     if not event_id:
         event_id = uuid.uuid4().hex
-        setattr(event, "_outbox_transport_id", event_id)
+        event._outbox_transport_id = event_id
     store = store_for(home)
     turn_id = local_admission_turn(event, runner, home)
     if turn_id is None:
@@ -99,9 +99,9 @@ async def _admit_outbox_event(runner, event, source):
             event._outbox_admission_scope = event_admission_scope(event, runner, home)
     else:
         fresh = True  # Native queue/deferred replay retains its admitted turn.
-    setattr(event, "_outbox_turn_id", turn_id)
-    setattr(event, "_outbox_home", home)
-    setattr(event, "_outbox_duplicate", not fresh)
+    event._outbox_turn_id = turn_id
+    event._outbox_home = home
+    event._outbox_duplicate = not fresh
     if not fresh:
         logger.info("Telegram redelivery of admitted outbox turn %s; no second turn", turn_id)
     else:
@@ -140,8 +140,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
                 await authority.interrupt(actor, ref, handle.execution_generation)
 
     async def _hm_pre_gateway_dispatch_hook(
-        self, event: "MessageEvent", source: SessionSource
-    ) -> Optional["MessageEvent"]:
+        self, event: MessageEvent, source: SessionSource
+    ) -> Optional[MessageEvent]:
         """Gate ingress before auth: skip drops; rewrite replaces text; allow/None dispatches."""
         from gateway.run_inbound_hooks import GatewayInboundHooksMixin
         return await GatewayInboundHooksMixin._hm_pre_gateway_dispatch_hook(self, event, source)
@@ -360,7 +360,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             return False
 
     async def _hm_try_passive_fyi_relay(
-        self, event: "MessageEvent", source: SessionSource, session_key: str,
+        self, event: MessageEvent, source: SessionSource, session_key: str,
     ) -> bool:
         """Persist one unaddressed Telegram FYI relay without creating an agent turn."""
         from gateway.response_filters import is_passive_fyi_relay_event
@@ -420,7 +420,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
                             "Skipping duplicate passive FYI relay (message_id=%s) in session %s",
                             event.message_id, session_entry.session_id,
                         )
-                        setattr(event, "_agent_turn_succeeded", True)
+                        event._agent_turn_succeeded = True
                         return True
                 except Exception:
                     logger.debug("FYI relay duplicate lookup failed; falling back to a turn", exc_info=True)
@@ -443,7 +443,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
                 await self._refresh_agent_cache_message_count(session_key, session_entry.session_id)
             except Exception:
                 logger.debug("FYI relay agent-cache rebaseline failed", exc_info=True)
-            setattr(event, "_agent_turn_succeeded", True)
+            event._agent_turn_succeeded = True
             return True
         finally:
             if state.turn.agent is _AGENT_PENDING_SENTINEL and state.turn.event is event:
@@ -1004,7 +1004,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         return target if target.startswith("/") else f"/{target}"
 
     def _quick_command_alias_text(
-        self, event: "MessageEvent", profile_name: Optional[str] = None,
+        self, event: MessageEvent, profile_name: Optional[str] = None,
     ) -> Optional[str]:
         """Return the expanded text for a configured alias quick command, without mutating
         ``event``; ``None`` when the typed command is a built-in or no alias matches.
@@ -1045,7 +1045,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         return f"{target} {user_args}".strip()
 
     @classmethod
-    def _hm_expand_alias_quick_command(cls, event: "MessageEvent", qcmd: dict) -> Optional[str]:
+    def _hm_expand_alias_quick_command(cls, event: MessageEvent, qcmd: dict) -> Optional[str]:
         """Rewrite ``event.text`` to an alias quick command's target; returns the new command name."""
         target = cls._normalize_alias_target(qcmd)
         if target is None:
@@ -1351,7 +1351,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             return t("gateway.quick_command.error", error=e)
 
     @staticmethod
-    def _hm_is_registered_command(event: "MessageEvent") -> bool:
+    def _hm_is_registered_command(event: MessageEvent) -> bool:
         command = event.get_command()
         if not command:
             return False
@@ -1696,7 +1696,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             try:
                 if turn_id and not getattr(event, "_outbox_duplicate", False):
                     await asyncio.to_thread(
-                        store_for(getattr(event, "_outbox_home")).finish_admission,
+                        store_for(event._outbox_home).finish_admission,
                         turn_id, "completed" if result is not None else "empty")
             finally:
                 restore_turn(token)
@@ -1927,7 +1927,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             # preserves the attended route's same-turn semantics without delaying the sentinel claim.
             _attended_activity_marked = await self._mark_attended_user_activity(event, source, _quick_key)
             if _attended_activity_marked:
-                setattr(event, "_attended_activity_marked", True)
+                event._attended_activity_marked = True
             if not is_internal and not executing_admission.get():  # fail-open plugin consume, inside the claimed slot (#129958)
                 from gateway.run_inbound_consumer import run_post_admission_hook
                 _consumed, _consumer_reply = await run_post_admission_hook(self, event, source, _quick_key)
@@ -2081,7 +2081,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             return await self._enrich_message_with_vision(message_text, image_paths)
 
     async def _echo_stt_transcripts(
-        self, adapter, source: SessionSource, transcripts: List[str], *, event: MessageEvent,
+        self, adapter, source: SessionSource, transcripts: list[str], *, event: MessageEvent,
         metadata=None, log_context: str = "Transcript",
     ) -> None:
         """Send each transcript back as ``🎙️ "…"`` (best-effort; failures are logged, never raised)."""
@@ -2222,26 +2222,26 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         _msg_custom_providers = []
         with suppress(Exception):
             _msg_cfg = _load_gateway_config()
-            _msg_model_cfg = _msg_cfg.get("model", {})
-            if isinstance(_msg_model_cfg, dict):
-                _msg_raw_ctx = _msg_model_cfg.get("context_length")
-                if _msg_raw_ctx is not None:
-                    _msg_config_ctx = int(_msg_raw_ctx)
-            try:
-                from hermes_cli.config import get_compatible_custom_providers
+        _msg_cfg = _msg_cfg or {}
+        _msg_model_cfg = _msg_cfg.get("model", {})
+        from hermes_cli.model_preset_runtime import resolve_default_route
+        _msg_default_route = resolve_default_route(_msg_cfg)
+        if isinstance(_msg_model_cfg, dict):
+            _msg_raw_ctx = _msg_model_cfg.get("context_length")
+            if _msg_raw_ctx is not None:
+                _msg_config_ctx = int(_msg_raw_ctx)
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
 
-                _msg_custom_providers = get_compatible_custom_providers(_msg_cfg)
-            except Exception:
-                _msg_custom_providers = _msg_cfg.get("custom_providers") or []
+            _msg_custom_providers = get_compatible_custom_providers(_msg_cfg)
+        except Exception:
+            _msg_custom_providers = _msg_cfg.get("custom_providers") or []
         # GatewayRunner has no self._model/self._base_url; resolve the session's actual runtime.
         _msg_model, _msg_runtime = await self._resolve_session_agent_runtime_async(
             source=source, session_key=session_key, user_config=_msg_cfg,
         )
         _msg_base_url = _msg_runtime.get("base_url") or ""
-        if isinstance(_msg_model_cfg, dict):
-            _msg_configured_model = _msg_model_cfg.get("default") or _msg_model_cfg.get("model")
-        else:
-            _msg_configured_model = _msg_model_cfg  # (no dict → no pin was read; ctx is already None)
+        _msg_configured_model = _msg_default_route.model
         if _msg_model != _msg_configured_model:
             _msg_config_ctx = None
         if _msg_config_ctx is not None:
@@ -2250,8 +2250,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
 
                 if await should_clear_context_pin_async(
                     None, None,  # model match already checked above
-                    _msg_model_cfg.get("base_url"), _msg_base_url,
-                    _msg_model_cfg.get("provider"), _msg_runtime.get("provider"),
+                    _msg_default_route.base_url, _msg_base_url,
+                    _msg_default_route.provider, _msg_runtime.get("provider"),
                 ):
                     _msg_config_ctx = None
             except Exception:

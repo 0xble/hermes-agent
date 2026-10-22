@@ -475,6 +475,22 @@ def _roundtrip_dump(path: Path, yaml_rt, config, *, extra_content: str | None = 
     _atomic_write(path, _write, prefix=f".{path.stem}_", mode=_preserve_file_mode(path))
 
 
+def _roundtrip_delete_key(current, key) -> None:
+    """Drop a key's inline comment, but retain standalone comments before its next sibling."""
+    # ruamel attaches those standalone comments to the deleted key's end-of-line token.
+    comment = current.ca.items.get(key)
+    token = comment[2] if comment else None
+    trailing = token.value.partition("\n")[2] if token else ""
+    siblings = list(current)
+    if trailing.strip() and key in current and siblings.index(key) + 1 < len(siblings):
+        following = siblings[siblings.index(key) + 1]
+        lines = trailing.rstrip("\n").splitlines()
+        indent = min(len(line) - len(line.lstrip()) for line in lines if line.strip())
+        text = "\n".join(line.strip().removeprefix("#").removeprefix(" ") for line in lines)
+        current.yaml_set_comment_before_after_key(following, before=text, indent=indent)
+    current.pop(key, None)
+
+
 def atomic_roundtrip_yaml_update(path: str | Path, key_path: str, value: Any) -> None:
     """Update one dotted YAML key while preserving comments, ordering, quoting and Unicode.
 
@@ -495,7 +511,7 @@ def atomic_roundtrip_yaml_update(path: str | Path, key_path: str, value: Any) ->
 
     mkdir_under_hermes_home(path.parent)
     yaml_rt, config = _roundtrip_load(path)
-    current = config
+    current: CommentedMap = config
     keys = _split_key_path(key_path)
     i = 0
     while True:
@@ -503,7 +519,7 @@ def atomic_roundtrip_yaml_update(path: str | Path, key_path: str, value: Any) ->
         seg, consumed = _greedy_literal_match(dict(current), remaining) or (remaining[0], 1)
         if i + consumed == len(keys):
             if value is None:
-                current.pop(seg, None)
+                _roundtrip_delete_key(current, seg)
             else:
                 current[seg] = value
             break
@@ -598,7 +614,7 @@ def atomic_roundtrip_yaml_save(path: str | Path, new_state: dict, *,
             else:
                 dst[key] = _rt_value(value)
         for key in [k for k in dst if k not in src]:
-            del dst[key]
+            _roundtrip_delete_key(dst, key)
 
     _merge(existing, new_state)
     _roundtrip_dump(path, yaml_rt, existing, extra_content=extra_content_on_create if creating else None)

@@ -10172,7 +10172,8 @@ def test_config_set_model_requires_confirmation_for_expensive_model(monkeypatch)
     assert agent.switched is True
 
 
-def test_config_set_model_global_persists(monkeypatch):
+@pytest.mark.parametrize("slot", ["keep", "off"])
+def test_config_set_model_global_persists(monkeypatch, slot):
     from hermes_cli.config import get_config_path, read_user_config_raw
 
     class _Agent:
@@ -10200,7 +10201,10 @@ def test_config_set_model_global_persists(monkeypatch):
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", switch)
     monkeypatch.setattr(server, "_restart_slash_worker", lambda sid, session: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
-    config_path.write_text("model:\n  model_slots:\n    fast: keep\n", encoding="utf-8")
+    config_path.write_text(
+        f'model:\n  default: old/model\n  model_slots:\n    fast: "{slot}"\n',
+        encoding="utf-8",
+    )
 
     resp = server.handle_request(
         {
@@ -10220,7 +10224,8 @@ def test_config_set_model_global_persists(monkeypatch):
     assert saved_values["default"] == "anthropic/claude-sonnet-4.6"
     assert saved_values["provider"] == "anthropic"
     assert saved_values["base_url"] == "https://api.anthropic.com"
-    assert saved_values["model_slots"] == {"fast": "keep"}
+    assert saved_values["api_mode"] == "anthropic_messages"
+    assert saved_values["model_slots"] == {"fast": slot}
 
 
 def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatch):

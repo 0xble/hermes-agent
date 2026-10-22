@@ -304,6 +304,7 @@ gateway:
     choice_show: "show reasoning in replies"
     choice_hide: "hide reasoning from replies"
     set_global: "🧠 ✓ Reasoning effort set to `{effort}` (saved to config)\n_(takes effect on next message)_"
+    preset_owns_effort: "The `{preset}` preset sets the main route's effort to `{preset_effort}`. `{effort}` applies to other models."
     set_global_save_failed: "🧠 ✓ Reasoning effort set to `{effort}` (session only — config save failed)\n_(takes effect on next message)_"
     set_session: "🧠 ✓ Reasoning effort set to `{effort}` (session only — add `--global` to persist)\n_(takes effect on next message)_"
     quote_label_discord: "-# 💭 Reasoning"

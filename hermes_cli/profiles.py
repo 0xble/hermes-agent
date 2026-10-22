@@ -761,9 +761,15 @@ def _read_config_model(profile_dir: Path) -> tuple:
 
     def _read() -> tuple:
         try:
-            # load_config() targets the ACTIVE profile's home; read THIS profile's file raw.
+            # load_config() targets the ACTIVE profile's home; read THIS profile's file raw,
+            # then resolve a preset reference so the listing shows the concrete model.
             from hermes_cli.config import read_user_config_raw
-            model_cfg = read_user_config_raw(config_path).get("model", {})
+            from hermes_cli.model_preset_runtime import resolve_default_route
+            raw = read_user_config_raw(config_path)
+            route = resolve_default_route(raw)
+            if route.model:
+                return route.model, route.provider or None
+            model_cfg = raw.get("model", {})
             if isinstance(model_cfg, str):
                 return model_cfg, None
             if isinstance(model_cfg, dict):

@@ -35,9 +35,9 @@ from agent.fast_mode import STATIC_TIERS
 from agent.replay_cleanup import canonicalize_replay_history
 from agent.reasoning_effort import clamp_effort, route_supported_efforts
 from agent.voice_turn_route import session_runtime_view
-from agent.compaction_display import project_compaction_message_for_display  # noqa: F401
-from agent.skill_commands import describe_skill_invocation  # noqa: F401
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX  # noqa: F401
+from agent.compaction_display import project_compaction_message_for_display
+from agent.skill_commands import describe_skill_invocation
+from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe, pending_moa
 from hermes_state import _BARE_BILLING_PROVIDERS
 from tui_gateway.checkpoints import (_load_checkpoints_enabled, _resolve_checkpoint_hash,
@@ -1311,7 +1311,8 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
 def _active_config_path() -> Path:
     """config.yaml of the per-session profile override (session.resume) when bound, else the launch home."""
     override = get_hermes_home_override()
-    return Path(override if isinstance(override, str) and override else _hermes_home) / "config.yaml"
+    home = override if isinstance(override, str) and override else _launch_home()
+    return Path(home) / "config.yaml"
 
 
 def _load_cfg_raw() -> dict:
@@ -1563,21 +1564,6 @@ def _env_model_seed() -> str:
     return (os.environ.get("HERMES_MODEL", "") or os.environ.get("HERMES_INFERENCE_MODEL", "")).strip()
 
 
-def _resolve_model() -> str:
-    if env := _env_model_seed():
-        return env
-    m = _load_cfg().get("model", "")
-    if isinstance(m, dict):
-        return str(m.get("default", "") or "").strip()
-    if isinstance(m, str) and m:
-        return m.strip()
-    # No env seed / config preference: the cost-safe silent default (cache-only read), never an unpicked flagship.
-    with contextlib.suppress(Exception):
-        from hermes_cli.models import get_preferred_silent_default_model
-        return get_preferred_silent_default_model()
-    return "z-ai/glm-5.2"
-
-
 def _resolve_session_platform() -> str:
     """``HERMES_DESKTOP=1`` without ``HERMES_DESKTOP_TERMINAL`` → "desktop" (chat panel; the agent then
     suggests TUI-only slash commands), else "tui" (embedded terminal pane or standalone ``hermes --tui``)."""
@@ -1593,17 +1579,6 @@ def _resolve_session_source(explicit: str | None) -> str:
 
 def _resolve_agent_platform(source: str | None) -> str:
     return _resolve_session_source(source)
-
-
-def _config_model_target() -> tuple[str, str]:
-    """(model, provider) selected by config.yaml — and ONLY config: the HERMES_MODEL launch seed fed into
-    the per-turn sync would be replayed as a /model switch and persisted globally, or pin the session so
-    dashboard/CLI model changes never reach an open chat. Empty model = "no preference" → no-op sync."""
-    cfg_model = _load_cfg().get("model")
-    if isinstance(cfg_model, dict):
-        provider = str(cfg_model.get("provider") or "").strip()
-        return str(cfg_model.get("default", "") or "").strip(), "" if provider.lower() == "auto" else provider
-    return (cfg_model.strip() if isinstance(cfg_model, str) else ""), ""
 
 
 def _resolve_startup_runtime() -> tuple[str, str | None]:
@@ -1947,10 +1922,10 @@ def _display_mouse_tracking(display: dict) -> str:
 
 
 def _load_reasoning_config(model: str = "") -> dict | None:
-    """Via the shared chokepoint :func:`hermes_constants.resolve_reasoning_config` (per-model override >
-    global ``agent.reasoning_effort``; YAML False = disabled).
+    """Via the shared chokepoint :func:`hermes_constants.resolve_reasoning_config`.
 
-    Closes #21256.
+    Precedence lives there: the default route's declared preset effort, then the
+    per-model override, then global ``agent.reasoning_effort``. YAML False = disabled.
     """
     from hermes_constants import resolve_reasoning_config
     return resolve_reasoning_config(_load_cfg(), model)

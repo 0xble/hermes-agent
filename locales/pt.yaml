@@ -300,6 +300,7 @@ gateway:
     choice_show: "mostrar raciocínio nas respostas"
     choice_hide: "ocultar raciocínio das respostas"
     set_global: "🧠 ✓ Esforço de raciocínio definido como `{effort}` (guardado na configuração)\n_(produz efeito na próxima mensagem)_"
+    preset_owns_effort: "A predefinição `{preset}` define o esforço da rota principal como `{preset_effort}`. `{effort}` aplica-se aos outros modelos."
     set_global_save_failed: "🧠 ✓ Esforço de raciocínio definido como `{effort}` (apenas sessão — falha ao guardar a configuração)\n_(produz efeito na próxima mensagem)_"
     set_session: "🧠 ✓ Esforço de raciocínio definido como `{effort}` (apenas sessão — adiciona `--global` para persistir)\n_(produz efeito na próxima mensagem)_"
     quote_label_discord: "-# 💭 Raciocínio"

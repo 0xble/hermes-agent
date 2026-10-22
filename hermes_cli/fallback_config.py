@@ -131,7 +131,10 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     provider/model/base_url route as an earlier entry. The returned list always contains fresh dict
     copies.
     """
-    config = config or {}
+    # Raw effective config and already-expanded config share this boundary.
+    # Resolve the complete route before concrete-entry parsing can discard refs.
+    from hermes_cli.model_presets import expand_model_presets
+    config = expand_model_presets(config or {})
     chain: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for key in ("fallback_providers", "fallback_model"):
@@ -155,7 +158,9 @@ def get_cron_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any
     declared = cron.get("fallback_providers") if isinstance(cron, dict) else None
     if declared is None:
         return get_fallback_chain(config)
-    return get_fallback_chain({"fallback_providers": declared})
+    return get_fallback_chain({
+        "model_presets": config.get("model_presets"), "fallback_providers": declared,
+    })
 
 def scoped_fallback_chain(
     inherited: list[dict[str, Any]] | None, declared: Any, *, pinned: bool, owner: str,

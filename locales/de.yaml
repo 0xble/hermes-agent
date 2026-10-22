@@ -300,6 +300,7 @@ gateway:
     choice_show: "Reasoning in Antworten anzeigen"
     choice_hide: "Reasoning in Antworten ausblenden"
     set_global: "🧠 ✓ Reasoning-Stärke auf `{effort}` gesetzt (in Konfiguration gespeichert)\n_(wird mit der nächsten Nachricht wirksam)_"
+    preset_owns_effort: "Die Vorgabe `{preset}` setzt die Stärke der Hauptroute auf `{preset_effort}`. `{effort}` gilt für andere Modelle."
     set_global_save_failed: "🧠 ✓ Reasoning-Stärke auf `{effort}` gesetzt (nur Sitzung — Konfiguration konnte nicht gespeichert werden)\n_(wird mit der nächsten Nachricht wirksam)_"
     set_session: "🧠 ✓ Reasoning-Stärke auf `{effort}` gesetzt (nur Sitzung — `--global` hinzufügen, um zu speichern)\n_(wird mit der nächsten Nachricht wirksam)_"
     quote_label_discord: "-# 💭 Reasoning"

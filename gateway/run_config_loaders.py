@@ -155,9 +155,11 @@ class GatewayConfigLoadersMixin:
         """Reasoning effort from the owning profile's config.yaml via
         :func:`hermes_constants.resolve_reasoning_config`.
 
-        Per-model override > global ``agent.reasoning_effort``; YAML False = disabled. Empty
-        ``model`` uses ``model.default``. ``profile_home`` is supplied by multiplexed callers so
-        readback never falls through to the launch profile's config.
+        Precedence lives in that resolver: the default route's declared preset
+        effort, then the per-model override, then global ``agent.reasoning_effort``.
+        YAML False = disabled. Empty ``model`` uses the default route.
+        ``profile_home`` is supplied by multiplexed callers so readback never
+        falls through to the launch profile's config.
 
         Closes #21256.
         """
@@ -200,7 +202,7 @@ class GatewayConfigLoadersMixin:
                 and getattr(getattr(self, "config", None), "multiplex_profiles", False)
                 and source is not None and callable(resolve_profile_home)):
             profile_home = resolve_profile_home(source)
-        loader = getattr(self, "_load_reasoning_config")
+        loader = self._load_reasoning_config
         native_loader = getattr(type(self), "_load_reasoning_config", None)
         native_loader = getattr(native_loader, "__func__", native_loader)
         loader_func = getattr(loader, "__func__", loader)
@@ -685,11 +687,13 @@ class GatewayConfigLoadersMixin:
     @staticmethod
     def _load_fallback_model() -> list | None:
         """Fallback chain: ``fallback_providers`` (kept first) merged with legacy ``fallback_model``."""
-        from gateway.run import _load_gateway_config
+        from gateway.run import _load_gateway_runtime_config
         try:
-            # Canonical gateway loader (fail-open): managed overlay + ${VAR} expansion apply here too.
-            return get_fallback_chain(_load_gateway_config()) or None
-        except Exception:
+            return get_fallback_chain(_load_gateway_runtime_config()) or None
+        except Exception as exc:
+            from hermes_cli.model_presets import ModelPresetError
+            if isinstance(exc, ModelPresetError):
+                raise
             return None
 
     def _refresh_fallback_model(self) -> list | None:
@@ -728,6 +732,8 @@ class GatewayConfigLoadersMixin:
             logger.debug("fallback_providers refresh: config.yaml read failed; keeping last known-good chain", exc_info=True)
             self._fallback_model = by_home.get(home_key, self._fallback_model)
             return self._fallback_model
+        from hermes_cli.model_presets import expand_model_presets
+        cfg = expand_model_presets(cfg)
         by_home[home_key] = self._fallback_model = get_fallback_chain(cfg) or None
         return self._fallback_model
 
