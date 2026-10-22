@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from agent.i18n import t
 from gateway.platforms.event import MessageEvent
@@ -673,21 +673,30 @@ class GatewayModelCommandsMixin:
         chat_type = str(getattr(source, "chat_type", "") or "").lower()
         if chat_type not in {"dm", "direct", "private"}:
             return False
-        # An open inbound policy is not an owner grant for this destructive command. Reuse the
-        # canonical checker for restricted env allowlists, including adapter-resolved user IDs.
+        # A restricted env owner grant requires principal membership. General inbound
+        # authorization also accepts roles, relays, bots and pairing, which are not owner grants.
         from gateway.authz_mixin import (
-            _ALLOWED_USERS_ENV, _ALLOW_ALL_ENV, _auth_env, _coerce_allow_set, _env_truthy, _registry_entry,
+            GatewayAuthorizationMixin, _ALLOWED_USERS_ENV, _ALLOW_ALL_ENV, _auth_env, _coerce_allow_set, _env_truthy,
+            _principal_matches_allowlist, _registry_entry,
         )
 
         platform = getattr(source, "platform", None)
         entry = _registry_entry(platform)
         allow_env = _ALLOWED_USERS_ENV.get(platform) or getattr(entry, "allowed_users_env", "")
         allow_all_env = _ALLOW_ALL_ENV.get(platform) or getattr(entry, "allow_all_env", "")
-        configured = _coerce_allow_set(_auth_env(allow_env)) | _coerce_allow_set(_auth_env("GATEWAY_ALLOWED_USERS"))
-        if configured and "*" not in configured and not _env_truthy(allow_all_env) and self._is_user_authorized(source):
-            return True
-        # Adapter attribute fallbacks stay local. Do not widen shared inbound authorization with
-        # adapter implementation details.
+        platform_allowed = _coerce_allow_set(_auth_env(allow_env))
+        configured = platform_allowed | _coerce_allow_set(_auth_env("GATEWAY_ALLOWED_USERS"))
+        user_id = getattr(source, "user_id", None)
+        if (
+            configured and "*" not in configured and not _env_truthy(allow_all_env)
+            and user_id and not getattr(source, "is_bot", False)
+        ):
+            if platform_allowed:
+                configured |= cast(GatewayAuthorizationMixin, self)._adapter_resolved_allowlist_ids(source)
+            if _principal_matches_allowlist(source, user_id, configured):
+                return True
+        # Preserve the explicit adapter allow_from fallback, including its legacy wildcard.
+        # Keep these adapter attributes local rather than widening shared inbound authorization.
         adapter = self._delivery_adapter_for(source)
         extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
         raw_allow = extra.get("allow_from")

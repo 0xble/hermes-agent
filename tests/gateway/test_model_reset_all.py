@@ -148,6 +148,68 @@ def test_reset_all_dm_authorization_uses_shared_allowlist_without_promoting_open
     assert runner._model_reset_all_is_authorized(source) is expected
 
 
+@pytest.mark.parametrize(
+    "source_fields,adapter_fields,env,paired",
+    [
+        ({"role_authorized": True}, {}, {}, False),
+        ({"delivered_via_upstream_relay": True}, {}, {}, False),
+        ({}, {"authorization_is_upstream": True}, {}, False),
+        ({"is_bot": True}, {}, {"DISCORD_ALLOW_BOTS": "all"}, False),
+        ({"is_bot": True}, {}, {"DISCORD_ALLOW_BOTS": "mentions"}, False),
+        ({"is_bot": True, "user_id": "owner"}, {}, {}, False),
+        ({}, {}, {}, True),
+    ],
+    ids=["role", "relay", "upstream-adapter", "all-bots", "mention-bots", "owner-bot", "paired-user"],
+)
+def test_reset_all_does_not_promote_inbound_grants_to_owner(
+    monkeypatch, source_fields, adapter_fields, env, paired,
+):
+    for key in (
+        "DISCORD_ALLOWED_USERS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
+        "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "owner")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    runner = object.__new__(GatewayRunner)
+    platform_config = PlatformConfig(extra={})
+    runner.config = GatewayConfig(platforms={Platform.DISCORD: platform_config})
+    adapter = SimpleNamespace(config=platform_config, **adapter_fields)
+    monkeypatch.setattr(runner, "adapters", {Platform.DISCORD: adapter}, raising=False)
+    monkeypatch.setattr(runner, "_delivery_adapter_for", lambda source: adapter)
+    monkeypatch.setattr(runner, "_adapter_profile_for_source", lambda source: None)
+    if paired:
+        monkeypatch.setattr(runner, "pairing_store", SimpleNamespace(is_approved=lambda *_args: True), raising=False)
+    fields = {"platform": Platform.DISCORD, "user_id": "member", "chat_id": "dm", "chat_type": "dm"}
+    source = SessionSource(**(fields | source_fields))
+
+    assert runner._is_user_authorized(source) is True
+    assert runner._model_reset_all_is_authorized(source) is False
+
+
+@pytest.mark.parametrize(
+    "allow_key,expected",
+    [("DISCORD_ALLOWED_USERS", True), ("GATEWAY_ALLOWED_USERS", False)],
+)
+def test_reset_all_owner_uses_only_platform_allowlist_resolutions(monkeypatch, allow_key, expected):
+    for key in (
+        "DISCORD_ALLOWED_USERS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
+        "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(allow_key, "owner-name")
+    runner = object.__new__(GatewayRunner)
+    platform_config = PlatformConfig(extra={})
+    runner.config = GatewayConfig(platforms={Platform.DISCORD: platform_config})
+    adapter = SimpleNamespace(config=platform_config, resolved_allowlist_user_ids=lambda: {"owner-id"})
+    monkeypatch.setattr(runner, "adapters", {Platform.DISCORD: adapter}, raising=False)
+    monkeypatch.setattr(runner, "_delivery_adapter_for", lambda source: adapter)
+    source = SessionSource(platform=Platform.DISCORD, user_id="owner-id", chat_id="dm", chat_type="dm")
+
+    assert runner._model_reset_all_is_authorized(source) is expected
+
+
 @pytest.mark.asyncio
 async def test_reset_all_clears_sqlite_routing_picks_after_restart(tmp_path, monkeypatch):
     import asyncio
