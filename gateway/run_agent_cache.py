@@ -280,11 +280,14 @@ class GatewayAgentCacheMixin:
 
     async def _rehydrate_session_model_selection_async(self, session_key: str) -> None:
         """Restore role and concrete picks before capturing a turn's assignment."""
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return
         async with self._session_model_override_lock(session_key):
             state = self._session_state(session_key)
             if state.conversation.model_role is None:
                 state.conversation.model_role = await asyncio.to_thread(
-                    self.session_store.get_model_role, session_key)
+                    store.get_model_role, session_key)
             if self._session_model_override(session_key) is None:
                 epoch = self._session_model_override_epoch(session_key)
                 loaded = await asyncio.to_thread(self._load_session_model_override, session_key)
