@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
@@ -170,6 +171,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--interpreter",
         help="Absolute or ~ path to a Python for a .py script / monitor script. "
             "Pass empty string to clear (back to Hermes' Python).")
+
+    for job_parser in (cron_create, cron_edit):
+        job_parser.add_argument(
+            "--keep-pinned-lane", action=argparse.BooleanOptionalAction, default=None,
+            help="Keep explicit delivery targets pinned instead of converting them to the subject lane.",
+        )
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
