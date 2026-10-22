@@ -862,6 +862,7 @@ def try_register_running_job(job_id: str, *, owner=None, future=_FUTURE_PENDING)
 
 def release_running_job(
     job_id: str, home: Optional[Path | str] = None, *, owner=None, force: bool = False,
+    wake: bool = True,
 ) -> None:
     """Remove the registration unless an explicit ``owner`` has been replaced.
 
@@ -889,10 +890,10 @@ def release_running_job(
                 except Exception:
                     # Unknown liveness remains fenced; the reaper owns the forced path.
                     return
-        _drop_running_claim(key)
+        _drop_running_claim(key, wake=wake)
 
 
-def _drop_running_claim(key) -> None:
+def _drop_running_claim(key, *, wake: bool = True) -> None:
     """Drop a fenced claim under ``_running_lock`` and return its admission slot."""
     _running_registration_owners.pop(key, None)
     _running_job_ids.discard(key)
@@ -908,7 +909,7 @@ def _drop_running_claim(key) -> None:
     _restart_safe_waiter_job_ids.discard(key)
     _restart_safe_external_worker_job_ids.discard(key)
     from cron.scheduler_admission import worker_released
-    worker_released(key)
+    worker_released(key, wake=wake)
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -4697,7 +4698,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         _ctx = contextvars.copy_context()
     except Exception as execution_err:
         # Release the claim so the next tick retries instead of wedging "already running".
-        release_running_job(job_id, home=_claim_home, owner=registration_owner)
+        release_running_job(job_id, home=_claim_home, owner=registration_owner, wake=False)
         _clear_run_claim_best_effort()
         if execution is not None:  # the receipt was persisted; a later step failed
             settle_unstarted_execution(execution["id"], job_id, (
@@ -4716,7 +4717,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     try:
         fut = pool.submit(_run_and_release)
     except Exception as submit_err:
-        release_running_job(job_id, home=_claim_home, owner=registration_owner)
+        release_running_job(job_id, home=_claim_home, owner=registration_owner, wake=False)
         _clear_run_claim_best_effort()
         finish_execution(
             execution["id"], success=False, error=f"Executor dispatch failed: {submit_err}")

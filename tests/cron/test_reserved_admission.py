@@ -1,8 +1,9 @@
 """Completion-cadence admission with saturated general workers and detached-process fencing."""
 
+import errno
 import subprocess
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -18,7 +19,7 @@ from tests.waiting import wait_until
 
 @pytest.fixture
 def clock_home(tmp_path, monkeypatch):
-    clock = SimpleNamespace(now=datetime(2030, 1, 1, tzinfo=timezone.utc), elapsed=0.0)
+    clock = SimpleNamespace(now=datetime(2030, 1, 1, tzinfo=UTC), elapsed=0.0)
     monkeypatch.setattr(jobs, "_hermes_now", lambda: clock.now)
     monkeypatch.setattr(executions, "_hermes_now", lambda: clock.now)
     monkeypatch.setattr(scheduler, "_sweep_stale_inflight_for_tick", lambda *args: None)
@@ -57,7 +58,9 @@ def make_job(schedule="every 2m"):
 
 def set_due(job, when):
     jobs.update_job(job["id"], {"next_run_at": when.isoformat()})
-    return jobs.get_job(job["id"])
+    result = jobs.get_job(job["id"])
+    assert result is not None
+    return result
 
 
 def test_saturated_general_workers_start_protected_by_completion_deadline(clock_home, monkeypatch):
@@ -356,3 +359,138 @@ def test_worker_release_interrupts_deadline_wait(clock_home):
     finally:
         stopped.set()
         thread.join(5)
+
+
+def _run_clocked_ticker(clock, monkeypatch, tick, stopped, *, home=None):
+    fake_time = SimpleNamespace(monotonic=lambda: clock.elapsed)
+    monkeypatch.setattr(admission, "time", fake_time)
+    monkeypatch.setattr("cron.scheduler_provider.time", fake_time)
+    monkeypatch.setattr(scheduler, "tick", tick)
+    monkeypatch.setattr(InProcessCronScheduler, "recover_interrupted", lambda self: 0)
+
+    class Stop:
+        def is_set(self):
+            return stopped()
+
+        def wait(self, seconds):
+            assert seconds >= 0
+            if not self.is_set():
+                clock.elapsed += seconds
+                clock.now += timedelta(seconds=seconds)
+            return self.is_set()
+
+    homes = [("test", home)] if home is not None else None
+    InProcessCronScheduler().start(Stop(), interval=60, profile_homes=homes)
+
+
+@pytest.mark.parametrize("stage", ["create_execution", "note_cron_execution", "submit"])
+def test_unstarted_dispatch_cleanup_does_not_wake_ticker(clock_home, monkeypatch, stage):
+    item = set_due(make_job(), clock_home.now)
+    pool = Mock()
+    failure = OSError(errno.EMFILE, "Too many open files")
+    if stage == "submit":
+        pool.submit.side_effect = failure
+    else:
+        monkeypatch.setattr(scheduler, stage, Mock(side_effect=failure))
+    assert scheduler._submit_with_guard(item, pool, Mock()) is None
+    assert not scheduler.is_job_running(item["id"])
+    assert not admission._wake.is_set()
+
+
+@pytest.mark.parametrize("loop", ["single", "multiplex"])
+def test_persistent_execution_creation_failure_does_not_spin(clock_home, tmp_path, monkeypatch, loop):
+    """A failed dispatch does not masquerade as newly freed worker capacity."""
+    set_due(make_job(), clock_home.now)
+    create = Mock(side_effect=OSError(errno.EMFILE, "Too many open files"))
+    monkeypatch.setattr(scheduler, "create_execution", create)
+    original_tick = scheduler.tick
+    ticks = []
+
+    def tick(**kwargs):
+        ticks.append(clock_home.elapsed)
+        result = original_tick(**kwargs)
+        # Bookkeeping takes a little time, but must not cause an immediate retry.
+        clock_home.elapsed += 0.01
+        clock_home.now += timedelta(seconds=0.01)
+        return result
+
+    _run_clocked_ticker(
+        clock_home, monkeypatch, tick, lambda: clock_home.elapsed >= 3 or len(ticks) >= 400,
+        home=tmp_path if loop == "multiplex" else None)
+    assert create.call_count >= 1
+    assert len(ticks) <= 4, f"{len(ticks)} ticks in a 3-second fake-clock window: {ticks[:5]}"
+    assert not admission._wake.is_set()
+
+
+@pytest.mark.parametrize("loop", ["single", "multiplex"])
+def test_deadline_crossed_during_tick_is_scanned_within_floor(clock_home, tmp_path, monkeypatch, loop):
+    clock_home.elapsed = 60.0
+    clock_home.now += timedelta(seconds=60)
+    set_due(make_job(), clock_home.now + timedelta(seconds=0.2))
+    starts, ticks = [], []
+
+    def run(item, **kwargs):
+        starts.append(clock_home.elapsed)
+        jobs.mark_job_run(item["id"], True)
+        executions.finish_execution(item["execution_id"], success=True)
+        return True
+
+    monkeypatch.setattr(scheduler, "run_one_job", run)
+    original_tick = scheduler.tick
+
+    def tick(**kwargs):
+        ticks.append(clock_home.elapsed)
+        result = original_tick(sync=True)
+        if len(ticks) == 1:
+            clock_home.elapsed += 0.25
+            clock_home.now += timedelta(seconds=0.25)
+        return result
+
+    _run_clocked_ticker(
+        clock_home, monkeypatch, tick, lambda: len(ticks) >= 2,
+        home=tmp_path if loop == "multiplex" else None)
+    assert ticks == pytest.approx([60.0, 61.25])
+    assert starts == pytest.approx([61.25])
+
+
+def test_reselected_protected_job_uses_general_fifo_while_reserve_is_held(clock_home, monkeypatch, caplog):
+    first = set_due(make_job(), clock_home.now)
+    ordinary = make_job("every 10m")
+    release, started = threading.Event(), threading.Event()
+    starts, submissions = {}, []
+    original_submit = scheduler._submit_with_guard
+
+    def submit(item, pool, process_job):
+        submissions.append(item["id"])
+        return original_submit(item, pool, process_job)
+
+    def run(item, **kwargs):
+        starts[item["id"]] = threading.current_thread().name
+        if item["id"] == first["id"]:
+            started.set()
+        assert release.wait(10)
+        return True
+
+    monkeypatch.setattr(scheduler, "_submit_with_guard", submit)
+    monkeypatch.setattr(scheduler, "run_one_job", run)
+    try:
+        assert scheduler.tick(sync=False) == 1
+        assert started.wait(5)
+        jobs.update_job(first["id"], {"enabled": False})
+        replacement = make_job()
+        for item in (ordinary, replacement):
+            set_due(item, clock_home.now)
+        assert scheduler.tick(sync=False) == 2
+        assert wait_until(lambda: len(starts) == 3, timeout=5)
+        assert submissions == [first["id"], ordinary["id"], replacement["id"]]
+        assert starts[first["id"]].startswith("cron-reserved")
+        assert starts[ordinary["id"]].startswith("cron-parallel")
+        assert starts[replacement["id"]].startswith("cron-parallel")
+        key = hermes_home_key(scheduler._get_hermes_home())
+        assert admission._reserved_claims[key][0] == first["id"]
+        assert len(admission._reserved_pools) == 1
+        assert scheduler.tick(sync=False) == 0
+        overflow = [record for record in caplog.records if "general pool best-effort" in record.message]
+        assert len(overflow) == 1
+    finally:
+        release.set()

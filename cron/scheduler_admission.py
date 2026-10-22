@@ -26,12 +26,17 @@ def reserved_job_id(jobs: list[dict], home) -> str | None:
         str(job["id"]) for job in jobs
         if is_protected_interval(job) and is_job_runnable(job) and not is_terminal_job(job))
     key = hermes_home_key(home)
-    if _loaded_protected.get(key) != eligible:
-        _loaded_protected[key] = eligible
-        if len(eligible) > 1:
+    with _lock:
+        held = _reserved_claims.get(key)
+    loaded = eligible
+    if held is not None and held[0] not in eligible:
+        loaded = (held[0], *eligible)
+    if _loaded_protected.get(key) != loaded:
+        _loaded_protected[key] = loaded
+        if len(loaded) > 1:
             logger.error(
                 "Cron has %d protected interval jobs but only 1 reserved worker; "
-                "%s use the general pool best-effort (FIFO)", len(eligible), ", ".join(eligible[1:]))
+                "%s use the general pool best-effort (FIFO)", len(loaded), ", ".join(loaded[1:]))
     return eligible[0] if eligible else None
 
 
@@ -39,7 +44,14 @@ def submit_due_jobs(due_jobs: list[dict], pool, process_job) -> list:
     """Preserve general FIFO while sending only the selected protected job to its reserve."""
     from cron import jobs, scheduler
 
-    reserved_id = reserved_job_id(jobs.load_jobs(), scheduler._get_hermes_home())
+    home = scheduler._get_hermes_home()
+    reserved_id = reserved_job_id(jobs.load_jobs(), home)
+    with _lock:
+        held = _reserved_claims.get(hermes_home_key(home))
+        if held is not None and held[0] != reserved_id:
+            # Selection can change while the previous owner still holds its fenced slot.
+            # Treat the replacement as overflow, keeping its place in the general FIFO.
+            reserved_id = None
     futures = []
     # Start the reserved lane before general submission bookkeeping, without changing
     # the relative admission order of any general-pool jobs (including protected extras).
@@ -90,13 +102,15 @@ def _release_unsubmitted(key, token) -> None:
             _reserved_claims.pop(key)
 
 
-def worker_released(inflight_key: tuple) -> None:
+def worker_released(inflight_key: tuple, *, wake: bool = True) -> None:
     """Called only AFTER the running claim passes the detached-process exit fence."""
     with _lock:
         claim = _reserved_claims.get(inflight_key[0])
         if claim is not None and claim[0] == inflight_key[1]:
             _reserved_claims.pop(inflight_key[0])
-    _wake.set()
+    # Failed dispatches return their claim too, but have freed no worker capacity.
+    if wake:
+        _wake.set()
 
 
 def discard_reserved_pools(home_keys) -> None:
@@ -117,8 +131,8 @@ def shutdown_reserved_pools() -> None:
 def next_due_wait(max_wait: float) -> float:
     """Read, never claim/advance, the active home's next eligible deadline.
 
-    In-flight or already-due records cannot shorten the wait: their release wakes us,
-    while failed/paused admission must not spin at zero delay.
+    In-flight records rely on release wakes. An eligible deadline crossed during the
+    tick gets a bounded rescan, not a heartbeat delay or a zero-delay failure spin.
     """
     from cron import jobs, scheduler
 
@@ -130,8 +144,9 @@ def next_due_wait(max_wait: float) -> float:
                 or scheduler.is_job_running(job["id"])):
             continue
         due = jobs._parse_aware(job.get("next_run_at"))
-        if due is not None and due.timestamp() > now:
-            wait = min(wait, due.timestamp() - now)
+        if due is not None:
+            remaining = due.timestamp() - now
+            wait = min(wait, remaining if remaining > 0 else 1.0)
     return wait
 
 

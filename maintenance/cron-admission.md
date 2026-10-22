@@ -12,24 +12,29 @@ Also preserve the process-exit ownership contract in
 Interval schedules of at most 120 seconds form the protected class, derived
 from schedule data rather than names, IDs, or job flags. Their completion-based
 next eligibility spends 30 seconds of headroom before the natural interval.
+An `every 1m` job therefore rearms 30 seconds after completion and runs more
+often than once per minute. Today only the `every 2m` inbox job qualifies.
 All other schedules retain their existing rearm calculation.
 
 Each profile's existing FIFO general executor keeps `cron.max_parallel_jobs`
 (default 4). Add exactly 1 reserved worker, select the first enabled, unpaused,
-nonterminal protected job in store order, and never admit that selected job to
-the general executor.
+nonterminal protected job in store order, and send it to the reserved executor.
+If selection changes while the previous owner still holds the reservation,
+treat the replacement as overflow in the general pool until the slot is free.
 Additional protected jobs log an error once per loaded class and use the
-general executor best-effort in its unchanged FIFO order. A long protected run
-must not occupy a general worker or overlap another instance of itself.
+general executor best-effort in its unchanged FIFO order. A long run holding
+the reservation must not occupy a general worker or overlap itself.
 
 A finished waiter future or terminal execution row does not release the
 reservation while its detached process remains live. Only the existing
 owner-fenced running-job release returns it. The healthy built-in ticker
 waits to the earliest eligible deadline, bounded by its 60-second heartbeat,
 and checks worker-release wakes within 0.25 seconds. Due-time and release wakes
-add scans without shifting the fixed-period heartbeat deadline. Overruns
-rebaseline instead of bursting. Retain fd-exhaustion backoff and shutdown
-responsiveness.
+add scans without shifting the fixed-period heartbeat deadline. An eligible
+non-running job already due after a tick gets a 1-second rescan rather than
+waiting for the heartbeat. Failed dispatch cleanup does not signal a worker
+release wake. Overruns rebaseline instead of bursting. Retain fd-exhaustion
+backoff and shutdown responsiveness.
 
 ## Update
 
