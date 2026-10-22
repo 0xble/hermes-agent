@@ -8,6 +8,7 @@ _COPY_OPEN = "[[copy]]"
 _COPY_CLOSE = "[[/copy]]"
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _LIST_PREFIX_RE = re.compile(r"(?:[-*+•]|[0-9]+[.)])[ \t]+")
+_LIST_TOKEN_RE = re.compile(r"(?:[-*+•]|[0-9]+[.)]?)")
 
 
 def _marker_text(line: str) -> str:
@@ -125,6 +126,7 @@ class CopyMarkerStreamFilter:
         self._drop_bodies = drop_bodies
         self._in_copy = False
         self._pending = ""  # held line prefix that may still become a marker line
+        self._boundary_text = ""  # ordinary held text, finished by a message boundary
         self._line = ""  # already-seen text of the current line, for fence tracking
         self._fence: str | None = None
 
@@ -135,7 +137,7 @@ class CopyMarkerStreamFilter:
             return True
         # Hold a list token until its separating whitespace arrives. Emitting it
         # now would leak a number/bullet even if the rest becomes a marker line.
-        if re.fullmatch(r"(?:[-*+•]|[0-9]+[.)]?)", stripped):
+        if _LIST_TOKEN_RE.fullmatch(stripped):
             return True
         for marker in (_COPY_OPEN, _COPY_CLOSE):
             if marker.startswith(stripped):
@@ -160,7 +162,8 @@ class CopyMarkerStreamFilter:
             return ""
         text = self._pending + delta
         self._pending = ""
-        output: list[str] = []
+        output: list[str] = [self._boundary_text]
+        self._boundary_text = ""
         cursor = 0
         while cursor < len(text):
             match = re.search(r"\r\n|\n|\r", text[cursor:])
@@ -194,6 +197,7 @@ class CopyMarkerStreamFilter:
         """Forget all state, for replaying a complete text after nothing was emitted."""
         self._in_copy = False
         self._pending = ""
+        self._boundary_text = ""
         self._line = ""
         self._fence = None
 
@@ -204,19 +208,26 @@ class CopyMarkerStreamFilter:
         ordinary line ends, so a following ``[[copy]]`` is at line start. A held tail that is
         already a complete marker line (a message may end on ``[[/copy]]`` with no newline) is
         consumed here; a genuinely partial marker stays held for the next message.
+        A bare list token is ordinary text, released by the next feed or flush without
+        joining it to a marker in the new message.
         """
         if self._pending and self._is_marker(self._pending):
             self._on_marker(self._pending)
+            self._pending = ""
+        elif self._pending and _LIST_TOKEN_RE.fullmatch(self._pending.strip()):
+            if self._emit():
+                self._boundary_text += self._pending
             self._pending = ""
         self._line = ""
 
     def flush(self) -> str:
         """Release a non-marker tail, or drop it when it is a complete marker line."""
+        released, self._boundary_text = self._boundary_text, ""
         pending, self._pending = self._pending, ""
         self._line = ""
         if not pending or self._is_marker(pending) or not self._emit():
-            return ""
-        return pending
+            return released
+        return released + pending
 
 
 # Platforms whose adapter sends a ``copy_block`` payload byte-exact as plain text. Every other
