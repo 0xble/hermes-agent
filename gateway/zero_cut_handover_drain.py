@@ -23,7 +23,7 @@ def _status(runner) -> dict[str, Any]:
     active = runner._running_agent_count()
     queued = _queued_followups(runner)
     state["active_turns"] = active
-    state["idle"] = bool(state["token_lock_released"] and active == 0 and not queued)
+    state["idle"] = bool(state["token_lock_released"] and not state.get("failed") and active == 0 and not queued)
     return dict(state)
 
 
@@ -37,7 +37,7 @@ def _queued_followups(runner) -> int:
     # turn count drops before the adapter finishes delivering the final and starting that follow-up.
     # Exiting in that gap flushed the follow-up to disk and left the final unconfirmed, so the
     # successor re-sent it as a "may be a duplicate" recovery (found in a real drill).
-    for adapter in (getattr(runner, "adapters", {}) or {}).values():
+    for adapter in _adapters(runner):
         for name in ("_active_sessions", "_pending_messages"):
             values = getattr(adapter, name, None)
             if isinstance(values, dict):
@@ -45,8 +45,20 @@ def _queued_followups(runner) -> int:
     return total
 
 
+def _adapters(runner):
+    """Every served transport, deduplicating shared primary/profile registrations."""
+    mappings = [getattr(runner, "adapters", {}) or {}]
+    mappings.extend((getattr(runner, "_profile_adapters", {}) or {}).values())
+    seen = set()
+    for mapping in mappings:
+        for adapter in mapping.values():
+            if id(adapter) not in seen:
+                seen.add(id(adapter))
+                yield adapter
+
+
 def _telegram_adapters(runner):
-    for adapter in (getattr(runner, "adapters", {}) or {}).values():
+    for adapter in _adapters(runner):
         platform = getattr(adapter, "platform", None)
         if getattr(platform, "value", platform) == "telegram":
             yield adapter
@@ -69,6 +81,9 @@ async def _handover(runner) -> None:
             release_handover_lock(adapter)
         state["token_lock_released"] = True
         await _wait_for_idle(runner)
+    except asyncio.CancelledError:
+        _fail(runner, "handover cancelled")
+        raise
     except Exception as exc:
         logger.exception("Zero-cut handover failed")
         _fail(runner, str(exc) or type(exc).__name__)
@@ -89,6 +104,9 @@ def _fail(runner, reason: str) -> None:
     state = runner._zero_cut_handover_state
     state["failed"] = reason
     state["idle"] = False
+    # A late batch may still finish identity recovery after settlement fails/times out. Keep it in
+    # the existing drain spool instead of sending the external-drain maintenance refusal.
+    runner._draining = True
     logger.error("Zero-cut handover refused to release Telegram lock: %s", reason)
 
 
@@ -99,6 +117,21 @@ def handover_runs_followups(runner) -> bool:
     state = getattr(runner, "_zero_cut_handover_state", None) or {}
     stopping = getattr(runner, "_zero_cut_stop_task", None) is not None  # the real stop spools as today
     return bool(state.get("token_lock_released") and not state.get("failed") and not stopping)
+
+
+def handover_accepts_received(runner, source) -> bool:
+    """Keep the old Telegram transport's received work admissible until its chats finish.
+
+    External drain remains set early to quiesce cron and reviews. Polling settlement is not runner
+    admission: a popped batch can still be awaiting identity recovery or an adapter processing hook.
+    Only a registered receiving Telegram adapter, never restored or relay input, owns this allowance.
+    Ordinary drains, failed handovers and the real stop retain their normal refusal/spooling path.
+    """
+    state = getattr(runner, "_zero_cut_handover_state", None) or {}
+    if not state.get("accepted") or state.get("failed") or getattr(runner, "_zero_cut_stop_task", None) is not None:
+        return False
+    owner = runner._transport_owner(source)
+    return bool(owner and any(owner[0] is adapter for adapter in _telegram_adapters(runner)))
 
 
 def request_handover(runner, main_loop: asyncio.AbstractEventLoop) -> dict[str, Any]:
@@ -115,6 +148,8 @@ def request_handover(runner, main_loop: asyncio.AbstractEventLoop) -> dict[str, 
         state = getattr(runner, "_zero_cut_handover_state", None)
         if state is not None:
             return _status(runner)
+        if getattr(runner, "_external_drain_active", False) or getattr(runner, "_draining", False):
+            return {"accepted": False, "refused": "draining"}
         runner._zero_cut_handover_state = {
             "accepted": True, "updates_settled": False,
             "token_lock_released": False, "active_turns": runner._running_agent_count(),

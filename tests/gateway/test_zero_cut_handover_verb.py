@@ -141,7 +141,7 @@ def test_idle_handover_stops_outside_background_tasks_and_exits_cleanly(monkeypa
     asyncio.run(scenario())
 
 
-def test_handover_verb_refuses_disabled_and_standby(monkeypatch):
+def test_handover_verb_refuses_disabled_standby_and_existing_drain(monkeypatch):
     loop = asyncio.new_event_loop()
     try:
         disabled = _Runner(enabled=False)
@@ -149,6 +149,12 @@ def test_handover_verb_refuses_disabled_and_standby(monkeypatch):
         standby = _Runner()
         monkeypatch.setattr("gateway.zero_cut_standby.is_standby", lambda: True)
         assert request_handover(standby, loop) == {"accepted": False, "refused": "standby"}
+        monkeypatch.setattr("gateway.zero_cut_standby.is_standby", lambda: False)
+        for attr in ("_external_drain_active", "_draining"):
+            draining = _Runner()
+            setattr(draining, attr, True)
+            assert request_handover(draining, loop) == {"accepted": False, "refused": "draining"}
+            assert getattr(draining, "_zero_cut_handover_state", None) is None
     finally:
         loop.close()
 
