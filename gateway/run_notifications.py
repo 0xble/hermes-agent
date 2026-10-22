@@ -2560,16 +2560,21 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         claimed = await claim_siblings_off_loop(deliverable[1:], f"gateway-batch:{id(self)}")
         blocks = [primary_text]
         siblings: list[tuple[dict, str]] = []
+        unclaimed: list[dict] = []
         for evt, synth_text, claim_id in claimed:
             if claim_id is None:
-                # Another consumer owns this row: keep it out of our text so it is never double-injected.
-                forget(evt)
+                # Another consumer owns this row, or its ownership is unproven: keep it out of our text so
+                # it is never double-injected. It stays in a failed batch's retry payload only.
+                unclaimed.append(evt)
                 continue
             siblings.append((evt, claim_id))
             blocks.append(synth_text)
         if not siblings:
             outcome = await deliver_one(primary_text, primary_evt)
-            return False if retry_needed else outcome
+            if outcome is not False:
+                for evt in unclaimed:
+                    forget(evt)
+            return False if retry_needed or group else outcome
         from tools.process_registry_notifications import PROCESS_NOTICE_OPEN
         header = (
             f"{PROCESS_NOTICE_OPEN}{len(blocks)} background subagent delegations "
@@ -2583,6 +2588,8 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         )
         if delivered is not False:
             forget(primary_evt)
+            for evt in unclaimed:
+                forget(evt)
             if delivered is True:
                 for evt, _claim_id in siblings:
                     forget(evt)
