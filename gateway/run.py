@@ -4593,19 +4593,6 @@ class GatewayRunner(
         needs_progress_queue: Any = None
         _generic_status_phrase: Any = None
 
-    @dataclasses.dataclass
-    class _RunAgentWorker:
-        """Executor future + inactivity-watchdog handles for one ``_run_agent_inner`` turn."""
-        executor_task: Any = None
-        agent_timeout: Optional[float] = None
-        agent_warning: Optional[float] = None
-        task_id: str = ""
-        process_baseline: Any = None
-        worker_done: Any = None
-        timeout_fired: Any = None
-        cleanup_lock: Any = None
-        is_current: Any = None
-
 
 def _run_planned_stop_watcher(
     stop_event: threading.Event, runner, loop: asyncio.AbstractEventLoop, shutdown_handler, *,

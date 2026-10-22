@@ -1069,7 +1069,8 @@ class GatewayAgentCacheMixin:
                 evicted = _cache.pop(session_key, None)
         agent = _first_agent(evicted)
         # Never tear down an agent that's mid-turn — its client, sandbox and child subagents are in use.
-        # Not covered yet: fallback drift and mid-turn /model evict a running agent and return here (leak).
+        # Running fallback drift and mid-turn /model pop the cache entry here; the turn worker owns
+        # the exact instance and releases it only after both the worker and outer turn have drained.
         if agent is None or agent is _AGENT_PENDING_SENTINEL or id(agent) in self._running_agent_ids():
             return
         # No on_session_end here: /model, fallback drift and similar callers continue the SAME session,
@@ -1187,13 +1188,68 @@ class GatewayAgentCacheMixin:
         except Exception:
             logger.warning("Evicted agent memory shutdown failed", exc_info=True)
 
+    def _pop_cached_agent_for_eviction(self, session_key: str) -> Any:
+        """Pop under the caller's cache lock, deferring blocking soft release until after unlock."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        evicted = self._agent_cache.pop(session_key, None)
+        agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
+        return agent if agent and agent is not _AGENT_PENDING_SENTINEL else None
+
+    def _turn_lifetime_drained(self, agent: Any) -> bool:
+        """True when this exact agent has no unfinished turn, or both turn stages have drained."""
+        lifetime = getattr(agent, "_gateway_turn_lifetime", None)
+        if not isinstance(lifetime, tuple) or len(lifetime) != 2:
+            return True
+        return all(getattr(stage, "is_set", lambda: False)() is True for stage in lifetime)
+
+    def _claim_soft_release(self, agent: Any) -> bool:
+        """Claim this exact agent's soft release once. An unfinished turn owns the later claim."""
+        from agent.memory_manager import memory_handoff_lock
+        try:
+            lock = memory_handoff_lock(agent)
+        except (AttributeError, TypeError):  # Slotted doubles cannot retain a handoff lock.
+            lock = nullcontext()
+        with lock:
+            if not self._turn_lifetime_drained(agent):
+                return False
+            if getattr(agent, "_gateway_soft_release_started", None) is True:
+                return False
+            try:
+                agent._gateway_soft_release_started = True
+            except AttributeError:  # Slotted doubles cannot retain the release claim.
+                return True
+            return True
+
+    def _release_finished_turn_agent(self, turn_ctx: Any, worker: Any) -> None:
+        """Soft-release an exact agent popped while running, once its worker and turn have drained."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        if not (
+            getattr(worker.worker_done, "is_set", lambda: False)()
+            and getattr(worker.turn_done, "is_set", lambda: False)()
+        ):
+            return
+        holder = getattr(turn_ctx, "agent_holder", None)
+        agent = holder[0] if holder else None
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return
+        session_key = getattr(turn_ctx, "session_key", None)
+        cache = getattr(self, "_agent_cache", None)
+        lock = getattr(self, "_agent_cache_lock", None)
+        with lock if lock is not None else nullcontext():
+            if _first_agent(cache.get(session_key) if cache is not None else None) is agent:
+                return
+        self._spawn_release_thread(
+            self._release_evicted_agent_soft, (agent,),
+            f"agent-turn-release-{str(session_key)[:24]}", inline_fallback=True, session_key=session_key,
+        )
+
     def _release_evicted_agent_soft(self, agent: Any, *, retired: Optional[list] = None,
                                     commit_key: Optional[str] = None) -> None:
         """Soft cleanup for cache-evicted agents: unlike _cleanup_agent_resources, the session may
         resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance.
         With ``retired``, the detached memory manager is appended for the caller to shut down. With
         ``commit_key``, end-of-session memory is committed atomically with the detach."""
-        if agent is None:
+        if agent is None or not self._claim_soft_release(agent):
             return
         manager = self._detach_memory_manager(agent, commit_key)
         if manager is not None:
