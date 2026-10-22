@@ -7,11 +7,19 @@ import re
 _COPY_OPEN = "[[copy]]"
 _COPY_CLOSE = "[[/copy]]"
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_LIST_PREFIX_RE = re.compile(r"(?:[-*+•]|[0-9]+[.)])[ \t]+")
+
+
+def _marker_text(line: str) -> str:
+    """Ignore list decoration only when deciding whether a line is control syntax."""
+    text = line.lstrip()
+    prefix = _LIST_PREFIX_RE.match(text)
+    return text[prefix.end():] if prefix else text
 
 
 def _line_marker(line: str, marker: str) -> bool:
-    """Match a marker line while accepting only surrounding whitespace."""
-    return line.strip() == marker
+    """Match a marker-only line, including an accidentally list-prefixed marker."""
+    return _marker_text(line).rstrip() == marker
 
 
 def _is_copy_marker(line: str) -> bool:
@@ -122,8 +130,12 @@ class CopyMarkerStreamFilter:
 
     @staticmethod
     def _could_be_marker_prefix(line: str) -> bool:
-        stripped = line.lstrip()
+        stripped = _marker_text(line)
         if not stripped:
+            return True
+        # Hold a list token until its separating whitespace arrives. Emitting it
+        # now would leak a number/bullet even if the rest becomes a marker line.
+        if re.fullmatch(r"(?:[-*+•]|[0-9]+[.)]?)", stripped):
             return True
         for marker in (_COPY_OPEN, _COPY_CLOSE):
             if marker.startswith(stripped):
