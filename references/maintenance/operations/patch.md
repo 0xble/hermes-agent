@@ -1,5 +1,16 @@
 # Maintained fork patch register
 
+## mcp-verbatim-tool-labels
+
+- **Status:** Candidate.
+- **Contract:** MCP labels retain the exact callable tool name, including underscores, hyphens and case, in direct calls, bridge batches, progress lines and GUI payloads. Hosted connector phrases, account aliases and app-title formatting are unchanged.
+- **Source surfaces:** `tools/tool_labels.py`, `agent/display.py` (example), `tests/tools/test_tool_labels.py`, `tests/gateway/test_telegram_progress_literals.py`.
+- **Independent hypothesis (2026-10-23):** `_action_phrase` converts MCP underscores and case before every client receives the shared label. Keeping the raw MCP tool suffix in `ToolLabel.action` fixes the shared boundary without a renderer-specific special case or extension. A second formatter modifying the action after this boundary would falsify the hypothesis. Inspection found progress only lowercases the app and GUI clients consume `text` or `action` unchanged.
+- **Upstream findings:** Guidance and label implementation inspected at `bf0203a794a07aac3ff764972ab9087baa4e4f4e`. The original shared-label change intentionally humanized MCP actions. This fork intentionally prefers exact callable identifiers. Issue search for `tool_labels` returned no results. Related open [#55094](https://github.com/NousResearch/hermes-agent/pull/55094) changes desktop fallback labels, not the shared bridge owner, and does not preserve tool underscores.
+- **Verification:** `HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh tests/tools/test_tool_labels.py tests/agent/test_display.py tests/gateway/test_telegram_progress_literals.py -q --file-retries 0 -j 1` passes: 53 tests. New regression file fails before the fix: 7 failed, 1 passed. Telegram rich-message, MarkdownV2 and stream-event paths retain literal underscores.
+- **Rollback:** Revert the MCP action assignment and its matching tests/examples. No schema, dependency, configuration or state migration.
+- **Retirement:** Remove when upstream's shared MCP label owner preserves the complete callable suffix and its consumers retain the same contract.
+
 ## background-review-memory-delete: durable observer requirement
 
 - **Status:** Candidate; not landed or activated.

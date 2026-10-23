@@ -125,7 +125,7 @@ def label_for_tool_name(name: str, arguments: Any = None) -> Optional[ToolLabel]
     if name.startswith(MCP_TOOL_NAME_PREFIX):
         server, _, tool = name[len(MCP_TOOL_NAME_PREFIX):].partition("__")
         if tool:
-            return ToolLabel(kind="mcp", app=app_title(server), action=_action_phrase(tool),
+            return ToolLabel(kind="mcp", app=app_title(server), action=tool,
                              emoji=MCP_EMOJI, name=name, preview=_arg_preview(name, arguments))
     return _local_tool_label(name, arguments)
 
