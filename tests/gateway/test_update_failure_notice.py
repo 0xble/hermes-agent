@@ -44,7 +44,7 @@ async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
     with patch("gateway.run._hermes_home", tmp_path):
         assert await runner._send_update_notification()
 
-    text = adapter.send.call_args.kwargs["content"]
+    text = adapter.send.call_args.args[1]
     assert text.startswith("❌ Update Failed\n\nNothing changed. Still on ")
     assert (RELEASE if immutable else SOURCE)[:12] in text
     assert "Cause:" in text and len(text.splitlines()[-1]) < 400
