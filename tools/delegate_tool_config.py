@@ -510,6 +510,27 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         command=pinned_command, args=list(runtime.get("args") or []),
     )
 
+_DELEGATION_ROUTE_KEYS = frozenset({
+    "model", "provider", "base_url", "api_key", "api_mode", "request_overrides",
+    "fallback_providers", "fallback_chain", "reasoning_effort", "command", "args",
+})
+
+
+def _select_routing_cfg(cfg: dict, parent_agent) -> dict:
+    """Select from the live model, never the original model before a switch or fallback.
+
+    Preset keys and values have already been validated and expanded by config loading.
+    Return the original config on a miss so existing route behavior stays untouched.
+    """
+    route = cfg.get("by_parent", {}).get(getattr(parent_agent, "model", None))
+    if route is None:
+        return cfg
+    selected = {key: value for key, value in cfg.items() if key not in _DELEGATION_ROUTE_KEYS}
+    if route != "inherit":
+        selected.update(route)
+    return selected
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Child credential bundle from the ``delegation`` config section. Three branches: ``base_url`` set → direct
     endpoint (``api_key`` None means inherit the parent's key, so providers keyed outside OPENAI_API_KEY work);
@@ -536,20 +557,19 @@ def _load_config() -> dict:
     (follows HERMES_HOME/profile; no deepcopy, since this runs on every get_definitions() rebuild) over the legacy
     ``cli.CLI_CONFIG``, which can hide user-set keys — except that ``HERMES_IGNORE_USER_CONFIG=1`` is only honored
     by the legacy loader, so it stays authoritative when that flag is set."""
+    from hermes_cli.model_presets import ModelPresetError, delegation_runtime_config
     if os.environ.get("HERMES_IGNORE_USER_CONFIG") != "1":
         try:
             from hermes_cli.config import load_config_readonly
-            cfg = load_config_readonly().get("delegation") or {}
-            if isinstance(cfg, dict):
-                return cfg
+            return delegation_runtime_config(load_config_readonly())
         except Exception as exc:
-            from hermes_cli.model_presets import ModelPresetError
             if isinstance(exc, ModelPresetError):
                 raise
     try:
         from cli import CLI_CONFIG
-        cfg = CLI_CONFIG.get("delegation") or {}
-        return cfg if isinstance(cfg, dict) else {}
+        return delegation_runtime_config(CLI_CONFIG)
+    except ModelPresetError:
+        raise
     except Exception:
         return {}
 

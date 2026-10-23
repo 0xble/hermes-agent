@@ -291,10 +291,13 @@ class SubagentLifecycleService:
         # Lazy: delegate construction stays internal, plugins never import private delegation helpers.
         from tools.delegate_tool import (
             _build_child_preserving_parent_tools, _credential_overrides, _load_config, _resolve_delegation_credentials,
-            DEFAULT_MAX_ITERATIONS,
+            DEFAULT_MAX_ITERATIONS, _select_routing_cfg,
         )
-        # Routing precedence: request.provider > delegation config > parent.
-        routing_cfg = {"provider": request.provider, "model": request.model or ""} if request.provider is not None else _load_config()
+        # Explicit launch routes win. Otherwise share delegate_task's live-parent selection.
+        routing_cfg = (
+            {"provider": request.provider, "model": request.model or ""}
+            if request.provider is not None else _select_routing_cfg(_load_config(), parent)
+        )
         try:
             creds = _resolve_delegation_credentials(routing_cfg, parent)
         except ValueError as exc:
@@ -304,6 +307,7 @@ class SubagentLifecycleService:
             toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
             model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
             task_count=1, parent_agent=parent, role=request.role, **_credential_overrides(creds, routing_cfg),
+            reasoning_cfg=routing_cfg if request.provider is None else None,
         )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
