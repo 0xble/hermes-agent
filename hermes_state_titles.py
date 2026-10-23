@@ -20,6 +20,11 @@ _TITLE_INVISIBLE_RE = re.compile(r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufef
 _NUMBERED_TITLE_RE = re.compile(r'^(.*?) #(\d+)$')
 
 
+def _auto_title_matches(stored: str, candidate: str) -> bool:
+    """Only a stored alias can lose its suffix, never the requested subject's number."""
+    return stored.casefold() == candidate or _NUMBERED_TITLE_RE.sub(r'\1', stored).casefold() == candidate
+
+
 def next_title_in_lineage(conn, base_title: str) -> str:
     """Next title in a lineage ("my session" -> "my session #2") as seen by *conn*: strip any
     " #N" suffix, then increment the highest existing number."""
@@ -204,17 +209,29 @@ class SessionTitlesMixin:
         row = self._read_one("SELECT title FROM sessions WHERE id = ?", (session_id,))
         return row["title"] if row else None
 
-    def list_recent_session_titles(self, exclude_session_id: Optional[str] = None, limit: Optional[int] = 20):
-        """Return non-empty titles, newest first, excluding the active session. None reads all titles."""
+    def has_auto_title_collision(self, title: str, *, exclude_session_id: Optional[str] = None) -> bool:
+        """Check one candidate without transferring or sorting the title inventory."""
+        if not title:
+            return False
+        with self._read_ctx() as conn:
+            # SQLite's lower()/NOCASE do not implement Unicode casefolding.
+            conn.create_function("auto_title_matches", 2, _auto_title_matches, deterministic=True)
+            return conn.execute(
+                "SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL "
+                "AND auto_title_matches(title, ?) LIMIT 1",
+                (exclude_session_id or "", title.casefold()),
+            ).fetchone() is not None
+
+    def list_recent_session_titles(self, exclude_session_id: Optional[str] = None, limit: int = 20):
+        """Return non-empty titles, newest first, excluding the active session."""
         params = []
         where = "title IS NOT NULL AND TRIM(title) != ''"
         if exclude_session_id:
             where += " AND id != ?"
             params.append(str(exclude_session_id))
-        if limit is not None:
-            params.append(max(1, min(100, int(limit))))
+        params.append(max(1, min(100, int(limit))))
         rows = self._read_all(
-            f"SELECT title FROM sessions WHERE {where} ORDER BY started_at DESC" + (" LIMIT ?" if limit is not None else ""),
+            f"SELECT title FROM sessions WHERE {where} ORDER BY started_at DESC LIMIT ?",
             tuple(params),
         )
         return [row["title"] for row in rows if row["title"]]
