@@ -2,7 +2,7 @@
 import asyncio
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -145,7 +145,7 @@ async def test_only_human_receipts_refresh_once_without_blocking(busy_activity, 
     assert before <= stamp <= received
     assert event._attended_activity_marked is True
     runner.async_session_store.mark_user_activity.assert_awaited_once_with(
-        key, when=datetime.fromtimestamp(stamp, timezone.utc),
+        key, when=datetime.fromtimestamp(stamp),
     )
     assert await runner._mark_attended_user_activity(event, event.source, key)
     assert state.conversation.last_user_activity_at == stamp
@@ -162,8 +162,9 @@ async def test_api_boundary_refreshes_same_session_durable_activity_off_loop(
     runner, event, key, state = busy_activity
     owner_store = SessionStore(tmp_path / "sessions", runner.config)
     await asyncio.to_thread(owner_store.get_or_create_session, event.source)
-    old = datetime.fromtimestamp(1, timezone.utc)
-    await asyncio.to_thread(owner_store.mark_user_activity, key, old)
+    await asyncio.to_thread(owner_store.mark_user_activity, key)
+    old = await asyncio.to_thread(owner_store.get_last_user_activity_at, key)
+    assert old is not None and old.tzinfo is None
     writer = SessionStore(tmp_path / "sessions", runner.config) if foreign else owner_store
     runner.session_store = writer
     # Store hydration and receipt persistence both go through the real AsyncSessionStore.
@@ -171,7 +172,11 @@ async def test_api_boundary_refreshes_same_session_durable_activity_off_loop(
     await _receive(busy_activity, "runner", "steer", monkeypatch)
     await event._attended_activity_task
     first = await asyncio.to_thread(writer.get_last_user_activity_at, key)
-    assert first is not None and first.timestamp() >= before
+    assert first is not None and first.timestamp() >= before and first > old
+    assert first.tzinfo is None
+    assert state.conversation.last_user_activity_at == pytest.approx(first.timestamp(), rel=0, abs=1e-6)
+    assert await asyncio.to_thread(writer.list_sessions, active_minutes=15)
+    assert await asyncio.to_thread(writer.prune_old_entries, max_age_days=1) == 0
     next_event = MessageEvent(text="another thing", source=event.source)
     await runner._mark_attended_user_activity(next_event, event.source, key)
     latest = await asyncio.to_thread(writer.get_last_user_activity_at, key)
@@ -223,3 +228,44 @@ async def test_api_boundary_refreshes_same_session_durable_activity_off_loop(
     assert await asyncio.to_thread(owner_store.get_last_user_activity_at, key, refresh=True) == latest
     for store in (owner_store, writer, reader):
         await asyncio.to_thread(store.close_all_db_handles)
+
+
+@pytest.mark.parametrize("offset", [-7, 5.5])
+def test_aware_activity_rows_and_writes_keep_store_clocks_comparable(tmp_path, offset, monkeypatch):
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="aware", user_id="owner")
+    writer = SessionStore(tmp_path / "sessions", GatewayConfig())
+    entry = writer.get_or_create_session(source)
+    key = entry.session_key
+    old = datetime.fromtimestamp(1)
+    writer.mark_user_activity(key, old)
+    owner = SessionStore(tmp_path / "sessions", GatewayConfig())
+    assert owner.get_last_user_activity_at(key) == old
+    zone = timezone(timedelta(hours=offset))
+    aware = datetime.fromtimestamp(time.time() - 60, zone)
+    payload = entry.to_dict()
+    payload.update(last_user_activity_at=aware.isoformat(), updated_at=aware.isoformat())
+    # Reproduce a routing row written by the earlier candidate, not a mock read.
+    writer._save_entry(key, entry_data=payload)
+    reader = SessionStore(tmp_path / "sessions", GatewayConfig())
+    try:
+        expected = datetime.fromtimestamp(aware.timestamp())
+        assert reader.get_last_user_activity_at(key) == expected
+        assert owner.get_last_user_activity_at(key, refresh=True) == expected
+        with monkeypatch.context() as cached:
+            resolver = Mock(side_effect=AssertionError("cached activity must not resolve the DB"))
+            cached.setattr(owner, "_routing_db_method", resolver)
+            assert owner.get_last_user_activity_at(key) == expected
+            resolver.assert_not_called()
+        reader.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="naive"))
+        assert len(reader.list_sessions()) == 2
+        assert len(reader.list_sessions(active_minutes=15)) == 2
+        assert reader.prune_old_entries(max_age_days=1) == 0
+        assert reader.mark_user_activity(key, datetime.now(zone))
+        latest = reader.get_last_user_activity_at(key)
+        assert latest is not None and latest.tzinfo is None and latest > expected
+        restored = reader.lookup_by_session_key(key)
+        assert restored is not None and restored.updated_at == latest
+        assert not reader.mark_user_activity(key, aware)
+    finally:
+        for store in (writer, owner, reader):
+            store.close_all_db_handles()

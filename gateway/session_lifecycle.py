@@ -23,6 +23,11 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _local_naive(stamp: datetime) -> datetime:
+    """Match the store clock when reading or receiving an attended activity stamp."""
+    return stamp.astimezone().replace(tzinfo=None) if stamp.tzinfo is not None else stamp
+
+
 def _new_session_id(now: datetime) -> str:
     return new_session_id(now, hex_len=8)
 

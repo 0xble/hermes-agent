@@ -20,7 +20,7 @@ from gateway.session_identity import transport_profile_of
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pin
 from gateway.session_recovery import SessionRecoveryMixin
-from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
+from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _local_naive, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
 
 logger = logging.getLogger(__name__)
@@ -709,10 +709,11 @@ class SessionEntry:
         owner_slot = data.get("active_turn_owner_slot")
         if not isinstance(owner_slot, str) or not owner_slot:
             owner_slot = None
+        activity = _parse_iso(data.get("last_user_activity_at"))
         return cls(
             session_key=session_key, session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]), origin=origin,
+            updated_at=_local_naive(datetime.fromisoformat(data["updated_at"])), origin=origin,
             display_name=data.get("display_name"), platform=platform,
             chat_type=data.get("chat_type", "dm"), metadata=dict(data.get("metadata") or {}),
             restart_note_marked_at=_parse_iso(data.get("restart_note_marked_at")),
@@ -721,7 +722,7 @@ class SessionEntry:
             active_turn_owner_pid=owner_pid, active_turn_owner_slot=owner_slot,
             model_override=sanitize_model_override(data.get("model_override")),
             reasoning_override=sanitize_reasoning_override(data.get("reasoning_override")),
-            last_user_activity_at=_parse_iso(data.get("last_user_activity_at")),
+            last_user_activity_at=_local_naive(activity) if activity is not None else None,
             attended_route_active=data.get("attended_route_active")
             if isinstance(data.get("attended_route_active"), bool) else None,
             model_role=str(data.get("model_role")).strip().lower() if data.get("model_role") else None,
@@ -1348,10 +1349,10 @@ class SessionStore(
         with self._lock:
             entry = self._entry_locked(session_key)
             # A successor gateway can receive replies while this process still owns the turn.
-            loader = self._routing_db_method("load_gateway_routing_entry")
-            if refresh and entry is not None and loader is not None:
+            if refresh and entry is not None:
                 try:
-                    payload = loader(session_key, scope=self._routing_scope())
+                    loader = self._routing_db_method("load_gateway_routing_entry")
+                    payload = loader(session_key, scope=self._routing_scope()) if loader else None
                     durable = self._routing_entry_from_json(session_key, payload) if payload else None
                     if (
                         durable is not None and durable.session_id == entry.session_id
@@ -1366,7 +1367,7 @@ class SessionStore(
 
     def mark_user_activity(self, session_key: str, when: Optional[datetime] = None) -> bool:
         """Persist the last genuine user message without treating relays/wakeups as activity."""
-        stamp = when or _now()
+        stamp = _local_naive(when) if when is not None else _now()
 
         with self._lock:
             entry = self._entry_locked(session_key)

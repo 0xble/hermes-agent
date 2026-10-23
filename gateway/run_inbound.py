@@ -1654,7 +1654,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if stamp is None:
             stamp = event._attended_activity_received_at = time.time()
         try:
-            from datetime import datetime, timezone
+            from datetime import datetime
             from gateway.run import _load_gateway_config
             from gateway.attended_model import parse_attended_config
             attended_cfg = await asyncio.to_thread(
@@ -1678,7 +1678,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 # Preserve the creation boundary before mark_user_activity updates updated_at.
                 state.conversation.attended_new_session = True
             await self.async_session_store.mark_user_activity(
-                entry.session_key, when=datetime.fromtimestamp(stamp, timezone.utc),
+                entry.session_key, when=datetime.fromtimestamp(stamp),
             )
             previous = state.conversation.last_user_activity_at
             if previous is None or stamp > previous:
