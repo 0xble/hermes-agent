@@ -335,6 +335,17 @@ def _wait_for_manual_execution(execution_id: str) -> Optional[dict[str, Any]]:
         time.sleep(1.0)
 
 
+def _execution_delivery_status(execution: dict[str, Any]) -> str:
+    """Read both scheduler outcomes and detached delivery receipts for this attempt."""
+    status = execution.get("delivery_status")
+    outcome = execution.get("delivery_outcome")
+    # Gateway-owned runs record only the outcome. Detached queue receipts can
+    # resolve later, but a recorded failure must never be reported as success.
+    if "failed" in (status, outcome):
+        return "failed"
+    return status or outcome or "unverified"
+
+
 def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) -> dict[str, Any]:
     """Fire an already-claimed job through the shared ``run_one_job`` body (split from
     ``_execute_job_now`` so the background path can claim synchronously and hand the run
@@ -407,7 +418,7 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
             with _run_heartbeat(str(job.get("name") or job_id)):
                 execution = _wait_for_manual_execution(str(execution_id)) or {}
             state = execution.get("status") or "unknown"
-            delivery_failed = execution.get("delivery_status") == "failed"
+            delivery_failed = _execution_delivery_status(execution) == "failed"
             error = execution.get("error")
             if not error and (state != "completed" or delivery_failed):
                 error = "Delivery failed for this execution." if delivery_failed else f"Execution outcome is {state}."
@@ -538,7 +549,7 @@ def _manual_run_completion(
         error = (execution or {}).get("error")
         if execution is None:
             error = "Execution record is missing; outcome is unknown."
-        elif state == "completed" and execution.get("delivery_status") == "failed":
+        elif state == "completed" and _execution_delivery_status(execution) == "failed":
             state, error = "failed", "Delivery failed for this execution."
         res = {"success": state == "completed", "error": error}
     else:
@@ -547,10 +558,11 @@ def _manual_run_completion(
     refreshed = get_job(job_id) or {}
     # Job-level delivery errors may belong to a different attempt, just like
     # last_error and the newest output file. Never use them for an exact run.
+    delivery_status = _execution_delivery_status(execution or {})
     delivery_note = _manual_run_delivery_note(deliver, refreshed) if not execution_id else (
         " (output saved locally only)" if not deliver or deliver == "local" else
-        " (delivery FAILED for this execution)" if (execution or {}).get("delivery_status") == "failed" else
-        f" (delivery status: {(execution or {}).get('delivery_status') or 'unverified'})")
+        " (delivery FAILED for this execution)" if delivery_status == "failed" else
+        f" (delivery status: {delivery_status})")
     label = "ok" if state == "completed" else "unknown" if state == "unknown" else "FAILED"
     lines = [
         f"Cron job '{job_name}' ({job_id}) finished its manual run.",

@@ -19,6 +19,7 @@ from gateway.run_pending_recovery import _defer_followup, _recovered_followup_ev
 from gateway.session import SessionStore
 from gateway.shutdown_flush import flush_pending_to_file, recover_pending_to_db
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+from tests.waiting import async_wait_until
 
 
 def _setup(tmp_path, monkeypatch):
@@ -874,8 +875,14 @@ async def test_durable_and_fresh_followups_same_session_do_not_silently_delete_d
         # the durable spool has no scheduler-dependent deletion path of its own.
         assert runner._restart_followup_keys == {entry.session_key}
         assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 0
-        assert await runner._drain_startup_restore_queue() == 1
-        await asyncio.gather(*list(runner._background_tasks))
+        # Releasing the declined sibling starts a background drain. Its accepted
+        # successor need not contribute to this caller's batch count.
+        await runner._drain_startup_restore_queue()
+        await async_wait_until(
+            lambda: len(_outcome_lines(caplog)) == 2,
+            what="durable decline and fresh follow-up completion",
+        )
+        await runner._get_replay_scheduler().wait_idle()
     assert claimed == [fresh.text]
     assert len(adapter.sent) == 1 and "may already have been handled" in adapter.sent[0]
     assert _outcome_lines(caplog) == [

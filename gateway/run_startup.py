@@ -45,9 +45,7 @@ from typing import Any, Dict, Optional, Tuple
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
-# A restart resumes every interrupted session at once. Their turn openings (history load, prompt
-# build, first writes) all hit the shared state.db writer, so admit a few at a time: each slot is
-# held until its turn ends or the opening window passes, so long turns never hold later sessions.
+# Long turns release opening admission after this window, without releasing session ownership.
 _STARTUP_RESUME_CONCURRENCY = 4
 _STARTUP_RESUME_OPENING_S = 15.0
 
@@ -96,10 +94,15 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     def _serving_state(self) -> str:
         return "degraded" if self._startup_parked_platforms else "running"
 
-    def _queue_startup_restore_event(self, event: MessageEvent, *, front: bool = False) -> None:
+    def _queue_startup_restore_event(
+        self, event: MessageEvent, *, front: bool = False, session_key: Optional[str] = None,
+    ) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             queue = self._startup_restore_queue = []
+        # Keep source order independent of scheduler priority and dropped-item callback order.
+        sequence = self._startup_restore_sequence = getattr(self, "_startup_restore_sequence", 0) + 1
+        setattr(event, "_hermes_startup_restore_order", -sequence if front else sequence)
         if front:
             queue.insert(0, event)
         else:
@@ -110,14 +113,84 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             if claimed is None:
                 claimed = self._restart_followup_keys = set()
             claimed.add(key)
+        key = session_key or key or self._session_key_for_source(
+            self._normalize_source_for_session_key(event.source)
+        )
+        restore_keys = getattr(self, "_startup_restore_keys", None)
+        if restore_keys is None:
+            restore_keys = self._startup_restore_keys = {}
+        restore_keys[key] = restore_keys.get(key, 0) + 1
         with suppress(Exception):
             source = event.source
+            kind = (
+                "recovered_followup"
+                if getattr(event, "_hermes_recovered_followup", False)
+                else "startup_queued_human"
+            )
             logger.info(
-                "Queued inbound message during gateway startup restore: platform=%s chat=%s",
-                source.platform.value if source and source.platform else "unknown",
-                source.chat_id if source else "unknown",
+                "Queued replay source: kind=%s session_key=%s",
+                kind,
+                key,
+                extra={"replay_scheduler": "source_queued", "kind": kind},
             )
 
+    def _requeue_startup_restore_event(self, event: MessageEvent, *, session_key: str) -> None:
+        """Return a replay item to the restore queue without creating a second claim.
+
+        Scheduler shutdown can cancel an item after it has been removed from the
+        restore queue but before its turn starts.  The existing restore-key claim
+        remains outstanding so the shutdown flush sees this copy exactly once.
+        Restore source order before releasing a failed resume's session claim,
+        or newer queued input could overtake this item on the next drain.
+        """
+        queue = getattr(self, "_startup_restore_queue", None)
+        if queue is None:
+            queue = self._startup_restore_queue = []
+        if not any(existing is event for existing in queue):
+            order = getattr(event, "_hermes_startup_restore_order", 0)
+            index = next(
+                (i for i, existing in enumerate(queue)
+                 if getattr(existing, "_hermes_startup_restore_order", 0) > order),
+                len(queue),
+            )
+            queue.insert(index, event)
+        with suppress(Exception):
+            logger.info(
+                "Returned dropped replay to restore queue: session_key=%s",
+                session_key,
+                extra={"replay_scheduler": "source_requeued", "session_key": session_key},
+            )
+
+    def _schedule_startup_restore_drain(self) -> None:
+        if not getattr(self, "_startup_restore_queue", None):
+            return
+        scheduler = getattr(self, "_replay_scheduler", None)
+        if scheduler is not None and getattr(scheduler, "_closed", False):
+            return
+        current = getattr(self, "_startup_restore_drain_task", None)
+        if current is not None and not current.done():
+            # A release may land after ready() scanned the queue but before this
+            # pass reports no progress. Retain the wakeup for a follow-up pass.
+            self._startup_restore_drain_requested = True
+            return
+
+        async def drain() -> None:
+            while queue := getattr(self, "_startup_restore_queue", None):
+                self._startup_restore_drain_requested = False
+                before = {id(event) for event in queue}
+                await self._drain_startup_restore_queue(wait=True)
+                if (
+                    before.issubset({id(event) for event in queue})
+                    and not self._startup_restore_drain_requested
+                ):
+                    break
+
+        task = asyncio.create_task(drain())
+        self._startup_restore_drain_task = task
+        self._retain_background_task(task)
+        task.add_done_callback(
+            self._late_failure_callback("background startup restore drain failed", level=logging.DEBUG)
+        )
 
     @staticmethod
     def _start_free_tier_bootstrap() -> None:
@@ -283,37 +356,19 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             completion.set()
 
     async def _finish_startup_restore(self) -> None:
-        """Wait (BOUNDED by ``_startup_restore_drain_timeout_secs``) for startup auto-resume, then
-        release + drain inbound. On timeout the gate opens and resume turns finish in the background
-        (NOT cancelled) — safe because ``_schedule_resume_pending_sessions`` claims each
-        ``_running_agents`` slot SYNCHRONOUSLY first, so drained inbound queues behind."""
-        from gateway.run import _startup_restore_drain_timeout_secs
+        """Open fresh inbound after warm-up and replay admission, without waiting for replay turns."""
         drained = 0
         try:
-            tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
-            if tasks:
-                # Tasks outliving the gate get a late-failure callback (their done-callback only discards them).
-                done = await self._wait_bounded_or_release(
-                    set(tasks), _startup_restore_drain_timeout_secs(),
-                    "Startup-restore gate released after %.0fs with %d boot auto-resume turn(s) "
-                    "still running; draining inbound queue now (resume slots already claimed, so no "
-                    "duplicate agents). Slow turn(s) continue in the background.",
-                    "background startup auto-resume task failed after gate release", level=logging.DEBUG,
-                )
-                report = self._late_failure_callback("startup auto-resume task failed", level=logging.DEBUG)
-                for task in done:
-                    report(task)
-            self._startup_restore_tasks = []
-            # Warm the turn machinery BEFORE the queue drains: inbound turns must not build skeleton prompts.
             await self._await_startup_warmup()
-            drained = await self._drain_startup_restore_queue()
+            # Replay turns run under the shared scheduler, not under the inbound gate. Queue one
+            # claimant per session so the per-session fence remains ordered while unrelated sessions
+            # retain concurrency; recovered follow-ups await their own resume task before admission.
+            drained = await self._drain_startup_restore_queue(wait=False)
         finally:
-            # The inbound gate must open no matter what raised above it (bounded wait, warm-up,
-            # drain): a stuck _startup_restore_in_progress would queue every non-internal inbound
-            # forever (run_inbound.py reads this flag first). See #116514.
             self._startup_restore_in_progress = False
+            self._schedule_startup_restore_drain()
         if drained:
-            logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+            logger.info("Admitted %d inbound message(s) queued during startup restore", drained)
 
     @staticmethod
     def _late_failure_callback(message: str, *, level: int = logging.WARNING):
@@ -743,6 +798,16 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             # under its own outbox identity so one marker resumes at most once.
             setattr(event, "_outbox_admission_id", f"resume:{resume_marker}")
         return event
+
+    async def _drop_queued_resume(self, session_key: str) -> None:
+        """Release a shutdown-dropped resume sentinel and keep the durable marker recoverable."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        getattr(self, "_startup_resume_inflight", set()).discard(session_key)
+        state = self._peek_session_state(session_key)
+        if state is None or state.turn.agent is not _AGENT_PENDING_SENTINEL:
+            return
+        # No turn was admitted, so the original reason, turn ID and marker token still own recovery.
+        self._release_running_agent_state(session_key)
 
     def _schedule_auto_resume_delegations(self) -> int:
         """Queue bounded parent notices for eligible abandoned single-task rows.
@@ -1912,7 +1977,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         # The boot decision survives the async refresh and reconnect path. Never evade the
         # breaker merely because an interruption-note send is unavailable or ambiguous.
         self._restart_resume_breaker_tripped = breaker_tripped
-        self._schedule_resume_pending_sessions(candidates=candidates, allow_resume=not breaker_tripped)
+        self._schedule_resume_pending_sessions(
+            candidates=candidates, allow_resume=not breaker_tripped, start_scheduler=False,
+        )
         await self._finish_startup_restore()
         # Queue bounded parent-facing recovery notices after adapters/session restore are ready.
         # The async delegation watcher performs the route/authorization preflight and durable

@@ -22,7 +22,7 @@ async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
     import sqlite3
 
     from gateway.run_inbound import _admit_outbox_event
-    from gateway.run_startup import GatewayStartupMixin
+    from gateway.run import GatewayRunner
 
     source = _source("resume-admission")
     source.message_id = "reply-anchor"
@@ -30,7 +30,7 @@ async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
         SimpleNamespace(session_key=f"resume-key-{i}", origin=source, resume_turn_id=f"resume-{i}")
         for i in range(2)
     ]
-    runner = object.__new__(GatewayStartupMixin)
+    runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         restart_resume_policy="continue", durable_outbox_enabled=True,
     )
