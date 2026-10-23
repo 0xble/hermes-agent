@@ -496,6 +496,9 @@ def _run_job_script(
         strip_session_context_env(env)
         if cron_job_id:
             env["HERMES_SESSION_ID"] = f"cron_{cron_job_id}"
+            # The known job is cron even on no_agent's early path, before
+            # _CronRunScope binds the marker in the caller's ContextVars.
+            env["HERMES_CRON_SESSION"] = "1"
             try:
                 from hermes_cli.profiles import current_profile_name
                 env["HERMES_SESSION_PROFILE"] = current_profile_name("default") or "default"

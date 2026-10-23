@@ -557,6 +557,15 @@ class TestBrowserRetrievalHints:
         assert "mailbox, or phone" in rendered["browser_vault"]
         assert "Never type, ask for or repeat a password" not in rendered["browser_vault"]
         assert "card numbers and CVCs" in rendered["browser_vault"]
+        assert "Card numbers and CVCs remain vault-only" in rendered["browser_type"]
+        assert "code copied from the page or supplied in chat" in rendered["browser_type"]
+        vault = rendered["browser_vault"]
+        assert "1Password passkey through the canonical-origin browser/system prompt" in vault
+        assert "issuer's web/desktop approval" in vault
+        assert "Never use iPhone Mirroring" in vault
+        assert "Hand off phone-only approvals, passkeys not in 1Password" in vault
+        assert "Never type a value shown on the page or supplied in chat" in vault
+        assert "numbers and CVCs in vault fills" in vault
 
 
 def test_tool_defs_cache_key_sees_config_replacement_with_pinned_mtime(tmp_path):
