@@ -158,7 +158,8 @@ async def test_create_binds_a_new_session_with_every_setting_and_starts_it(home)
     assert cast(Any, TelegramAdapter).format_message(None, expected_origin) == expected_origin
     assert adapter.sent[0]["content"].startswith("**Planning Room**\n\n/title is not a command here: read the plan")
     assert adapter.sent[0]["content"].endswith(f"*{expected_origin}*")
-    assert adapter.sent[0]["metadata"] == {"thread_id": "4242"}
+    assert adapter.sent[0]["metadata"] == {
+        "thread_id": "4242", "rich_fallback_content": f"{expected_origin}\n\n/title is not a command here: read the plan"}
     turn = adapter.admitted[0]
     assert turn.internal and not turn.allow_gateway_control and not turn.is_command()
     assert turn.source.thread_id == "4242" and turn.text.startswith(expected_origin)
