@@ -524,6 +524,8 @@ Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the d
 
 Fork patch identity: `session-controls`. One session can pause, resume, clear or replace another session's goal, and pause, resume or stop another session's loop, authorized by a fresh verbatim user quote or a Telegram Approve/Deny press. See [the maintenance unit](maintenance/session-controls.md).
 
-## TUI prompt test isolation
+## TUI Prompt Test Isolation
 
-Fork patch identity: `test-isolation`. TUI prompt-submit row-id resolution tests stub `_run_after_agent_ready` so successful requests do not leave deferred prompt workers running after the request; production behavior is unchanged.
+Fork patch identity: `test-isolation`. Fake-agent prompt-submit rewind tests share a containment fixture that stubs real build/turn/deferred execution and joins the submit dispatcher before their mocks and session mapping are removed. A prior deferred-run-only stub left an earlier dispatcher able to enter a real prompt after monkeypatch teardown and contaminate a later poller test. Preserve every rewind assertion, real-conversation rewind coverage and the poller's owner-session assertion. Production behavior is unchanged.
+
+Verify the complete `tests/tui_gateway/test_tui_gateway_server.py` through `scripts/run_tests.sh` with file retries disabled. Retire this test-only adaptation when the accepted upstream tests contain their dispatchers across teardown and retain equivalent rewind and notification-ownership coverage.
