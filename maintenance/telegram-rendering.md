@@ -217,7 +217,7 @@ is not proof that the configured behavior survives an update.
 `555ccdf1052d644bc1f44b3957e36fe77a813919`. Not upstreamed.
 
 **Behavior:** Tool-progress lines name MCP and connector tools by their friendly
-label (`🔌 paper · get guide`, from `tools.tool_labels.label_for_tool_name`,
+label (`🔌 paper · get_guide`, from `tools.tool_labels.label_for_tool_name`,
 with the app lowercased to match the raw built-in tool names beside it) and
 show every interpolated tool label, argument preview, and verbose args dump
 verbatim on Telegram. Terminal commands keep their fenced blocks. A compact
