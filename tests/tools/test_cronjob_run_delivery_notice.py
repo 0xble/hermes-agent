@@ -10,8 +10,8 @@ job record because the post-run delivery (telegram/discord/…) failed. The
 calling agent then relayed "all good" over a failed delivery.
 
 The completion notice must follow the exact execution record, not stale job-level
-history. A real delivery failure keeps its current error visible, and local jobs
-always say saved-locally.
+history. A real delivery failure stays visible even when the execution has no
+transport error text, and local jobs always say saved-locally.
 """
 
 import contextlib
@@ -129,6 +129,40 @@ def _finish_execution(job, *, error=None, delivery_status=None, **_):
     return True
 
 
+def _finish_successful_run(job, *, owner_kind, delivery, **_):
+    """Exercise the scheduler's terminal write without a network send or job-store mutation."""
+    from cron import executions, scheduler
+
+    eid = job["execution_id"]
+    if owner_kind == "detached":
+        assert executions.mark_execution_handoff_pending(eid)
+        assert executions.adopt_claimed_execution(eid)
+        assert executions.finish_execution(eid, success=True)
+        executions.record_delivery_status(eid, delivery)
+    else:
+        assert executions.mark_execution_running(eid)
+        outcome = scheduler._RunDelivery(
+            job=job, success=True, error=None, should_deliver=delivery != "suppressed",
+            delivery_error="telegram send failed: 400" if delivery == "failed" else None,
+        )
+        if delivery == "queued":
+            job["last_delivery_queued"] = True
+        with patch("cron.scheduler.mark_job_run", return_value=True):
+            assert scheduler._finish_completed_run(outcome, None, eid)
+    row = executions.get_execution(eid)
+    assert row is not None
+    assert row["status"] == "completed"
+    assert row["error"] is None
+    assert row["owner_kind"] == owner_kind
+    if owner_kind == "gateway":
+        assert row["delivery_outcome"] == delivery
+        assert row["delivery_status"] is None
+    else:
+        assert row["delivery_status"] == delivery
+        assert row["delivery_outcome"] is None
+    return True
+
+
 class TestDeliveryNote:
     """``_manual_run_delivery_note`` — the summary-line wording contract."""
 
@@ -153,7 +187,11 @@ class TestRunnerSummaryWiring:
     """The completion event the calling agent actually sees must follow the
     exact execution record — both directions of issue #83993."""
 
-    def test_delivery_failure_surfaces_in_completion_summary(self):
+    @pytest.mark.parametrize("owner_kind,delivery", [
+        ("gateway", "failed"), ("detached", "failed"),
+        ("gateway", "delivered"), ("gateway", "queued"), ("gateway", "suppressed"),
+    ])
+    def test_successful_run_delivery_outcome_in_completion_summary(self, owner_kind, delivery):
         from tools.cronjob_tools import _try_dispatch_background_run
 
         job = _job("job-dn-01", "telegram")
@@ -163,8 +201,8 @@ class TestRunnerSummaryWiring:
                     "tools.cronjob_tools.claim_job_for_fire",
                     return_value=job,  # claimed snapshot (return_job=True API)
                 ),
-                patch("cron.scheduler.run_one_job", side_effect=lambda job, **kw: _finish_execution(
-                    job, error="telegram send failed: 400", delivery_status="failed", **kw)),
+                patch("cron.scheduler.run_one_job", side_effect=lambda job, **kw: _finish_successful_run(
+                    job, owner_kind=owner_kind, delivery=delivery, **kw)),
                 patch(
                     "tools.cronjob_tools.get_job",
                     return_value={
@@ -182,12 +220,44 @@ class TestRunnerSummaryWiring:
         assert evt is not None, "completion event never reached the queue"
         summary = evt.get("summary") or ""
         assert "Delivery target: telegram" in summary
-        assert "delivery FAILED" in summary
-        assert "telegram send failed: 400" in summary
         assert "delivered there by the job itself" not in summary
-        # The headline must not read "Result: ok" over an undelivered run.
-        assert "Result: FAILED" in summary
-        assert "Result: ok" not in summary
+        assert "telegram send failed: 400" not in summary
+        if delivery == "failed":
+            assert evt["status"] == "error"
+            assert evt["error"] == "Delivery failed for this execution."
+            assert "delivery FAILED for this execution" in summary
+            assert "Result: FAILED" in summary
+            assert "Result: ok" not in summary
+        else:
+            assert evt["status"] == "completed"
+            assert evt["error"] is None
+            assert f"delivery status: {delivery}" in summary
+            assert "Result: ok" in summary
+            assert "delivery FAILED" not in summary
+
+    @pytest.mark.parametrize("owner_kind,delivery", [
+        ("gateway", "failed"), ("detached", "failed"),
+        ("gateway", "delivered"), ("gateway", "queued"), ("gateway", "suppressed"),
+    ])
+    def test_successful_run_delivery_outcome_in_sync_result(self, owner_kind, delivery):
+        from cron import executions
+        from tools.cronjob_tools import _run_claimed_job
+
+        job = _job("job-dn-sync", "telegram")
+        job["execution_id"] = executions.create_execution(job["id"], source="manual")["id"]
+        with (
+            patch("cron.scheduler.run_one_job", side_effect=lambda job, **kw: _finish_successful_run(
+                job, owner_kind=owner_kind, delivery=delivery, **kw)),
+            patch("tools.cronjob_tools.get_job", return_value={
+                "last_status": "error", "last_error": "previous run error",
+                "last_delivery_error": "previous delivery error",
+            }),
+        ):
+            result = _run_claimed_job(job)
+        assert result == {
+            "claimed": True, "success": delivery != "failed",
+            "error": "Delivery failed for this execution." if delivery == "failed" else None,
+        }
 
     def test_empty_deliver_summary_states_local_not_phantom_target(self):
         """End-to-end: an empty stored deliver must render as the local target
