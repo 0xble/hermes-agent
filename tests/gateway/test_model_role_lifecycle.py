@@ -187,7 +187,7 @@ async def test_temporary_concrete_pick_expires_back_to_named_hold(lane, monkeypa
     runner = lane.runner
     await runner._set_session_model_role(lane.key, "fast")
     ctx = SimpleNamespace(session_key=lane.key, persist_global=False, current_model="first",
-                          restore_snapshot=None, model_override_scope="temporary")
+                          restore_snapshot=None, model_override_scope="temporary", pick_ttl_hours=0.0)
     result = SimpleNamespace(new_model="temporary", target_provider="provider-b", api_key="fixture",
                              base_url="", api_mode="chat_completions", request_overrides={},
                              runtime_capabilities={}, provider_label="B")
@@ -472,7 +472,8 @@ async def test_concrete_role_clear_settles_before_newer_topic_role_edit(lane, mo
     runner = lane.runner
     await runner._set_session_model_role(lane.key, "fast")
     ctx = SimpleNamespace(session_key=lane.key, persist_global=global_pick, current_model="first",
-                          config_path=lane.path, restore_snapshot=None, model_override_scope="session")
+                          config_path=lane.path, restore_snapshot=None, model_override_scope="session",
+                          pick_ttl_hours=0.0)
     result = ModelSwitchResult(success=True, new_model="concrete", target_provider="provider-c",
                                api_key="fixture", base_url="", api_mode="chat_completions")
     clearing, waiting = asyncio.Event(), asyncio.Event()
