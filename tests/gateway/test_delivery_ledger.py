@@ -1240,6 +1240,7 @@ async def test_cancel_after_failed_send_leaves_attempting_for_recovery():
     """A refused send plus a cancel must not be marked failed without the finalizer's
     refusal and redelivery handling. The row keeps today's ambiguous-recovery state."""
     import asyncio
+    from concurrent.futures import ThreadPoolExecutor
     from gateway.platforms.base import SendResult
 
     async def refuse_then_cancel(**kwargs):
@@ -1249,9 +1250,31 @@ async def test_cancel_after_failed_send_leaves_attempting_for_recovery():
     adapter = _LedgerAdapter(refuse_then_cancel)
     adapter._base._send_with_retry_body = lambda chat_id, content, **kw: refuse_then_cancel(content=content)
     key = "agent:main:telegram:dm:2027045491:113596"
-    with pytest.raises(asyncio.CancelledError):
-        await adapter.send_final_ledgered(
-            _telegram_event(message_id="m-refused"), key, "refused text", {}, reply_to=None)
+    refused = []
+
+    async def on_refused(result, transport):
+        refused.append(result)
+
+    # A worker may finish before the event loop observes the pending cancel.
+    # Force that legal ordering, with real ledger writes on a real worker, so
+    # the assertion cannot pass merely because a cancelled future won the race.
+    with ThreadPoolExecutor(max_workers=1) as worker, \
+            patch.object(dl, "mark_failed", wraps=dl.mark_failed) as mark_failed:
+        def submit_and_finish(executor, func, *args):
+            result = worker.submit(func, *args).result(timeout=5)
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            loop.call_soon(lambda: None if future.cancelled() else future.set_result(result))
+            return future
+
+        with patch.object(asyncio.get_running_loop(), "run_in_executor", submit_and_finish):
+            send = asyncio.create_task(adapter.send_final_ledgered(
+                _telegram_event(message_id="m-refused"), key, "refused text", {}, reply_to=None,
+                on_refused=on_refused))
+            with pytest.raises(asyncio.CancelledError):
+                await send
     row = _row(dl.compute_obligation_id(key, "m-refused", "refused text"))
     assert row["state"] == "attempting"
     assert row["attempts"] == 0
+    mark_failed.assert_not_called()
+    assert refused == []

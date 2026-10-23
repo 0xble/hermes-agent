@@ -3987,25 +3987,18 @@ class BasePlatformAdapter(ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
-        returned: dict[str, SendResult] = {}
-        try:
-            result = await self._send_with_retry_body(
-                chat_id, content, reply_to=reply_to, metadata=metadata,
-                max_retries=max_retries, base_delay=base_delay)
-            returned["result"] = result
-            return result
-        finally:
-            # A queued follow-up, /stop, or preemption cancels this task while the platform
-            # call is in flight. Python raises that cancel at this return, so the caller
-            # never sees the result and the ledger write after the send is skipped. A result
-            # already returned successfully is not ambiguous. A cancel that aborts the body, or
-            # a failed result, leaves the row 'attempting' for the duplicate-marked sweep.
-            captured = returned.get("result")
-            task = asyncio.current_task()
-            pending = _PENDING_LEDGER_SETTLEMENT.get()
-            if (pending is not None and captured is not None and getattr(captured, "success", False)
-                    and task is not None and task.cancelling()):
+        result = await self._send_with_retry_body(
+            chat_id, content, reply_to=reply_to, metadata=metadata,
+            max_retries=max_retries, base_delay=base_delay)
+        task = asyncio.current_task()
+        pending = _PENDING_LEDGER_SETTLEMENT.get()
+        if pending is not None and task is not None and task.cancelling():
+            if getattr(result, "success", False):
                 self._settle_delivered_obligation_sync(pending[0])
+            # A return is not a cancellation checkpoint. Suspend before the caller
+            # can submit a failure write or run refusal callbacks with cancel pending.
+            await asyncio.sleep(0)
+        return result
 
     async def _send_with_retry_body(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
