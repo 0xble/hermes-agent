@@ -1819,8 +1819,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         finally:
             with suppress(Exception):
                 self._session_state(_quick_key).conversation.attended_new_session = False
-            # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
-            # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
+                self._session_state(getattr(event, "_hermes_attended_session_key", _quick_key)).conversation.attended_new_session = False
+            # One-shot restore runs on every exit; the generation guard ignores displaced turns.
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
             # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
             # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which

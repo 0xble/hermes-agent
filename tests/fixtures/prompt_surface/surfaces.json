@@ -143,7 +143,7 @@
   "cli.gpt": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 2640,
+      "stable": 2612,
       "volatile": 1810
     },
     "tool_tokens": 15109,

@@ -95,8 +95,14 @@ message; group messages are denied.
 
 The attended switch-in card is rendered by one helper in
 `gateway/attended_model.py` as a single sentence-style line, like the `/fast`
-expiry notice. A fresh session starts attended without a switch-in card. Idle
-expiry emits a separate back-to-default line and leads with the `⇄` symbol.
+expiry notice. A fresh session starts attended without a switch-in card. The
+new-session marker lasts until inbound turn finalization, including failed and
+interrupted turns. Finalization clears both the admission key and the resolved
+session key, because Telegram topic recovery can change the thread identity.
+Preparatory route probes, such as image-mode selection and
+vision enrichment, must not consume first-turn silence. Later genuine
+switch-ins still announce the configured idle window.
+Idle expiry emits a separate back-to-default line and leads with the `⇄` symbol.
 For example, with a `gpt-6.1-sol` default and a 15 minute window:
 
 ```text
@@ -134,6 +140,12 @@ This is a fork-only gateway feature that adds per-topic attended routing, idle
 expiry, persisted activity timestamps, and boundary-only idle expiry. A new genuine user message switches in at the next API call; idle expiry switches back to the default only when the session is quiet and the request fits the default route. A long autonomous turn that continues making API calls stays on the attended route. An active fallback is never undone. The deprecated `compact_before_switch_tokens` key remains accepted but is ignored; normal per-model preflight compression remains the only compaction path. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly.
 
 ## Verification
+
+Run `tests/gateway/test_attended_session_opening.py` for new user-opened text
+and photo topics, `telegram_topic`-created topics, preparatory route probes,
+first-request silence, later switch-in notices, and genuine-activity provenance.
+The tests enter through `_handle_message` and assert marker cleanup after success,
+exceptions, and task cancellation, including recovery from a lobby key to a topic.
 
 Run `tests/gateway/test_model_role_lifecycle.py` for request-boundary profile
 edits, busy assignment timing, stale hydration/one-turn restores, failed
