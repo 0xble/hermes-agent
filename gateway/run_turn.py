@@ -333,10 +333,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             else:
                 stamp = self._load_attended_activity_stamp(session_key)
         if new_session:
+            # Routing is probed repeatedly before the first request (including image preparation).
+            # Keep first-turn silence through every probe, not just the first route resolution.
+            # Inbound finalization clears the marker on success, failure, and interruption.
             stamp, _ = self._ensure_attended_new_session_activity(session_key, cfg, stamp)
-            self._handoff_attended_state(session_key, conversation={"attended_new_session": False})
-        elif new_session_pending:
-            self._handoff_attended_state(session_key, conversation={"attended_new_session": False})
         self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
         channel_model = ""
         channel_provider = ""
