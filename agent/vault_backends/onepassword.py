@@ -106,6 +106,34 @@ def _card_secret(fields) -> Dict[str, str]:
     return out
 
 
+def _login_password(fields) -> str:
+    """Prefer populated native passwords, falling back only to unambiguous custom fields.
+
+    Labels are user-editable and can collide with the native field. Purpose identifies
+    that field on both CLI and Connect. Blank candidates do not mask usable values,
+    but selected bytes (including surrounding whitespace) must remain untouched.
+    """
+    native, custom = [], []
+    for field in fields if isinstance(fields, list) else []:
+        if not isinstance(field, dict):
+            continue
+        value = field.get("value")
+        if not isinstance(value, str) or not value.strip():
+            continue
+        purpose = field.get("purpose")
+        if purpose == "PASSWORD":
+            native.append(value)
+        elif purpose in (None, "") and field.get("type") != "OTP" and any(
+            isinstance(field.get(key), str) and field[key].strip().lower() == "password"
+            for key in ("id", "label")
+        ):
+            custom.append(value)
+    candidates = native or custom
+    if len(candidates) != 1:
+        raise RuntimeError("1Password login requires one populated password field")
+    return candidates[0]
+
+
 class OnePasswordLoginBackend(LoginBackend):
     name = "onepassword"
     display_name = "1Password"
@@ -675,15 +703,23 @@ class OnePasswordLoginBackend(LoginBackend):
 
     def resolve_password(self, handle: str) -> str:
         if self._connect_credentials()[1]:
-            fields = self._connect_item(handle).get("fields", [])
-            passwords = [f.get("value") for f in fields if f.get("purpose") == "PASSWORD"]
-            if len(passwords) != 1 or not isinstance(passwords[0], str) or not passwords[0]:
-                raise RuntimeError("Connect login requires one password field")
-            return passwords[0]
+            return _login_password(self._connect_item(handle).get("fields"))
         return self._read_password(self._item_selector(handle))
 
     def _read_password(self, selector: List[str]) -> str:
-        return self._run("item", "get", *selector, "--fields", "label=password", "--reveal").rstrip("\r\n")
+        # The documented --fields projection cannot select by purpose. Read only the
+        # exact authorized item transiently, never retain its revealed fields in metadata.
+        raw = self._run("item", "get", *selector, "--format", "json", "--reveal")
+        try:
+            item = json.loads(raw)
+        except (TypeError, ValueError):
+            raise RuntimeError("1Password login has invalid password data") from None
+        vault = item.get("vault") if isinstance(item, dict) else None
+        if (not isinstance(item, dict) or item.get("id") != selector[0]
+                or not isinstance(vault, dict) or vault.get("id") != selector[2]
+                or item.get("category") != "LOGIN" or item.get("state", "ACTIVE") != "ACTIVE"):
+            raise RuntimeError("1Password login identity or category mismatch")
+        return _login_password(item.get("fields"))
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         if self._connect_credentials()[1]:
