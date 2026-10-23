@@ -1,5 +1,6 @@
 """Failed updates explain the cause without claiming unproved runtime changes."""
 import json
+import subprocess
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -160,8 +161,8 @@ def test_matching_head_does_not_prove_an_unchanged_checkout_with_recovery_owed(
     markers = {
         "interrupted_pull": interrupted_pull_marker(notification_checkout),
         "completion": completion_pending_path(notification_checkout),
-        "host": host_obligation_path(),
-        "legacy_host": host_obligation_path().with_name(HOST_OBLIGATION_NAME),
+        "host": host_obligation_path(notification_checkout),
+        "legacy_host": host_obligation_path(notification_checkout).with_name(HOST_OBLIGATION_NAME),
     }
     owed = markers[marker]
     owed.parent.mkdir(parents=True, exist_ok=True)
@@ -176,4 +177,58 @@ def test_matching_head_does_not_prove_an_unchanged_checkout_with_recovery_owed(
     owed.unlink()
     assert final_outcome(tmp_path, data) == (
         False, "Nothing changed. Still on aaaaaaaaaaaa. Cause: The downloaded update contains a syntax error.",
+    )
+
+
+@pytest.mark.parametrize("marker", ["interrupted_pull", "completion", "host", "legacy_host"])
+def test_immutable_notice_checks_recovery_in_journal_bound_source(
+    tmp_path, notification_checkout, monkeypatch, marker,
+):
+    from hermes_cli import update_host_obligation as obligation
+    from hermes_cli._early_recovery import interrupted_pull_marker
+    from hermes_cli.venv_sync import completion_pending_path
+
+    source = notification_checkout
+    # A real source identity keeps the immutable resolver's git validation in the test.
+    git_dir = tmp_path / "git" / "worktrees" / "source"
+    subprocess.run(["git", "init", f"--separate-git-dir={git_dir}", str(source)],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "source"],
+                   check=True, capture_output=True)
+    release = _release(tmp_path)
+    (tmp_path / "release-layout.json").write_text(json.dumps({"source": str(source)}))
+    monkeypatch.setattr("gateway.update_notifications.__file__", str(release / "gateway" / "update_notifications.py"))
+    # The updater runs from the source, while the gateway imports its release copy.
+    monkeypatch.setattr(obligation, "__file__", str(source / "hermes_cli" / "update_host_obligation.py"))
+    data = pending(tmp_path, reason=False)
+    finalize_update(tmp_path, outcome="failed", noop=True)
+    (tmp_path / ".update_process_exit_code").write_text("1")
+    markers = {
+        "interrupted_pull": interrupted_pull_marker(source),
+        "completion": completion_pending_path(source),
+        "host": obligation.host_obligation_path(),
+        "legacy_host": obligation.host_obligation_path().with_name(obligation.HOST_OBLIGATION_NAME),
+    }
+    owed = markers[marker]
+    if marker == "host":
+        assert obligation.write_host_obligation(expected_sha=RELEASE)
+        assert owed.is_file()
+        assert not (tmp_path / "fleet_restart_pending").exists()
+        assert not markers["legacy_host"].exists()
+    else:
+        owed.parent.mkdir(parents=True, exist_ok=True)
+        owed.write_text("unreadable recovery record")
+    # Model module locations in the gateway process, after the source updater exits.
+    monkeypatch.setattr(obligation, "__file__", str(release / "hermes_cli" / "update_host_obligation.py"))
+    assert obligation.host_obligation_path() != markers["host"]
+
+    ok, detail = final_outcome(tmp_path, data)
+    assert ok is False
+    assert "Runtime state is unverified" in detail
+    assert "Nothing changed" not in detail and "Still on" not in detail
+
+    owed.unlink()
+    assert final_outcome(tmp_path, data) == (
+        False, f"Nothing changed. Still on {RELEASE[:12]}. Cause: The updater exited with code 1.",
     )
