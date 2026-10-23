@@ -1260,7 +1260,13 @@ def cmd_sessions(args, sessions_parser=None):
     if action == "optimize" and (getattr(args, "at_next_start", False)
                                  or getattr(args, "cancel_next_start", False)):
         return _cmd_optimize_next_start(args)
-    observational = action in _OBSERVATIONAL_DB_ACTIONS
+    # Verified deletion is an explicit mutation, not a read-only export.
+    deleting_export = (
+        action == "export" and getattr(args, "delete_after_verified", False)
+        and getattr(args, "yes", False) and getattr(args, "session_id", None)
+        and getattr(args, "format", None) in ("md", "qmd")
+    )
+    observational = action in _OBSERVATIONAL_DB_ACTIONS or (action == "export" and not deleting_export)
     from hermes_state import SessionDB, _default_db_path
     try:
         db = SessionDB(read_only=observational)
