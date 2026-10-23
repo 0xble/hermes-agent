@@ -230,6 +230,33 @@ async def test_api_boundary_refreshes_same_session_durable_activity_off_loop(
         await asyncio.to_thread(store.close_all_db_handles)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_stamp", [None, 2.0])
+async def test_worker_handoff_keeps_a_receipt_that_arrives_before_loop_apply(
+    busy_activity, worker_stamp,
+):
+    runner, event, key, state = busy_activity
+    state.conversation.last_user_activity_at = worker_stamp
+    queued = []
+    runner._gateway_loop = SimpleNamespace(
+        is_running=lambda: True, call_soon_threadsafe=queued.append,
+    )
+    runner._load_reasoning_config = lambda *_args, **_kwargs: {}
+    await asyncio.to_thread(
+        runner._attended_resolution_for_session,
+        source=event.source, session_key=key, user_config=CONFIG,
+        activity_stamp=worker_stamp,
+    )
+    assert queued
+    # The receipt runs on the owning loop after the worker read but before its apply.
+    assert await runner._mark_attended_user_activity(event, event.source, key)
+    receipt = state.conversation.last_user_activity_at
+    assert receipt is not None and receipt > (worker_stamp or 0)
+    for apply in queued:
+        apply()
+    assert state.conversation.last_user_activity_at == receipt
+
+
 @pytest.mark.parametrize("offset", [-7, 5.5])
 def test_aware_activity_rows_and_writes_keep_store_clocks_comparable(tmp_path, offset, monkeypatch):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="aware", user_id="owner")

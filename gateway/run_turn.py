@@ -276,6 +276,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             if session_key and conversation:
                 state = self._session_state(session_key)
                 for name, value in conversation.items():
+                    if name == "last_user_activity_at":
+                        # Both values are epoch seconds. Receipts may advance after the worker read.
+                        current = state.conversation.last_user_activity_at
+                        if current is not None and (value is None or current > value):
+                            continue
                     setattr(state.conversation, name, value)
             if runner:
                 for name, value in runner.items():
