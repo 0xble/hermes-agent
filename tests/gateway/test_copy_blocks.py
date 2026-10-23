@@ -247,7 +247,8 @@ async def test_copy_block_failure_is_recorded_and_does_not_disappear() -> None:
 
 
 @pytest.mark.asyncio
-async def test_streamed_copy_blocks_use_ledgered_delivery() -> None:
+@pytest.mark.parametrize("prefix", ["", "1. ", "  - "])
+async def test_streamed_copy_blocks_use_ledgered_delivery(prefix) -> None:
     runner = object.__new__(GatewayTurnMixin)
     sent = []
 
@@ -269,7 +270,7 @@ async def test_streamed_copy_blocks_use_ledgered_delivery() -> None:
     event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
     result = {"already_sent": True, "is_ephemeral_response": True, "ephemeral_ttl": 7}
     returned = await runner._hmwa_deliver_turn_response(
-        event, event.source, None, "session", None, result, [], "[[copy]]\nbody\n[[/copy]]", None, False,
+        event, event.source, None, "session", None, result, [], f"{prefix}[[copy]]\nbody\n[[/copy]]", None, False,
     )
     assert returned is None
     assert sent == [(["body"], {"thread_id": "t"}, {"is_ephemeral_response": True, "ephemeral_ttl": 7})]
@@ -278,7 +279,7 @@ async def test_streamed_copy_blocks_use_ledgered_delivery() -> None:
     sent.clear()
     result = {"already_sent": True, "copy_already_delivered": True}
     await runner._hmwa_deliver_turn_response(
-        event, event.source, None, "session", None, result, [], "[[copy]]\nbody\n[[/copy]]", None, False,
+        event, event.source, None, "session", None, result, [], f"{prefix}[[copy]]\nbody\n[[/copy]]", None, False,
     )
     assert sent == []
 
@@ -641,6 +642,8 @@ def test_only_separate_send_platforms_promise_separate_copy_messages() -> None:
     for platform, hint in PLATFORM_HINTS.items():
         promises = "its own plain-text message" in hint
         assert promises == platform_sends_copy_blocks(platform), platform
+        if promises:
+            assert all(rule in hint for rule in ("top-level", "standalone lines", "numbered lists", "bullet lists", "quotes"))
 
 
 @pytest.mark.parametrize("body", ["[[as_document]]", "![literal](https://example.com/literal.png)"])
