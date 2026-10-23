@@ -157,7 +157,7 @@ async def receipt(runner, source, state, item, dest):
         from hermes_constants import get_hermes_home
         scratch = get_hermes_home() / "cache" / "scratch"
         scratch.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(mode="w", dir=scratch, suffix=".txt", delete=False) as payload:
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=scratch, suffix=".txt", delete=False) as payload:
             payload.write(body)
             path = Path(payload.name)
         try:
