@@ -253,3 +253,36 @@ async def test_title_paragraph_is_not_repeated_as_objective(monkeypatch, title_l
     assert "<details>\n<summary>Details</summary>" in markdown
     assert "<details open" not in markdown
     assert admit.call_args.args[1].text == f"{ORIGIN}\n\n{brief}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [
+    "Next action:\nread the panic report and the evidence note, then test the hypotheses.",
+    "**Next action:**\nread the panic report and the evidence note, then test the hypotheses.",
+    "Next action:  \nread the panic report and the evidence note, then test the hypotheses.",
+    "Next: read the panic report and the evidence note,\nthen test the hypotheses.",
+])
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+async def test_wrapped_next_action_stays_visible_in_full(monkeypatch, action, separator):
+    adapter = _adapter()
+    admit = AsyncMock()
+    monkeypatch.setattr("gateway.wake.admit_internal_event", admit)
+    dest = SessionSource(platform=Platform.TELEGRAM, chat_id="123", thread_id="456")
+    brief = separator.join([
+        "**Mac Studio Crash**", "Investigate the panic report.", action,
+        "Keep the original constraints.",
+    ])
+
+    await _deliver_brief(adapter, dest, brief, ORIGIN, title="Mac Studio Crash")
+
+    assert adapter._bot is not None
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    visible = " ".join(_visible(markdown).split())
+    assert visible == (
+        "**Mac Studio Crash** Investigate the panic report. "
+        "▸ Next: read the panic report and the evidence note, then test the hypotheses."
+    )
+    assert brief in markdown
+    assert "<details>\n<summary>Details</summary>" in markdown
+    assert "<details open" not in markdown
+    assert admit.call_args.args[1].text == f"{ORIGIN}\n\n{brief}"
