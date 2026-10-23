@@ -89,7 +89,6 @@ async def _receive(fixture, path, mode, monkeypatch):
         if path == "adapter_fallthrough":
             assert result is False
     elif path == "command":
-        event.text = "/status"
         runner._hm_admit_event = AsyncMock(return_value=(event, event.source, event.internal))
         runner._quick_command_alias_text = lambda _event: None
         runner._hm_estop_gate = lambda *_args: None
@@ -112,6 +111,8 @@ BUSY_PATHS += [("grace", "interrupt"), ("adapter_fallthrough", "queue"),
 @pytest.mark.parametrize("kind", ["human", "relay", "goal", "process"])
 async def test_only_human_receipts_refresh_once_without_blocking(busy_activity, monkeypatch, path, mode, kind):
     runner, event, key, state = busy_activity
+    if path == "command":
+        event.text = "/status"
     if kind == "relay":
         event.text = "[relay from=hermes:default/other]\nFYI"
         event.metadata = {"notification_origin": "relay_delivery"}
