@@ -477,6 +477,10 @@ def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict
         k: str(v) for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    from gateway.model_pick import model_pick_deadline
+    deadline = model_pick_deadline(override)
+    if cleaned and deadline:
+        cleaned["expires_at"] = str(deadline)
     return cleaned or None
 
 
@@ -555,7 +559,7 @@ class SessionEntry:
     # Zero-cut handover ownership; omitted from legacy JSON when unset so flag-off routing stays byte-identical.
     active_turn_owner_pid: Optional[int] = None
     active_turn_owner_slot: Optional[str] = None
-    # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
+    # Session-scoped /model override (route and optional expiry, never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[Dict[str, str]] = None
     # Session-scoped /reasoning pick, persisted like model_override so a restart keeps the effort.

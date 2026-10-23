@@ -19,9 +19,21 @@ switching is unconfigured but a role is set. `/model reset --all` clears both
 on every session. A durable `/model X` or `/model X --session` replaces the
 role; `/model X --once` wins for that turn and leaves the role in place. A
 `/reasoning default` or `/reasoning reset` removes the persisted reasoning
-pick. Plain picks remain temporary while attended switching is enabled and
-expire after the idle window. Temporary picks preserve a named hold and expire
-back to it, just as `--once` preserves it.
+pick. With `model.pick_ttl_hours` unset, plain picks keep their existing behavior:
+temporary with attended routing (cleared after its idle window), otherwise
+session-scoped. A positive finite `model.pick_ttl_hours`, for example `12`,
+opts plain model picks into that many wall-clock hours instead of idle expiry,
+regardless of whether attended routing is enabled. Zero, negative, non-finite
+and invalid values leave the policy disabled. No config is changed automatically.
+The confirmation states when the pick expires, in hours, only for timed picks.
+The deadline is sanitized and saved inside the existing session override so
+restart, idle gaps and `--once` restoration do not extend it. At or after the
+deadline the next turn clears the pick under the route lock and returns to the
+current held role, attended, channel or global route. The reply carries a
+one-line expiry notice naming the resolved model. `--session`, `--once`,
+`--global`, topic-tool edits and temporary reasoning idle expiry are unchanged.
+Temporary picks preserve a named hold and expire back to it, just as `--once`
+preserves it. `/model reset` immediately clears a timed pick.
 
 Role assignment is bound to a turn, not to its starting config snapshot. Busy
 topic edits and bulk conversions take effect next turn, even before the current
@@ -98,7 +110,7 @@ For example, with a `gpt-6.1-sol` default and a 15 minute window:
 
 ## Provenance and patch
 
-Fork patch identities: `attended-model-switching`, `gateway-telegram-topic-tool`, `live-model-preset-roles`.
+Fork patch identities: `attended-model-switching`, `gateway-telegram-topic-tool`, `live-model-preset-roles`, `model-pick-expiry`.
 
 `live-model-preset-roles` covers `@role` holds: the role field on conversation
 state and `SessionEntry`, role reset, concrete-pick precedence, live preset
@@ -133,6 +145,13 @@ and photo topics, `telegram_topic`-created topics, preparatory route probes,
 first-request silence, later switch-in notices, and genuine-activity provenance.
 The tests enter through `_handle_message` and assert marker cleanup after success,
 exceptions, and task cancellation, including recovery from a lobby key to a topic.
+
+Run `tests/gateway/test_model_pick_expiry.py` for disabled-by-default policy,
+positive TTLs with attended routing on and off, command confirmation, unchanged
+flags, persisted restart hydration, exact-deadline routing and notices,
+repicking, stale expiry, one-turn restoration, immediate reset and independent
+reasoning idle expiry. Pair it with `test_attended_model.py`,
+`test_session_model_override_persistence.py` and the model-command regressions.
 
 Run `tests/gateway/test_model_role_lifecycle.py` for request-boundary profile
 edits, busy assignment timing, stale hydration/one-turn restores, failed
