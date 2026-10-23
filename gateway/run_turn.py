@@ -43,7 +43,7 @@ from gateway.session import (
 )
 from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
 from gateway.attended_model import (
-    format_attended_switch_back_notice, format_attended_switch_notice,
+    _stamp_seconds, format_attended_switch_back_notice, format_attended_switch_notice,
     is_active, parse_attended_config, resolve_attended_model,
 )
 from gateway.session_transcript import TranscriptReadError
@@ -277,9 +277,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 state = self._session_state(session_key)
                 for name, value in conversation.items():
                     if name == "last_user_activity_at":
-                        # Both values are epoch seconds. Receipts may advance after the worker read.
-                        current = state.conversation.last_user_activity_at
-                        if current is not None and (value is None or current > value):
+                        # Receipts may advance after the worker read. Compare the same instants
+                        # the attended resolver accepts, rather than ordering raw store values.
+                        current = _stamp_seconds(state.conversation.last_user_activity_at)
+                        incoming = _stamp_seconds(value)
+                        if current is not None and (incoming is None or current > incoming):
                             continue
                     setattr(state.conversation, name, value)
             if runner:
