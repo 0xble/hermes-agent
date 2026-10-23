@@ -1,6 +1,58 @@
 """Native updater receipt fixtures built through its real persistence boundary."""
 import json
-from unittest.mock import patch
+from datetime import datetime, timezone
+from unittest.mock import Mock, patch
+
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
+from gateway.update_launcher import launch_native_update
+from gateway.update_notifications import read_pending
+
+SOURCE = "a" * 40  # frozen source-checkout HEAD recorded as pre/post_update
+RELEASE = "c" * 40  # active immutable release
+
+
+def _make_event(text="/update", platform=Platform.TELEGRAM,
+                user_id="12345", chat_id="67890", thread_id=None):
+    """Build a MessageEvent for testing."""
+    source = SessionSource(
+        platform=platform,
+        user_id=user_id,
+        chat_id=chat_id,
+        user_name="testuser",
+        thread_id=thread_id,
+    )
+    return MessageEvent(text=text, source=source)
+
+
+def _make_runner():
+    """Create a bare GatewayRunner without calling __init__."""
+    from gateway.run import GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._voice_mode = {}
+    runner._update_prompt_pending = {}
+    return runner
+
+
+def pending(home, *, reason=True):
+    data = {"platform": "telegram", "chat_id": "42", "thread_id": "77", "chat_type": "dm",
+            "session_key": "agent:main:telegram:dm:42:thread:77",
+            "timestamp": datetime.now(timezone.utc).isoformat()}
+    if reason:
+        data["reason"] = "Activating the delegation-label fix."
+    launch_native_update(home=home, hermes_cmd=["hermes"], pending=data, spawn=Mock())
+    return read_pending(home)[1]
+
+
+def _release(home, sha=RELEASE):
+    path = home / "releases" / sha
+    path.mkdir(parents=True)
+    for name in (".release-ready", ".hermes_build_sha"):
+        (path / name).write_text(sha)
+    (home / "current").symlink_to(path)
+    return path
 
 
 def finalize_update(home, *, outcome="success", fleet_state="current", noop=False):

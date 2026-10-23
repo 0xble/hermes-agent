@@ -7,11 +7,21 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gateway.config import Platform
-from gateway.update_notifications import final_outcome
-from tests.gateway.test_update_command import _make_runner
-from tests.gateway.test_update_immutable_identity import RELEASE, SOURCE, _release
-from tests.gateway.test_update_lifecycle_notifications import pending
-from tests.gateway.update_fixtures import finalize_update
+from gateway.update_notifications import _failure_cause, final_outcome
+from tests.gateway.update_fixtures import RELEASE, SOURCE, _make_runner, _release, finalize_update, pending
+
+
+@pytest.fixture(autouse=True)
+def notification_checkout(tmp_path, monkeypatch):
+    """Keep recovery-state probes in a synthetic linked checkout, not the running tree."""
+    root = tmp_path / "source"
+    root.mkdir()
+    git_dir = tmp_path / "git" / "worktrees" / "source"
+    git_dir.mkdir(parents=True)
+    (root / ".git").write_text(f"gitdir: {git_dir}\n")
+    monkeypatch.setattr("gateway.update_notifications.__file__", str(root / "gateway" / "update_notifications.py"))
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "host-state"))
+    return root
 
 
 @pytest.mark.asyncio
@@ -22,6 +32,7 @@ from tests.gateway.update_fixtures import finalize_update
     "x" * 1000,
     "Traceback (most recent call last):\n  File \"probe.py\", line 1\nRuntimeError: smoke failed",
     None,
+    "sys.exit(1)",
 ])
 async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
     tmp_path, immutable, exit_code, stop_reason,
@@ -32,7 +43,8 @@ async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
     finalize_update(tmp_path, outcome="failed", noop=True)
     path = tmp_path / "logs" / "update_receipts" / "latest.json"
     receipt = json.loads(path.read_text())
-    receipt.update(stop_reason=stop_reason, pre_update={"sha": SOURCE}, post_update={"sha": SOURCE})
+    receipt.update(stop_reason=stop_reason, stop_class="syntax_rollback",
+                   pre_update={"sha": SOURCE}, post_update={"sha": SOURCE})
     path.write_text(json.dumps(receipt))
     (tmp_path / ".update_process_exit_code").write_text(str(exit_code))
     if immutable:
@@ -52,6 +64,9 @@ async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
     assert "unverified" not in text
     if stop_reason and "candidate plugin" in stop_reason:
         assert "Cause: candidate plugin smoke failed on plugin rea." in text
+    if stop_reason == "sys.exit(1)":
+        assert "Cause: The downloaded update contains a syntax error." in text
+        assert "sys.exit" not in text
     assert not (tmp_path / ".update_pending.json").exists()
 
 
@@ -108,3 +123,57 @@ def test_failed_exit_never_claims_unchanged_without_current_receipt_proof(tmp_pa
     assert "Nothing changed" not in detail and "Still on" not in detail
     if case in {"changed", "missing_sha", "restart", "fleet", "transition", "release_pending", "fleet_pending"}:
         assert "Cause: candidate plugin smoke failed on plugin rea." in detail
+
+
+@pytest.mark.parametrize("stop_class, expected", [
+    ("syntax_rollback", "The downloaded update contains a syntax error."),
+    ("target_syntax_error", "The selected update contains a syntax error."),
+    ("future_stop_class", "future_stop_class"),
+    (None, "The updater exited with code 1."),
+])
+@pytest.mark.parametrize("reason", ["sys.exit(1)", "\n  sys.exit(130)  \n", None])
+def test_boundary_exit_reason_falls_back_to_stop_class(stop_class, expected, reason):
+    assert _failure_cause({"stop_reason": reason, "stop_class": stop_class}, 1) == expected
+
+
+def test_boundary_exit_reason_preserves_restart_explanation():
+    receipt = {"stop_reason": "sys.exit(1)", "stop_class": "syntax_rollback",
+               "gateway_restart": {"phase_error": "The gateway could not restart."}}
+    assert _failure_cause(receipt, 1) == "The gateway could not restart."
+
+
+@pytest.mark.parametrize("marker", ["interrupted_pull", "completion", "host", "legacy_host"])
+def test_matching_head_does_not_prove_an_unchanged_checkout_with_recovery_owed(
+    tmp_path, notification_checkout, marker,
+):
+    from hermes_cli._early_recovery import interrupted_pull_marker
+    from hermes_cli.update_host_obligation import HOST_OBLIGATION_NAME, host_obligation_path
+    from hermes_cli.venv_sync import completion_pending_path
+
+    data = pending(tmp_path, reason=False)
+    finalize_update(tmp_path, outcome="failed", noop=True)
+    path = tmp_path / "logs" / "update_receipts" / "latest.json"
+    receipt = json.loads(path.read_text())
+    receipt.update(stop_reason="sys.exit(1)", stop_class="syntax_rollback")
+    path.write_text(json.dumps(receipt))
+    (tmp_path / ".update_process_exit_code").write_text("1")
+    markers = {
+        "interrupted_pull": interrupted_pull_marker(notification_checkout),
+        "completion": completion_pending_path(notification_checkout),
+        "host": host_obligation_path(),
+        "legacy_host": host_obligation_path().with_name(HOST_OBLIGATION_NAME),
+    }
+    owed = markers[marker]
+    owed.parent.mkdir(parents=True, exist_ok=True)
+    owed.write_text("unreadable recovery record")
+
+    ok, detail = final_outcome(tmp_path, data)
+    assert ok is False
+    assert detail == ("Cause: The downloaded update contains a syntax error. "
+                      "Runtime state is unverified; see the update output.")
+    assert "Nothing changed" not in detail and "Still on" not in detail
+
+    owed.unlink()
+    assert final_outcome(tmp_path, data) == (
+        False, "Nothing changed. Still on aaaaaaaaaaaa. Cause: The downloaded update contains a syntax error.",
+    )

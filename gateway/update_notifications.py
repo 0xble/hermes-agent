@@ -153,18 +153,44 @@ def _finalized_receipt(home: Path, pending: dict, exit_path: Path) -> dict | Non
 
 
 def _failure_cause(receipt: dict, exit_code: int) -> str:
-    # Keep the explanation, never the traceback or its frame/source lines.
-    reason = receipt.get("stop_reason") or (receipt.get("gateway_restart") or {}).get("phase_error")
-    if isinstance(reason, str):
+    # Keep the explanation, never the traceback or its frame/source lines. The
+    # command boundary's sys.exit(N) safety net explains no underlying failure.
+    for reason in (receipt.get("stop_reason"), (receipt.get("gateway_restart") or {}).get("phase_error")):
+        if not isinstance(reason, str):
+            continue
         for line in reason.splitlines():
             line = line.strip()
-            if line.startswith("Traceback (most recent call last):"):
+            if line.startswith("Traceback (most recent call last):") or re.fullmatch(r"sys\.exit\(-?\d+\)", line):
                 break
             if line:
                 return line[:240].rstrip()
+    stop_class = receipt.get("stop_class")
+    if isinstance(stop_class, str) and stop_class.strip():
+        explanations = {
+            "syntax_rollback": "The downloaded update contains a syntax error.",
+            "target_syntax_error": "The selected update contains a syntax error.",
+        }
+        return explanations.get(stop_class, stop_class.splitlines()[0].strip()[:240])
     if exit_code:
         return f"The updater exited with code {exit_code}."
     return f"Updater outcome: {receipt.get('outcome') or 'unknown'}."
+
+
+def _update_recovery_pending(home: Path) -> bool:
+    """HEAD may already be restored while checkout repair or completion is still owed."""
+    from hermes_cli._early_recovery import interrupted_pull_marker
+    from hermes_cli.immutable_releases import update_source_checkout
+    from hermes_cli.update_host_obligation import HOST_OBLIGATION_NAME, host_obligation_path
+    from hermes_cli.venv_sync import completion_pending_path
+
+    root = update_source_checkout(home, Path(__file__).resolve().parents[1])
+    if root is None:
+        return True
+    host_record = host_obligation_path()
+    return any(path.exists() for path in (
+        interrupted_pull_marker(root), completion_pending_path(root),
+        host_record, host_record.with_name(HOST_OBLIGATION_NAME),
+    ))
 
 
 def _failed_update_detail(home: Path, receipt: dict | None, exit_code: int) -> str:
@@ -184,7 +210,8 @@ def _failed_update_detail(home: Path, receipt: dict | None, exit_code: int) -> s
     pending_runtime = any((home / name).exists() for name in ("release-txn.json", "fleet_restart_pending"))
     valid_sha = isinstance(previous, str) and re.fullmatch(r"[0-9a-fA-F]{40}", previous)
     if (receipt.get("outcome") in {"failed", "partial"} and valid_sha and previous == post
-            and expected and not disagreement and not changed_runtime and not pending_runtime):
+            and expected and not disagreement and not changed_runtime and not pending_runtime
+            and not _update_recovery_pending(home)):
         return f"Nothing changed. Still on {expected[:12]}. Cause: {cause}"
     return f"Cause: {cause} Runtime state is unverified; see the update output."
 
