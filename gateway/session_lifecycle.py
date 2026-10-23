@@ -150,7 +150,7 @@ class SessionLifecycleMixin:
         if touched is not None:
             # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
             # downgrade/upgrade window.
-            candidate["updated_at"] = touched.isoformat()
+            candidate["updated_at"] = _local_iso(touched)
         self._save_entry(session_key, entry_data=candidate, lock_held=True)
         entry.active_turn_token = token
         entry.active_turn_started_at = started_at

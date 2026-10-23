@@ -344,6 +344,84 @@ def test_activity_advances_and_survives_reload_during_dst_fallback(tmp_path, mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["runner", "adapter"])
+@pytest.mark.parametrize("failure", ["exception", "cancelled"])
+@pytest.mark.parametrize("drain", [False, True])
+async def test_steered_receipt_recovers_without_drain(busy_activity, monkeypatch, path, failure, drain):
+    runner, event, key, state = busy_activity
+    calls = 0
+
+    async def persist(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if failure == "cancelled":
+                raise asyncio.CancelledError
+            raise RuntimeError("transient receipt failure")
+        return True
+
+    runner.async_session_store.mark_user_activity.side_effect = persist
+    await _receive(busy_activity, path, "steer", monkeypatch)
+    original = event._attended_activity_task
+    stamp = event._attended_activity_received_at
+    if drain:
+        # A concurrent turn-start must join recovery instead of duplicating its write.
+        assert await runner._mark_attended_user_activity(event, event.source, key)
+    await asyncio.gather(original, return_exceptions=True)
+    await asyncio.gather(event._attended_activity_task, return_exceptions=True)
+    # Successful steering consumes the event, so recovery cannot depend on drain.
+    runner._steer_running_agent.assert_called_once()
+    runner._queue_or_replace_pending_event.assert_not_called()
+    assert getattr(event, "_attended_activity_marked", False)
+    assert state.conversation.last_user_activity_at == stamp
+    assert runner.async_session_store.mark_user_activity.await_count == 2
+    for call in runner.async_session_store.mark_user_activity.await_args_list:
+        assert call.args == (key,)
+        assert call.kwargs == {"when": datetime.fromtimestamp(stamp)}
+    runner._load_reasoning_config = lambda *_args, **_kwargs: {}
+    decision = runner._attended_resolution_for_session(
+        source=event.source, session_key=key, user_config=CONFIG,
+        activity_stamp=1.0, allow_switch_back=True,
+    )
+    assert decision.reason == "attended"
+
+
+@pytest.mark.platforms("posix")
+def test_turn_marker_preserves_updated_instant_during_dst_fallback(tmp_path, monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    from gateway import session_lifecycle
+
+    instant = datetime(2026, 11, 1, 1, 20, fold=1, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="dst-turn", user_id="owner")
+    stores = []
+    try:
+        with monkeypatch.context() as local:
+            local.setenv("TZ", "America/Los_Angeles")
+            time.tzset()
+            touched = datetime.fromtimestamp(instant)
+            local.setattr(session_lifecycle, "_now", lambda: touched)
+            writer = SessionStore(tmp_path / "sessions", GatewayConfig())
+            stores.append(writer)
+            key = writer.get_or_create_session(source).session_key
+            assert writer.mark_user_activity(key, touched)
+            token = writer.mark_turn_active(key)
+            assert token
+            reader = SessionStore(tmp_path / "sessions", GatewayConfig())
+            stores.append(reader)
+            entry = reader.lookup_by_session_key(key)
+            assert entry is not None and entry.active_turn_token == token
+            assert entry.last_user_activity_at is not None
+            assert entry.last_user_activity_at.timestamp() == instant
+            assert entry.updated_at.timestamp() == instant
+            assert entry.updated_at.fold == 1
+    finally:
+        time.tzset()
+        for store in stores:
+            store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("receipt_result", ["false", "exception", "cancelled"])
 async def test_drain_retries_failed_receipt_with_original_arrival_time(busy_activity, receipt_result):
     runner, event, key, state = busy_activity

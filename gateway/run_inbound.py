@@ -1637,7 +1637,19 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if getattr(event, "_attended_activity_task", None) is not None:
             return
         event._attended_activity_received_at = time.time()
-        task = asyncio.create_task(self._mark_attended_user_activity(event, source, session_key))
+
+        async def mark_receipt():
+            # Steering consumes the event, so recovery cannot rely on a queue drain.
+            for attempt in range(2):
+                try:
+                    if await self._mark_attended_user_activity(event, source, session_key):
+                        return True
+                except asyncio.CancelledError:
+                    if attempt:
+                        raise
+            return False
+
+        task = asyncio.create_task(mark_receipt())
         event._attended_activity_task = task
         self._retain_background_task(task)
 
