@@ -4851,14 +4851,14 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                                 os.unlink(temp_path)
                 chunks = [content]
                 return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
-            # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
-            # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
+            # Rich skips and permanent refusals fall back, never successes or transient failures.
             if self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
+            content = _normalize_dollar_entities((metadata or {}).get("rich_fallback_content", content))
             chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
