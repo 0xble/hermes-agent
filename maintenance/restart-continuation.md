@@ -96,6 +96,10 @@ and restart-loop breaker remain authoritative. A recovery notice is not a delive
 receipt. Deferred follow-ups wait outside scheduler workers for their own session's
 resume. Per-session queue claims remain until older input has been dispatched, so
 releasing one session cannot admit another session's newer live input first.
+Failed resume or replay admission returns follow-ups in their original source-queue
+order without decrementing their outstanding input claims. Shutdown drops use the
+same ordering, independent of replay priority or drop-callback order, before the
+remaining input is spooled.
 
 The cap governs turn openings, not complete long-running turns. After the existing
 startup opening window passes, retain the actual turn as the ordering dependency

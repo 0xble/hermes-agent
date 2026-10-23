@@ -763,18 +763,83 @@ async def test_startup_release_does_not_overtake_other_session_deferred_followup
 
 
 @pytest.mark.asyncio
-async def test_shutdown_spools_restore_items_dropped_behind_replay_cap(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure", ["resume", "enqueue", "cancel"])
+async def test_failed_deferred_followup_keeps_older_input_ahead_of_live(tmp_path, monkeypatch, failure):
+    runner, adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    resume = asyncio.get_running_loop().create_future()
+    runner._replay_resume_tasks = {key: resume}
+    older = MessageEvent(text="older-followup", source=source, user_id="u1")
+    setattr(older, "_hermes_recovered_followup", True)
+    runner._queue_startup_restore_event(older, session_key=key)
+    runner._queue_startup_restore_event(
+        MessageEvent(text="newer-live", source=source, user_id="u1"), session_key=key,
+    )
+    seen = []
+    older_started, release_older = asyncio.Event(), asyncio.Event()
+    live_dispatched = asyncio.Event()
+
+    async def handle(event):
+        seen.append(event.text)
+        event._gateway_accepted = True
+        if event is older:
+            older_started.set()
+            await release_older.wait()
+        if event.text == "newer-live":
+            live_dispatched.set()
+
+    adapter.handle_message = handle
+    assert await runner._drain_startup_restore_queue(wait=False) == 0
+    assert runner._startup_restore_claimed_keys == {key}
+    if failure == "enqueue":
+        enqueue = runner._enqueue_replay
+        attempts = 0
+
+        def fail_once(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("replay admission failed")
+            return enqueue(**kwargs)
+
+        monkeypatch.setattr(runner, "_enqueue_replay", fail_once)
+        resume.set_result(None)
+    elif failure == "resume":
+        resume.set_exception(RuntimeError("resume failed"))
+    else:
+        resume.cancel()
+
+    try:
+        await asyncio.wait_for(older_started.wait(), 5)
+        assert seen == ["older-followup"]
+        assert runner._startup_restore_keys == {key: 2}
+    finally:
+        release_older.set()
+    await asyncio.wait_for(live_dispatched.wait(), 5)
+    await asyncio.gather(*tuple(runner._background_tasks), return_exceptions=True)
+    assert seen == ["older-followup", "newer-live"]
+    assert runner._startup_restore_queue == []
+    assert not runner._startup_restore_keys
+    assert not runner._startup_restore_claimed_keys
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("front", [False, True])
+async def test_shutdown_spools_restore_items_dropped_behind_replay_cap(tmp_path, monkeypatch, front):
     """Scheduler close must return every not-started inbound item for shutdown flush."""
     runner, adapter, source, _key, _ = _spooled_runner(tmp_path, monkeypatch)
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
     runner._replay_scheduler = ReplayScheduler(1)
     events = [
-        MessageEvent(text=f"queued-{i}", source=replace(source, chat_id=f"chat-{i}"), user_id="u1")
-        for i in range(3)
+        MessageEvent(text="blocker", source=replace(source, chat_id="blocker"), user_id="u1"),
+        MessageEvent(text="older", source=source, user_id="u1"),
+        MessageEvent(text="middle", source=source, user_id="u1"),
+        MessageEvent(text="newer", source=source, user_id="u1"),
+        MessageEvent(text="other", source=replace(source, chat_id="other"), user_id="u1"),
     ]
-    for event in events:
-        runner._queue_startup_restore_event(event)
+    setattr(events[1], "_hermes_recovered_followup", True)
+    for event in reversed(events) if front else events:
+        runner._queue_startup_restore_event(event, front=front)
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -791,8 +856,9 @@ async def test_shutdown_spools_restore_items_dropped_behind_replay_cap(tmp_path,
     await asyncio.wait_for(started.wait(), 5)
     await runner._replay_scheduler.close(timeout=0)
 
-    assert sorted(event.text for event in runner._startup_restore_queue) == [
-        "queued-1", "queued-2",
+    # The dropped head must return ahead of the same session's undispatched tail.
+    assert [event.text for event in runner._startup_restore_queue] == [
+        "older", "middle", "newer", "other",
     ]
     assert events[0] not in runner._startup_restore_queue
 
@@ -807,12 +873,21 @@ async def test_shutdown_spools_restore_items_dropped_behind_replay_cap(tmp_path,
     runner._shutdown_event = asyncio.Event()
     runner._active_api_run_count = MagicMock(return_value=0)
     runner._stop_kill_tool_subprocesses_off_loop = AsyncMock()
+    flushed = []
+    flush = runner._flush_owned_pending
+
+    def record_flush(key, event, **kwargs):
+        flushed.append(event.text)
+        return flush(key, event, **kwargs)
+
+    monkeypatch.setattr(runner, "_flush_owned_pending", record_flush)
     ctx = MagicMock()
     ctx.elapsed.return_value = 0
     await runner._stop_release_runtime_state(ctx)
     payloads = [json.loads(path.read_text(encoding="utf-8"))["data"]["text"]
                 for path in (tmp_path / "pending_messages").glob("*.json")]
-    assert sorted(payloads) == ["queued-1", "queued-2"]
+    assert flushed == ["older", "middle", "newer", "other"]
+    assert sorted(payloads) == ["middle", "newer", "older", "other"]
 
 
 @pytest.mark.asyncio

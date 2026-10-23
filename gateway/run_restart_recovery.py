@@ -320,12 +320,13 @@ class RestartRecoveryMixin:
             watcher.cancel()
         await self._finish_recovered_followup(event, session_key, reason)
 
-    def _release_startup_restore_key(self, session_key: str) -> None:
+    def _release_startup_restore_key(self, session_key: str, *, requeued: bool = False) -> None:
+        """Release dispatch ownership, keeping the admission fence for requeued input."""
         restore_keys = getattr(self, "_startup_restore_keys", None)
         claimed = getattr(self, "_startup_restore_claimed_keys", None)
         if claimed is not None:
             claimed.discard(session_key)
-        if restore_keys and session_key in restore_keys:
+        if not requeued and restore_keys and session_key in restore_keys:
             remaining = restore_keys[session_key] - 1
             if remaining > 0:
                 restore_keys[session_key] = remaining
@@ -409,7 +410,7 @@ class RestartRecoveryMixin:
                         await resume_task
                     except BaseException:
                         self._requeue_startup_restore_event(event, session_key=key)
-                        self._release_startup_restore_key(key)
+                        self._release_startup_restore_key(key, requeued=True)
                         return
                     try:
                         handle = self._enqueue_replay(
@@ -424,7 +425,7 @@ class RestartRecoveryMixin:
                         )
                     except BaseException:
                         self._requeue_startup_restore_event(event, session_key=key)
-                        self._release_startup_restore_key(key)
+                        self._release_startup_restore_key(key, requeued=True)
                         return
                     waiter = self._retain_background_task(asyncio.create_task(
                         self._get_replay_scheduler().wait_for(handle)

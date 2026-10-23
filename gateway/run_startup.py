@@ -100,6 +100,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             queue = self._startup_restore_queue = []
+        # Keep source order independent of scheduler priority and dropped-item callback order.
+        sequence = self._startup_restore_sequence = getattr(self, "_startup_restore_sequence", 0) + 1
+        setattr(event, "_hermes_startup_restore_order", -sequence if front else sequence)
         if front:
             queue.insert(0, event)
         else:
@@ -137,12 +140,20 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         Scheduler shutdown can cancel an item after it has been removed from the
         restore queue but before its turn starts.  The existing restore-key claim
         remains outstanding so the shutdown flush sees this copy exactly once.
+        Restore source order before releasing a failed resume's session claim,
+        or newer queued input could overtake this item on the next drain.
         """
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             queue = self._startup_restore_queue = []
         if not any(existing is event for existing in queue):
-            queue.append(event)
+            order = getattr(event, "_hermes_startup_restore_order", 0)
+            index = next(
+                (i for i, existing in enumerate(queue)
+                 if getattr(existing, "_hermes_startup_restore_order", 0) > order),
+                len(queue),
+            )
+            queue.insert(index, event)
         with suppress(Exception):
             logger.info(
                 "Returned dropped replay to restore queue: session_key=%s",
