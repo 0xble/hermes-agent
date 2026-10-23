@@ -149,6 +149,21 @@ def _replace_from_durable_row(manager: Any, **kwargs: Any) -> Dict[str, Any]:
     return dict(_STATE_CHANGED)
 
 
+def stop_condition_only(state: Any, *, goal: str, contract: Any,
+                        max_turns: Optional[int] = None) -> bool:
+    """A stop-condition edit cannot replace the objective or any completion requirement."""
+    from hermes_cli.goals import GoalContract
+
+    if state is None or contract is None:
+        return False
+    contract = contract if isinstance(contract, GoalContract) else GoalContract.from_dict(contract)
+    before, after = state.contract.to_dict(), contract.to_dict()
+    return (goal == state.goal and bool(before["stop_when"])
+            and before["stop_when"] != after["stop_when"]
+            and all(after[key] == value for key, value in before.items() if key != "stop_when")
+            and (max_turns is None or max_turns == state.max_turns))
+
+
 class GoalRevisionsMixin:
     def revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
                contract: Optional[Dict[str, str]] = None, subgoals: Optional[List[str]] = None,
@@ -232,6 +247,7 @@ class GoalRevisionsMixin:
                     "status": state.status, "turns_used": state.turns_used, "subgoals": list(state.subgoals)}
 
         previous = snapshot()
+        stop_only = stop_condition_only(state, goal=goal, contract=contract, max_turns=max_turns)
         lift_judge_pause = _paused_by_contract_verdict(state)
         state.goal = goal
         state.created_at = max(time.time(), float(state.created_at or 0.0) + 1e-6)
@@ -239,7 +255,7 @@ class GoalRevisionsMixin:
             state.contract = contract if isinstance(contract, GoalContract) else GoalContract.from_dict(contract)
         # An approved session control installs the shown payload as a fresh outcome scope; the
         # slash command keeps the existing additive criteria.
-        if approved:
+        if approved and not stop_only:
             state.subgoals = []
         if max_turns is not None:
             state.max_turns = normalize_goal_max_turns(max_turns, self.default_max_turns)

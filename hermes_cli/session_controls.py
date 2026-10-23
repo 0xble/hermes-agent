@@ -170,7 +170,7 @@ def _is_negated(quote: str, source: str) -> bool:
 # "Please explain how to clear the X goal" fall back to Approve/Deny.
 _QUALIFIER_TOKENS = frozenset({
     "if", "unless", "only", "when", "whenever", "once", "after", "before", "until", "later",
-    "whether", "how", "why", "what", "would", "could", "should", "might", "maybe",
+    "whether", "how", "why", "would", "could", "should", "might", "maybe",
     "perhaps", "probably", "explain", "wait", "think", "wonder", "consider",
 })
 _SENTENCE_END = ".!;\n"
@@ -395,6 +395,24 @@ def _quote_matches_control(kind: str, action: str, target_sid: str, requester_si
                            quote: str, payload: Optional[Dict[str, Any]], *, cursor=None) -> bool:
     """True when the quoted words state this exact control: kind, action, target and payload."""
     all_words = _negation_words(quote)
+    if kind == "goal" and action == "replace" and target_sid == requester_sid:
+        from hermes_cli.goals import GoalContract, load_goal
+        from hermes_cli.goals_revisions import stop_condition_only
+        edit = dict(payload or {})
+        # Contextual removal names the restriction, not the whole goal. Bind authority
+        # to the actual delta under the write lock, without granting it over other fields.
+        words = list(all_words)
+        while words and words[0] in _LEAD_WORDS:
+            words.pop(0)
+        if (len(words) > 1 and words[0] in {"remove", "drop", "delete", "clear", "change", "update",
+                                          "replace", "loosen"}
+                and (words[1] in {"this", "that", "it", "what"}
+                     or {"stop", "condition"}.issubset(words))
+                and stop_condition_only(load_goal(target_sid, cursor=cursor),
+                                        goal=str(edit.get("goal") or "").strip(),
+                                        contract=GoalContract.from_dict(edit.get("contract")),
+                                        max_turns=edit.get("max_turns"))):
+            return True
     if kind == "goal" and action == "replace":
         link = next((n for n, w in enumerate(all_words) if w in _REPLACE_LINKS), len(all_words))
         all_words = all_words[:link]
