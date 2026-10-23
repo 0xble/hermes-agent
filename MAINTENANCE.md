@@ -176,6 +176,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Hindsight memory provider | Keep the provider constructible before `initialize()`, retire memory workers on soft agent eviction, and coalesce Hindsight prefetch | Memory plugin lifecycle, retain strategy, cron-exclusion, agent-cache eviction, or prefetch changes | [Hindsight memory](maintenance/hindsight-memory.md) |
 | Auxiliary fallback configuration | Recognize runtime-read fallback chains without config backfill or invalid preset saves | Auxiliary config defaults, fallback chains, or preset reference persistence | [Auxiliary fallback configuration](maintenance/auxiliary-fallback-config.md) |
 | Auxiliary overload fallback | Route status-less provider overloads through configured auxiliary fallback | Auxiliary error classification or fallback-chain changes | [Auxiliary overload fallback](maintenance/auxiliary-overload-fallback.md) |
+| Auxiliary route health | Share typed, endpoint-scoped auxiliary route health across callers and processes with single-probe recovery and once-per-epoch notices | Auxiliary unhealthy marking, recovery probes, skip notices or route-health state | [Auxiliary route health](maintenance/auxiliary-route-health.md) |
 | Compression route deadline | Preserve auxiliary compression fallback at the shared route deadline | Compression worker cancellation, deadline, or fallback changes | [Compression route deadline](maintenance/compression-route-deadline.md) |
 | Compression pool saturation | A full compression pool defers instead of spending a compression attempt | Pool admission, transient compression signals, or preflight attempt accounting | [Compression pool saturation](maintenance/compression-pool-saturation.md) |
 | Manual compression levels | `/compress --level 1-3` escalation and a `here N` head that keeps no extra tail | `/compress` parsing, `here N`, or manual compression budget changes | [Manual compression levels](maintenance/manual-compression-levels.md) |
@@ -439,8 +440,10 @@ records, not patches. This contract's own patch identity: `maintenance-contract`
 rebases can rewrite the floor SHA; the checker requires the floor to be an ancestor of HEAD,
 locates a rewritten default floor by its exact subject, and fails clearly if that is gone.
 A maintenance unit may repair missing published metadata with an explicit
-`Fork-Patch-Backfill: <stable-patch-id>; <owned-identity>` line. This covers only
-the reviewed patch content without rewriting shared history or advancing the floor.
+`Fork-Patch-Backfill: <stable-patch-id>; <owned-identity>` line. This covers only the
+reviewed patch content without rewriting shared history or advancing the floor.
+Fork-Patch-Backfill: dd8b51a7f52d926fc084cd7e84bc8b72a651ff0f; evidence
+Published upstream maintenance merge `c8d3ae60f4f6` arrived without a trailer.
 New commits still require trailers, including the final squash merge message.
 A trailer proves classification, not functional coverage. Retire a patch only after its
 regression passes on the selected upstream release without the local implementation.
