@@ -95,8 +95,11 @@ elif args[:3] == ["item", "get", "item-b"] and args[3:5] == ["--vault", state["v
         print(token + " dummy-password")
         print("synthetic read failure", file=sys.stderr)
         sys.exit(1)
-    if args[5:] == ["--fields", "label=password", "--reveal"]:
-        print("dummy-password")
+    if args[5:] == ["--format", "json", "--reveal"]:
+        revealed = state.get("secret_item", {
+            "id": "item-b", "category": "LOGIN", "vault": {"id": state["vault"]},
+            "fields": [{"id": "password", "purpose": "PASSWORD", "value": "dummy-password"}]})
+        print(state.get("reveal_text", json.dumps(revealed)))
     elif args[5:] == ["--otp"]:
         print("123456")
     else:
@@ -196,12 +199,12 @@ def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, 
         ["item", "get", "card-c", "--vault", "vault-c", "--format", "json", "--reveal"],
         ["item", "get", "card-c", "--vault", "vault-c", "--format", "json"],
         ["item", "get", "item-b", "--vault", "vault-b", "--format", "json"],
-        ["item", "get", "item-b", "--vault", "vault-b", "--fields", "label=password", "--reveal"],
+        ["item", "get", "item-b", "--vault", "vault-b", "--format", "json", "--reveal"],
         ["item", "get", "item-b", "--vault", "vault-b", "--format", "json"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--otp"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
-        ["item", "get", "item-b", "--vault", "vault-moved", "--fields", "label=password", "--reveal"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json", "--reveal"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--otp"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
@@ -244,3 +247,134 @@ def test_real_subprocess_auth_is_scoped_and_empty_profile_fails_closed(fake_op, 
     assert calls() == before
     assert all(row["stdin_eof"] and not row["unexpected_env"] for row in before)
     assert_no_secret_diagnostics(capfd, caplog, str(error.value), str(unscoped.value), before)
+
+_PASSWORD_CASES = [
+    pytest.param([
+        {"label": "password", "value": "synthetic-custom"},
+        {"id": "password", "purpose": "PASSWORD", "value": "synthetic-native"},
+    ], "synthetic-native", id="native-after-custom"),
+    pytest.param([
+        {"purpose": "PASSWORD", "value": "synthetic-native"},
+        {"label": "password", "value": "synthetic-custom"},
+        {"label": "password", "value": "synthetic-other-custom"},
+    ], "synthetic-native", id="native-before-ambiguous-custom"),
+    pytest.param([
+        {"purpose": "PASSWORD", "value": " \t\r\n"},
+        {"label": "password", "value": "synthetic-custom"},
+    ], "synthetic-custom", id="blank-native-fallback"),
+    pytest.param([
+        {"label": "password", "value": ""},
+        {"label": "PASSWORD", "value": " \tsynthetic-custom\r\n\n"},
+    ], " \tsynthetic-custom\r\n\n", id="blank-custom-before-usable-preserve-bytes"),
+    pytest.param([
+        {"purpose": "PASSWORD", "value": ""},
+        {"purpose": "PASSWORD", "value": " \tsynthetic-native\r\n\n"},
+        {"label": "password", "value": "synthetic-custom"},
+    ], " \tsynthetic-native\r\n\n", id="blank-native-before-usable-preserve-bytes"),
+    pytest.param([
+        {"purpose": "USERNAME", "label": "password", "value": "not-a-password"},
+        {"purpose": "ONE_TIME_PASSWORD", "label": "password", "value": "not-a-password"},
+        {"label": "password", "value": "synthetic-custom"},
+    ], "synthetic-custom", id="other-native-purposes-are-not-custom"),
+    pytest.param([
+        {"type": "OTP", "label": "password", "value": "not-a-password"},
+        {"id": "password", "type": "CONCEALED", "value": "synthetic-custom"},
+    ], "synthetic-custom", id="custom-id-fallback-not-otp"),
+]
+
+
+def password_item(fields):
+    return {"id": "item-b", "category": "LOGIN", "vault": {"id": "vault-b"},
+            "urls": [{"href": "https://second.example/login"}], "fields": fields,
+            "passkeys": [{"credentialId": "opaque-credential", "unknown": {"nested": [None, 4]}}]}
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("method", ["resolve_password", "resolve_secret"])
+@pytest.mark.parametrize("fields,expected", _PASSWORD_CASES)
+def test_password_precedence_through_offline_cli(fake_op, fields, expected, method, capfd, caplog):
+    profile, calls, state = fake_op
+    revealed = password_item(fields)
+    state.write_text(json.dumps({"mode": "ok", "vault": "vault-b", "secret_item": revealed}))
+    before = state.read_bytes()
+    with profile("a") as backend:
+        metadata = backend.list_items()
+        assert [m.id for m in metadata] == ["op:item-a", "op:item-b", "op:card-c"]
+        assert len(calls()) == 1  # Listing never fans out to secret-bearing detail reads.
+        assert backend.get_meta("op:item-b").origin == "https://second.example"
+        result = getattr(backend, method)("op:item-b")
+        assert result == (expected if method == "resolve_password" else {"password": expected})
+        assert not hasattr(backend._fill_metadata, "item")
+        assert len(calls()) == 3  # List + fresh authorization + one transient reveal.
+        assert calls()[-1]["argv"] == [
+            "item", "get", "item-b", "--vault", "vault-b", "--format", "json", "--reveal"]
+    assert state.read_bytes() == before  # Read-only, including opaque passkeys.
+    assert all(row["identity"] == "a" for row in calls())
+    cache_text = repr((metadata, onepassword._LISTING_CACHE, onepassword._ITEM_META_INFLIGHT))
+    captured = capfd.readouterr()
+    diagnostic_text = captured.out + captured.err + caplog.text + cache_text + repr(calls())
+    assert expected not in diagnostic_text
+    assert "synthetic-custom" not in diagnostic_text and "synthetic-native" not in diagnostic_text
+    assert "opaque-credential" not in diagnostic_text
+
+
+_BAD_PASSWORD_FIELDS = [
+    pytest.param(None, id="null-fields"),
+    pytest.param({}, id="mapping-fields"),
+    pytest.param("not-a-list", id="string-fields"),
+    pytest.param([], id="empty-fields"),
+    pytest.param([None, 4, {"value": "unlabeled"}], id="opaque-or-unlabeled"),
+    pytest.param([{"purpose": "PASSWORD", "value": 4}], id="non-string-value"),
+    pytest.param([{"purpose": "PASSWORD"}, {"label": "password", "value": " \n"}], id="missing-or-blank"),
+    pytest.param([{"purpose": "PASSWORD", "value": "synthetic-native"},
+                  {"purpose": "PASSWORD", "value": "synthetic-other"},
+                  {"label": "password", "value": "synthetic-custom"}], id="ambiguous-native"),
+    pytest.param([{"label": "password", "value": "synthetic-custom"},
+                  {"label": "password", "value": "synthetic-other"}], id="ambiguous-custom"),
+    pytest.param([{"purpose": "PASSWORD", "value": "same-synthetic"},
+                  {"purpose": "PASSWORD", "value": "same-synthetic"}], id="duplicate-native-even-if-equal"),
+]
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("method", ["resolve_password", "resolve_secret"])
+@pytest.mark.parametrize("fields", _BAD_PASSWORD_FIELDS)
+def test_unusable_password_fields_fail_without_diagnostics(fake_op, fields, method, capfd, caplog):
+    profile, calls, state = fake_op
+    revealed = password_item(fields)
+    state.write_text(json.dumps({"mode": "ok", "vault": "vault-b", "secret_item": revealed}))
+    with profile("a") as backend, pytest.raises(RuntimeError, match="1Password login") as error:
+        getattr(backend, method)("op:item-b")
+    captured = capfd.readouterr()
+    text = captured.out + captured.err + caplog.text + repr(error.value) + repr(calls())
+    assert "synthetic-" not in text and "unlabeled" not in text
+    assert not hasattr(backend._fill_metadata, "item")
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("mutation", [
+    {"id": "item-other"}, {"vault": {"id": "vault-other"}}, {"vault": None},
+    {"category": "CREDIT_CARD"}, {"state": "ARCHIVED"}, {"fields": None},
+])
+def test_revealed_login_must_match_verified_identity(fake_op, mutation):
+    profile, calls, state = fake_op
+    revealed = password_item([{"purpose": "PASSWORD", "value": "synthetic-native"}])
+    revealed.update(mutation)
+    state.write_text(json.dumps({"mode": "ok", "vault": "vault-b", "secret_item": revealed}))
+    with profile("a") as backend, pytest.raises(RuntimeError, match="1Password login"):
+        backend.resolve_password("op:item-b")
+    assert len(calls()) == 3
+
+
+@pytest.mark.parametrize("reveal_text", ["{synthetic-private", "null", "[]", "{}"])
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("method", ["resolve_password", "resolve_secret"])
+def test_password_precedence_malformed_reveal_is_generic(fake_op, reveal_text, method, capfd, caplog):
+    profile, _calls, state = fake_op
+    state.write_text(json.dumps({"mode": "ok", "vault": "vault-b", "reveal_text": reveal_text}))
+    with profile("a") as backend, pytest.raises(RuntimeError, match="1Password login") as error:
+        getattr(backend, method)("op:item-b")
+    captured = capfd.readouterr()
+    assert "synthetic-private" not in (repr(error.value) + captured.out + captured.err + caplog.text)
+    assert error.value.__cause__ is None
+    assert not hasattr(backend._fill_metadata, "item")
