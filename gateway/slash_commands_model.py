@@ -926,6 +926,8 @@ class GatewayModelCommandsMixin:
             if store is not None:
                 with contextlib.suppress(Exception):
                     role_set = bool(await asyncio.to_thread(store.get_model_role, session_key))
+        if request.target.strip().lower() == "reset" and not request.explicit_provider:
+            await self._rehydrate_session_model_override_async(session_key)
         if request.target.strip().lower() == "reset" and not request.explicit_provider and (
             attended_enabled or role_set or pick_ttl or model_pick_deadline(conversation.model_override)
         ):

@@ -198,7 +198,7 @@ def test_new_session_first_attended_turn_has_no_switch_in_notice():
 
 @pytest.mark.parametrize("notice", [
     "⇄ Switched to Opus while you're active.",
-    "⇄ Model pick expired. Back to GPT-6.1 Sol.",
+    "⇄ Back to GPT-6.1 Sol, model pick expired.",
 ])
 def test_turn_start_attended_notice_is_delivered_persistently_once(monkeypatch, notice):
     state = SimpleNamespace(

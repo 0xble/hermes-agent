@@ -274,6 +274,14 @@ class GatewayAgentCacheMixin:
         lock = locks.get(session_key) if isinstance(locks, dict) else None
         return bool(lock is not None and lock.locked())
 
+    async def _rehydrate_session_model_override_async(self, session_key: str) -> None:
+        """Serialize restart hydration with route edits, publishing only on the loop."""
+        async with self._session_model_override_lock(session_key):
+            if self._session_model_override(session_key) is None:
+                epoch = self._session_model_override_epoch(session_key)
+                loaded = await asyncio.to_thread(self._load_session_model_override, session_key)
+                self._commit_session_model_override(session_key, loaded, epoch)
+
     def _rehydrate_session_model_override(self, session_key: str) -> None:
         """Synchronous callers retain lazy restoration, using the same fenced commit.
 

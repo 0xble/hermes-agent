@@ -159,14 +159,111 @@ async def test_repick_restarts_deadline_and_stale_expiry_cannot_clear_it(harness
 
 
 @pytest.mark.asyncio
-async def test_reset_clears_deadline_even_if_config_opt_in_was_removed(harness):
+@pytest.mark.parametrize("after_restart", [False, True])
+@pytest.mark.parametrize("past_deadline", [0, 1])
+@pytest.mark.parametrize("role_hold", [False, True])
+async def test_short_attended_turn_expires_before_assignment_and_emits_notice_now(
+    harness, monkeypatch, after_restart, past_deadline, role_hold,
+):
+    from gateway.turn_context import TurnContext
+
+    cfg, clock, source, restart = harness
+    cfg["model"].update(pick_ttl_hours=12, attended={"model": "attended", "provider": "openai"})
+    runner = restart()
+    key = runner._session_key_for_source(source)
+    expected_model = "attended"
+    if role_hold:
+        cfg["model"].pop("attended")
+        cfg["model_presets"] = {"fast": {"model": "fast-model", "provider": "openai"}}
+        expected_model = "fast-model"
+    await runner._handle_model_command(MessageEvent(text="/model picked", source=source))
+    deadline = runner._session_model_override(key)["expires_at"]
+    if role_hold:
+        runner.session_store.set_model_role(key, "fast")
+        runner._session_state(key).conversation.model_role = "fast"
+    if after_restart:
+        runner = restart()
+    runner._gateway_loop = asyncio.get_running_loop()
+    clock.now = deadline + past_deadline
+    runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, timezone.utc))
+    runner._session_state(key).conversation.last_user_activity_at = clock.now
+    runner._get_proxy_url = lambda: None
+    defaults = TurnContext()
+    display = SimpleNamespace(**{name: getattr(defaults, name) for name in runner._DISPLAY_TO_TURN_CTX})
+    display.user_config = cfg
+    display.platform_key = "telegram"
+    display.resolve_display_setting = lambda *_args: False
+    runner._run_agent_display_settings = lambda _source: display
+    runner._run_still_current_fn = lambda *_args: lambda: True
+    captured = []
+
+    class TurnAssembled(Exception):
+        pass
+
+    def capture_turn(ctx, turn, *_args):
+        captured.append(turn)
+        raise TurnAssembled
+
+    runner._run_agent_bind_turn_wiring = capture_turn
+    # No history, media or @refs: this path used to reach the worker before any lookup.
+    with pytest.raises(TurnAssembled):
+        await runner._run_agent_inner("hi", "", [], source, "sid", session_key=key)
+    turn = captured[0]
+    assert turn._model_assignment["override"] is None
+    assert runner.session_store.get_model_override(key) is None
+    notices, api_models = [], []
+    monkeypatch.setattr(turn, "_emit_persistent_attended_notice", notices.append)
+    monkeypatch.setattr(turn, "_combined_ephemeral_prompt", lambda: "")
+    monkeypatch.setattr(turn, "_setup_stream_consumer", lambda _platform: (None, None, None, False))
+    agent = SimpleNamespace(tools=[], context_compressor=None, session_prompt_tokens=0, session_completion_tokens=0)
+
+    def resolve_agent(route, *_args):
+        agent.model = route["model"]
+        agent.provider = route["runtime"]["provider"]
+        agent.api_mode = route["runtime"]["api_mode"]
+        agent._gateway_attended_decision_key = runner._session_state(key).conversation.last_attended_decision.decision_key
+        return agent, False
+
+    def switch_model(agent, model, provider, _key, _url, api_mode, _capabilities):
+        agent.model, agent.provider, agent.api_mode = model, provider, api_mode
+
+    monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", switch_model)
+    monkeypatch.setattr(turn, "_resolve_turn_agent", resolve_agent)
+    monkeypatch.setattr(turn, "_wire_turn_agent_callbacks", lambda *_args: None)
+    monkeypatch.setattr(turn, "_load_turn_history", lambda *_args: ([], None, []))
+    monkeypatch.setattr(turn, "_prepare_turn_message", lambda *_args: ("hi", 0.0))
+
+    def conversation(*_args):
+        turn._apply_attended_before_api_call(agent)
+        api_models.append(agent.model)
+        return {"final_response": "ok", "messages": [], "api_calls": 1}
+
+    monkeypatch.setattr(turn, "_run_conversation_with_approval", conversation)
+    monkeypatch.setattr(turn, "_finish_stream_consumer", lambda result, *_args: result)
+    monkeypatch.setattr(turn, "_append_auto_media_tags", lambda response, *_args: response)
+    monkeypatch.setattr(turn, "_sync_session_after_run", lambda *_args: (False, "sid", 0))
+    runner._provider_routing = {}
+    await asyncio.to_thread(turn.run_sync)
+    assert api_models == [expected_model]
+    assert notices == [f"⇄ Back to {expected_model}, model pick expired."]
+    assert runner._session_state(key).conversation.pending_attended_notice is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_restart", [False, True])
+async def test_reset_clears_deadline_even_if_config_opt_in_was_removed(harness, after_restart):
     cfg, clock, source, restart = harness
     cfg["model"]["pick_ttl_hours"] = 12
     runner = restart()
     key = runner._session_key_for_source(source)
     await runner._handle_model_command(MessageEvent(text="/model picked", source=source))
     cfg["model"].pop("pick_ttl_hours")
+    if after_restart:
+        runner = restart()
+        assert runner._session_model_override(key) is None
+    runner._perform_model_switch.reset_mock()
     await runner._handle_model_command(MessageEvent(text="/model reset", source=source))
+    runner._perform_model_switch.assert_not_called()
     assert runner._session_model_override(key) is None
     assert runner.session_store.get_model_override(key) is None
 

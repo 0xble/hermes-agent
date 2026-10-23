@@ -829,11 +829,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             attended_enabled = parse_attended_config(user_config or {}).enabled
             if attended_enabled:
                 state.conversation.pre_agent_fallback_notice = None
-            async with self._session_model_override_lock(skey):
-                if self._session_model_override(skey) is None:
-                    epoch = self._session_model_override_epoch(skey)
-                    hydrated = await asyncio.to_thread(self._load_session_model_override, skey)
-                    self._commit_session_model_override(skey, hydrated, epoch)
+            await self._rehydrate_session_model_override_async(skey)
             if not attended_enabled:
                 await self._expire_attended_temporary_picks_async(skey, user_config)
             if attended_enabled:
@@ -5549,6 +5545,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 _native_slack_task_cards=False,
                 needs_progress_queue=False,
             )
+        if session_key:
+            from gateway.model_pick import model_pick_deadline
+            await self._rehydrate_session_model_override_async(session_key)
+            deadline = model_pick_deadline(self._session_model_override(session_key))
+            if deadline and time.time() >= deadline:
+                # Expire before the assignment snapshot, and publish its notice on this loop
+                # before the worker can consume it on the same turn.
+                await self._resolve_session_agent_runtime_async(
+                    source=source, session_key=session_key, user_config=disp.user_config)
         turn_ctx, turn_runner, _cleanup_adapter = self._run_agent_build_turn_context(
             disp, AIAgent, message=message, source=source, session_key=session_key,
             run_generation=run_generation, context_prompt=context_prompt, history=history,
