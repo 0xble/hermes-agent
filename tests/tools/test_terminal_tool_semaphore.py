@@ -316,16 +316,25 @@ def test_wrapped_command_keeps_shell_state_and_runs_in_slot(tmp_path, monkeypatc
 @pytest.mark.live_system_guard_bypass  # kills the semaphore tree it started itself
 def test_background_wrapped_run_is_killable_and_releases_its_slot(tmp_path, monkeypatch):
     """The real helper under the process registry: kill stops the whole tree and frees the slot."""
-    real = Path.home() / ".local" / "bin" / "semaphore"
-    if not os.access(real, os.X_OK):
-        pytest.skip("semaphore helper not installed")
+    real = heavy._semaphore_executable(os.environ)
+    if real is None:
+        pytest.skip("semaphore helper not available on PATH or in home bin")
+    assert real is not None
     from tools.process_registry import ProcessRegistry
 
     monkeypatch.delenv("SEMAPHORE_HELD", raising=False)
     monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
     slots = tmp_path / "slots"
     monkeypatch.setenv("SEMAPHORE_DIR", str(slots))  # private slots: never touch the host's
+    monkeypatch.setenv("SEMAPHORE_SLOTS", "1")
+    monkeypatch.setenv("SEMAPHORE_EVENT_LOG", str(tmp_path / "events.jsonl"))
     monkeypatch.setenv("SEMAPHORE_STOP_GRACE", "1")
+    # Read-only protocol check before spawning anything we may later kill.
+    protocol = subprocess.run(
+        [real, "status", "--json"], capture_output=True, text=True,
+        env={**os.environ, "SEMAPHORE_SLOTS": "invalid"},
+    )
+    assert protocol.returncode != 0 and "SEMAPHORE_SLOTS" in protocol.stderr, protocol
     monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds", staticmethod(lambda: 1.0))
     monkeypatch.setattr(ProcessRegistry, "_write_checkpoint", lambda self: None)
     runner = tmp_path / "pytest"
@@ -340,7 +349,8 @@ def test_background_wrapped_run_is_killable_and_releases_its_slot(tmp_path, monk
         deadline = time.monotonic() + 20
         while "started" not in session.output_buffer and time.monotonic() < deadline:
             time.sleep(0.1)
-        assert "started held=0" in session.output_buffer or "started held=1" in session.output_buffer
+        assert "started held=0" in session.output_buffer
+        assert (slots / "slot-0.lock").stat().st_size > 0, "helper must hold the private slot"
         result = reg.kill_process(session.id)
         assert result["status"] == "killed", result
     finally:

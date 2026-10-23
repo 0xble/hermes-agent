@@ -6,7 +6,7 @@ Load when changing `tools/terminal_tool_semaphore.py`, how `terminal_tool` hands
 
 Fork patch identities: `terminal-semaphore`; lifecycle-guard addition: `lifecycle-guard-semaphore-walk`.
 
-On the Mac Studio, agents started test suites and gates from the Hermes terminal tool directly. A 10-minute load probe on 2026-10-05 found an average of 9.5 suites or gates running outside the host's `semaphore` semaphore at once (12 at peak), on 28 cores at load 60-120. The shell-function wrappers in `~/.config/shell/semaphore.sh` only cover `./bin/ci` and `scripts/run_tests.sh` typed literally, and miss `pytest`, `uv run pytest`, `pnpm test` and `vitest`.
+On the Mac Studio, agents started test suites and gates from the Hermes terminal tool directly. A 10-minute load probe on 2026-10-05 found an average of 9.5 suites or gates running outside the host's machine-wide semaphore at once (12 at peak), on 28 cores at load 60-120. The shell-function wrappers in `~/.config/shell/semaphore.sh` only cover `./bin/ci` and `scripts/run_tests.sh` typed literally, and miss `pytest`, `uv run pytest`, `pnpm test` and `vitest`.
 
 For the local backend only, `wrap_heavy_command` parses the command with the existing quote-aware shell scanner (`_scan_shell`), with heredoc bodies masked by `_mask_heredocs`. It routes each simple command in command position that runs a broad pytest, vitest or jest run, `scripts/run_tests.sh`, tox or nox, a package `test`/`test:*` script in any spelling (`pnpm test`, `npm run test`, `yarn workspace app test`, `pnpm -r test`) including heavy build/check/lint/typecheck scripts and dependency installation (`add`, `install`, `ci` and similar), `turbo`/`nx`/`lerna` test runs, or a `./bin/ci` profile other than `preflight`, `list` or `install-hooks` through `_hermes_semaphore LABEL CMD ...`, a shell function the rewrite defines on its first line. An external program goes through `semaphore --label` with the cwd it runs in. A name the session shell resolves itself (alias, function, builtin, in bash or zsh) runs unchanged, so a user's own wrapper such as the `./bin/ci` function from `~/.config/shell/semaphore.sh` keeps deciding. The `_` prefix keeps the snapshot re-dump from persisting the function. Exec-style prefix utilities (`env`, `nice`, `timeout`, `nohup`) cannot run a shell function, so the dispatcher goes in front of them. `command NAME` and `exec NAME` are left unwrapped because they deliberately bypass functions or replace the session shell. The rest of the command stays in the session shell, so `cd`, exports, functions, `&` and the cwd marker behave as before. Approval, guards, metrics, exit-code notes, verification evidence and redaction all see the user's original command.
 
@@ -45,6 +45,24 @@ Only `/dev/null` and `/dev/zero` are ignored by the referenced-script candidate 
 Generic interpreter/shebang leniency is retired. Every other directly executed script, including Python and `env` shebang forms, remains on the base strict walk; a shebang is not an attestation that its source is safe to tokenize as shell. The lifecycle guard does not model arbitrary interpreter dispatch, shell fallback, or command-specific PATH changes.
 
 Upstream: `semaphore` is a host-local tool, so this has no upstream equivalent and is not proposed upstream.
+
+## Coordinated Activation Prerequisite
+
+This source rename must not activate against a retiring-protocol-only helper.
+The unchanged helper-absent fail-open behavior is not a deployment fallback.
+Follow the dotfiles [Semaphore Cutover contract](https://github.com/0xble/dotfiles/blob/refactor/semaphore-rename/automation/launchd/candidates.md#semaphore-cutover)
+before switching this runtime: install and verify the actual new helper, prove
+the default state bridge shares the existing queue, then update and resolve
+`terminal.shell_init_files` to the installed `semaphore.sh` before deleting the
+retiring init file. Keep the old executable only for draining existing consumers,
+not as a permanent alias. Do not add retired environment reads or hint matching.
+
+Hermes update/restart remains gated on the Sunday go/no-go or Brian's explicit
+approval. The unrelated dotfiles candidate pin is not this change's to release.
+A source merge, private-fixture proof or existing shared-inode bridge is not
+permission to activate. The cutover owner must read back the installed helper
+hash, configured and resolved init paths, fresh-shell wrappers and real wrapped
+command before marking activation complete.
 
 ## Verification and retirement
 
