@@ -44,6 +44,7 @@ class ConversationState:
 
     model_override: Optional[dict[str, Any]] = None  # /model per-session override
     model_override_scope: str = "session"  # session, temporary, or once
+    model_pick_expired: bool = False  # stage a notice once the replacement route resolves
     one_turn_restore: Optional[dict[str, Any]] = None  # /model --once snapshot
     reasoning_override: Optional[dict[str, Any]] = None  # /reasoning override
     reasoning_override_scope: str = "session"  # session or temporary
