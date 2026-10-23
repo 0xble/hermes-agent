@@ -1067,9 +1067,7 @@ def auto_title_session(
         duplicate = False
         if title:
             with suppress(Exception):
-                titles = session_db.list_recent_session_titles(exclude_session_id=session_id, limit=None)
-                normalized = re.sub(r" #\d+$", "", title).casefold()
-                duplicate = any(re.sub(r" #\d+$", "", other).casefold() == normalized for other in titles)
+                duplicate = session_db.has_auto_title_collision(title, exclude_session_id=session_id)
         # Empty string is an explicit abstention. None is a failed/unusable provider response,
         # which must keep the existing derived fallback rather than hold the topic nameless.
         rejected = title == "" or bool(title and is_junk_title(title)) or duplicate

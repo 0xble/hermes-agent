@@ -39,7 +39,7 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - `/title X` on a Telegram topic stores the user's exact text, or the next free lineage alias
   such as `X #2` only when that exact text is held by another session; the visible Telegram
   topic is renamed to the unsuffixed label. Model-generated titles that match another
-  session's name are rejected before persistence, ignoring case and a trailing ` #N`. Background title
+  session's name are rejected before persistence, ignoring case and a trailing ` #N` on the stored name only. Numbers in a proposed subject remain meaningful. Background title
   callbacks use their persisted alias so even a collision arriving between the check and
   persistence cannot show a duplicate label.
 - `/title X` also re-picks the icon from `X` when `auto_topic_icons` is on, through the same
@@ -62,7 +62,8 @@ its optional icon, and the durable alias can be observed through one Telegram to
   are greetings, the placeholder stays provisional. Each failed attempt is logged, but
   the turn's failure callback reports only the first failure, including a retry-only
   failure. Gateway callbacks remain debug-only, not user-visible. Later turns retain
-  the existing turn-3 cap. A manual `/title` still wins, and a stored `llm` or `user`
+  the existing turn-3 cap. At turn 3 a rejected name falls back to a title derived from
+  the current user message. A manual `/title` still wins, and a stored `llm` or `user`
   title is never replaced. `auxiliary.title_generation.hold_until_reply: false` restores
   the previous opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared

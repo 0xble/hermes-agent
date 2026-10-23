@@ -371,7 +371,7 @@ def test_title_worker_distinguishes_abstention_from_provider_failure(tmp_path, r
 @pytest.mark.parametrize("existing, generated", [
     ("Influence and Persuasion", "Influence and Persuasion"),
     ("INFLUENCE AND PERSUASION #2", "Influence and Persuasion"),
-    ("Influence and Persuasion", "influence and persuasion #3"),
+    ("Review PR #586", "Review PR #586"),
 ])
 @pytest.mark.parametrize("turns, hold", [(1, True), (3, True), (1, False)])
 def test_duplicate_model_title_is_held_or_replaced_by_derived(tmp_path, existing, generated, turns, hold):
@@ -397,6 +397,31 @@ def test_duplicate_model_title_is_held_or_replaced_by_derived(tmp_path, existing
         assert db.get_session_title("active") == derive_title(opener)
         assert db.get_session_title_source("active") == "derived"
         assert seen[0][1]["display_title"] == derive_title(opener)
+
+
+@pytest.mark.parametrize("existing, generated", [
+    ("Review PR #586", "Review PR #597"),
+    ("Influence and Persuasion", "Influence and Persuasion #3"),
+])
+def test_candidate_number_is_part_of_the_subject(tmp_path, existing, generated):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="taken", source="telegram")
+    db.set_session_title("taken", existing)
+    db.create_session(session_id="active", source="telegram")
+    with patch("agent.title_generator.generate_title", return_value=generated):
+        auto_title_session(db, "active", "Review the requested subject")
+    assert db.get_session_title("active") == generated
+    assert db.get_session_title_source("active") == "llm"
+
+
+def test_collision_lookup_failure_keeps_auto_title_fail_open(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="active", source="telegram")
+    with patch.object(db, "has_auto_title_collision", side_effect=RuntimeError("unavailable")), \
+         patch("agent.title_generator.generate_title", return_value="Review Requested Subject"):
+        auto_title_session(db, "active", "Review the requested subject")
+    assert db.get_session_title("active") == "Review Requested Subject"
+    assert db.get_session_title_source("active") == "llm"
 
 
 class TestAutoTitleSession:
@@ -490,6 +515,7 @@ class TestAutoTitleSession:
     def test_invokes_title_callback_after_setting_title(self):
         db = MagicMock()
         db.get_session_title_source.return_value = None
+        db.has_auto_title_collision.return_value = False
         db.set_auto_title.return_value = True
         seen = []
         with patch("agent.title_generator.generate_title", return_value="Readable Session"):
@@ -1010,6 +1036,7 @@ class TestAutoTitleDuplicateHandling:
     def test_collision_at_persistence_never_notifies_unsuffixed_title(self):
         db = MagicMock()
         db.get_session_title_source.return_value = None
+        db.has_auto_title_collision.return_value = False
         # Atomic write path: collision raises ValueError, retry persists.
         db.set_auto_title.side_effect = [ValueError("in use"), True]
         db.get_next_title_in_lineage.return_value = "Debugging Import Error #2"

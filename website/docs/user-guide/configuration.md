@@ -1467,9 +1467,9 @@ not literal URL hosts. Loopback, RFC 1918, link-local, CGNAT, and cloud metadata
 Bare links and attachment-only openers wait for the first reply before the title upgrade.
 Prose openers are tried immediately. If the model abstains, returns a platform label, raw ID,
 generic word (`None`, `Investigation`, `Unspecified`), or another session's title (ignoring case
-and a trailing ` #N`), the session keeps its placeholder and retries at the next user turn,
+and a trailing ` #N` on the stored name only), the session keeps its placeholder and retries at the next user turn,
 not again when the current turn ends. Retries can use a bounded excerpt of the latest assistant
-reply. At turn 3, rejected model names fall back to the derived opener title. Provider failures
+reply. At turn 3, rejected model names fall back to a title derived from the current user message. Provider failures
 and truncated output use the derived fallback immediately rather than holding. A manual `/title`
 always wins, and a real title is never renamed.
 Set `auxiliary.title_generation.hold_until_reply: false` to title from the opening message only.
