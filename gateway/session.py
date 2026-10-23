@@ -1462,6 +1462,19 @@ class SessionStore(
                 self._save()
         return len(dropped)
 
+    def unbind_session(self, session_key: str, expected_session_id: str) -> bool:
+        """Remove 1 routing identity without deleting its session or other routes."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return True
+            if entry.session_id != expected_session_id:
+                return False
+            self._entries.pop(session_key)
+            self._save()
+            return True
+
     def remove_by_session_id(self, session_id: str) -> int:
         """Drop every routing entry pointing at *session_id* (hard delete) and persist the drop.
 

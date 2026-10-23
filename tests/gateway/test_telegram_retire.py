@@ -1,0 +1,247 @@
+"""Retirement never uses callback timing as deletion authority."""
+import asyncio
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import Platform
+from gateway.platforms.base import MessageEvent, SendResult
+from gateway.session import SessionSource
+from gateway import telegram_retire as retire
+
+
+@pytest.fixture
+def setup_retire(monkeypatch):
+    monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=()))
+    meta = {}
+    db = SimpleNamespace(
+        get_meta=AsyncMock(side_effect=lambda key: meta.get(key)),
+        set_meta=AsyncMock(side_effect=lambda key, value: meta.__setitem__(key, value)),
+        get_telegram_topic_owner_for_thread=AsyncMock(return_value={"owner_key": "monitor"}),
+        set_telegram_topic_owner_state=AsyncMock(), delete_telegram_topic_binding=AsyncMock(),
+        list_meta_prefix=AsyncMock(side_effect=lambda prefix: list(meta.items())),
+    )
+    bot = SimpleNamespace(delete_forum_topic=AsyncMock(return_value=True),
+                          send_message=AsyncMock(side_effect=RuntimeError("Bad Request: message thread not found")))
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SendResult(True, message_id="10")), _bot=bot,
+                              _session_tasks={}, cancel_session_processing=AsyncMock())
+    runner = SimpleNamespace(_session_db=db, session_store=SimpleNamespace(
+        peek_session_id=MagicMock(return_value="session-1"), unbind_session=MagicMock(return_value=True)),
+        _session_key_for_source=lambda source: "topic-key", _is_session_running=MagicMock(return_value=False),
+        _delivery_adapter_for=lambda source: adapter, _running_agents={})
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="100", thread_id="42", chat_type="dm", user_id="100")
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(return_value=True))
+    return runner, source, adapter, meta
+
+
+@pytest.fixture
+def runtime(setup_retire):
+    runner, source, adapter, _ = setup_retire
+    runner.source, runner.adapter, runner.bot = source, adapter, adapter._bot
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_delivery_persist_delete_probe_unbind_order(setup_retire):
+    runner, source, adapter, meta = setup_retire
+    order = []
+    async def close(*args, **kwargs):
+        order.append("close")
+        assert kwargs["metadata"] == {"thread_id": "42"}
+        assert not adapter._bot.delete_forum_topic.called
+        return SendResult(True, message_id="10")
+    async def delete(**kwargs):
+        state = json.loads(meta[retire.state_key(source)])
+        assert state["closing_receipt"]["message_id"] == "10"
+        assert state["closing_receipt"]["thread_id"] == "42"
+        order.append("delete")
+        return True
+    adapter.send.side_effect = close
+    adapter._bot.delete_forum_topic.side_effect = delete
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+    assert order == ["close", "delete"]
+    assert (await retire.load(runner, source))["phase"] == "done"
+    runner._session_db.delete_telegram_topic_binding.assert_awaited_once_with(chat_id="100", thread_id="42", profile_name="default")
+    runner.session_store.unbind_session.assert_called_once_with("topic-key", "session-1")
+    runner._session_db.set_telegram_topic_owner_state.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [SendResult(False, error="failed"), SendResult(True),
+    SendResult(True, message_id="10", deferred=True), SendResult(True, message_id="10", held=True),
+    SendResult(False, message_id="10", continuation_message_ids=("9",)),
+    SendResult(True, message_id="10", continuation_message_ids=("9",)),
+    SendResult(True, message_id="10", raw_response={"partial_overflow": True}),
+    SendResult(True, message_id="10", raw_response={"thread_fallback": True}),
+    SendResult(True, message_id="10", raw_response={"requested_thread_id": 99}),
+    SendResult(True, message_id="10", raw_response={"message_ids": ["9", "10"]})])
+async def test_nonconfirmed_send_never_deletes(setup_retire, result):
+    runner, source, adapter, _ = setup_retire
+    adapter.send.return_value = result
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+    runner._session_db.delete_telegram_topic_binding.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_closing_invalidates_delete(setup_retire):
+    runner, source, adapter, _ = setup_retire
+    async def close(*args, **kwargs):
+        await retire.request(runner, source, cancel=True)
+        return SendResult(True, message_id="10")
+    adapter.send.side_effect = close
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+    assert (await retire.load(runner, source))["phase"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_active_turn_waits_and_reinventories_after_turn(setup_retire, monkeypatch):
+    runner, source, adapter, _ = setup_retire
+    prepare = AsyncMock(return_value=True)
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", prepare)
+    runner._is_session_running.return_value = True
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+    prepare.assert_not_awaited()
+    runner._is_session_running.return_value = False
+    await retire.advance(runner, source)
+    prepare.assert_awaited_once()
+    adapter._bot.delete_forum_topic.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_keeps_topic_and_durable_unresolved_attempt(setup_retire):
+    runner, source, adapter, _ = setup_retire
+    adapter.send.side_effect = asyncio.CancelledError
+    await retire.request(runner, source)
+    with pytest.raises(asyncio.CancelledError):
+        await retire.advance(runner, source)
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+    state = await retire.load(runner, source)
+    assert state["closing_attempt"] and not state.get("closing_receipt")
+    adapter.send.side_effect = None
+    await retire.advance(runner, source)
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_failure_keeps_binding_and_posts_failure(setup_retire, monkeypatch):
+    runner, source, adapter, _ = setup_retire
+    adapter._bot.delete_forum_topic.side_effect = RuntimeError("not enough rights")
+    adapter._bot.send_message.side_effect = None
+    adapter._bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot", id=900))
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", AsyncMock(side_effect=RuntimeError("not enough rights")))
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+    runner._session_db.delete_telegram_topic_binding.assert_not_awaited()
+    assert "not enough rights" in adapter.send.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciles_delete_without_repeating_it(setup_retire):
+    runner, source, adapter, _ = setup_retire
+    await retire.request(runner, source)
+    state = await retire.load(runner, source)
+    state.update(phase="deleting", closing_receipt={"message_id": "10", "generation": state["generation"], "chat_id": "100", "thread_id": "42"})
+    await retire.save(runner, source, state)
+    await retire.advance(runner, source)
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+    assert (await retire.load(runner, source))["phase"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_now_interrupts_first_preserves_pending_obligations(setup_retire):
+    runner, source, adapter, _ = setup_retire
+    agent = runner._running_agents["topic-key"] = MagicMock()
+    await retire.request(runner, source, now=True)
+    agent.interrupt.assert_called_once()
+    adapter.cancel_session_processing.assert_awaited_once_with("topic-key", discard_pending=False)
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prompt_and_commands_admitted_unrelated_work_rejected(setup_retire, monkeypatch):
+    runner, source, _adapter, _ = setup_retire
+    await retire.request(runner, source)
+    state = await retire.load(runner, source)
+    state["questions"] = [{"id": "goal", "suggestion": "Work"}]
+    await retire.save(runner, source, state)
+    resolve = AsyncMock(return_value=True)
+    monkeypatch.setattr("gateway.telegram_retire_work.resolve_answers", resolve)
+    event = SimpleNamespace(source=source, allow_gateway_control=True, internal=False,
+                            get_command=lambda: None, text="1 Work")
+    assert await retire.intercept(runner, event) == "Retirement owners recorded."
+    resolve.return_value = False
+    event.text = "start a new project"
+    assert await retire.intercept(runner, event) == retire.NOTICE
+    event.get_command = lambda: "retire"
+    assert await retire.intercept(runner, event) is None
+
+
+@pytest.mark.asyncio
+async def test_complete_split_receipt_authorizes_delete(runtime):
+    runtime.adapter.send.return_value = SendResult(
+        success=True, message_id="50", raw_response={"message_ids": ["50", "51"], "requested_thread_id": "42"})
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    runtime.bot.delete_forum_topic.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pending_owner_question_never_sends_closing_or_deletes(runtime, monkeypatch):
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(return_value=False))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    runtime.adapter.send.assert_not_awaited()
+    runtime.bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_generation_prevents_stale_save(runtime):
+    await retire.request(runtime, runtime.source)
+    prior = await retire.load(runtime, runtime.source)
+    await retire.request(runtime, runtime.source, cancel=True)
+    with pytest.raises(retire.RetirementSuperseded):
+        await retire.save(runtime, runtime.source, prior)
+    assert (await retire.load(runtime, runtime.source))["phase"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_internal_completion_can_settle_and_addressed_cancel_is_admitted(runtime):
+    await retire.request(runtime, runtime.source)
+    completion = MessageEvent(text="owned completion", source=runtime.source, internal=True)
+    assert await retire.intercept(runtime, completion) is None
+    command = MessageEvent(text="/retire@HermesBot cancel", source=runtime.source)
+    assert await retire.intercept(runtime, command) is None
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_delete_probes_before_any_fallback(runtime, monkeypatch):
+    runtime.bot.delete_forum_topic.side_effect = TimeoutError("response lost")
+    probe = AsyncMock(side_effect=[True, True])
+    monkeypatch.setattr(retire, "_probe_deleted", probe)
+    cli = AsyncMock()
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", cli)
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    cli.assert_not_awaited()
+    runtime.bot.delete_forum_topic.assert_awaited_once()
+    runtime.session_store.unbind_session.assert_called_once_with("topic-key", "session-1")
+
+
+@pytest.mark.asyncio
+async def test_exact_mtproto_probe_uses_bot_dialog_not_user_chat(runtime, monkeypatch):
+    from gateway import telegram_retire_work
+    monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=("telegram",)))
+    runtime.bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot", id=900))
+    command = AsyncMock(return_value=[])
+    monkeypatch.setattr(telegram_retire_work, "cli", command)
+    assert await retire._probe_deleted(runtime.bot, runtime.source, runner=runtime)
+    assert command.await_args.args[-3:] == ("@HermesBot", "--id", "42")
+    runtime.bot.send_message.assert_not_awaited()

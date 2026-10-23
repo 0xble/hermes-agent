@@ -1,0 +1,299 @@
+"""Native Telegram topic retirement. State lives beside goals/loops in state_meta.
+
+The turn-completion hook only wakes this executor. It is never a delivery receipt.
+The executor sends its own short, thread-strict closing line and persists the
+transport acknowledgement before it can dispatch a destructive request.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from dataclasses import asdict
+
+from gateway.config import Platform
+from gateway.session import SessionSource
+from gateway.telegram_topic_sessions import TopicRequestError
+
+logger = logging.getLogger(__name__)
+PREFIX = "telegram_retire:"
+CLOSING = "This topic is retired. Its session and transcript are preserved."
+NOTICE = "This topic is retiring. Use /retire cancel to keep it."
+
+
+def state_key(source):
+    return f"{PREFIX}{source.profile or 'default'}:{source.chat_id}:{source.thread_id}"
+
+
+async def load(runner, source):
+    if source.platform != Platform.TELEGRAM or not source.thread_id:
+        return None
+    db = getattr(runner, "_session_db", None)
+    if db is None:
+        return None
+    raw = await db.get_meta(state_key(source))
+    return json.loads(raw) if isinstance(raw, str) and raw else None
+
+
+class RetirementSuperseded(Exception):
+    """A control request fenced an older executor generation."""
+
+
+async def save(runner, source, state, *, force=False):
+    locks = getattr(runner, "_telegram_retire_state_locks", None)
+    if locks is None:
+        locks = runner._telegram_retire_state_locks = {}
+    async with locks.setdefault(state_key(source), asyncio.Lock()):
+        current = await load(runner, source)
+        if not force and current and current["generation"] != state["generation"]:
+            raise RetirementSuperseded
+        await runner._session_db.set_meta(state_key(source), json.dumps(state))
+
+
+async def request(runner, source, *, target="", now=False, cancel=False):
+    if source.platform != Platform.TELEGRAM or not source.thread_id or str(source.thread_id) in {"0", "1"}:
+        raise TopicRequestError("Retirement requires a non-General Telegram topic.")
+    if runner._session_db is None:
+        raise TopicRequestError("Session storage is unavailable. The topic was not changed.")
+    existing = await load(runner, source)
+    if cancel:
+        if existing and existing["phase"] in {"deleting", "delete_unresolved"}:
+            raise TopicRequestError("Topic deletion has already been dispatched and cannot be cancelled.")
+        if existing and existing["phase"] != "done":
+            existing["phase"] = "cancelled"
+            existing["generation"] = uuid.uuid4().hex
+            await save(runner, source, existing, force=True)
+        return {"action": "cancel_retire", "status": "cancelled", "thread_id": str(source.thread_id)}
+    if existing and existing["phase"] in {"deleting", "delete_unresolved", "done"}:
+        return {"action": "retire", "status": existing["phase"], "thread_id": str(source.thread_id)}
+    session_key = runner._session_key_for_source(source)
+    session_id = runner.session_store.peek_session_id(session_key)
+    if not session_id:
+        raise TopicRequestError("This topic has no bound session to retire.")
+    # Repeated requests without a new target are idempotent. A target change fences
+    # callbacks and closing sends already in flight for the preceding generation.
+    if existing and existing["phase"] not in {"cancelled", "failed"} and not target:
+        state = existing
+    else:
+        state = {
+            "generation": uuid.uuid4().hex, "phase": "pending", "session_id": session_id,
+            "session_key": session_key, "target": target.strip(), "mode": "now" if now else "after_turn",
+            "requested_at": time.time(), "source": {**asdict(source), "platform": "telegram"},
+            "handoffs": (existing or {}).get("handoffs", {}) if existing and existing["phase"] != "cancelled" else {},
+        }
+        # Receipt idempotency and executor cancellation are different identities.
+        # A control generation must fence stale saves without duplicating work.
+        if state["handoffs"]:
+            state["handoff_generation"] = existing.get("handoff_generation", existing["generation"])
+        await save(runner, source, state, force=True)
+    if now:
+        adapter = runner._delivery_adapter_for(source)
+        agent = (getattr(runner, "_running_agents", {}) or {}).get(session_key)
+        if agent is not None and callable(getattr(agent, "interrupt", None)):
+            agent.interrupt("Topic retirement requested now")
+        if adapter is not None:
+            # Keep queued obligations: now interrupts the turn, it does not discard work.
+            await adapter.cancel_session_processing(session_key, discard_pending=False)
+    return {"action": "retire", "status": "queued", "thread_id": str(source.thread_id),
+            "generation": state["generation"], "effective_when": "after_current_turn"}
+
+
+async def intercept(runner, event):
+    """Called before both adapter queuing and runner dispatch. None means continue."""
+    state = await load(runner, event.source)
+    if not state or state["phase"] in {"cancelled", "done"}:
+        return None
+    if event.internal:
+        # Already-owned completion work may settle while retirement waits. The
+        # admission fence is for new user work, not a way to discard results.
+        return None
+    if event.allow_gateway_control and not event.internal:
+        if event.get_command() == "retire":
+            return None
+        if state.get("questions"):
+            from gateway.telegram_retire_work import resolve_answers
+            if await resolve_answers(runner, event.source, state, event.text):
+                return "Retirement owners recorded."
+    return NOTICE
+
+
+def confirmed(result, source=None):
+    """No outbox acceptance, held retry, partial send or missing transport ID authorizes delete."""
+    raw = getattr(result, "raw_response", None)
+    if isinstance(raw, dict):
+        if raw.get("thread_fallback") or raw.get("undelivered_chunks"):
+            return False
+        if len(raw.get("message_ids") or []) > 1 and raw.get("requested_thread_id") is None:
+            return False
+        if source is not None and raw.get("requested_thread_id") is not None and str(raw["requested_thread_id"]) != str(source.thread_id):
+            return False
+    if getattr(result, "continuation_message_ids", None):
+        ids = {str(value) for value in raw.get("message_ids", [])} if isinstance(raw, dict) else set()
+        if not {str(result.message_id), *map(str, result.continuation_message_ids)} <= ids:
+            return False
+    return bool(result is not None and result.success and result.message_id
+                and not result.error and not result.deferred and not result.held
+                and not (isinstance(result.raw_response, dict)
+                         and result.raw_response.get("partial_overflow")))
+
+
+async def _current(runner, source, generation):
+    state = await load(runner, source)
+    return state if state and state["generation"] == generation and state["phase"] not in {"cancelled", "done"} else None
+
+
+async def _probe_deleted(bot, source, *, runner=None):
+    from gateway.telegram_retire_work import cli
+    from hermes_platform.resolver import locate_command
+    if runner is not None and locate_command("telegram").command:
+        topics = await cli(runner, source, "telegram", "--agent", "topic", "list",
+                           await _cli_peer(bot, source), "--id", str(source.thread_id))
+        if not isinstance(topics, list):
+            raise RuntimeError("Exact-topic lookup returned an incomplete response")
+        return not topics
+    # The Bot API has no getForumTopic. A thread-strict send is the documented
+    # absence probe. Never retry or fall back to the chat root.
+    try:
+        await bot.send_message(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id), text=NOTICE)
+    except Exception as exc:
+        if "message thread not found" in str(exc).lower() or "topic_deleted" in str(exc).lower():
+            return True
+        raise
+    return False
+
+
+async def _cli_peer(bot, source):
+    if source.chat_type != "dm":
+        return str(source.chat_id)
+    # The Bot API's DM chat_id is the user. MTProto addresses the bot dialog.
+    me = await bot.get_me()
+    return "@" + me.username if me.username else str(me.id)
+
+
+async def _unbind(runner, source, state):
+    profile = source.profile or "default"
+    owner = await runner._session_db.get_telegram_topic_owner_for_thread(
+        chat_id=str(source.chat_id), thread_id=str(source.thread_id), profile_name=profile)
+    if owner:
+        await runner._session_db.set_telegram_topic_owner_state(
+            chat_id=str(source.chat_id), owner_key=owner["owner_key"], status="retired", profile_name=profile)
+    await runner._session_db.delete_telegram_topic_binding(
+        chat_id=str(source.chat_id), thread_id=str(source.thread_id), profile_name=profile)
+    if not await asyncio.to_thread(runner.session_store.unbind_session, state["session_key"], state["session_id"]):
+        raise RuntimeError("Topic routing changed before unbinding, session was preserved")
+    state["phase"] = "done"
+    await save(runner, source, state)
+
+
+async def advance(runner, source):
+    """Resume persisted retirement only after the active turn relinquishes its lane."""
+    state = await load(runner, source)
+    if not state or state["phase"] in {"cancelled", "done", "failed"}:
+        return
+    key = state["session_key"]
+    adapter = runner._delivery_adapter_for(source)
+    if adapter is None or runner._is_session_running(key):
+        return
+    tasks = getattr(adapter, "_session_tasks", {})
+    task = tasks.get(key)
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        return
+    locks = getattr(runner, "_telegram_retire_locks", None)
+    if locks is None:
+        locks = runner._telegram_retire_locks = {}
+    lock = locks.setdefault(state_key(source), asyncio.Lock())
+    if lock.locked():
+        return
+    async with lock:
+        state = await _current(runner, source, state["generation"])
+        if not state:
+            return
+        generation = state["generation"]
+        bot = getattr(adapter, "_bot", None)
+        try:
+            if bot is None:
+                raise RuntimeError("Telegram bot is disconnected")
+            if state["phase"] in {"deleting", "delete_unresolved"}:
+                # A restart/timeout cannot authorize a second delete. Reconcile
+                # first using the saved successful closing acknowledgement.
+                receipt = state.get("closing_receipt") or {}
+                if (receipt.get("generation") != generation or not receipt.get("message_id")
+                        or receipt.get("chat_id") != str(source.chat_id)
+                        or receipt.get("thread_id") != str(source.thread_id)):
+                    raise RuntimeError("Missing exact-topic confirmed closing receipt")
+                if await _probe_deleted(bot, source, runner=runner):
+                    await _unbind(runner, source, state)
+                    return
+                raise RuntimeError("The previous delete was not confirmed. Use /retire to retry.")
+            from gateway.telegram_retire_work import prepare
+            # Inventory happens here, after the turn, not when /retire was typed.
+            if runner.session_store.peek_session_id(key) != state["session_id"]:
+                raise RuntimeError("The bound session changed during retirement. Cancel and retry from its current session.")
+            if not await prepare(runner, source, state):
+                return
+            state = await _current(runner, source, generation)
+            if not state:
+                return
+            if state.get("closing_attempt"):
+                raise RuntimeError("Closing delivery is unresolved. Cancel retirement before retrying.")
+            state["closing_attempt"] = time.time()
+            await save(runner, source, state)
+            result = await adapter.send(str(source.chat_id), CLOSING, metadata={"thread_id": str(source.thread_id)})
+            state = await _current(runner, source, generation)
+            if not state:
+                return
+            if not confirmed(result, source):
+                raise RuntimeError("Closing reply was not fully acknowledged in this topic. The topic was kept.")
+            state["closing_receipt"] = {
+                "generation": generation, "message_id": str(result.message_id),
+                "chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "delivered_at": time.time(),
+            }
+            state["phase"] = "deleting"
+            await save(runner, source, state)
+            # Cancellation changes the generation before this check. No await
+            # separates the final fence from initiating the destructive request.
+            if not await _current(runner, source, generation):
+                return
+            try:
+                if await bot.delete_forum_topic(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id)) is not True:
+                    raise RuntimeError("Telegram did not acknowledge topic deletion")
+            except Exception:
+                # A lost response can mean the topic is already gone. Reconcile
+                # the exact thread before invoking the user-CLI fallback once.
+                if not await _probe_deleted(bot, source, runner=runner):
+                    from gateway.telegram_retire_work import cli
+                    peer = await _cli_peer(bot, source)
+                    await cli(runner, source, "telegram", "--agent", "--yes", "topic", "delete",
+                              str(peer), str(source.thread_id))
+            if not await _probe_deleted(bot, source, runner=runner):
+                raise RuntimeError("Telegram still accepts messages in the topic after deletion")
+            await _unbind(runner, source, state)
+        except asyncio.CancelledError:
+            raise
+        except RetirementSuperseded:
+            return
+        except Exception as exc:
+            logger.warning("Topic retirement failed for %s: %s", key, exc, exc_info=True)
+            current = await _current(runner, source, generation)
+            if current:
+                current["phase"] = "delete_unresolved" if current["phase"] in {"deleting", "delete_unresolved"} else "failed"
+                current["error"] = str(exc)
+                await save(runner, source, current)
+                await adapter.send(str(source.chat_id), f"Topic retirement failed: {exc}",
+                                   metadata={"thread_id": str(source.thread_id)})
+
+
+async def resume_all(runner):
+    if getattr(runner, "_session_db", None) is None:
+        return
+    for _, raw in await runner._session_db.list_meta_prefix(PREFIX):
+        try:
+            state = json.loads(raw)
+            if state["phase"] not in {"cancelled", "done", "failed"}:
+                source = SessionSource(**{**state["source"], "platform": Platform.TELEGRAM})
+                async with runner._async_profile_scope_for_source(source):
+                    await advance(runner, source)
+        except Exception:
+            logger.warning("Unable to resume one topic retirement", exc_info=True)

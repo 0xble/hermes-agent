@@ -28,13 +28,19 @@ TELEGRAM_TOPIC_SCHEMA = {
         "swapped); reasoning changes apply to the next model request. Use reasoning=default (or reset) "
         "to clear a session override. Results report applied, queued or unchanged status plus effective "
         "model, provider, effort and when each takes effect. Settings persist across gateway restarts. "
+        "action=retire schedules the current topic for retirement after the active turn finishes, "
+        "including open-work handoff and confirmed closing delivery before deletion. A queued result "
+        "is not proof of deletion. Set now=true only to interrupt the active turn before retirement. "
+        "action=cancel_retire clears the pending request. "
         "Only available in a Telegram DM session."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["create", "edit"],
-                       "description": "create a new topic session, or edit an existing topic."},
+            "action": {"type": "string", "enum": ["create", "edit", "retire", "cancel_retire"],
+                       "description": "create or edit a topic, schedule retirement after this turn, or cancel retirement."},
+            "target": {"type": "string", "description": "retire only: live topic to inherit all open work. Omit to resolve owners."},
+            "now": {"type": "boolean", "description": "retire only: interrupt the active turn while preserving its obligations."},
             "name": {"type": "string",
                      "description": "Topic name, also stored as the session title. Required for create."},
             "icon": {"type": "string",
@@ -108,11 +114,16 @@ async def telegram_topic_tool(args: dict, **_kwargs: Any) -> str:
     if source is None or source.chat_type != "dm":
         return tool_error("telegram_topic works only from a Telegram DM session.")
     action = str(args.get("action") or "").strip().lower()
-    if action not in {"create", "edit"}:
-        return tool_error("action must be create or edit.")
+    if action not in {"create", "edit", "retire", "cancel_retire"}:
+        return tool_error("action must be create, edit, retire or cancel_retire.")
     spec = TopicSpec(**{field: str(args.get(field) or "").strip()
                         for field in ("name", "icon", "model", "provider", "reasoning", "message")})
-    if action == "create":
+    if action in {"retire", "cancel_retire"}:
+        from gateway.telegram_retire import request
+        if args.get("thread_id") and str(args["thread_id"]) != str(source.thread_id):
+            return tool_error("Retire operates on the current topic only.")
+        make_coro = lambda: request(runner, source, target=str(args.get("target") or ""), now=bool(args.get("now")), cancel=action == "cancel_retire")  # noqa: E731
+    elif action == "create":
         if not spec.name:
             return tool_error("name is required for action=create.")
         make_coro = lambda: create_topic_session(runner, source, spec)  # noqa: E731
