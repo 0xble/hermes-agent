@@ -122,6 +122,9 @@ async def queue_foreign_owner(runner: Any, event: Any, session_key: str) -> bool
         marker = await asyncio.to_thread(_marker, runner.async_session_store, session_key)
         if marker is None or marker["pid"] == os.getpid() or not _owner_live(marker["pid"]):
             return False
+    schedule_activity = getattr(runner, "_schedule_attended_user_activity", None)
+    if callable(schedule_activity):
+        schedule_activity(event, event.source, session_key)
     accepted = runner._queue_or_replace_pending_event(session_key, event)
     if accepted:
         keys = getattr(runner, "_zero_cut_busy_keys", None)

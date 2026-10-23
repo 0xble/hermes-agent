@@ -310,7 +310,7 @@ def _attended_route_runner(state):
     runner = SimpleNamespace(
         _session_state=lambda _key: state,
         _peek_session_state=lambda _key: state,
-        _load_attended_activity_stamp=lambda _key: state.conversation.last_user_activity_at,
+        _load_attended_activity_stamp=lambda _key, **_kwargs: state.conversation.last_user_activity_at,
         _load_attended_route_active=lambda _key: None,
         _handoff_attended_state=handoff,
         _session_reasoning_override=lambda _key: None,
@@ -341,7 +341,7 @@ def test_first_user_message_preserves_new_session_boundary_before_activity_stamp
         was_auto_reset=False, is_fresh_reset=False,
     )
 
-    async def mark_activity(_session_key):
+    async def mark_activity(_session_key, *, when=None):
         entry.updated_at = "updated"
 
     inbound = SimpleNamespace(
@@ -457,7 +457,7 @@ def test_automation_opened_session_stays_attended_until_first_user_message():
     ))
     durable: dict[str, float | None] = {"stamp": None}
     route_runner = _attended_route_runner(state)
-    route_runner._load_attended_activity_stamp = lambda _key: durable["stamp"]
+    route_runner._load_attended_activity_stamp = lambda _key, **_kwargs: durable["stamp"]
     with patch.object(gateway_run, "_resolve_gateway_model", return_value="gpt-6.1-sol"):
         held = GatewayTurnMixin._attended_resolution_for_session(
             route_runner, source=None, session_key="k", user_config=cfg, allow_switch_back=True,

@@ -1344,9 +1344,24 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             return getattr(entry, "reasoning_override_scope", "session") if entry else "session"
 
-    def get_last_user_activity_at(self, session_key: str) -> Optional[datetime]:
+    def get_last_user_activity_at(self, session_key: str, *, refresh: bool = False) -> Optional[datetime]:
         with self._lock:
             entry = self._entry_locked(session_key)
+            # A successor gateway can receive replies while this process still owns the turn.
+            loader = self._routing_db_method("load_gateway_routing_entry")
+            if refresh and entry is not None and loader is not None:
+                try:
+                    payload = loader(session_key, scope=self._routing_scope())
+                    durable = self._routing_entry_from_json(session_key, payload) if payload else None
+                    if (
+                        durable is not None and durable.session_id == entry.session_id
+                        and durable.last_user_activity_at is not None
+                        and (entry.last_user_activity_at is None
+                             or durable.last_user_activity_at > entry.last_user_activity_at)
+                    ):
+                        entry.last_user_activity_at = durable.last_user_activity_at
+                except Exception:
+                    logger.debug("attended activity refresh failed for %s", session_key, exc_info=True)
             return getattr(entry, "last_user_activity_at", None) if entry else None
 
     def mark_user_activity(self, session_key: str, when: Optional[datetime] = None) -> bool:
@@ -1356,6 +1371,8 @@ class SessionStore(
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None:
+                return False
+            if entry.last_user_activity_at is not None and stamp <= entry.last_user_activity_at:
                 return False
             changed = entry.last_user_activity_at != stamp
             entry.last_user_activity_at = stamp

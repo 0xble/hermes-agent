@@ -912,6 +912,10 @@ class GatewayBusySessionMixin:
             return True
         event._bot_loop_admitted = True
 
+        # Adapter-owned busy sessions bypass normal inbound and turn-start admission.
+        schedule_activity: Any = getattr(self, "_schedule_attended_user_activity", None)
+        if callable(schedule_activity):
+            schedule_activity(event, event.source, session_key)
         if await self._route_plaintext_approval_while_busy(event, session_key):
             event._gateway_accepted = True  # consumed by the blocked approval, an admission
             return True
