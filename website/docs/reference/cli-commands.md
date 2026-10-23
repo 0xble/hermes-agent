@@ -1809,7 +1809,7 @@ hermes sessions state delivery --session-key SESSION_KEY --include-content
 
 `search` calls the existing `session_search` discovery handler against the current store in read-only mode. It prints that handler's JSON, without building another index. `--limit` defaults to 3 and is clamped to 1-10. `--after` is inclusive and `--before` exclusive, using the tool's ISO-8601/date or relative-duration bounds, such as `2026-01-01` or `7d`. No matches return a successful empty result. An unavailable store or invalid time bound returns an error and a nonzero exit status.
 
-`state` calls the same handlers as the `session_state` tool, with identical profile scoping, selector validation, per-field clipping, and 64 KiB serialized-result cap. Delivery content is omitted unless `--include-content` is supplied. Session transcript messages are never returned. Successful reads, including not-found results, exit 0. Handler validation/read errors exit nonzero with JSON on stdout, while malformed command syntax exits 2 with argparse usage on stderr. There is no SQL argument.
+`state` calls the same handlers as the `session_state` tool, with identical selector validation, per-field clipping, and 64 KiB serialized-result cap. The CLI scopes reads to the home selected by `-p` or `HERMES_HOME`, ignoring an inherited `HERMES_SESSION_PROFILE`. The native tool instead retains the bound session's profile. Delivery content is omitted unless `--include-content` is supplied. Session transcript messages are never returned. Successful reads, including not-found results, exit 0. Handler validation/read errors exit nonzero with JSON on stdout, while malformed command syntax exits 2 with argparse usage on stderr. There is no SQL argument.
 
 ## `hermes insights`
 
