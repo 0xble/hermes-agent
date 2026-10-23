@@ -99,7 +99,10 @@ releasing one session cannot admit another session's newer live input first.
 Failed resume or replay admission returns follow-ups in their original source-queue
 order without decrementing their outstanding input claims. Shutdown drops use the
 same ordering, independent of replay priority or drop-callback order, before the
-remaining input is spooled.
+remaining input is spooled. Releasing a reconnect owner or opening the startup
+fence schedules another restore drain. A schedule request made during an active
+drain remains pending until a follow-up pass, even when the current pass already
+scanned readiness and reports no progress.
 
 The cap governs turn openings, not complete long-running turns. After the existing
 startup opening window passes, retain the actual turn as the ordering dependency
@@ -110,8 +113,9 @@ exit after draining their batch and later enqueue recreates the pool.
 
 Focused regressions: `test_replay_scheduler.py`, `test_startup_resume_admission.py`,
 `test_restart_resume_pending.py`, `test_resume_queued_followup.py`,
-`test_restart_recovery_outcomes.py`, and `test_shutdown_followup_restart.py` in
-`tests/gateway/`. This extends the existing `seamless-restart` patch unit, not a
+`test_restart_recovery_outcomes.py`, `test_restore_drain_wakeups.py`, and
+`test_shutdown_followup_restart.py` in `tests/gateway/`. This extends the existing
+`seamless-restart` patch unit, not a
 plugin or a second delivery store.
 
 ## Observable restart recovery

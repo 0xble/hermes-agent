@@ -169,13 +169,20 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             return
         current = getattr(self, "_startup_restore_drain_task", None)
         if current is not None and not current.done():
+            # A release may land after ready() scanned the queue but before this
+            # pass reports no progress. Retain the wakeup for a follow-up pass.
+            self._startup_restore_drain_requested = True
             return
 
         async def drain() -> None:
             while queue := getattr(self, "_startup_restore_queue", None):
+                self._startup_restore_drain_requested = False
                 before = {id(event) for event in queue}
                 await self._drain_startup_restore_queue(wait=True)
-                if before.issubset({id(event) for event in queue}):
+                if (
+                    before.issubset({id(event) for event in queue})
+                    and not self._startup_restore_drain_requested
+                ):
                     break
 
         task = asyncio.create_task(drain())
@@ -359,6 +366,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             drained = await self._drain_startup_restore_queue(wait=False)
         finally:
             self._startup_restore_in_progress = False
+            self._schedule_startup_restore_drain()
         if drained:
             logger.info("Admitted %d inbound message(s) queued during startup restore", drained)
 

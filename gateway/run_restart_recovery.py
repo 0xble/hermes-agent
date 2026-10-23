@@ -335,7 +335,12 @@ class RestartRecoveryMixin:
         self._schedule_startup_restore_drain()
 
     async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None, wait: bool = True) -> int:
-        """Submit ready startup/recovered events to the shared priority scheduler."""
+        """Submit ready startup/recovered events to the shared priority scheduler.
+
+        With wait=True, return only the accepted count for batches owned by this
+        call (including its recursive tail). Concurrent background drains are not
+        included, even when this call waits for them to finish.
+        """
         handles = []
         queue = getattr(self, "_startup_restore_queue", None) or []
         claimed = getattr(self, "_startup_restore_claimed_keys", None)
