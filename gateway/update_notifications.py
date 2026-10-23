@@ -186,7 +186,7 @@ def _update_recovery_pending(home: Path) -> bool:
     root = update_source_checkout(home, Path(__file__).resolve().parents[1])
     if root is None:
         return True
-    host_record = host_obligation_path()
+    host_record = host_obligation_path(root)
     return any(path.exists() for path in (
         interrupted_pull_marker(root), completion_pending_path(root),
         host_record, host_record.with_name(HOST_OBLIGATION_NAME),
