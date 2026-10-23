@@ -80,6 +80,44 @@ translated, and the retired cause-based keys were removed.
   `build_resume_recovery_note`, `_prepare_resume_pending_message`),
   `gateway/run_turn_runner.py` (`_resume_restart_policy`, `_prepare_turn_message`).
 
+## Shared Replay Admission
+
+Post-restart intake uses one process-wide `ReplayScheduler` with FIFO order inside
+priority lanes. Restored human input enters before empty synthetic resumes.
+Recovered follow-ups wait for their own session's resume and use the deferred
+lane. `gateway.restart_replay_concurrency` defaults to 2. Delegation, goal and
+notification wakes remain outside this scheduler. Live authorized gateway controls bypass
+session restore fences. A stopped synthetic resume must lose its pending preclaim
+before dispatch and must never be resurrected by the scheduler.
+
+The current recovery owner remains `gateway/run_restart_recovery.py`. Its existing
+adapter admission, actual-turn observer, durable input retirement, profile scope,
+and restart-loop breaker remain authoritative. A recovery notice is not a delivery
+receipt. Deferred follow-ups wait outside scheduler workers for their own session's
+resume. Per-session queue claims remain until older input has been dispatched, so
+releasing one session cannot admit another session's newer live input first.
+Failed resume or replay admission returns follow-ups in their original source-queue
+order without decrementing their outstanding input claims. Shutdown drops use the
+same ordering, independent of replay priority or drop-callback order, before the
+remaining input is spooled. Releasing a reconnect owner or opening the startup
+fence schedules another restore drain. A schedule request made during an active
+drain remains pending until a follow-up pass, even when the current pass already
+scanned readiness and reports no progress.
+
+The cap governs turn openings, not complete long-running turns. After the existing
+startup opening window passes, retain the actual turn as the ordering dependency
+but release scheduler admission for unrelated sessions. Keep state.db key resolution
+off-loop. On shutdown, queued human input returns to its source queue and is
+spooled again after scheduler cancellation, before adapter teardown. Idle workers
+exit after draining their batch and later enqueue recreates the pool.
+
+Focused regressions: `test_replay_scheduler.py`, `test_startup_resume_admission.py`,
+`test_restart_resume_pending.py`, `test_resume_queued_followup.py`,
+`test_restart_recovery_outcomes.py`, `test_restore_drain_wakeups.py`, and
+`test_shutdown_followup_restart.py` in `tests/gateway/`. This extends the existing
+`seamless-restart` patch unit, not a
+plugin or a second delivery store.
+
 ## Observable restart recovery
 
 The shared recovery decision lives in `gateway/run_restart_recovery.py`; note
