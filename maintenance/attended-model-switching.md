@@ -164,7 +164,8 @@ Scheduled receipt bookkeeping retries once after an ordinary exception even
 when steering consumes the event. Cancellation propagates immediately, and
 disabled routing or missing sessions are terminal, not retryable failures.
 A concurrent drain joins that same task, and both attempts retain the original
-arrival time. Run
+arrival time. Store activity publishes only after persistence succeeds, so a
+failed write cannot make its retry look like an already-recorded receipt. Run
 `tests/gateway/test_session_store_lock_io.py` for refresh reads outside the store
 lock and concurrent activity or session replacement during those reads.
 

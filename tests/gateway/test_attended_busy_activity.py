@@ -384,6 +384,43 @@ async def test_steered_receipt_recovers_without_drain(busy_activity, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_steered_receipt_retries_failed_store_write(busy_activity, tmp_path, monkeypatch):
+    from gateway.session import AsyncSessionStore, SessionStore
+
+    runner, event, key, _state = busy_activity
+    store = SessionStore(tmp_path / "sessions", runner.config)
+    reader = SessionStore(tmp_path / "sessions", runner.config)
+    try:
+        entry = store.get_or_create_session(event.source)
+        store.mark_user_activity(key, when=datetime.fromtimestamp(1))
+        runner.session_store = store
+        runner._async_session_store = AsyncSessionStore(store)
+        save_entry = store._save_entry
+        attempts = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient persistence failure")
+            return save_entry(*args, **kwargs)
+
+        monkeypatch.setattr(store, "_save_entry", fail_once)
+        await _receive(busy_activity, "runner", "steer", monkeypatch)
+        await event._attended_activity_task
+        assert attempts == 2
+        reloaded = reader.lookup_by_session_key(key)
+        assert reloaded is not None and reloaded.last_user_activity_at is not None
+        assert reloaded.last_user_activity_at.timestamp() == pytest.approx(
+            event._attended_activity_received_at,
+        )
+        assert entry.last_user_activity_at == reloaded.last_user_activity_at
+    finally:
+        for owner in (store, reader):
+            await asyncio.to_thread(owner.close_all_db_handles)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["runner", "adapter"])
 async def test_cancelled_receipt_does_not_retry_persistence(busy_activity, monkeypatch, path):
     runner, event, key, state = busy_activity

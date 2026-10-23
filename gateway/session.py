@@ -1380,9 +1380,13 @@ class SessionStore(
                 and stamp.timestamp() <= entry.last_user_activity_at.timestamp()
             ):
                 return False
+            candidate = entry.to_dict()
+            candidate["last_user_activity_at"] = _local_iso(stamp)
+            candidate["updated_at"] = _local_iso(stamp)
+            # A failed save must leave the receipt eligible for its retry.
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
             entry.last_user_activity_at = stamp
             entry.updated_at = stamp
-            self._save_entry(session_key, entry_data=entry.to_dict(), lock_held=True)
             return True
 
     def get_attended_route_active(self, session_key: str) -> Optional[bool]:
