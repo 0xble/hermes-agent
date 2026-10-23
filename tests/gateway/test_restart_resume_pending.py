@@ -975,7 +975,19 @@ async def test_startup_queues_humans_before_resume_workers_and_fences_same_chat(
 
     release.set()
     await asyncio.wait_for(finish, timeout=5)
-    await asyncio.gather(*(tuple(runner._background_tasks)), return_exceptions=True)
+
+    # Finishing A-older can schedule a fresh restore drain after any one
+    # snapshot of the background tasks, so wait until B-live dispatches.
+    async def _b_live_dispatched() -> None:
+        while "B-live" not in started:
+            pending = set(runner._background_tasks)
+            drain = getattr(runner, "_startup_restore_drain_task", None)
+            if drain is not None:
+                pending.add(drain)
+            await asyncio.gather(*pending, return_exceptions=True)
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_b_live_dispatched(), timeout=5)
     assert started.index("A-older") < started.index("B-live")
 
 
