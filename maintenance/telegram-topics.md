@@ -38,9 +38,10 @@ its optional icon, and the durable alias can be observed through one Telegram to
   sampling the configured title model on real opening messages against the live catalog.
 - `/title X` on a Telegram topic stores the user's exact text, or the next free lineage alias
   such as `X #2` only when that exact text is held by another session; the visible Telegram
-  topic is renamed to the unsuffixed label. Auto-titles that collide likewise keep the visible
-  label unsuffixed while the session row carries the alias. Non-Telegram collision behavior
-  remains upstream behavior.
+  topic is renamed to the unsuffixed label. Model-generated titles that match another
+  session's name are rejected before persistence, ignoring case and a trailing ` #N` on the stored name only. Numbers in a proposed subject remain meaningful. Background title
+  callbacks use their persisted alias so even a collision arriving between the check and
+  persistence cannot show a duplicate label.
 - `/title X` also re-picks the icon from `X` when `auto_topic_icons` is on, through the same
   selection helper as automatic renames, and replaces a manual icon (automatic renames never do).
   Any icon Hermes writes clears the adapter's remembered manual icon for that topic; see
@@ -51,15 +52,15 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - A title the model cannot support does not lock. The schema includes `abstain`; a true
   answer, or a deterministic junk title (`None`, `Investigation`, `Unspecified...`, a platform
   label plus a raw ID such as `Slack Thread <id>` or `YouTube Video <id>`, or a title that is
-  mostly IDs), leaves the placeholder in place. The upgrade retries after turns 1, 2, and 3
-  with the opener plus a bounded excerpt of the latest assistant reply, then keeps the best
-  concrete title. A manual `/title` still wins, and a stored `llm` or `user` title is never
+  mostly IDs), leaves the placeholder in place. Prose openers run immediately, then retry
+  at the next user turn, not at the end of the current turn. Retries use a bounded excerpt
+  of the latest assistant reply. At turn 3 a rejected name falls back to a title derived from the current user message. A manual `/title` still wins, and a stored `llm` or `user` title is never
   replaced. `auxiliary.title_generation.hold_until_reply: false` restores the previous
   opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
   multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. The opening
-  turn is the exception: `auxiliary.title_generation.hold_until_reply` (default true) waits
-  for that turn's reply before the first model title, so a can't-tell answer can use it.
+  turn waits only for a bare link or attachment-only opener: `auxiliary.title_generation.hold_until_reply`
+  (default true) lets the first model title use that turn's reply. Clear prose is tried immediately.
   Upstream #117296 defers the title until the turn settles whenever both share a self-hosted base URL,
   which delays a new topic's name and icon by the whole first turn on a routing proxy. The
   declaration is keyed by endpoint URL, never by route name, and an undeclared or `false`

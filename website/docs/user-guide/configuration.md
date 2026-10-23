@@ -1459,11 +1459,19 @@ verification, unsubscribe, invite) or carry credential-named query parameters. A
 failure titles from the text alone. Set `auxiliary.title_generation.link_context: false` to
 disable it.
 
-When the title model abstains, or its title is only a platform label, a raw ID, or a generic
-word such as `None`, `Investigation`, or `Unspecified`, the session keeps its placeholder.
-The title is retried once the turn ends, using the opening message plus a bounded excerpt of
-the assistant reply, and again after turns 2 and 3 if it still cannot tell. After turn 3 the
-best concrete title is kept. A manual `/title` always wins, and a real title is never renamed.
+A fake-IP TUN proxy needs an explicit sentinel declaration, for example
+`security.fake_ip_ranges: ['198.18.0.0/15']`. Without it, resolved benchmark addresses are
+blocked like other private/reserved targets. Declared ranges are allowed only as DNS answers,
+not literal URL hosts. Loopback, RFC 1918, link-local, CGNAT, and cloud metadata stay blocked.
+
+Bare links and attachment-only openers wait for the first reply before the title upgrade.
+Prose openers are tried immediately. If the model abstains, returns a platform label, raw ID,
+generic word (`None`, `Investigation`, `Unspecified`), or another session's title (ignoring case
+and a trailing ` #N` on the stored name only), the session keeps its placeholder and retries at the next user turn,
+not again when the current turn ends. Retries can use a bounded excerpt of the latest assistant
+reply. At turn 3, rejected model names fall back to a title derived from the current user message. Provider failures
+and truncated output use the derived fallback immediately rather than holding. A manual `/title`
+always wins, and a real title is never renamed.
 Set `auxiliary.title_generation.hold_until_reply: false` to title from the opening message only.
 
 On a `custom` main provider (llama.cpp, Ollama, vLLM, LM Studio and other self-hosted
