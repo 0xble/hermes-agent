@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import time
 from typing import Any, Optional, cast
 
 from agent.i18n import t
@@ -80,6 +81,7 @@ class _ModelSwitchContext:
     one_turn: bool = False
     reasoning_effort: str = ""  # `--reasoning <level>` riding with the pick (typed path only)
     model_override_scope: str = "session"  # session, temporary, or once
+    pick_ttl_hours: float = 0.0  # opt-in wall-clock lifetime for a plain pick
     restore_snapshot: Optional[dict] = None
     current_model: str = ""
     current_provider: str = "openrouter"
@@ -263,6 +265,8 @@ class GatewayModelCommandsMixin:
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.runtime_capabilities or {}),
         }
+        if ctx.pick_ttl_hours and not one_turn:
+            self._session_model_overrides[ctx.session_key]["expires_at"] = time.time() + ctx.pick_ttl_hours * 3600
         self._session_state(ctx.session_key).conversation.model_override_scope = (
             "once" if one_turn else getattr(ctx, "model_override_scope", "session")
         )
@@ -378,6 +382,8 @@ class GatewayModelCommandsMixin:
             lines.append(t("gateway.model.saved_global"))
         elif one_turn:
             lines.append(t("gateway.model.next_turn_only"))
+        elif ctx.pick_ttl_hours:
+            lines.append(t("gateway.model.pick_expires", hours=f"{ctx.pick_ttl_hours:g}"))
         else:
             lines.append(t("gateway.model.session_only_hint"))
         return "\n".join(lines)
@@ -931,7 +937,10 @@ class GatewayModelCommandsMixin:
         if request.target.strip() == "@" or preset_ref_name(request.target):
             return await self._handle_model_role_command(event, request, source, session_key, profile_home)
 
-        attended_enabled = parse_attended_config(_load_gateway_config()).enabled
+        from gateway.model_pick import model_pick_deadline, model_pick_ttl_hours
+        model_config = _load_gateway_config()
+        attended_enabled = parse_attended_config(model_config).enabled
+        pick_ttl = model_pick_ttl_hours(model_config)
         conversation = self._session_state(session_key).conversation
         role_set = bool(getattr(conversation, "model_role", None))
         if not role_set:
@@ -939,8 +948,10 @@ class GatewayModelCommandsMixin:
             if store is not None:
                 with contextlib.suppress(Exception):
                     role_set = bool(await asyncio.to_thread(store.get_model_role, session_key))
+        if request.target.strip().lower() == "reset" and not request.explicit_provider:
+            await self._rehydrate_session_model_override_async(session_key)
         if request.target.strip().lower() == "reset" and not request.explicit_provider and (
-            attended_enabled or role_set
+            attended_enabled or role_set or pick_ttl or model_pick_deadline(conversation.model_override)
         ):
             async with self._session_model_override_lock(session_key):
                 await self._persist_session_model_override_locked(session_key, None)
@@ -954,12 +965,12 @@ class GatewayModelCommandsMixin:
             request.is_global, request.is_session, is_once=request.is_once,
             explicit_provider=request.explicit_provider,
         )
-        if attended_enabled and not request.is_global and not request.is_session and not request.is_once:
+        if (attended_enabled or pick_ttl) and not request.is_global and not request.is_session and not request.is_once:
             effective_global = False
         model_scope = (
             "once" if request.is_once else
             "session" if request.is_session or requested_global or effective_global else
-            "temporary" if attended_enabled else "session"
+            "temporary" if attended_enabled or pick_ttl else "session"
         )
         ctx = self._model_switch_context(
             source, session_key, profile_home=profile_home,
@@ -967,6 +978,7 @@ class GatewayModelCommandsMixin:
             one_turn=request.is_once,
             reasoning_effort=request.reasoning_effort,
             model_override_scope=model_scope,
+            pick_ttl_hours=pick_ttl if model_scope == "temporary" else 0.0,
             restore_snapshot=self._snapshot_session_model_override(session_key) if request.is_once else None,
         )
         if not request.target and not request.explicit_provider:

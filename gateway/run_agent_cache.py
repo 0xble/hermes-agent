@@ -210,6 +210,18 @@ class GatewayAgentCacheMixin:
                 self._session_state(session_key).conversation.model_override_scope = resolved_scope
         await self._persist_model_route_edit_locked([session_key], write, publish)
 
+    async def _expire_session_model_pick(self, session_key: str, expected: dict) -> None:
+        """A waiting expiry must not erase a newer pick that acquired the route lock first."""
+        from gateway.model_pick import model_pick_deadline
+        async with self._session_model_override_lock(session_key):
+            if self._session_model_override(session_key) is not expected:
+                return
+            await self._persist_session_model_override_locked(session_key, None, scope="session")
+            if model_pick_deadline(expected):
+                (getattr(self, "_pending_model_notes", None) or {}).pop(session_key, None)
+                self._session_state(session_key).conversation.model_pick_expired = True
+            self._evict_cached_agent(session_key)
+
     async def _persist_model_route_edit_locked(self, session_keys, write, publish) -> None:
         """Fence hydration and retain all held route locks until the storage worker settles.
 
@@ -262,6 +274,14 @@ class GatewayAgentCacheMixin:
         lock = locks.get(session_key) if isinstance(locks, dict) else None
         return bool(lock is not None and lock.locked())
 
+    async def _rehydrate_session_model_override_async(self, session_key: str) -> None:
+        """Serialize restart hydration with route edits, publishing only on the loop."""
+        async with self._session_model_override_lock(session_key):
+            if self._session_model_override(session_key) is None:
+                epoch = self._session_model_override_epoch(session_key)
+                loaded = await asyncio.to_thread(self._load_session_model_override, session_key)
+                self._commit_session_model_override(session_key, loaded, epoch)
+
     def _rehydrate_session_model_override(self, session_key: str) -> None:
         """Synchronous callers retain lazy restoration, using the same fenced commit.
 
@@ -293,6 +313,8 @@ class GatewayAgentCacheMixin:
         if not persisted:
             return None, scope
         override: dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
+        if "expires_at" in persisted:
+            override["expires_at"] = persisted["expires_at"]
         provider = persisted.get("provider")
         from hermes_cli.runtime_provider import is_foreign_provider_endpoint
         if is_foreign_provider_endpoint(provider, override.get("base_url")):
@@ -356,7 +378,8 @@ class GatewayAgentCacheMixin:
     def _snapshot_session_model_override(self, session_key: str) -> dict:
         """Capture a gateway session override before a one-turn switch."""
         override = self._session_model_override(session_key)
-        return {"had_override": override is not None, "override": dict(override) if override is not None else None}
+        return {"had_override": override is not None, "override": dict(override) if override is not None else None,
+                "scope": self._session_model_override_scope(session_key)}
 
     def _claim_one_turn_restore(self, session_key: str, snapshot: Optional[dict] = None) -> None:
         """Arm the one-shot restore snapshot for ``/model --once`` / ``/moa``. A repeated one-shot
@@ -377,6 +400,7 @@ class GatewayAgentCacheMixin:
         else:
             self._bump_session_model_override_epoch(session_key)
             self._session_model_overrides.pop(session_key, None)
+        self._session_state(session_key).conversation.model_override_scope = snapshot.get("scope", "session")
         self._evict_cached_agent(session_key)
 
     def _is_intentional_model_switch(self, session_key: str, agent: Any, config_model: str) -> bool:

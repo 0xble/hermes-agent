@@ -208,7 +208,7 @@ def _maybe_title_session_at_turn_start(
         return
     try:
         from agent.message_content import flatten_message_text
-        from agent.title_generator import apply_subagent_title, maybe_auto_title
+        from agent.title_generator import apply_subagent_title, defer_title_completion_retry, maybe_auto_title
 
         # Turn's user message as text; image-only turns yield "" and are skipped.
         user_text = ""
@@ -243,16 +243,24 @@ def _maybe_title_session_at_turn_start(
             k: getattr(agent, k, None)
             for k in ("model", "provider", "base_url", "api_key", "api_mode", "session_id")
         }
+        # Both opening attempts share one failure sink. Keep the first failure visible
+        # without repeating the warning when the completion retry also fails.
+        failure_callback = (
+            getattr(agent, "_title_failure_callback", None)
+            or getattr(agent, "_emit_auxiliary_failure", None)
+        )
+        failure_reported = False
+
+        def report_title_failure_once(task, exc):
+            nonlocal failure_reported
+            if not failure_reported and failure_callback is not None:
+                failure_reported = True
+                failure_callback(task, exc)
+
         # See #19027.
-        upgrade = maybe_auto_title(
-            session_db,
-            session_id,
-            user_text,
+        title_kwargs = dict(
             conversation_history=messages,
-            failure_callback=(
-                getattr(agent, "_title_failure_callback", None)
-                or getattr(agent, "_emit_auxiliary_failure", None)
-            ),
+            failure_callback=report_title_failure_once,
             main_runtime=main_runtime,
             title_callback=getattr(agent, "_on_session_title", None),
             icon_context=getattr(agent, "_title_icon_context", None),
@@ -262,10 +270,13 @@ def _maybe_title_session_at_turn_start(
             ),
             title_preview=title_preview,
         )
-        # Unstarted = the title call would share a self-hosted endpoint with this turn's request
-        # (#117296); ``finalize_turn`` starts it once the model has answered.
-        if upgrade is not None and upgrade.ident is None:
-            agent._deferred_title_upgrade = upgrade
+        upgrade = maybe_auto_title(session_db, session_id, user_text, **title_kwargs)
+        # Finalization starts an unstarted upgrade, or retries a provisional eager
+        # opening title with the reply. A settled llm/user title is never regenerated.
+        if upgrade is not None:
+            agent._deferred_title_upgrade = defer_title_completion_retry(
+                upgrade, session_db, session_id, user_text, **title_kwargs,
+            )
     except Exception:
         logger.debug("Turn-start auto-title dispatch failed", exc_info=True)
 

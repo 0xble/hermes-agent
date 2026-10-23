@@ -227,6 +227,16 @@ isolation via `scripts/run_tests_parallel.py` (no xdist; workers scale with CPU 
 module-level dicts/ContextVars cannot leak between files. Direct `pytest` on a big machine
 with API keys set has caused repeated "works locally, fails in CI" incidents (and the reverse).
 
+Standalone reproductions and review probes are tests too. Prefer a temporary pytest test run
+through that runner. If a probe must run directly, set both `HERMES_HOME` and
+`HERMES_TEST_ISOLATION` to an invocation-owned temporary home **before importing Hermes**.
+A temporary `GatewayConfig.sessions_dir` or `SessionStore.sessions_dir` isolates only the routing
+scope and `sessions.json`. Transcripts, `state.db`, the JSONL fallback and the pending spool still
+resolve from `HERMES_HOME`. `HERMES_TEST_ISOLATION` also turns on strict TUI contract checks and
+test-instance registration, so a probe can behave differently from production. Direct Python
+probes do not execute `tests/conftest.py` and cannot rely on pytest ancestry to arm the live-DB guard.
+Never strip the isolation marker or set `HERMES_STATE_DB_GUARD_BYPASS` to make a probe pass.
+
 Prepare a test interpreter with the checkout's bootstrapped Python:
 
 ```bash

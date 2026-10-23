@@ -2,6 +2,11 @@
 
 Patch identity: `seamless-restart` (legacy single-gateway path).
 
+Restart and reconnect replay admission shares the existing recovery owner and
+bounded priority scheduler. Its ordering, long-turn opening window, profile scope
+and shutdown-source durability contract live in
+[Shared Replay Admission](restart-continuation.md#shared-replay-admission).
+
 ## Shutdown Notice Routing
 
 Use upstream's `_delivery_target_key` for active chats, served home channels,

@@ -75,7 +75,8 @@ def test_local_ci_gate_missing_relative_references_do_not_spend_remote_budget(tm
         encoding="utf-8",
     )
     calls = []
-    env = LocalEnvironment(cwd=str(tmp_path))
+    env = object.__new__(LocalEnvironment)
+    env.cwd = str(tmp_path)
 
     def _execute(command):
         calls.append(command)

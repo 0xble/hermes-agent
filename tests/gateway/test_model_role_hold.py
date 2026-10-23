@@ -229,6 +229,7 @@ async def test_concrete_model_clears_role_except_once(tmp_path, monkeypatch, per
         config_path=tmp_path / "config.yaml",
         restore_snapshot=None,
         model_override_scope="session",
+        pick_ttl_hours=0.0,
         current_model="old-model",
     )
     result = SimpleNamespace(

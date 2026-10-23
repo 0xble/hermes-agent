@@ -1,6 +1,7 @@
 """Tests for agent.auxiliary_client resolution chain, provider overrides, and model overrides."""
 
 import base64
+import contextlib
 import json
 import logging
 import time
@@ -9,6 +10,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
+import agent.auxiliary_client as aux
 from agent.auxiliary_client import (
     _NOUS_MODEL,
     CodexAuxiliaryClient,
@@ -86,6 +88,131 @@ def _clean_env(monkeypatch):
     yield
     _aux_mod._aux_unhealthy_until.clear()
     _aux_mod._aux_unhealthy_logged_at.clear()
+
+
+def test_mark_provider_unhealthy_keeps_local_quarantine_when_persist_fails(monkeypatch):
+    key = aux._unhealthy_cache_key("openrouter", "https://example.test/v1")
+    monkeypatch.setattr(
+        aux,
+        "_mark_auxiliary_health",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    aux._mark_provider_unhealthy(
+        "openrouter", base_url="https://example.test/v1", reason="payment error",
+    )
+
+    assert aux._aux_unhealthy_until[key] > time.time()
+    assert aux._aux_unhealthy_reason[key] == "payment error"
+
+
+def test_log_skip_unhealthy_deduplicates_same_epoch_and_reopens_on_new_lane(caplog):
+    aux._mark_provider_unhealthy("openrouter", reason="payment error")
+    with caplog.at_level(logging.INFO):
+        aux._log_skip_unhealthy("openrouter")
+        aux._aux_unhealthy_logged_at.clear()
+        aux._mark_provider_unhealthy("openrouter", reason="payment error")
+        aux._log_skip_unhealthy("openrouter")
+        aux._aux_unhealthy_logged_at.clear()
+        aux._mark_provider_unhealthy("openrouter", reason="rate limit")
+        aux._log_skip_unhealthy("openrouter")
+
+    messages = [record.getMessage() for record in caplog.records if "skipping openrouter" in record.getMessage()]
+    assert len(messages) == 2
+
+
+def test_known_provider_failure_on_client_url_is_seen_by_provider_wide_walks():
+    aux._mark_provider_unhealthy(
+        "openrouter", base_url="https://openrouter.ai/api/v1/", reason="payment error",
+    )
+
+    assert aux._is_provider_unhealthy("openrouter") is True
+    assert aux._is_provider_unhealthy("openrouter", aux._custom_health_base_url("openrouter")) is True
+
+
+def test_model_scoped_failure_does_not_hide_sibling_model():
+    aux._mark_provider_unhealthy(
+        "custom", base_url="https://example.test/v1", model="model-a", reason="rate limit",
+    )
+
+    assert aux._is_provider_unhealthy("custom", "https://example.test/v1", "model-a") is True
+    assert aux._is_provider_unhealthy("custom", "https://example.test/v1", "model-b") is False
+
+
+def test_unshared_failure_still_quarantines_locally():
+    aux._mark_provider_unhealthy("nous", ttl=60, reason="invalid provider response")
+
+    assert aux._is_provider_unhealthy("nous") is True
+    assert aux._read_auxiliary_health(aux._auxiliary_route_identity("nous")) is None
+
+
+def test_route_health_store_errors_fail_open(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise OSError("read-only state directory")
+
+    for name in (
+        "_read_auxiliary_health", "_claim_auxiliary_probe", "_claim_auxiliary_notice",
+        "_clear_auxiliary_health_after_probe", "_reset_auxiliary_health",
+    ):
+        monkeypatch.setattr(aux, name, unavailable)
+
+    assert aux._is_provider_unhealthy("openrouter") is False
+    aux._clear_provider_health("openrouter")
+    aux._log_skip_unhealthy("openrouter")
+    aux._reset_aux_unhealthy_cache()
+
+
+@pytest.mark.parametrize("strict_chain", [False, True])
+def test_exhaustion_warning_is_not_suppressed_when_route_health_store_fails(monkeypatch, caplog, strict_chain):
+    """A local-only quarantine still emits its exhaustion warning when shared state is unavailable."""
+    def unavailable(*args, **kwargs):
+        raise OSError("read-only state directory")
+
+    for name in ("_read_auxiliary_health", "_claim_auxiliary_notice"):
+        monkeypatch.setattr(aux, name, unavailable)
+    caplog.set_level(logging.WARNING, logger="agent.auxiliary_client")
+    route = MagicMock(
+        client=MagicMock(base_url="https://proxy.example/v1"),
+        resolved_provider="custom",
+        base_info="https://proxy.example/v1",
+        final_model="model",
+        resolved_model="model",
+        task="compression",
+        tag="",
+    )
+    key = aux._unhealthy_cache_key("custom", route.base_info, "model")
+    aux._aux_unhealthy_reason[key] = "invalid provider response"
+
+    aux._warn_auxiliary_route_once(route, "provider unavailable", RuntimeError("offline"), strict_chain=strict_chain)
+
+    expected_chain = "per-call fallback_chain" if strict_chain else "fallback_chain + main agent model"
+    assert any(
+        f"all fallbacks exhausted ({expected_chain})" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_primary_rate_limit_uses_short_lane_hold(monkeypatch):
+    marks = []
+    monkeypatch.setattr(aux, "_mark_provider_unhealthy", lambda *a, **kw: marks.append(kw))
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {})
+    monkeypatch.setattr(aux, "_try_payment_fallback", lambda *a, **kw: (None, None, ""))
+    monkeypatch.setattr(aux, "_try_configured_fallback_chain", lambda *a, **kw: (None, None, ""))
+    monkeypatch.setattr(aux, "_try_main_fallback_chain", lambda *a, **kw: (None, None, ""))
+    err = Exception("Rate limit exceeded")
+    err.status_code = 429
+    route = aux._LadderRoute(
+        client=MagicMock(base_url="https://openrouter.ai/api/v1/"), task="compression", tag="",
+        async_mode=False, base_info="https://openrouter.ai/api/v1/", resolved_provider="openrouter",
+        resolved_model="m", resolved_base_url=None, resolved_api_key=None, resolved_api_mode=None,
+        final_model="m", main_runtime=None, route_info=None, timeout=30.0,
+    )
+
+    ladder = aux._ladder_provider_fallback(err, route)
+    with contextlib.suppress(StopIteration, TypeError):
+        next(ladder)
+
+    assert marks and marks[0]["ttl"] == 60.0 and marks[0]["reason"] == "rate limit"
 
 
 class TestResolveTaskProviderModel:
@@ -4531,19 +4658,19 @@ class TestAuxUnhealthyCache:
         _reset_aux_unhealthy_cache()
 
 
-    def test_ttl_expiry_evicts(self):
+    def test_ttl_expiry_evicts(self, monkeypatch):
         from agent.auxiliary_client import (
             _mark_provider_unhealthy,
             _is_provider_unhealthy,
             _aux_unhealthy_until,
         )
+        monkeypatch.setattr("agent.auxiliary_client.time.time", lambda: 1000.0)
         _mark_provider_unhealthy("openrouter", ttl=0.01)
         assert _is_provider_unhealthy("openrouter") is True
-        import time
-        time.sleep(0.02)
+        monkeypatch.setattr("agent.auxiliary_client.time.time", lambda: 1000.02)
         # Lazy eviction: first lookup after expiry returns False AND removes the entry.
         assert _is_provider_unhealthy("openrouter") is False
-        assert "openrouter" not in _aux_unhealthy_until
+        assert not _aux_unhealthy_until
 
 
 
@@ -4628,7 +4755,7 @@ class TestAuxUnhealthyCache:
         """A hosted custom endpoint's billing state must not quarantine a local custom endpoint."""
         from agent.auxiliary_client import call_llm, _is_provider_unhealthy
 
-        hosted_url = "https://hosted.example/v1"
+        hosted_url = "https://openrouter.ai/api/v1"
         local_url = "http://127.0.0.1:8080/v1"
         payment_error = Exception("Payment Required: weekly usage limit")
         payment_error.status_code = 402
@@ -4662,6 +4789,7 @@ class TestAuxUnhealthyCache:
 
         assert response.choices[0].message.content == "local-ok"
         assert _is_provider_unhealthy("custom", hosted_url) is True
+        assert _is_provider_unhealthy("openrouter") is False
         assert _is_provider_unhealthy("custom", local_url) is False
         assert hosted_client.chat.completions.create.call_count == 1
         assert local_client.chat.completions.create.call_count == 1
@@ -4698,8 +4826,8 @@ class TestAuxUnhealthyCache:
             )
 
         assert result is None
-        assert _is_provider_unhealthy("custom", hosted_url) is True
-        assert _is_provider_unhealthy("custom", local_url) is False
+        assert _is_provider_unhealthy("custom", hosted_url, "hosted-model") is True
+        assert _is_provider_unhealthy("custom", local_url, "local-model") is False
 
 
 # ── auxiliary_max_tokens_param ──────────────────────────────────────────────

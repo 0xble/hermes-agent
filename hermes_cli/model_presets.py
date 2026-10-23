@@ -253,7 +253,10 @@ def _expand_delegation(config: dict[str, Any], definitions: dict[str, dict[str, 
             fields["fallback_providers"] = []
         config["delegation"] = {**{key: value for key, value in site.items() if key not in {"model_preset", "fallbacks"}}, **fields}
     delegation = config.get("delegation")
-    if not isinstance(delegation, dict) or not isinstance(delegation.get("subagents"), dict):
+    if not isinstance(delegation, dict):
+        return
+    _expand_delegation_by_parent(delegation, definitions)
+    if not isinstance(delegation.get("subagents"), dict):
         return
     roles = delegation["subagents"]
     for name, role in list(roles.items()):
@@ -279,6 +282,53 @@ def _expand_delegation(config: dict[str, Any], definitions: dict[str, dict[str, 
             **{key: value for key, value in role.items() if key not in {"model_preset", "fallbacks"}},
             **fields,
         }
+
+
+def _expand_delegation_by_parent(delegation: dict[str, Any], definitions: dict[str, dict[str, Any]]) -> None:
+    if "by_parent" not in delegation:
+        return
+    raw = delegation["by_parent"]
+    if not isinstance(raw, dict):
+        raise _error("delegation.by_parent", "must be a mapping")
+    expanded: dict[str, Any] = {}
+    for key, value in raw.items():
+        path = f"delegation.by_parent.{key}"
+        if not isinstance(key, str) or not key.strip():
+            raise _error(path, "parent model must be a non-empty string")
+        parent_route = _reference(key, path, definitions, conflicts=set())
+        model = parent_route["model"] if parent_route is not None else key
+        if model in expanded:
+            raise _error(path, f"duplicate parent model '{model}' after preset expansion")
+        if value == "inherit":
+            expanded[model] = "inherit"
+        elif preset_ref_name(value):
+            _reference(value, path, definitions, conflicts=set())
+            # Retain target references so repeated expansion (e.g. fallback
+            # resolution on CLI_CONFIG) remains valid and serializable.
+            expanded[model] = value
+        else:
+            raise _error(path, "value must be 'inherit' or an @preset reference")
+    delegation["by_parent"] = expanded
+
+
+def delegation_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve validated parent-map targets only at the delegation boundary.
+
+    General config retains string values so it can be expanded repeatedly,
+    serialized, and saved without admitting inline dictionaries in authored maps.
+    """
+    cfg = config.get("delegation") or {}
+    if not isinstance(cfg, dict):
+        return {}
+    routes = cfg.get("by_parent", {})
+    if not any(preset_ref_name(value) for value in routes.values()):
+        return cfg
+    definitions = _definitions(config)
+    resolved = {}
+    for model, value in routes.items():
+        route = _reference(value, f"delegation.by_parent.{model}", definitions, conflicts=set())
+        resolved[model] = _route_fields(route, fallback_key="fallback_providers") if route is not None else value
+    return {**cfg, "by_parent": resolved}
 
 
 def _expand_auxiliary(config: dict[str, Any], definitions: dict[str, dict[str, Any]]) -> None:
@@ -410,6 +460,20 @@ def _lift_main_model(model: Any) -> Any:
     return model
 
 
+def _restore_parent_routes(actual: Any, raw: Any, expected: Any, definitions: dict[str, Any]) -> None:
+    if not all(isinstance(site, dict) for site in (actual, raw, expected)):
+        return
+    # Restore entries individually so adding or editing one route cannot persist
+    # unrelated expanded target dictionaries, which are not valid authored values.
+    for key, value in raw.items():
+        parent = _reference(key, f"delegation.by_parent.{key}", definitions, conflicts=set())
+        model = parent["model"] if parent is not None else key
+        if model not in actual or (key != model and key in actual):
+            continue
+        current = actual.pop(model)
+        actual[key] = deepcopy(value if current == expected[model] else current)
+
+
 def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> dict[str, Any]:
     """Put unchanged named-route references back before a config write.
 
@@ -499,6 +563,10 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
     expected_delegation = expanded_authored.get("delegation")
     if (isinstance(actual_delegation, dict) and isinstance(raw_delegation, dict)
             and isinstance(expected_delegation, dict)):
+        _restore_parent_routes(
+            actual_delegation.get("by_parent"), raw_delegation.get("by_parent"),
+            expected_delegation.get("by_parent"), _definitions(authored),
+        )
         raw_roles = raw_delegation.get("subagents")
         actual_roles = actual_delegation.get("subagents")
         expected_roles = expected_delegation.get("subagents")

@@ -44,6 +44,7 @@ class ConversationState:
 
     model_override: Optional[dict[str, Any]] = None  # /model per-session override
     model_override_scope: str = "session"  # session, temporary, or once
+    model_pick_expired: bool = False  # stage a notice once the replacement route resolves
     one_turn_restore: Optional[dict[str, Any]] = None  # /model --once snapshot
     reasoning_override: Optional[dict[str, Any]] = None  # /reasoning override
     reasoning_override_scope: str = "session"  # session or temporary
@@ -56,7 +57,7 @@ class ConversationState:
     pending_attended_notice: Optional[str] = None  # one switching-in line for this turn
     model_role: Optional[str] = None  # @role hold; cleared with the conversation so /new drops it
     last_attended_decision: Any = None  # route precedence decision for this session's current turn
-    attended_new_session: bool = False  # consumed by the first attended route resolution or turn finalization
+    attended_new_session: bool = False  # first-turn notice suppression, cleared by inbound finalization
     pre_agent_fallback_notice: Optional[str] = None  # one-shot fallback notice for this session
     queued_events: list[Any] = field(default_factory=list)  # /queue overflow FIFO (head in adapter)
     sidecar_notes: list[str] = field(default_factory=list)  # one-shot must-deliver notes

@@ -3031,6 +3031,46 @@ delegation:
 
 **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
 
+### Routes By Parent
+
+Use `delegation.by_parent` to override the normal worker route only for selected
+parent models. This example keeps the pinned sol worker route except when the
+parent's live model is the model selected by `@uncensored`:
+
+```yaml
+model_presets:
+  uncensored: {provider: custom:venice, model: abliteration-abliterated-model-large-v2}
+  delegation-sol:
+    provider: custom:codex-proxy
+    model: gpt-6.1-sol
+    reasoning_effort: high
+    fallbacks:
+      - {provider: openrouter, model: anthropic/claude-sonnet-4, reasoning_effort: medium}
+delegation:
+  model_preset: delegation-sol
+  by_parent:
+    "@uncensored": inherit
+```
+
+Keys are exact model IDs or bare `@preset` references. A preset key matches its
+resolved model ID, regardless of provider. Values are `inherit` or a bare
+`@preset` reference, such as `"@delegation-sol"`. `inherit` discards the pinned
+route settings, including its fallback chain, request overrides, and reasoning
+effort, so the child takes the parent's current route, fallback chain, and
+reasoning. A preset value replaces those settings with that preset's route.
+Operational settings such as concurrency, depth, and compression caps do not
+change. Explicit session reasoning picks retain their existing precedence.
+
+No match means the existing delegation route is unchanged. Matching uses the
+parent's **live** model, including model switches and active fallback models,
+not its startup model. Config edits apply on the next spawn without a restart.
+Nested children and plugin lifecycle launches use the same rule. An explicit
+plugin launch provider/model still wins. Internal `/review` routes bypass the
+map and keep their existing global delegation reasoning policy.
+
+Unknown presets, invalid values, and 2 keys resolving to the same model are
+configuration errors. Unrelated config saves preserve authored references.
+
 **Subagent reasoning and Fast mode:** `delegation.reasoning_effort` sets the children's default thinking level (empty = the parent's level). An explicit session pick on the parent (`/reasoning <level>`, `--reasoning`, `/model … --reasoning`) wins over it, so raising the effort for a hard task also raises it for the subagents that task spawns; a `--global` save is a configured default, not a pick. The level is clamped to what each child's route supports. With `delegation.inherit_service_tier: true`, children also inherit the parent's `/fast` mode (`fast`, `auto` or `cold`), including under a pinned `delegation.provider`: the Fast request field is derived for the child's own route, and a route without a fast mode receives none. An explicit `service_tier`/`speed` in `delegation.request_overrides` wins.
 
 **Subagent fallback chain:** Set `delegation.fallback_providers` to give workers their own chain (same entry shape as the top-level list). An explicitly pinned child (by provider, endpoint, or model) uses that chain only when it is declared; otherwise it fails loudly instead of borrowing the parent agent's route. For an unpinned child, an absent or `null` setting preserves parent-chain inheritance. Use `fallback_providers: []` under `delegation:` to disable child fallback entirely.

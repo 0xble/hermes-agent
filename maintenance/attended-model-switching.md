@@ -19,9 +19,21 @@ switching is unconfigured but a role is set. `/model reset --all` clears both
 on every session. A durable `/model X` or `/model X --session` replaces the
 role; `/model X --once` wins for that turn and leaves the role in place. A
 `/reasoning default` or `/reasoning reset` removes the persisted reasoning
-pick. Plain picks remain temporary while attended switching is enabled and
-expire after the idle window. Temporary picks preserve a named hold and expire
-back to it, just as `--once` preserves it.
+pick. With `model.pick_ttl_hours` unset, plain picks keep their existing behavior:
+temporary with attended routing (cleared after its idle window), otherwise
+session-scoped. A positive finite `model.pick_ttl_hours`, for example `12`,
+opts plain model picks into that many wall-clock hours instead of idle expiry,
+regardless of whether attended routing is enabled. Zero, negative, non-finite
+and invalid values leave the policy disabled. No config is changed automatically.
+The confirmation states when the pick expires, in hours, only for timed picks.
+The deadline is sanitized and saved inside the existing session override so
+restart, idle gaps and `--once` restoration do not extend it. At or after the
+deadline the next turn clears the pick under the route lock and returns to the
+current held role, attended, channel or global route. The reply carries a
+one-line expiry notice naming the resolved model. `--session`, `--once`,
+`--global`, topic-tool edits and temporary reasoning idle expiry are unchanged.
+Temporary picks preserve a named hold and expire back to it, just as `--once`
+preserves it. `/model reset` immediately clears a timed pick.
 
 Without slash-admin gating, the restricted env path for `/model reset --all`
 accepts a human DM principal listed in the platform or gateway env allowlist.
@@ -95,8 +107,14 @@ message; group messages are denied.
 
 The attended switch-in card is rendered by one helper in
 `gateway/attended_model.py` as a single sentence-style line, like the `/fast`
-expiry notice. A fresh session starts attended without a switch-in card. Idle
-expiry emits a separate back-to-default line and leads with the `⇄` symbol.
+expiry notice. A fresh session starts attended without a switch-in card. The
+new-session marker lasts until inbound turn finalization, including failed and
+interrupted turns. Finalization clears both the admission key and the resolved
+session key, because Telegram topic recovery can change the thread identity.
+Preparatory route probes, such as image-mode selection and
+vision enrichment, must not consume first-turn silence. Later genuine
+switch-ins still announce the configured idle window.
+Idle expiry emits a separate back-to-default line and leads with the `⇄` symbol.
 For example, with a `gpt-6.1-sol` default and a 15 minute window:
 
 ```text
@@ -105,7 +123,7 @@ For example, with a `gpt-6.1-sol` default and a 15 minute window:
 
 ## Provenance and patch
 
-Fork patch identities: `attended-model-switching`, `gateway-telegram-topic-tool`, `live-model-preset-roles`.
+Fork patch identities: `attended-model-switching`, `gateway-telegram-topic-tool`, `live-model-preset-roles`, `model-pick-expiry`.
 
 `live-model-preset-roles` covers `@role` holds: the role field on conversation
 state and `SessionEntry`, role reset, concrete-pick precedence, live preset
@@ -134,6 +152,19 @@ This is a fork-only gateway feature that adds per-topic attended routing, idle
 expiry, persisted activity timestamps, and boundary-only idle expiry. A new genuine user message switches in at the next API call; idle expiry switches back to the default only when the session is quiet and the request fits the default route. A long autonomous turn that continues making API calls stays on the attended route. An active fallback is never undone. The deprecated `compact_before_switch_tokens` key remains accepted but is ignored; normal per-model preflight compression remains the only compaction path. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly.
 
 ## Verification
+
+Run `tests/gateway/test_attended_session_opening.py` for new user-opened text
+and photo topics, `telegram_topic`-created topics, preparatory route probes,
+first-request silence, later switch-in notices, and genuine-activity provenance.
+The tests enter through `_handle_message` and assert marker cleanup after success,
+exceptions, and task cancellation, including recovery from a lobby key to a topic.
+
+Run `tests/gateway/test_model_pick_expiry.py` for disabled-by-default policy,
+positive TTLs with attended routing on and off, command confirmation, unchanged
+flags, persisted restart hydration, exact-deadline routing and notices,
+repicking, stale expiry, one-turn restoration, immediate reset and independent
+reasoning idle expiry. Pair it with `test_attended_model.py`,
+`test_session_model_override_persistence.py` and the model-command regressions.
 
 Run `tests/gateway/test_model_role_lifecycle.py` for request-boundary profile
 edits, busy assignment timing, stale hydration/one-turn restores, failed

@@ -50,6 +50,18 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+
+def _is_restore_control_event(event: MessageEvent) -> bool:
+    """Let recognized gateway controls bypass replay fences and reach the busy fast path."""
+    if not getattr(event, "allow_gateway_control", False):
+        return False
+    command = event.get_command()
+    if not command:
+        return False
+    from hermes_cli.commands import should_bypass_active_session
+    return should_bypass_active_session(command)
+
+
 def discord_triggering_note(message_id: Any) -> str:
     """Model-facing routing note for a Discord turn (rides the API-bound user message only)."""
     return (
@@ -255,20 +267,25 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return None
 
         reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
+        startup_restore_keys = getattr(self, "_startup_restore_keys", None)
         # Session-key normalization precedes the turn's key derivation. The
         # pre_gateway_dispatch hook runs only after this gate and must not rewrite
         # the routing identity of an already admitted event.
         reconnect_key = None
-        if reconnect_keys and not is_internal:
+        if (reconnect_keys or startup_restore_keys or getattr(self, "_startup_restore_in_progress", False)) and not is_internal:
             normalized = await asyncio.to_thread(self._normalize_source_for_session_key, source)
             reconnect_key = self._session_key_for_source(normalized)
         if (
-            (getattr(self, "_startup_restore_in_progress", False)
-             or (reconnect_keys and reconnect_keys.get(reconnect_key, 0)))
-            and not is_internal
+            not is_internal
+            and (
+                getattr(self, "_startup_restore_in_progress", False)
+                or (reconnect_keys and reconnect_keys.get(reconnect_key, 0))
+                or (startup_restore_keys and startup_restore_keys.get(reconnect_key, 0))
+            )
             and not getattr(event, "_hermes_startup_restore_replay", False)
+            and not _is_restore_control_event(event)
         ):
-            self._queue_startup_restore_event(event)
+            self._queue_startup_restore_event(event, session_key=reconnect_key)
             return None
 
         # Adapter admission can precede this task by an arbitrary delay on an idle lane.
@@ -1824,8 +1841,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         finally:
             with suppress(Exception):
                 self._session_state(_quick_key).conversation.attended_new_session = False
-            # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
-            # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
+                self._session_state(getattr(event, "_hermes_attended_session_key", _quick_key)).conversation.attended_new_session = False
+            # One-shot restore runs on every exit; the generation guard ignores displaced turns.
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
             # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
             # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
