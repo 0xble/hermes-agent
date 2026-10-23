@@ -295,19 +295,18 @@ async def test_stop_during_sentinel_force_cleans_session():
     session_key = build_session_key(event1.source)
 
     barrier = asyncio.Event()
+    agent_setup_entered = asyncio.Event()
 
     async def slow_inner(self_inner, ev, src, qk, generation):
+        agent_setup_entered.set()
         await barrier.wait()
         return "ok"
 
     with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
         task1 = asyncio.create_task(runner._handle_message(event1))
-        for _ in range(50):
-            await asyncio.sleep(0)
-            if runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL:
-                break
+        await asyncio.wait_for(agent_setup_entered.wait(), timeout=10)
 
-        # Sentinel should be set
+        # Sentinel should be set before the blocked agent setup.
         assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
 
         # Send /stop — should force-clean the sentinel
