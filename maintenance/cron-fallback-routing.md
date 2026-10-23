@@ -25,6 +25,21 @@ to cron preflight, provider recovery, agent construction, or fallback normalizat
 - Source adoption does not activate the personal or company installations or
   change their model policy. Use the separately authorized runtime owner for that.
 
+## Script Sender Boundary
+
+Fork PR [#657](https://github.com/0xble/hermes-agent/pull/657) also uses this
+patch identity for cron's truthful relay sender. Scripts with a known job ID
+receive `HERMES_SESSION_ID=cron_<job_id>`, the owning profile, and
+`HERMES_CRON_SESSION=1` after the session sanitizer. No-agent scripts run before
+`_CronRunScope` binds ContextVars, so their explicit job ID establishes cron
+execution. Unknown-job scripts remain unmarked. Ambient sender, routing and
+auto-delivery values must not be restored.
+
+`tests/cron/test_script_context_propagation.py` exercises real `run_job` monitor,
+pre-run and no-agent subprocesses, including the claimed one-shot heartbeat
+wrapper. `tests/cron/test_cron_script.py` covers the known/unknown-job boundary.
+Retire this extension when upstream has equivalent sanitized script identity.
+
 ## Proof and retirement
 
 The proof surface is `tests/cron/test_cron_fallback_config.py`, the existing
