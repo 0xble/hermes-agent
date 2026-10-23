@@ -983,22 +983,26 @@ class TestMaybeAutoTitle:
         assert db.get_session_title("sess-1") == "Debug scheduler failures"
         assert db.get_session_title_source("sess-1") == "llm"
 
-    def test_a_placeholder_title_stops_retrying_after_the_third_turn(self, tmp_path):
-        """A derived name gets turns 2-3 to upgrade, not a model call on every later turn."""
+    def test_a_placeholder_stops_model_requests_after_the_third_turn(self, tmp_path):
+        """Cap model requests, not deterministic recovery of a still-provisional name."""
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="sess-1", source="cli")
         db.set_auto_title("sess-1", "hi", source="derived")
         history = [{"role": "user", "content": f"turn {n}"} for n in range(3)]
-        with patch("agent.title_generator.auto_title_session") as mock_auto, \
+        with patch("agent.title_generator.generate_title", return_value=None) as generate, \
+                patch("agent.title_generator._hold_until_reply_enabled", return_value=True), \
                 patch("agent.title_generator._auto_title_enabled", return_value=True), \
                 patch("agent.title_generator._model_title_upgrade_enabled", return_value=True):
             maybe_auto_title(db, "sess-1", "and now the real question", history)
             wait_for_title_upgrades(10)
-            assert mock_auto.call_count == 1  # turn 3: the placeholder still gets a model shot
-            history.append({"role": "user", "content": "turn 3"})
-            maybe_auto_title(db, "sess-1", "and now the real question", history)
+            assert generate.call_count == 1
+            assert db.get_session_title_source("sess-1") == "derived"
+            history.append({"role": "user", "content": "Q4 Invoice Reconciliation"})
+            maybe_auto_title(db, "sess-1", "Q4 Invoice Reconciliation", history)
             wait_for_title_upgrades(10)
-        assert mock_auto.call_count == 1  # turn 4: capped, no call
+        assert generate.call_count == 1
+        assert db.get_session_title("sess-1") == "Q4 Invoice Reconciliation"
+        assert db.get_session_title_source("sess-1") == "llm"
 
     def test_instant_title_declines_a_name_collision(self, tmp_path):
         """A colliding derived title is skipped, not scanned into 'hi #2'.

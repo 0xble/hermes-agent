@@ -61,10 +61,13 @@ its optional icon, and the durable alias can be observed through one Telegram to
   a reply can supply a subject even when the opener was only a greeting. If both attempts
   are greetings, the placeholder stays provisional. Each failed attempt is logged, but
   the turn's failure callback reports only the first failure, including a retry-only
-  failure. Gateway callbacks remain debug-only, not user-visible. Later turns retain
-  the existing turn-3 cap. At turn 3 a rejected name falls back to a title derived from
-  the current user message, finalized at `llm` authority so it replaces the instant
-  `derived` placeholder exactly once. A manual `/title` still wins, and a stored `llm` or `user`
+  failure. Gateway callbacks remain debug-only, not user-visible. A provisional title
+  gets model attempts through turn 3. At turn 3 a rejected name falls back to a title
+  derived from the current user message. Only a substantive, non-colliding final
+  candidate gets `llm` authority and replaces the instant `derived` placeholder once.
+  A rejected fallback stays provisional. Later user turns may recover from their
+  literal subject without more model calls or link fetches. An entirely untitled
+  session retains its existing model retry eligibility. A manual `/title` still wins, and a stored `llm` or `user`
   title is never replaced. `auxiliary.title_generation.hold_until_reply: false` restores
   the previous opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared

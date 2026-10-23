@@ -1056,16 +1056,22 @@ def auto_title_session(
                 icon_instructions=str(icon_context.get("instructions") or ""),
                 icon_callback=lambda icon, _how: chosen_icon.append(icon),
             )
-        # Off the critical path by construction: this thread starts after the instant title is stored,
-        # and for the opening turn only after the reply is in ``conversation_history``.
-        if reply_excerpt is None and _hold_until_reply_enabled():
-            reply_excerpt = _latest_assistant_excerpt(conversation_history)
-        link_context = _title_link_context(user_message, title_preview)
-        title = generate_title(
-            user_message, failure_callback=failure_callback, main_runtime=main_runtime,
-            runtime_validator=runtime_validator, recent_titles=recent_titles, title_preview=title_preview,
-            link_context=link_context, reply_excerpt=reply_excerpt, **icon_kwargs,
-        )
+        # The three-turn model budget does not make a rejected placeholder final.
+        # Later user turns can still supply a usable literal subject without more I/O.
+        hold_until_reply = _hold_until_reply_enabled()
+        user_turns = _real_user_turns(conversation_history)
+        fallback_only = hold_until_reply and user_turns > 3 and not _session_is_untitled(session_db, session_id)
+        if fallback_only:
+            title = ""
+        else:
+            if reply_excerpt is None and hold_until_reply:
+                reply_excerpt = _latest_assistant_excerpt(conversation_history)
+            link_context = _title_link_context(user_message, title_preview)
+            title = generate_title(
+                user_message, failure_callback=failure_callback, main_runtime=main_runtime,
+                runtime_validator=runtime_validator, recent_titles=recent_titles, title_preview=title_preview,
+                link_context=link_context, reply_excerpt=reply_excerpt, **icon_kwargs,
+            )
         source = "llm"
         # The prompt's recent-name sample is not a uniqueness check: older topics still exist.
         duplicate = False
@@ -1075,8 +1081,8 @@ def auto_title_session(
         # Empty string is an explicit abstention. None is a failed/unusable provider response,
         # which must keep the existing derived fallback rather than hold the topic nameless.
         rejected = title == "" or bool(title and is_junk_title(title)) or duplicate
-        terminal_fallback = rejected and _hold_until_reply_enabled() and _real_user_turns(conversation_history) >= 3
-        if rejected and _hold_until_reply_enabled() and not terminal_fallback:
+        terminal_fallback = rejected and hold_until_reply and user_turns >= 3
+        if rejected and hold_until_reply and not terminal_fallback:
             logger.debug("Auto-title held: unsupported or duplicate subject")
             return
         if duplicate or terminal_fallback:
@@ -1091,6 +1097,16 @@ def auto_title_session(
             title, source = derive_title(user_message, title_preview), "derived"
         if not title:
             return
+        # Only a usable final candidate may acquire final authority. A derived
+        # replacement has not passed the model candidate's earlier checks.
+        if source == "llm":
+            if is_junk_title(title):
+                logger.debug("Auto-title held: unsupported final subject")
+                return
+            with suppress(Exception):
+                if session_db.has_auto_title_collision(title, exclude_session_id=session_id):
+                    logger.debug("Auto-title held: duplicate final subject")
+                    return
         try:
             persisted = _persist_session_title(session_db, session_id, title, source=source)
         except Exception as e:
@@ -1229,11 +1245,13 @@ def maybe_auto_title(
     # ``llm``/``user`` name: count alone left a machinery-opened session nameless, and a ``derived``
     # name is still a placeholder (instant slice, or the model's greeting title for a bare "hi") that
     # the first substantive turn should replace. Untitled sessions always get another shot; a
-    # placeholder gets turns 2-3, so a failing title model costs at most three calls, not one per turn.
+    # placeholder gets model attempts on turns 2-3. If its final fallback is rejected, later turns
+    # may still recover using a deterministic subject, without more model or link requests.
     user_msg_count = sum(1 for m in (conversation_history or []) if _is_real_user_turn(m))
     if user_msg_count > 1 and (
         _has_upgraded_title(session_db, session_id)
-        or (user_msg_count > 3 and not _session_is_untitled(session_db, session_id))
+        or (user_msg_count > 3 and not _session_is_untitled(session_db, session_id)
+            and not _hold_until_reply_enabled())
     ):
         return None
     kanban_title = _kanban_task_title()

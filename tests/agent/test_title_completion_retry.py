@@ -175,6 +175,69 @@ def test_third_turn_finalizes_current_subject_once_without_clobbering_manual_tit
         db.close()
 
 
+@pytest.mark.parametrize("existing, current", [
+    ("Q3 Billing #2", "Q3 Billing"),
+    ("Influence and Persuasion", "influence and persuasion"),
+    ("Exact Subject", "Exact Subject"),
+    ("Other Subject", "Investigation"),
+])
+@pytest.mark.parametrize("manual_before_recovery", [False, True])
+def test_rejected_terminal_fallback_stays_provisional_and_recovers_without_more_model_calls(
+    tmp_path, monkeypatch, existing, current, manual_before_recovery,
+):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="active", source="telegram")
+    for session_id, title in [("taken", existing), ("model-taken", "Taken Model Subject")]:
+        db.create_session(session_id=session_id, source="telegram")
+        db.set_session_title(session_id, title)
+    callback = Mock()
+    agent = SimpleNamespace(_session_db=db, session_id="active", _session_db_created=True,
+                            platform="telegram", _on_session_title=callback)
+    generate = Mock(return_value="Taken Model Subject")
+    link_context = Mock(return_value=None)
+    monkeypatch.setattr("agent.title_generator.generate_title", generate)
+    monkeypatch.setattr("agent.title_generator._title_link_context", link_context)
+    monkeypatch.setattr("agent.title_generator._title_config", dict)
+    monkeypatch.setattr("agent.title_generator.title_upgrade_must_wait_for_turn", lambda *_: False)
+    history = []
+    try:
+        for message in ["look at this", "look again", current]:
+            history.append({"role": "user", "content": message})
+            _maybe_title_session_at_turn_start(agent, history)
+            wait_for_title_upgrades(timeout=5)
+            history.append({"role": "assistant", "content": "The subject is not clear yet."})
+            start_deferred_title_upgrade(agent)
+            wait_for_title_upgrades(timeout=5)
+        assert db.get_session_title("active") == "look at this"
+        assert db.get_session_title_source("active") == "derived"
+        assert [event.args for event in callback.call_args_list if event.args[1] == "llm"] == []
+        attempts = generate.call_count
+        assert attempts == 4  # first attempt + completion retry, then turns 2 and 3
+        assert link_context.call_count == attempts
+        if manual_before_recovery:
+            db.set_session_title("active", "My Manual Title")
+        recovery = "Q4 Invoice Reconciliation"
+        history.append({"role": "user", "content": recovery})
+        _maybe_title_session_at_turn_start(agent, history)
+        start_deferred_title_upgrade(agent)
+        wait_for_title_upgrades(timeout=5)
+        assert generate.call_count == attempts
+        assert link_context.call_count == attempts
+        assert db.get_session_title("active") == ("My Manual Title" if manual_before_recovery else recovery)
+        assert db.get_session_title_source("active") == ("user" if manual_before_recovery else "llm")
+        final_callbacks = [event.args for event in callback.call_args_list if event.args[1] == "llm"]
+        assert final_callbacks == ([] if manual_before_recovery else [(recovery, "llm")])
+        history.append({"role": "user", "content": "A different subject"})
+        _maybe_title_session_at_turn_start(agent, history)
+        start_deferred_title_upgrade(agent)
+        wait_for_title_upgrades(timeout=5)
+        assert generate.call_count == attempts
+        assert db.get_session_title("active") == ("My Manual Title" if manual_before_recovery else recovery)
+    finally:
+        wait_for_title_upgrades(timeout=5)
+        db.close()
+
+
 @pytest.mark.parametrize("reply, retry_title, expected_title, expected_source", [
     ("Hi! How can I help?", "Friendly greeting", "hi", "derived"),
     ("Let's look at your Postgres connection pool.", "Postgres Connection Pool Exhaustion",

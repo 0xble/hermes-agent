@@ -1470,9 +1470,11 @@ If the model abstains, returns a platform label, raw ID,
 generic word (`None`, `Investigation`, `Unspecified`), or another session's title (ignoring case
 and a trailing ` #N` on the stored name only), the session keeps its placeholder. An unsuccessful
 eager attempt retries once at opening-turn completion using a bounded excerpt of the assistant
-reply. If it still cannot support a name, later user turns retry up to turn 3. At turn 3, rejected
-model names fall back to a title derived from the current user message, finalized at `llm`
-authority to replace the instant placeholder once. Provider failures
+reply. A provisional title gets model retries through turn 3. At turn 3, rejected model names
+fall back to a title derived from the current user message. That final candidate must be substantive
+and non-colliding before it receives `llm` authority and replaces the instant placeholder once.
+Otherwise it stays provisional, and later user turns can supply a literal subject without more
+model calls or link fetches. Entirely untitled sessions retain their model retry eligibility. Provider failures
 and truncated output use the derived fallback immediately rather than holding. A manual `/title`
 always wins, and a real title is never renamed.
 Set `auxiliary.title_generation.hold_until_reply: false` to title from the opening message only.
