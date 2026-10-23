@@ -101,6 +101,15 @@ the browser vault fill tool, or the 1Password backends.
 
 ## Provenance and patches
 
+- Fork patch identity: `vault-native-password-precedence`. Fork
+  [PR 742](https://github.com/0xble/hermes-agent/pull/742) keeps CLI and Connect
+  password selection native-first, with an unambiguous nonblank custom fallback.
+  The CLI reads exact-item JSON transiently and validates item, vault, category and
+  active state before selection. This PR includes no upstream contribution.
+  Preserve the synthetic subprocess and Connect precedence, ambiguity, malformed
+  output and byte-preservation regressions in the existing vault tests below.
+  Retire only when released upstream provides equivalent selection and validation.
+  Source publication does not imply runtime activation.
 - Fork patch identities: `op-batched-secret-loader` (one `op run` over distinct
   refs, private JSON handoff, per-ref fallback except on 429). Upstream
   [PR 116616](https://github.com/NousResearch/hermes-agent/pull/116616) proposes
