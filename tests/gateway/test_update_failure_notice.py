@@ -188,13 +188,14 @@ def test_immutable_notice_checks_recovery_in_journal_bound_source(
     from hermes_cli._early_recovery import interrupted_pull_marker
     from hermes_cli.venv_sync import completion_pending_path
 
-    source = notification_checkout
+    # Start fresh rather than reinitializing the autouse fixture's synthetic gitdir.
     # A real source identity keeps the immutable resolver's git validation in the test.
-    git_dir = tmp_path / "git" / "worktrees" / "source"
-    subprocess.run(["git", "init", f"--separate-git-dir={git_dir}", str(source)],
+    source = tmp_path / "immutable-source"
+    subprocess.run(["git", "-c", "init.defaultBranch=main", "init", str(source)],
                    check=True, capture_output=True)
     subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c",
-                    "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "source"],
+                    "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "commit", "--allow-empty", "-m", "source"],
                    check=True, capture_output=True)
     release = _release(tmp_path)
     (tmp_path / "release-layout.json").write_text(json.dumps({"source": str(source)}))
