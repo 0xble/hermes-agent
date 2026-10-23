@@ -214,3 +214,36 @@ async def test_wrapped_prose_uses_topic_name_and_rich_timeout_does_not_resend(mo
     # An ambiguous rich timeout may have delivered. Never duplicate it with legacy.
     adapter._bot.send_message.assert_not_called()
     admit.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title_line", [
+    "Mac Studio Crash", "**Mac Studio Crash**", "# Mac Studio Crash",
+])
+@pytest.mark.parametrize("objective", ["", "Investigate the panic report."])
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+async def test_title_paragraph_is_not_repeated_as_objective(monkeypatch, title_line, objective, separator):
+    adapter = _adapter()
+    admit = AsyncMock()
+    monkeypatch.setattr("gateway.wake.admit_internal_event", admit)
+    dest = SessionSource(platform=Platform.TELEGRAM, chat_id="123", thread_id="456")
+    brief = separator.join(filter(None, [
+        title_line, objective,
+        "Next: read the panic report and the existing evidence note, then test the hypotheses below.",
+        "Keep the original constraints.",
+    ]))
+
+    await _deliver_brief(adapter, dest, brief, ORIGIN, title="Mac Studio Crash")
+
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    visible = _visible(markdown)
+    paragraphs = [
+        "".join(child.content for child in token.children if child.type == "text")
+        for token in MarkdownIt().parse(visible) if token.type == "inline"
+    ]
+    assert paragraphs == ["Mac Studio Crash", *([objective] if objective else []),
+                          "▸ Next: read the panic report and the existing evidence note, then test the hypotheses below."]
+    assert brief in markdown
+    assert "<details>\n<summary>Details</summary>" in markdown
+    assert "<details open" not in markdown
+    assert admit.call_args.args[1].text == f"{ORIGIN}\n\n{brief}"
