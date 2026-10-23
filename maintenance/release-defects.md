@@ -697,6 +697,14 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `test_final_outcome_reads_the_update_receipt_after_a_pm_sync_overwrites_latest`), both red on the
   base. A replay of the real 2026-10-08 marker and receipts reports success on `fa95c7c4`.
 
+## Failed Update Notices Explain Unchanged Revisions
+
+- Fork patch identity: `update-lifecycle`.
+- A nonzero updater exit previously skipped its finalized receipt and sent only an unverified-runtime warning. The notice now reads fresh, request-bound evidence before classifying failures. A failed or partial receipt with matching valid pre/post SHAs, no release transition, restart, fleet mutation, or pending runtime transaction reports `Nothing changed. Still on <sha>. Cause: <reason>`. Immutable homes name their ready active release rather than the frozen updater checkout.
+- The first nonempty `stop_reason` line is trimmed and bounded to 240 characters. Traceback headers and their following frame/source lines are never sent. Missing, malformed, stale, contradictory, or mutation-bearing evidence retains the unverified-runtime warning and never claims an unchanged version.
+- Regression guard: `tests/gateway/test_update_failure_notice.py` drives the Telegram completion path for legacy and immutable layouts and failed receipts with zero or nonzero process exits. Its evidence matrix protects the conservative fallback. Existing successful no-op and runtime-verification contracts remain unchanged.
+- Upstream status: no matching gateway failure-notice fix found. NousResearch/hermes-agent#111147 presents receipt summaries in the web UI, and #132110 improves receipt production for early failures. Neither consumes the gateway receipt on a nonzero process exit. Retire this adaptation when upstream supplies equivalent request-bound gateway behavior.
+
 ## Watchdog Dumps Preserve the Main Thread
 
 - Fork patch identity: `watchdog-main-thread-dump`.
