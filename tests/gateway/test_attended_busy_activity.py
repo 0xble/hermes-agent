@@ -345,9 +345,8 @@ def test_activity_advances_and_survives_reload_during_dst_fallback(tmp_path, mon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["runner", "adapter"])
-@pytest.mark.parametrize("failure", ["exception", "cancelled"])
 @pytest.mark.parametrize("drain", [False, True])
-async def test_steered_receipt_recovers_without_drain(busy_activity, monkeypatch, path, failure, drain):
+async def test_steered_receipt_recovers_without_drain(busy_activity, monkeypatch, path, drain):
     runner, event, key, state = busy_activity
     calls = 0
 
@@ -355,8 +354,6 @@ async def test_steered_receipt_recovers_without_drain(busy_activity, monkeypatch
         nonlocal calls
         calls += 1
         if calls == 1:
-            if failure == "cancelled":
-                raise asyncio.CancelledError
             raise RuntimeError("transient receipt failure")
         return True
 
@@ -384,6 +381,57 @@ async def test_steered_receipt_recovers_without_drain(busy_activity, monkeypatch
         activity_stamp=1.0, allow_switch_back=True,
     )
     assert decision.reason == "attended"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["runner", "adapter"])
+async def test_cancelled_receipt_does_not_retry_persistence(busy_activity, monkeypatch, path):
+    runner, event, key, state = busy_activity
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def persist(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return True
+
+    runner.async_session_store.mark_user_activity.side_effect = persist
+    await _receive(busy_activity, path, "steer", monkeypatch)
+    task = event._attended_activity_task
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    # Shutdown cancels retained tasks that are already awaiting persistence.
+    assert task in runner._background_tasks
+    task.cancel()
+    release.set()
+    await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
+    assert runner.async_session_store.mark_user_activity.await_count == 1
+    assert not getattr(event, "_attended_activity_marked", False)
+    assert state.conversation.last_user_activity_at == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["disabled", "no_session", "no_key", "automation", "older_receipt"])
+async def test_terminal_receipt_does_not_retry(busy_activity, monkeypatch, terminal):
+    runner, event, key, state = busy_activity
+    load_config = Mock(return_value={} if terminal == "disabled" else CONFIG)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", load_config)
+    if terminal == "no_session":
+        runner.async_session_store.lookup_by_session_key.return_value = None
+    elif terminal == "no_key":
+        key = None
+        runner._session_key_for_source = lambda _source: None
+    elif terminal == "automation":
+        event.internal = True
+    elif terminal == "older_receipt":
+        # Store False means missing entry or non-newer instant, not failed I/O.
+        runner.async_session_store.mark_user_activity.return_value = False
+    runner._schedule_attended_user_activity(event, event.source, key)
+    task = getattr(event, "_attended_activity_task", None)
+    if task is not None:
+        await task
+    assert load_config.call_count == (0 if terminal == "automation" else 1)
+    assert runner.async_session_store.mark_user_activity.await_count == (1 if terminal == "older_receipt" else 0)
 
 
 @pytest.mark.platforms("posix")

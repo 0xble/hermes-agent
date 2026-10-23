@@ -1637,23 +1637,15 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if getattr(event, "_attended_activity_task", None) is not None:
             return
         event._attended_activity_received_at = time.time()
-
-        async def mark_receipt():
-            # Steering consumes the event, so recovery cannot rely on a queue drain.
-            for attempt in range(2):
-                try:
-                    if await self._mark_attended_user_activity(event, source, session_key):
-                        return True
-                except asyncio.CancelledError:
-                    if attempt:
-                        raise
-            return False
-
-        task = asyncio.create_task(mark_receipt())
+        task = asyncio.create_task(self._mark_attended_user_activity(
+            event, source, session_key, retry_on_failure=True,
+        ))
         event._attended_activity_task = task
         self._retain_background_task(task)
 
-    async def _mark_attended_user_activity(self, event, source, session_key: str | None = None) -> bool:
+    async def _mark_attended_user_activity(
+        self, event, source, session_key: str | None = None, *, retry_on_failure: bool = False,
+    ) -> bool:
         """Persist genuine Brian activity only for an existing session when attended routing is enabled."""
         if not is_genuine_user_message(event):
             return False
@@ -1707,6 +1699,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return True
         except Exception:
             logger.debug("attended-model activity stamp failed", exc_info=True)
+            if retry_on_failure:
+                # Steering consumes the event, so only ordinary failures retry here.
+                # False eligibility results and task cancellation are terminal.
+                return await self._mark_attended_user_activity(event, source, session_key)
             return False
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:

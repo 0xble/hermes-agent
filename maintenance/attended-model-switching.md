@@ -160,9 +160,11 @@ including Telegram grace queueing and foreign-owner handover, without counting a
 Activity ordering compares instants, not naive wall times. The repeated DST hour
 must advance both activity and `updated_at`, survive durable reload with its fold
 intact even when a turn marker updates the row, and reject older receipts.
-Scheduled receipt bookkeeping retries once after failure or cancellation even
-when steering consumes the event. A concurrent drain joins that same task, and
-both attempts retain the original arrival time. Run
+Scheduled receipt bookkeeping retries once after an ordinary exception even
+when steering consumes the event. Cancellation propagates immediately, and
+disabled routing or missing sessions are terminal, not retryable failures.
+A concurrent drain joins that same task, and both attempts retain the original
+arrival time. Run
 `tests/gateway/test_session_store_lock_io.py` for refresh reads outside the store
 lock and concurrent activity or session replacement during those reads.
 
