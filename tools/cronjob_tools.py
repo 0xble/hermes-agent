@@ -320,6 +320,21 @@ def _run_heartbeat(job_name: str):
             thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)
 
 
+def _wait_for_manual_execution(execution_id: str) -> Optional[dict[str, Any]]:
+    """Keep the existing runner alive until the exact durable attempt settles.
+
+    A bounded scheduler waiter can return while its detached worker still owns
+    the execution. The scheduler's recovery owns dead workers, not this adapter.
+    """
+    from cron.executions import _TERMINAL_STATES, get_execution
+
+    while True:
+        execution = get_execution(execution_id)
+        if execution is None or execution.get("status") in _TERMINAL_STATES:
+            return execution
+        time.sleep(1.0)
+
+
 def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) -> dict[str, Any]:
     """Fire an already-claimed job through the shared ``run_one_job`` body (split from
     ``_execute_job_now`` so the background path can claim synchronously and hand the run
@@ -387,13 +402,17 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
         finally:
             _registered = False
             release_running_job(job_id, owner=registration_owner)
-        refreshed = get_job(job_id) or {}
-        execution = None
         execution_id = job.get("execution_id")
         if execution_id:
-            from cron.executions import get_execution
-
-            execution = get_execution(str(execution_id))
+            with _run_heartbeat(str(job.get("name") or job_id)):
+                execution = _wait_for_manual_execution(str(execution_id)) or {}
+            state = execution.get("status") or "unknown"
+            delivery_failed = execution.get("delivery_status") == "failed"
+            error = execution.get("error")
+            if not error and (state != "completed" or delivery_failed):
+                error = "Delivery failed for this execution." if delivery_failed else f"Execution outcome is {state}."
+            return {"claimed": True, "success": state == "completed" and not delivery_failed, "error": error}
+        refreshed = get_job(job_id) or {}
         last_status = refreshed.get("last_status")
         # "delivery_failed": the run succeeded but output never reached the user — not a
         # success for the caller; surface last_delivery_error.
@@ -404,9 +423,6 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
         # failed and surface the delivery error, which lives in last_delivery_error (last_error is None for
         # these runs, and a bare success=False with error=None reads as an unexplained failure). See #83993.
         ok = last_status in {"ok", "delivery_queued"}
-        if execution is not None and execution.get("status") != "completed":
-            ok = False
-            run_error = execution.get("error") or f"execution ended in {execution.get('status') or 'unknown'} state"
         return {"claimed": True, "success": bool(processed and ok), "error": run_error}
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
@@ -517,26 +533,35 @@ def _manual_run_completion(
     """Report the exact durable execution, not the gateway waiter's result."""
     execution = None
     if execution_id:
-        from cron.executions import get_execution
-        execution = get_execution(str(execution_id))
-    if execution is not None and execution["status"] in {"completed", "failed", "unknown"}:
-        state = execution["status"]
-        res = {"success": state == "completed", "error": execution.get("error")}
+        execution = _wait_for_manual_execution(str(execution_id))
+        state = (execution or {}).get("status") or "unknown"
+        error = (execution or {}).get("error")
+        if execution is None:
+            error = "Execution record is missing; outcome is unknown."
+        elif state == "completed" and execution.get("delivery_status") == "failed":
+            state, error = "failed", "Delivery failed for this execution."
+        res = {"success": state == "completed", "error": error}
     else:
         state = "completed" if res.get("success") else "failed"
     duration = round(time.time() - started_at, 2)
     refreshed = get_job(job_id) or {}
+    # Job-level delivery errors may belong to a different attempt, just like
+    # last_error and the newest output file. Never use them for an exact run.
+    delivery_note = _manual_run_delivery_note(deliver, refreshed) if not execution_id else (
+        " (output saved locally only)" if not deliver or deliver == "local" else
+        " (delivery FAILED for this execution)" if (execution or {}).get("delivery_status") == "failed" else
+        f" (delivery status: {(execution or {}).get('delivery_status') or 'unverified'})")
     label = "ok" if state == "completed" else "unknown" if state == "unknown" else "FAILED"
     lines = [
         f"Cron job '{job_name}' ({job_id}) finished its manual run.",
         f"Result: {label}"
         + (f" — {res.get('error')}" if res.get("error") else ""),
-        f"Delivery target: {deliver}" + _manual_run_delivery_note(deliver, refreshed),
+        f"Delivery target: {deliver}" + delivery_note,
     ]
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-    excerpt = (str(execution.get("output") or "")[-4000:] if execution is not None else "")
-    excerpt = excerpt or _latest_job_output_excerpt(job_id)
+    excerpt = (str((execution or {}).get("output") or "")[-4000:] if execution_id else
+               _latest_job_output_excerpt(job_id))
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {
