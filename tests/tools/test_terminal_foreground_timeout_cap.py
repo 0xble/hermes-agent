@@ -142,7 +142,7 @@ class TestForegroundTimeoutCap:
         assert "error" not in result or result["error"] is None
 
 
-class TestHeavySlotExpiryPromotion:
+class TestSemaphoreExpiryPromotion:
     def test_single_heavy_command_is_resumed_in_background_without_retry(self):
         """A bounded not-started result preserves the command instead of asking the model to re-run it."""
         from tools.terminal_tool import terminal_tool
@@ -170,7 +170,7 @@ class TestHeavySlotExpiryPromotion:
             result = json.loads(terminal_tool(command="pytest -q tests", timeout=180))
 
         assert result["error"] is None
-        assert result["promoted_from_heavy_slot"].startswith("The foreground heavy-slot wait expired")
+        assert result["promoted_from_semaphore"].startswith("The foreground semaphore wait expired")
         assert wrapped == [("pytest -q tests", 60), ("pytest -q tests", None)]
         assert spawn.call_args.kwargs["command"] == "wrapped-2"
         assert spawn.call_args.kwargs["notify_on_complete"] is True

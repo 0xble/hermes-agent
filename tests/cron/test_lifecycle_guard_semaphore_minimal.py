@@ -21,7 +21,7 @@ def _script(tmp_path, name, text):
 @pytest.fixture
 def trusted_slot(tmp_path, monkeypatch):
     home = tmp_path / "home"
-    installed = home / ".local" / "bin" / "heavy-slot"
+    installed = home / ".local" / "bin" / "semaphore"
     installed.parent.mkdir(parents=True)
     installed.write_text('#!/usr/bin/env python3\n"""/dev/null"""\n')
     installed.chmod(0o755)
@@ -32,7 +32,7 @@ def trusted_slot(tmp_path, monkeypatch):
 def test_lpg_wrapper_scan_is_allowed(tmp_path, trusted_slot):
     recovery = _script(tmp_path, "run-recovery.sh", "#!/bin/sh\nprintf 'proof\\n'\n")
     command = (
-        f"env -u HEAVY_SLOT_HELD {trusted_slot} --label lpg-v2-fresh-copy-old-vs-batched-recovery "
+        f"env -u SEMAPHORE_HELD {trusted_slot} --label lpg-v2-fresh-copy-old-vs-batched-recovery "
         f"-- bash {recovery}"
     )
     assert scan_gateway_lifecycle(command) == (False, None)
@@ -42,7 +42,7 @@ def test_lpg_wrapper_scan_is_allowed(tmp_path, trusted_slot):
     "", "--label proof", "--label=proof", "--label=", "--gate-fd 3", "--gate-fd=3",
     "--label proof --gate-fd 3 --label=again",
 ])
-@pytest.mark.parametrize("prefix", ["", "env -u HEAVY_SLOT_HELD ", "nohup ", "timeout 30 "])
+@pytest.mark.parametrize("prefix", ["", "env -u SEMAPHORE_HELD ", "nohup ", "timeout 30 "])
 def test_exact_wrappers_scan_the_wrapped_command(tmp_path, trusted_slot, options, prefix):
     restart = _script(tmp_path, "restart.sh", "#!/bin/sh\nhermes gateway restart\n")
     assert scan_gateway_lifecycle(f"{prefix}{trusted_slot} {options} -- bash {restart}") == (True, None)
@@ -71,7 +71,7 @@ def test_identity_not_basename_controls_trust(tmp_path, trusted_slot):
     alias.symlink_to(trusted_slot)
     benign = _script(tmp_path, "benign.sh", "#!/bin/sh\ntrue\n")
     assert scan_gateway_lifecycle(f"{alias} --label proof -- bash {benign}") == (False, None)
-    shadow = _script(tmp_path, "heavy-slot", '#!/usr/bin/env python3\nhermes gateway restart\n')
+    shadow = _script(tmp_path, "semaphore", '#!/usr/bin/env python3\nhermes gateway restart\n')
     unsafe, refusal = scan_gateway_lifecycle(f"{shadow} --label proof -- bash {benign}")
     assert (unsafe, refusal) == (True, None)
 
@@ -80,23 +80,23 @@ def test_identity_not_basename_controls_trust(tmp_path, trusted_slot):
 def test_bare_names_stay_strict_without_refusing_device_prose(tmp_path, trusted_slot, monkeypatch, prefix):
     monkeypatch.setenv("PATH", str(trusted_slot.parent))
     benign = _script(tmp_path, "benign.sh", "#!/bin/sh\ntrue\n")
-    assert scan_gateway_lifecycle(f"{prefix}heavy-slot --label proof -- bash {benign}") == (False, None)
+    assert scan_gateway_lifecycle(f"{prefix}semaphore --label proof -- bash {benign}") == (False, None)
 
 
-def test_path_shadowed_bare_heavy_slot_is_strict(tmp_path, monkeypatch):
-    shadow = _script(tmp_path, "heavy-slot", '#!/usr/bin/env python3\nhermes gateway restart\n')
+def test_path_shadowed_bare_semaphore_is_strict(tmp_path, monkeypatch):
+    shadow = _script(tmp_path, "semaphore", '#!/usr/bin/env python3\nhermes gateway restart\n')
     monkeypatch.setenv("PATH", str(shadow.parent))
-    assert scan_gateway_lifecycle("heavy-slot --label proof -- true") == (True, None)
+    assert scan_gateway_lifecycle("semaphore --label proof -- true") == (True, None)
 
 
 @pytest.mark.parametrize(
     "command",
     [
-        "heavy-slot --help",
-        "heavy-slot --label t -- bash scripts/run_tests.sh tests/a.py",
+        "semaphore --help",
+        "semaphore --label t -- bash scripts/run_tests.sh tests/a.py",
     ],
 )
-def test_bare_heavy_slot_ignores_python_docstring_device_path(
+def test_bare_semaphore_ignores_python_docstring_device_path(
     tmp_path, trusted_slot, monkeypatch, command,
 ):
     scripts = tmp_path / "scripts"
@@ -109,16 +109,16 @@ def test_bare_heavy_slot_ignores_python_docstring_device_path(
 @pytest.mark.parametrize(
     "command_template",
     [
-        "heavy-slot --label t -- bash scripts/r.sh",
-        "nohup heavy-slot --label t -- bash scripts/r.sh",
-        "heavy-slot --label t -- ./scripts/r.sh",
-        "heavy-slot --label t -- . scripts/r.sh",
+        "semaphore --label t -- bash scripts/r.sh",
+        "nohup semaphore --label t -- bash scripts/r.sh",
+        "semaphore --label t -- ./scripts/r.sh",
+        "semaphore --label t -- . scripts/r.sh",
         "{trusted} --bogus -- bash scripts/r.sh",
         "{trusted} --label t bash scripts/r.sh",
         "{trusted} --label t -- bash scripts/r.sh",
     ],
 )
-def test_bare_and_unknown_heavy_slot_wrappers_scan_the_wrapped_command(
+def test_bare_and_unknown_semaphore_wrappers_scan_the_wrapped_command(
     tmp_path, trusted_slot, monkeypatch, command_template,
 ):
     scripts = tmp_path / "scripts"
@@ -134,7 +134,7 @@ def test_bare_and_unknown_heavy_slot_wrappers_scan_the_wrapped_command(
         assert refusal is None
 
 
-def test_heavy_slot_device_path_predicate_is_exact():
+def test_semaphore_device_path_predicate_is_exact():
     from cron.lifecycle_guard import _is_non_executable_device_path
 
     assert _is_non_executable_device_path("/dev/null")
@@ -145,14 +145,14 @@ def test_heavy_slot_device_path_predicate_is_exact():
     assert not _is_non_executable_device_path("/dev/fd/../cwd/restart.sh")
 
 
-@pytest.mark.parametrize("wrapper", ["heavy-slot", "{trusted}"])
+@pytest.mark.parametrize("wrapper", ["semaphore", "{trusted}"])
 @pytest.mark.parametrize("prefix", ["--bogus --", "--label t"])
 @pytest.mark.parametrize("tail", [
     "env -S {payload}", "env -iS{payload}",
     "su -c {payload}", "su -c{payload}", "runuser -c {payload}", "runuser -c{payload}",
     "env -S {payload} -- true",
 ])
-def test_opaque_heavy_slot_keeps_option_carried_commands(
+def test_opaque_semaphore_keeps_option_carried_commands(
     tmp_path, trusted_slot, monkeypatch, wrapper, prefix, tail,
 ):
     child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
@@ -168,10 +168,10 @@ def test_opaque_heavy_slot_keeps_option_carried_commands(
 
 
 @pytest.mark.parametrize("options", ["--bogus", "--label", "--gate-fd", "--"])
-def test_ambiguous_heavy_slot_command_is_refused_by_name(trusted_slot, options):
+def test_ambiguous_semaphore_command_is_refused_by_name(trusted_slot, options):
     unsafe, refusal = scan_gateway_lifecycle(f"{trusted_slot} {options}")
     assert unsafe is True
-    assert refusal is not None and "heavy-slot wrapper" in refusal
+    assert refusal is not None and "semaphore wrapper" in refusal
     assert "/dev/null" not in refusal
 
 
@@ -179,15 +179,15 @@ def test_ambiguous_heavy_slot_command_is_refused_by_name(trusted_slot, options):
     "{trusted} --label t -- " + "nohup " * 8 + "true",
     "nohup " * 9 + "{trusted} --label t -- true",
 ])
-def test_exhausted_heavy_slot_tail_is_refused_instead_of_dropped(trusted_slot, command_template):
+def test_exhausted_semaphore_tail_is_refused_instead_of_dropped(trusted_slot, command_template):
     command = command_template.format(trusted=trusted_slot)
     unsafe, refusal = scan_gateway_lifecycle(command)
     assert unsafe is True
     assert refusal is not None and "prefix scan budget" in refusal
 
 
-def test_remote_heavy_slot_fallback_scans_the_wrapped_command(tmp_path):
-    slot = tmp_path / "heavy-slot"
+def test_remote_semaphore_fallback_scans_the_wrapped_command(tmp_path):
+    slot = tmp_path / "semaphore"
     child = tmp_path / "child.sh"
     source = {
         str(slot): '#!/usr/bin/env python3\n"""/dev/null"""\n',
@@ -220,14 +220,14 @@ def test_shell_command_payload_is_still_scanned(trusted_slot):
     assert scan_gateway_lifecycle(f"{trusted_slot} --label proof -- bash -c 'hermes gateway restart'") == (True, None)
 
 
-def test_string_wrapper_payload_after_heavy_slot_is_scanned(tmp_path, trusted_slot):
+def test_string_wrapper_payload_after_semaphore_is_scanned(tmp_path, trusted_slot):
     child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
     payload = shlex.quote(f"bash {child}")
     assert scan_gateway_lifecycle(f"{trusted_slot} --label proof -- env -S {payload}") == (True, None)
 
 
 @pytest.mark.parametrize("option", ["-S{payload}", "--split-string={payload}"])
-def test_attached_env_split_string_payload_after_heavy_slot_is_scanned(
+def test_attached_env_split_string_payload_after_semaphore_is_scanned(
     tmp_path, trusted_slot, option,
 ):
     child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
@@ -345,7 +345,7 @@ def test_getopt_clusters_and_runuser_user_option_benign_commands_are_allowed(
     ],
     ids=["at-helper", "after-helper", "after-helper-twice"],
 )
-def test_exhaustion_at_or_after_heavy_slot_keeps_helper_strict(
+def test_exhaustion_at_or_after_semaphore_keeps_helper_strict(
     tmp_path, trusted_slot, monkeypatch, outer_nohups, tail,
 ):
     """A budget stop never earns the helper peel, whether it lands at or after the helper."""
@@ -360,7 +360,7 @@ def test_exhaustion_at_or_after_heavy_slot_keeps_helper_strict(
     assert scan_gateway_lifecycle(command) == (True, None)
 
 
-def test_natural_heavy_slot_peel_reaches_wrapped_script(tmp_path, trusted_slot):
+def test_natural_semaphore_peel_reaches_wrapped_script(tmp_path, trusted_slot):
     restart = _script(tmp_path, "restart.sh", "#!/bin/sh\nhermes gateway restart\n")
     trusted_slot.write_text("#!/bin/sh\ntrue\n", encoding="utf-8")
     command = " ".join(

@@ -59,7 +59,7 @@ its existing last-known-good bookkeeping, but a fallback config cannot be probed
 ## Verification and retirement
 
 Run through the existing heavy slot:
-`heavy-slot --label io-probe-redesign -- scripts/run_tests.sh tests/scripts/test_probe_provider.py`.
+`semaphore --label io-probe-redesign -- scripts/run_tests.sh tests/scripts/test_probe_provider.py`.
 The HTTP stub observes actual child argv and Authorization headers, reflects
 opaque/vendor-shaped tokens in status reasons and bodies, and checks stdout,
 stderr and DEBUG logs with redaction disabled. Every accepted test fixture is

@@ -45,7 +45,7 @@ suite is:
 `scripts/run_tests.sh tests/tools/test_search_files_engine_selection.py tests/tools/test_search_native_rg.py tests/tools/test_search_files_cpu_windows.py tests/tools/test_search_zero_match_and_multipath.py --file-retries 0`
 
 Also run the relevant broader tools tests through the canonical runner.
-Recovery verification through machine-wide `heavy-slot` admission observed:
+Recovery verification through machine-wide `semaphore` admission observed:
 
 - RED: `1 failed, 53 deselected in 0.84s`; the generated filename command
   lacked `--threads 4`.

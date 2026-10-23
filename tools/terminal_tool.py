@@ -75,26 +75,26 @@ def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
 # Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer")
 
-# Foreground heavy-slot wait: leave most of the command timeout for the test itself.
+# Foreground semaphore wait: leave most of the command timeout for the test itself.
 # Below a 30s timeout the floor exceeds a third, so the terminal timeout may fire first.
-_FOREGROUND_HEAVY_SLOT_WAIT_CAP = 120
-_FOREGROUND_HEAVY_SLOT_WAIT_FLOOR = 10
+_FOREGROUND_SEMAPHORE_WAIT_CAP = 120
+_FOREGROUND_SEMAPHORE_WAIT_FLOOR = 10
 
 
-def _foreground_heavy_slot_max_wait(effective_timeout: int) -> int:
-    """Bound heavy-slot admission without consuming the terminal's whole deadline."""
-    return min(_FOREGROUND_HEAVY_SLOT_WAIT_CAP, max(_FOREGROUND_HEAVY_SLOT_WAIT_FLOOR, effective_timeout // 3))
+def _foreground_semaphore_max_wait(effective_timeout: int) -> int:
+    """Bound semaphore admission without consuming the terminal's whole deadline."""
+    return min(_FOREGROUND_SEMAPHORE_WAIT_CAP, max(_FOREGROUND_SEMAPHORE_WAIT_FLOOR, effective_timeout // 3))
 
 
-def _heavy_slot_max_wait_for(*, background: bool, env_type: str, effective_timeout: int) -> Optional[int]:
+def _semaphore_max_wait_for(*, background: bool, env_type: str, effective_timeout: int) -> Optional[int]:
     """Foreground local calls get a bounded queue wait; background jobs keep waiting.
 
     A foreground call later adopted into the background mid-run keeps the bound it
-    started with, so it can still end with heavy-slot's exit-75 not-started result.
+    started with, so it can still end with semaphore's exit-75 not-started result.
     """
     if background or env_type != "local":
         return None
-    return _foreground_heavy_slot_max_wait(effective_timeout)
+    return _foreground_semaphore_max_wait(effective_timeout)
 
 
 # Disk usage warning threshold (in GB)
@@ -911,7 +911,7 @@ from tools.terminal_tool_guards import (
     gateway_lifecycle_block, self_repo_block,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
-from tools.terminal_tool_heavy_slot import can_promote_expired_wait, wrap_heavy_command
+from tools.terminal_tool_semaphore import can_promote_expired_wait, wrap_heavy_command
 from tools.terminal_tool_result import finalize_foreground_result
 
 
@@ -1235,16 +1235,16 @@ def _with_promoted_note(result_json: str, requested_timeout: int) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def _with_heavy_slot_promoted_note(result_json: str) -> str:
-    """Explain that a bounded heavy-slot wait was resumed without a retry."""
+def _with_semaphore_promoted_note(result_json: str) -> str:
+    """Explain that a bounded semaphore wait was resumed without a retry."""
     try:
         data = json.loads(result_json)
     except (TypeError, ValueError):
         return result_json
     if not isinstance(data, dict) or data.get("error"):
         return result_json
-    data["promoted_from_heavy_slot"] = (
-        "The foreground heavy-slot wait expired before this command started. "
+    data["promoted_from_semaphore"] = (
+        "The foreground semaphore wait expired before this command started. "
         "It was automatically moved to a tracked background process and will run "
         "when a slot is available. Do NOT re-run it."
     )
@@ -1308,11 +1308,11 @@ def _run_foreground(
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
     metered: bool = True, execution_command: Optional[str] = None,
-    on_heavy_slot_expired: Optional[Callable[[], Optional[str]]] = None,
+    on_semaphore_expired: Optional[Callable[[], Optional[str]]] = None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize. ``metered``
     is False for Hermes' own control-plane commands (``_host_local``). ``execution_command``
-    is what the shell runs (the heavy-slot rewrite); metrics, exit-code notes, verification
+    is what the shell runs (the semaphore rewrite); metrics, exit-code notes, verification
     evidence and redaction keep describing the user's ``command``."""
     from hermes_cli.observability.shared_metrics_harness import record_terminal_outcome
     max_retries = 3
@@ -1366,14 +1366,14 @@ def _run_foreground(
             "status": "yielded_to_background", "session_id": result["yielded_session_id"],
             "pid": result.get("pid"), "notify_on_complete": True, "note": _YIELDED_NOTE,
         }, ensure_ascii=False)
-    if result.get("returncode") == 75 and on_heavy_slot_expired is not None:
-        # Exit 75 is heavy-slot's bounded "not started" result. A single simple
+    if result.get("returncode") == 75 and on_semaphore_expired is not None:
+        # Exit 75 is semaphore's bounded "not started" result. A single simple
         # command can be resumed safely; compound commands keep their explicit
         # not-started result so earlier shell side effects are never repeated.
         try:
-            promoted = on_heavy_slot_expired()
+            promoted = on_semaphore_expired()
         except Exception:
-            logger.debug("heavy-slot expiry promotion failed", exc_info=True)
+            logger.debug("semaphore expiry promotion failed", exc_info=True)
             promoted = None
         if promoted is not None:
             return promoted
@@ -1552,10 +1552,10 @@ def terminal_tool(
             # caller could not have meant for a foreground call, and the two are exclusive anyway.
             background, notify_on_complete, watch_patterns = True, True, None
         # Approval and pre-exec security checks above saw the user-supplied command; only the
-        # local execution is rewritten, putting heavy-slot in front of each recognized test or
-        # CI simple command. HEAVY_SLOT_HELD (a nested run) or HERMES_HEAVY_SLOT=off disables it.
+        # local execution is rewritten, putting semaphore in front of each recognized test or
+        # CI simple command. SEMAPHORE_HELD (a nested run) or HERMES_SEMAPHORE=off disables it.
         # Promoted foreground calls are already background jobs, so they retain an unbounded queue wait.
-        max_wait_seconds = _heavy_slot_max_wait_for(
+        max_wait_seconds = _semaphore_max_wait_for(
             background=background, env_type=env_type, effective_timeout=plan.effective_timeout,
         )
         execution_command = wrap_heavy_command(
@@ -1581,7 +1581,7 @@ def terminal_tool(
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
             return _metered(None if _host_local else plan, result)
 
-        def _promote_expired_heavy_slot_wait() -> Optional[str]:
+        def _promote_expired_semaphore_wait() -> Optional[str]:
             if not can_promote_expired_wait(
                 command, env_type=env_type, environment=getattr(env, "env", None),
             ):
@@ -1603,11 +1603,11 @@ def terminal_tool(
                 completion_output_chars=_completion_output_chars,
                 heartbeat_seconds=0, persist_on_release=False,
             )
-            return _with_heavy_slot_promoted_note(promoted)
+            return _with_semaphore_promoted_note(promoted)
 
         return _metered(None if _host_local else plan, _run_foreground(
             command, env, plan, execution_command=execution_command,
-            on_heavy_slot_expired=_promote_expired_heavy_slot_wait,
+            on_semaphore_expired=_promote_expired_semaphore_wait,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
             metered=not _host_local,
