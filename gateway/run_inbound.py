@@ -282,10 +282,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
-        self._scale_to_zero_note_real_inbound()
-        event = await self._hm_pre_gateway_dispatch_hook(event, source)
-        if event is None:
-            return None
+        if not getattr(event, "_gateway_compression_deferred", False):
+            self._scale_to_zero_note_real_inbound()
+            event = await self._hm_pre_gateway_dispatch_hook(event, source)
+            if event is None:
+                return None
         from gateway.response_filters import apply_agent_origin_reply_expectation
         event = apply_agent_origin_reply_expectation(event)
         source = event.source
@@ -311,9 +312,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             else:
                 logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             return None
-        # The busy path charged this event on arrival; a drained follow-up must not pay twice.
-        if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
-            return None
+        # Charge each admitted event once, including retries and drained busy follow-ups.
+        # Authorization above still checks the live conversation cooldown on every attempt.
+        if not getattr(event, "_bot_loop_admitted", False):
+            if not self._admit_bot_message_for_source(source):
+                return None
+            event._bot_loop_admitted = True
         await _admit_outbox_event(self, event, source)
         return event, source, False
 
@@ -1655,7 +1659,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         finally:
             turn_id = getattr(event, "_outbox_turn_id", None)
             try:
-                if turn_id and not getattr(event, "_outbox_duplicate", False):
+                if (turn_id and not getattr(event, "_outbox_duplicate", False)
+                        and not getattr(event, "_gateway_compression_deferred", False)):
                     await asyncio.to_thread(
                         store_for(getattr(event, "_outbox_home")).finish_admission,
                         turn_id, "completed" if result is not None else "empty")

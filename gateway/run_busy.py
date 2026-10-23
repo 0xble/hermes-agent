@@ -1033,6 +1033,12 @@ class GatewayBusySessionMixin:
         ):
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
 
+        # Compression-held inputs wait silently, including arrivals admitted by
+        # this busy path rather than cold ingress. Keep ordinary busy acks intact.
+        if (_steer.demoted_for_compression
+                or await self._session_has_compression_in_flight(session_key)):
+            return True
+
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.
         if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":

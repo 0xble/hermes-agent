@@ -4243,7 +4243,13 @@ class BasePlatformAdapter(ABC):
         return result
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
-        """Return True when two text debounce events came from the same sender."""
+        """Batch only unadmitted human text from the same sender."""
+        from gateway.platforms.event import _is_human_event
+
+        if not all(_is_human_event(candidate) and not candidate.is_command()
+                   and not getattr(candidate, "_gateway_compression_deferred", False)
+                   for candidate in (existing, event)):
+            return False
 
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
@@ -5235,9 +5241,16 @@ class BasePlatformAdapter(ABC):
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
             return
+        # A cancelled compression waiter must not resurrect itself from its visible
+        # pending slot. Shutdown spools it, while /stop and /new discard it.
+        pending = self._pending_messages.get(session_key)
+        if (current_task is not None and current_task.cancelling()
+                and pending is getattr(current_task, "_hermes_event", None)
+                and getattr(pending, "_gateway_compression_deferred", False)):
+            self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
         # A drain-deferred turn belongs to the shutdown spool, not this adapter's
         # post-turn handoff. Keep the FIFO head in its slot until shutdown flush.
-        pending = self._pending_messages.get(session_key)
         runner = getattr(self, "gateway_runner", None)
         if (getattr(pending, "_drain_deferred", False)
                 and (runner is None or getattr(runner, "_draining", False))):
@@ -5260,6 +5273,29 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(late_pending, session_key)
         elif current_task is not None and self._session_tasks.get(session_key) is current_task:
             self._cleanup_finished_session_task(session_key, interrupt_event)
+
+    async def _handle_compression_retries(
+        self, event: MessageEvent, session_key: str, interrupt_event: asyncio.Event,
+    ) -> Optional[Union[str, "EphemeralReply"]]:
+        """Keep one processing lifecycle while the same input waits for compression.
+
+        The pending slot stays visible during backoff for FIFO admission and shutdown.
+        Controls retain the existing task cancellation and guard ownership boundaries.
+        """
+        assert self._message_handler is not None
+        while True:
+            response = await self._message_handler(event)
+            if (response is not None or not getattr(event, "_gateway_compression_deferred", False)
+                    or self._pending_messages.get(session_key) is not event):
+                return response
+            if getattr(event, "_drain_deferred", False):
+                return None
+            delay = self._requeue_backoff_delay(session_key, event, event)
+            await asyncio.sleep(delay)
+            if (self._active_sessions.get(session_key) is not interrupt_event
+                    or self._pending_messages.get(session_key) is not event):
+                return None
+            self._pending_messages.pop(session_key)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
@@ -5301,7 +5337,9 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
-            response = await self._message_handler(event)
+            response = await self._handle_compression_retries(event, session_key, interrupt_event)
+            if self._pending_messages.get(session_key) is event and getattr(event, "_drain_deferred", False):
+                return  # Shutdown owns the retained input, not a completed delivery.
             bind_event_turn(event)
             delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
@@ -5425,7 +5463,9 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, delivery_generation)
+            if not (self._pending_messages.get(session_key) is event
+                    and getattr(event, "_gateway_compression_deferred", False)):
+                await self._fire_post_delivery_callback(session_key, delivery_generation)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
