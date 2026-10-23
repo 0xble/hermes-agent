@@ -156,8 +156,10 @@ async def test_create_binds_a_new_session_with_every_setting_and_starts_it(home)
     # The brief is shown in the topic and admitted as the session's first turn, never as a command.
     expected_origin = "Split from [🧵 Calling Topic](https://t.me/hermes_test_bot/297206/297206)"
     assert cast(Any, TelegramAdapter).format_message(None, expected_origin) == expected_origin
-    assert adapter.sent[0]["content"] == expected_origin + "\n\n/title is not a command here: read the plan"
-    assert adapter.sent[0]["metadata"] == {"thread_id": "4242"}
+    assert adapter.sent[0]["content"].startswith("**Planning Room**\n\n/title is not a command here: read the plan")
+    assert adapter.sent[0]["content"].endswith(f"*{expected_origin}*")
+    assert adapter.sent[0]["metadata"] == {
+        "thread_id": "4242", "rich_fallback_content": f"{expected_origin}\n\n/title is not a command here: read the plan"}
     turn = adapter.admitted[0]
     assert turn.internal and not turn.allow_gateway_control and not turn.is_command()
     assert turn.source.thread_id == "4242" and turn.text.startswith(expected_origin)
@@ -179,8 +181,9 @@ async def test_create_from_general_topic_uses_main_chat_origin_line(home):
 
     await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", message="start here"))
 
-    assert adapter.sent[0]["content"] == "Split from the main chat\n\nstart here"
-    assert adapter.admitted[0].text == adapter.sent[0]["content"]
+    assert adapter.sent[0]["content"].startswith("**Room**\n\nstart here")
+    assert adapter.sent[0]["content"].endswith("*Split from the main chat*")
+    assert adapter.admitted[0].text == "Split from the main chat\n\nstart here"
 
 
 @pytest.mark.asyncio
@@ -191,10 +194,9 @@ async def test_create_from_topic_without_recorded_icon_omits_icon(home):
 
     await create_topic_session(runner, _source(thread_id="297206"), TopicSpec(name="Room", icon="💡", message="start here"))
 
-    assert adapter.sent[0]["content"] == (
-        "Split from [Calling Topic](https://t.me/hermes_test_bot/297206/297206)\n\nstart here"
-    )
-    assert adapter.admitted[0].text == adapter.sent[0]["content"]
+    origin = "Split from [Calling Topic](https://t.me/hermes_test_bot/297206/297206)"
+    assert adapter.sent[0]["content"].endswith(f"*{origin}*")
+    assert adapter.admitted[0].text == f"{origin}\n\nstart here"
 
 
 @pytest.mark.asyncio

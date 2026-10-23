@@ -1203,6 +1203,56 @@ def defer_title_completion_retry(
     return spawn_context_thread(retry_with_reply, name="auto-title-reply")
 
 
+def defer_title_completion_retry(
+    upgrade: threading.Thread, session_db, session_id: str, user_message: str, **title_kwargs,
+) -> Optional[threading.Thread]:
+    """Return the unstarted upgrade, or one bounded opening-turn retry for finalization.
+
+    Eager attempts can abstain even when the opener passes the cheap subject heuristic.
+    Wait off the turn's critical path for that attempt, then reuse the completed reply.
+    """
+    if upgrade.ident is None:
+        return upgrade
+    history = title_kwargs.get("conversation_history")
+    if not _hold_until_reply_enabled() or _real_user_turns(history) > 1:
+        return None
+
+    def retry_with_reply():
+        upgrade.join()
+        if _has_upgraded_title(session_db, session_id) or not _latest_assistant_excerpt(history):
+            return
+        logger.info("Retrying opening title after reply: session=%s", session_id)
+        auto_title_session(session_db, session_id, user_message, **title_kwargs)
+
+    from agent.memory_provider import spawn_context_thread
+    return spawn_context_thread(retry_with_reply, name="auto-title-reply")
+
+
+def defer_title_completion_retry(
+    upgrade: threading.Thread, session_db, session_id: str, user_message: str, **title_kwargs,
+) -> Optional[threading.Thread]:
+    """Return the unstarted upgrade, or one bounded opening-turn retry for finalization.
+
+    Eager attempts can abstain even when the opener passes the cheap subject heuristic.
+    Wait off the turn's critical path for that attempt, then reuse the completed reply.
+    """
+    if upgrade.ident is None:
+        return upgrade
+    history = title_kwargs.get("conversation_history")
+    if not _hold_until_reply_enabled() or _real_user_turns(history) > 1:
+        return None
+
+    def retry_with_reply():
+        upgrade.join()
+        if _has_upgraded_title(session_db, session_id) or not _latest_assistant_excerpt(history):
+            return
+        logger.info("Retrying opening title after reply: session=%s", session_id)
+        auto_title_session(session_db, session_id, user_message, **title_kwargs)
+
+    from agent.memory_provider import spawn_context_thread
+    return spawn_context_thread(retry_with_reply, name="auto-title-reply")
+
+
 def maybe_auto_title(
     session_db,
     session_id: str,
