@@ -2753,6 +2753,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         _persist_shutdown_pending_messages(self)
         scheduler = getattr(self, "_replay_scheduler", None)
         if scheduler is not None:
+            # Close after pre-drain marking: queued resume sentinels are skipped there,
+            # and dropping them must leave their original durable markers untouched.
             with suppress(Exception):
                 await scheduler.close()
             # Dropped scheduler items return to the restore queue after the first shutdown spool.

@@ -1020,21 +1020,83 @@ async def test_shutdown_retains_active_unaccepted_human_replay():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_drop_releases_resume_sentinel_and_restores_marker():
+async def test_shutdown_drop_preserves_resume_marker(tmp_path, monkeypatch):
+    from gateway.replay_scheduler import REPLAY_PRIORITY_RESUME
+    from gateway.run import GatewayRunner
+
     runner, _adapter = make_restart_runner()
+    store = _make_store(tmp_path)
+    runner.session_store = store
     source = make_restart_source(chat_id="dropped-replay")
-    key = runner._session_key_for_source(source)
+    entry = store.get_or_create_session(source)
+    key = entry.session_key
+    assert store.mark_resume_pending(key, "restart_timeout", turn_id="t1")
+    marker = entry.resume_marker_token
+    assert marker
+    assert runner._resume_pending_candidates(record_boot=False) == [entry]
     state = runner._session_state(key)
     state.turn.agent = _AGENT_PENDING_SENTINEL
-    store = MagicMock()
-    store._store = runner.session_store
-    store.mark_resume_pending = AsyncMock()
-    runner.__dict__["_async_session_store"] = store
+    runner._startup_resume_inflight = {key}
 
-    await runner._drop_queued_resume(key)
+    async def drain(*_args):
+        assert state.turn.agent is _AGENT_PENDING_SENTINEL
+        assert entry.resume_reason == "restart_timeout"
+        assert entry.resume_turn_id == "t1"
+        assert entry.resume_marker_token == marker
+        return {}, False
 
-    assert state.turn.agent is None
-    store.mark_resume_pending.assert_awaited_once_with(key, "restart_replay_shutdown")
+    drain_mock = AsyncMock(side_effect=drain)
+    runner._drain_active_agents = drain_mock
+
+    async def drop():
+        # Closing the scheduler must follow the pre-drain pass, which skips this sentinel.
+        drain_mock.assert_awaited_once()
+        await runner._drop_queued_resume(key)
+
+    dispatch = AsyncMock()
+    scheduler = runner._get_replay_scheduler()
+    scheduler.enqueue(
+        priority=REPLAY_PRIORITY_RESUME, kind="resume", session_key=key,
+        dispatch=dispatch, on_drop=drop,
+    )
+    runner._active_cron_job_count = lambda: 0
+    runner._active_api_run_count = lambda: 0
+    runner._active_deferred_agent_worker_count = lambda: 0
+    runner._finalize_shutdown_agents = AsyncMock()
+    runner._cancel_process_completion_batch_tasks = AsyncMock()
+    runner._bounded_adapter_teardown = AsyncMock()
+
+    async def begin(_runner, ctx):
+        ctx.started_at = time.monotonic()
+
+    monkeypatch.setattr(GatewayRunner, "_stop_begin_teardown", begin)
+    for phase in ("_stop_release_runtime_state", "_stop_persist_exit_state"):
+        monkeypatch.setattr(GatewayRunner, phase, AsyncMock())
+    monkeypatch.setattr(GatewayRunner, "_stop_quiesce_and_close_session_dbs", MagicMock())
+
+    fresh = None
+    try:
+        await runner._stop_impl()
+
+        dispatch.assert_not_awaited()
+        assert state.turn.agent is None
+        assert key not in runner._startup_resume_inflight
+        assert runner._resume_pending_candidates(record_boot=False) == [entry]
+        # A successor must see the same durable marker, not only unchanged in-memory fields.
+        fresh = _make_store(tmp_path)
+        runner.session_store = fresh
+        candidates = runner._resume_pending_candidates(record_boot=False)
+        assert candidates is not None
+        assert [candidate.session_key for candidate in candidates] == [key]
+        restored = candidates[0]
+        assert restored.resume_reason == "restart_timeout"
+        assert restored.resume_turn_id == "t1"
+        assert restored.resume_marker_token == marker
+    finally:
+        await scheduler.close(timeout=0)
+        if fresh is not None:
+            fresh.close_all_db_handles()
+        store.close_all_db_handles()
 
 
 

@@ -787,11 +787,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         state = self._peek_session_state(session_key)
         if state is None or state.turn.agent is not _AGENT_PENDING_SENTINEL:
             return
+        # No turn was admitted, so the original reason, turn ID and marker token still own recovery.
         self._release_running_agent_state(session_key)
-        store = getattr(self, "async_session_store", None)
-        if store is not None:
-            with suppress(Exception):
-                await store.mark_resume_pending(session_key, "restart_replay_shutdown")
 
     def _schedule_auto_resume_delegations(self) -> int:
         """Queue bounded parent notices for eligible abandoned single-task rows.
