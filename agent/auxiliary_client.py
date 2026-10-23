@@ -3224,11 +3224,11 @@ def _mark_provider_unhealthy(
     label = _normalize_chain_label(provider)
     if not label:
         return
-    key = _unhealthy_cache_key(label, base_url, model)
+    key = _unhealthy_cache_key(provider, base_url, model)
     ttl = _AUX_UNHEALTHY_TTL_SECONDS if ttl is None else ttl
     try:
         record = _mark_auxiliary_health(
-            _auxiliary_route_identity(label, base_url, model), ttl=ttl, reason=reason,
+            _auxiliary_route_identity(provider, base_url, model), ttl=ttl, reason=reason,
         )
     except OSError as exc:
         expires_at = time.time() + ttl
@@ -3267,14 +3267,13 @@ def _health_route_candidates(
     endpoint. A caller that knows its concrete model must therefore check that wildcard
     record after the exact model key. Model-scoped failures still remain isolated.
     """
-    normalized_label = _normalize_chain_label(label)
     normalized_model = str(model or "").strip() or None
     models = (normalized_model, None) if normalized_model else (None,)
     return tuple(
         (
             candidate_model,
-            _unhealthy_cache_key(normalized_label, base_url, candidate_model),
-            _auxiliary_route_identity(normalized_label, base_url, candidate_model),
+            _unhealthy_cache_key(label, base_url, candidate_model),
+            _auxiliary_route_identity(label, base_url, candidate_model),
         )
         for candidate_model in models
     )
@@ -3283,7 +3282,7 @@ def _health_route_candidates(
 def _clear_provider_health(
     provider: str, base_url: Optional[str] = None, model: Optional[str] = None,
 ) -> None:
-    label = _normalize_chain_label(_fallback_provider_from_label(provider))
+    label = _fallback_provider_from_label(provider)
     if not label:
         return
     for _candidate_model, key, identity in _health_route_candidates(label, base_url, model):
@@ -3310,7 +3309,8 @@ def _is_provider_unhealthy(
         if record is _HEALTH_STORE_UNAVAILABLE:
             if local_until is not None:
                 _clear_local_health(key)
-            return False
+            # A provider-wide local hold may still follow the exact model candidate.
+            continue
         if record is not None:
             _aux_unhealthy_until[key] = record.expires_at
             _aux_unhealthy_reason[key] = record.reason

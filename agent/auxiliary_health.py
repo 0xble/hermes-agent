@@ -88,7 +88,7 @@ def _unhealthy_cache_key(
     """Return a profile/endpoint/model-scoped, non-secret route key."""
     from agent.auxiliary_client import _normalize_chain_label
     label = _normalize_chain_label(provider)
-    endpoint = normalize_route_base_url(_custom_health_base_url(label, base_url))
+    endpoint = normalize_route_base_url(_custom_health_base_url(provider, base_url))
     return AuxiliaryRouteIdentity(
         home=hermes_home_key(), provider=label, endpoint=endpoint, model=str(model or "").strip(),
     ).as_key()
@@ -102,9 +102,9 @@ def _custom_health_base_url(provider: str, explicit_base_url: Optional[str] = No
     that a failure on the concrete client URL wrote.
     """
     explicit = str(explicit_base_url or "").strip()
-    from agent.auxiliary_client import _normalize_chain_label
-    label = _normalize_chain_label(provider)
-    if label == "local/custom":
+    # Keep named custom identity until its endpoint has been resolved.
+    label = str(provider or "").strip().lower()
+    if label in {"custom", "local/custom"}:
         if explicit:
             return explicit
         with contextlib.suppress(Exception):
