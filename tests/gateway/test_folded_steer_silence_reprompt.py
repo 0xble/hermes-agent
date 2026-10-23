@@ -202,8 +202,8 @@ def _cumulative_adapter(h, transport, monkeypatch):
         monkeypatch.setattr(type(adapter), "SUPPORTS_NATIVE_STREAMING", True, raising=False)
         adapter.supports_native_streaming = lambda **kw: True
 
-        async def frame(text, *, finalize=False, **kw):
-            adapter.frames.append({"text": text, "finalize": finalize})
+        async def frame(text, *, turn_id, finalize=False, **kw):
+            adapter.frames.append({"text": text, "finalize": finalize, "turn_id": turn_id})
             return True
 
         adapter.send_stream_frame = frame
@@ -388,9 +388,13 @@ async def test_cumulative_preamble_survives_without_marker_frames(harness, monke
 
     def check_retry_start(response):
         if transport == "native" and len(h.calls) == 2:
+            first = h.consumers[0]
+            # The retry may already have seeded its own native stream.
+            last_frame = next(frame for frame in reversed(h.adapter.frames)
+                              if frame["turn_id"] == first._turn_id)
             native_at_retry.append((
-                h.consumers[0]._native_stream_opened, h.adapter.frames[-1].copy(),
-                h.consumers[0]._accumulated, h.consumers[0].final_content_delivered,
+                first._native_stream_opened, last_frame.copy(),
+                first._accumulated, first.final_content_delivered,
             ))
 
     h.model_hook = check_retry_start
@@ -400,7 +404,8 @@ async def test_cumulative_preamble_survives_without_marker_frames(harness, monke
         assert len(native_at_retry) == 1
         opened, frame, prefix, delivered = native_at_retry[0]
         assert not opened
-        assert frame == {"text": prefix, "finalize": True}
+        assert frame == {"text": prefix, "finalize": True,
+                         "turn_id": h.consumers[0]._turn_id}
         assert prefix.startswith("Checking the brief.")
         assert not delivered
     assert len(h.consumers) == 2
