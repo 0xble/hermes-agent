@@ -834,6 +834,10 @@ def generate_title(
             logger.debug("Rejecting truncated title output (finish_reason=%s)", finish_reason)
             return None
         raw_content = getattr(getattr(choice, "message", None), "content", "") or ""
+        # Normalize the visible answer before any structured extraction,
+        # including the abstention and combined title/icon paths.
+        from agent.agent_runtime_helpers import strip_think_blocks
+        raw_content = strip_think_blocks(None, str(raw_content)).strip()
         payload = None
         if icon_allowed:
             with suppress(Exception):
@@ -1071,12 +1075,17 @@ def auto_title_session(
         # Empty string is an explicit abstention. None is a failed/unusable provider response,
         # which must keep the existing derived fallback rather than hold the topic nameless.
         rejected = title == "" or bool(title and is_junk_title(title)) or duplicate
-        if rejected and _hold_until_reply_enabled() and _real_user_turns(conversation_history) < 3:
+        terminal_fallback = rejected and _hold_until_reply_enabled() and _real_user_turns(conversation_history) >= 3
+        if rejected and _hold_until_reply_enabled() and not terminal_fallback:
             logger.debug("Auto-title held: unsupported or duplicate subject")
             return
-        if duplicate or (rejected and _hold_until_reply_enabled()):
-            title, source = derive_title(user_message, title_preview), "derived"
-        if title and _is_provisional_greeting_title(title):
+        if duplicate or terminal_fallback:
+            title = derive_title(user_message, title_preview)
+            # The final decision must outrank the instant derived placeholder
+            # and stop later upgrades. Existing CAS still gives /title priority.
+            source = "llm" if terminal_fallback else "derived"
+            chosen_icon.clear()
+        if title and not terminal_fallback and _is_provisional_greeting_title(title):
             source = "derived"
         if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
             title, source = derive_title(user_message, title_preview), "derived"
@@ -1145,21 +1154,16 @@ _REPLY_EXCERPT_CHARS = 600
 
 
 def opener_needs_reply(user_message: str, title_preview: str | None = None) -> bool:
-    """True when the opener is a link or attachment whose subject is not in the typed text.
+    """True when no usable typed text or paste preview can start a title attempt.
 
-    A link whose page metadata came back, or a paste preview, can be titled now. A bare link
-    or an attachment cannot: the page or the reply has the subject. Short prose is titled now;
-    a junk result is held by the title check, not by delaying every short opener.
+    Link metadata stays in the background worker, never on the turn-start path.
+    Link and prose openers start immediately. An unsupported result is held by
+    the title check and can recover from the reply at turn completion.
     """
     if isinstance(title_preview, str) and title_preview.strip():
         return False
     text = first_link_text(user_message)
     if not text.strip():
-        return True
-    from agent.title_link_context import first_link
-    if first_link(text):
-        # Link metadata is fetched by the background upgrade. Never put that network request on
-        # the turn-start path just to decide whether the upgrade should wait for the reply.
         return True
     return _attachment_only_opener(text)
 

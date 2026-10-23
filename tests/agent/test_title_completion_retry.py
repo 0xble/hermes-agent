@@ -1,6 +1,7 @@
 """An eager title attempt must not require a second user turn to recover."""
 
-from threading import Event, Thread
+import json
+from threading import Event, Thread, get_ident
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -55,6 +56,122 @@ def test_first_turn_completion_recovers_an_unusable_eager_title(
         wait_for_title_upgrades(timeout=5)
         assert generate.call_count == expected_calls
     finally:
+        db.close()
+
+
+@pytest.mark.parametrize("opener, metadata, title, manual_title", [
+    ("https://youtu.be/MgRynDGk-4Y", "Software Is DEAD", "Software Is DEAD", None),
+    ("https://x.com/example/status/1234567890", "Postgres connection pool", "Postgres Connection Pool", None),
+    ("https://example.slack.com/archives/C123/p1234567890", None, "Q3 Billing Dispute", None),
+    ("https://example.slack.com/archives/C123/p1234567890", None, "Q3 Billing Dispute", "My Manual Title"),
+])
+def test_link_metadata_titles_before_reply_or_recovers_once_at_completion(
+    tmp_path, monkeypatch, opener, metadata, title, manual_title,
+):
+    history = [{"role": "user", "content": opener}]
+    reply = "The subject is the Q3 billing dispute."
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="link-topic", source="telegram")
+    callback = Mock()
+    agent = SimpleNamespace(_session_db=db, session_id="link-topic", _session_db_created=True,
+                            platform="telegram", _on_session_title=callback)
+    responses = [
+        {"title": title if metadata else "", "abstain": not bool(metadata)},
+        {"title": title, "abstain": False},
+    ]
+    call = Mock(side_effect=[SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content=json.dumps(response)), finish_reason="stop",
+    )]) for response in responses])
+    fetch_threads = []
+    fetch = Mock(side_effect=lambda *_: fetch_threads.append(get_ident()) or metadata)
+    monkeypatch.setattr("agent.title_generator.call_llm", call)
+    monkeypatch.setattr("agent.title_generator._title_config", dict)
+    monkeypatch.setattr("agent.title_generator._title_link_context", fetch)
+    try:
+        _maybe_title_session_at_turn_start(agent, history)
+        wait_for_title_upgrades(timeout=5)
+        # Even an opaque URL gets a background metadata attempt before the reply exists.
+        fetch.assert_called_once_with(opener, None)
+        assert fetch_threads[0] != get_ident()
+        assert call.call_count == 1
+        first_input = call.call_args.kwargs["messages"][-1]["content"]
+        assert reply not in first_input
+        if metadata:
+            assert metadata in first_input
+            assert db.get_session_title("link-topic") == title
+            assert db.get_session_title_source("link-topic") == "llm"
+        else:
+            assert db.get_session_title_source("link-topic") != "llm"
+
+        if manual_title:
+            db.set_session_title("link-topic", manual_title)
+        history.append({"role": "assistant", "content": reply})
+        start_deferred_title_upgrade(agent)
+        wait_for_title_upgrades(timeout=5)
+        expected_calls = 1 if metadata or manual_title else 2
+        assert call.call_count == expected_calls
+        assert db.get_session_title("link-topic") == (manual_title or title)
+        assert db.get_session_title_source("link-topic") == ("user" if manual_title else "llm")
+        if expected_calls == 2:
+            assert reply in call.call_args.kwargs["messages"][-1]["content"]
+        llm_callbacks = [event.args for event in callback.call_args_list if event.args[1] == "llm"]
+        assert llm_callbacks == ([] if manual_title else [(title, "llm")])
+        start_deferred_title_upgrade(agent)
+        wait_for_title_upgrades(timeout=5)
+        assert call.call_count == expected_calls
+    finally:
+        wait_for_title_upgrades(timeout=5)
+        db.close()
+
+
+@pytest.mark.parametrize("rejected_title", ["", "Investigation", "Existing Billing Topic"])
+@pytest.mark.parametrize("manual_during_generation", [False, True])
+def test_third_turn_finalizes_current_subject_once_without_clobbering_manual_title(
+    tmp_path, monkeypatch, rejected_title, manual_during_generation,
+):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="active", source="telegram")
+    db.create_session(session_id="taken", source="telegram")
+    db.set_session_title("taken", "Existing Billing Topic")
+    callback = Mock()
+    agent = SimpleNamespace(_session_db=db, session_id="active", _session_db_created=True,
+                            platform="telegram", _on_session_title=callback)
+    current = "Q3 invoice numbers do not match"
+    history = []
+
+    def reject_title(message, **_kwargs):
+        if manual_during_generation and message == current:
+            db.set_session_title("active", "My Manual Title")
+        return rejected_title
+
+    generate = Mock(side_effect=reject_title)
+    monkeypatch.setattr("agent.title_generator.generate_title", generate)
+    monkeypatch.setattr("agent.title_generator._title_config", dict)
+    monkeypatch.setattr("agent.title_generator.title_upgrade_must_wait_for_turn", lambda *_: False)
+    try:
+        for index, message in enumerate(["look at this", "look again", current]):
+            history.append({"role": "user", "content": message})
+            _maybe_title_session_at_turn_start(agent, history)
+            wait_for_title_upgrades(timeout=5)
+            if index < 2:
+                assert db.get_session_title("active") == "look at this"
+                assert db.get_session_title_source("active") == "derived"
+            history.append({"role": "assistant", "content": "The subject is not clear yet."})
+            start_deferred_title_upgrade(agent)
+            wait_for_title_upgrades(timeout=5)
+        assert db.get_session_title("active") == ("My Manual Title" if manual_during_generation else current)
+        assert db.get_session_title_source("active") == ("user" if manual_during_generation else "llm")
+        final_callbacks = [event.args for event in callback.call_args_list if event.args[1] == "llm"]
+        assert final_callbacks == ([] if manual_during_generation else [(current, "llm")])
+        attempts = generate.call_count
+        history.append({"role": "user", "content": "A different subject"})
+        _maybe_title_session_at_turn_start(agent, history)
+        start_deferred_title_upgrade(agent)
+        wait_for_title_upgrades(timeout=5)
+        assert generate.call_count == attempts
+        assert db.get_session_title("active") == ("My Manual Title" if manual_during_generation else current)
+    finally:
+        wait_for_title_upgrades(timeout=5)
         db.close()
 
 
