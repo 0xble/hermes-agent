@@ -138,7 +138,8 @@ passes the same mode, routing, no-duplicate, and budget regressions.
 
 ## Provenance and adoption
 
-Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
+Fork patch identities: `telegram-rendering`, `telegram-rich-modes`,
+  `telegram-paragraph-spacing`,
   `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`,
   `telegram-ordered-list-separation`, `telegram-footnote-refs`,
   `telegram-progress-literal`, `telegram-table-boundaries`,
