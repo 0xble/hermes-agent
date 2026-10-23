@@ -1,6 +1,7 @@
 """Fresh-topic silence survives session admission and preparatory route probes."""
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -59,43 +60,84 @@ def _turn(runner, source, key, cfg):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["text", "photo", "agent-created"])
-async def test_first_route_is_quiet_but_real_later_switch_in_is_announced(opening, monkeypatch, kind):
+@pytest.mark.parametrize("kind", ["text", "photo", "agent-created", "recovered-topic"])
+@pytest.mark.parametrize("outcome", ["success", "exception", "interrupt"])
+async def test_opening_turn_finalizes_before_later_switch_in(opening, monkeypatch, kind, outcome):
     runner, source, cfg = opening.runner, opening.source, opening.cfg
     key = runner._session_key_for_source(source)
     if kind == "agent-created":
         adapter = SimpleNamespace(_create_dm_topic=AsyncMock(return_value="456"))
         monkeypatch.setattr(runner, "_delivery_adapter_for", lambda _: adapter)
         await create_topic_session(runner, source, TopicSpec(name="Room"))
+    if kind == "recovered-topic":
+        # Internal lobby-shaped events bypass the lobby refusal, then recover a topic.
+        source = replace(source, thread_id=None)
+        monkeypatch.setattr(runner, "_recover_telegram_topic_thread_id", lambda _: "456")
+    quick_key = runner._session_key_for_source(source)
     event = MessageEvent(
-        text="hello", source=source, internal=kind == "agent-created",
+        text="hello", source=source, internal=kind in {"agent-created", "recovered-topic"},
         message_type=MessageType.PHOTO if kind == "photo" else MessageType.TEXT,
     )
-    # Real admission tries before the entry exists, then retries after routing creates it.
-    marked = await runner._mark_attended_user_activity(event, source, key)
-    _, entry, key = await runner._hmwa_resolve_session(event, source)
-    if not marked:
-        await runner._mark_attended_user_activity(event, source, key)
-    await runner._hmwa_open_session(entry, key, source)
-    if kind == "photo":
-        # Image-mode selection reads config, vision enrichment probes without a config,
-        # and message assembly resolves with config again before the real agent starts.
-        await asyncio.to_thread(runner._resolve_session_agent_runtime, session_key=key, user_config=cfg)
-        await runner._resolve_session_agent_runtime_async(source=source, session_key=key)
-    model, _ = await runner._resolve_session_agent_runtime_async(
-        source=source, session_key=key, user_config=cfg,
-    )
-    state = runner._session_state(key).conversation
-    assert model == "claude-opus-5-5"
-    assert state.pending_attended_notice is None
-    turn, agent, notices = _turn(runner, source, key, cfg)
-    await asyncio.to_thread(turn._apply_attended_before_api_call, agent, commit=False)
-    await asyncio.to_thread(turn._apply_attended_before_api_call, agent)
-    assert notices == []
-    assert (runner.session_store.get_last_user_activity_at(key) is None) == event.internal
+    monkeypatch.setattr(runner, "_is_user_authorized_for_source", lambda _: True)
+    monkeypatch.setattr(runner, "_is_telegram_topic_root_lobby", lambda _: False)
+    monkeypatch.setattr(runner, "_hm_try_passive_fyi_relay", AsyncMock(return_value=False))
+    monkeypatch.setattr(runner, "_hmwa_run_session_hygiene", AsyncMock(return_value=[]))
+    monkeypatch.setattr(runner, "_hmwa_first_contact_notes", AsyncMock())
+    monkeypatch.setattr(runner, "_run_post_turn_hooks", AsyncMock())
+    reached_request = asyncio.Event()
+    continue_request = asyncio.Event()
+    request = SimpleNamespace()
 
-    # Consume the same first-turn lifetime as normal inbound finalization.
-    state.attended_new_session = False
+    async def prepare_message(**kwargs):
+        # Admission, session recovery/creation and opening all run through the real handler.
+        assert kwargs["session_key"] == key
+        if kind == "photo":
+            await asyncio.to_thread(runner._resolve_session_agent_runtime, session_key=key, user_config=cfg)
+            await runner._resolve_session_agent_runtime_async(source=event.source, session_key=key)
+        model, _ = await runner._resolve_session_agent_runtime_async(
+            source=event.source, session_key=key, user_config=cfg,
+        )
+        state = runner._session_state(key).conversation
+        assert model == "claude-opus-5-5"
+        assert state.attended_new_session
+        assert state.pending_attended_notice is None
+        request.turn, request.agent, request.notices = _turn(runner, event.source, key, cfg)
+        await asyncio.to_thread(request.turn._apply_attended_before_api_call, request.agent, commit=False)
+        await asyncio.to_thread(request.turn._apply_attended_before_api_call, request.agent)
+        assert request.notices == []
+        assert (runner.session_store.get_last_user_activity_at(key) is None) == event.internal
+        reached_request.set()
+        if outcome == "exception":
+            raise RuntimeError("opening failed")
+        if outcome == "interrupt":
+            await continue_request.wait()
+        return None
+
+    monkeypatch.setattr(runner, "_prepare_profile_scoped_inbound_message_text", prepare_message)
+    prepare_turn = runner._hmwa_prepare_turn
+
+    async def prepared_reply(*args):
+        await prepare_turn(*args)
+        return "opening reply", None
+
+    monkeypatch.setattr(runner, "_hmwa_prepare_turn", prepared_reply)
+    if outcome == "interrupt":
+        task = asyncio.create_task(runner._handle_message(event))
+        await asyncio.wait_for(reached_request.wait(), timeout=10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif outcome == "exception":
+        with pytest.raises(RuntimeError, match="opening failed"):
+            await runner._handle_message(event)
+    else:
+        assert await runner._handle_message(event) == "opening reply"
+    assert reached_request.is_set()
+    state = runner._session_state(key).conversation
+    assert not state.attended_new_session
+    assert not runner._session_state(quick_key).conversation.attended_new_session
+    assert not runner._is_session_running(quick_key)
+
     expired = datetime.now(timezone.utc) - timedelta(hours=1)
     runner.session_store.mark_user_activity(key, expired)
     state.last_user_activity_at = expired.timestamp()
@@ -105,11 +147,12 @@ async def test_first_route_is_quiet_but_real_later_switch_in_is_announced(openin
         target.model, target.provider = model, provider
 
     monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", switch)
+    turn, agent, notices = request.turn, request.agent, request.notices
     await asyncio.to_thread(turn._apply_attended_before_api_call, agent)
     assert agent.model == "gpt-6.1-sol"
     notices.clear()
-    reply = MessageEvent(text="I'm back", source=source)
-    await runner._mark_attended_user_activity(reply, source, key)
+    reply = MessageEvent(text="I'm back", source=event.source)
+    await runner._mark_attended_user_activity(reply, event.source, key)
     await asyncio.to_thread(turn._apply_attended_before_api_call, agent)
     assert agent.model == "claude-opus-5-5"
     assert notices == [

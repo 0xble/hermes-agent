@@ -3113,6 +3113,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        event._hermes_attended_session_key = session_key
         if not getattr(event, "_attended_activity_marked", False):
             mark_activity = getattr(self, "_mark_attended_user_activity", None)
             if callable(mark_activity):
