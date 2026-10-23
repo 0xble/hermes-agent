@@ -1464,7 +1464,6 @@ def _pull_updates(
             if not update_succeeded:
                 print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
                 print("  Restore manually with: git stash apply")
-                _record_stash_disposition("parked", auto_stash_ref, "update failed before restore")
                 _clear_pending_autostash()  # named just above; a later boundary must not repeat it
             elif discard_local_changes:
                 # Non-interactive + updates.non_interactive_local_changes: discard.

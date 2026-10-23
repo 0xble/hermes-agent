@@ -166,8 +166,14 @@ def _resolve_stash_selector(git_cmd: list[str], cwd: Path, stash_ref: str) -> Op
 
 
 def _clear_pending_autostash() -> None:
-    """Forget this run's unsettled autostash after it was already reported (#122557)."""
+    """Persist an unsettled stash before suppressing its already-printed notice.
+
+    Stdout is not visible to receipt consumers. Restored, discarded and deliberately
+    parked stashes already clear the pending state in _record_stash_disposition.
+    """
     global _pending_autostash
+    if _pending_autostash is not None:
+        _record_stash_disposition("parked", _pending_autostash[0], "update stopped without a confirmed restore")
     _pending_autostash = None
 
 
