@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import html
 import logging
+import re
+import textwrap
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -311,8 +314,60 @@ async def _origin_line(runner, adapter, source: SessionSource) -> str:
     return f"Split from [{label}]({link})"
 
 
-async def _deliver_brief(adapter, dest: SessionSource, brief: str, origin_line: str = "") -> None:
-    """Show the origin and brief in the topic, then admit the same text as the session's first turn.
+def _opening_brief_display(brief: str, title: str, origin_line: str) -> str:
+    """Bound the visible preview, not the brief that the new session receives.
+
+    Relay-style ``title\nobjective\n---`` is a multiline setext heading. Never
+    send that envelope directly: rich paragraph spacers can pull even the origin
+    into its heading. Parse before transport shaping, then give the title its
+    own paragraph and keep the complete authored brief behind a native toggle.
+    """
+    from markdown_it import MarkdownIt
+
+    parser = MarkdownIt()
+    blocks = parser.parse(brief)
+    paragraphs = [t for t in blocks if t.type == "inline" and t.level == 1]
+
+    def plain(text: str) -> str:
+        children = parser.parseInline(text)[0].children or []
+        return "".join(
+            " " if t.type in {"softbreak", "hardbreak"} else t.content
+            for t in children if t.type in {"text", "code_inline", "image", "softbreak", "hardbreak"}
+        ).strip()
+
+    def excerpt(text: str, width: int) -> str:
+        shortened = textwrap.shorten(plain(text), width=width, placeholder="…")
+        # Excerpts are plain text. Cutting a code span/link/emphasis mid-way must
+        # not leak formatting into the next paragraph or toggle.
+        return re.sub(r"([\\`*_\[\]<>])", r"\\\1", shortened)
+
+    objective = paragraphs[0].content if paragraphs else ""
+    if blocks and blocks[0].type == "heading_open" and paragraphs:
+        title, _, objective = paragraphs[0].content.partition("\n")
+        if not objective and len(paragraphs) > 1:
+            objective = paragraphs[1].content
+
+    preview = [f"**{excerpt(title, 100)}**"]
+    if objective:
+        preview.append(excerpt(objective, 280))
+    for paragraph in paragraphs:
+        match = re.match(r"Next(?: action)?:\s*(.+)", plain(paragraph.content), re.IGNORECASE)
+        if match:
+            action = re.split(r"(?<=[.!?])\s+", match.group(1), maxsplit=1)[0]
+            preview.append(f"▸ Next: {excerpt(action, 160)}")
+            break
+
+    # Keep nested/literal disclosure tags from closing our toggle early. Their
+    # text remains available, and the session still receives the original bytes.
+    details = re.sub(r"</?(?:details|summary)\b[^>]*>", lambda m: html.escape(m[0]), brief, flags=re.IGNORECASE)
+    preview.append(f"<details>\n<summary>Details</summary>\n\n{details}\n\n</details>")
+    if origin_line:
+        preview.append(f"*{origin_line}*")
+    return "\n\n".join(preview)
+
+
+async def _deliver_brief(adapter, dest: SessionSource, brief: str, origin_line: str = "", *, title: str = "Opening brief") -> None:
+    """Show a compact preview, then admit the complete original brief as the first turn.
     The turn is internal (the calling session already holds the user's authority) and never a
     gateway command, so a brief starting with ``/`` is read as text. A brief that could not be
     shown is not admitted, so the session never works from a brief the user cannot see; the caller
@@ -325,15 +380,16 @@ async def _deliver_brief(adapter, dest: SessionSource, brief: str, origin_line: 
     paused = paused_reply()
     if paused is not None:
         raise RuntimeError(paused)
-    shown_brief = f"{origin_line}\n\n{brief}" if origin_line else brief
+    session_brief = f"{origin_line}\n\n{brief}" if origin_line else brief
+    shown_brief = _opening_brief_display(brief, title, origin_line)
     sent = await adapter.send(str(dest.chat_id), shown_brief,
-                              metadata={"thread_id": str(dest.thread_id)})
+                              metadata={"thread_id": str(dest.thread_id), "rich_fallback_content": session_brief})
     if not getattr(sent, "success", False):
         raise RuntimeError(getattr(sent, "error", None) or "Telegram did not accept the message")
     # Anchor the turn on the shown brief, as a typed message anchors its own turn, so the session's
     # replies thread under it instead of relying on the anchor-less synthetic-send fallback.
     anchor = str(sent.message_id) if getattr(sent, "message_id", None) else None
-    event = MessageEvent(text=shown_brief, message_type=MessageType.TEXT, source=replace_source(dest, message_id=anchor),
+    event = MessageEvent(text=session_brief, message_type=MessageType.TEXT, source=replace_source(dest, message_id=anchor),
                          message_id=anchor, internal=True, allow_gateway_control=False,
                          metadata={"notification_category": "result"})
     await admit_internal_event(adapter, event)
@@ -416,7 +472,7 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
     if brief:
         try:
             origin_line = await _origin_line(runner, adapter, source)
-            await _deliver_brief(adapter, dest, brief, origin_line)
+            await _deliver_brief(adapter, dest, brief, origin_line, title=name)
         except Exception as exc:
             logger.warning("Opening brief for topic %s was not delivered", thread_id, exc_info=True)
             raise TopicRequestError(
