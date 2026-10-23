@@ -2,6 +2,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import sys
 
+import pytest
+
 from gateway.attended_model import AttendedResolution
 from gateway.session import Platform, SessionSource
 from gateway.turn_context import TurnContext
@@ -194,10 +196,14 @@ def test_new_session_first_attended_turn_has_no_switch_in_notice():
     assert notices == [] and turn.attended_notices == []
 
 
-def test_turn_start_attended_notice_is_delivered_persistently_once(monkeypatch):
+@pytest.mark.parametrize("notice", [
+    "⇄ Switched to Opus while you're active.",
+    "⇄ Model pick expired. Back to GPT-6.1 Sol.",
+])
+def test_turn_start_attended_notice_is_delivered_persistently_once(monkeypatch, notice):
     state = SimpleNamespace(
         conversation=SimpleNamespace(
-            pending_attended_notice="⇄ Switched to Opus while you're active.",
+            pending_attended_notice=notice,
             last_attended_decision=None,
         )
     )
@@ -243,8 +249,9 @@ def test_turn_start_attended_notice_is_delivered_persistently_once(monkeypatch):
 
     with patch.dict(sys.modules, {"gateway.run": SimpleNamespace(_current_max_iterations=lambda: 1)}):
         turn.run_sync()
+        turn.run_sync()
 
-    assert persistent == ["⇄ Switched to Opus while you're active."]
+    assert persistent == [notice]
     assert notices == []
     assert state.conversation.pending_attended_notice is None
 

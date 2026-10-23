@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -83,8 +84,14 @@ async def test_pick_policy_is_opt_in_and_explicit_flags_are_unchanged(harness, a
 @pytest.mark.parametrize("attended", [False, True])
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("ttl", [None, 12])
-def test_pick_deadline_survives_restart_and_returns_to_normal_route(harness, attended, asynchronous, ttl):
+@pytest.mark.parametrize("picked_at", [
+    100_000.0,
+    # 12 elapsed hours cross the Los Angeles fall-back to 07:00 PST, not 08:00.
+    datetime(2026, 10, 31, 20, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp(),
+])
+def test_pick_deadline_survives_restart_and_returns_to_normal_route(harness, attended, asynchronous, ttl, picked_at):
     cfg, clock, source, restart = harness
+    clock.now = picked_at
     if attended:
         cfg["model"]["attended"] = {"model": "attended", "provider": "openai"}
     if ttl:
@@ -124,6 +131,10 @@ def test_pick_deadline_survives_restart_and_returns_to_normal_route(harness, att
     assert "pick expired" in notice
     assert ("attended" if attended else "new-default") in notice
     assert runner._session_model_override(key) is None
+    # The turn consumer clears this notice after emission. Later resolution must not re-arm it.
+    runner._session_state(key).conversation.pending_attended_notice = None
+    resolve()
+    assert runner._session_state(key).conversation.pending_attended_notice is None
     # A second restart cannot resurrect the expired selection.
     runner = restart()
     assert runner.session_store.get_model_override(key) is None
