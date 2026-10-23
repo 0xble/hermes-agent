@@ -1483,6 +1483,20 @@ class CLITuiMixin:
         from cli import CLI_CONFIG, _ACCENT, _DIM, _RST, _cprint, _hermes_home
         _effective_mode = mode or self.busy_input_mode
         redirected = False
+        if _effective_mode == "auto":
+            from agent.steer_deferral import offer_auto_steer
+
+            def handoff():
+                self._pending_input.put(payload)
+                _cprint("  Queued after this.")
+                return True
+
+            if (not images and text and not text.lstrip().startswith("/")
+                    and offer_auto_steer(self.agent, text, handoff)):
+                preview = text[:80] + ("..." if len(text) > 80 else "")
+                _cprint(f"  {_ACCENT}{t('cli.tui.steered', preview=preview)}{_RST}")
+                return
+            _effective_mode = "queue"
         if _effective_mode == "steer":
             if images or not text:
                 _effective_mode = "queue"

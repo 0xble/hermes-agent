@@ -749,7 +749,12 @@ def finalize_turn(
     # A /steer landing after the final assistant turn has no tool batch to drain into;
     # hand it back so it becomes the next user turn instead of being lost. A gateway transfer
     # (ticketed) stays buffered: the claim's settlement returns it to its own queue place.
+    from agent.steer_deferral import close_auto_steer, requeue_undelivered_steers
+
+    close_auto_steer(agent)
     _leftover_steer = (getattr(agent, "_drain_leftover_steer", None) or agent._drain_pending_steer)()
+    if _leftover_steer:
+        _leftover_steer = requeue_undelivered_steers(agent, _leftover_steer)
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False

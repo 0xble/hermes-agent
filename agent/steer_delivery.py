@@ -31,12 +31,15 @@ def report_steer_delivered(agent, text: str) -> None:
     delivery_id = str(uuid.uuid4())
     try:
         from hermes_cli.lifecycle import invoke_hook
+        from agent.steer_deferral import auto_messages_for_delivery, manual_text_for_delivery
         invoke_hook(
             "post_steer_delivered",
             session_id=getattr(agent, "session_id", None),
             turn_id=getattr(agent, "_current_turn_id", ""),
             platform=getattr(agent, "platform", ""),
             text=text, delivery_id=delivery_id, ordinal=ordinal,
+            manual_text=manual_text_for_delivery(agent, text),
+            **({"auto_messages": auto_messages} if (auto_messages := auto_messages_for_delivery(agent, text)) else {}),
         )
     except Exception:
         logger.warning("post_steer_delivered hook failed", exc_info=True)

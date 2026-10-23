@@ -1513,7 +1513,7 @@ Each hook is documented in full on the **[Event Hooks reference](../../user-guid
 | [`pre_llm_call`](../../user-guide/features/hooks.md#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str` | [context injection](#pre_llm_call-context-injection) |
 | [`post_llm_call`](../../user-guide/features/hooks.md#post_llm_call) | Once per turn, after the tool-calling loop (successful turns only) | `session_id: str, user_message: str, assistant_response: str, conversation_history: list, model: str, platform: str` | ignored |
 | `pre_api_request` | Before each raw provider API request (several per turn when the model calls tools) | `session_id: str, model: str, provider: str, base_url: str, api_mode: str, api_call_count: int, message_count: int, tool_count: int, approx_input_tokens: int, max_tokens: int, request: dict` | ignored |
-| `post_steer_delivered` | After a native mid-turn steer row is inserted (post-tool or pre-API drain) | `session_id: str, turn_id: str, platform: str, text: str, delivery_id: str, ordinal: int` | ignored; fail-open |
+| `post_steer_delivered` | After a native mid-turn steer row is inserted (post-tool or pre-API drain) | `session_id: str, turn_id: str, platform: str, text: str, delivery_id: str, ordinal: int, manual_text: str`, optional `auto_messages: list[dict]` | ignored; fail-open |
 | `post_api_request` | After each raw provider API request returns | `pre_api_request` fields plus `api_duration: float, finish_reason: str, response_model: str \| None, usage: dict, response: dict, assistant_content_chars: int, assistant_tool_call_count: int` | ignored |
 | `api_request_error` | A provider API call raised | correlation fields plus `status_code: int \| None, retry_count: int \| None, max_retries: int \| None, retryable: bool \| None, reason: str \| None, error: dict, request: dict` | ignored |
 | `pre_auxiliary_call` | Before each provider attempt of an auxiliary LLM call (titling, compression, MoA, vision, approval, ...); not a `pre_api_request` | `aux_task: str` plus the `pre_api_request` fields (`session_id`/`task_id`/`turn_id` are the parent turn's or empty, `api_request_id: str`, `retry_count: int`, `streaming: bool`, `request: dict`) | ignored |
@@ -1552,12 +1552,24 @@ exact drained text without the out-of-band marker frame. The existing `steer()`
 entry point strips each input and joins several pending inputs with `\n`; that
 joined batch is one delivery, not heuristically split into original messages.
 
+Auto steering adds host-owned message identities without changing that batch
+contract. `auto_messages`, when present, contains `{message_id, text}` entries
+for original auto-steered messages in the inserted row. `manual_text` contains
+only the manual remainder, or `""` for auto-only input. Use these fields rather
+than parsing wrapper text. Older hosts omit both fields, so a compatible consumer
+falls back to whole-batch capture only when `manual_text` is absent.
+
+A successful `defer_message` is reported by the existing `post_tool_call` hook.
+Its result has `accepted: true`, `status: "deferred"`, and the exact `message_id`.
+That handoff queues the original input for another turn, not completed work on
+the request. Match by the host ID, never regenerated user text.
+
 No event fires for a requeue, an empty drain, or next-turn fallback. Fallback is
 ordinary `user_message` on a new admitted turn. Retries and transcript replay
 do not emit deliveries. Callback returns cannot rewrite or veto the inserted row;
 failures are logged and do not break the turn. This is an insertion receipt, not
 a durable provider-acceptance or exactly-once persistence guarantee. Keep callbacks
-fast. Privacy: `text` contains the user’s raw drained steer.
+fast. Privacy: `text`, `manual_text`, and `auto_messages[].text` contain raw user input.
 
 ### `pre_llm_call` context injection
 

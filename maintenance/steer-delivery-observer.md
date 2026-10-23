@@ -1,34 +1,76 @@
-# Delivered steer observer
+# Steer Routing
 
 Identity: `steer-delivery-observer`
 
 ## Divergence
 
-Ask Tracking's out-of-tree plugin needs a delivery witness for mid-turn input:
-normal turn hooks contain the admitted message, while native inserted steer rows
-have no stable delivery identity. Transcript capture is intentionally not a substitute.
+Ask Tracking's out-of-tree plugin needs a delivery witness for mid-turn input.
+Normal turn hooks contain the admitted message, while native inserted steer rows
+have no stable delivery identity. Transcript capture is not a substitute.
 Consumer: https://github.com/0xble/agents/pull/1043.
 
-The fork adds `post_steer_delivered`; its public payload and batching behavior
+The fork adds `post_steer_delivered`. Its public payload and batching behavior
 are owned by the developer plugin guide. `agent/steer_delivery.py` owns the
-observer and the unchanged requeue helper, extracted to offset the oversized
-runtime-helper file's growth.
+observer and requeue helper. Auto steering extends that existing event with
+host-separated manual text and original-message descriptors, rather than
+requiring consumers to parse wrappers.
 
-## Preserve and retire
+`busy-input-auto` is a related native-routing divergence. Ordinary plain text
+can stay in the active turn or return to its host's queue through
+`defer_message`. Hooks cannot atomically hand back the original queue envelope,
+so the shared receipt primitive belongs in core. The gateway, CLI, and TUI reuse
+it rather than maintaining independent model-visible IDs. The tool schema stays
+stable, with availability checked against the active turn at dispatch.
 
-On upstream adoption, inspect both native insertion sites and per-turn binding.
-Keep requeue/fallback silent, observer failures nonfatal, and Python callbacks
-bounded by the existing fail-open hook timeout. Missing turn/platform attributes
-use empty-string fallbacks. Retire this patch
-only when upstream exposes an equivalent insertion-time event and the consumer
-can use it without transcript inference. Upstream PR 106072 was closed for an
-adapter-owned acceptance hook; that is not equivalent to actual row delivery.
+Related upstream PR [#31500](https://github.com/NousResearch/hermes-agent/pull/31500)
+was closed without merge. Its `auto_steer` proposal describes dropping instead
+of queueing in the priority fallback, which does not meet this fork's contract.
+The upstream guidance inspected for this design was pinned at
+`cb757fac59c92b49e9b8f2910e5cd7ab75efffdd`. No public contribution is authorized
+by this record.
+
+## Preserve
+
+Observer callbacks remain nonfatal and bounded by the existing hook timeout.
+An insertion receipt is not provider-acceptance or process-death persistence
+proof. Missing turn/platform attributes keep their empty-string fallbacks.
+
+Auto receipts retain the host's original envelope, arrival order, and reply
+anchor. A deferred envelope cannot merge with later text or photos. Repeated
+handoffs are idempotent. Input accepted after the last model request returns to
+the original host queue at finalization. Slash commands, media, explicit
+`/queue`, internal events, interrupt, and `/stop` retain their existing paths.
+
+The Ask Tracking consumer update must be qualified with the compatible core
+before enabling auto mode. Optional `manual_text` and `auto_messages` are
+host-owned input boundaries. The consumer observes successful deferrals through
+the existing `post_tool_call` hook and never infers completion from a handoff.
+
+## Adoption
+
+On upstream adoption, inspect both native insertion sites, per-turn binding,
+late-input finalization, and each host queue. Retire the observer divergence only
+when upstream exposes an equivalent insertion-time event that its consumer can
+use without transcript inference. Upstream PR 106072 was closed for an
+adapter-owned acceptance hook, not actual row delivery.
+
+Retire auto routing only when a released upstream implementation preserves the
+complete absorb-or-defer contract across these surfaces. Configure another
+supported busy mode before rolling back to code that does not accept `auto`.
+Revert only the auto-routing commit and companion consumer change. Keep the
+pre-existing observer, manual steer behavior, and unrelated fork patches.
 
 ## Proof
 
-Run `scripts/run_tests.sh tests/agent/test_steer_delivered_hook.py
- tests/agent/test_steer.py tests/agent/test_compression_busy_steer_anchor.py
- tests/agent/test_lock_fallback_base_semantics.py
- tests/hermes_cli/test_plugins.py` (one shell command).
-The consumer's native probe additionally checks real plugin dispatch and durable
-capture with disposable state; it is not provider-acceptance or live activation proof.
+Use the canonical `scripts/run_tests.sh` runner for
+`tests/agent/test_steer_deferral.py`,
+`tests/agent/test_steer_delivered_hook.py`,
+`tests/agent/test_compression_last_assistant_anchor.py`,
+`tests/gateway/test_busy_auto.py`, and
+`tests/tui_gateway/test_auto_steer.py`, plus the existing steer, busy-policy,
+queue, lock-fallback, and plugin suites for the affected surfaces.
+
+The consumer's native probe checks real plugin dispatch and durable capture with
+disposable state. Live Telegram must additionally prove absorption of a related
+message and deferral of unrelated input into a separately anchored next turn.
+Source tests do not establish live activation.

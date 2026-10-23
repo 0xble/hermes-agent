@@ -149,7 +149,7 @@ class CLIInitMixin:
         set_active(self._modern_layout)
         # busy_input_mode: "interrupt" (redirect the run) | "queue" (next turn) | "steer" (inject mid-run).
         _bim = busy_input_mode_from_config(display)
-        self.busy_input_mode = _bim if _bim in ("queue", "steer") else "interrupt"
+        self.busy_input_mode = _bim if _bim in ("queue", "steer", "auto") else "interrupt"
 
         # verbose ONLY controls global DEBUG logging; tool_progress="verbose" is independent
         # (coupling them spewed every module's DEBUG logs to the console).
