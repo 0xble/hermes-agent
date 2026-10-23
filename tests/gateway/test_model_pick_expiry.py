@@ -1,6 +1,7 @@
 """Opt-in wall-clock model picks retain the legacy policy when unconfigured."""
 
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -20,6 +21,7 @@ def harness(tmp_path, monkeypatch):
     clock = SimpleNamespace(now=100_000.0)
     monkeypatch.setattr("time.time", lambda: clock.now)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda **_kw: cfg)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config: config["model"]["default"])
     runtime = {"provider": "openai", "api_key": "test-only", "base_url": "https://example.test/v1"}
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: dict(runtime))
@@ -97,7 +99,7 @@ def test_pick_deadline_survives_restart_and_returns_to_normal_route(harness, att
 
     # Fresh process state and store exercise the durable hydration path, not just memory.
     runner = restart()
-    runner.session_store.set_last_user_activity_at(key, clock.now)
+    runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, timezone.utc))
     clock.now += 1800
 
     def resolve():
@@ -113,7 +115,7 @@ def test_pick_deadline_survives_restart_and_returns_to_normal_route(harness, att
     # At the exact wall-clock deadline it returns to the route live now, not the old default.
     cfg["model"]["default"] = "new-default"
     if attended:
-        runner.session_store.set_last_user_activity_at(key, clock.now)
+        runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, timezone.utc))
         runner._session_state(key).conversation.last_user_activity_at = clock.now
     clock.now = deadline
     assert resolve() == ("attended" if attended else "new-default")
@@ -185,7 +187,7 @@ async def test_temporary_reasoning_keeps_idle_expiry_while_timed_model_survives(
     key = runner._session_key_for_source(source)
     await runner._handle_model_command(MessageEvent(text="/model picked", source=source))
     runner._set_session_reasoning_override(key, {"enabled": True, "effort": "high"}, scope="temporary")
-    runner.session_store.set_last_user_activity_at(key, clock.now)
+    runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, timezone.utc))
     clock.now += 1800
     assert (await runner._resolve_session_agent_runtime_async(source=source, user_config=cfg))[0] == "picked"
     assert runner._session_reasoning_override(key) is None
