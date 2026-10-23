@@ -52,15 +52,20 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - A title the model cannot support does not lock. The schema includes `abstain`; a true
   answer, or a deterministic junk title (`None`, `Investigation`, `Unspecified...`, a platform
   label plus a raw ID such as `Slack Thread <id>` or `YouTube Video <id>`, or a title that is
-  mostly IDs), leaves the placeholder in place. Prose openers run immediately, then retry
-  at the next user turn, not at the end of the current turn. Retries use a bounded excerpt
-  of the latest assistant reply. At turn 3 a rejected name falls back to a title derived from the current user message. A manual `/title` still wins, and a stored `llm` or `user` title is never
+  mostly IDs), leaves the placeholder in place. A clear opener still starts its model
+  title immediately. If that eager first attempt yields no usable title, turn completion
+  retries once with the opener plus a bounded excerpt of the assistant reply, without
+  waiting for a second user message. It joins any in-flight attempt on the background
+  thread, never on the main turn path. A successful or manually chosen title skips that
+  retry. Later turns retain the existing turn-3 cap. A manual `/title` still wins, and a
+  stored `llm` or `user` title is never
   replaced. `auxiliary.title_generation.hold_until_reply: false` restores the previous
   opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
   multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. The opening
-  turn waits only for a bare link or attachment-only opener: `auxiliary.title_generation.hold_until_reply`
-  (default true) lets the first model title use that turn's reply. Clear prose is tried immediately.
+  turn's subject-less opener is the exception: `auxiliary.title_generation.hold_until_reply`
+  (default true) waits for that turn's reply before the first model title. Other openers
+  start immediately and receive the bounded completion retry described above.
   Upstream #117296 defers the title until the turn settles whenever both share a self-hosted base URL,
   which delays a new topic's name and icon by the whole first turn on a routing proxy. The
   declaration is keyed by endpoint URL, never by route name, and an undeclared or `false`
