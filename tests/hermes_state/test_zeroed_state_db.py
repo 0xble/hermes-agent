@@ -213,17 +213,13 @@ def test_quarantine_during_writability_preflight_is_not_readonly(tmp_path, monke
 
     monkeypatch.setattr(repair.os, "access", access_after_rename)
 
-    def opener():
+    def probe_preflight():
         try:
-            sdb = hs.SessionDB(db_path=db)
-            try:
-                sdb.create_session(session_id="after-race", source="test")
-            finally:
-                sdb.close()
+            hs.preflight_db_writability(db)
         except BaseException as exc:
             errors.append(exc)
 
-    thread = threading.Thread(target=opener)
+    thread = threading.Thread(target=probe_preflight)
     thread.start()
     try:
         assert checking.wait(timeout=5), "preflight did not inspect the damaged file"
@@ -234,6 +230,12 @@ def test_quarantine_during_writability_preflight_is_not_readonly(tmp_path, monke
         thread.join(timeout=10)
     assert not thread.is_alive()
     assert not errors, errors
+    assert not db.exists()
+    sdb = hs.SessionDB(db_path=db)
+    try:
+        sdb.create_session(session_id="after-race", source="test")
+    finally:
+        sdb.close()
     assert db.read_bytes().startswith(b"SQLite format 3\x00")
 
 
