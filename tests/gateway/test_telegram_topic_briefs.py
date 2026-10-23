@@ -237,12 +237,18 @@ async def test_title_paragraph_is_not_repeated_as_objective(monkeypatch, title_l
 
     markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
     visible = _visible(markdown)
-    paragraphs = [
-        "".join(child.content for child in token.children if child.type == "text")
+    # Rich delivery uses NBSP spacer rows, not separate Markdown paragraphs.
+    visible_text = " ".join("".join(
+        child.content if child.type == "text" else " "
         for token in MarkdownIt().parse(visible) if token.type == "inline"
-    ]
-    assert paragraphs == ["Mac Studio Crash", *([objective] if objective else []),
-                          "▸ Next: read the panic report and the existing evidence note, then test the hypotheses below."]
+        for child in token.children
+        if child.type in {"text", "softbreak", "hardbreak"}
+    ).split())
+    assert visible.startswith("**Mac Studio Crash**")
+    assert visible_text == " ".join([
+        "Mac Studio Crash", *([objective] if objective else []),
+        "▸ Next: read the panic report and the existing evidence note, then test the hypotheses below.",
+    ])
     assert brief in markdown
     assert "<details>\n<summary>Details</summary>" in markdown
     assert "<details open" not in markdown
