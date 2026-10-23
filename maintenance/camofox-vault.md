@@ -10,13 +10,14 @@ the browser vault fill tool, or the 1Password backends.
 - A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.
   Only explicit navigation creates/retries a tab, once; page actions and vault evaluations
   never replay on replacement tabs, and account identity survives invalidation.
-- Named Camofox accounts route per profile; account aliases are profile-specific. Their
-  shared identity userId is `hermes_camofox_` plus the first 24 lowercase hex
-  characters of SHA-256 over `camofox-account:{profile_camofox_state_dir}:{alias}`;
-  this matches the server and dotfiles launcher contract. The session key is unchanged.
-  This is a hard cutover from the old `hermes_<10hex>` account IDs: the parent's
-  server-side cutover retires old account profiles and moves their data to these
-  derived IDs; Hermes does not dual-read, map, or migrate profiles.
+- Named Camofox account aliases are profile-configured, but resolve to the server's
+  canonical persistent userId through `GET /browser/identities`. Clients do not
+  derive a named identity from their local Hermes home: the same server alias must
+  reuse its existing profile from Mac and Linux clients. Each mapping must name exactly
+  one `hermes_camofox_<24 lowercase hex>` identity. Missing, invalid, duplicate, or
+  unavailable mappings fail closed before navigation or handoff, including for an
+  already-bound task. Session keys remain scoped to the client profile state directory.
+  Hermes does not create an empty fallback identity, copy profiles, or migrate cookies.
   `browser_handoff(account=...)` opens/focuses that account's shared identity, restarts
   its headless-by-default browser as visible, adopts the returned tabId for subsequent
   browser actions (across turns, see [Camofox tab reuse](camofox-tab-reuse.md)), and never

@@ -8,6 +8,7 @@ compression handoff against a stub Camofox HTTP server, with a temporary ``HERME
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,9 @@ class _Camofox:
         self.created = 0
         self.gone: set[str] = set()
         self.open_tab_ids: list[str] = []
+        self.identities_status = 200
+        self.identities = [{"alias": alias, "userId": "hermes_camofox_" + hashlib.sha256(alias.encode()).hexdigest()[:24]}
+                           for alias in ("brianle", "lpg", "meridian", "mgf")]
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -48,6 +52,8 @@ class _Camofox:
                 parsed = urlsplit(self.path)
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 stub.calls.append(("GET", parsed.path, query))
+                if parsed.path == "/browser/identities":
+                    return self._send({"identities": stub.identities}, stub.identities_status)
                 if parsed.path == "/tabs":
                     return self._send({"running": True, "tabs": stub.tabs.get(query.get("userId"), [])})
                 tab_id = parsed.path.split("/")[2] if parsed.path.startswith("/tabs/") else ""
@@ -159,6 +165,73 @@ def _dispatch(name, args, task_id):
     from tools.registry import registry
     raw = registry.dispatch(name, args, task_id=task_id)
     return json.loads(raw) if isinstance(raw, str) else raw
+
+
+def test_named_accounts_reuse_existing_profiles_across_hosts(camofox, tmp_path, monkeypatch, request):
+    """The server registry, not the client's absolute home, selects each persistent profile."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    c = camofox
+    aliases = ("brianle", "lpg", "meridian", "mgf")
+    mac_home = tmp_path / "mac" / ".hermes"
+    canonical = {alias: "hermes_camofox_" + hashlib.sha256(
+        f"camofox-account:{mac_home / 'browser_auth' / 'camofox'}:{alias}".encode()
+    ).hexdigest()[:24] for alias in aliases}
+    c.server.identities = [{"alias": alias, "userId": user_id} for alias, user_id in canonical.items()]
+    for alias, user_id in canonical.items():
+        c.server.seed(user_id, {"tabId": f"existing-{alias}", "url": "https://example.com",
+                                "listItemId": SHARED})
+    for host, home in (("mac", mac_home), ("linux", tmp_path / "linux" / "home" / "hermes" / ".hermes")):
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            "browser:\n  cloud_provider: camofox\n  camofox:\n    accounts: [brianle, lpg, meridian, mgf]\n",
+            encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        token = set_hermes_home_override(home)
+        request.addfinalizer(lambda token=token: reset_hermes_home_override(token))
+        for alias in aliases:
+            task = f"{host}-{alias}"
+            result = _dispatch("browser_navigate", {"url": "https://example.com", "account": alias}, task)
+            assert result["success"], result
+            assert c.cf._sessions[task]["user_id"] == canonical[alias]
+            assert c.cf._sessions[task]["tab_id"] == f"existing-{alias}"
+            assert canonical[alias] not in json.dumps(result)
+            c.cf.release_task_bindings([task])
+    assert not c.server.tab_posts(), "Selecting an existing account must not create a replacement profile/tab"
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("metadata,status", [
+    ([], 200),
+    (None, 200),
+    ({}, 200),
+    ([{"alias": "brianle", "userId": "ephemeral"}], 200),
+    ([{"alias": "brianle", "userId": None}], 200),
+    ([{"alias": "brianle", "userId": "hermes_camofox_" + "a" * 24}] * 2, 200),
+    ([{"alias": "brianle", "userId": "hermes_camofox_" + "b" * 24}], 503),
+])
+def test_named_accounts_fail_closed_without_persistent_mapping(camofox, metadata, status, bound):
+    c = camofox
+    tasks = ("unmapped-browser_navigate", "unmapped-browser_handoff")
+    if bound:
+        for task in tasks:
+            assert _dispatch("browser_navigate", {"url": "https://example.com", "account": "brianle"}, task)["success"]
+        c.server.calls.clear()
+    c.server.identities = metadata
+    c.server.identities_status = status
+    for tool, args in (("browser_navigate", {"url": "https://example.com", "account": "brianle"}),
+                       ("browser_handoff", {"account": "brianle"})):
+        result = _dispatch(tool, args, f"unmapped-{tool}")
+        assert result["success"] is False
+        assert "persistent" in result["error"].lower()
+        assert "brianle" in result["error"]
+    if bound:
+        result = _dispatch("browser_snapshot", {}, tasks[0])
+        assert result["success"] is False
+        assert "persistent" in result["error"].lower()
+    assert c.server.calls
+    assert all(method == "GET" and path == "/browser/identities" for method, path, _ in c.server.calls)
+    assert bool(c.cf._sessions) == bound
 
 
 def _end_turn(task_id, *, headed=False):

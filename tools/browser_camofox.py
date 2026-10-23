@@ -639,6 +639,10 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
                 else:
                     _sessions.pop(task_id, None)
             else:
+                if bound_account is not None:
+                    identity = get_camofox_account_identity(bound_account, task_id)
+                    if identity["user_id"] != session["user_id"]:
+                        raise ValueError(f"Camofox account {bound_account!r} persistent mapping changed; start a new task")
                 session.pop("carried", None)
                 session.pop("carried_from", None)  # in use now: its own agent releases it
                 _release_protected_tab_binding(task_id, session)
