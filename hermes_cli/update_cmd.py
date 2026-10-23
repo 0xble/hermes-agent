@@ -84,7 +84,7 @@ from hermes_cli.update_cmd_zip import (
 from hermes_cli.update_cmd_stash import (
     _AUTOSTASH_NAME_PREFIX, _AUTOSTASH_WARN_AGE_DAYS, _clear_pending_autostash,
     _discard_stashed_changes,
-    _git_untracked_paths, _park_stashed_changes, _print_stash_cleanup_guidance,
+    _git_untracked_paths, _park_stashed_changes, _print_stash_cleanup_guidance, _record_stash_disposition,
     _reject_unsafe_stash_restore, _resolve_stash_selector, _restore_stashed_changes,
     _restored_python_paths, _stash_apply_failed_only_on_existing_untracked,
     _stash_local_changes_if_needed, _unrestored_autostash_notice,
@@ -1464,6 +1464,7 @@ def _pull_updates(
             if not update_succeeded:
                 print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
                 print("  Restore manually with: git stash apply")
+                _record_stash_disposition("parked", auto_stash_ref, "update failed before restore")
                 _clear_pending_autostash()  # named just above; a later boundary must not repeat it
             elif discard_local_changes:
                 # Non-interactive + updates.non_interactive_local_changes: discard.
