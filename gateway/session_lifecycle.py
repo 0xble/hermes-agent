@@ -25,11 +25,16 @@ def _now() -> datetime:
 
 def _local_naive(stamp: datetime) -> datetime:
     """Match the store clock when reading or receiving an attended activity stamp."""
-    return stamp.astimezone().replace(tzinfo=None) if stamp.tzinfo is not None else stamp
+    return datetime.fromtimestamp(stamp.timestamp()) if stamp.tzinfo is not None else stamp
 
 
 def _new_session_id(now: datetime) -> str:
     return new_session_id(now, hex_len=8)
+
+
+def _local_iso(stamp: datetime) -> str:
+    """Preserve the repeated local hour, which an offset-free ISO string loses."""
+    return (stamp.astimezone() if stamp.fold else stamp).isoformat()
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:

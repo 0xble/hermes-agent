@@ -269,3 +269,71 @@ def test_aware_activity_rows_and_writes_keep_store_clocks_comparable(tmp_path, o
     finally:
         for store in (writer, owner, reader):
             store.close_all_db_handles()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("elapsed", [3000, 3600])
+def test_activity_advances_and_survives_reload_during_dst_fallback(tmp_path, monkeypatch, elapsed):
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("America/Los_Angeles")
+    first = datetime(2026, 11, 1, 1, 30, tzinfo=zone).timestamp()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="dst", user_id="owner")
+    stores = []
+    try:
+        with monkeypatch.context() as local:
+            local.setenv("TZ", "America/Los_Angeles")
+            time.tzset()
+            writer = SessionStore(tmp_path / "sessions", GatewayConfig())
+            stores.append(writer)
+            key = writer.get_or_create_session(source).session_key
+            assert writer.mark_user_activity(key, datetime.fromtimestamp(first))
+            owner = SessionStore(tmp_path / "sessions", GatewayConfig())
+            stores.append(owner)
+            prior = owner.get_last_user_activity_at(key)
+            assert prior is not None and prior.timestamp() == first
+            # Repeated wall times may be earlier OR equal while the instant advances.
+            instant = first + elapsed
+            stamp = datetime.fromtimestamp(instant)
+            assert stamp.fold == 1
+            assert writer.mark_user_activity(key, stamp)
+            latest = writer.get_last_user_activity_at(key)
+            assert latest is not None and latest.timestamp() == instant
+            updated = writer.lookup_by_session_key(key)
+            assert updated is not None and updated.updated_at.timestamp() == instant
+            refreshed = owner.get_last_user_activity_at(key, refresh=True)
+            assert refreshed is not None and refreshed.timestamp() == instant
+            reader = SessionStore(tmp_path / "sessions", GatewayConfig())
+            stores.append(reader)
+            restored = reader.get_last_user_activity_at(key)
+            assert restored is not None and restored.timestamp() == instant
+            entry = reader.lookup_by_session_key(key)
+            assert entry is not None and entry.updated_at.timestamp() == instant
+            assert not reader.mark_user_activity(key, datetime.fromtimestamp(first))
+    finally:
+        time.tzset()
+        for store in stores:
+            store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_result", ["false", "exception", "cancelled"])
+async def test_drain_retries_failed_receipt_with_original_arrival_time(busy_activity, receipt_result):
+    runner, event, key, state = busy_activity
+    stamp = event._attended_activity_received_at = time.time() - 60
+
+    async def failed_receipt():
+        if receipt_result == "exception":
+            raise RuntimeError("transient receipt failure")
+        if receipt_result == "cancelled":
+            raise asyncio.CancelledError
+        return False
+
+    task = event._attended_activity_task = asyncio.create_task(failed_receipt())
+    await asyncio.gather(task, return_exceptions=True)
+    assert await runner._mark_attended_user_activity(event, event.source, key)
+    assert event._attended_activity_marked is True
+    assert state.conversation.last_user_activity_at == stamp
+    runner.async_session_store.mark_user_activity.assert_awaited_once_with(
+        key, when=datetime.fromtimestamp(stamp),
+    )

@@ -1649,7 +1649,15 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return True
         pending = getattr(event, "_attended_activity_task", None)
         if pending is not None and pending is not asyncio.current_task():
-            return await asyncio.shield(pending)
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                if not pending.cancelled():
+                    raise
+            except Exception:
+                logger.debug("attended-model receipt task failed", exc_info=True)
+            if getattr(event, "_attended_activity_marked", False):
+                return True
         stamp = getattr(event, "_attended_activity_received_at", None)
         if stamp is None:
             stamp = event._attended_activity_received_at = time.time()
