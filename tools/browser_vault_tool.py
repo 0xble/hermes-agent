@@ -599,8 +599,12 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     otp_controls = classify_otp_controls([LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)])
     if not otp_controls:
         return json.dumps({"success": False, "error_type": "no_code_field",
-                           "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or "
-                                     "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
+                           "error": ("No one-time-code field on the current page. If the site wants a passkey, use a "
+                                     "stored 1Password passkey through the canonical-origin browser/system prompt for the "
+                                     "intended identity. For an approval, try the issuer's web or desktop path, then an "
+                                     "email/SMS code or a 1Password TOTP or passkey. Never use iPhone Mirroring. A phone-only "
+                                     "approval, a passkey not in 1Password, a Touch ID or Face ID sensor read, or a hardware "
+                                     "security key remains a physical handoff.")})
 
     # Inspection and alias consent can race navigation. Refuse before minting
     # a code, and retain the checked origin in the atomic in-page write guard.
@@ -1100,7 +1104,10 @@ BROWSER_VAULT_SCHEMA = {
         "Hermes saves and fills it); enter_code (a one-time/2FA code after the password: generated from a saved "
         "authenticator key when available; otherwise fetch the newest matching code from the intended 1Password item, "
         "mailbox, or phone and type it with the browser input tool, calling enter_code only when no such source exists; "
-        "no_code_field means approve on their device); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
+        "no_code_field means use a stored 1Password passkey through the canonical-origin browser/system prompt for "
+        "the intended identity, or try the issuer's web/desktop approval and email/SMS/TOTP alternatives. Never use "
+        "iPhone Mirroring. Hand off phone-only approvals, passkeys not in 1Password, hardware security keys, and "
+        "Touch ID/Face ID sensor reads); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
         "Never type a value shown on the page or supplied in chat, never ask for or repeat a secret, and keep card "
         "numbers and CVCs in vault fills. Stop on save_declined; never retry payment_declined."
     ),
@@ -1201,9 +1208,7 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     return _fenced_page_op(tid, page_ops[action])
 
 
-from tools.registry import no_cache_check_fn, registry
-
-_check_vault_available = no_cache_check_fn(_check_vault_available)
+from tools.registry import registry
 
 registry.register(
     name="browser_vault_list",
