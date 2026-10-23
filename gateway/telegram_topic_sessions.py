@@ -341,17 +341,30 @@ def _opening_brief_display(brief: str, title: str, origin_line: str) -> str:
         # not leak formatting into the next paragraph or toggle.
         return re.sub(r"([\\`*_\[\]<>])", r"\\\1", shortened)
 
+    next_action = re.compile(r"Next(?: action)?:\s*(.+)", re.IGNORECASE)
     objective = paragraphs[0].content if paragraphs else ""
     if blocks and blocks[0].type == "heading_open" and paragraphs:
         title, _, objective = paragraphs[0].content.partition("\n")
         if not objective and len(paragraphs) > 1:
             objective = paragraphs[1].content
+    elif paragraphs:
+        first_line, _, remainder = objective.partition("\n")
+        # A plain or emphasized title is still a paragraph to Markdown. It is
+        # the envelope title, not an objective to repeat beneath that title.
+        if plain(first_line).casefold() == plain(title).casefold():
+            objective = remainder or (paragraphs[1].content if len(paragraphs) > 1 else "")
+    objective_lines = objective.splitlines()
+    for index, line in enumerate(objective_lines):
+        if next_action.match(plain(line)):
+            objective = "\n".join(objective_lines[:index])
+            break
 
     preview = [f"**{excerpt(title, 100)}**"]
     if objective:
         preview.append(excerpt(objective, 280))
-    for paragraph in paragraphs:
-        match = re.match(r"Next(?: action)?:\s*(.+)", plain(paragraph.content), re.IGNORECASE)
+    lines = (line for paragraph in paragraphs for line in paragraph.content.splitlines())
+    for line in lines:
+        match = next_action.match(plain(line))
         if match:
             action = re.split(r"(?<=[.!?])\s+", match.group(1), maxsplit=1)[0]
             preview.append(f"▸ Next: {excerpt(action, 160)}")
