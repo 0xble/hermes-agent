@@ -341,7 +341,18 @@ def _opening_brief_display(brief: str, title: str, origin_line: str) -> str:
         # not leak formatting into the next paragraph or toggle.
         return re.sub(r"([\\`*_\[\]<>])", r"\\\1", shortened)
 
-    next_action = re.compile(r"Next(?: action)?:\s*(.+)", re.IGNORECASE)
+    next_action = re.compile(r"Next(?: action)?:\s*(.*)", re.IGNORECASE)
+
+    def split_next_action(text: str) -> tuple[str, str]:
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            if next_action.match(plain(line)):
+                # The label starts on this line, but Markdown soft/hard breaks
+                # can continue the action through the rest of its paragraph.
+                match = next_action.match(plain("\n".join(lines[index:])))
+                return "\n".join(lines[:index]), match.group(1).strip() if match else ""
+        return text, ""
+
     objective = paragraphs[0].content if paragraphs else ""
     if blocks and blocks[0].type == "heading_open" and paragraphs:
         title, _, objective = paragraphs[0].content.partition("\n")
@@ -353,20 +364,15 @@ def _opening_brief_display(brief: str, title: str, origin_line: str) -> str:
         # the envelope title, not an objective to repeat beneath that title.
         if plain(first_line).casefold() == plain(title).casefold():
             objective = remainder or (paragraphs[1].content if len(paragraphs) > 1 else "")
-    objective_lines = objective.splitlines()
-    for index, line in enumerate(objective_lines):
-        if next_action.match(plain(line)):
-            objective = "\n".join(objective_lines[:index])
-            break
+    objective, _ = split_next_action(objective)
 
     preview = [f"**{excerpt(title, 100)}**"]
     if objective:
         preview.append(excerpt(objective, 280))
-    lines = (line for paragraph in paragraphs for line in paragraph.content.splitlines())
-    for line in lines:
-        match = next_action.match(plain(line))
-        if match:
-            action = re.split(r"(?<=[.!?])\s+", match.group(1), maxsplit=1)[0]
+    for paragraph in paragraphs:
+        _, action = split_next_action(paragraph.content)
+        if action:
+            action = re.split(r"(?<=[.!?])\s+", action, maxsplit=1)[0]
             preview.append(f"▸ Next: {excerpt(action, 160)}")
             break
 
