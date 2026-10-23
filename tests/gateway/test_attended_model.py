@@ -522,14 +522,14 @@ def test_disabled_attended_routing_does_not_reopen_existing_sessions():
 
 def test_restart_with_durable_attended_route_marks_switch_back(tmp_path):
     """A fresh process has no in-memory decision, but the route marker survives it."""
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource, SessionStore
 
     store = SessionStore(tmp_path / "sessions", GatewayConfig())
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="restart", user_id="owner")
     entry = store.get_or_create_session(source)
-    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=timezone.utc)
+    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=UTC)
     store.mark_user_activity(entry.session_key, spoke_at)
     store.mark_attended_route_active(entry.session_key, True)
 
@@ -565,7 +565,7 @@ def test_restart_resolution_switches_back_from_durable_attended_route():
 
 
 def test_route_repoint_keeps_the_users_last_activity(tmp_path):
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
 
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource, SessionStore
@@ -573,9 +573,10 @@ def test_route_repoint_keeps_the_users_last_activity(tmp_path):
     store = SessionStore(tmp_path / "sessions", GatewayConfig())
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="repoint", user_id="owner")
     entry = store.get_or_create_session(source)
-    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=timezone.utc)
+    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=UTC)
     store.mark_user_activity(entry.session_key, spoke_at)
 
     store.switch_session(entry.session_key, entry.session_id + "-compressed")
 
-    assert store.get_last_user_activity_at(entry.session_key) == spoke_at
+    # Repointing preserves the instant in the store's naive-local convention.
+    assert store.get_last_user_activity_at(entry.session_key) == spoke_at.astimezone().replace(tzinfo=None)
