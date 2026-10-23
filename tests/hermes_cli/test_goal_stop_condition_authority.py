@@ -1,4 +1,4 @@
-"""A contextual user removal is not authority to discard the rest of a goal."""
+"""Stop-condition authority binds the instruction and delta, not an unrelated imperative."""
 from __future__ import annotations
 
 import json
@@ -23,7 +23,7 @@ def goal_session(tmp_path, monkeypatch):
     db.create_session("work", "telegram", profile_name="default", chat_id="work",
                       chat_type="private", session_key="agent:main:telegram:dm:work")
     mgr = GoalManager("work")
-    mgr.set("Ship the incentive method", contract=GoalContract(
+    mgr.set("Ship the incentive method", max_turns=20, contract=GoalContract(
         outcome="The method works", verification="Live calculation passes",
         constraints="Do not change compensation", boundaries="The incentive system",
         stop_when="scope must change beyond incentive method",
@@ -34,7 +34,7 @@ def goal_session(tmp_path, monkeypatch):
     release_or_close(db)
 
 
-def _replace(mgr, **changes):
+def _replace(mgr, user_quote="Clear the stop condition", **changes):
     contract = mgr.state.contract.to_dict()
     contract["stop_when"] = ""
     payload = dict(goal=mgr.state.goal, contract=contract)
@@ -44,51 +44,68 @@ def _replace(mgr, **changes):
         else:
             payload[field] = value
     return sc.apply_control("goal", "replace", "work", requester_sid="work",
-                            user_quote="Remove what says this", payload=payload,
+                            user_quote=user_quote, payload=payload,
                             reason="User removed the stop condition")
 
 
-@pytest.mark.parametrize("stop_when", ["", "Stop only if the requested outcome changes"])
-def test_fresh_contextual_stop_edit_keeps_the_goal_and_user_requirements(goal_session, stop_when):
+@pytest.mark.parametrize("message", [
+    "Clear the stop condition",
+    "Please remove this stop condition now",
+    "Delete the stop condition",
+    "Drop the stop condition",
+])
+def test_explicit_stop_removal_keeps_the_goal_and_user_requirements(goal_session, message):
     db, mgr = goal_session
-    db.append_message("work", "user", "Remove what says this")
+    db.append_message("work", "user", message)
     before = json.loads(mgr.state.to_json())
 
-    result = _replace(mgr, stop_when=stop_when)
+    result = _replace(mgr, user_quote=message)
 
     assert result.get("status") == "applied", result
     after = GoalManager("work").state
+    assert after is not None
     assert after.goal == before["goal"]
     assert after.subgoals == before["subgoals"]
-    assert after.contract.stop_when == stop_when
+    assert after.contract.stop_when == ""
+    assert after.max_turns == before["max_turns"]
+    assert after.turns_used == before["turns_used"]
     for field in ("outcome", "verification", "constraints", "boundaries"):
         assert getattr(after.contract, field) == before["contract"][field]
     assert after.revisions[-1]["authority"] == "quote"
-    assert after.revisions[-1]["user_quote"] == "Remove what says this"
+    assert after.revisions[-1]["user_quote"] == message
     assert all(r["status"] != "pending" for r in sc.pending_outbox())
 
 
-@pytest.mark.parametrize("changes, message", [
-    ({"goal": "Ship something else"}, "Remove what says this"),
-    ({"verification": ""}, "Remove what says this"),
-    ({"outcome": ""}, "Remove what says this"),
-    ({"constraints": ""}, "Remove what says this"),
-    ({"boundaries": ""}, "Remove what says this"),
-    ({"max_turns": 1}, "Remove what says this"),
-    ({}, "Do not Remove what says this"),
-    ({}, "Remove what says this?"),
-    ({}, "If the checks pass, Remove what says this"),
-    ({}, 'The log says "Remove what says this"'),
-    ({}, "That earlier removal is no longer current"),
+@pytest.mark.parametrize("changes, message, source", [
+    ({"goal": "Ship something else"}, "Clear the stop condition", None),
+    ({"verification": ""}, "Clear the stop condition", None),
+    ({"outcome": ""}, "Clear the stop condition", None),
+    ({"constraints": ""}, "Clear the stop condition", None),
+    ({"boundaries": ""}, "Clear the stop condition", None),
+    ({"max_turns": 1}, "Clear the stop condition", None),
+    ({"stop_when": "never stop"}, "Clear the stop condition", None),
+    ({}, "Delete that branch from the remote", None),
+    ({"stop_when": "never stop"}, "Update this file with the new numbers", None),
+    ({"stop_when": "never stop"}, "Change it to blue", None),
+    ({}, "Remove what says this", None),
+    ({}, "Clear the stop condition from this file", None),
+    ({}, "Delete this branch with the stop condition", None),
+    ({}, "Remove the loop stop condition", None),
+    ({}, "Clear the stop condition", "Do not clear the stop condition"),
+    ({}, "Clear the stop condition", "Clear the stop condition?"),
+    ({}, "Clear the stop condition", "If the checks pass, clear the stop condition"),
+    ({}, "Clear the stop condition", 'The log says "Clear the stop condition"'),
+    ({}, "Clear the stop condition", "That earlier removal is no longer current"),
+    ({}, "Remove what says this", '[Replying to: "The stop condition blocks progress"]\nRemove what says this'),
 ])
-def test_contextual_stop_removal_does_not_authorize_dropping_other_requirements(goal_session, changes, message):
+def test_unbound_or_broader_stop_edits_require_approval(goal_session, changes, message, source):
     db, mgr = goal_session
-    db.append_message("work", "user", "Remove what says this")
-    if message != "Remove what says this":
-        db.append_message("work", "user", message)
+    db.append_message("work", "user", message)
+    if source is not None:
+        db.append_message("work", "user", source)
     before = json.loads(mgr.state.to_json())
 
-    result = _replace(mgr, **changes)
+    result = _replace(mgr, user_quote=message, **changes)
 
-    assert result.get("status") != "applied", result
+    assert result.get("status") == "pending", result
     assert json.loads(GoalManager("work").state.to_json()) == before

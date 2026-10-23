@@ -391,27 +391,37 @@ def _is_direct_instruction(kind: str, action: str, target_sid: str, requester_si
     return all(w in _TAIL_WORDS for w in tail)
 
 
+def _is_stop_condition_removal(words: list[str]) -> bool:
+    # Use the same direct-instruction shape as other controls. The noun phrase must
+    # name the stop condition itself, not an unbound pronoun or an unrelated object.
+    i = 0
+    while i < len(words) and words[i] in _LEAD_WORDS:
+        i += 1
+    if i >= len(words) or words[i] not in {"remove", "drop", "delete", "clear"}:
+        return False
+    i += 1
+    while i < len(words) and words[i] in _DETERMINERS:
+        i += 1
+    return (words[i:i + 2] == ["stop", "condition"]
+            and all(w in _TAIL_WORDS for w in words[i + 2:]))
+
+
 def _quote_matches_control(kind: str, action: str, target_sid: str, requester_sid: str,
                            quote: str, payload: Optional[Dict[str, Any]], *, cursor=None) -> bool:
     """True when the quoted words state this exact control: kind, action, target and payload."""
     all_words = _negation_words(quote)
-    if kind == "goal" and action == "replace" and target_sid == requester_sid:
+    if (kind == "goal" and action == "replace" and target_sid == requester_sid
+            and _is_stop_condition_removal(all_words)):
         from hermes_cli.goals import GoalContract, load_goal
         from hermes_cli.goals_revisions import stop_condition_only
         edit = dict(payload or {})
-        # Contextual removal names the restriction, not the whole goal. Bind authority
-        # to the actual delta under the write lock, without granting it over other fields.
-        words = list(all_words)
-        while words and words[0] in _LEAD_WORDS:
-            words.pop(0)
-        if (len(words) > 1 and words[0] in {"remove", "drop", "delete", "clear", "change", "update",
-                                          "replace", "loosen"}
-                and (words[1] in {"this", "that", "it", "what"}
-                     or {"stop", "condition"}.issubset(words))
+        contract = GoalContract.from_dict(edit.get("contract"))
+        # A removal instruction does not authorize an agent-authored replacement
+        # restriction. Recheck this exact delta under the existing write lock.
+        if (not contract.stop_when
                 and stop_condition_only(load_goal(target_sid, cursor=cursor),
                                         goal=str(edit.get("goal") or "").strip(),
-                                        contract=GoalContract.from_dict(edit.get("contract")),
-                                        max_turns=edit.get("max_turns"))):
+                                        contract=contract, max_turns=edit.get("max_turns"))):
             return True
     if kind == "goal" and action == "replace":
         link = next((n for n, w in enumerate(all_words) if w in _REPLACE_LINKS), len(all_words))
