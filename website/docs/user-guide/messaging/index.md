@@ -434,18 +434,21 @@ Send a message while the agent is working to correct the active turn:
 - **Running tools finish safely** — the correction is applied at the next tool-result boundary instead of killing the tool
 - **`/stop` remains a hard stop** — use it to cancel the active turn and foreground work
 
-### Queue vs interrupt vs steer (busy-input mode)
+### Busy Input Mode {#queue-vs-interrupt-vs-steer-busy-input-mode}
 
-By default, messaging a busy agent redirects its active turn (a running foreground terminal command is moved to the background rather than killed, so your message is read immediately). Two other modes are available:
+By default, messaging a busy agent redirects its active turn (a running foreground terminal command is moved to the background rather than killed, so your message is read immediately). 3 other modes are available:
 
 - `queue` — follow-up messages wait and run as the next turn after the current task finishes. Each follow-up (text, voice note, video, document) gets its own turn in arrival order; only a rapid photo burst is merged into one album turn.
 - `steer` — follow-up messages are injected into the current run via `/steer`, arriving at the agent after the next tool call. No interrupt, no new turn. Falls back to `queue` behavior if the agent hasn't started yet.
+- `auto`: ordinary plain-text user messages reach the active turn through redirect, with steer as a fallback. The agent absorbs related input or calls `defer_message` with the supplied immutable `message_id` to hand unrelated input back for its own next turn. A successful deferral preserves the original event, reply anchor, and arrival order. The agent must not act on or answer deferred input in the current turn.
+
+`auto` queues input when the active agent cannot accept it. Voice, other media, slash commands, explicit `/queue`, and internal events keep their existing busy handling. `/stop` and `interrupt` behavior do not change. A message handed back by `defer_message` receives a short “Queued after this.” acknowledgment through the existing busy-reply path.
 
 Gateway steers (including explicit `/steer`) and active-turn redirects carry the requesting event's available platform, chat, thread, sender, message, profile, and scope identifiers as per-message JSON context. With `privacy.redact_pii: true`, identifiers in this model-visible context are hashed on supported platforms, including alternate and parent identifiers; the original event identifiers remain internal for routing. Otherwise identifiers are preserved exactly. Neither mode changes the session's system prompt or chooses a fallback reply destination. The context is routing data, not authorization or a guarantee of automatic delivery.
 
 ```yaml
 display:
-  busy_input_mode: steer   # or queue, or interrupt (default)
+  busy_input_mode: auto    # or steer, queue, interrupt (default)
   busy_ack_enabled: true   # set to false to suppress the ⚡/⏳/⏩ chat reply entirely
   busy_text_debounce_seconds: 0.35   # quiet window before merged busy text is delivered
   busy_text_hard_cap_seconds: 1.0    # never hold merged busy text longer than this

@@ -147,7 +147,7 @@ def _ac_inflight_original(session: dict) -> str:
 
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
                     turn_author: dict | None = None, display_kind: str | None = None,
-                    moa_token: str | None = None) -> dict | None:
+                    moa_token: str | None = None, preserve_event: bool = False) -> dict | None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing and authored ones stay separate
     envelopes so attachment chronology and the sender survive. ``transport`` is pinned so the drained turn
@@ -157,18 +157,21 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     # Scrub live-turn self-duplicates first so the text merge below can't glue "{original}\n\n{later}" and re-fire the
     # original after a correction settles.
     # See #84417.
-    _drop_queued_duplicates_of_inflight_user(session)
+    if not preserve_event:
+        _drop_queued_duplicates_of_inflight_user(session)
     text_only = not image_paths and isinstance(text, str)
     # A text-only self-copy of the live prompt would restart it on drain; an authored copy is another sender's message.
-    if text_only and not turn_author and not moa_token and text.strip() == _ac_inflight_original(session) != "":
+    if not preserve_event and text_only and not turn_author and not moa_token and text.strip() == _ac_inflight_original(session) != "":
         return None
     queued = {"text": text, "transport": transport,
               **({"image_paths": image_paths} if image_paths else {}),
               **({"turn_author": turn_author} if turn_author else {}),
               **({"display_kind": display_kind} if display_kind else {}),
-              **({"moa_token": moa_token} if moa_token else {})}
+              **({"moa_token": moa_token} if moa_token else {}),
+              **({"preserve_event": True} if preserve_event else {})}
     existing = session.get("queued_prompt")
-    if (existing and text_only and not turn_author and isinstance(existing.get("text"), str)
+    if (not preserve_event and existing and not existing.get("preserve_event")
+            and text_only and not turn_author and isinstance(existing.get("text"), str)
             and not existing.get("image_paths") and not existing.get("turn_author")
             and existing.get("display_kind") == display_kind
             and not moa_token and not existing.get("moa_token")
@@ -195,7 +198,7 @@ def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict |
     if not isinstance(entry, dict):
         return None
     text = entry.get("text")
-    if (not original or entry.get("image_paths") or entry.get("turn_author")
+    if (not original or entry.get("preserve_event") or entry.get("image_paths") or entry.get("turn_author")
             or entry.get("moa_token") or not isinstance(text, str)):
         return entry
     # A lossless text-merge may have glued the live original onto a later follow-up: keep the remainder.
@@ -417,7 +420,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     # Compression in flight demotes steer/interrupt to queue: a correction delivered
     # mid-compression aborts the compression instead of waiting for it (#61042). The
     # follow-up drains when compression finishes — the Discord-gateway contract.
-    if mode in ("steer", "interrupt") and _session_compression_in_flight(session):
+    if mode in ("steer", "interrupt", "auto") and _session_compression_in_flight(session):
         mode = "queue"
     with session["history_lock"]:
         if not session.get("running"):
@@ -428,6 +431,33 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
         if image_paths:
             session["attached_images"] = []  # claim now so a later paste isn't consumed when the turn yields
     plain_text = _coerce_message_text(text).strip() if not image_paths and _is_text_only_busy_payload(text) else ""
+    if mode == "auto" and plain_text and not plain_text.startswith("/") and not turn_author and not display_kind:
+        from agent.steer_deferral import offer_auto_steer
+
+        def handoff():
+            with session["history_lock"]:
+                if not session.get("running") or session.get("agent") is not agent:
+                    return False
+                envelope = _enqueue_prompt(session, text, transport, turn_author=turn_author,
+                                           display_kind=display_kind, preserve_event=True)
+                if envelope is None:
+                    return False
+                # Queue acceptance is the handoff commit. Persistence retries on drain, and
+                # a failed observer cannot leave this receipt actionable and enqueue it twice.
+                try:
+                    _persist_queued_user_row(session, envelope, display_kind)
+                except Exception:
+                    logger.warning("Auto-steer queued-row persistence failed; drain will retry", exc_info=True)
+            try:
+                _emit("message.interim", sid, {"text": "Queued after this."})
+            except Exception:
+                logger.debug("Auto-steer queue acknowledgement failed", exc_info=True)
+            return True
+
+        if offer_auto_steer(agent, plain_text, handoff):
+            with session["history_lock"]:
+                _record_inflight_correction(session, plain_text)
+            return _ok(rid, {"status": "steered"})
     # Text-only corrections steer/redirect in place when supported; media payloads and older agents fall through to
     # the proven interrupt + queue path.
     if plain_text and agent is not None:

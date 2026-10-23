@@ -11,6 +11,17 @@
 - **Rollback:** Revert the MCP action assignment and its matching tests/examples. No schema, dependency, configuration or state migration.
 - **Retirement:** Remove when upstream's shared MCP label owner preserves the complete callable suffix and its consumers retain the same contract.
 
+## busy-input-auto
+
+- **Status:** Candidate, not activated.
+- **Boundary:** Native busy-input routing and its existing delivered-steer observer. Detailed provenance, companion consumer dependency, proof, rollback, and retirement: [Steer Routing](../../../maintenance/steer-delivery-observer.md).
+- **Source surfaces:** `agent/steer_deferral.py`, steer insertion/compression/finalization, `tools/defer_message_tool.py`, gateway busy routing, CLI busy dispatch, TUI queue handling, config consumers, and the existing `post_steer_delivered` payload.
+- **Contract:** Steer ordinary plain text into the active turn, absorb related input or hand the original unrelated input back once for its own next turn. Keep reply anchors and arrival order. Commands, media, internal events, interrupt, and `/stop` stay unchanged.
+- **Related upstream:** Closed unmerged [#31500](https://github.com/NousResearch/hermes-agent/pull/31500) proposes `auto_steer` without this absorb-or-defer contract. This fork uses existing queue ownership instead of a dropping fallback.
+- **Verification:** `scripts/run_tests.sh tests/agent/test_steer_deferral.py tests/agent/test_steer_delivered_hook.py tests/agent/test_compression_last_assistant_anchor.py tests/gateway/test_busy_auto.py tests/tui_gateway/test_auto_steer.py`. Live Telegram and each enabled runtime need separate acceptance evidence.
+- **Rollback:** Change affected profiles from `auto` to a supported prior busy mode before reverting only this routing change. Preserve the existing delivered-steer observer and unrelated patches.
+- **Retirement:** Adopt released upstream behavior only after equivalent host-envelope, idempotency, late-input, observer, and unchanged-control-path proof.
+
 ## background-review-memory-delete: durable observer requirement
 
 - **Status:** Candidate; not landed or activated.
