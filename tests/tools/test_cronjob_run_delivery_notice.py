@@ -9,9 +9,8 @@ that was appended UNCONDITIONALLY for non-local targets — even when
 job record because the post-run delivery (telegram/discord/…) failed. The
 calling agent then relayed "all good" over a failed delivery.
 
-The note must follow the refreshed job record: a set ``last_delivery_error``
-means delivery FAILED with the error text surfaced; an empty/missing error
-keeps the legacy wording byte-for-byte (zero regression), and local jobs
+The completion notice must follow the exact execution record, not stale job-level
+history. A real delivery failure keeps its current error visible, and local jobs
 always say saved-locally.
 """
 
@@ -24,7 +23,7 @@ import pytest
 from tools.cronjob_tools import _manual_run_delivery_note
 
 @pytest.fixture(autouse=True)
-def _clean_state():
+def _clean_state(monkeypatch, tmp_path):
     """Reset the shared async-delegation world around each test.
 
     The dispatch tests below submit real workers onto the process-wide
@@ -44,9 +43,11 @@ def _clean_state():
     deterministically whenever this file runs before it. Mirrors
     ``tests/tools/test_async_delegation.py::_clean_state``.
     """
+    from cron import executions
     from tools import async_delegation as ad
     from tools.process_registry import process_registry
 
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
     ad._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
@@ -119,6 +120,15 @@ def _drain_completion_event(delegation_id):
         time.sleep(0.05)
     return None
 
+def _finish_execution(job, *, error=None, delivery_status=None, **_):
+    from cron import executions
+
+    executions.finish_execution(job["execution_id"], success=error is None, error=error)
+    if delivery_status:
+        executions.record_delivery_status(job["execution_id"], delivery_status)
+    return True
+
+
 class TestDeliveryNote:
     """``_manual_run_delivery_note`` — the summary-line wording contract."""
 
@@ -141,7 +151,7 @@ class TestDeliveryNote:
 
 class TestRunnerSummaryWiring:
     """The completion event the calling agent actually sees must follow the
-    refreshed job record — both directions of issue #83993."""
+    exact execution record — both directions of issue #83993."""
 
     def test_delivery_failure_surfaces_in_completion_summary(self):
         from tools.cronjob_tools import _try_dispatch_background_run
@@ -153,7 +163,8 @@ class TestRunnerSummaryWiring:
                     "tools.cronjob_tools.claim_job_for_fire",
                     return_value=job,  # claimed snapshot (return_job=True API)
                 ),
-                patch("cron.scheduler.run_one_job", return_value=True),
+                patch("cron.scheduler.run_one_job", side_effect=lambda job, **kw: _finish_execution(
+                    job, error="telegram send failed: 400", delivery_status="failed", **kw)),
                 patch(
                     "tools.cronjob_tools.get_job",
                     return_value={
@@ -191,7 +202,7 @@ class TestRunnerSummaryWiring:
                     "tools.cronjob_tools.claim_job_for_fire",
                     return_value=job,  # claimed snapshot (return_job=True API)
                 ),
-                patch("cron.scheduler.run_one_job", return_value=True),
+                patch("cron.scheduler.run_one_job", side_effect=_finish_execution),
                 patch(
                     "tools.cronjob_tools.get_job",
                     return_value={"last_status": "ok", "last_error": None},
