@@ -170,7 +170,7 @@ def _is_negated(quote: str, source: str) -> bool:
 # "Please explain how to clear the X goal" fall back to Approve/Deny.
 _QUALIFIER_TOKENS = frozenset({
     "if", "unless", "only", "when", "whenever", "once", "after", "before", "until", "later",
-    "whether", "how", "why", "would", "could", "should", "might", "maybe",
+    "whether", "what", "how", "why", "would", "could", "should", "might", "maybe",
     "perhaps", "probably", "explain", "wait", "think", "wonder", "consider",
 })
 _SENTENCE_END = ".!;\n"

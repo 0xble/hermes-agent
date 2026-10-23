@@ -253,8 +253,8 @@ class GoalRevisionsMixin:
         state.created_at = max(time.time(), float(state.created_at or 0.0) + 1e-6)
         if contract is not None:
             state.contract = contract if isinstance(contract, GoalContract) else GoalContract.from_dict(contract)
-        # An approved session control installs the shown payload as a fresh outcome scope; the
-        # slash command keeps the existing additive criteria.
+        # Only a broader approved replacement drops additive criteria. Stop-only edits and
+        # slash replacements preserve them, regardless of how the control was authorized.
         if approved and not stop_only:
             state.subgoals = []
         if max_turns is not None:

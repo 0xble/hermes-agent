@@ -91,9 +91,7 @@ def test_explicit_stop_removal_keeps_the_goal_and_user_requirements(goal_session
     ({}, "Clear the stop condition from this file", None),
     ({}, "Delete this branch with the stop condition", None),
     ({}, "Remove the loop stop condition", None),
-    ({}, "Clear the stop condition", "Do not clear the stop condition"),
     ({}, "Clear the stop condition", "Clear the stop condition?"),
-    ({}, "Clear the stop condition", "If the checks pass, clear the stop condition"),
     ({}, "Clear the stop condition", 'The log says "Clear the stop condition"'),
     ({}, "Clear the stop condition", "That earlier removal is no longer current"),
     ({}, "Remove what says this", '[Replying to: "The stop condition blocks progress"]\nRemove what says this'),
@@ -109,3 +107,54 @@ def test_unbound_or_broader_stop_edits_require_approval(goal_session, changes, m
 
     assert result.get("status") == "pending", result
     assert json.loads(GoalManager("work").state.to_json()) == before
+
+
+def test_underspecified_replacement_does_not_grant_quote_authority(goal_session):
+    db, mgr = goal_session
+    message = "Replace the goal with what we discussed"
+    db.append_message("work", "user", message)
+    before = json.loads(mgr.state.to_json())
+
+    result = _replace(mgr, user_quote=message, goal="An agent-authored objective")
+
+    assert result.get("status") == "pending", result
+    assert result.get("quote_refused") == "user_quote_qualified"
+    after = GoalManager("work").state
+    assert after is not None
+    assert json.loads(after.to_json()) == before
+
+
+@pytest.mark.parametrize("source, quote, refusal", [
+    ("Do not clear the stop condition", "clear the stop condition", "user_quote_negated"),
+    ("Clear the stop condition if the checks pass", "Clear the stop condition", "user_quote_qualified"),
+])
+def test_stop_removal_checks_the_exact_quote_context(goal_session, source, quote, refusal):
+    db, mgr = goal_session
+    db.append_message("work", "user", source)
+    before = json.loads(mgr.state.to_json())
+
+    result = _replace(mgr, user_quote=quote)
+
+    assert result.get("status") == "pending", result
+    assert result.get("quote_refused") == refusal
+    after = GoalManager("work").state
+    assert after is not None
+    assert json.loads(after.to_json()) == before
+
+
+@pytest.mark.parametrize("stop_when", ["", "A Hermes restart is needed"])
+def test_button_approved_stop_only_edit_preserves_subgoals(goal_session, stop_when):
+    _, mgr = goal_session
+    before = json.loads(mgr.state.to_json())
+    pending = _replace(mgr, user_quote="", stop_when=stop_when)
+    assert pending.get("status") == "pending", pending
+
+    result = sc.resolve_request(pending["request_id"], "approve", "admin")
+
+    assert result is not None and result.get("status") == "applied", result
+    after = GoalManager("work").state
+    assert after is not None
+    assert after.subgoals == before["subgoals"]
+    assert after.contract.stop_when == stop_when
+    assert after.max_turns == before["max_turns"]
+    assert after.revisions[-1]["authority"] == "button"
