@@ -12,6 +12,57 @@ V = 'a' * 26
 I = 'b' * 26
 SYNTHETIC_VALUE = 'synthetic-only-passphrase'
 
+@pytest.mark.parametrize("method", ["resolve_password", "resolve_secret"])
+@pytest.mark.parametrize("fields,expected", [
+    ([{'label': 'password', 'value': 'synthetic-custom'},
+      {'purpose': 'PASSWORD', 'value': SYNTHETIC_VALUE}], SYNTHETIC_VALUE),
+    ([{'purpose': 'PASSWORD', 'value': SYNTHETIC_VALUE},
+      {'label': 'password', 'value': 'synthetic-custom'},
+      {'label': 'password', 'value': 'synthetic-other'}], SYNTHETIC_VALUE),
+    ([{'purpose': 'PASSWORD', 'value': ' \r\n'},
+      {'label': 'password', 'value': 'synthetic-custom'}], 'synthetic-custom'),
+    ([{'label': 'password', 'value': ''},
+      {'label': 'PASSWORD', 'value': ' \tsynthetic-custom\r\n'}], ' \tsynthetic-custom\r\n'),
+    ([{'purpose': 'PASSWORD', 'value': ''},
+      {'purpose': 'PASSWORD', 'value': ' \tsynthetic-native\r\n'}], ' \tsynthetic-native\r\n'),
+    ([{'purpose': 'USERNAME', 'label': 'password', 'value': 'not-a-password'},
+      {'id': 'password', 'value': 'synthetic-custom'}], 'synthetic-custom'),
+    ([{'purpose': 'PASSWORD', 'value': 'synthetic-native'},
+      {'purpose': 'PASSWORD', 'value': 'synthetic-other'}], None),
+    ([{'label': 'password', 'value': 'synthetic-custom'},
+      {'label': 'password', 'value': 'synthetic-other'}], None),
+    ([{'purpose': 'PASSWORD'}, {'label': 'password', 'value': ' \n'}], None),
+    ([{'purpose': 'PASSWORD', 'value': 4}], None),
+    (None, None), ({}, None), ('malformed-fields', None), ([], None),
+])
+def test_connect_password_precedence_and_fallback(monkeypatch, capfd, caplog, fields, expected, method):
+    server, thread = _connect_server(fields)
+    monkeypatch.delenv('OP_SERVICE_ACCOUNT_TOKEN', raising=False)
+    set_multiplex_active(True)
+    backend, scope = _scoped_backend(server)
+    # Any accidental route fallback fails without ever discovering the real executable.
+    monkeypatch.setattr(backend, '_op', lambda: pytest.fail('Connect must not use CLI'))
+    original = json.dumps(fields)
+    try:
+        handle = f'op:connect:{V}:{I}'
+        if expected is None:
+            with pytest.raises(RuntimeError, match='1Password login') as error:
+                getattr(backend, method)(handle)
+            diagnostic = str(error.value)
+        else:
+            assert getattr(backend, method)(handle) == (
+                expected if method == 'resolve_password' else {'password': expected})
+            diagnostic = ''
+        assert json.dumps(fields) == original
+        captured = capfd.readouterr()
+        diagnostic += captured.out + captured.err + caplog.text
+        assert 'synthetic-custom' not in diagnostic and SYNTHETIC_VALUE not in diagnostic
+        assert 'synthetic-native' not in diagnostic
+    finally:
+        reset_secret_scope(scope); set_multiplex_active(False)
+        server.shutdown(); server.server_close(); thread.join()
+
+
 
 def test_connect_native_metadata_resolution_and_fail_closed(monkeypatch):
     requests = []
@@ -78,7 +129,9 @@ def _connect_server(item_fields):
                              {'href': 'https://accounts.example.com/signin'},
                              {'href': 'androidapp://example'}]}
             routes = {'/v1/vaults': [{'id': V}], f'/v1/vaults/{V}/items': [item],
-                      f'/v1/vaults/{V}/items/{I}': dict(item, fields=item_fields)}
+                      f'/v1/vaults/{V}/items/{I}': dict(
+                          item, fields=item_fields,
+                          passkeys=[{'credentialId': 'synthetic-opaque-passkey'}])}
             self.send_response(200); self.end_headers()
             self.wfile.write(json.dumps(routes.get(self.path, {})).encode())
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)

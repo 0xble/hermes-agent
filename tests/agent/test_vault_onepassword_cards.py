@@ -93,10 +93,11 @@ def test_resolve_secret_reads_card_in_its_vault_and_returns_payment_shape(backen
 
 
 def test_resolve_secret_on_a_login_keeps_password_only_shape(backend):
-    backend._run.side_effect = [json.dumps([_login()]), json.dumps(_login()), "pw\n"]
+    backend._run.side_effect = [json.dumps([_login()]), json.dumps(_login()),
+                                json.dumps(dict(_login(), fields=[{"purpose": "PASSWORD", "value": "pw"}]))]
     assert backend.resolve_secret("op:login-a") == {"password": "pw"}
     assert backend._run.call_count == 3  # display hint, metadata and one secret read
-    assert backend._run.call_args.args == ("item", "get", "login-a", "--vault", "vault-a", "--fields", "label=password", "--reveal")
+    assert backend._run.call_args.args == ("item", "get", "login-a", "--vault", "vault-a", "--format", "json", "--reveal")
 
 
 def test_card_handle_never_resolves_as_a_login_password(backend):
