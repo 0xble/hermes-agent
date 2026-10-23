@@ -55,11 +55,15 @@ its optional icon, and the durable alias can be observed through one Telegram to
   title immediately. If that eager first attempt yields no usable title, turn completion
   retries once with the opener plus a bounded excerpt of the assistant reply, without
   waiting for a second user message. It joins any in-flight attempt on the background
-  thread, never on the main turn path. A successful or manually chosen title skips that
-  retry. Later turns retain the existing turn-3 cap. A manual `/title` still wins, and a
-  stored `llm` or `user` title is never
-  replaced. `auxiliary.title_generation.hold_until_reply: false` restores the previous
-  opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
+  thread, never on the main turn path. A settled `llm` or manually chosen `user` title
+  skips that retry. The model's greeting placeholder stays `derived` and also retries:
+  a reply can supply a subject even when the opener was only a greeting. If both attempts
+  are greetings, the placeholder stays provisional. Each failed attempt is logged, but
+  the turn's failure callback reports only the first failure, including a retry-only
+  failure. Gateway callbacks remain debug-only, not user-visible. Later turns retain
+  the existing turn-3 cap. A manual `/title` still wins, and a stored `llm` or `user`
+  title is never replaced. `auxiliary.title_generation.hold_until_reply: false` restores
+  the previous opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
   multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. The opening
   turn's subject-less opener is the exception: `auxiliary.title_generation.hold_until_reply`
