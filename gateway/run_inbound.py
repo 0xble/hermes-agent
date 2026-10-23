@@ -1592,7 +1592,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             # behind them, so arrival order (#28503) holds: oldest orphan runs as this turn, the rest drain
             # in order, the new message last.
             _orphan_adapter = self._delivery_adapter_for(source)
-            if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
+            if (_orphan_adapter is None or getattr(event, "internal", False) or event.get_command()
+                    or getattr(event, "_gateway_compression_deferred", False)):
                 return event, source, is_internal
             _rescued = self._rescue_orphaned_overflow(_quick_key, _orphan_adapter)
             if _rescued is None:
@@ -1737,6 +1738,15 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
                 return t("gateway.busy.draining_maintenance")
 
+        # Both human inputs and gateway wakes remain retryable while compression
+        # owns the transcript. Slash controls above remain available.
+        if await self._defer_compression_locked_event(_quick_key, event):
+            return None
+        if self._is_session_running(_quick_key):
+            # The durable lock lookup yielded; another turn may now own the slot.
+            return await self._hm_handle_running_session_message(event, source, _quick_key)
+
+
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
@@ -1751,6 +1761,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+        event._gateway_compression_deferred = False
 
         # A rewrite continues the wake's admission generation. No await may separate this
         # check from sentinel installation, and no rejected wake inherits a successor token.
@@ -1798,9 +1809,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 await self._release_unsettled_loop_tick(event, ran=False)
                 return t("gateway.busy.another_turn_running")
             try:
-                await self._run_post_turn_hooks(
-                    agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
-                )
+                if not getattr(event, "_gateway_compression_deferred", False):
+                    await self._run_post_turn_hooks(
+                        agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
+                    )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
@@ -1830,6 +1842,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             _resume_deferred = getattr(_deferred_adapter, "resume_deferred_commands", None)
             if callable(_resume_deferred):
                 _resume_deferred(_quick_key)
+            if getattr(event, "_gateway_compression_deferred", False):
+                self._start_compression_deferred_drain(_quick_key, _deferred_adapter)
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
