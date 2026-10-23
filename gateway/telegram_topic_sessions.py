@@ -346,8 +346,6 @@ def _opening_brief_display(brief: str, title: str, origin_line: str) -> str:
         title, _, objective = paragraphs[0].content.partition("\n")
         if not objective and len(paragraphs) > 1:
             objective = paragraphs[1].content
-    elif "\n" in objective:
-        title, _, objective = objective.partition("\n")
 
     preview = [f"**{excerpt(title, 100)}**"]
     if objective:
@@ -385,7 +383,7 @@ async def _deliver_brief(adapter, dest: SessionSource, brief: str, origin_line: 
     session_brief = f"{origin_line}\n\n{brief}" if origin_line else brief
     shown_brief = _opening_brief_display(brief, title, origin_line)
     sent = await adapter.send(str(dest.chat_id), shown_brief,
-                              metadata={"thread_id": str(dest.thread_id)})
+                              metadata={"thread_id": str(dest.thread_id), "rich_fallback_content": session_brief})
     if not getattr(sent, "success", False):
         raise RuntimeError(getattr(sent, "error", None) or "Telegram did not accept the message")
     # Anchor the turn on the shown brief, as a typed message anchors its own turn, so the session's
