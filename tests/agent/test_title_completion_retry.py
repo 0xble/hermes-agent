@@ -58,6 +58,70 @@ def test_first_turn_completion_recovers_an_unusable_eager_title(
         db.close()
 
 
+@pytest.mark.parametrize("reply, retry_title, expected_title, expected_source", [
+    ("Hi! How can I help?", "Friendly greeting", "hi", "derived"),
+    ("Let's look at your Postgres connection pool.", "Postgres Connection Pool Exhaustion",
+     "Postgres Connection Pool Exhaustion", "llm"),
+])
+def test_greeting_placeholder_retries_with_the_reply(
+    tmp_path, monkeypatch, reply, retry_title, expected_title, expected_source,
+):
+    history = [{"role": "user", "content": "hi"}]
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="greeting", source="telegram")
+    agent = SimpleNamespace(_session_db=db, session_id="greeting", _session_db_created=True,
+                            platform="telegram")
+    generate = Mock(side_effect=["Friendly greeting", retry_title])
+    monkeypatch.setattr("agent.title_generator.generate_title", generate)
+    monkeypatch.setattr("agent.title_generator._title_config", dict)
+    monkeypatch.setattr("agent.title_generator.title_upgrade_must_wait_for_turn", lambda *_: False)
+    try:
+        _maybe_title_session_at_turn_start(agent, history)
+        wait_for_title_upgrades(timeout=5)
+        assert db.get_session_title_source("greeting") == "derived"
+        history.append({"role": "assistant", "content": reply})
+        start_deferred_title_upgrade(agent)
+        wait_for_title_upgrades(timeout=5)
+        assert generate.call_count == 2
+        assert generate.call_args.kwargs["reply_excerpt"] == reply
+        assert db.get_session_title("greeting") == expected_title
+        assert db.get_session_title_source("greeting") == expected_source
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("eager_fails", [False, True])
+@pytest.mark.parametrize("failure_sink", ["_emit_auxiliary_failure", "_title_failure_callback"])
+def test_completion_attempts_report_only_the_first_failure(
+    tmp_path, monkeypatch, eager_fails, failure_sink,
+):
+    eager_error, retry_error = RuntimeError("eager unavailable"), RuntimeError("retry unavailable")
+    abstention = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content='{"title": "", "abstain": true}'), finish_reason="stop",
+    )])
+    call = Mock(side_effect=[eager_error if eager_fails else abstention, retry_error])
+    monkeypatch.setattr("agent.title_generator.call_llm", call)
+    monkeypatch.setattr("agent.title_generator._title_config", dict)
+    monkeypatch.setattr("agent.title_generator.title_upgrade_must_wait_for_turn", lambda *_: False)
+    history = [{"role": "user", "content": "Fix topic opening formatting"}]
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="failed-title", source="cli")
+    report_failure = Mock()
+    agent = SimpleNamespace(_session_db=db, session_id="failed-title", _session_db_created=True,
+                            platform="cli", **{failure_sink: report_failure})
+    try:
+        _maybe_title_session_at_turn_start(agent, history)
+        wait_for_title_upgrades(timeout=5)
+        assert report_failure.call_count == int(eager_fails)
+        history.append({"role": "assistant", "content": "The title and objective share a heading."})
+        start_deferred_title_upgrade(agent)
+        wait_for_title_upgrades(timeout=5)
+        assert call.call_count == 2
+        report_failure.assert_called_once_with("title generation", eager_error if eager_fails else retry_error)
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("hold, user_turns, has_reply, retries", [
     (False, 1, True, False),
     (True, 2, True, False),
