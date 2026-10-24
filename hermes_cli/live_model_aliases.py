@@ -81,16 +81,19 @@ def resolve_live_alias(reference: str, config: dict | None = None) -> LiveAlias:
     name = reference.strip()[len(PREFIX):].strip().lower()
     cfg = current_config() if config is None else config
     authored = cfg.get("model_aliases") or {}
-    entries = {str(key).lower(): value for key, value in authored.items()} if isinstance(authored, dict) else {}
+    entries = {str(key).strip().lower(): value for key, value in authored.items()} if isinstance(authored, dict) else {}
     if not name or name not in entries:
         raise ValueError(f"Unknown live model alias {reference!r} in model_aliases")
-    route = _load_direct_aliases(cfg).get(name)
-    if not route or not route.model or is_live_alias(route.model):
+    definition = entries[name]
+    model = definition.get("model") if isinstance(definition, dict) else None
+    if not isinstance(model, str) or not model.strip() or is_live_alias(model):
         raise ValueError(f"Invalid live model alias {reference!r}: expected a concrete model")
+    # Only the authored entry participates. A malformed sibling or a same-named built-in
+    # must never turn an explicit live reference into some unrelated route.
+    route = _load_direct_aliases({"model_aliases": {name: definition}})[name]
     from hermes_cli.model_switch import direct_alias_api_key
     model, provider, base_url = route.model, route.provider, route.base_url
     api_key = direct_alias_api_key(route)
-    definition = entries[name]
     if isinstance(definition, dict) and "reasoning_effort" in definition:
         reasoning = parse_reasoning_effort(definition["reasoning_effort"])
         if reasoning is None:

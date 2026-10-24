@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import copy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import hermes_yaml as yaml
@@ -23,7 +23,7 @@ def config_file(tmp_path, monkeypatch):
     config = {
         "model": {"default": "alias:work", "provider": "openai"},
         "model_aliases": {
-            "work": {"model": "gpt-test-old", "provider": "openai", "api_key": "test-old", "reasoning_effort": "low"},
+            "work": {"model": "gpt-test-old", "provider": "openrouter", "api_key": "test-old", "reasoning_effort": "low"},
         },
         "agent": {"reasoning_effort": "medium"},
         "cron": {"preflight": False},
@@ -92,10 +92,6 @@ async def test_topic_pick_survives_alias_edit_without_consumer_rewrite(config_fi
     runner._session_model_overrides = {}
     runner._session_db = None
     runner.session_store = store
-    persist = AsyncMock(side_effect=store.set_model_override)
-    runner._async_session_store = SimpleNamespace(set_model_override=persist)
-    runner._evict_cached_agent = MagicMock()
-    runner._channel_override_for = lambda _source: None
     result = switch_model("alias:work", "openai", "before")
     assert result.success, result.error_message
     ctx = SimpleNamespace(session_key=entry.session_key, persist_global=False, current_model="before", restore_snapshot=None)
@@ -103,20 +99,20 @@ async def test_topic_pick_survives_alias_edit_without_consumer_rewrite(config_fi
     assert store.get_model_override(entry.session_key) == {"model": "alias:work"}
     persisted = entry.to_dict()
     first, first_runtime = runner._resolve_session_agent_runtime(session_key=entry.session_key)
-    assert (first, first_runtime["provider"]) == ("gpt-test-old", "openai")
+    assert (first, first_runtime["provider"]) == ("gpt-test-old", "openrouter")
     assert runner._resolve_session_reasoning_config(session_key=entry.session_key, model=first) == parse_reasoning_effort("low")
     _edit(config, save)
     second, runtime = runner._resolve_session_agent_runtime(session_key=entry.session_key)
     assert (second, runtime["provider"]) == ("claude-test-new", "anthropic")
     assert runner._resolve_session_reasoning_config(session_key=entry.session_key, model=second) == parse_reasoning_effort("high")
     assert entry.to_dict() == persisted
-    assert persist.call_count == 1
+    assert SessionStore(home / "sessions", GatewayConfig()).get_model_override(entry.session_key) == {"model": "alias:work"}
 
 
 def _cron_fire(job):
     from cron.scheduler import _construct_cron_agent, _load_cron_job_config, _resolve_cron_agent_setup
     jc = _load_cron_job_config(job, "alias-job", "Alias job")
-    with patch("cron.scheduler._init_cron_mcp_tools"), patch("cron.scheduler._load_credential_pool", return_value=None):
+    with patch("cron.scheduler._init_cron_mcp_tools"):
         setup = _resolve_cron_agent_setup(job, "alias-job", "Alias job", jc)
     assert setup.blocked is None
     ctor = MagicMock()
@@ -130,7 +126,7 @@ def test_cron_fire_resolves_alias_again_without_rewriting_job(config_file):
     original = copy.deepcopy(job)
     old = _cron_fire(job)
     assert (old["model"], old["provider"], old["reasoning_config"]) == (
-        "gpt-test-old", "openai", parse_reasoning_effort("low"))
+        "gpt-test-old", "openrouter", parse_reasoning_effort("low"))
     _edit(config, save)
     new = _cron_fire(job)
     assert (new["model"], new["provider"], new["reasoning_config"]) == (
@@ -143,13 +139,13 @@ def test_new_child_moves_existing_child_keeps_launch_route(config_file):
     parent = _parent()
     first = _launch(parent)
     assert (first.model, first.provider, first.reasoning_config) == (
-        "gpt-test-old", "openai", parse_reasoning_effort("low"))
+        "gpt-test-old", "openrouter", parse_reasoning_effort("low"))
     _edit(config, save)
     second = _launch(parent)
     assert (second.model, second.provider, second.reasoning_config) == (
         "claude-test-new", "anthropic", parse_reasoning_effort("high"))
     assert (first.model, first.provider, first.reasoning_config) == (
-        "gpt-test-old", "openai", parse_reasoning_effort("low"))
+        "gpt-test-old", "openrouter", parse_reasoning_effort("low"))
     assert config["delegation"]["backends"]["by_parent"]["routes"]["parent-live"] == "work"
 
 
@@ -250,11 +246,11 @@ def test_startup_and_frozen_policy_keep_reference_live(config_file):
     assert resolve_startup_model_route("alias:work").model == "gpt-test-old"
     launch = resolve_launch_route({"source": "cli", "model": "alias:work"}, config)
     assert launch["model"] == "alias:work"
-    policy = build_policy(launch, config, profile_terminal=False)
+    policy = build_policy(launch, config, profile_terminal=False, private_secrets={})
     stored = policy.config_json
     frozen, model = policy.effective()
     runtime, fallback = route_runtime(policy, frozen, model, None)
-    assert (model, runtime["provider"], fallback) == ("gpt-test-old", "openai", None)
+    assert (model, runtime["provider"], fallback) == ("gpt-test-old", "openrouter", None)
     _edit(config, save)
     frozen, model = policy.effective()
     runtime, _fallback = route_runtime(policy, frozen, model, None)
@@ -287,7 +283,7 @@ def test_cron_default_alias_moves_on_next_fire(config_file, model_field):
     first = _cron_fire({})
     _edit(config, save)
     second = _cron_fire({})
-    assert (first["model"], first["provider"]) == ("gpt-test-old", "openai")
+    assert (first["model"], first["provider"]) == ("gpt-test-old", "openrouter")
     assert (second["model"], second["provider"]) == ("claude-test-new", "anthropic")
     assert second["reasoning_config"] == parse_reasoning_effort("high")
 
@@ -299,7 +295,7 @@ def test_gateway_default_and_reasoning_pin(config_file):
     runner._session_model_overrides = {}
     runner._session_db = None
     model, runtime = runner._resolve_session_agent_runtime(session_key="held-default")
-    assert (model, runtime["provider"]) == ("gpt-test-old", "openai")
+    assert (model, runtime["provider"]) == ("gpt-test-old", "openrouter")
     runner._session_state("held-default").conversation.reasoning_override = parse_reasoning_effort("medium")
     _edit(config, save)
     model, runtime = runner._resolve_session_agent_runtime(session_key="held-default")
@@ -310,7 +306,7 @@ def test_gateway_default_and_reasoning_pin(config_file):
 def test_local_policy_explicit_reasoning_beats_alias(config_file):
     from gateway.session_policy import build_policy
     _home, config, save = config_file
-    policy = build_policy({"source": "cli", "model": "alias:work", "reasoning": "medium"}, config, profile_terminal=False)
+    policy = build_policy({"source": "cli", "model": "alias:work", "reasoning": "medium"}, config, profile_terminal=False, private_secrets={})
     assert policy.reasoning_config == parse_reasoning_effort("medium")
     _edit(config, save)
     assert policy.reasoning_config == parse_reasoning_effort("medium")
@@ -342,3 +338,13 @@ def test_nested_inherit_and_unmatched_runtime_parity(config_file):
     plain = _launch(parent)
     for field in ("model", "provider", "base_url", "api_key", "api_mode", "reasoning_config", "fallback_model", "request_overrides"):
         assert getattr(routed, field) == getattr(plain, field)
+
+
+@pytest.mark.parametrize("definition", [None, {}, {"model": ""}, {"model": "alias:work"}])
+def test_malformed_alias_never_uses_same_named_builtin(config_file, definition):
+    from hermes_cli.live_model_aliases import resolve_live_alias
+    _home, config, save = config_file
+    config["model_aliases"]["opus"] = definition
+    save()
+    with pytest.raises(ValueError, match="expected a concrete model"):
+        resolve_live_alias("alias:opus")
