@@ -3054,6 +3054,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             self._clear_session_env(_session_env_tokens)
             return t("gateway.errors.history_unavailable"), _session_env_tokens
 
+        # Hygiene may have started its worker during this very turn and released
+        # the inline wait without releasing the compression lock. Do not enter
+        # preflight on the old transcript or consume the input as a retry notice.
+        if await self._defer_compression_locked_event(session_key, event, prepend=True):
+            self._clear_session_env(_session_env_tokens)
+            return None, _session_env_tokens
+
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, internal=event.internal)
 
         # Voice channel state rides the user message ONLY when changed (in the system prompt it
