@@ -159,10 +159,9 @@ def test_explicit_replace_drops_only_named_candidate(installed):
     assert update_cmd._post_swap_argv_tail(args) == ["--replace-candidate", installed.live]
 
 
-@pytest.mark.parametrize("replacement", ["wrong", "short", "uppercase"])
+@pytest.mark.parametrize("replacement", ["wrong", "short"])
 def test_replacement_must_name_exact_live_candidate(installed, replacement):
-    value = {"wrong": installed.base, "short": installed.live[:12],
-             "uppercase": installed.live.upper()}[replacement]
+    value = {"wrong": installed.base, "short": installed.live[:12]}[replacement]
     with pytest.raises(SystemExit):
         apply(installed, "--replace-candidate", value)
     assert installed.handed == []
@@ -182,3 +181,82 @@ def test_merged_or_contained_live_keeps_bare_target(installed, already_in):
     active = apply(installed)
     assert active.name == installed.target
     assert "carried_candidates" not in update_receipt._current.get().data
+
+
+@pytest.mark.parametrize("landing", ["squash", "merge", "squash-deleted-branch"])
+def test_carried_candidate_landing_returns_to_published_target(installed, landing):
+    combined = apply(installed)
+    # Carry over a second main advance too, so synthetic ancestry cannot leak in.
+    commit_file(installed.source, "later.txt", "later main change\n")
+    git(installed.source, "fetch", ".", "main")
+    combined = apply(installed)
+    if landing.startswith("squash"):
+        git(installed.source, "merge", "--squash", "candidate")
+        git(installed.source, "commit", "-m", "squash candidate")
+        if landing == "squash-deleted-branch":
+            git(installed.source, "branch", "-D", "candidate")
+    else:
+        git(installed.source, "merge", "--no-edit", "candidate")
+    target = git(installed.source, "rev-parse", "HEAD")
+    git(installed.source, "update-ref", "refs/remotes/origin/main", target)
+    git(installed.source, "fetch", ".", "main")
+    assert apply(installed).name == target
+    assert (releases.read_pointer(installed.home / "previous")).name == combined.name
+    assert git(installed.source, "status", "--porcelain") == ""
+
+
+def test_uppercase_replacement_names_the_same_commit(installed):
+    assert apply(installed, "--replace-candidate", installed.live.upper()).name == installed.target
+    assert update_receipt._current.get().data["replaced_candidate"] == installed.live
+
+
+@pytest.mark.parametrize("carried", [False, True])
+@pytest.mark.parametrize("revision", ["amend", "rebase"])
+def test_rewritten_named_candidate_refuses_stale_resurrection(installed, capsys, carried, revision):
+    # Receipts from the existing updater retain argv and exact release transition.
+    receipts = installed.home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True, exist_ok=True)
+    (receipts / "update_original.json").write_text(json.dumps({
+        "argv": ["hermes", "update", "--branch", "candidate"],
+        "release_transition": {"to_sha": installed.live}, "started_at": "2026-10-23",
+    }))
+    git(installed.source, "remote", "add", "origin", ".")
+    active = apply(installed) if carried else releases.read_pointer(installed.home / "current")
+    if carried:
+        assert json.loads((active / "install-stamp.json").read_text())["sourceBranch"] == "candidate"
+        (receipts / "update_original.json").unlink()
+    git(installed.source, "switch", "candidate")
+    git(installed.source, "reset", "--hard", installed.base if revision == "amend" else installed.target)
+    reviewed = commit_file(installed.source, "reviewed.txt", "replacement without removed candidate code\n")
+    git(installed.source, "switch", "main")
+    git(installed.source, "merge", "--no-edit", "candidate")
+    target = git(installed.source, "rev-parse", "HEAD")
+    git(installed.source, "fetch", ".", "main")
+    # An exact head refresh must not rely on the stale remote tracking branch.
+    git(installed.source, "update-ref", "refs/remotes/origin/candidate", installed.live)
+    installed.handed.clear()
+    with pytest.raises(SystemExit) as stopped:
+        apply(installed)
+    assert stopped.value.code == 2
+    assert releases.read_pointer(installed.home / "current") == active
+    assert installed.handed == []
+    out = capsys.readouterr().out
+    assert installed.live in out and reviewed in out and "--replace-candidate" in out
+    assert apply(installed, "--replace-candidate", active.name).name == target
+    assert not (releases.read_pointer(installed.home / "current") / "candidate.txt").exists()
+
+
+def test_activation_prunes_unneeded_carry_refs_but_retains_rollback(installed):
+    (installed.home / "release-layout.json").write_text(json.dumps({"source": str(installed.source)}))
+    first = apply(installed)
+    commit_file(installed.source, "later.txt", "second target\n")
+    git(installed.source, "fetch", ".", "main")
+    second = apply(installed)
+    commit_file(installed.source, "later.txt", "third target\n")
+    git(installed.source, "fetch", ".", "main")
+    third = apply(installed)
+    refs = git(installed.source, "for-each-ref", "--format=%(objectname)", "refs/hermes/carry-forward/").split()
+    assert set(refs) == {second.name, third.name}
+    assert first.name not in refs
+    releases.activate_release(installed.home, second, operation="rollback")
+    assert set(git(installed.source, "for-each-ref", "--format=%(objectname)", "refs/hermes/carry-forward/").split()) == {second.name, third.name}
