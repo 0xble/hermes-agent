@@ -159,6 +159,26 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - **Retirement:** Retire only after the selected released upstream contains the
   equivalent behavior and the regression passes there without the local implementation.
 
+## Desktop hand-off timeout test reads a PID file that may never exist
+
+- Fork patch identity: `desktop-handoff-timeout-readiness`.
+- `a timed-out hand-off kills the real script tree it spawned` in
+  `apps/desktop/electron/updater/checkout-handoff.test.ts` started a real
+  `bash` launcher and then read the PID file its background child writes. Nothing
+  ordered that write before the 600 ms claim deadline. On a loaded host the
+  Desktop correctly killed the launcher's process group first, the file was never
+  written, and the test failed with `ENOENT` before either process-death
+  assertion ran. A discriminating probe reproduced the exact failure by delaying
+  shell startup past the deadline while cleanup stayed correct.
+- The spawn stand-in now returns only after the real tree has published its
+  PID. The production deadline, the `updater-spawn-failed` and absent-marker
+  assertions, and both process-death assertions are unchanged. Stubbing
+  `killHandoffTree` still fails the test. Production code is untouched.
+- Guard: run the test through the electron project
+  (`npm run test:desktop:platforms -- electron/updater/checkout-handoff.test.ts`).
+- Retire when upstream's copy of this test establishes the tree before the
+  deadline with equivalent cleanup assertions.
+
 ## Launchd restart tests depend on the host gateway
 
 - Fork patch identity: `launchd-restart-test-isolation`.
