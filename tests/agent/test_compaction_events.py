@@ -561,4 +561,3 @@ def test_publication_failure_does_not_select_another_summary_model(published, tm
         assert db.get_messages(agent.session_id) == []
     finally:
         db.close()
-
