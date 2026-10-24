@@ -70,5 +70,13 @@ the fetched-code route. Exercise a stored passkey login when the browser offers 
 
 This patch is a private policy choice and is not expected upstream. Retire it when upstream
 satisfies the complete secret-entry and supported-approval routing contract, or the owner
-explicitly changes that contract. Revert the affected `Fork-Patch: agent-secret-entry` commit
-to roll back, including its synchronized guidance, tests, and maintenance record.
+explicitly changes that contract. Use `Fork-Patch: agent-secret-entry` to discover rollback
+candidates, then inspect their diffs against the Surfaces above before reverting the relevant
+guidance, tests, and maintenance record.
+
+[6b6058a89b10aacbd25be2b4e0d5d99e944c6be8](https://github.com/0xble/hermes-agent/commit/6b6058a89b10aacbd25be2b4e0d5d99e944c6be8)
+carries an unrelated `Fork-Patch: agent-secret-entry` trailer. Its entire diff is the state DB
+preflight race fix, its regressions, and the [nightly regression unit](nightly-regression-0926b.md),
+owned by `nightly-regression-0926b`. Exclude that commit from secret-entry rollback so the
+quarantine/recreated-path fix remains intact. This ownership correction does not rewrite
+merged commit metadata.
