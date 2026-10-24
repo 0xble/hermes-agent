@@ -85,6 +85,20 @@ def _print_first_line(text: str) -> None:
         print(f"  {text.strip().splitlines()[0]}")
 
 
+def _track_preparation_moves(checkout_move):
+    """Prove early failures leave source alone, invalidating that proof before any cleanup writes."""
+    from hermes_cli.update_cmd_git import _no_move
+    from hermes_cli.update_receipt import record_step
+
+    _record_stash_disposition("not_needed", "", "checkout preparation has not touched source files")
+
+    def move(*targets, **bound):
+        record_step("local_changes_stash", False, "checkout preparation may have changed source files", replace=True)
+        return (checkout_move or _no_move)(*targets, **bound)
+
+    return move
+
+
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path, *, checkout_move=None) -> Optional[str]:
     """Stash local changes before the update moves the checkout; the stash commit, or None when clean.
     ``checkout_move`` binds the push (and its cleanup reset) to the paused gateways' tree gate."""
@@ -179,9 +193,20 @@ def _clear_pending_autostash() -> None:
 
 
 def _record_pending_autostash() -> None:
-    """Receipt close must name parked work without suppressing its stdout notice."""
-    if _pending_autostash is not None:
-        _record_stash_disposition("parked", _pending_autostash[0], "update stopped without a confirmed restore")
+    """Receipt close must name parked work without losing an already-recorded cause."""
+    from hermes_cli.update_receipt import _current
+
+    if _pending_autostash is None:
+        return
+    stash = _pending_autostash[0]
+    current = _current.get()
+    steps = current.data["steps"] if current is not None else []
+    latest = next((s for s in reversed(steps) if s["name"] == "local_changes_stash"), {})
+    detail = latest.get("detail", "")
+    prefix = f"parked: {stash} ("
+    if detail.startswith(prefix) and detail.endswith(")") and detail != f"{prefix}restore pending)":
+        return
+    _record_stash_disposition("parked", stash, "update stopped without a confirmed restore")
 
 
 def _unrestored_autostash_notice() -> Optional[str]:
@@ -260,7 +285,7 @@ def _record_stash_disposition(outcome: str, stash_ref: str, detail: str = "", *,
     record_step(
         "local_changes_stash",
         outcome != "parked",
-        f"{outcome}: {stash_ref}" + (f" ({detail})" if detail else ""),
+        f"{outcome}: " + (f"{stash_ref} ({detail})" if stash_ref and detail else stash_ref or detail),
         replace=True,
     )
 

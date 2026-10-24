@@ -75,6 +75,65 @@ async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
     assert not (tmp_path / ".update_pending.json").exists()
 
 
+@pytest.mark.parametrize("local_work", ["clean", "edits", "lockfile-churn"])
+def test_fetch_failure_proves_unchanged_only_before_source_cleanup(
+    update_tree, tmp_path, monkeypatch, local_work,
+):
+    from hermes_cli import update_cmd, update_receipt
+    from tests.hermes_cli.test_update_target_identity import git
+
+    source = update_tree.clone
+    git(source, "checkout", "-q", "main")
+    if local_work == "lockfile-churn":
+        (source / "package-lock.json").write_text("{}\n")
+        git(source, "add", "package-lock.json")
+        git(source, "-c", "commit.gpgsign=false", "commit", "-qm", "lockfile")
+        (source / "package-lock.json").write_text('{"lockfileVersion": 3}\n')
+    elif local_work == "edits":
+        (source / "content.txt").write_text("local edits\n")
+    sha = git(source, "rev-parse", "HEAD")
+    before = git(source, "diff")
+    home = tmp_path / "home"
+    home.mkdir()
+    request = pending(home, reason=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_receipt, "_receipt_dir", lambda: home / "logs/update_receipts")
+    monkeypatch.setattr(update_receipt, "_code_identity", lambda **_: {"sha": git(source, "rev-parse", "HEAD")})
+    monkeypatch.setattr("gateway.update_notifications.__file__", str(source / "gateway/update_notifications.py"))
+    update_tree.args.channel = "main"
+    run_git = update_cmd._git_run
+
+    def fail_fetch(cmd, args, *a, **kw):
+        if args[0] == "fetch":
+            return subprocess.CompletedProcess([*cmd, *args], 1, stdout="", stderr="fatal: fetch failed")
+        return run_git(cmd, args, *a, **kw)
+
+    monkeypatch.setattr(update_cmd, "_git_run", fail_fetch)
+    with update_receipt.update_receipt_scope():
+        with pytest.raises(SystemExit) as exc:
+            update_cmd._cmd_update_impl(update_tree.args, gateway_mode=False)
+        assert exc.value.code == 1
+        path = update_receipt.finalize_update_receipt("failed", stop_reason="sys.exit(1)")
+    assert path is not None
+    receipt = json.loads(path.read_text())
+    assert receipt["pre_update"]["sha"] == receipt["post_update"]["sha"] == sha
+    assert receipt["stop_class"] == "fetch_failed"
+    assert git(source, "rev-parse", "HEAD") == sha
+    (home / ".update_process_exit_code").write_text("1")
+    outcome = final_outcome(home, request)
+    assert outcome is not None
+    success, detail = outcome
+    assert success is False
+    assert "Cause: fetch_failed" in detail
+    if local_work == "lockfile-churn":
+        assert git(source, "diff") != before
+        assert "Nothing changed" not in detail
+        assert "Runtime state is unverified" in detail
+    else:
+        assert git(source, "diff") == before
+        assert detail == f"Nothing changed. Still on {sha[:12]}. Cause: fetch_failed"
+
+
 @pytest.mark.parametrize("dirty", [False, True])
 def test_immutable_build_failure_has_untouched_source_proof(update_tree, tmp_path, monkeypatch, dirty):
     from tests.hermes_cli.test_update_target_identity import git
