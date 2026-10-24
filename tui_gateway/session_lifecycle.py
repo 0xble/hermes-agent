@@ -1005,14 +1005,12 @@ def _schedule_ws_orphan_reap(
 
 
 def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect") -> tuple[int, int]:
-    """Single WS-disconnect teardown entry point: reap close_on_disconnect sessions (sidecar/dashboard) immediately;
-    re-point the rest at the detached transport (later emits miss the dead socket) for the grace-windowed WS-orphan
-    reaper. Returns ``(reaped, detached)`` counts.
+    """Detach a departing WS peer from every session, preserving other viewers' streams.
 
-    Multi-client fan-out: the departing transport is DETACHED from every session first. A session that still has
-    another client attached keeps streaming and is neither parked nor reaped — a watcher leaving must not end the
-    turn the remaining client is reading. Only the sessions left clientless take the historical
-    close_on_disconnect / park-sentinel path, so a single-client disconnect behaves exactly as it always has."""
+    Clientless close_on_disconnect sessions are reaped immediately. The rest keep
+    their empty mailbox through the WS-orphan grace window and any reconnect.
+    Returns ``(reaped, detached)`` counts.
+    """
     clientless = _detach_transport_from_sessions(transport)
     reaped = detached = 0
     for sid, session in clientless:
@@ -1039,9 +1037,8 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
             if current.get("close_on_disconnect"):
                 claimed_for_teardown = _pop_session_by_id(sid)
             else:
-                # Point at the drop sentinel (NOT real stdio) so _ws_session_is_orphaned recognizes it; standalone
-                # `hermes --tui` keeps real _stdio. UNLESS another window (pop-out viewer) still shows the session:
-                # re-bind to the most recent surviving viewer instead.
+                # Attach any surviving legacy viewer to the stable mailbox.
+                # A disconnected WebSocket must never fall back to process stdio.
                 viewers = current.get("viewers") or {}
                 # See #83716.
                 viewers.pop(transport, None)
@@ -1063,22 +1060,6 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
         elif should_schedule_reap:
             detached += 1
     return reaped, detached
-
-
-def _shutdown_live_sessions() -> None:
-    # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
-    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
-        with contextlib.suppress(Exception):
-            step()
-    with _sessions_lock:
-        sessions = list(_sessions.items())
-    for sid, _session in sessions:
-        _close_session_by_id(sid, end_reason="tui_shutdown")
-    # Session events now use daemon mailbox writers even on stdio. A graceful
-    # exit must wait for final admitted frames rather than lose them at exit.
-    for _sid, session in sessions:
-        if isinstance(publisher := session.get("transport"), FanoutTransport):
-            publisher.flush()
 
 
 def register(server) -> None:

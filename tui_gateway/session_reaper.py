@@ -528,6 +528,22 @@ def _schedule_startup_orphan_sweep() -> None:
         _WS_ORPHAN_REAP_GRACE_S, _sweep_orphaned_session_rows, "startup orphan session sweep failed", level="warning")
 
 
+def _shutdown_live_sessions() -> None:
+    # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
+    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
+        with contextlib.suppress(Exception):
+            step()
+    with _sessions_lock:
+        sessions = list(_sessions.items())
+    for sid, _session in sessions:
+        _close_session_by_id(sid, end_reason="tui_shutdown")
+    # Session events now use daemon mailbox writers even on stdio. A graceful
+    # exit must wait for final admitted frames rather than lose them at exit.
+    for _sid, session in sessions:
+        if isinstance(publisher := session.get("transport"), FanoutTransport):
+            publisher.flush()
+
+
 def register(server) -> None:
     """Publish this module's helpers onto ``server``, rebound to its globals."""
     bind_module(globals(), server, skip=("_",))
