@@ -166,6 +166,10 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     fail fast). Subclassing keeps every existing handler working."""
 
 
+class CompressionLeaseLostError(SessionCompressionInProgressError):
+    """This publication lost its holder. Waiting cannot revive the old snapshot."""
+
+
 class SessionTurnLeaseLostError(RuntimeError):
     """A transcript write presented a turn-lease holder that no longer owns it.
     Fail-fast fencing (no ``_execute_write`` retry): a later writer may already

@@ -21,7 +21,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
     db.create_session("synthetic", "cli")
     conn = db._conn
     assert db._db_sidecar_identity and path.with_name(path.name + "-wal").exists()
-    lock, close, guard = db._lock, db._close_connection_quietly, db._raise_if_db_replaced
+    lock, close = db._lock, db._close_connection_quietly
     closed, progress, second = threading.Event(), threading.Event(), threading.Event()
     calls = 0
     errors = []
@@ -33,25 +33,35 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
 
     class ObservedLock:
         def __enter__(self):
-            if is_writer():
-                progress.set()
-            lock.acquire()
+            self.acquire()
             return self
 
-        def __exit__(self, *args):
-            lock.release()
-            if is_writer() and entry == "error_branch" and calls == 1:
-                second.set()
-
-    def observed_guard():
-        nonlocal calls
-        if is_writer():
-            calls += 1
-        try:
-            return guard()
-        finally:
+        def acquire(self, blocking=True, timeout=-1):
             if is_writer():
                 progress.set()
+            return lock.acquire(blocking=blocking, timeout=timeout)
+
+        def __exit__(self, *args):
+            self.release()
+
+        def release(self):
+            lock.release()
+            if is_writer() and entry == "error_branch" and not second.is_set():
+                progress.clear()
+                second.set()
+                assert closed.wait(10), "close did not reach its teardown window"
+
+    def observe_guard(guard):
+        def observed_guard():
+            nonlocal calls
+            if is_writer():
+                calls += 1
+            try:
+                return guard()
+            finally:
+                if is_writer():
+                    progress.set()
+        return observed_guard
 
     def paused_close(connection):
         close(connection)
@@ -62,7 +72,10 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
 
     monkeypatch.setattr(db, "_lock", ObservedLock())
     monkeypatch.setattr(db, "_close_connection_quietly", paused_close)
-    monkeypatch.setattr(db, "_raise_if_db_replaced", observed_guard)
+    # Normal writers use the cached generation check, SQLite-error recovery the
+    # full probe. Both must observe the stable state under the same writer lock.
+    for name in ("_raise_if_db_replaced", "_raise_if_db_generation_flagged"):
+        monkeypatch.setattr(db, name, observe_guard(getattr(db, name)))
 
     def closer():
         try:
