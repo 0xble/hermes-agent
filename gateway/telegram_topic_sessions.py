@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import html
 import logging
+import re
+import textwrap
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -249,6 +252,41 @@ async def _apply_session_settings(
     }
 
 
+async def _session_settings_readback(runner, dest: SessionSource, entry, selection) -> dict[str, Any]:
+    """Optional inspection must not turn a successful topic mutation into a retry."""
+    from gateway.run import _load_gateway_config
+    from gateway.run_session_readback import read_session_settings
+
+    readback = {
+        "model": None, "provider": None, "effective_model": None,
+        "effective_provider": None, "effective_effort": None, "warnings": [],
+    }
+    if selection is not None and not (isinstance(selection, tuple) and selection[0] == "role"):
+        _ctx, result = selection
+        readback.update(model=result.new_model, provider=result.target_provider)
+    try:
+        if isinstance(selection, tuple) and selection and selection[0] == "role":
+            route = await asyncio.to_thread(_resolve_topic_model_ref, "@" + selection[1], dest, runner)
+            readback.update(model=route.model, provider=route.provider)
+        async with runner._async_profile_scope_for_source(dest):
+            profile_home = runner._profile_scope_key_for_source(dest)
+            user_config = await asyncio.to_thread(
+                _load_gateway_config, *([profile_home / "config.yaml"] if profile_home is not None else []),
+            )
+            effective_model, runtime, reasoning = await read_session_settings(
+                runner, source=dest, session_key=entry.session_key, user_config=user_config,
+            )
+            readback.update(
+                effective_model=effective_model, effective_provider=runtime.get("provider") or None,
+                effective_effort=_reasoning_effort(reasoning or {}),
+            )
+    except Exception:
+        logger.warning("Topic %s settings readback failed after successful changes", dest.thread_id, exc_info=True)
+        readback.update(effective_model=None, effective_provider=None, effective_effort=None)
+        readback["warnings"].append("Topic changes succeeded, but settings readback is unavailable.")
+    return readback
+
+
 async def _origin_line(runner, adapter, source: SessionSource) -> str:
     """Build the caller-owned origin line for a topic opening brief.
 
@@ -311,8 +349,79 @@ async def _origin_line(runner, adapter, source: SessionSource) -> str:
     return f"Split from [{label}]({link})"
 
 
-async def _deliver_brief(adapter, dest: SessionSource, brief: str, origin_line: str = "") -> None:
-    """Show the origin and brief in the topic, then admit the same text as the session's first turn.
+def _opening_brief_display(brief: str, title: str, origin_line: str) -> str:
+    """Bound the visible preview, not the brief that the new session receives.
+
+    Relay-style ``title\nobjective\n---`` is a multiline setext heading. Never
+    send that envelope directly: rich paragraph spacers can pull even the origin
+    into its heading. Parse before transport shaping, then give the title its
+    own paragraph and keep the complete authored brief behind a native toggle.
+    """
+    from markdown_it import MarkdownIt
+
+    parser = MarkdownIt()
+    blocks = parser.parse(brief)
+    paragraphs = [t for t in blocks if t.type == "inline" and t.level == 1]
+
+    def plain(text: str) -> str:
+        children = parser.parseInline(text)[0].children or []
+        return "".join(
+            " " if t.type in {"softbreak", "hardbreak"} else t.content
+            for t in children if t.type in {"text", "code_inline", "image", "softbreak", "hardbreak"}
+        ).strip()
+
+    def excerpt(text: str, width: int) -> str:
+        shortened = textwrap.shorten(plain(text), width=width, placeholder="…")
+        # Excerpts are plain text. Cutting a code span/link/emphasis mid-way must
+        # not leak formatting into the next paragraph or toggle.
+        return re.sub(r"([\\`*_\[\]<>])", r"\\\1", shortened)
+
+    next_action = re.compile(r"Next(?: action)?:\s*(.*)", re.IGNORECASE)
+
+    def split_next_action(text: str) -> tuple[str, str]:
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            if next_action.match(plain(line)):
+                # The label starts on this line, but Markdown soft/hard breaks
+                # can continue the action through the rest of its paragraph.
+                match = next_action.match(plain("\n".join(lines[index:])))
+                return "\n".join(lines[:index]), match.group(1).strip() if match else ""
+        return text, ""
+
+    objective = paragraphs[0].content if paragraphs else ""
+    if blocks and blocks[0].type == "heading_open" and paragraphs:
+        title, _, objective = paragraphs[0].content.partition("\n")
+        if not objective and len(paragraphs) > 1:
+            objective = paragraphs[1].content
+    elif paragraphs:
+        first_line, _, remainder = objective.partition("\n")
+        # A plain or emphasized title is still a paragraph to Markdown. It is
+        # the envelope title, not an objective to repeat beneath that title.
+        if plain(first_line).casefold() == plain(title).casefold():
+            objective = remainder or (paragraphs[1].content if len(paragraphs) > 1 else "")
+    objective, _ = split_next_action(objective)
+
+    preview = [f"**{excerpt(title, 100)}**"]
+    if objective:
+        preview.append(excerpt(objective, 280))
+    for paragraph in paragraphs:
+        _, action = split_next_action(paragraph.content)
+        if action:
+            action = re.split(r"(?<=[.!?])\s+", action, maxsplit=1)[0]
+            preview.append(f"▸ Next: {excerpt(action, 160)}")
+            break
+
+    # Keep nested/literal disclosure tags from closing our toggle early. Their
+    # text remains available, and the session still receives the original bytes.
+    details = re.sub(r"</?(?:details|summary)\b[^>]*>", lambda m: html.escape(m[0]), brief, flags=re.IGNORECASE)
+    preview.append(f"<details>\n<summary>Details</summary>\n\n{details}\n\n</details>")
+    if origin_line:
+        preview.append(f"*{origin_line}*")
+    return "\n\n".join(preview)
+
+
+async def _deliver_brief(adapter, dest: SessionSource, brief: str, origin_line: str = "", *, title: str = "Opening brief") -> None:
+    """Show a compact preview, then admit the complete original brief as the first turn.
     The turn is internal (the calling session already holds the user's authority) and never a
     gateway command, so a brief starting with ``/`` is read as text. A brief that could not be
     shown is not admitted, so the session never works from a brief the user cannot see; the caller
@@ -325,15 +434,16 @@ async def _deliver_brief(adapter, dest: SessionSource, brief: str, origin_line: 
     paused = paused_reply()
     if paused is not None:
         raise RuntimeError(paused)
-    shown_brief = f"{origin_line}\n\n{brief}" if origin_line else brief
+    session_brief = f"{origin_line}\n\n{brief}" if origin_line else brief
+    shown_brief = _opening_brief_display(brief, title, origin_line)
     sent = await adapter.send(str(dest.chat_id), shown_brief,
-                              metadata={"thread_id": str(dest.thread_id)})
+                              metadata={"thread_id": str(dest.thread_id), "rich_fallback_content": session_brief})
     if not getattr(sent, "success", False):
         raise RuntimeError(getattr(sent, "error", None) or "Telegram did not accept the message")
     # Anchor the turn on the shown brief, as a typed message anchors its own turn, so the session's
     # replies thread under it instead of relying on the anchor-less synthetic-send fallback.
     anchor = str(sent.message_id) if getattr(sent, "message_id", None) else None
-    event = MessageEvent(text=shown_brief, message_type=MessageType.TEXT, source=replace_source(dest, message_id=anchor),
+    event = MessageEvent(text=session_brief, message_type=MessageType.TEXT, source=replace_source(dest, message_id=anchor),
                          message_id=anchor, internal=True, allow_gateway_control=False,
                          metadata={"notification_category": "result"})
     await admit_internal_event(adapter, event)
@@ -416,49 +526,21 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
     if brief:
         try:
             origin_line = await _origin_line(runner, adapter, source)
-            await _deliver_brief(adapter, dest, brief, origin_line)
+            await _deliver_brief(adapter, dest, brief, origin_line, title=name)
         except Exception as exc:
             logger.warning("Opening brief for topic %s was not delivered", thread_id, exc_info=True)
             raise TopicRequestError(
                 f"Topic {thread_id} and session {entry.session_id} are set up, but the opening brief "
                 f"was not delivered: {exc}. Send it with relay to {relay}.") from exc
-    profile_home = None
-    if model and isinstance(model, tuple) and model and model[0] == "role":
-        route = _resolve_topic_model_ref("@" + model[1], dest, runner)
-        effective_model, effective_provider = route.model, route.provider
-        # The role was resolved from the routed profile; the reasoning readback
-        # must use that same profile, not the launch profile.
-        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
-                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
-            profile_home = runner._resolve_profile_home_for_source(dest)
-    else:
-        effective_model = getattr(model[1], "new_model", None) if model else None
-        effective_provider = getattr(model[1], "target_provider", None) if model else None
-        if model:
-            profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
-        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
-                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
-            profile_home = runner._resolve_profile_home_for_source(dest)
-        with_context = getattr(runner, "_model_switch_context", None)
-        if callable(with_context):
-            effective = with_context(
-                dest, entry.session_key, profile_home=profile_home, persist_global=False,
-            )
-            effective_model = effective.current_model
-            effective_provider = effective.current_provider
-    effective_config = runner._resolve_session_reasoning_config(
-        source=dest, session_key=entry.session_key, model=effective_model or "",
-        profile_home=profile_home,
-    )
+    readback = await _session_settings_readback(runner, dest, entry, model)
+    warnings.extend(readback.pop("warnings"))
     return {
         "action": "create", "thread_id": str(thread_id), "session_id": entry.session_id,
         "relay": relay, "title": title,
-        "icon": spec.icon if icon_id else None, "model": effective_model,
-        "provider": effective_provider,
+        "icon": spec.icon if icon_id else None,
         "reasoning": effort, "brief_delivered": bool(brief), "warnings": warnings,
         "model_status": settings["model_status"], "reasoning_status": settings["reasoning_status"],
-        "effective_model": effective_model, "effective_provider": effective_provider,
-        "effective_effort": _reasoning_effort(effective_config),
+        **readback,
         "model_effective_when": settings["model_effective_when"],
         "reasoning_effective_when": settings["reasoning_effective_when"],
     }
@@ -507,42 +589,15 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
             runner, dest, entry, model, effort, reasoning_reset=reasoning_reset,
         )
         warnings = settings["warnings"]
-    profile_home = None
-    if model and isinstance(model, tuple) and model and model[0] == "role":
-        route = _resolve_topic_model_ref("@" + model[1], dest, runner)
-        effective_model, effective_provider = route.model, route.provider
-        # The role was resolved from the routed profile; the reasoning readback
-        # must use that same profile, not the launch profile.
-        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
-                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
-            profile_home = runner._resolve_profile_home_for_source(dest)
-    else:
-        effective_model = getattr(model[1], "new_model", None) if model else None
-        effective_provider = getattr(model[1], "target_provider", None) if model else None
-        if model:
-            profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
-        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
-                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
-            profile_home = runner._resolve_profile_home_for_source(dest)
-        effective_ctx = runner._model_switch_context(
-            dest, entry.session_key, profile_home=profile_home, persist_global=False,
-        )
-        effective_model = effective_ctx.current_model
-        effective_provider = effective_ctx.current_provider
-    effective_config = runner._resolve_session_reasoning_config(
-        source=dest, session_key=entry.session_key, model=effective_model or "",
-        profile_home=profile_home,
-    )
+    readback = await _session_settings_readback(runner, dest, entry, model)
+    warnings.extend(readback.pop("warnings"))
     return {
         "action": "edit", "thread_id": thread_id, "session_id": entry.session_id,
         "relay": relay_address(runner, source, entry.session_id), "name": name, "title": title,
         "icon": spec.icon if icon_id else None,
-        "model": effective_model,
-        "provider": effective_provider,
         "reasoning": effort, "warnings": warnings,
         "model_status": settings["model_status"], "reasoning_status": settings["reasoning_status"],
-        "effective_model": effective_model, "effective_provider": effective_provider,
-        "effective_effort": _reasoning_effort(effective_config),
+        **readback,
         "model_effective_when": settings["model_effective_when"],
         "reasoning_effective_when": settings["reasoning_effective_when"],
     }

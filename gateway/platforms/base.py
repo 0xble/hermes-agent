@@ -3995,25 +3995,15 @@ class BasePlatformAdapter(ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
-        returned: dict[str, SendResult] = {}
-        try:
-            result = await self._send_with_retry_body(
-                chat_id, content, reply_to=reply_to, metadata=metadata,
-                max_retries=max_retries, base_delay=base_delay)
-            returned["result"] = result
-            return result
-        finally:
-            # A queued follow-up, /stop, or preemption cancels this task while the platform
-            # call is in flight. Python raises that cancel at this return, so the caller
-            # never sees the result and the ledger write after the send is skipped. A result
-            # already returned successfully is not ambiguous. A cancel that aborts the body, or
-            # a failed result, leaves the row 'attempting' for the duplicate-marked sweep.
-            captured = returned.get("result")
-            task = asyncio.current_task()
-            pending = _PENDING_LEDGER_SETTLEMENT.get()
-            if (pending is not None and captured is not None and getattr(captured, "success", False)
-                    and task is not None and task.cancelling()):
+        result = await self._send_with_retry_body(
+            chat_id, content, reply_to=reply_to, metadata=metadata,
+            max_retries=max_retries, base_delay=base_delay)
+        task = asyncio.current_task()
+        pending = _PENDING_LEDGER_SETTLEMENT.get()
+        if pending is not None and task is not None and task.cancelling():
+            if getattr(result, "success", False):
                 self._settle_delivered_obligation_sync(pending[0])
+        return result
 
     async def _send_with_retry_body(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
@@ -4251,7 +4241,13 @@ class BasePlatformAdapter(ABC):
         return result
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
-        """Return True when two text debounce events came from the same sender."""
+        """Batch only unadmitted human text from the same sender."""
+        from gateway.platforms.event import _is_human_event
+
+        if not all(_is_human_event(candidate) and not candidate.is_command()
+                   and not getattr(candidate, "_gateway_compression_deferred", False)
+                   for candidate in (existing, event)):
+            return False
 
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
@@ -4520,6 +4516,20 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
+        # Retirement admission precedes busy/debounce queues. The runner repeats
+        # this check when draining prompts queued before retirement was requested.
+        runner = self.gateway_runner
+        if runner is not None and self.platform == Platform.TELEGRAM:
+            from gateway.telegram_retire import intercept
+            if self._is_sender_authorized(event.source.user_id, event.source.chat_type,
+                                          event.source.chat_id, thread_id=event.source.thread_id) is True:
+                notice = await intercept(runner, event)
+                if notice is not None:
+                    await self.send(str(event.source.chat_id), notice, metadata=_thread_metadata_for_event(event))
+                    event._gateway_accepted = True
+                    from gateway.telegram_retire import advance
+                    await advance(runner, event.source)
+                    return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
@@ -4922,11 +4932,9 @@ class BasePlatformAdapter(ABC):
             # The ledger now owns the crash recovery. It carries text only, so a caller with
             # attachments still to send keeps the marker until they are delivered.
             await self._release_turn_marker(event)
-        # A queued follow-up, /stop, or preemption cancels this task at the next await after
-        # Telegram has already accepted the message. That used to skip the ledger write, leaving
-        # the row 'attempting' with attempts=0 so a later boot resent a copy. The send's wrapper
-        # records a result it already returned before that cancellation propagates. A cancel that
-        # aborts the transport never produces a result, so that row stays attempting.
+        # A turn can be cancelled after transport success but before finalization. The send
+        # wrapper settles that success synchronously so recovery cannot resend it. A cancelled
+        # transport produces no result and stays attempting.
         settlement = _PENDING_LEDGER_SETTLEMENT.set(
             (obligation_id, event, delivery_adapter) if obligation_id is not None else None)
         try:
@@ -4934,6 +4942,11 @@ class BasePlatformAdapter(ABC):
                 chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         finally:
             _PENDING_LEDGER_SETTLEMENT.reset(settlement)
+        # Let records_delivery count the captured result before cancellation propagates,
+        # but suspend before refusal callbacks or a failure write can run.
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            await asyncio.sleep(0)
         if (obligation_id is None and not result.success and result.pre_send
                 and self._outbox_covers_final(event, delivery_adapter)):
             obligation_id = await self._record_delivery_obligation(
@@ -5239,9 +5252,16 @@ class BasePlatformAdapter(ABC):
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
             return
+        # A cancelled compression waiter must not resurrect itself from its visible
+        # pending slot. Shutdown spools it, while /stop and /new discard it.
+        pending = self._pending_messages.get(session_key)
+        if (current_task is not None and current_task.cancelling()
+                and pending is getattr(current_task, "_hermes_event", None)
+                and getattr(pending, "_gateway_compression_deferred", False)):
+            self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
         # A drain-deferred turn belongs to the shutdown spool, not this adapter's
         # post-turn handoff. Keep the FIFO head in its slot until shutdown flush.
-        pending = self._pending_messages.get(session_key)
         runner = getattr(self, "gateway_runner", None)
         if (getattr(pending, "_drain_deferred", False)
                 and (runner is None or getattr(runner, "_draining", False))):
@@ -5264,6 +5284,29 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(late_pending, session_key)
         elif current_task is not None and self._session_tasks.get(session_key) is current_task:
             self._cleanup_finished_session_task(session_key, interrupt_event)
+
+    async def _handle_compression_retries(
+        self, event: MessageEvent, session_key: str, interrupt_event: asyncio.Event,
+    ) -> Optional[Union[str, "EphemeralReply"]]:
+        """Keep one processing lifecycle while the same input waits for compression.
+
+        The pending slot stays visible during backoff for FIFO admission and shutdown.
+        Controls retain the existing task cancellation and guard ownership boundaries.
+        """
+        assert self._message_handler is not None
+        while True:
+            response = await self._message_handler(event)
+            if (response is not None or not getattr(event, "_gateway_compression_deferred", False)
+                    or self._pending_messages.get(session_key) is not event):
+                return response
+            if getattr(event, "_drain_deferred", False):
+                return None
+            delay = self._requeue_backoff_delay(session_key, event, event)
+            await asyncio.sleep(delay)
+            if (self._active_sessions.get(session_key) is not interrupt_event
+                    or self._pending_messages.get(session_key) is not event):
+                return None
+            self._pending_messages.pop(session_key)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
@@ -5305,7 +5348,9 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
-            response = await self._message_handler(event)
+            response = await self._handle_compression_retries(event, session_key, interrupt_event)
+            if self._pending_messages.get(session_key) is event and getattr(event, "_drain_deferred", False):
+                return  # Shutdown owns the retained input, not a completed delivery.
             bind_event_turn(event)
             delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
@@ -5429,13 +5474,18 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, delivery_generation)
+            if not (self._pending_messages.get(session_key) is event
+                    and getattr(event, "_gateway_compression_deferred", False)):
+                await self._fire_post_delivery_callback(session_key, delivery_generation)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+            if self.gateway_runner is not None and self.platform == Platform.TELEGRAM:
+                from gateway.telegram_retire import advance
+                await advance(self.gateway_runner, event.source)
 
     _REQUEUE_BACKOFF_INITIAL_SECONDS = 0.25
     # Kept at 1s: nothing wakes the back-off sleep, so a genuine message merged into the slot

@@ -1468,11 +1468,19 @@ verification, unsubscribe, invite) or carry credential-named query parameters. A
 failure titles from the text alone. Set `auxiliary.title_generation.link_context: false` to
 disable it.
 
-When the title model abstains, or its title is only a platform label, a raw ID, or a generic
-word such as `None`, `Investigation`, or `Unspecified`, the session keeps its placeholder.
-The title is retried once the turn ends, using the opening message plus a bounded excerpt of
-the assistant reply, and again after turns 2 and 3 if it still cannot tell. After turn 3 the
-best concrete title is kept. A manual `/title` always wins, and a real title is never renamed.
+A fake-IP TUN proxy needs an explicit sentinel declaration, for example
+`security.fake_ip_ranges: ['198.18.0.0/15']`. Without it, resolved benchmark addresses are
+blocked like other private/reserved targets. Declared ranges are allowed only as DNS answers,
+not literal URL hosts. Loopback, RFC 1918, link-local, CGNAT, and cloud metadata stay blocked.
+
+Bare links and attachment-only openers wait for the first reply before the title upgrade.
+Prose openers are tried immediately. If the model abstains, returns a platform label, raw ID,
+generic word (`None`, `Investigation`, `Unspecified`), or another session's title (ignoring case
+and a trailing ` #N` on the stored name only), the session keeps its placeholder and retries at the next user turn,
+not again when the current turn ends. Retries can use a bounded excerpt of the latest assistant
+reply. At turn 3, rejected model names fall back to a title derived from the current user message. Provider failures
+and truncated output use the derived fallback immediately rather than holding. A manual `/title`
+always wins, and a real title is never renamed.
 Set `auxiliary.title_generation.hold_until_reply: false` to title from the opening message only.
 
 On a `custom` main provider (llama.cpp, Ollama, vLLM, LM Studio and other self-hosted
@@ -3031,6 +3039,46 @@ delegation:
 ```
 
 **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+
+### Routes By Parent
+
+Use `delegation.by_parent` to override the normal worker route only for selected
+parent models. This example keeps the pinned sol worker route except when the
+parent's live model is the model selected by `@uncensored`:
+
+```yaml
+model_presets:
+  uncensored: {provider: custom:venice, model: abliteration-abliterated-model-large-v2}
+  delegation-sol:
+    provider: custom:codex-proxy
+    model: gpt-6.1-sol
+    reasoning_effort: high
+    fallbacks:
+      - {provider: openrouter, model: anthropic/claude-sonnet-4, reasoning_effort: medium}
+delegation:
+  model_preset: delegation-sol
+  by_parent:
+    "@uncensored": inherit
+```
+
+Keys are exact model IDs or bare `@preset` references. A preset key matches its
+resolved model ID, regardless of provider. Values are `inherit` or a bare
+`@preset` reference, such as `"@delegation-sol"`. `inherit` discards the pinned
+route settings, including its fallback chain, request overrides, and reasoning
+effort, so the child takes the parent's current route, fallback chain, and
+reasoning. A preset value replaces those settings with that preset's route.
+Operational settings such as concurrency, depth, and compression caps do not
+change. Explicit session reasoning picks retain their existing precedence.
+
+No match means the existing delegation route is unchanged. Matching uses the
+parent's **live** model, including model switches and active fallback models,
+not its startup model. Config edits apply on the next spawn without a restart.
+Nested children and plugin lifecycle launches use the same rule. An explicit
+plugin launch provider/model still wins. Internal `/review` routes bypass the
+map and keep their existing global delegation reasoning policy.
+
+Unknown presets, invalid values, and 2 keys resolving to the same model are
+configuration errors. Unrelated config saves preserve authored references.
 
 **Subagent reasoning and Fast mode:** `delegation.reasoning_effort` sets the children's default thinking level (empty = the parent's level). An explicit session pick on the parent (`/reasoning <level>`, `--reasoning`, `/model … --reasoning`) wins over it, so raising the effort for a hard task also raises it for the subagents that task spawns; a `--global` save is a configured default, not a pick. The level is clamped to what each child's route supports. With `delegation.inherit_service_tier: true`, children also inherit the parent's `/fast` mode (`fast`, `auto` or `cold`), including under a pinned `delegation.provider`: the Fast request field is derived for the child's own route, and a route without a fast mode receives none. An explicit `service_tier`/`speed` in `delegation.request_overrides` wins.
 

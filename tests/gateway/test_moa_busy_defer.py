@@ -67,7 +67,7 @@ async def test_deferred_moa_replays_through_idle_handler_and_restores_standing_o
     assert replay.text == "compare these answers"
     state = runner._session_state(key)
     assert state.conversation.model_override["provider"] == "moa"
-    assert state.conversation.one_turn_restore == {"had_override": True, "override": STANDING}
+    assert state.conversation.one_turn_restore == {"had_override": True, "override": STANDING, "scope": "session"}
 
     # The real turn finalizer restores the standing /model override.
     generation = runner._begin_session_run_generation(key)

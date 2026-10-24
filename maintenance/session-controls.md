@@ -15,6 +15,7 @@ Agents reach this primitive through the `goal_set` and `loop_set` tools, which t
 - Treat relay and gateway-authored rows as non-user text. Quotes must be whitespace-normalized, at least 12 characters, present in the latest typed user message after the gateway `[Replying to…: "…"]` pointer is stripped, and drawn from a source message no longer than 4,000 characters.
 - Refuse a quote (`user_quote_negated`) when it contains a negation token (`not`, `don't`, `never`, `no`, `shouldn't`, …) or one appears earlier in the same sentence (only `.`, `!`, `?`, `;` or a newline ends the clause). `stop` is a control verb, not a negation. Also refuse (`user_quote_qualified`) when the latest message anywhere contains a negation, a `?`, or a condition, timing or hedge word (`if`, `only`, `when`, `after`, `how`, `would`, `explain`, …), so a trailing refusal ("Clear the X goal? Not now") or a conditional or informational mention never authorizes. The control must match the quote's whole sentence, not the agent-chosen span, so one sentence naming two actions or both a goal and a loop falls back to Approve/Deny. The sentence must also be a direct instruction: optional courtesy words, the action verb, a noun phrase naming only the target, then only filler (or, for a replacement, `with`/`to` the new objective). "Keep the X goal and clear the Y goal" or "Print the text clear the X goal" never authorize. A replacement objective longer than `REPLACEMENT_MAX_CHARS` (1500) is refused outright, and approval cards show the current and proposed goal as separately bounded lines so Approve never applies text the card hid. A refused quote (stale, paraphrased, relayed, from another session, or negated) never grants quote authority. For a cross-session goal clear or replace without a quote, the session-control authority applies directly instead of creating an approval request.
 - A valid quote must also state this control (`user_quote_mismatch` otherwise): it names the kind (`goal`/`objective` or `loop`), exactly one action's verbs (clear/remove/drop…, pause/hold…, resume/continue…, replace/change/switch… for goals; stop/end/cancel…, pause, resume for loops), and, for another session, that session's id or a title no other named session shares (whole words; "Deploy v2" never names "Deploy"). A replacement's new objective stays agent-authored, so the quote binds the replace intent and the target.
+- A fresh direct removal instruction naming the stop condition, such as "Clear the stop condition" or "Please remove this stop condition now", also authorizes a self-targeted replacement that empties only `stop_when`. The instruction must consist of courtesy words, `remove`/`drop`/`delete`/`clear`, optional determiners, `stop condition`, then optional filler. Compare the objective, all other contract fields and any supplied turn budget under the same write lock. Preserve user-added subgoals for any stop-only edit, including button-approved replacements. When both a goal and a loop exist, callers must resolve which stop condition the user means before selecting a control, because this quote path does not infer referents. A removal never authorizes a nonempty replacement restriction or dropping completion criteria or hard limits in other fields. Deictic instructions such as "Remove what says this" remain in Approve/Deny: the existing quote source strips the gateway reply pointer and supplies no verified referent binding, so neither a pronoun nor assistant-authored reply text grants stop-condition authority.
 - Residual risk: quote authority is a verbatim substring matched against deterministic word sets, not an interpretation of intent. It is mitigated by using only the latest typed message, the negation and control-match checks, the full source message shown in the target-topic notice, and Approve/Deny buttons as the fallback.
 - Goal resume applies only to a `paused` goal; done, cleared, and already-active goals return `nothing_to_resume`. Pause, clear, and replace require an active or paused goal.
 - Button requests are created only for self-targeted destructive goal changes and other controls that lack a valid quote, and only for targets whose session source has an Approve/Deny surface (Telegram). Cross-session goal clear and replace without a quote never wait for a button. The base adapter's text fallback remains for safety, and the quote path still works for any routable target.
@@ -62,6 +63,55 @@ only a missing origin is permanently skipped. Offline continuations still record
 and the existing 24-hour outcome expiry bounds retries.
 
 ## Proof surface
+
+### Telegram Topic Retirement
+
+**Fork patch identity:** `telegram-topic-retire`. `/retire [topic|now|cancel]`
+and `telegram_topic`'s `retire`/`cancel_retire` actions share the profile-local
+`state_meta` record and executor in `gateway/telegram_retire.py`. Pending
+retirement gates new user work, but accepts cancellation, owner answers and
+already-owned internal completions. `now` requests interruption first.
+Retirement waits until the active turn settles before discovering obligations.
+
+`gateway/telegram_retire_work.py` discovers goals, loops, active and paused cron
+routes, background processes and watchers, durable delegations and pending
+results, and the task ledger's exact-session assignment inbox. Active task claim
+tokens cannot be moved by assignment, so they hold retirement until settlement.
+Existing tasks retain their original assigner and report recipient. Self-owned
+work reports in the destination topic. Task creation and assignment use the
+ledger APIs, with exact task/context and typed-assignment readbacks before a
+source-origin relay. This avoids both an unreportable `assigned_by != report_to`
+row and relay's self-send refusal. Stable, bounded plain-token relay keys and
+assignment reconciliation prevent duplicate offers during recovery.
+A changed session binding holds retirement for an explicit cancel/retry instead
+of guessing which session owns a compacted turn's work. The existing live
+exact-title matcher selects unambiguous subject owners. Other owners require
+1 numbered question or an explicit target topic. Receipt IDs, transfer intentions
+and verified moves persist independently of discovery, so a restart cannot
+forget an item that has already left the source inventory.
+
+Deletion requires the same generation's complete successful closing SendResult,
+including a message ID and the original thread. Partial, deferred, held,
+thread-fallback, failed or cancelled sends never authorize it. Callback execution
+alone is not evidence. A saved uncertain closing attempt is not replayed. Remote
+delete uncertainty probes the exact thread before any CLI fallback, and reads
+back absence before removing the existing topic binding and routing index entry.
+The session and transcript remain. The user CLI's exact `topic list --id` probe
+is preferred when installed. Its DM peer is the bot's dialog, not the Bot API
+user chat ID. The strict Bot API missing-thread probe serves other installations.
+An unresolved delete is quiescent, not retried by housekeeping. `/retire` or
+`/retire cancel` first probes the exact topic under the executor lock. Confirmed
+absence only cleans up its binding. Confirmed existence permits cancellation or
+a fresh generation that inventories again and requires a new closing receipt.
+An unknown result leaves the previous dispatch unresolved and never repeats it.
+
+Proof surfaces: `tests/gateway/test_telegram_retire.py` and
+`test_telegram_retire_work.py`, plus the existing topic-tool, topic-mode,
+process-registry, async-delegation and completion-delivery regression suites.
+Live validation must use disposable topics and preserve their session histories.
+Roll back the gateway/tool hooks and retirement modules together. The additive
+metadata may remain ignored by older versions. Retire this fork patch only after
+upstream provides equivalent durable handoff and delivery-before-delete behavior.
 
 Core regression tests cover quote freshness, relay rejection, target resolution, immediate controls, pending approval, atomic resolution/expiry, goal replacement, revision isolation, and loop actions. Gateway tests cover the non-blocking watcher/outbox behavior, Telegram-topic metadata, route skipping, continuation cleanup, and goal-resume admission. Telegram tests cover callback authorization, callback rendering that preserves the request text, and no-op second presses.
 

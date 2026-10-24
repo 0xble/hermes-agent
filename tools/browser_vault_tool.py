@@ -569,17 +569,17 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                                      f"the vault item's bound origin(s) ({', '.join(allowed)}).")})
     from agent.vault_origin_aliases import alias_domain_warning, alias_fill_confirmation_enabled
 
-    confirm_alias = allowed is not None and origin not in saved_origins and alias_fill_confirmation_enabled()
-    if allowed is not None and origin not in saved_origins and not confirm_alias:
-        if warning := alias_domain_warning(origin, saved_origins):
-            logger.info("%s", warning)
-    if confirm_alias:
+    alias_only = allowed is not None and origin not in saved_origins
+    if alias_only:
         alias_key = _alias_fill_key(effective_task_id, handle, origin)
         decision = _alias_fill_decision(alias_key)
         if decision == "refused":
             return json.dumps({"success": False, "error_type": "origin_alias_retry_refused",
                                "error": "Alias-origin confirmation was declined or unanswered. Do not retry."})
-        if decision is None:
+        if not alias_fill_confirmation_enabled():
+            if warning := alias_domain_warning(origin, saved_origins):
+                logger.info("%s", warning)
+        elif decision is None:
             decision = _confirm_alias_fill(raw_meta.label, origin, saved_origins)
             if decision != "accept":
                 _record_alias_fill_decision(alias_key, "refused")
@@ -599,8 +599,12 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     otp_controls = classify_otp_controls([LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)])
     if not otp_controls:
         return json.dumps({"success": False, "error_type": "no_code_field",
-                           "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or "
-                                     "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
+                           "error": ("No one-time-code field on the current page. If the site wants a passkey, use a "
+                                     "stored 1Password passkey through the canonical-origin browser/system prompt for the "
+                                     "intended identity. For an approval, try the issuer's web or desktop path, then an "
+                                     "email/SMS code or a 1Password TOTP or passkey. Never use iPhone Mirroring. A phone-only "
+                                     "approval, a passkey not in 1Password, a Touch ID or Face ID sensor read, or a hardware "
+                                     "security key remains a physical handoff.")})
 
     # Inspection and alias consent can race navigation. Refuse before minting
     # a code, and retain the checked origin in the atomic in-page write guard.
@@ -785,50 +789,17 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         )
     alias_only = meta.kind == "login" and page_origin not in saved_origins
     if alias_only:
-        from agent.vault_origin_aliases import alias_fill_confirmation_enabled
+        from tools.browser_vault_aliases import authorize_login_alias
 
-        if not alias_fill_confirmation_enabled():
-            from agent.vault_origin_aliases import alias_domain_warning
+        assert raw_meta is not None
 
-            if warning := alias_domain_warning(page_origin, saved_origins):
-                logger.info("%s", warning)
-        else:
-            alias_key = _alias_fill_key(effective_task_id, handle, page_origin)
-            decision = _alias_fill_decision(alias_key)
-            if decision == "refused":
-                _discard_fill_metadata()
-                return json.dumps({"success": False, "error_type": "origin_alias_retry_refused",
-                                   "error": "Alias-origin login confirmation was declined or unanswered. Do not retry; ask the user to fill the login or explicitly start a new approval session."})
-            if decision is None:
-                prompt_started = time.monotonic()
-                decision = _confirm_alias_fill(meta.label, page_origin, saved_origins)
-                if decision != "accept":
-                    _record_alias_fill_decision(alias_key, "refused")
-                else:
-                    if time.monotonic() - prompt_started > FILL_METADATA_TTL_SECONDS:
-                        refreshed = _refresh_fill_metadata_after_confirmation()
-                        if refreshed is None:
-                            return json.dumps({"success": False, "error_type": "metadata_changed",
-                                               "error": "The vault item changed while confirmation was pending. Nothing was written; retry the fill."})
-                        if isinstance(refreshed, VaultItemMeta):
-                            raw_meta = refreshed
-                            saved_origins = tuple(refreshed.allowed_origins) or ((str(refreshed.origin),) if refreshed.origin else ())
-                            meta = refreshed
-                            from agent.vault_origin_aliases import apply_origin_aliases
-                            meta = apply_origin_aliases([meta])[0]
-                    if refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin):
-                        # The prompt can wait for hours (approvals.timeout). Re-read both the item
-                        # metadata and the alias config before allowing the write.
-                        _discard_fill_metadata()
-                        return refusal
-                    _record_alias_fill_decision(alias_key, "accept")
-            if decision != "accept":
-                _discard_fill_metadata()
-                return json.dumps({"success": False,
-                                   "error_type": "origin_alias_declined" if decision == "decline" else "origin_alias_prompt_unanswered",
-                                   "error": ("The user declined this alias-origin login fill." if decision == "decline" else
-                                             "The alias-origin login fill prompt went unanswered.") +
-                                            " Do not retry; ask the user to fill the login."})
+        authorization = authorize_login_alias(
+            handle, raw_meta, meta, page_origin, effective_task_id, _refresh_fill_metadata_after_confirmation,
+        )
+        if isinstance(authorization, str):
+            _discard_fill_metadata()
+            return authorization
+        raw_meta, meta = authorization
     retry_key = _payment_retry_key(effective_task_id, page_origin) if meta.kind == "payment" else None
     if retry_key is not None and _payment_retry_blocked(retry_key):
         _discard_fill_metadata()
@@ -907,6 +878,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             return inspected
     nonce, classified = inspected
     # ── Resolve secret and fill (secret never enters any logged string) ─────
+    if alias_only and (refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin)):
+        _discard_fill_metadata()
+        return refusal
     try:
         if meta.kind == "login":
             secret = {"password": backend.resolve_password(handle)}
@@ -974,6 +948,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         return refusal  # re-checked at the write: the browser selection may have changed meanwhile
     if meta.kind == "protected_field" and (refusal := _private_protected_field_refusal(effective_task_id, browser_key)):
         return refusal  # selection may have changed during inspection
+    if alias_only and (refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin)):
+        _discard_fill_metadata()
+        return refusal
     try:
         fill_result = _eval_js_secret(
             browser_key, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
@@ -1061,12 +1038,11 @@ def _confirm_payment_fill(label: str, origin: str) -> str:
 
 
 def _alias_fill_revalidation_refusal(raw_meta: Any, page_origin: str) -> str | None:
-    """Re-authorize an alias-only login fill after its confirmation prompt returns.
+    """Re-authorize an alias-only fill after prompting, inspection, or secret resolution.
 
-    The prompt can wait up to ``approvals.timeout``. Re-read ``vault.origin_aliases`` through the
-    same registry path used before the prompt (it revalidates the config file signature), and
-    refuse when the exact page origin is no longer allowed. A navigation during the wait is
-    already refused at write time by the fill script's ``expected_origin`` check.
+    Re-read ``vault.origin_aliases`` through the same registry path used before the prompt
+    (it revalidates the config file signature), and refuse when the exact page origin is no
+    longer allowed. Navigation is refused by the fill script's ``expected_origin`` check.
     """
     from agent.vault_origin_aliases import apply_origin_aliases
 
@@ -1075,7 +1051,7 @@ def _alias_fill_revalidation_refusal(raw_meta: Any, page_origin: str) -> str | N
     if page_origin not in allowed:
         return json.dumps({"success": False, "error_type": "origin_alias_revoked",
                            "error": (f"Refused: the origin alias for {page_origin} was removed from "
-                                     "vault.origin_aliases while the confirmation was pending. Nothing was written. "
+                                     "vault.origin_aliases while the fill was pending. Nothing was written. "
                                      "Do not re-add it without the user's instruction.")})
     return None
 
@@ -1128,7 +1104,10 @@ BROWSER_VAULT_SCHEMA = {
         "Hermes saves and fills it); enter_code (a one-time/2FA code after the password: generated from a saved "
         "authenticator key when available; otherwise fetch the newest matching code from the intended 1Password item, "
         "mailbox, or phone and type it with the browser input tool, calling enter_code only when no such source exists; "
-        "no_code_field means approve on their device); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
+        "no_code_field means use a stored 1Password passkey through the canonical-origin browser/system prompt for "
+        "the intended identity, or try the issuer's web/desktop approval and email/SMS/TOTP alternatives. Never use "
+        "iPhone Mirroring. Hand off phone-only approvals, passkeys not in 1Password, hardware security keys, and "
+        "Touch ID/Face ID sensor reads); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
         "Never type a value shown on the page or supplied in chat, never ask for or repeat a secret, and keep card "
         "numbers and CVCs in vault fills. Stop on save_declined; never retry payment_declined."
     ),
@@ -1229,9 +1208,7 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     return _fenced_page_op(tid, page_ops[action])
 
 
-from tools.registry import no_cache_check_fn, registry
-
-_check_vault_available = no_cache_check_fn(_check_vault_available)
+from tools.registry import registry
 
 registry.register(
     name="browser_vault_list",

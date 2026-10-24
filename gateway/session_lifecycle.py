@@ -23,8 +23,18 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _local_naive(stamp: datetime) -> datetime:
+    """Match the store clock when reading or receiving an attended activity stamp."""
+    return datetime.fromtimestamp(stamp.timestamp()) if stamp.tzinfo is not None else stamp
+
+
 def _new_session_id(now: datetime) -> str:
     return new_session_id(now, hex_len=8)
+
+
+def _local_iso(stamp: datetime) -> str:
+    """Preserve the repeated local hour, which an offset-free ISO string loses."""
+    return (stamp.astimezone() if stamp.fold else stamp).isoformat()
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -140,7 +150,7 @@ class SessionLifecycleMixin:
         if touched is not None:
             # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
             # downgrade/upgrade window.
-            candidate["updated_at"] = touched.isoformat()
+            candidate["updated_at"] = _local_iso(touched)
         self._save_entry(session_key, entry_data=candidate, lock_held=True)
         entry.active_turn_token = token
         entry.active_turn_started_at = started_at

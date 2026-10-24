@@ -86,6 +86,7 @@
   "/reset": null,
   "/restart": "terminal",
   "/resume": null,
+  "/retire": "messaging",
   "/retry": null,
   "/review": null,
   "/rollback": null,

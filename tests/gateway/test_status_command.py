@@ -229,6 +229,7 @@ async def test_status_command_prefers_rehydrated_session_model_override(tmp_path
         switch_ctx = SimpleNamespace(
             session_key=session_entry.session_key,
             current_model="model-a",
+            pick_ttl_hours=0.0,
             persist_global=False,
             restore_snapshot=None,
         )

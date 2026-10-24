@@ -278,20 +278,23 @@ class TestSyncFallbacks:
         from tools.cronjob_tools import _manual_run_completion
         monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
         run = executions.create_execution("job-bg-completion", source="manual")
+        executions.finish_execution(run["id"], success=False, error="already running")
         with patch("tools.cronjob_tools.get_job", return_value={}), \
-             patch("tools.cronjob_tools._latest_job_output_excerpt", return_value="saved agent output"):
+             patch("tools.cronjob_tools._latest_job_output_excerpt", return_value="previous saved output"):
             refused = _manual_run_completion(
-                {"success": False, "error": "already running"}, "job-bg-completion",
+                {"success": False, "error": "waiter error"}, "job-bg-completion",
                 "job", "local", 0, execution_id=run["id"])
             assert refused["status"] == "error" and refused["error"] == "already running"
-            assert "saved agent output" in refused["summary"]
+            assert "previous saved output" not in refused["summary"]
+            run = executions.create_execution("job-bg-completion", source="manual")
             executions.mark_execution_running(run["id"])
-            executions.finish_execution(run["id"], success=True)
+            executions.finish_execution(run["id"], success=True, output="current agent output")
             completed = _manual_run_completion(
-                {"success": True, "error": None}, "job-bg-completion",
+                {"success": False, "error": "waiter error"}, "job-bg-completion",
                 "job", "local", 0, execution_id=run["id"])
             assert completed["status"] == "completed"
-            assert "saved agent output" in completed["summary"]
+            assert "current agent output" in completed["summary"]
+            assert "previous saved output" not in completed["summary"]
 
 class TestInFlightDedupe:
     """Manual runs must not double-fire a job that is already mid-run

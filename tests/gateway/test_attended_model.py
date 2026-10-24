@@ -310,7 +310,7 @@ def _attended_route_runner(state):
     runner = SimpleNamespace(
         _session_state=lambda _key: state,
         _peek_session_state=lambda _key: state,
-        _load_attended_activity_stamp=lambda _key: state.conversation.last_user_activity_at,
+        _load_attended_activity_stamp=lambda _key, **_kwargs: state.conversation.last_user_activity_at,
         _load_attended_route_active=lambda _key: None,
         _handoff_attended_state=handoff,
         _session_reasoning_override=lambda _key: None,
@@ -341,7 +341,7 @@ def test_first_user_message_preserves_new_session_boundary_before_activity_stamp
         was_auto_reset=False, is_fresh_reset=False,
     )
 
-    async def mark_activity(_session_key):
+    async def mark_activity(_session_key, *, when=None):
         entry.updated_at = "updated"
 
     inbound = SimpleNamespace(
@@ -457,7 +457,7 @@ def test_automation_opened_session_stays_attended_until_first_user_message():
     ))
     durable: dict[str, float | None] = {"stamp": None}
     route_runner = _attended_route_runner(state)
-    route_runner._load_attended_activity_stamp = lambda _key: durable["stamp"]
+    route_runner._load_attended_activity_stamp = lambda _key, **_kwargs: durable["stamp"]
     with patch.object(gateway_run, "_resolve_gateway_model", return_value="gpt-6.1-sol"):
         held = GatewayTurnMixin._attended_resolution_for_session(
             route_runner, source=None, session_key="k", user_config=cfg, allow_switch_back=True,
@@ -522,14 +522,14 @@ def test_disabled_attended_routing_does_not_reopen_existing_sessions():
 
 def test_restart_with_durable_attended_route_marks_switch_back(tmp_path):
     """A fresh process has no in-memory decision, but the route marker survives it."""
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource, SessionStore
 
     store = SessionStore(tmp_path / "sessions", GatewayConfig())
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="restart", user_id="owner")
     entry = store.get_or_create_session(source)
-    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=timezone.utc)
+    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=UTC)
     store.mark_user_activity(entry.session_key, spoke_at)
     store.mark_attended_route_active(entry.session_key, True)
 
@@ -565,7 +565,7 @@ def test_restart_resolution_switches_back_from_durable_attended_route():
 
 
 def test_route_repoint_keeps_the_users_last_activity(tmp_path):
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
 
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource, SessionStore
@@ -573,9 +573,10 @@ def test_route_repoint_keeps_the_users_last_activity(tmp_path):
     store = SessionStore(tmp_path / "sessions", GatewayConfig())
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="repoint", user_id="owner")
     entry = store.get_or_create_session(source)
-    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=timezone.utc)
+    spoke_at = datetime(2026, 10, 18, 20, 0, tzinfo=UTC)
     store.mark_user_activity(entry.session_key, spoke_at)
 
     store.switch_session(entry.session_key, entry.session_id + "-compressed")
 
-    assert store.get_last_user_activity_at(entry.session_key) == spoke_at
+    # Repointing preserves the instant in the store's naive-local convention.
+    assert store.get_last_user_activity_at(entry.session_key) == spoke_at.astimezone().replace(tzinfo=None)

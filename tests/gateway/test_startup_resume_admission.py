@@ -76,3 +76,42 @@ async def test_long_resumed_turn_releases_its_slot_after_the_opening_window(monk
     assert not any(task.done() for task in tasks)
     release.set()
     await asyncio.wait_for(asyncio.gather(*tasks), 5)
+
+
+@pytest.mark.asyncio
+async def test_shared_replay_cap_releases_long_turn_openings(monkeypatch):
+    from gateway.config import GatewayConfig
+    from gateway.replay_scheduler import REPLAY_PRIORITY_RESUME
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    monkeypatch.setattr(run_startup, "_STARTUP_RESUME_OPENING_S", 0.01)
+    release = asyncio.Event()
+    adapter, runner = _Adapter(release), _runner()
+    runner.config = GatewayConfig(restart_replay_concurrency=1)
+    runner._background_tasks = set()
+    states = {key: SimpleNamespace(turn=SimpleNamespace(agent=_AGENT_PENDING_SENTINEL))
+              for key in ("s0", "s1")}
+    runner._peek_session_state = states.get
+    runner._release_startup_preclaim = lambda key: setattr(states[key].turn, "agent", None)
+    scheduler = runner._get_replay_scheduler()
+    handles = [scheduler.enqueue(
+        priority=REPLAY_PRIORITY_RESUME, kind="restart_auto_resume", session_key=key,
+        dispatch=lambda key=key: runner._admit_startup_resume_event(
+            adapter, SimpleNamespace(session_key=key), key,
+        ),
+    ) for key in states]
+    scheduler.start()
+    try:
+        turns = await asyncio.wait_for(asyncio.gather(
+            *(scheduler.wait_for(handle) for handle in handles)
+        ), 2)
+        # Both turns opened under a cap of 1, neither actual turn has completed.
+        assert adapter.started == ["s0", "s1"]
+        assert not any(turn.done() for turn in turns)
+        assert adapter.running == 2
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*turns), 2)
+    finally:
+        release.set()
+        await scheduler.close()
+        await asyncio.gather(*tuple(runner._background_tasks), return_exceptions=True)

@@ -69,14 +69,14 @@ async def test_resume_outcome_is_logged_once_only_after_turn_finishes(tmp_path, 
     adapter.handle_message = handle
     monkeypatch.setattr("gateway.run_startup._STARTUP_RESUME_OPENING_S", 0.01)
     with caplog.at_level("INFO", logger="gateway.run"):
-        assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 1
+        assert runner._schedule_resume_pending_sessions(candidates=[entry], start_scheduler=True) == 1
         await entered.wait()
         await asyncio.sleep(0.02)
         assert _outcomes(caplog) == []
         release.set()
         await asyncio.gather(*runner._startup_restore_tasks)
         # A reconnect scan cannot create a second terminal outcome for this boot.
-        runner._schedule_resume_pending_sessions(candidates=[entry])
+        runner._schedule_resume_pending_sessions(candidates=[entry], start_scheduler=True)
     assert _outcomes(caplog) == [_line(entry, "resumed")]
 
 
@@ -92,7 +92,7 @@ async def test_nonadmitted_resume_gets_a_visible_note_not_a_false_resumed_log(tm
 
     adapter.handle_message = handle
     with caplog.at_level("INFO", logger="gateway.run"):
-        assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 1
+        assert runner._schedule_resume_pending_sessions(candidates=[entry], start_scheduler=True) == 1
         results = await asyncio.gather(*runner._startup_restore_tasks, return_exceptions=True)
         assert isinstance(results[0], RuntimeError) if failure == "raised" else results == [None]
     assert len(adapter.sent) == 1
@@ -110,7 +110,7 @@ async def test_accepted_resume_without_session_task_is_not_reported_as_resumed(t
 
     adapter.handle_message = handle
     with caplog.at_level("INFO", logger="gateway.run"):
-        assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 1
+        assert runner._schedule_resume_pending_sessions(candidates=[entry], start_scheduler=True) == 1
         await asyncio.gather(*runner._startup_restore_tasks)
     assert _outcomes(caplog) == [_line(entry, "noted")]
     assert entry.resume_pending
@@ -188,7 +188,7 @@ async def test_ambiguous_note_prefers_eligible_resume_without_resending_note(tmp
 
     adapter.handle_message = handle
     with caplog.at_level("INFO", logger="gateway.run"):
-        assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 1
+        assert runner._schedule_resume_pending_sessions(candidates=[entry], start_scheduler=True) == 1
         await asyncio.gather(*runner._startup_restore_tasks)
     assert adapter.sent == []
     assert _outcomes(caplog) == [_line(entry, "resumed")]
@@ -206,7 +206,7 @@ def test_resume_admission_skips_are_observable_once(tmp_path, monkeypatch, caplo
     }
     mutations[reason]()
     with caplog.at_level("INFO", logger="gateway.run"):
-        assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 0
-        assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 0
+        assert runner._schedule_resume_pending_sessions(candidates=[entry], start_scheduler=True) == 0
+        assert runner._schedule_resume_pending_sessions(candidates=[entry], start_scheduler=True) == 0
     assert _outcomes(caplog) == [_line(entry, f"skipped:{reason}")]
     assert entry.resume_pending

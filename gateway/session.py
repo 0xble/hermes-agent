@@ -20,7 +20,7 @@ from gateway.session_identity import transport_profile_of
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pin
 from gateway.session_recovery import SessionRecoveryMixin
-from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
+from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _local_iso, _local_naive, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
 from hermes_state_keys import profile_from_session_key_namespace
 
@@ -478,6 +478,10 @@ def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict
         k: str(v) for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    from gateway.model_pick import model_pick_deadline
+    deadline = model_pick_deadline(override)
+    if cleaned and deadline:
+        cleaned["expires_at"] = str(deadline)
     return cleaned or None
 
 
@@ -556,7 +560,7 @@ class SessionEntry:
     # Zero-cut handover ownership; omitted from legacy JSON when unset so flag-off routing stays byte-identical.
     active_turn_owner_pid: Optional[int] = None
     active_turn_owner_slot: Optional[str] = None
-    # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
+    # Session-scoped /model override (route and optional expiry, never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[Dict[str, str]] = None
     # Session-scoped /reasoning pick, persisted like model_override so a restart keeps the effort.
@@ -606,7 +610,7 @@ class SessionEntry:
     def to_dict(self) -> dict[str, Any]:
         result = {
             "session_key": self.session_key, "session_id": self.session_id,
-            "created_at": self.created_at.isoformat(), "updated_at": self.updated_at.isoformat(),
+            "created_at": self.created_at.isoformat(), "updated_at": _local_iso(self.updated_at),
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type, "metadata": self.metadata,
@@ -628,7 +632,7 @@ class SessionEntry:
         result["active_turn_token"] = self.active_turn_token
         result["active_turn_started_at"] = _iso(self.active_turn_started_at)
         if self.last_user_activity_at is not None:
-            result["last_user_activity_at"] = _iso(self.last_user_activity_at)
+            result["last_user_activity_at"] = _local_iso(self.last_user_activity_at)
         if self.attended_route_active is not None:
             result["attended_route_active"] = self.attended_route_active
         if self.model_role:
@@ -714,10 +718,11 @@ class SessionEntry:
         owner_slot = data.get("active_turn_owner_slot")
         if not isinstance(owner_slot, str) or not owner_slot:
             owner_slot = None
+        activity = _parse_iso(data.get("last_user_activity_at"))
         return cls(
             session_key=session_key, session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]), origin=origin,
+            updated_at=_local_naive(datetime.fromisoformat(data["updated_at"])), origin=origin,
             display_name=data.get("display_name"), platform=platform,
             chat_type=data.get("chat_type", "dm"), metadata=dict(data.get("metadata") or {}),
             restart_note_marked_at=_parse_iso(data.get("restart_note_marked_at")),
@@ -726,7 +731,7 @@ class SessionEntry:
             active_turn_owner_pid=owner_pid, active_turn_owner_slot=owner_slot,
             model_override=sanitize_model_override(data.get("model_override")),
             reasoning_override=sanitize_reasoning_override(data.get("reasoning_override")),
-            last_user_activity_at=_parse_iso(data.get("last_user_activity_at")),
+            last_user_activity_at=_local_naive(activity) if activity is not None else None,
             attended_route_active=data.get("attended_route_active")
             if isinstance(data.get("attended_route_active"), bool) else None,
             model_role=str(data.get("model_role")).strip().lower() if data.get("model_role") else None,
@@ -1341,25 +1346,49 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             return getattr(entry, "reasoning_override_scope", "session") if entry else "session"
 
-    def get_last_user_activity_at(self, session_key: str) -> Optional[datetime]:
+    def get_last_user_activity_at(self, session_key: str, *, refresh: bool = False) -> Optional[datetime]:
+        # A successor gateway can receive replies while this process still owns the turn.
+        # Read outside the store lock, then recheck the live session and activity below.
+        durable = None
+        if refresh:
+            try:
+                loader = self._routing_db_method("load_gateway_routing_entry")
+                payload = loader(session_key, scope=self._routing_scope()) if loader else None
+                durable = self._routing_entry_from_json(session_key, payload) if payload else None
+            except Exception:
+                logger.debug("attended activity refresh failed for %s", session_key, exc_info=True)
         with self._lock:
             entry = self._entry_locked(session_key)
+            if (
+                entry is not None and durable is not None and durable.session_id == entry.session_id
+                and durable.last_user_activity_at is not None
+                and (entry.last_user_activity_at is None
+                     or durable.last_user_activity_at.timestamp() > entry.last_user_activity_at.timestamp())
+            ):
+                entry.last_user_activity_at = durable.last_user_activity_at
             return getattr(entry, "last_user_activity_at", None) if entry else None
 
     def mark_user_activity(self, session_key: str, when: Optional[datetime] = None) -> bool:
         """Persist the last genuine user message without treating relays/wakeups as activity."""
-        stamp = when or _now()
+        stamp = _local_naive(when) if when is not None else _now()
 
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None:
                 return False
-            changed = entry.last_user_activity_at != stamp
+            if (
+                entry.last_user_activity_at is not None
+                and stamp.timestamp() <= entry.last_user_activity_at.timestamp()
+            ):
+                return False
+            candidate = entry.to_dict()
+            candidate["last_user_activity_at"] = _local_iso(stamp)
+            candidate["updated_at"] = _local_iso(stamp)
+            # A failed save must leave the receipt eligible for its retry.
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
             entry.last_user_activity_at = stamp
             entry.updated_at = stamp
-            if changed:
-                self._save_entry(session_key, entry_data=entry.to_dict(), lock_held=True)
-            return changed
+            return True
 
     def get_attended_route_active(self, session_key: str) -> Optional[bool]:
         with self._lock:
@@ -1461,6 +1490,19 @@ class SessionStore(
             if dropped:
                 self._save()
         return len(dropped)
+
+    def unbind_session(self, session_key: str, expected_session_id: str) -> bool:
+        """Remove 1 routing identity without deleting its session or other routes."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return True
+            if entry.session_id != expected_session_id:
+                return False
+            self._entries.pop(session_key)
+            self._save()
+            return True
 
     def remove_by_session_id(self, session_id: str) -> int:
         """Drop every routing entry pointing at *session_id* (hard delete) and persist the drop.

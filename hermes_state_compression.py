@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_state_common import (
     _BOUNDARY_END_REASONS, _COMPRESSION_LOCK_ROW_SQL as _LOCK_ROW_SQL, _ENDED_ROW_SQL, _ended_by_compression,
     _RESET_CHILD_SQL, _sql_json_extract, _sql_session_last_active, is_automatic_end_reason)
+from hermes_state_transactions import execute_transcript_write
 
 # Log-record parity with the origin module (caplog tests pin "hermes_state").
 logger = logging.getLogger("hermes_state")
@@ -297,12 +298,13 @@ class SessionCompressionMixin:
         See #75316.
         ``None`` = unbounded (no internal flush happened). See #47202.
         """
-        self._execute_transcript_write(lambda conn: self._publish_compression_child_on_conn(
+        execute_transcript_write(self, lambda conn: self._publish_compression_child_on_conn(
             conn, parent_session_id=parent_session_id, child_session_id=child_session_id, source=source,
             messages=messages, model=model, model_config=model_config, system_prompt=system_prompt,
             cwd=cwd, profile_name=profile_name, compression_lock_holder=compression_lock_holder,
             require_compression_lease=require_compression_lease, require_lease_refresh=require_lease_refresh,
-            lease_ttl_seconds=lease_ttl_seconds, watermark=watermark, watermark_ceiling=watermark_ceiling), messages)
+            lease_ttl_seconds=lease_ttl_seconds, watermark=watermark, watermark_ceiling=watermark_ceiling),
+            messages, session_id=child_session_id)
 
     def _publish_compression_child_on_conn(
             self, conn, *, parent_session_id: str, child_session_id: str, source: str,
@@ -541,11 +543,12 @@ class SessionCompressionMixin:
         UPDATE."""
         if not session_id or not holder:
             return False
-        expires_at = time.time() + ttl_seconds
-        try:
-            return self._write_rowcount(
+        def _refresh(conn):
+            return conn.execute(
                 "UPDATE compression_locks SET expires_at = ? WHERE session_id = ? AND holder = ?",
-                (expires_at, session_id, holder)) > 0
+                (time.time() + ttl_seconds, session_id, holder)).rowcount > 0
+        try:
+            return self._execute_write(_refresh)
         except sqlite3.Error as exc:
             logger.warning("refresh_compression_lock(%s) failed: %s", session_id, exc)
             return False
@@ -557,9 +560,9 @@ class SessionCompressionMixin:
         from hermes_state import _compression_lock_holder_process_is_dead
         if not session_id:
             return False
-        now = time.time()
-        expires_at = now + ttl_seconds
         def _do(conn):
+            now = time.time()
+            expires_at = now + ttl_seconds
             return _claim_lease_row(
                 conn, "compression_locks", "session_id", session_id, holder, now, expires_at,
                 lambda h, e: e < now or _compression_lock_holder_process_is_dead(h))

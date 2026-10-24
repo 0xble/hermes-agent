@@ -19,6 +19,8 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from tests.gateway.restart_test_helpers import make_restart_runner
+from tests.waiting import async_wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -177,7 +179,7 @@ async def test_process_watcher_lookup_runs_off_the_loop(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_startup_restore_drain_resolves_keys_off_the_loop():
-    runner = object.__new__(GatewayRunner)
+    runner, _ = make_restart_runner()
     threads = []
 
     def normalize(source):
@@ -198,7 +200,9 @@ async def test_startup_restore_drain_resolves_keys_off_the_loop():
     runner._intake_adapter_for = lambda source: adapter
     runner._startup_restore_queue = [MessageEvent(text="first", source=_source())]
     loop_thread = _arm()
-    assert await runner._drain_startup_restore_queue() == 2
+    await runner._drain_startup_restore_queue()
+    await async_wait_until(lambda: accepted == ["first", "late"], what="both restore admissions")
+    await runner._get_replay_scheduler().wait_idle()
     assert accepted == ["first", "late"]
     assert threads and loop_thread not in threads
 

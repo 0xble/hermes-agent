@@ -25,39 +25,44 @@ _DURABLE_CLAIM_OPS = {
 }
 
 
-def settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> None:
-    """Best-effort transition of one durable completion claim. Blocking: never call on the loop."""
+def settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> bool:
+    """Report whether one durable transition succeeded. Blocking: never call on the loop."""
     fn_name, fail_msg = _DURABLE_CLAIM_OPS[kind]
     try:
         import tools.async_delegation as _ad
-        getattr(_ad, fn_name)(delegation_id, claim_id)
+        return getattr(_ad, fn_name)(delegation_id, claim_id)
     except Exception:
         logger.log(logging.WARNING if kind == "complete" else logging.DEBUG, fail_msg, exc_info=True)
+        return False
 
 
 async def settle_durable_claims(
     operations: Iterable[tuple[str, str, str]],
-    settle: Callable[[str, str, str], None] = settle_durable_claim,
-) -> None:
+    settle: Callable[[str, str, str], bool | None] = settle_durable_claim,
+) -> bool:
     """Settle ``(kind, delegation_id, claim_id)`` claims in ONE worker-thread hop.
 
     The copied context ensures the caller's profile scope still selects the ledger. One hop keeps a
     batch whole: the worker future is shielded so cancellation of the awaiting task cannot cancel a
     queued settle before the thread starts, and the thread finishes every settle regardless.
-    Operations without a claim id are skipped.
+    Operations without a claim id are skipped. False reports an unsettled transition; legacy
+    custom settlers returning None retain their successful no-result contract.
     """
     pending = [op for op in operations if op[2]]
     if not pending:
-        return
+        return True
 
-    def _settle_all() -> None:
+    def _settle_all() -> bool:
+        settled = True
         for kind, delegation_id, claim_id in pending:
-            settle(kind, delegation_id, claim_id)
+            if settle(kind, delegation_id, claim_id) is False:
+                settled = False
+        return settled
 
     loop = asyncio.get_running_loop()
     settle_ctx = contextvars.copy_context()
     future = loop.run_in_executor(None, settle_ctx.run, _settle_all)
-    await asyncio.shield(future)
+    return await asyncio.shield(future)
 
 
 async def claim_off_loop(claim: Callable[[], _T], release: Callable[[_T], None]) -> _T:

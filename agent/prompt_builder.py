@@ -472,7 +472,6 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Correctness: does the output satisfy every stated requirement?\n"
     "- Grounding: are factual claims backed by tool outputs or provided context?\n"
     "- Formatting: does the output match the requested format or schema?\n"
-    "- Safety: if the next step has side effects (file writes, commands, API calls), confirm scope before executing.\n"
     "- Completion: 'done' means every named acceptance criterion is verified — never a plausible subset. Completing "
     "your plan is not itself the answer; the requested output must appear in your response.\n"
     "</verification>\n\n"

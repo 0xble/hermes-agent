@@ -110,6 +110,9 @@ def _emit_compression_attempt_telemetry(
             # another's numbers.
             telemetry = {**seed, "method": "none"}
         payload = dict(telemetry)
+        for field in ("generate_ms", "publish_wait_ms", "publish_hold_ms", "publish_rows_written", "publish_attempts"):
+            if field in seed:
+                payload[field] = seed[field]
         payload.setdefault("event", "compression_attempt")
         payload.setdefault("route", "hermes")
         payload.setdefault("attempt_id", seed["attempt_id"])

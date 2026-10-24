@@ -52,6 +52,18 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+
+def _is_restore_control_event(event: MessageEvent) -> bool:
+    """Let recognized gateway controls bypass replay fences and reach the busy fast path."""
+    if not getattr(event, "allow_gateway_control", False):
+        return False
+    command = event.get_command()
+    if not command:
+        return False
+    from hermes_cli.commands import should_bypass_active_session
+    return should_bypass_active_session(command)
+
+
 def discord_triggering_note(message_id: Any) -> str:
     """Model-facing routing note for a Discord turn (rides the API-bound user message only)."""
     return (
@@ -266,22 +278,27 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             return None
 
         reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
+        startup_restore_keys = getattr(self, "_startup_restore_keys", None)
         # Session-key normalization precedes the turn's key derivation. The
         # pre_gateway_dispatch hook runs only after this gate and must not rewrite
         # the routing identity of an already admitted event.
         reconnect_key = None
-        if reconnect_keys and not is_internal:
+        if (reconnect_keys or startup_restore_keys or getattr(self, "_startup_restore_in_progress", False)) and not is_internal:
             normalized = await asyncio.to_thread(self._normalize_source_for_session_key, source)
             reconnect_key = self._session_key_for_source(normalized)
         from gateway.session_ingress import executing_admission
         if (
-            (getattr(self, "_startup_restore_in_progress", False)
-             or (reconnect_keys and reconnect_keys.get(reconnect_key, 0)))
-            and not is_internal
+            not is_internal
+            and (
+                getattr(self, "_startup_restore_in_progress", False)
+                or (reconnect_keys and reconnect_keys.get(reconnect_key, 0))
+                or (startup_restore_keys and startup_restore_keys.get(reconnect_key, 0))
+            )
             and not getattr(event, "_hermes_startup_restore_replay", False)
             and not executing_admission.get()
+            and not _is_restore_control_event(event)
         ):
-            self._queue_startup_restore_event(event)
+            self._queue_startup_restore_event(event, session_key=reconnect_key)
             return None
 
         # Adapter admission can precede this task by an arbitrary delay on an idle lane.
@@ -295,10 +312,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
-        self._scale_to_zero_note_real_inbound()
-        event = await self._hm_pre_gateway_dispatch_hook(event, source)
-        if event is None:
-            return None
+        if not getattr(event, "_gateway_compression_deferred", False):
+            self._scale_to_zero_note_real_inbound()
+            event = await self._hm_pre_gateway_dispatch_hook(event, source)
+            if event is None:
+                return None
         from gateway.response_filters import apply_agent_origin_reply_expectation
         event = apply_agent_origin_reply_expectation(event)
         source = event.source
@@ -324,9 +342,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             else:
                 logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             return None
-        # The busy path charged this event on arrival; a drained follow-up must not pay twice.
-        if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
-            return None
+        # Charge each admitted event once, including retries and drained busy follow-ups.
+        # Authorization above still checks the live conversation cooldown on every attempt.
+        if not getattr(event, "_bot_loop_admitted", False):
+            if not self._admit_bot_message_for_source(source):
+                return None
+            event._bot_loop_admitted = True
         await _admit_outbox_event(self, event, source)
         return event, source, False
 
@@ -926,6 +947,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
     ) -> Optional[str]:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
+        # Steered input can stay in this turn and never reach turn-start admission.
+        schedule_activity: Any = getattr(self, "_schedule_attended_user_activity", None)
+        if callable(schedule_activity):
+            schedule_activity(event, source, _quick_key)
         from gateway.cron_review import fail_busy_review
         if fail_busy_review(event):
             # The runner slot can still be live when the adapter guard is not (reconnect,
@@ -1612,7 +1637,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             # behind them, so arrival order (#28503) holds: oldest orphan runs as this turn, the rest drain
             # in order, the new message last.
             _orphan_adapter = self._delivery_adapter_for(source)
-            if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
+            if (_orphan_adapter is None or getattr(event, "internal", False) or event.get_command()
+                    or getattr(event, "_gateway_compression_deferred", False)):
                 return event, source, is_internal
             _rescued = self._rescue_orphaned_overflow(_quick_key, _orphan_adapter)
             if _rescued is None:
@@ -1629,11 +1655,43 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
             return event, source, is_internal
 
-    async def _mark_attended_user_activity(self, event, source, session_key: str | None = None) -> bool:
+    def _schedule_attended_user_activity(self, event, source, session_key: str):
+        """Keep receipt-time bookkeeping alive without delaying busy input or commands."""
+        if not is_genuine_user_message(event) or getattr(event, "_attended_activity_marked", False):
+            return
+        if getattr(event, "_attended_activity_task", None) is not None:
+            return
+        event._attended_activity_received_at = time.time()
+        task = asyncio.create_task(self._mark_attended_user_activity(
+            event, source, session_key, retry_on_failure=True,
+        ))
+        event._attended_activity_task = task
+        self._retain_background_task(task)
+
+    async def _mark_attended_user_activity(
+        self, event, source, session_key: str | None = None, *, retry_on_failure: bool = False,
+    ) -> bool:
         """Persist genuine Brian activity only for an existing session when attended routing is enabled."""
         if not is_genuine_user_message(event):
             return False
+        if getattr(event, "_attended_activity_marked", False):
+            return True
+        pending = getattr(event, "_attended_activity_task", None)
+        if pending is not None and pending is not asyncio.current_task():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                if not pending.cancelled():
+                    raise
+            except Exception:
+                logger.debug("attended-model receipt task failed", exc_info=True)
+            if getattr(event, "_attended_activity_marked", False):
+                return True
+        stamp = getattr(event, "_attended_activity_received_at", None)
+        if stamp is None:
+            stamp = event._attended_activity_received_at = time.time()
         try:
+            from datetime import datetime
             from gateway.run import _load_gateway_config
             from gateway.attended_model import parse_attended_config
             attended_cfg = await asyncio.to_thread(
@@ -1649,19 +1707,26 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             if entry is None:
                 return False
             state = self._session_state(session_key)
-            if attended_cfg.start_new_sessions and (
-                getattr(entry, "created_at", None) == getattr(entry, "updated_at", None)
-                or getattr(entry, "is_fresh_reset", False)
-                or getattr(state.conversation, "attended_new_session", False)
+            from gateway.session_state import session_opening_pending
+            if attended_cfg.start_new_sessions and session_opening_pending(
+                entry, attended_new_session=state.conversation.attended_new_session,
             ):
                 # Preserve the creation boundary before mark_user_activity updates updated_at.
                 state.conversation.attended_new_session = True
-            await self.async_session_store.mark_user_activity(entry.session_key)
-            stamp = time.time()
-            state.conversation.last_user_activity_at = stamp
+            await self.async_session_store.mark_user_activity(
+                entry.session_key, when=datetime.fromtimestamp(stamp),
+            )
+            previous = state.conversation.last_user_activity_at
+            if previous is None or stamp > previous:
+                state.conversation.last_user_activity_at = stamp
+            event._attended_activity_marked = True
             return True
         except Exception:
             logger.debug("attended-model activity stamp failed", exc_info=True)
+            if retry_on_failure:
+                # Steering consumes the event, so only ordinary failures retry here.
+                # False eligibility results and task cancellation are terminal.
+                return await self._mark_attended_user_activity(event, source, session_key)
             return False
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
@@ -1674,7 +1739,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         finally:
             turn_id = getattr(event, "_outbox_turn_id", None)
             try:
-                if turn_id and not getattr(event, "_outbox_duplicate", False):
+                if (turn_id and not getattr(event, "_outbox_duplicate", False)
+                        and not getattr(event, "_gateway_compression_deferred", False)):
                     await asyncio.to_thread(
                         store_for(event._outbox_home).finish_admission,
                         turn_id, "completed" if result is not None else "empty")
@@ -1764,6 +1830,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         if _paused_notice is not None:
             return _paused_notice
 
+        from gateway.telegram_retire import intercept
+        _retire_reply = await intercept(self, event)
+        if _retire_reply is not None:
+            return _retire_reply
         _quick_key = self._session_key_for_source(source)
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
@@ -1792,7 +1862,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         if _handled:
             # Activity bookkeeping is telemetry for an already-dispatched command.  Do not hold the
             # adapter's bounded command response on the opt-in config/store worker hop.
-            asyncio.create_task(self._mark_attended_user_activity(event, source, _quick_key))
+            self._schedule_attended_user_activity(event, source, _quick_key)
             return _result
 
         # Non-command messages are stamped after the session slot is claimed, immediately before
@@ -1821,48 +1891,14 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
                 return t("gateway.busy.draining_maintenance")
 
-        # Compression new-turn gate (#134239): a post-turn compression starts ~0.4 s after
-        # "Turn ended", i.e. while ``_is_session_running`` is already False, so a follow-up
-        # message reaches this fresh-turn path with the guard from #56391 never firing. The
-        # turn it starts reads the pre-rotation history and its own post-turn compression later
-        # commits a snapshot taken before the previous commit — double-compressing the
-        # transcript. The running-agent path already demotes for this; the fresh-turn path
-        # must refuse too. Lock is TTL-leased (~300 s), so a leaked lock can't wedge this.
-        _compression_in_flight = await self._session_has_compression_in_flight(_quick_key)
-        if _compression_in_flight:
-            # The lock can cover several gateway inputs. Keep one automatic retry turn for the
-            # whole episode, rather than dropping internal wakes or creating one retry per notice.
-            _deferred = self._queue_compression_deferred_event(_quick_key, event)
-            if not _deferred:
-                # The normal route is the adapter's pending slot. The durable drain fallback is
-                # only for a transiently missing adapter, so an internal wake is still retained.
-                preserve = getattr(self, "_preserve_drain_event", None)
-                _deferred = bool(preserve and preserve(_quick_key, event))
-            if is_internal:
-                if not _deferred:
-                    logger.error(
-                        "Could not preserve internal turn for session %s during compression.",
-                        _quick_key,
-                    )
-                else:
-                    logger.info(
-                        "Deferring internal turn for session %s — context compression in flight.",
-                        _quick_key,
-                    )
-                return None
-            _conversation = self._session_state(_quick_key).conversation
-            if not _conversation.compression_deferred_notice_sent:
-                _conversation.compression_deferred_notice_sent = True
-                logger.info("Deferring user turn for session %s — context compression in flight.", _quick_key)
-                return t("gateway.busy.compressing_retry")
-            logger.info("Coalescing another deferred user turn for session %s.", _quick_key)
+        # Both human inputs and gateway wakes remain retryable while compression
+        # owns the transcript. Slash controls above remain available.
+        if await self._defer_compression_locked_event(_quick_key, event):
             return None
-        else:
-            # The next held lock starts a new notice episode after the automatic retry clears this
-            # transient latch. Conversation boundaries also reset it through ConversationState.clear().
-            _state = self._peek_session_state(_quick_key)
-            if _state is not None:
-                _state.conversation.compression_deferred_notice_sent = False
+        if self._is_session_running(_quick_key):
+            # The durable lock lookup yielded; another turn may now own the slot.
+            return await self._hm_handle_running_session_message(event, source, _quick_key)
+
 
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
@@ -1878,6 +1914,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+        event._gateway_compression_deferred = False
 
         # A rewrite continues the wake's admission generation. No await may separate this
         # check from sentinel installation, and no rejected wake inherits a successor token.
@@ -1902,6 +1939,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         self._persist_active_agents()
         # The admission context is set by the durable executor, not by direct legacy dispatch.
         from gateway.session_ingress import executing_admission
+        _preserve_lease_wait_on_shutdown = False
         try:
             # Mark genuine user activity inside the claimed turn, before resolving the model. This
             # preserves the attended route's same-turn semantics without delaying the sentinel claim.
@@ -1916,33 +1954,47 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
-                # A rejected message, not a completed turn: return before the /goal judge so it
-                # cannot consume the resend notice and enqueue a synthetic continuation loop.
+                # The bounded wait expired or its durable spool failed. No turn ran,
+                # so refund the wake tick and bypass the /goal judge for the resend notice.
                 logger.error(
-                    "Rejecting turn for routing key %s on session %s after "
-                    "turn-lease timeout; transcript load was not started and "
-                    "the user must resend",
+                    "Cannot run queued turn for routing key %s on session %s: "
+                    "turn-lease wait expired or input could not be preserved; "
+                    "transcript load was not started and the user must resend",
                     _quick_key, exc.session_id,
                 )
                 await self._release_unsettled_loop_tick(event, ran=False)
                 return t("gateway.busy.another_turn_running")
             try:
-                await self._run_post_turn_hooks(
-                    agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
-                )
+                if not getattr(event, "_gateway_compression_deferred", False):
+                    await self._run_post_turn_hooks(
+                        agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
+                    )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
+        except asyncio.CancelledError:
+            # Shutdown may replay an unfinished turn, but a stop/reset invalidates
+            # its generation even when the gateway is already draining.
+            _preserve_lease_wait_on_shutdown = (
+                self._draining and self._is_session_run_current(_quick_key, _run_generation)
+            )
+            raise
         finally:
             with suppress(Exception):
                 self._session_state(_quick_key).conversation.attended_new_session = False
-            # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
-            # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
+                self._session_state(getattr(event, "_hermes_attended_session_key", _quick_key)).conversation.attended_new_session = False
+            # One-shot restore runs on every exit; the generation guard ignores displaced turns.
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
             # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
             # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
             # clears it only once the reply is in the delivery ledger (else a kill in between
             # left neither marker nor ledger row and the persisted reply was never sent).
+            if getattr(event, "_gateway_lease_wait_spool", None) is not None:
+                from gateway.run_turn_lease_wait import retire_lease_wait
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        retire_lease_wait, self, event, discard=not _preserve_lease_wait_on_shutdown,
+                    )
             if not getattr(event, "_turn_marker_handoff", False):
                 await self._clear_durable_active_turn(event)
             # Release only this turn's generation. Eviction may immediately admit a replacement
@@ -1959,6 +2011,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             _resume_deferred = getattr(_deferred_adapter, "resume_deferred_commands", None)
             if callable(_resume_deferred):
                 _resume_deferred(_quick_key)
+            if getattr(event, "_gateway_compression_deferred", False):
+                self._start_compression_deferred_drain(_quick_key, _deferred_adapter)
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
@@ -2419,8 +2473,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         from agent.memory_manager import sanitize_context
 
         analysis_prompt = (
-            "Concisely describe this image in 2-4 sentences "
-            "(~200 Chinese characters or ~150 English words). "
+            "Concisely describe this image in English using 2-4 sentences "
+            "(~150 words). Preserve quoted text and identifiers in their original language. "
             "Cover the main subject, key visible text/data/code, and overall context. "
             "If it is a chart, diagram, or scientific figure, include the important "
             "labels, legend, and key values. Skip decorative details."

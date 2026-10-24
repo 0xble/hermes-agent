@@ -26,6 +26,10 @@ from hermes_state_common import (
 from hermes_state_detached_results import SessionDetachedResultsMixin
 from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json)
+from hermes_state_transactions import execute_transcript_write
+
+from hermes_state_write_metrics import add_write_rows, timed_write_phase
+from hermes_state_message_archive import archive_message_rows
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
@@ -85,7 +89,6 @@ _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls, messa
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
 _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?"
 _SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
-_ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
 _SHADOWED_CHECKPOINT_ROWS_SQL = ("SELECT id, codex_reasoning_items FROM messages WHERE session_id = ? AND active = 1 "
     "AND role = 'assistant' AND id < ? AND codex_reasoning_items LIKE '%\"compaction\"%'")
 _SET_CODEX_REASONING_SQL = "UPDATE messages SET codex_reasoning_items = ? WHERE id = ?"
@@ -475,38 +478,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
                     compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
                     turn_lease_ttl_seconds=turn_lease_ttl_seconds)
                 for start in range(0, len(messages), chunk_rows))
-        return self._execute_transcript_write(lambda conn: self._append_messages_in_transaction(
+        return execute_transcript_write(self, lambda conn: self._append_messages_in_transaction(
             conn, session_id, messages, compression_lock_holder=compression_lock_holder,
             turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds),
-            messages, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
-
-    _ROW_STATE_KEYS = ("_row_id", DB_ROW_SNAPSHOT, "timestamp")
-
-    def _execute_transcript_write(self, fn, messages: list[dict[str, Any]], **kwargs):
-        """``_execute_write(fn)`` for callbacks that stamp row state onto the caller's *messages* (every
-        :meth:`_insert_message_rows` caller that passes caller-owned dicts; rewind and import insert fresh copies). Each attempt, and a final failure, restores the caller's
-        ``_row_id`` / digest / timestamp: a rolled-back insert's id is reused by SQLite, so a stale stamp
-        would make a later flush adopt another writer's row and drop this message."""
-        _absent = object()
-        pre_state = [tuple(m.get(k, _absent) for k in self._ROW_STATE_KEYS) for m in messages]
-
-        def _restore() -> None:
-            for msg, state in zip(messages, pre_state):
-                msg.pop(CANONICAL_ROW, None)
-                for key, value in zip(self._ROW_STATE_KEYS, state):
-                    if value is _absent:
-                        msg.pop(key, None)
-                    else:
-                        msg[key] = value
-
-        def _attempt(conn):
-            _restore()
-            return fn(conn)
-        try:
-            return self._execute_write(_attempt, **kwargs)
-        except BaseException:
-            _restore()
-            raise
+            messages, session_id=session_id, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def set_latest_matching_message_display_kind(self, session_id: str, *, role: str, content: str,
                                                  display_kind: str,
@@ -741,6 +716,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
         except Exception:
             return  # Best-effort: a failed carry falls back to the publish-time stamp, never breaks publish.
 
+    @timed_write_phase("insert_incl_fts")
     def _insert_message_rows(self, conn, session_id: str, messages: list[dict[str, Any]], *,
                              prune_checkpoints: bool = True) -> tuple[int, int]:
         """Insert *messages* as fresh active rows in the caller's txn -> ``(inserted, tool_call_count)``.
@@ -778,6 +754,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
         # legacy one. One batched SELECT; hash the STORED rows (column affinity rewrites bind values).
         from agent.transcript_repair import stamp_inserted_row_snapshots
         stamp_inserted_row_snapshots(conn, session_id, messages)
+        add_write_rows("inserted", inserted)
         return inserted, tool_calls_total
 
     def _prune_shadowed_checkpoints(self, conn, session_id: str, live_messages: list[dict[str, Any]]) -> None:
@@ -855,7 +832,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
             self.replace_messages_in_transaction(
                 conn, session_id, messages, active_only=active_only, archive_dropped=archive_dropped,
                 reject_active_turn_lease=reject_active_turn_lease)
-        self._execute_transcript_write(_do, messages)
+        execute_transcript_write(self, _do, messages, session_id=session_id)
 
     @classmethod
     def _row_identity(cls, role: str, content: Any, tool_call_id: Any, tool_calls: Any) -> tuple:
@@ -915,6 +892,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
         rows = conn.execute(sql, params).fetchall()
         return [int(r["id"]) for r in rows], sum(_tool_calls_len(r["tool_calls"]) for r in rows)
 
+    @timed_write_phase("clone_incl_fts")
     def _clone_message_rows(self, conn, tail_ids: list[int], *, session_id: Optional[str] = None) -> None:
         """Pure-SQL clone of *tail_ids* as fresh live rows (new id/display order, active=1, compacted=0;
         message payload columns stay byte-exact and FTS triggers index the clones), into *session_id* when given."""
@@ -924,11 +902,12 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
         # still display-visible (the source may just have become rewind-only).
         skip = ("id", "active", "compacted", "display_order") + (("session_id",) if retarget else ())
         col_list = ", ".join(c for c in self._message_column_names(conn) if c not in skip)
-        conn.execute(
+        cursor = conn.execute(
             f"INSERT INTO messages ({col_list}, {'session_id, ' if retarget else ''}active, compacted) "
             f"SELECT {col_list}, {'?, ' if retarget else ''}1, 0 FROM messages "
             f"WHERE id IN ({_placeholders(tail_ids)}) ORDER BY id",
             [session_id, *tail_ids] if retarget else tail_ids)
+        add_write_rows("cloned", cursor.rowcount)
 
     def _archive_named_rows(
         self, conn, session_id: str, compacted_messages: list[dict[str, Any]], covered: list[int], *,
@@ -953,13 +932,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
             rewind_ids += self._tail_originals(covered_active, tail_count, merged_away)
         rewind_ids += unseen
         rewind_ids = list(dict.fromkeys(rewind_ids))
-        if rewind_ids:
-            placeholders = _placeholders(rewind_ids)
-            conn.execute(
-                "UPDATE messages SET active = 0, compacted = 0 "
-                f"WHERE session_id = ? AND id IN ({placeholders})",
-                [session_id, *rewind_ids])
-        conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
+        archive_message_rows(conn, session_id, rewind_ids)
         # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
         # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
         # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
@@ -995,7 +968,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
         if lock_holder is not None:
             lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
             if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
-                raise SessionCompressionInProgressError(
+                raise CompressionLeaseLostError(
                     f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
         if held_messages is not None:
             self._raise_if_unheld_summary(conn, session_id, held_messages)
@@ -1021,13 +994,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
                  int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
         rewind_ids += tail_ids
         rewind_ids = list(dict.fromkeys(rewind_ids))
-        if rewind_ids:
-            placeholders = _placeholders(rewind_ids)
-            conn.execute("UPDATE messages SET active = 0, compacted = 0 "
-                f"WHERE session_id = ? AND id IN ({placeholders})", [session_id, *rewind_ids])
-            conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({placeholders})", [session_id, *rewind_ids])
-        else:
-            conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
+        archive_message_rows(conn, session_id, rewind_ids, exclude_rewound=True)
+        # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
+        # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
+        # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
         self._carry_parent_timestamps(conn, session_id, compacted_messages)
         inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
         if tail_ids:
@@ -1084,7 +1054,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
                 watermark=watermark, lock_holder=lock_holder, tail_count=tail_count,
                 carried_messages=carried_messages, covered_ids=covered_ids,
                 unresolved_held=unresolved_held, held_messages=held_messages, fold_plan=fold_plan)
-        return self._execute_transcript_write(_do, compacted_messages)
+        return execute_transcript_write(self, _do, compacted_messages, session_id=session_id)
 
     def _raise_if_unheld_summary(self, conn, session_id: str, held_messages: list[dict[str, Any]]) -> None:
         """Raise ``StaleHeldHistory`` when an active summary row is missing from *held_messages*.
@@ -1339,6 +1309,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
                 rows[row[0]] = (row[0], row[1], row[2])
         return [rows[row_id] for row_id in sorted(rows)]
 
+    @timed_write_phase("display_reconcile")
     def _reconcile_display_orders(self, conn, session_id: str,
                                   plan: Optional[_FoldPlan] = None) -> None:
         """Re-fold split display generations by the recomputed display key.
@@ -1376,7 +1347,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
             rows.close()
             if last_id == batch_start:
                 break
-            conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+            cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+            add_write_rows("display_reconciled", cursor.rowcount)
 
     def _fold_display_orders(self, conn, visible: list[tuple[int, Optional[bytes], Optional[int]]],
                              plan: _FoldPlan) -> None:
@@ -1406,7 +1378,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin):
             if folded != order or identity != stored:
                 updates.append((folded, identity, row_id))
         if updates:
-            conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+            cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+            add_write_rows("display_reconciled", cursor.rowcount)
 
     def _ensure_display_order(self, session_id: str) -> bool:
         """Backfill one legacy session once, preserving the pre-index display identity exactly."""

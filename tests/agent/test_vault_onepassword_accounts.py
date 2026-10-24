@@ -39,8 +39,10 @@ elif args == ["item", "get", item[0], "--vault", item[1], "--format", "json"]:
                       "vault": {"id": item[1]}, "urls": [{"href": item[2]}],
                       "additional_information": account + "@example.com",
                       "fields": [{"id": "password", "value": "must-not-be-retained"}]}))
-elif args == ["item", "get", item[0], "--vault", item[1], "--fields", "label=password", "--reveal"]:
-    print("dummy-" + account + "-password")
+elif args == ["item", "get", item[0], "--vault", item[1], "--format", "json", "--reveal"]:
+    print(json.dumps({"id": item[0], "category": "LOGIN", "vault": {"id": item[1]}, "fields": [
+        {"label": "password", "value": "synthetic-wrong-custom"},
+        {"purpose": "PASSWORD", "value": "dummy-" + account + "-password"}]}))
 elif args[:2] == ["item", "get"] and "--vault" not in args:
     print("a vault query must be provided", file=sys.stderr)
     sys.exit(1)

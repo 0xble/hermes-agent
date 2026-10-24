@@ -229,6 +229,7 @@ async def test_concrete_model_clears_role_except_once(tmp_path, monkeypatch, per
         config_path=tmp_path / "config.yaml",
         restore_snapshot=None,
         model_override_scope="session",
+        pick_ttl_hours=0.0,
         current_model="old-model",
     )
     result = SimpleNamespace(
@@ -472,7 +473,7 @@ def test_held_wakeup_posts_no_switch_card(monkeypatch):
     runner = SimpleNamespace(
         _session_state=lambda _key: state,
         _peek_session_state=lambda _key: state,
-        _load_attended_activity_stamp=lambda _key: conversation.last_user_activity_at,
+        _load_attended_activity_stamp=lambda _key, **_kwargs: conversation.last_user_activity_at,
         _load_attended_route_active=lambda _key: None,
         _handoff_attended_state=lambda _key, conversation=None, runner=None: [
             setattr(state.conversation, name, value) for name, value in (conversation or {}).items()
@@ -607,7 +608,7 @@ async def test_status_and_turn_read_role_from_conversation_without_touching_the_
     from gateway.run_turn import GatewayTurnMixin
     runner = SimpleNamespace(
         _session_state=lambda _key: state, _peek_session_state=lambda _key: state,
-        _load_attended_activity_stamp=lambda _key: None,
+        _load_attended_activity_stamp=lambda _key, **_kwargs: None,
         _handoff_attended_state=lambda *a, **k: None,
         _session_reasoning_override=lambda _key: None,
         _load_reasoning_config=lambda _model: {},

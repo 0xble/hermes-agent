@@ -1030,6 +1030,7 @@ class GatewayAdapterLifecycleMixin:
                 counts[key] -= 1
                 if not counts[key]:
                     del counts[key]
+            self._schedule_startup_restore_drain()
 
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:

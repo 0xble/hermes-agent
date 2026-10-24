@@ -119,6 +119,11 @@ class GatewayBusySessionMixin:
             return
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
+        elif overflow := self._overflow_queue(session_key):
+            # The drain removes its head before awaiting admission. A vacant
+            # slot can still have older overflow, which must precede this arrival.
+            pending_slot[session_key] = overflow.pop(0)
+            overflow.append(queued_event)
         else:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
@@ -372,6 +377,47 @@ class GatewayBusySessionMixin:
             return False
         except Exception:
             return _assume_active("lock holder for session", session_id)
+
+    async def _defer_compression_locked_event(
+        self, session_key: str, event: MessageEvent, *, prepend: bool = False,
+    ) -> bool:
+        """Retain input until compression publishes, without consuming it as a retry notice.
+
+        The initiating turn can encounter the lock only AFTER hygiene's inline
+        wait expires. Put that older input before arrivals queued during hygiene.
+        Keep distinct events intact: their control fences and provenance must not
+        be combined with another wake or a human message.
+        """
+        if not await self._session_has_compression_in_flight(session_key):
+            return False
+        # A retry bounce of an input already held for this episode is older than
+        # anything queued since. Keep it at the head instead of requeueing it last.
+        prepend = prepend or bool(getattr(event, "_gateway_compression_deferred", False))
+        adapter = self._delivery_adapter_for(event.source)
+        pending = getattr(adapter, "_pending_messages", None)
+        if not isinstance(pending, dict):
+            return False
+        if prepend:
+            previous = pending.get(session_key)
+            if previous is not None and previous is not event:
+                self._session_state(session_key).conversation.queued_events.insert(0, previous)
+            pending[session_key] = event
+            event._gateway_accepted = True
+            self._prefetch_queued_voice_transcript(event, adapter)
+        else:
+            self._enqueue_fifo(session_key, event, adapter)
+        event._gateway_compression_deferred = True
+        # Transport-owned dispatch drains its own pending slot. Internal wakes can
+        # enter directly, with no adapter guard, so start that same drain here.
+        self._start_compression_deferred_drain(session_key, adapter)
+        return True
+
+    def _start_compression_deferred_drain(self, session_key: str, adapter: Any) -> None:
+        """Use the normal adapter drain when no transport or runner owns retry."""
+        if (not self._is_session_running(session_key)
+                and session_key not in getattr(adapter, "_active_sessions", {})
+                and session_key in getattr(adapter, "_pending_messages", {})):
+            adapter._start_session_processing(adapter._pending_messages.pop(session_key), session_key)
 
     @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):
@@ -912,6 +958,7 @@ class GatewayBusySessionMixin:
     async def _send_busy_ack_reply(self, event: MessageEvent, adapter, message: str) -> None:
         try:
             await self._send_busy_reply(event, adapter, message)
+            event._gateway_busy_ack_sent = True
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
@@ -954,6 +1001,10 @@ class GatewayBusySessionMixin:
             return True
         event._bot_loop_admitted = True
 
+        # Adapter-owned busy sessions bypass normal inbound and turn-start admission.
+        schedule_activity: Any = getattr(self, "_schedule_attended_user_activity", None)
+        if callable(schedule_activity):
+            schedule_activity(event, event.source, session_key)
         if await self._route_plaintext_approval_while_busy(event, session_key):
             event._gateway_accepted = True  # consumed by the blocked approval, an admission
             return True
@@ -1135,6 +1186,12 @@ class GatewayBusySessionMixin:
         ):
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
 
+        # Compression-held inputs wait silently, including arrivals admitted by
+        # this busy path rather than cold ingress. Keep ordinary busy acks intact.
+        if (_steer.demoted_for_compression
+                or await self._session_has_compression_in_flight(session_key)):
+            return True
+
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.
         if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":
@@ -1190,7 +1247,7 @@ class GatewayBusySessionMixin:
         "status", "context", "restart", "approve", "deny", "pause", "agents", "bg", "btw",
         "kanban", "subgoal", "heartbeat", "busy", "yolo", "verbose", "footer", "help",
         "commands", "profile", "login", "update", "version",
-        "title", "fast", "reasoning", "usage", "whoami",
+        "title", "retire", "fast", "reasoning", "usage", "whoami",
     )
     # Dispatched only on the idle path (busy dispatch has its own allowlist).
     _IDLE_COMMANDS = (

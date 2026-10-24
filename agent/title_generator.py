@@ -576,6 +576,8 @@ def _extract_json_title(raw: str) -> Optional[str]:
             return ""
         if isinstance(parsed.get("title"), str):
             return parsed["title"].strip()
+    if re.search(r'"abstain"\s*:\s*true\b', raw):
+        return ""
     match = re.search(r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
     if match:
         with suppress(ValueError):
@@ -760,7 +762,7 @@ def generate_title(
     link_context: str | None = None,
     reply_excerpt: str | None = None,
 ) -> Optional[str]:
-    """Title from the opening message, plus the turn's reply when the opener did not name a subject.
+    """Title from the opener and reply, ``""`` for abstention, or None for an unusable/failed response.
 
     ``runtime_validator`` runs right before the request; False skips silently. If it returns False
     (e.g. the user's model was switched since the background thread captured its runtime snapshot),
@@ -839,8 +841,8 @@ def generate_title(
                 fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
                 payload = json.loads(fence.group(1) if fence else candidate)
 
-        if icon_allowed and isinstance(payload, dict) and payload.get("abstain") is True:
-            return None
+        if _extract_json_title(str(raw_content)) == "":
+            return ""
         title_value = payload.get("title") if isinstance(payload, dict) else None
         title = _clean_title(_extract_title_text(title_value or raw_content) or _title_from_reasoning(choice.message))
         if icon_allowed and icon_callback is not None:
@@ -1061,13 +1063,19 @@ def auto_title_session(
             link_context=link_context, reply_excerpt=reply_excerpt, **icon_kwargs,
         )
         source = "llm"
-        # Can't-tell and junk are not names. Leave the placeholder and let the next turn's reply try.
-        # Turn 3 is the last attempt ``maybe_auto_title`` allows, so there the best concrete title wins.
-        if _hold_until_reply_enabled() and (not title or is_junk_title(title)):
-            if _real_user_turns(conversation_history) < 3:
-                logger.debug("Auto-title held: opener does not name a subject yet")
-                return
-            title = title or derive_title(user_message, title_preview)
+        # The prompt's recent-name sample is not a uniqueness check: older topics still exist.
+        duplicate = False
+        if title:
+            with suppress(Exception):
+                duplicate = session_db.has_auto_title_collision(title, exclude_session_id=session_id)
+        # Empty string is an explicit abstention. None is a failed/unusable provider response,
+        # which must keep the existing derived fallback rather than hold the topic nameless.
+        rejected = title == "" or bool(title and is_junk_title(title)) or duplicate
+        if rejected and _hold_until_reply_enabled() and _real_user_turns(conversation_history) < 3:
+            logger.debug("Auto-title held: unsupported or duplicate subject")
+            return
+        if duplicate or (rejected and _hold_until_reply_enabled()):
+            title, source = derive_title(user_message, title_preview), "derived"
         if title and _is_provisional_greeting_title(title):
             source = "derived"
         if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
@@ -1082,7 +1090,7 @@ def auto_title_session(
         if persisted is not None:
             logger.debug("Auto-generated session title: %s", persisted)
             _notify_title(
-                title_callback, persisted, source, "Auto-title", display_title=title,
+                title_callback, persisted, source, "Auto-title", display_title=persisted,
                 icon=(chosen_icon[0] if chosen_icon and source == "llm" else None),
             )
     except Exception as e:
@@ -1168,6 +1176,81 @@ def _latest_assistant_excerpt(messages: Optional[list]) -> str:
             if text:
                 return text[:_REPLY_EXCERPT_CHARS]
     return ""
+
+
+def defer_title_completion_retry(
+    upgrade: threading.Thread, session_db, session_id: str, user_message: str, **title_kwargs,
+) -> Optional[threading.Thread]:
+    """Return the unstarted upgrade, or one bounded opening-turn retry for finalization.
+
+    Eager attempts can abstain even when the opener passes the cheap subject heuristic.
+    Wait off the turn's critical path for that attempt, then reuse the completed reply.
+    """
+    if upgrade.ident is None:
+        return upgrade
+    history = title_kwargs.get("conversation_history")
+    if not _hold_until_reply_enabled() or _real_user_turns(history) > 1:
+        return None
+
+    def retry_with_reply():
+        upgrade.join()
+        if _has_upgraded_title(session_db, session_id) or not _latest_assistant_excerpt(history):
+            return
+        logger.info("Retrying opening title after reply: session=%s", session_id)
+        auto_title_session(session_db, session_id, user_message, **title_kwargs)
+
+    from agent.memory_provider import spawn_context_thread
+    return spawn_context_thread(retry_with_reply, name="auto-title-reply")
+
+
+def defer_title_completion_retry(
+    upgrade: threading.Thread, session_db, session_id: str, user_message: str, **title_kwargs,
+) -> Optional[threading.Thread]:
+    """Return the unstarted upgrade, or one bounded opening-turn retry for finalization.
+
+    Eager attempts can abstain even when the opener passes the cheap subject heuristic.
+    Wait off the turn's critical path for that attempt, then reuse the completed reply.
+    """
+    if upgrade.ident is None:
+        return upgrade
+    history = title_kwargs.get("conversation_history")
+    if not _hold_until_reply_enabled() or _real_user_turns(history) > 1:
+        return None
+
+    def retry_with_reply():
+        upgrade.join()
+        if _has_upgraded_title(session_db, session_id) or not _latest_assistant_excerpt(history):
+            return
+        logger.info("Retrying opening title after reply: session=%s", session_id)
+        auto_title_session(session_db, session_id, user_message, **title_kwargs)
+
+    from agent.memory_provider import spawn_context_thread
+    return spawn_context_thread(retry_with_reply, name="auto-title-reply")
+
+
+def defer_title_completion_retry(
+    upgrade: threading.Thread, session_db, session_id: str, user_message: str, **title_kwargs,
+) -> Optional[threading.Thread]:
+    """Return the unstarted upgrade, or one bounded opening-turn retry for finalization.
+
+    Eager attempts can abstain even when the opener passes the cheap subject heuristic.
+    Wait off the turn's critical path for that attempt, then reuse the completed reply.
+    """
+    if upgrade.ident is None:
+        return upgrade
+    history = title_kwargs.get("conversation_history")
+    if not _hold_until_reply_enabled() or _real_user_turns(history) > 1:
+        return None
+
+    def retry_with_reply():
+        upgrade.join()
+        if _has_upgraded_title(session_db, session_id) or not _latest_assistant_excerpt(history):
+            return
+        logger.info("Retrying opening title after reply: session=%s", session_id)
+        auto_title_session(session_db, session_id, user_message, **title_kwargs)
+
+    from agent.memory_provider import spawn_context_thread
+    return spawn_context_thread(retry_with_reply, name="auto-title-reply")
 
 
 def maybe_auto_title(

@@ -599,7 +599,7 @@ def tool_row_emoji(tool_name: str, args: dict | None = None, default: str = "⚡
 
 def progress_tool_label(tool_name: str, default: str = "⚡") -> tuple[str, str]:
     """``(emoji, label)`` naming a tool in a progress line: the friendly ``app · action`` label for
-    MCP and connector tools (``mcp__paper__get_guide`` -> ``paper · get guide``) when friendly
+    MCP and connector tools (``mcp__paper__get_guide`` -> ``paper · get_guide``) when friendly
     labels are on, else the raw tool name with its registry/skin emoji. The app is lowercased to
     match the raw lowercase names built-in tools show on the same lines; GUI payloads keep the
     title-cased ``ToolLabel.app``."""

@@ -67,7 +67,17 @@ def _model_result(model="gpt-test", provider="openai-codex"):
 
 
 @pytest.fixture
-def home(tmp_path):
+def home(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda *_: {
+        "model": {"default": "gpt-test", "provider": "openai-codex"},
+    })
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
+        "provider": "openai-codex", "api_key": "sk-x",
+    })
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", lambda provider, **_: {
+        "provider": provider, "api_key": "sk-x",
+    })
+    monkeypatch.setattr("gateway.run._credential_pool_for_provider", lambda _: None)
     db = SessionDB(db_path=tmp_path / "state.db")
     db.enable_telegram_topic_mode(chat_id=CHAT, user_id=CHAT)
     yield SimpleNamespace(path=tmp_path, db=db)
@@ -103,6 +113,32 @@ async def _seed_caller(runner, home, thread_id="297206", title="Calling Topic", 
     if icon:
         home.db.record_telegram_topic_icon_state(CHAT, thread_id, emoji=icon, owner="manual")
     return entry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("immediate", [False, True])
+async def test_retire_tool_preserves_immediate_mode(monkeypatch, immediate):
+    import gateway.telegram_retire as retirement
+    import tools.send_message_tool as send_tool
+    import tools.telegram_topic_tool as topic_tool
+
+    runner, source = object(), _source(thread_id="297206")
+    request = AsyncMock(return_value={"status": "queued"})
+    monkeypatch.setattr(retirement, "request", request)
+    monkeypatch.setattr(topic_tool, "_live_runner", lambda: runner)
+    monkeypatch.setattr(topic_tool, "_calling_source", lambda _: source)
+
+    async def dispatch(_runner, make_coro, _error):
+        return await make_coro()
+
+    monkeypatch.setattr(send_tool, "_dispatch_on_gateway_loop", dispatch)
+    result = json.loads(await topic_tool.telegram_topic_tool(
+        {"action": "retire", "target": "Owner", "now": immediate},
+    ))
+
+    assert result["status"] == "queued"
+    request.assert_awaited_once_with(runner, source, target="Owner", now=immediate, cancel=False)
+    assert topic_tool.TELEGRAM_TOPIC_SCHEMA["parameters"]["properties"]["now"]["type"] == "boolean"
 
 
 @pytest.mark.asyncio
@@ -156,8 +192,10 @@ async def test_create_binds_a_new_session_with_every_setting_and_starts_it(home)
     # The brief is shown in the topic and admitted as the session's first turn, never as a command.
     expected_origin = "Split from [🧵 Calling Topic](https://t.me/hermes_test_bot/297206/297206)"
     assert cast(Any, TelegramAdapter).format_message(None, expected_origin) == expected_origin
-    assert adapter.sent[0]["content"] == expected_origin + "\n\n/title is not a command here: read the plan"
-    assert adapter.sent[0]["metadata"] == {"thread_id": "4242"}
+    assert adapter.sent[0]["content"].startswith("**Planning Room**\n\n/title is not a command here: read the plan")
+    assert adapter.sent[0]["content"].endswith(f"*{expected_origin}*")
+    assert adapter.sent[0]["metadata"] == {
+        "thread_id": "4242", "rich_fallback_content": f"{expected_origin}\n\n/title is not a command here: read the plan"}
     turn = adapter.admitted[0]
     assert turn.internal and not turn.allow_gateway_control and not turn.is_command()
     assert turn.source.thread_id == "4242" and turn.text.startswith(expected_origin)
@@ -179,8 +217,9 @@ async def test_create_from_general_topic_uses_main_chat_origin_line(home):
 
     await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", message="start here"))
 
-    assert adapter.sent[0]["content"] == "Split from the main chat\n\nstart here"
-    assert adapter.admitted[0].text == adapter.sent[0]["content"]
+    assert adapter.sent[0]["content"].startswith("**Room**\n\nstart here")
+    assert adapter.sent[0]["content"].endswith("*Split from the main chat*")
+    assert adapter.admitted[0].text == "Split from the main chat\n\nstart here"
 
 
 @pytest.mark.asyncio
@@ -191,10 +230,9 @@ async def test_create_from_topic_without_recorded_icon_omits_icon(home):
 
     await create_topic_session(runner, _source(thread_id="297206"), TopicSpec(name="Room", icon="💡", message="start here"))
 
-    assert adapter.sent[0]["content"] == (
-        "Split from [Calling Topic](https://t.me/hermes_test_bot/297206/297206)\n\nstart here"
-    )
-    assert adapter.admitted[0].text == adapter.sent[0]["content"]
+    origin = "Split from [Calling Topic](https://t.me/hermes_test_bot/297206/297206)"
+    assert adapter.sent[0]["content"].endswith(f"*{origin}*")
+    assert adapter.admitted[0].text == f"{origin}\n\nstart here"
 
 
 @pytest.mark.asyncio

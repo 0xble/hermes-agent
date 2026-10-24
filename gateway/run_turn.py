@@ -43,12 +43,12 @@ from gateway.session import (
 )
 from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
 from gateway.attended_model import (
-    format_attended_switch_back_notice, format_attended_switch_notice,
-    is_active, parse_attended_config, resolve_attended_model,
+    _stamp_seconds, format_attended_switch_back_notice, format_attended_switch_notice,
+    is_active, parse_attended_config,
 )
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext
-from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
+from gateway.turn_lease import DEFAULT_LEASE_WAIT
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -203,10 +203,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         )
         return self._commit_session_agent_runtime(skey, resolved)
 
-    def _load_attended_activity_stamp(self, session_key: str):
+    def _load_attended_activity_stamp(self, session_key: str, *, refresh: bool = False):
         """Read the durable activity stamp without changing live session state."""
         with suppress(Exception):
-            stamp = self.session_store.get_last_user_activity_at(session_key)
+            stamp = self.session_store.get_last_user_activity_at(session_key, refresh=refresh)
             if stamp is not None and hasattr(stamp, "timestamp"):
                 stamp = stamp.timestamp()
             return stamp
@@ -240,7 +240,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             with suppress(Exception):
                 from gateway.run import _resolve_gateway_model
                 model = model or _resolve_gateway_model(user_config)
-        stamp = self._load_attended_activity_stamp(session_key)
+        stamp = self._load_attended_activity_stamp(session_key, refresh=True)
         cfg = parse_attended_config(user_config or {})
         stamp, new_session = self._ensure_attended_new_session_activity(session_key, cfg, stamp)
         reasoning_override = None
@@ -286,6 +286,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             if session_key and conversation:
                 state = self._session_state(session_key)
                 for name, value in conversation.items():
+                    if name == "last_user_activity_at":
+                        # Receipts may advance after the worker read. Compare the same instants
+                        # the attended resolver accepts, rather than ordering raw store values.
+                        current = _stamp_seconds(state.conversation.last_user_activity_at)
+                        incoming = _stamp_seconds(value)
+                        if current is not None and (incoming is None or current > incoming):
+                            continue
                     setattr(state.conversation, name, value)
             if runner:
                 for name, value in runner.items():
@@ -325,7 +332,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         """Return the one authoritative desired route decision for a gateway session."""
         if not session_key:
             return None
-        from gateway.run import _get_channel_override, _resolve_gateway_model
         cfg = parse_attended_config(user_config or {})
         state = self._session_state(session_key)
         conversation = state.conversation
@@ -337,45 +343,19 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         new_session_pending = bool(new_session or getattr(conversation, "attended_new_session", False))
         new_session = new_session_pending and cfg.start_new_sessions
         stamp = conversation.last_user_activity_at
-        if stamp is None:
+        if stamp is None or allow_switch_back:
             if activity_stamp is not _NO_ATTENDED_ACTIVITY_STAMP:
-                stamp = activity_stamp
+                durable_stamp = activity_stamp
             else:
-                stamp = self._load_attended_activity_stamp(session_key)
+                durable_stamp = self._load_attended_activity_stamp(session_key, refresh=allow_switch_back)
+            if durable_stamp is not None and (stamp is None or durable_stamp > stamp):
+                stamp = durable_stamp
         if new_session:
+            # Routing is probed repeatedly before the first request (including image preparation).
+            # Keep first-turn silence through every probe, not just the first route resolution.
+            # Inbound finalization clears the marker on success, failure, and interruption.
             stamp, _ = self._ensure_attended_new_session_activity(session_key, cfg, stamp)
-            self._handoff_attended_state(session_key, conversation={"attended_new_session": False})
-        elif new_session_pending:
-            self._handoff_attended_state(session_key, conversation={"attended_new_session": False})
         self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
-        channel_model = ""
-        channel_provider = ""
-        gateway_config = getattr(self, "config", None)
-        if source is not None and gateway_config is not None:
-            with suppress(Exception):
-                ch = _get_channel_override(
-                    gateway_config, source.platform, str(source.chat_id) if source.chat_id else "",
-                    thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
-                    parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
-                )
-                channel_model = getattr(ch, "model", "") or ""
-                channel_provider = getattr(ch, "provider", "") or ""
-        default_model = _resolve_gateway_model(user_config)
-        model_value = (override or {}).get("model")
-        model_provider = (override or {}).get("provider")
-        # A held role may differ even when setup supplied a default baseline.
-        if default_reasoning is None or (model_role and not model_value):
-            default_reasoning = {}
-            with suppress(Exception):
-                default_reasoning = self._load_attended_reasoning_config(
-                    str(model_value or channel_model or default_model or ""), user_config,
-                    model_role=model_role if not model_value else None,
-                )
-        if attended_reasoning is None:
-            attended_reasoning = {}
-            with suppress(Exception):
-                if cfg.model:
-                    attended_reasoning = self._load_attended_reasoning_config(cfg.model, user_config)
         model_scope = assignment.get("model_scope", getattr(conversation, "model_override_scope", "session"))
         if "reasoning_override" in assignment:
             reasoning_value = assignment["reasoning_override"]
@@ -393,46 +373,18 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         reasoning_scope = (getattr(conversation, "reasoning_override_scope", "session")
                            if reasoning_scope is None else reasoning_scope)
         previous_decision = conversation.last_attended_decision
-        decision = resolve_attended_model(
-            {
-                "model_override": model_value if model_scope not in ("session", "temporary", "once") else None,
-                "once_model": model_value if model_scope == "once" else None,
-                "session_model": model_value if model_scope == "session" else None,
-                "temporary_model": model_value if model_scope == "temporary" else None,
-                "model_override_provider": model_provider,
-                "default_model": default_model,
-                "default_provider": (user_config or {}).get("model", {}).get("provider", "")
-                if isinstance((user_config or {}).get("model"), dict) else "",
-                "channel_model": channel_model,
-                "channel_provider": channel_provider,
-                "last_user_activity_at": stamp,
-                "new_session": new_session,
-                "model_role": model_role,
-                "default_reasoning": default_reasoning,
-                "explicit_model_reasoning": default_reasoning,
-                "attended_reasoning": attended_reasoning,
-                "session_reasoning": reasoning_value if reasoning_scope == "session" else None,
-                "temporary_reasoning": reasoning_value if reasoning_scope == "temporary" else None,
-            },
-            time.time(), user_config or {},
+        from gateway.run_session_readback import resolve_attended_snapshot
+        decision = resolve_attended_snapshot(
+            self, source=source, user_config=user_config, override=override,
+            model_role=model_role, model_scope=model_scope, stamp=stamp, new_session=new_session,
+            reasoning_value=reasoning_value, reasoning_scope=reasoning_scope,
+            default_reasoning=default_reasoning, attended_reasoning=attended_reasoning,
         )
         load_route_active = getattr(self, "_load_attended_route_active", None)
         durable_route_active = load_route_active(session_key) if callable(load_route_active) else None
-        switched_back = bool(
-            decision.reason == "default"
-            # An unresolved hold falls back immediately. Only automatic attended
-            # expiry waits for a quiet API boundary, not a role's missing config.
-            and not model_role
-            and (
-                (
-                    previous_decision is not None
-                    and previous_decision.reason == "attended"
-                    and previous_decision.active
-                    and previous_decision.idle_model
-                    and previous_decision.idle_model != previous_decision.model
-                )
-                or durable_route_active is True
-            )
+        from gateway.run_session_readback import attended_switch_back_pending
+        switched_back = attended_switch_back_pending(
+            decision, previous_decision, model_role, durable_route_active,
         )
         api_quiet = True
         awaiting_first_message = False
@@ -501,14 +453,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             )
         if decision.reason not in {"attended", "role"}:
             return None
-        route = {
-            "active": True,
-            "model": decision.model,
-            "provider": decision.provider,
-            "reasoning_effort": decision.reasoning_effort,
-            "decision_key": decision.decision_key,
-            "role": decision.role,
-        }
+        from gateway.run_session_readback import attended_runtime_route
+        route = attended_runtime_route(decision)
         target_model = cfg.model or decision.model
         session_last_model = last_model or conversation.last_resolved_model or ""
         if (
@@ -536,9 +482,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         self, session_key: str, user_config: Optional[dict],
         activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP,
     ) -> None:
-        """Clear only plain picks after an idle window; --session remains pinned."""
+        """Timed model picks use their deadline, reasoning and untimed picks retain idle expiry."""
         cfg = parse_attended_config(user_config or {})
-        if not cfg.enabled:
+        from gateway.model_pick import model_pick_deadline
+        deadline = model_pick_deadline(self._session_model_override(session_key))
+        expired = bool(deadline and time.time() >= deadline)
+        if not cfg.enabled and not expired:
             return
         state = self._session_state(session_key)
         conversation = state.conversation
@@ -549,10 +498,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             else:
                 stamp = self._load_attended_activity_stamp(session_key)
             self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
-        if is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
+        if not expired and is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
             return
-        if conversation.model_override is not None and conversation.model_override_scope == "temporary":
-            persist = self._persist_session_model_override
+        if (expired or not deadline) and conversation.model_override is not None and conversation.model_override_scope == "temporary":
+            persist = self._expire_session_model_pick
+            expected = conversation.model_override
             loop = getattr(self, "_gateway_loop", None)
             try:
                 asyncio.get_running_loop()
@@ -560,18 +510,17 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 try:
                     if loop is not None and loop.is_running():
                         future = asyncio.run_coroutine_threadsafe(
-                            persist(session_key, None, scope="session"), loop,
+                            persist(session_key, expected), loop,
                         )
                         future.result()
                     else:
-                        asyncio.run(persist(session_key, None, scope="session"))
+                        asyncio.run(persist(session_key, expected))
                 except Exception:
                     logger.debug("Failed to expire temporary attended model pick", exc_info=True)
-                else:
-                    self._evict_cached_agent(session_key)
             else:
                 logger.debug("Skipping synchronous attended expiry on the gateway loop")
-        if conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary":
+        if (cfg.enabled and not is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes)
+                and conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary"):
             self._clear_attended_reasoning_override_threadsafe(session_key)
 
     def _clear_attended_reasoning_override_threadsafe(self, session_key: str) -> None:
@@ -600,9 +549,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         self, session_key: str, user_config: Optional[dict],
         activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP,
     ) -> None:
-        """Async-loop-safe expiry for the first route resolution after restart."""
+        """Async-loop-safe deadline and legacy idle expiry, including after restart."""
         cfg = parse_attended_config(user_config or {})
-        if not cfg.enabled:
+        from gateway.model_pick import model_pick_deadline
+        deadline = model_pick_deadline(self._session_model_override(session_key))
+        expired = bool(deadline and time.time() >= deadline)
+        if not cfg.enabled and not expired:
             return
         state = self._session_state(session_key)
         conversation = state.conversation
@@ -613,16 +565,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             else:
                 stamp = activity_stamp
             self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
-        if is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
+        if not expired and is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
             return
-        if conversation.model_override is not None and conversation.model_override_scope == "temporary":
+        if (expired or not deadline) and conversation.model_override is not None and conversation.model_override_scope == "temporary":
             try:
-                await self._persist_session_model_override(session_key, None, scope="session")
+                await self._expire_session_model_pick(session_key, conversation.model_override)
             except Exception:
                 logger.debug("Failed to expire temporary attended model pick", exc_info=True)
-            else:
-                self._evict_cached_agent(session_key)
-        if conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary":
+        if (cfg.enabled and not is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes)
+                and conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary"):
             await self._clear_attended_reasoning_override_async(session_key)
 
     def _snapshot_session_runtime_state(self, skey):
@@ -647,7 +598,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             self._pre_agent_fallback_notice = notice
         if skey:
             fields = {"pre_agent_fallback_notice": notice}
-            if notice:
+            conversation = self._session_state(skey).conversation
+            if getattr(conversation, "model_pick_expired", False):
+                from gateway.attended_model import friendly_model_name
+                fields["pending_attended_notice"] = t("gateway.model.pick_expired", model=friendly_model_name(model))
+                fields["model_pick_expired"] = False
+            elif notice:
                 fields["pending_attended_notice"] = None
             self._handoff_attended_state(skey, conversation=fields)
             with _attended_notice_lock:
@@ -831,6 +787,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             attended_enabled = parse_attended_config(user_config or {}).enabled
             if attended_enabled:
                 state.conversation.pre_agent_fallback_notice = None
+            await self._rehydrate_session_model_override_async(skey)
+            if not attended_enabled:
+                await self._expire_attended_temporary_picks_async(skey, user_config)
             if attended_enabled:
                 current_override = self._session_model_override(skey) or {}
                 attended_cfg = parse_attended_config(user_config or {})
@@ -1221,11 +1180,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         attended_new_session = getattr(
             self._session_state(session_key).conversation, "attended_new_session", False,
         )
-        _is_new_session = (
-            (attended_enabled and attended_new_session)
-            or session_entry.created_at == session_entry.updated_at
-            or _was_auto_reset
-            or _is_fresh_reset
+        from gateway.session_state import session_opening_pending
+        _is_new_session = _was_auto_reset or session_opening_pending(
+            session_entry, attended_new_session=attended_enabled and attended_new_session,
         )
         # Consume is_fresh_reset so it doesn't leak onto later messages in the same session.
         if _is_fresh_reset:
@@ -1302,12 +1259,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         except Exception as e:
             logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens):
+    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens, event=None):
         """Serialize [load history → run → flush] per resolved SESSION_ID so another routing key on
         the same session waits for the prior flush. Fail-closed on timeout (outer dispatch returns
-        a resend notice). Released in _handle_message's finally, granted per (routing key, run
-        generation) so a stale unwind can't release a newer turn's."""
+        a resend notice for callers without an inbound event). Inbound messages retain their FIFO
+        waiter beyond the deadline, backed by the recovery spool. Released in _handle_message's
+        finally, granted per (routing key, run generation) so a stale unwind can't
+        release a newer turn's."""
         from gateway.run import _float_env
+        from gateway.run_turn_lease_wait import lease_wait_max_seconds, lease_wait_notice, preserve_lease_wait_async
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is None:
             return
@@ -1315,9 +1275,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             _lease_token = await _lease_registry.acquire(
                 session_entry.session_id, owner_key=_quick_key, generation=run_generation,
                 timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
+                max_wait=lease_wait_max_seconds(),
+                on_wait=(lambda: lease_wait_notice(self, _quick_key, event)) if event is not None else None,
+                on_timeout=(lambda: preserve_lease_wait_async(
+                    self, _quick_key, session_entry.session_id, event,
+                )) if event is not None else None,
             )
-        except TurnLeaseTimeoutError:
-            # The cleanup finally starts later; restore the tokens here or this exit leaks identity.
+        except BaseException:
+            # The cleanup finally starts later; cancellation and spool failures restore identity too.
             self._clear_session_env(_session_env_tokens)
             raise
         if _lease_token is not None:
@@ -3033,7 +2998,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if _is_new_session and _auto:
             self._hmwa_auto_load_skills(event, _auto, _quick_key, session_key)
 
-        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens)
+        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens, event)
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
@@ -3049,6 +3014,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
             return t("gateway.errors.history_unavailable"), _session_env_tokens
+
+        # Hygiene may have started its worker during this very turn and released
+        # the inline wait without releasing the compression lock. Do not enter
+        # preflight on the old transcript or consume the input as a retry notice.
+        if await self._defer_compression_locked_event(session_key, event, prepend=True):
+            self._clear_session_env(_session_env_tokens)
+            return None, _session_env_tokens
 
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, internal=event.internal)
 
@@ -3127,6 +3099,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        event._hermes_attended_session_key = session_key
         if not getattr(event, "_attended_activity_marked", False):
             mark_activity = getattr(self, "_mark_attended_user_activity", None)
             if callable(mark_activity):
@@ -5148,6 +5121,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             _head_origin = bound_turn_origin()
             if pending_event is not None:
                 set_turn_origin(turn_origin_for_event(pending_event))
+            _consumed_events = (
+                (pending_event, *getattr(pending_event, "_hermes_absorbed_events", ()))
+                if pending_event is not None else ()
+            )
+            # In-band turns bypass _handle_message_with_agent. Record their own
+            # result, including absorbed inputs, rather than borrowing the chain head's.
+            for consumed_event in _consumed_events:
+                consumed_event._agent_turn_succeeded = False
             try:
                 followup_result = await self._run_agent(
                     message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
@@ -5163,6 +5144,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     persist_user_display_metadata={
                         **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
                 )
+                from gateway.run import _should_clear_resume_pending_after_turn
+                for consumed_event in _consumed_events:
+                    consumed_event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(followup_result)
             finally:
                 set_turn_origin(_head_origin)
         except asyncio.CancelledError:
@@ -5580,6 +5564,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 _native_slack_task_cards=False,
                 needs_progress_queue=False,
             )
+        if session_key:
+            from gateway.model_pick import model_pick_deadline
+            await self._rehydrate_session_model_override_async(session_key)
+            deadline = model_pick_deadline(self._session_model_override(session_key))
+            if deadline and time.time() >= deadline:
+                # Expire before the assignment snapshot, and publish its notice on this loop
+                # before the worker can consume it on the same turn.
+                await self._resolve_session_agent_runtime_async(
+                    source=source, session_key=session_key, user_config=disp.user_config)
         turn_ctx, turn_runner, _cleanup_adapter = self._run_agent_build_turn_context(
             disp, AIAgent, message=message, source=source, session_key=session_key,
             run_generation=run_generation, context_prompt=context_prompt, history=history,
