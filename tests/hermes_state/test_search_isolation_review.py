@@ -80,6 +80,60 @@ def test_all_tool_shapes_bypass_busy_token_writer(db):
             db._lock.release()
 
 
+@pytest.mark.parametrize("mode", ["browse", "read", "scroll", "discover"])
+def test_tool_stage_log_accounts_for_every_read(db, monkeypatch, caplog, mode):
+    import logging
+    import re
+    from functools import partial
+    from types import SimpleNamespace
+
+    import hermes_state_search
+    import hermes_state_search_runtime as runtime
+
+    anchor = db.get_messages("tip")[0]["id"]
+    calls = {
+        "browse": {},
+        "read": {"session_id": "tip"},
+        "scroll": {"session_id": "root", "around_message_id": anchor},
+        "discover": {"query": "needle", "detail": "full"},
+    }
+    clock, reads = [time.monotonic()], []
+
+    def trace(sql):
+        if sql.lstrip().upper().startswith(("SELECT", "WITH")):
+            reads.append(sql)
+            clock[0] += .025
+
+    checkout = db._checkout_read_conn
+
+    def traced_checkout(*args, **kwargs):
+        conn = checkout(*args, **kwargs)
+        if conn is not None:
+            conn.set_trace_callback(trace)
+        return conn
+
+    monkeypatch.setattr(db, "_checkout_read_conn", traced_checkout)
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(runtime, "SearchOperation", partial(runtime.SearchOperation, started=clock[0]))
+    monkeypatch.setattr(hermes_state_search, "_search_slow_ms", lambda: 0)
+    with caplog.at_level(logging.INFO, logger="hermes_state"):
+        payload = json.loads(session_search(db=db, **calls[mode]))
+    assert payload["success"], payload
+    lines = [r.getMessage() for r in caplog.records if "slow session search:" in r.getMessage()]
+    assert len(lines) == 1
+    line = lines[0]
+    rows = (payload["count"] if mode == "browse" else
+            payload["message_count"] if mode == "read" else
+            len(payload["messages"]) if mode == "scroll" else 2)
+    assert f"rows={rows} " in line
+    assert f"path={'fts5' if mode == 'discover' else mode} " in line
+    values = {key: float(value) for key, value in re.findall(r"(\w+_ms)=(\d+\.\d+)", line)}
+    assert reads
+    assert values["sql_ms"] == pytest.approx(len(reads) * 25)
+    assert values["hydration_ms"] == 0
+    assert values["total_ms"] == pytest.approx(len(reads) * 25)
+
+
 def test_get_session_keeps_exact_totals_outside_search(db, monkeypatch):
     from hermes_state_search_runtime import search_operation
 
@@ -143,7 +197,14 @@ def test_priority_uses_only_bound_source(monkeypatch, engaged):
     import gateway.session_context as context
     from hermes_state_search_runtime import _priority
 
-    monkeypatch.setenv("HERMES_SESSION_SOURCE", "cron")
+    for name, value in {
+        "HERMES_SESSION_SOURCE": "cron",
+        "HERMES_SESSION_PLATFORM": "subagent",
+        "HERMES_TURN_ORIGIN": "cron",
+        "HERMES_CRON_SESSION": "1",
+        "HERMES_DELEGATED_CHILD_CONTEXT": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setattr(context, "_session_context_engaged", engaged)
     assert Context().run(_priority) == 0
 
@@ -156,6 +217,61 @@ def test_priority_uses_only_bound_source(monkeypatch, engaged):
 
     assert Context().run(bound, "cron") == 1
     assert Context().run(bound, "telegram") == 0
+
+
+@pytest.mark.parametrize("identity", [
+    {"turn_origin": "cron"},
+    {"cron_session": "1"},
+    {"platform": "cron"},
+    {"platform": "subagent"},
+])
+def test_priority_recognizes_bound_background_identity(identity):
+    import gateway.session_context as context
+    from hermes_state_search_runtime import _priority
+
+    def bound():
+        tokens = context.set_session_vars(source="telegram", **identity)
+        try:
+            assert _priority() == 1
+        finally:
+            context.clear_session_vars(tokens)
+
+    Context().run(bound)
+
+
+def test_priority_recognizes_production_cron_environment(monkeypatch):
+    from cron import scheduler
+    from hermes_state_search_runtime import _priority
+
+    monkeypatch.setattr(scheduler, "_resolve_job_workdir", lambda *_args: None)
+
+    def run():
+        environment = scheduler._CronRunScope({}, "search-priority", None)
+        environment.enter()
+        try:
+            assert _priority() == 1
+        finally:
+            environment.exit()
+
+    Context().run(run)
+
+
+def test_priority_recognizes_delegated_child_with_parent_source():
+    import gateway.session_context as context
+    from agent.delegation_context import delegated_child_context
+    from hermes_state_search_runtime import _priority
+
+    def run():
+        tokens = context.set_session_vars(source="telegram", platform="telegram", turn_origin="user")
+        try:
+            assert _priority() == 0
+            with delegated_child_context():
+                assert _priority() == 1
+            assert _priority() == 0
+        finally:
+            context.clear_session_vars(tokens)
+
+    Context().run(run)
 
 
 @pytest.mark.parametrize("message", ["database is locked", "interrupted", "disk I/O error"])

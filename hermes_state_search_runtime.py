@@ -72,14 +72,21 @@ def _queue_for(db):
 
 
 def _priority():
-    # Gateway context is thread-local. Unknown/library callers use FIFO with
-    # interactive calls. Only known automation yields, never a guessed UI list.
-    from gateway.session_context import _SESSION_SOURCE
+    # Unknown/library callers use FIFO with interactive calls. Production cron
+    # scopes bind origin/cron status, while inline children inherit parent source.
+    from agent.delegation_context import is_delegated_child_context
+    from gateway.session_context import (
+        _CRON_SESSION, _SESSION_PLATFORM, _SESSION_SOURCE, _TURN_ORIGIN,
+    )
 
-    # No process-environment fallback, even before the first bound gateway turn.
-    # The unbound sentinel matches no background source and gets default priority.
-    source = _SESSION_SOURCE.get()
-    return int(source in {"cron", "subagent", "batch", "kanban", "oneshot", "tool", "a2a"})
+    background = {"cron", "subagent", "batch", "kanban", "oneshot", "tool", "a2a"}
+    # Inspect only task-bound signals. Ambient process state belongs to whichever
+    # concurrent turn wrote last and must not promote or demote an unbound caller.
+    return int(
+        is_delegated_child_context()
+        or _CRON_SESSION.get() == "1"
+        or any(var.get() in background for var in (_SESSION_SOURCE, _SESSION_PLATFORM, _TURN_ORIGIN))
+    )
 
 
 @dataclass

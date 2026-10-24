@@ -610,26 +610,36 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
                    exclude_session_ids=exclude_session_ids, detail=detail, limit=limit)
     scope = (search_operation(db, caller="session_search tool", query=query, sort=sort, filters=filters)
              if isinstance(db, SessionDB) else nullcontext())
-    with scope:
+    with scope as operation:
         with search_stage(db, "hydration_ms"):
             if isinstance(session_id, str) and session_id.strip():
-                if around_message_id is not None:
-                    return _scroll(db, session_id.strip(), around_message_id, window, current_session_id)
-                return _read_scoped(db, session_id.strip(), profile)
-            limit = _clamp_int(limit, 3, 1, 10)
-            if not query or not isinstance(query, str) or not query.strip():
-                return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
-            sort_norm = sort.strip().lower() if isinstance(sort, str) else None
-            try:
-                after_ts, before_ts = _parse_iso_bound(after), _parse_iso_bound(before)
-            except ValueError as e:
-                return tool_error(str(e), success=False)
-            return _discover(
-                db=db, query=query.strip(), limit=limit, sort=sort_norm if sort_norm in ("newest", "oldest") else None,
-                role_filter=([r.strip() for r in role_filter.split(",") if r.strip()] or None) if isinstance(role_filter, str) else None,
-                detail="full" if isinstance(detail, str) and detail.strip().lower() == "full" else "adaptive",
-                current_session_id=current_session_id, link_profile=profile, after_ts=after_ts, before_ts=before_ts,
-                exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids))
+                mode = "scroll" if around_message_id is not None else "read"
+                if operation is not None:
+                    operation.path = mode
+                result = (_scroll(db, session_id.strip(), around_message_id, window, current_session_id)
+                          if mode == "scroll" else _read_scoped(db, session_id.strip(), profile))
+            elif not query or not isinstance(query, str) or not query.strip():
+                if operation is not None:
+                    operation.path = "browse"
+                result = _list_recent_sessions(db, _clamp_int(limit, 3, 1, 10), current_session_id, link_profile=profile)
+            else:
+                sort_norm = sort.strip().lower() if isinstance(sort, str) else None
+                try:
+                    after_ts, before_ts = _parse_iso_bound(after), _parse_iso_bound(before)
+                except ValueError as e:
+                    return tool_error(str(e), success=False)
+                return _discover(
+                    db=db, query=query.strip(), limit=_clamp_int(limit, 3, 1, 10),
+                    sort=sort_norm if sort_norm in ("newest", "oldest") else None,
+                    role_filter=([r.strip() for r in role_filter.split(",") if r.strip()] or None) if isinstance(role_filter, str) else None,
+                    detail="full" if isinstance(detail, str) and detail.strip().lower() == "full" else "adaptive",
+                    current_session_id=current_session_id, link_profile=profile, after_ts=after_ts, before_ts=before_ts,
+                    exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids))
+            if operation is not None:
+                payload = json.loads(result)
+                if payload.get("success"):
+                    operation.rows = payload.get("count", payload.get("message_count", len(payload.get("messages", []))))
+            return result
 
 
 def _shape_session_links(raw_result: str, platform: str | None = None) -> str:
