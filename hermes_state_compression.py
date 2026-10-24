@@ -521,11 +521,12 @@ class SessionCompressionMixin:
         UPDATE."""
         if not session_id or not holder:
             return False
-        expires_at = time.time() + ttl_seconds
-        try:
-            return self._write_rowcount(
+        def _refresh(conn):
+            return conn.execute(
                 "UPDATE compression_locks SET expires_at = ? WHERE session_id = ? AND holder = ?",
-                (expires_at, session_id, holder)) > 0
+                (time.time() + ttl_seconds, session_id, holder)).rowcount > 0
+        try:
+            return self._execute_write(_refresh)
         except sqlite3.Error as exc:
             logger.warning("refresh_compression_lock(%s) failed: %s", session_id, exc)
             return False
@@ -537,9 +538,9 @@ class SessionCompressionMixin:
         from hermes_state import _compression_lock_holder_process_is_dead
         if not session_id:
             return False
-        now = time.time()
-        expires_at = now + ttl_seconds
         def _do(conn):
+            now = time.time()
+            expires_at = now + ttl_seconds
             return _claim_lease_row(
                 conn, "compression_locks", "session_id", session_id, holder, now, expires_at,
                 lambda h, e: e < now or _compression_lock_holder_process_is_dead(h))
