@@ -193,3 +193,53 @@ def test_one_store_through_symlinked_homes_keeps_one_pm_runtime(tmp_path, monkey
     for tools in (home / "tools", task / "tools", real, home / "tools"):
         assert launch(tools) == current
     assert len(staged) == 1
+
+
+def test_default_project_uses_checkout_identity_for_lock_and_install_owner(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from pm import runtime
+    from pm.environments import install_state_dir, install_state_lock_path, install_metadata_path
+
+    project = tmp_path / "checkout"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname = 'fixture'\n")
+    (project / "uv.lock").write_text("version = 1\n")
+    pm_project = Path(runtime.__file__).resolve().parent
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "tools"))
+    monkeypatch.setattr("pm.paths.repo_root", lambda: project)
+    observed = []
+
+    @contextmanager
+    def lock(root, **kwargs):
+        observed.append(root)
+        raise PermissionError(13, "Permission denied",
+                              str(install_state_lock_path(install_state_dir(root))))
+        yield
+
+    monkeypatch.setattr("hermes_cli.runtime_state.runtime_lock", lock)
+    with pytest.raises(PermissionError) as denied:
+        runtime.prepare_runtime(Path("uv"), Path(sys.executable), tmp_path / "runtime")
+    assert observed == [project]
+    from pm.environments import install_state_permission_message
+    message = install_state_permission_message(project, denied.value)
+    assert message is not None and "install state is not writable" in message
+
+    # The success path records the same owner while its install lock is held.
+    @contextmanager
+    def acquired(root, **kwargs):
+        assert root == project
+        yield True
+
+    monkeypatch.setattr("hermes_cli.runtime_state.runtime_lock", acquired)
+    def stage(_uv, _python, environment, **kwargs):
+        assert kwargs["project"] == pm_project
+        environment.mkdir(parents=True)
+        return runtime._python(environment)
+
+    monkeypatch.setattr("pm.runtime_stage.stage_runtime", stage)
+    monkeypatch.setattr(runtime, "_validate", lambda *args: "")
+    monkeypatch.setattr(runtime, "_hold_for_children", lambda *args: None)
+    runtime.prepare_runtime(Path("uv"), Path(sys.executable), tmp_path / "runtime")
+    metadata = json.loads(install_metadata_path(project).read_text())
+    assert metadata["project_root"] == str(project.resolve())

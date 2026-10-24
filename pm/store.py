@@ -191,6 +191,50 @@ def hash_url(url: str) -> str:
     return retry_network(request)
 
 
+def _legacy_tar_filter(member, dest: str):
+    """Containment for unpatched bootstrap Pythons predating PEP 706.
+
+    Never fall back to unfiltered extraction: historical releases can run
+    3.10/3.11 stdlibs without data_filter, FilterError, or TarInfo.replace.
+    Resolve each member immediately before extraction so earlier symlinks
+    cannot turn a later file into an out-of-tree write.
+    """
+    import copy
+    import tarfile
+
+    def contained(name: str) -> None:
+        if os.path.isabs(name):
+            raise tarfile.ExtractError(f"absolute archive path: {name!r}")
+        target = os.path.realpath(os.path.join(dest, name))
+        if os.path.commonpath([target, dest]) != dest:
+            raise tarfile.ExtractError(f"archive path escapes destination: {name!r}")
+
+    name = member.name.rstrip("/")
+    contained(name)
+    if member.issym() or member.islnk():
+        if os.path.isabs(member.linkname):
+            raise tarfile.ExtractError(f"absolute archive link: {member.linkname!r}")
+        target = (os.path.join(os.path.dirname(name), member.linkname)
+                  if member.issym() else member.linkname)
+        contained(target)
+    elif not (member.isfile() or member.isdir()):
+        raise tarfile.ExtractError(f"special archive member: {member.name!r}")
+    filtered = copy.copy(member)
+    # Old chown/chmod do not support PEP 706's None-to-skip semantics.
+    # numeric_owner=True below suppresses archive name lookup; any chown is
+    # idempotent to the extracting account, never to an archive-supplied owner.
+    filtered.uid = getattr(os, "getuid", lambda: 0)()
+    filtered.gid = getattr(os, "getgid", lambda: 0)()
+    filtered.uname = filtered.gname = ""
+    filtered.mode = 0o755 if member.isdir() else 0o777
+    if member.isfile() or member.islnk():
+        mode = member.mode & 0o755
+        if not mode & 0o100:
+            mode &= ~0o111
+        filtered.mode = mode | 0o600
+    return filtered
+
+
 def _tar_filter(member, dest: str):
     """The stdlib 'data' filter, with symlink targets resolved from the link's own
     directory. Bootstrap interpreters (Ubuntu 22.04 ships 3.10) resolve them from
@@ -213,7 +257,7 @@ def _tar_filter(member, dest: str):
 def extract_tar(archive: Path | IO[bytes], dest: Path) -> None:
     """Extract a tarball (a path, or an open stream such as a .deb's data.tar)
     with the one containment policy every PM tar consumer shares. Unsafe
-    members raise tarfile.FilterError.
+    members raise tarfile.TarError (FilterError on PEP 706 stdlibs).
     """
     import tarfile
 
@@ -221,7 +265,13 @@ def extract_tar(archive: Path | IO[bytes], dest: Path) -> None:
     real_dest = os.path.realpath(dest)
     opened = tarfile.open(archive) if isinstance(archive, (str, os.PathLike)) else tarfile.open(fileobj=archive)
     with opened as tf:
-        tf.extractall(dest, filter=lambda member, path: _tar_filter(member, real_dest))
+        if hasattr(tarfile, "data_filter"):
+            tf.extractall(dest, filter=lambda member, path: _tar_filter(member, real_dest))
+        else:
+            # A lazy iterator preserves ordering: check after preceding members
+            # have been placed, not before their symlinks exist on disk.
+            tf.extractall(dest, members=(_legacy_tar_filter(member, real_dest) for member in tf),
+                          numeric_owner=True)
 
 
 def extract(archive: Path, dest: Path) -> None:
