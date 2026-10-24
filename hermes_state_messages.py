@@ -25,6 +25,7 @@ from hermes_state_common import (
     _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json)
+from hermes_state_transactions import execute_transcript_write
 
 from hermes_state_write_metrics import add_write_rows, timed_write_phase
 from hermes_state_message_archive import archive_message_rows
@@ -508,35 +509,8 @@ class SessionMessagesMixin:
             inserted, tool_calls_total = self._insert_message_rows(conn, session_id, inserted_rows)
             self._bump_session_counters(conn, session_id, inserted, tool_calls_total, unit=False)
             return inserted
-        return self._execute_transcript_write(_do, messages, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
-
-    _ROW_STATE_KEYS = ("_row_id", DB_ROW_SNAPSHOT, "timestamp")
-
-    def _execute_transcript_write(self, fn, messages: list[dict[str, Any]], **kwargs):
-        """``_execute_write(fn)`` for callbacks that stamp row state onto the caller's *messages* (every
-        :meth:`_insert_message_rows` caller that passes caller-owned dicts; rewind and import insert fresh copies). Each attempt, and a final failure, restores the caller's
-        ``_row_id`` / digest / timestamp: a rolled-back insert's id is reused by SQLite, so a stale stamp
-        would make a later flush adopt another writer's row and drop this message."""
-        _absent = object()
-        pre_state = [tuple(m.get(k, _absent) for k in self._ROW_STATE_KEYS) for m in messages]
-
-        def _restore() -> None:
-            for msg, state in zip(messages, pre_state):
-                msg.pop(CANONICAL_ROW, None)
-                for key, value in zip(self._ROW_STATE_KEYS, state):
-                    if value is _absent:
-                        msg.pop(key, None)
-                    else:
-                        msg[key] = value
-
-        def _attempt(conn):
-            _restore()
-            return fn(conn)
-        try:
-            return self._execute_write(_attempt, **kwargs)
-        except BaseException:
-            _restore()
-            raise
+        return execute_transcript_write(self, _do, messages, session_id=session_id,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def set_latest_matching_message_display_kind(self, session_id: str, *, role: str, content: str,
                                                  display_kind: str,
@@ -877,7 +851,7 @@ class SessionMessagesMixin:
             inserted, inserted_tool_calls = self._insert_message_rows(conn, session_id, messages[kept:])
             conn.execute(f"{_SET_COUNTERS_SQL} WHERE id = ?",
                          (kept + inserted, kept_tool_calls + inserted_tool_calls, session_id))
-        self._execute_transcript_write(_do, messages)
+        execute_transcript_write(self, _do, messages, session_id=session_id)
 
     @classmethod
     def _row_identity(cls, role: str, content: Any, tool_call_id: Any, tool_calls: Any) -> tuple:
@@ -1089,7 +1063,7 @@ class SessionMessagesMixin:
             conn.execute(f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
                 (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
             return inserted
-        return self._execute_transcript_write(_do, compacted_messages)
+        return execute_transcript_write(self, _do, compacted_messages, session_id=session_id)
 
     def _raise_if_unheld_summary(self, conn, session_id: str, held_messages: List[Dict[str, Any]]) -> None:
         """Raise ``StaleHeldHistory`` when an active summary row is missing from *held_messages*.
