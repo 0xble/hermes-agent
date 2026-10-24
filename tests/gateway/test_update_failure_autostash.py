@@ -6,10 +6,11 @@ import pytest
 
 from gateway.update_notifications import final_outcome
 from tests.gateway.update_fixtures import pending
-from tests.hermes_cli.test_update_target_identity import git, update_tree  # noqa: F401
+from tests.hermes_cli.test_update_target_identity import git
+from tests.hermes_cli.test_update_target_identity import update_tree  # fixture
 
 
-@pytest.mark.parametrize("failure", ["commit_point", "syntax_rollback"])
+@pytest.mark.parametrize("failure", ["commit_point", "syntax_rollback", "called_process"])
 @pytest.mark.parametrize("dirty", [False, True])
 def test_failed_pull_notice_preserves_local_work_evidence(update_tree, tmp_path, monkeypatch, failure, dirty):
     from hermes_cli import main, update_cmd, update_cmd_stash, update_host_obligation, update_receipt
@@ -31,7 +32,7 @@ def test_failed_pull_notice_preserves_local_work_evidence(update_tree, tmp_path,
         local.write_text("local edits\n", encoding="utf-8")
     if failure == "commit_point":
         monkeypatch.setattr(update_cmd._commit, "arm_commit_point", lambda *_a, **_k: "fixture commit-point refusal")
-    else:
+    elif failure == "syntax_rollback":
         # The selected commit is syntactically broken. Exercise the real tree move,
         # syntax check, rollback and recovery-marker cleanup, not a receipt stand-in.
         (tree.origin / "broken.py").write_text("def broken(:\n", encoding="utf-8")
@@ -43,13 +44,19 @@ def test_failed_pull_notice_preserves_local_work_evidence(update_tree, tmp_path,
     try:
         stash = main._stash_local_changes_if_needed(["git"], tree.clone)
         with pytest.raises(SystemExit) as error:
-            update_cmd._pull_updates(
-                ["git"], "main", stash, prompt_for_restore=False, gw_input_fn=None,
-                discard_local_changes=False, keep_stash=False,
-            )
+            if failure == "called_process":
+                update_cmd._handle_update_called_process_error(
+                    subprocess.CalledProcessError(1, ["git", "fetch", "origin"]),
+                    args=None, gateway_mode=True, had_desktop_app_before_update=False,
+                )
+            else:
+                update_cmd._pull_updates(
+                    ["git"], "main", stash, prompt_for_restore=False, gw_input_fn=None,
+                    discard_local_changes=False, keep_stash=False,
+                )
         assert error.value.code == 1
     finally:
-        update_receipt.finalize_update_receipt("failed")
+        main._finalize_update_receipt(1, "sys.exit(1)")
         update_cmd_stash._clear_pending_autostash()
     (home / ".update_process_exit_code").write_text("1", encoding="utf-8")
     assert git(tree.clone, "rev-parse", "HEAD") == tree.base
@@ -57,7 +64,8 @@ def test_failed_pull_notice_preserves_local_work_evidence(update_tree, tmp_path,
     assert not completion_pending_path(tree.clone).exists()
     assert not update_host_obligation.host_obligation_path(tree.clone).exists()
     receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
-    assert receipt["stop_class"] == ("commit_point_refused" if failure == "commit_point" else "syntax_rollback")
+    if failure != "called_process":
+        assert receipt["stop_class"] == ("commit_point_refused" if failure == "commit_point" else "syntax_rollback")
     assert receipt["pre_update"]["sha"] == receipt["post_update"]["sha"] == tree.base
     ok, detail = final_outcome(home, request)
     assert ok is False
@@ -125,7 +133,7 @@ def test_pre_pull_failure_notice_names_parked_autostash(update_tree, tmp_path, m
                 update_cmd._exit_after_failed_branch_switch(["git"], "main", result, stash, None)
         assert error.value.code == 1
     finally:
-        update_receipt.finalize_update_receipt("failed")
+        main._finalize_update_receipt(1, "sys.exit(1)")
         update_cmd_stash._clear_pending_autostash()
     (home / ".update_process_exit_code").write_text("1", encoding="utf-8")
 

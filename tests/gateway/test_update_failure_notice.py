@@ -74,6 +74,7 @@ async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
 @pytest.mark.parametrize("case", [
     "missing", "malformed", "stale", "bad_timestamp", "unfinished", "changed", "missing_sha", "invalid_sha",
     "restart", "fleet", "transition", "release_pending", "fleet_pending", "success_receipt", "broken_release",
+    "missing_working_tree_fact",
 ])
 def test_failed_exit_never_claims_unchanged_without_current_receipt_proof(tmp_path, case):
     data = pending(tmp_path, reason=False)
@@ -87,7 +88,9 @@ def test_failed_exit_never_claims_unchanged_without_current_receipt_proof(tmp_pa
     elif case == "malformed":
         path.write_text("{")
     else:
-        if case == "stale":
+        if case == "missing_working_tree_fact":
+            receipt["steps"] = []
+        elif case == "stale":
             receipt["started_at"] = receipt["finished_at"] = (
                 datetime.now(timezone.utc) - timedelta(days=1)
             ).isoformat()

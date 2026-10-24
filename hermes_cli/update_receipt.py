@@ -645,6 +645,11 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason
     current = _current.get()
     if current is None:
         return None
+    # Inner failure handlers and the command-boundary safety net share this close.
+    # Persist any still-pending autostash before the receipt becomes immutable.
+    from hermes_cli.update_cmd_stash import _record_pending_autostash
+    _record_pending_autostash()
+    current = _current.get() or current
     receipt = copy.copy(current)
     receipt.data = copy.deepcopy(current.data)
     token = getattr(receipt, "current_token", None)
