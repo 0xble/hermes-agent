@@ -916,6 +916,7 @@ class GatewayBusySessionMixin:
     async def _send_busy_ack_reply(self, event: MessageEvent, adapter, message: str) -> None:
         try:
             await self._send_busy_reply(event, adapter, message)
+            event._gateway_busy_ack_sent = True
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
