@@ -145,7 +145,9 @@ def test_standby_readiness_is_local(monkeypatch):
     monkeypatch.setattr(gateway_slot, "_query_other_slot",
                         lambda home, slot, timeout: {"standby": False})
     gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
-    assert zero_cut_standby.readiness() == {"slot": "b", "standby": True, "ready": False, "deferred": []}
+    assert zero_cut_standby.readiness() == {
+        "slot": "b", "standby": True, "ready": False, "deferred": [], "handover_accepted": False,
+    }
     zero_cut_standby.mark_ready()
     assert zero_cut_standby.readiness()["ready"] is True
     zero_cut_standby.reset_for_tests()

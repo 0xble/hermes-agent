@@ -10,23 +10,15 @@ import pytest
 
 from hermes_cli import quiet_single_query as qsq
 import tools.process_registry as registry_module
-from tools.process_registry import ProcessRegistry, ProcessSession
+from tools.process_registry import ProcessRegistry
+from tests.tools.test_survive_restart import _checkpoint_from_exited_producer
 
 
 def _pending_result(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
     run_dir = home / "process-runs" / "proc_quiet"
-    run_dir.mkdir(parents=True)
-    (run_dir / "out.log").write_text("quiet result\n", encoding="utf-8")
-    (run_dir / "exit").write_text("0\n", encoding="utf-8")
-    producer = ProcessRegistry()
-    producer._running["proc_quiet"] = ProcessSession(
-        id="proc_quiet", command="echo quiet", pid=999999, task_id="task", session_key="session",
-        survive_restart=True, notify_on_complete=True, log_path=str(run_dir / "out.log"),
-        exit_path=str(run_dir / "exit"), delivered_path=str(run_dir / "delivered"),
-    )
-    producer._write_checkpoint()
+    _checkpoint_from_exited_producer(home, session_id="proc_quiet", log_text="quiet result\n")
     return home, run_dir
 
 

@@ -1,5 +1,6 @@
 """Regression coverage for terminal-fallback ownership and ambiguous writes."""
 import json
+import os
 import queue
 import sqlite3
 import time
@@ -50,6 +51,20 @@ def _drain_one(q):
     event = q.get_nowait()
     assert q.empty()
     return event
+
+
+def _restore_after_owner_exit(target_queue, monkeypatch):
+    """Startup recovery cannot steal a live producer's pending winner."""
+    assert ad.restore_undelivered_completions(target_queue) == 0
+    assert target_queue.empty()
+    alive = ad._owner_liveness()
+    assert alive is not None
+    owner_pid = os.getpid()
+    with monkeypatch.context() as exited:
+        exited.setattr(ad, "_owner_liveness", lambda: lambda pid, started: (
+            False if pid == owner_pid else alive(pid, started)
+        ))
+        return ad.restore_undelivered_completions(target_queue)
 
 
 def test_commit_then_raise_does_not_create_a_redundant_terminal_fallback(tmp_path, monkeypatch):
@@ -113,7 +128,7 @@ def test_competing_terminal_write_does_not_enqueue_the_losing_payload(tmp_path, 
     assert q.empty()
 
     replay = queue.Queue()
-    assert ad.restore_undelivered_completions(replay) == 1
+    assert _restore_after_owner_exit(replay, monkeypatch) == 1
     replayed = _drain_one(replay)
     assert replayed["results"] == winner["results"]
     assert replayed["group"] == winner["group"]
@@ -175,7 +190,7 @@ def test_competitor_after_active_read_keeps_winner_replayable(tmp_path, monkeypa
     assert q.empty(), "losing payload must never be offered against the winner's delivery identity"
 
     replay = queue.Queue()
-    assert ad.restore_undelivered_completions(replay) == 1
+    assert _restore_after_owner_exit(replay, monkeypatch) == 1
     replayed = _drain_one(replay)
     assert replayed["results"] == winner["results"]
     claim = ad.claim_event_delivery(replayed, "synthetic-parent")
@@ -319,7 +334,7 @@ def test_unavailable_reconciliation_never_claims_a_competing_winner(tmp_path, mo
     assert q.empty(), "a proven loser is never offered again"
     assert _row(record["delegation_id"])[1] == "pending"
     replay = queue.Queue()
-    assert ad.restore_undelivered_completions(replay) == 1
+    assert _restore_after_owner_exit(replay, monkeypatch) == 1
     assert _drain_one(replay)["results"] == winner["results"]
 
 
@@ -518,7 +533,7 @@ def test_rejected_terminal_copies_never_claim_after_winner_changes(tmp_path, mon
     assert _row(record["delegation_id"])[1] == "pending"
 
     replay = queue.Queue()
-    assert ad.restore_undelivered_completions(replay) == 1
+    assert _restore_after_owner_exit(replay, monkeypatch) == 1
     winner_event = _drain_one(replay)
     winner_claim = ad.claim_event_delivery(winner_event, "real-winner")
     assert winner_claim
@@ -601,7 +616,7 @@ def test_failed_gateway_primary_requeues_permanently_rejected_sibling(tmp_path, 
     assert ad.get_durable_delegation(loser_record["delegation_id"])["delivery_attempts"] == 0
     assert ad.claim_event_delivery(dict(loser), "post-batch-retry") is None
     replay = queue.Queue()
-    assert ad.restore_undelivered_completions(replay) == 1
+    assert _restore_after_owner_exit(replay, monkeypatch) == 1
     winner_event = _drain_one(replay)
     assert winner_event["results"] == winner["results"]
     winner_event["session_key"] = primary["session_key"]
@@ -646,7 +661,7 @@ def test_cli_drain_never_injects_an_unproven_terminal_result(tmp_path, monkeypat
     assert len(ad._unresolved) == 1, "held, not lost"
     assert _row(record["delegation_id"])[1] == "pending", "the winner's row is not consumed"
     replay = queue.Queue()
-    assert ad.restore_undelivered_completions(replay) == 1
+    assert _restore_after_owner_exit(replay, monkeypatch) == 1
     assert _drain_one(replay)["results"] == winner["results"]
 
 

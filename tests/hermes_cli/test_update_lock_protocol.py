@@ -548,10 +548,10 @@ _PROBER = """
 import fcntl, os, sys, time
 from pathlib import Path
 path = sys.argv[2]
-end = time.monotonic() + float(sys.argv[3])
-Path(sys.argv[4]).write_text("go", encoding="utf-8")
+stop = Path(sys.argv[3])
+end = time.monotonic() + 30
 n = 0
-while time.monotonic() < end:
+while not stop.exists() and time.monotonic() < end:
     fd = os.open(path, os.O_RDONLY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -561,8 +561,11 @@ while time.monotonic() < end:
         pass
     os.close(fd)
     n += 1
+    if n == 1:
+        Path(sys.argv[4]).write_text("go", encoding="utf-8")
     time.sleep(0.001)  # the next probe's process spawn
 print(n)
+assert stop.exists(), "acquisition workload did not finish before the watchdog"
 """
 
 
@@ -574,20 +577,28 @@ def test_held_probe_never_fails_a_concurrent_acquire(tmp_path):
     install.mkdir()
     lock_path = update_lock.checkout_lock_path(install)
     lock_path.touch()
-    prober = _python(tmp_path, _PROBER, lock_path, 4, tmp_path / "go", stdout=subprocess.PIPE, text=True)
+    stop = tmp_path / "stop-probing"
+    prober = _python(tmp_path, _PROBER, lock_path, stop, tmp_path / "go", stdout=subprocess.PIPE, text=True)
     _wait_for(tmp_path / "go", prober)
     attempts = refused = 0
     try:
-        while prober.poll() is None:
+        for _ in range(64):
+            assert prober.poll() is None, "prober exited before the acquisition workload finished"
             attempts += 1
             if update_lock._acquire_checkout(install) is not None:
                 refused += 1
             else:
                 update_lock._release_checkout()
     finally:
-        prober.kill()
-        prober.wait()
-    assert attempts > 50
+        stop.touch()
+        try:
+            probes, _ = prober.communicate(timeout=5)
+        finally:
+            if prober.poll() is None:
+                prober.kill()
+                prober.wait()
+    assert prober.returncode == 0
+    assert int(probes) > 0, "the independent process must actually probe the lock"
     assert refused == 0, f"{refused}/{attempts} acquires failed against a probe with no real holder"
 
 
