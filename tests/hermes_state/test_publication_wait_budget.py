@@ -132,3 +132,62 @@ def test_lost_compaction_lease_is_not_retried(tmp_path):
         assert db.get_messages("s") == []
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("abort_final_attempt", [False, True])
+def test_publication_and_attempt_metrics_keep_separate_retry_scopes(
+    tmp_path, monkeypatch, abort_final_attempt
+):
+    import sqlite3
+
+    from hermes_state_publication import publication_metrics, record_publication_write
+    from hermes_state_write_metrics import WriteMetrics, current_write_metrics
+
+    db = SessionDB(tmp_path / "metrics.db")
+    outer = WriteMetrics()
+    token = current_write_metrics.set(outer)
+    try:
+        db.create_session("s", "test")
+        attempts, changes = [], []
+
+        def publish(conn):
+            attempts.append(current_write_metrics.get())
+            before = conn.total_changes
+            db._insert_message_rows(conn, "s", [{"role": "user", "content": "summary"}])
+            changes.append(conn.total_changes - before)
+            if len(attempts) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            if abort_final_attempt:
+                raise ValueError("abort publication")
+
+        monkeypatch.setattr(db, "_sleep_before_write_retry", lambda *_args: True)
+        conn = db._conn
+        assert conn is not None
+        changes_before = conn.total_changes
+        with publication_metrics(10) as publication:
+            if abort_final_attempt:
+                with pytest.raises(ValueError, match="abort publication"):
+                    db._execute_write(publish)
+            else:
+                db._execute_write(publish)
+            assert current_write_metrics.get() is outer
+            # SQLite may defer additional FTS changes until commit, after the callback.
+            assert publication["publish_rows_written"] == conn.total_changes - changes_before
+            assert publication["publish_rows_written"] >= sum(changes)
+            assert publication["publish_hold_ms"] >= 0
+            assert publication["publish_wait_ms"] >= 0
+        assert len(attempts) == 2
+        assert attempts[0] is not attempts[1]
+        for attempt in attempts:
+            assert attempt.rows == {"inserted": 1}
+            assert "callback_total" in attempt.phases
+        assert "rollback" in attempts[0].phases
+        assert ("rollback" if abort_final_attempt else "commit") in attempts[1].phases
+        assert outer.rows == {} and outer.phases == {}
+        counted_rows = publication["publish_rows_written"]
+        record_publication_write(rows_written=999)
+        assert publication["publish_rows_written"] == counted_rows
+        assert len(db.get_messages("s")) == (0 if abort_final_attempt else 1)
+    finally:
+        current_write_metrics.reset(token)
+        db.close()

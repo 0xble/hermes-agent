@@ -30,6 +30,12 @@ calculated after the wait, inside the write callback. Atomic publication, lease
 ownership, covered row checks, FTS triggers, display reconciliation, and rewind
 flags stay intact.
 
+The publication scope accumulates total SQLite changes, including trigger work
+and rolled-back attempts, across retries. Attempt-local write diagnostics use a
+separate ContextVar, reset for each admitted transaction, to report logical row
+counts and callback/commit/rollback phases. Neither scope contributes its counts
+to the other, and both restore any enclosing context on success or failure.
+
 ## Incident Evidence
 
 The 2026-10-23 incident's 3 attempts spent 634497, 603812, and 555910 ms in

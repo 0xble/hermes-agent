@@ -26,6 +26,9 @@ from hermes_state_common import (
 from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json)
 
+from hermes_state_write_metrics import add_write_rows, timed_write_phase
+from hermes_state_message_archive import archive_message_rows
+
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
 # One INSERT shape for every message writer (append, batch, replace, compact, import).
@@ -84,7 +87,6 @@ _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls, messa
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
 _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?"
 _SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
-_ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
 _SHADOWED_CHECKPOINT_ROWS_SQL = ("SELECT id, codex_reasoning_items FROM messages WHERE session_id = ? AND active = 1 "
     "AND role = 'assistant' AND id < ? AND codex_reasoning_items LIKE '%\"compaction\"%'")
 _SET_CODEX_REASONING_SQL = "UPDATE messages SET codex_reasoning_items = ? WHERE id = ?"
@@ -769,6 +771,7 @@ class SessionMessagesMixin:
         except Exception:
             return  # Best-effort: a failed carry falls back to the publish-time stamp, never breaks publish.
 
+    @timed_write_phase("insert_incl_fts")
     def _insert_message_rows(self, conn, session_id: str, messages: list[dict[str, Any]], *,
                              prune_checkpoints: bool = True) -> tuple[int, int]:
         """Insert *messages* as fresh active rows in the caller's txn -> ``(inserted, tool_call_count)``.
@@ -806,6 +809,7 @@ class SessionMessagesMixin:
         # legacy one. One batched SELECT; hash the STORED rows (column affinity rewrites bind values).
         from agent.transcript_repair import stamp_inserted_row_snapshots
         stamp_inserted_row_snapshots(conn, session_id, messages)
+        add_write_rows("inserted", inserted)
         return inserted, tool_calls_total
 
     def _prune_shadowed_checkpoints(self, conn, session_id: str, live_messages: list[dict[str, Any]]) -> None:
@@ -933,6 +937,7 @@ class SessionMessagesMixin:
         rows = conn.execute(sql, params).fetchall()
         return [int(r["id"]) for r in rows], sum(_tool_calls_len(r["tool_calls"]) for r in rows)
 
+    @timed_write_phase("clone_incl_fts")
     def _clone_message_rows(self, conn, tail_ids: list[int], *, session_id: Optional[str] = None) -> None:
         """Pure-SQL clone of *tail_ids* as fresh live rows (new id/display order, active=1, compacted=0;
         message payload columns stay byte-exact and FTS triggers index the clones), into *session_id* when given."""
@@ -942,11 +947,12 @@ class SessionMessagesMixin:
         # still display-visible (the source may just have become rewind-only).
         skip = ("id", "active", "compacted", "display_order") + (("session_id",) if retarget else ())
         col_list = ", ".join(c for c in self._message_column_names(conn) if c not in skip)
-        conn.execute(
+        cursor = conn.execute(
             f"INSERT INTO messages ({col_list}, {'session_id, ' if retarget else ''}active, compacted) "
             f"SELECT {col_list}, {'?, ' if retarget else ''}1, 0 FROM messages "
             f"WHERE id IN ({_placeholders(tail_ids)}) ORDER BY id",
             [session_id, *tail_ids] if retarget else tail_ids)
+        add_write_rows("cloned", cursor.rowcount)
 
     def _archive_named_rows(
         self, conn, session_id: str, compacted_messages: list[dict[str, Any]], covered: list[int], *,
@@ -971,13 +977,7 @@ class SessionMessagesMixin:
             rewind_ids += self._tail_originals(covered_active, tail_count, merged_away)
         rewind_ids += unseen
         rewind_ids = list(dict.fromkeys(rewind_ids))
-        if rewind_ids:
-            placeholders = _placeholders(rewind_ids)
-            conn.execute(
-                "UPDATE messages SET active = 0, compacted = 0 "
-                f"WHERE session_id = ? AND id IN ({placeholders})",
-                [session_id, *rewind_ids])
-        conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
+        archive_message_rows(conn, session_id, rewind_ids)
         # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
         # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
         # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
@@ -1073,13 +1073,7 @@ class SessionMessagesMixin:
                      int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
             rewind_ids += tail_ids
             rewind_ids = list(dict.fromkeys(rewind_ids))
-            if rewind_ids:
-                placeholders = _placeholders(rewind_ids)
-                conn.execute("UPDATE messages SET active = 0, compacted = 0 "
-                    f"WHERE session_id = ? AND id IN ({placeholders})", [session_id, *rewind_ids])
-                conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({placeholders})", [session_id, *rewind_ids])
-            else:
-                conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
+            archive_message_rows(conn, session_id, rewind_ids, exclude_rewound=True)
             # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
             # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
             # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
@@ -1350,6 +1344,7 @@ class SessionMessagesMixin:
                 rows[row[0]] = (row[0], row[1], row[2])
         return [rows[row_id] for row_id in sorted(rows)]
 
+    @timed_write_phase("display_reconcile")
     def _reconcile_display_orders(self, conn, session_id: str,
                                   plan: Optional[_FoldPlan] = None) -> None:
         """Re-fold split display generations by the recomputed display key.
@@ -1387,7 +1382,8 @@ class SessionMessagesMixin:
             rows.close()
             if last_id == batch_start:
                 break
-            conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+            cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+            add_write_rows("display_reconciled", cursor.rowcount)
 
     def _fold_display_orders(self, conn, visible: List[Tuple[int, Optional[bytes], Optional[int]]],
                              plan: _FoldPlan) -> None:
@@ -1417,7 +1413,8 @@ class SessionMessagesMixin:
             if folded != order or identity != stored:
                 updates.append((folded, identity, row_id))
         if updates:
-            conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+            cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+            add_write_rows("display_reconciled", cursor.rowcount)
 
     def _ensure_display_order(self, session_id: str) -> bool:
         """Backfill one legacy session once, preserving the pre-index display identity exactly."""

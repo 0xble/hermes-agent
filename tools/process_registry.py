@@ -2644,7 +2644,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                     and s.id not in self._completion_consumed and s.id not in self._poll_observed]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
-                           to_session_key: str, note: str = "") -> Optional[ProcessSession]:
+                           to_session_key: str, note: str = "", to_source=None) -> Optional[ProcessSession]:
         """Move a RUNNING process from one owner to another under the registry lock. Ownership is the ``owner_task_id``
         field: completion notices are stamped from it at exit time and teardown kills by it, so flipping it here is the
         whole transfer. Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
@@ -2657,7 +2657,23 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
-            return session
+            if to_source is not None:
+                session.parent_session_id = to_owner
+                for field in _WATCHER_ROUTE_KEYS:
+                    value = getattr(to_source, field, "")
+                    if field == "platform":
+                        value = getattr(value, "value", value)
+                    setattr(session, f"watcher_{field}", str(value or ""))
+                # An old reply anchor belongs to the old topic.
+                session.watcher_message_id = ""
+                for watcher in self.pending_watchers:
+                    if watcher.get("session_id") == session_id:
+                        watcher.update(session_key=to_session_key, parent_session_id=to_owner,
+                                       **{field: getattr(session, f"watcher_{field}") for field in _WATCHER_ROUTE_KEYS})
+        # Checkpoints acquire the same lock. Persist after releasing it, including
+        # crash-surviving watcher routes rather than only the in-memory owner.
+        self._write_checkpoint()
+        return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
         """Active processes for a gateway session key. Processes older than

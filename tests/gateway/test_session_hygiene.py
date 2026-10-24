@@ -154,7 +154,7 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
         "agent.model_metadata.get_model_context_length",
         lambda *_args, **_kwargs: 100,
     )
-    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "1000000001")
 
     event = MessageEvent(
         text="hello",
@@ -281,7 +281,7 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
         "agent.model_metadata.get_model_context_length",
         lambda *_args, **_kwargs: 100,
     )
-    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "1000000001")
 
     event = MessageEvent(
         text="hello",
@@ -1044,10 +1044,11 @@ async def test_hygiene_fence_cancel_records_cooldown_without_abort_flag(
 
 
 @pytest.mark.asyncio
-async def test_hygiene_skips_when_compression_already_in_flight(
+async def test_hygiene_lock_in_flight_defers_turn_without_sibling_compressor(
     monkeypatch, tmp_path
 ):
-    """Do not spawn a sibling hygiene compressor while a lock is already held."""
+    """A held compression lock neither spawns a sibling hygiene compressor nor
+    runs the model against the transcript it owns. The input is retained."""
     from hermes_state import SessionDB
 
     session_id = "sess-in-flight"
@@ -1071,13 +1072,18 @@ async def test_hygiene_skips_when_compression_already_in_flight(
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.create_session(session_id, "telegram")
-        runner, _adapter, event = _make_cooldown_runner(
+        runner, adapter, event = _make_cooldown_runner(
             monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
         )
+        key = runner.session_store.get_or_create_session.return_value.session_key
+        # The transport owns this dispatch, so it drains the retained input itself.
+        adapter._active_sessions[key] = asyncio.Event()
         runner._session_has_compression_in_flight = AsyncMock(return_value=True)
-        assert await runner._handle_message(event) == "ok"
+        assert await runner._handle_message(event) is None
         assert ShouldNotRunAgent.instances == 0
-        assert runner._run_agent.await_count == 1
+        assert runner._run_agent.await_count == 0
+        assert adapter._pending_messages[key] is event
+        assert adapter.sent == []
     finally:
         db.close()
 

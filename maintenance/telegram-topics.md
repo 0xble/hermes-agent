@@ -38,9 +38,10 @@ its optional icon, and the durable alias can be observed through one Telegram to
   sampling the configured title model on real opening messages against the live catalog.
 - `/title X` on a Telegram topic stores the user's exact text, or the next free lineage alias
   such as `X #2` only when that exact text is held by another session; the visible Telegram
-  topic is renamed to the unsuffixed label. Auto-titles that collide likewise keep the visible
-  label unsuffixed while the session row carries the alias. Non-Telegram collision behavior
-  remains upstream behavior.
+  topic is renamed to the unsuffixed label. Model-generated titles that match another
+  session's name are rejected before persistence, ignoring case and a trailing ` #N` on the stored name only. Numbers in a proposed subject remain meaningful. Background title
+  callbacks use their persisted alias so even a collision arriving between the check and
+  persistence cannot show a duplicate label.
 - `/title X` also re-picks the icon from `X` when `auto_topic_icons` is on, through the same
   selection helper as automatic renames, and replaces a manual icon (automatic renames never do).
   Any icon Hermes writes clears the adapter's remembered manual icon for that topic; see
