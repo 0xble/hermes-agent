@@ -4,7 +4,7 @@
 
 ## Behavior
 
-Each completed `codex_responses` or `chat_completions` model response with a requested or reported service tier emits one INFO record:
+Each completed `codex_responses` or `chat_completions` model response emits one INFO record, even when neither side reports a tier:
 
 ```text
 speed tier: session=<id> model=<wire-model> provider=<provider> route=<api-mode> requested=<tier|none> served=<tier|unreported>

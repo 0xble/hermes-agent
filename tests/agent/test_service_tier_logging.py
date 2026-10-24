@@ -20,8 +20,8 @@ def _lines(caplog):
     ("priority", None, "requested=priority served=unreported"),
     (None, "priority", "requested=none served=priority"),
     (" PRIORITY ", " ULTRAFAST ", "requested=priority served=ultrafast"),
-    (None, None, None),
-    ("", " ", None),
+    (None, None, "requested=none served=unreported"),
+    ("", " ", "requested=none served=unreported"),
 ])
 def test_tier_line(mode, requested, served, expected, caplog):
     agent = SimpleNamespace(session_id="child-session", model="configured-model",
@@ -56,10 +56,13 @@ def test_other_wires_do_not_emit_a_tier_line(mode, caplog):
 
 @pytest.mark.parametrize("streaming", [True, False])
 @pytest.mark.parametrize("mode", ["codex_responses", "chat_completions"])
-def test_response_is_logged_once_after_middleware_and_preflight(mode, streaming, monkeypatch, caplog):
-    response = SimpleNamespace(service_tier="default")
+@pytest.mark.parametrize("requested,served", [("priority", "default"), (None, None)])
+def test_response_is_logged_once_after_middleware_and_preflight(
+    mode, streaming, requested, served, monkeypatch, caplog,
+):
+    response = SimpleNamespace(service_tier=served)
     # Stand-in for the negotiated transport kwargs, not the agent's Ultrafast preference.
-    preflight = lambda kwargs, **ignored: {**kwargs, "service_tier": "priority"}
+    preflight = lambda kwargs, **ignored: {**kwargs, "service_tier": requested}
     agent = SimpleNamespace(
         api_mode=mode, service_tier="ultrafast", model="gpt-6.1-sol", provider="custom:codex-proxy",
         session_id="child-session", platform="subagent", base_url="http://127.0.0.1:8317/v1",
@@ -71,7 +74,7 @@ def test_response_is_logged_once_after_middleware_and_preflight(mode, streaming,
     )
     monkeypatch.setattr("agent.turn_api_call._should_stream", lambda agent: streaming)
     monkeypatch.setattr("hermes_cli.middleware.run_llm_execution_middleware",
-                        lambda kwargs, invoke, **ignored: invoke({**kwargs, "service_tier": "priority"}))
+                        lambda kwargs, invoke, **ignored: invoke({**kwargs, "service_tier": requested}))
     monkeypatch.setattr("agent.relay_llm.execute", lambda kwargs, invoke, **ignored: invoke(kwargs))
     with caplog.at_level(logging.INFO):
         verdict = perform_api_call(
@@ -80,7 +83,7 @@ def test_response_is_logged_once_after_middleware_and_preflight(mode, streaming,
             api_call_count=1, api_request_id="request", effective_task_id="task", turn_id="turn", interrupted=False)
     assert verdict.response is response
     assert len(_lines(caplog)) == 1
-    assert "requested=priority served=default" in _lines(caplog)[0]
+    assert f"requested={requested or 'none'} served={served or 'unreported'}" in _lines(caplog)[0]
     assert "session=child-session" in _lines(caplog)[0]
 
 

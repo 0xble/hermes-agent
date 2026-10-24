@@ -85,14 +85,13 @@ def log_response_service_tier(agent: Any, response: Any, api_kwargs: dict[str, A
     requested = requested.strip().lower() if isinstance(requested, str) else ""
     usage = with_served_service_tier(normalize_usage(None), response)
     served = (usage.raw_usage or {}).get("service_tier")
-    if requested or served:
-        logger.info(
-            "speed tier: session=%s model=%s provider=%s route=%s requested=%s served=%s",
-            getattr(agent, "session_id", None) or "unknown",
-            api_kwargs.get("model") or getattr(agent, "model", "unknown"),
-            getattr(agent, "provider", None) or "unknown", agent.api_mode,
-            requested or "none", served or "unreported",
-        )
+    logger.info(
+        "speed tier: session=%s model=%s provider=%s route=%s requested=%s served=%s",
+        getattr(agent, "session_id", None) or "unknown",
+        api_kwargs.get("model") or getattr(agent, "model", "unknown"),
+        getattr(agent, "provider", None) or "unknown", agent.api_mode,
+        requested or "none", served or "unreported",
+    )
 
 
 def record_response_usage(
