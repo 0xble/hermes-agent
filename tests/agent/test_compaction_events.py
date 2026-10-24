@@ -532,8 +532,10 @@ def test_publication_busy_retries_the_same_generated_summary(published, tmp_path
         db.close()
 
 
-def test_publication_failure_does_not_select_another_summary_model(published, tmp_path):
+@pytest.mark.parametrize("at_deadline", [False, True])
+def test_publication_failure_does_not_select_another_summary_model(published, tmp_path, at_deadline):
     import sqlite3
+    import time
     from hermes_state import SessionDB
     from agent.conversation_compression import run_compress_context_with_progress_timeout
 
@@ -545,18 +547,27 @@ def test_publication_failure_does_not_select_another_summary_model(published, tm
     messages = _messages()
 
     def worker(fence):
-        return compress_context(agent, messages, "system prompt", approx_tokens=80_000, commit_fence=fence)
+        def busy(*args, **kwargs):
+            if at_deadline:
+                # Admission already won. Let the rolled-back publication finish
+                # beyond the deadline, where a generic unchanged result retries.
+                fence._deadline = time.monotonic() - 1
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch.object(db, "archive_and_compact", side_effect=busy) as publish:
+            result = compress_context(agent, messages, "system prompt", approx_tokens=80_000, commit_fence=fence)
+        assert fence.publication_failed and publish.call_count == 3
+        return result
 
     try:
-        with patch.object(db, "archive_and_compact", side_effect=sqlite3.OperationalError("database is locked")) as publish, \
-                patch.object(agent.context_compressor, "_generate_summary", return_value="SANITIZED SUMMARY") as generate, \
+        with patch.object(agent.context_compressor, "_generate_summary", return_value="SANITIZED SUMMARY") as generate, \
                 patch("agent.conversation_compression._retry_compression_on_fallback_chain") as fallback:
             compressed, _ = run_compress_context_with_progress_timeout(
                 worker=worker, messages=messages, system_prompt_fallback="system prompt", telemetry_agent=agent,
                 idle_timeout_seconds=30, total_ceiling_seconds=60,
             )
         assert compressed == _messages()
-        assert generate.call_count == 1 and publish.call_count == 3
+        assert generate.call_count == 1
         fallback.assert_not_called()
         assert db.get_messages(agent.session_id) == []
     finally:

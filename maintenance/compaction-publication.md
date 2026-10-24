@@ -10,6 +10,11 @@ Lease loss, generation conflicts, deliberate session closure, and other failures
 keep the original transcript. Publication failure is not a summarizer failure and
 must not select another summary model.
 
+Commit admission alone is not a publication failure: an admitted worker that
+finishes unchanged at its deadline may still recover on the next model route,
+after the first worker has fully settled. The fence records actual publication
+failure separately so storage errors cannot enter that recovery path.
+
 Writer patience includes acquisition of the SessionDB instance mutex, not only
 SQLite's `BEGIN IMMEDIATE`. Compression lease timestamps must be calculated after
 that wait, inside the write callback. Atomic publication, lease ownership, covered
@@ -31,6 +36,11 @@ reproducible stall mechanism, not conclusive attribution of every incident
 millisecond. A long display-plan read or reader-pool wait is another possible
 pre-transaction contributor. Separate publication wait/hold timings are required
 to distinguish the next occurrence.
+
+The clean-close race test's lock observer implements both context-manager and
+timed acquire/release entry, and observes both cached and full generation guards.
+This preserves its teardown barrier when writer admission or guard selection
+changes without relaxing the clean-close/sticky-loss invariant.
 
 ## Verification And Removal
 

@@ -48,13 +48,15 @@ def test_busy_retry_rolls_back_each_failed_transaction_and_counts_attempted_rows
         db.close()
 
 
-@pytest.mark.parametrize("published", [False, True])
-def test_model_fallback_is_only_allowed_before_publication_admission(published):
+@pytest.mark.parametrize("outcome", ["not_admitted", "unchanged", "publication_failed"])
+def test_model_fallback_excludes_publication_failure_not_commit_admission(outcome):
     fence = CompressionCommitFence()
-    if published:
+    if outcome != "not_admitted":
         assert fence.begin_commit()
+        if outcome == "publication_failed":
+            fence.mark_publication_failed()
         fence.finish_commit()
     with patch("agent.conversation_compression._retry_compression_on_fallback_chain", return_value="retry") as fallback:
         result = _attempt_stall_fallback(fence, worker=Mock())
-    assert result == (None if published else "retry")
-    assert fallback.call_count == (0 if published else 1)
+    assert result == (None if outcome == "publication_failed" else "retry")
+    assert fallback.call_count == (0 if outcome == "publication_failed" else 1)

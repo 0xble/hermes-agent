@@ -463,6 +463,7 @@ class CompressionCommitFence:
         self._lock = threading.Lock()
         self._cancelled = False
         self._commit_started = False
+        self._publication_failed = False
         # Readable WITHOUT the lock (begin_commit holds it until finish_commit): hosts see a hung commit.
         # Lock-free commit-phase marker (#76354 review F1). ``begin_commit`` RETAINS ``self._lock`` until
         # ``finish_commit``, so any host-side observation that needs the lock (``try_cancel_before_commit``)
@@ -606,6 +607,14 @@ class CompressionCommitFence:
     def commit_started(self) -> bool:
         """Lock-free read: a commit was admitted (it may already have finished)."""
         return self._commit_started
+
+    def mark_publication_failed(self) -> None:
+        """Keep a rolled-back storage failure out of model-route recovery."""
+        self._publication_failed = True
+
+    @property
+    def publication_failed(self) -> bool:
+        return self._publication_failed
 
     @property
     def commit_in_flight(self) -> bool:
@@ -961,8 +970,8 @@ def request_exceeds_model_window(agent: Any, request_tokens: Any) -> Optional[bo
 
 
 def _attempt_stall_fallback(fence: CompressionCommitFence, **kwargs):
-    """Model-route retries are only for failures before publication admission."""
-    if fence.commit_started:
+    """Storage failures reuse their candidate, unchanged deadline aborts may retry."""
+    if fence.publication_failed:
         return None
     return _retry_compression_on_fallback_chain(**kwargs)
 
@@ -1342,7 +1351,7 @@ def run_compress_context_with_progress_timeout(
                 if telemetry_agent is not None:
                     _record_recovered_stall_backoff(telemetry_agent)
                 return recovered
-        if fence.commit_started:
+        if fence.publication_failed:
             # Publication failures are not model stalls. The worker already logged
             # their stage and cooldown, and changing models cannot repair storage.
             return preserved_result if preserved_result is not None else (messages, _resolve_fallback_prompt())
@@ -4215,6 +4224,8 @@ def compress_context(
             # todo fold / user-anchor rows above keep their own class and are not carried.
             carried_messages=[reinserted_reply] if reinserted_reply is not None else None,
         )
+        if commit_fence is not None and commit.split_status in {"failed_not_indexed", "aborted"}:
+            commit_fence.mark_publication_failed()
         if commit.refused_prompt is not None:
             _restore_messages_snapshot(messages, messages_before_compression)
             return messages, commit.refused_prompt
