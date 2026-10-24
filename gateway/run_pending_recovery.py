@@ -245,6 +245,7 @@ def _recovered_followup_event(data, source, author_id):
         metadata=data.get("metadata") or {},
         reply_expected=data["reply_expected"] if isinstance(data.get("reply_expected"), bool) else None,
     )
+    setattr(event, "_attended_activity_received_at", data.get("_attended_activity_received_at"))
     if recovery_id is not None:
         setattr(event, "_hermes_recovery_id", recovery_id)
     return event

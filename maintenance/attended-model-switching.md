@@ -224,6 +224,8 @@ Run `tests/gateway/test_attended_busy_activity.py` when changing busy admission.
 Genuine replies must refresh activity at receipt on both runner and adapter paths,
 including Telegram grace queueing and foreign-owner handover, without counting automation or refreshing again when the same event drains. The old turn owner must observe the successor's durable activity at the next API boundary, but never adopt a replacement session's timestamp. Receipt tasks are retained until completion and capture the timestamp before worker hops. An in-flight receipt is joined during drain, and out-of-order workers cannot move the local activity clock backward. Durable refresh is opt-in for the off-loop routing snapshot and committed request boundary, not every cached getter.
 
+Shutdown and drain-deferred follow-ups preserve `_attended_activity_received_at` through the shared spool serializer and recovery builder. A recovered follow-up may publish only that original receipt, never its reconstruction or replay time. Legacy spools without the receipt do not count as fresh activity, because their ordering `ts` may instead be a shutdown flush time. Startup auto-resume remains internal and cannot reset activity. The busy-activity regressions round-trip both spool kinds through durable activity writes, including arrivals interrupted before their receipt write completes.
+
 Activity ordering compares instants, not naive wall times. The repeated DST hour
 must advance both activity and `updated_at`, survive durable reload with its fold
 intact even when a turn marker updates the row, and reject older receipts.

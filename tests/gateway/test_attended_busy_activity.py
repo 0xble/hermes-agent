@@ -1,5 +1,6 @@
 """Busy replies refresh attended routing at receipt, never when their queue drains."""
 import asyncio
+import json
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -540,3 +541,73 @@ async def test_drain_retries_failed_receipt_with_original_arrival_time(busy_acti
     runner.async_session_store.mark_user_activity.assert_awaited_once_with(
         key, when=datetime.fromtimestamp(stamp),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule", [False, True], ids=["turn-start", "busy-admission"])
+@pytest.mark.parametrize("reason", ["shutdown_follow_up", "drain_deferred"])
+@pytest.mark.parametrize("recorded_receipt", [True, False], ids=["original-receipt", "legacy-spool"])
+@pytest.mark.parametrize("persisted_receipt", [True, False], ids=["arrival-written", "arrival-not-written"])
+async def test_replayed_followup_never_counts_as_new_activity(
+    busy_activity, tmp_path, monkeypatch, schedule, reason, recorded_receipt, persisted_receipt,
+):
+    from gateway.run_pending_recovery import _claim_recovered_followup
+    from gateway.session import AsyncSessionStore
+    from gateway.shutdown_flush import flush_pending_to_file, recover_pending_spool
+
+    runner, original, key, state = busy_activity
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store = SessionStore(tmp_path / "sessions", runner.config)
+    reader = SessionStore(tmp_path / "sessions", runner.config)
+    receipt = datetime.fromtimestamp(time.time() - 600).timestamp()
+    original._attended_activity_received_at = receipt
+    original._drain_deferred = reason == "drain_deferred"
+    entry = store.get_or_create_session(original.source)
+    assert entry.session_key == key
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    queued = []
+    previous = receipt - 60
+    assert store.mark_user_activity(key, datetime.fromtimestamp(previous))
+    state.conversation.last_user_activity_at = previous
+    expected = receipt if recorded_receipt or persisted_receipt else previous
+    try:
+        if persisted_receipt:
+            assert await runner._mark_attended_user_activity(original, original.source, key)
+        assert flush_pending_to_file({key: original}, reason=reason) == 1
+        path, = (tmp_path / "pending_messages").glob("*.json")
+        if not recorded_receipt:
+            payload = json.loads(path.read_text())
+            payload["data"].pop("_attended_activity_received_at", None)
+            # Ordering/flush time is not proof of a human arrival.
+            payload["ts"] = time.time()
+            path.write_text(json.dumps(payload))
+
+        def claim(recovered_key, session_id, data, spool):
+            return _claim_recovered_followup(
+                runner, recovered_key, session_id, data, spool,
+                original.source, original.source.user_id, queued,
+            )
+
+        count, held = recover_pending_spool(
+            session_db=store,
+            session_resolver=lambda _key, **_kwargs: (entry.session_id, store),
+            deferred_followup=claim,
+        )
+        assert count == 1 and not held
+        replay = queued.pop()
+        if schedule:
+            runner._schedule_attended_user_activity(replay, replay.source, key)
+            task = getattr(replay, "_attended_activity_task", None)
+            if task is not None:
+                await task
+        else:
+            marked = await runner._mark_attended_user_activity(replay, replay.source, key)
+            assert marked is recorded_receipt
+        assert state.conversation.last_user_activity_at == expected
+        restored = reader.get_last_user_activity_at(key, refresh=True)
+        assert restored is not None and restored.timestamp() == expected
+        assert getattr(replay, "_attended_activity_marked", False) is recorded_receipt
+    finally:
+        for session_store in (store, reader):
+            session_store.close_all_db_handles()
