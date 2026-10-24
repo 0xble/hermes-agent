@@ -2216,6 +2216,8 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
         raise RuntimeError("current is not a release; remove the obsolete source pointer before updating")
     if current is not None and not _release_is_ready(current, current.name):
         raise RuntimeError("current release is not ready; refusing to activate from an invalid pointer")
+    from hermes_cli.update_cmd_candidate import select_update_candidate
+    fetched = select_update_candidate(source, home, fetched, getattr(args, "replace_candidate", None))
     # Capture migration metadata and the source plist transactionally at activation,
     # not at staging/handoff. Promote a deferred candidate on the next normal update
     # even when the remote has not advanced beyond it.
@@ -2223,8 +2225,9 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
         _catch_up_immutable_release(defer=opts.no_gateway_restart, sha=fetched, source=source)
         _apply_pending_fleet_restart_catchup(defer=opts.no_gateway_restart)
         return
-    # stage_release archives FETCH_HEAD itself, builds web and its own locked
-    # environment in a build-aside directory, then atomically publishes it.
+    # stage_release archives the selected target (including any local carry-forward
+    # merge), builds web and its own locked environment in a build-aside directory,
+    # then atomically publishes it.
     candidate, _ = stage_release(source, home, sha=fetched)
     if candidate != paths.release(fetched) or not _release_is_ready(candidate, fetched):
         raise RuntimeError("staged release does not match fetched commit")
@@ -2276,6 +2279,9 @@ def _post_swap_argv_tail(args) -> list[str]:
     branch = getattr(args, "branch", None)
     if branch:
         tail += ["--branch", str(branch)]
+    replacement = getattr(args, "replace_candidate", None)
+    if replacement:
+        tail += ["--replace-candidate", replacement]
     return tail
 
 

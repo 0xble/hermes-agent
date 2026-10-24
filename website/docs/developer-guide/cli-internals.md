@@ -112,6 +112,32 @@ weeks, months and years. The combined timeout is capped below the native signed
 unit limits cannot overflow subprocess polling. Zero/unknown/infinite phase
 limits use the bounded fallback. This does not change active-turn drain settings.
 
+### Immutable Live Candidates
+
+Immutable updates select a release before staging it, without moving the source
+checkout, index or environment. If `current` names a live candidate that is not
+contained in `origin/main` or the fetched target, `update_cmd_candidate.py` carries
+it forward using `git merge-tree --write-tree` and `git commit-tree`. The result
+contains both the fetched target and the live candidate. A local
+`refs/hermes/carry-forward/<SHA>` ref keeps this merge reachable for later updates.
+`stage_release` archives that selected SHA directly from the local object store.
+The merge does not need a push, fetch or remote branch.
+
+A candidate already merged into main or contained in the target needs no carry.
+If the target is already contained in the live candidate, the live release is
+reused. A conflicting merge refuses the update before staging or promotion,
+prints the full live SHA and records a failed `candidate_carry_forward` step.
+`hermes update --replace-candidate <exact-live-SHA>` explicitly authorizes replacing
+only that installed candidate. The authorization must be a complete 40-hex SHA
+and match the current release exactly. It does not bypass the separate
+`--allow-drop-main` guard.
+
+Successful selection prints the carried or replaced SHA and records
+`candidate_update_target`, `carried_candidates` or `replaced_candidate` in
+the update receipt. The shared immutable updater owns this selection for both
+CLI updates and `request_update`. The request-update plugin forwards its optional
+`replace_candidate` argument to the same CLI flag.
+
 ## Nous free tier sign-in
 
 Sign-in completion is one function, `settle_after_upgrade`, called by every caller that persists an
