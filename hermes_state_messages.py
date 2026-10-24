@@ -1010,14 +1010,14 @@ class SessionMessagesMixin:
         index the clones naturally), and the originals are archived. NOTE: re-sequencing assigns the tail
         rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
         """
-        from hermes_state import SessionCompressionInProgressError
+        from hermes_state_errors import CompressionLeaseLostError
         # The display re-fold's history read happens here, before the writer lock (see _display_fold_plan).
         fold_plan = self._display_fold_plan(session_id)
         def _do(conn):
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
-                    raise SessionCompressionInProgressError(
+                    raise CompressionLeaseLostError(
                         f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
             if held_messages is not None:
                 self._raise_if_unheld_summary(conn, session_id, held_messages)

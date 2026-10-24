@@ -11,6 +11,7 @@ from typing import Any, Callable, TypeVar
 
 from agent.message_metadata import CANONICAL_ROW, DB_ROW_SNAPSHOT
 from hermes_state_write_metrics import WriteMetrics, current_write_metrics
+from hermes_state_publication import record_publication_write
 
 
 T = TypeVar("T")
@@ -63,6 +64,7 @@ def settle_write_transaction(
     It is separate from the acquired-lock warning threshold. No payload or SQL is logged.
     """
     started = clock.monotonic()
+    changes_before = conn.total_changes
     cpu_started = clock.thread_time()
     callback_s = callback_cpu_s = commit_s = rollback_s = 0.0
     outcome = "rollback_failed"
@@ -99,6 +101,7 @@ def settle_write_transaction(
     finally:
         current_write_metrics.reset(metrics_token)
         held_s = clock.monotonic() - started
+        record_publication_write(hold_s=held_s, rows_written=conn.total_changes - changes_before)
         if held_s >= warn_s:
             name = getattr(fn, "__qualname__", type(fn).__qualname__)[:160]
             logger.warning(
