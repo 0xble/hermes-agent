@@ -11,16 +11,16 @@ Fork-Patch-Backfill: dd8b51a7f52d926fc084cd7e84bc8b72a651ff0f; state-prune-lock-
 - The automatic-prune function itself and its gateway/CLI callers run only when `maintenance.deletion_window` is open. Outside the window they return before touching the state database or spending throttle markers, so alternate entrypoints cannot bypass the gate.
 - Retention pruning selects candidates read-only, then rechecks each bounded batch inside its own idempotent write transaction. Active write guards protect the complete compression-descendant lineage, not only the rows in the current batch.
 - Each batch commits before the next batch begins and yields briefly so foreground writers can acquire the lock. Unreferenced system prompts are also removed in bounded transactions.
-- `_execute_write_marked` emits a warning when one callback-plus-commit holds the lock for several seconds, including the callback name and process id. On macOS, the lock-owner diagnostic says `/proc/locks` is unavailable rather than claiming that a holder released just before the deadline.
+- `_execute_write_marked` emits a warning when one callback-plus-commit holds the lock for several seconds, including the callback name and process id. The same threshold gates per-attempt archive/mark-inactive, insert (including inline FTS), clone (including inline FTS), display-reconcile, callback-total and commit timings, with affected message-row counts. Callback-total includes the named callback phases, so those durations must not be summed. Failed transactions report rollback time and attempted row writes, not committed totals. Fast transactions add no log lines or diagnostic SQL. On macOS, the lock-owner diagnostic says `/proc/locks` is unavailable rather than claiming that a holder released just before the deadline.
 
 ## Source surfaces
 
-`gateway/run.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_lockowners.py`, and their focused tests.
+`gateway/run.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_lockowners.py`, `hermes_state_messages.py`, `hermes_state_message_archive.py`, `hermes_state_write_metrics.py`, and their focused tests.
 
 ## Focused regression
 
 ```text
-uv run --with pytest --with pytest-asyncio pytest -q tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py
+uv run --with pytest --with pytest-asyncio pytest -q tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py
 ```
 
 ## Retirement
