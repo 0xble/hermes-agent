@@ -24,11 +24,18 @@ def carried_candidate(source: Path, sha: str) -> str:
     while True:
         ref = _git_run(["git"], ["rev-parse", "--verify", f"refs/hermes/carry-forward/{sha}"],
                        cwd=source, check=False)
-        if ref.returncode != 0:
-            return sha
         parents = _git_run(["git"], ["rev-list", "--parents", "-n", "1", sha],
                            cwd=source, check=True).stdout.split()
-        if len(parents) != 3 or ref.stdout.strip() != sha:
+        if ref.returncode != 0:
+            if len(parents) != 3:
+                return sha
+            # Nested carries from older releases can outlive their retention
+            # refs. Their exact generated subject still identifies the parents.
+            subject = _git_run(["git"], ["show", "-s", "--format=%s", sha],
+                               cwd=source, check=True).stdout.strip()
+            if subject != f"Carry installed candidate {parents[2]} into update {parents[1]}":
+                return sha
+        elif len(parents) != 3 or ref.stdout.strip() != sha:
             raise RuntimeError(f"invalid carry-forward identity {sha}")
         sha = parents[2]
 
@@ -43,10 +50,11 @@ def candidate_branch(home: Path, release: Path | None, *, source: Path) -> str |
         branch = data.get("sourceBranch") or data.get("branch")
         if branch:
             return branch
+    candidate = carried_candidate(source, release.name)
     directory = home / "logs" / "update_receipts"
     for path in sorted(directory.glob("update_*.json"), reverse=True):
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-        if (data.get("release_transition") or {}).get("to_sha") != release.name:
+        if (data.get("release_transition") or {}).get("to_sha") != candidate:
             continue
         argv = data.get("argv") or []
         for index, arg in enumerate(argv):
@@ -58,7 +66,6 @@ def candidate_branch(home: Path, release: Path | None, *, source: Path) -> str |
     # even that provenance is lost, selection refuses rather than guessing.
     from hermes_cli.update_cmd import _git_run
 
-    candidate = carried_candidate(source, release.name)
     refs = _git_run(["git"], ["for-each-ref", "--format=%(refname)", "--points-at", candidate,
                               "refs/heads/", "refs/remotes/origin/"], cwd=source, check=True)
     branches = {ref.removeprefix("refs/heads/").removeprefix("refs/remotes/origin/")
