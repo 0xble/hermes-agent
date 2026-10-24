@@ -8,8 +8,17 @@ off the gateway event loop. Eviction removes the cache entry first, so a refetch
 turn builds a fresh manager while retirement completes. Only idle-TTL, LRU-cap
 and memory-pressure evictions commit the transcript (`on_session_end`) first;
 same-session evictions (`/model`, fallback drift, config signature,
-cross-process) never do. Not covered yet: fallback drift and mid-turn `/model`
-evict while the agent is running, so they skip the soft release entirely.
+cross-process) never do. Running eviction removes only the cache entry. The existing
+turn worker retains the exact agent and soft-releases it after both its blocking
+work and the outer turn cleanup have drained, including errors and cancellation.
+The worker and turn completion events bind during agent lookup, before publication
+in the cache. Completion checks cache identity without removing a successor or
+clearing its generation. A per-agent handoff-lock claim prevents duplicate soft
+release when idle eviction races turn completion. Resolver doubles that reuse an
+agent across turns must model cache ownership and match the configured default
+model. Otherwise outer-turn cleanup correctly retires their uncached client.
+Silence-retry coverage keeps its call-count, retry-budget and history assertions
+with that ownership modeled in the shared fixture.
 An agent whose `shutdown_memory_provider()` already ran
 (`_memory_provider_shutdown`, the `/new` and `/reset` cleanup) is detached without
 a second commit or shutdown: `shutdown_memory_provider()` sets that flag and
@@ -28,18 +37,15 @@ auxiliary client.
 Hindsight prefetch keeps one in-flight worker and one latest-wins pending query;
 discard and shutdown fence both the pending query and the worker's publication,
 and a `BaseException` leaving the worker clears its running flag.
-Proof: `scripts/run_tests.sh tests/gateway/test_agent_cache_memory_lifetime.py`
+Proof: `scripts/run_tests.sh tests/gateway/test_agent_cache_memory_lifetime.py tests/gateway/test_running_agent_eviction_memory.py`
 and `scripts/run_tests.sh tests/plugins/memory/test_hindsight_prefetch_lifetime.py`.
+The running-eviction regression traverses model/fallback selection and the production
+turn worker with real manager, provider-writer and mem-sync thread identities. It
+proves those isolated resources terminate, not a match to live gateway objects.
 Retire when upstream soft eviction retires memory providers and Hindsight
 prefetch is single-flight. Roll back by reverting the commits carrying
 `Fork-Patch: evict-memory-shutdown`; evicted agents then keep their writer and
 mem-sync threads until process exit again.
-
-Follow up:
-- Fallback-drift and mid-turn `/model` eviction (`gateway/run_turn.py`
-  `_run_agent_evict_on_fallback`) reach `_evict_cached_agent` while the agent is
-  in `_running_agent_ids()`, which returns before the soft release, so that
-  agent's Hindsight writer and mem-sync executor still leak. Predates this patch.
 
 Accepted asynchronous retain operations remain tracked after the first prefetch
 visibility wait expires. Later prefetches do not repeat that wait. The existing

@@ -47,7 +47,7 @@ from gateway.attended_model import (
     is_active, parse_attended_config, resolve_attended_model,
 )
 from gateway.session_transcript import TranscriptReadError
-from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
+from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext, TurnWorker  # noqa: F401 (re-export)
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
@@ -4491,7 +4491,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
 
     _run_agent_stream_confirmed_final_delivery = staticmethod(stream_confirmed_final_delivery)
 
-    def _run_agent_start_turn_worker(self, turn_ctx: TurnContext, run_sync: Callable[[], Any]) -> GatewayRunner._RunAgentWorker:
+    def _run_agent_start_turn_worker(self, turn_ctx: TurnContext, run_sync: Callable[[], Any]) -> TurnWorker:
         """Schedule ``run_sync`` on the executor plus the inactivity watchdog thread.
 
         *Inactivity* timeout (agent.gateway_timeout / HERMES_AGENT_TIMEOUT, env wins; 0 = unlimited),
@@ -4515,22 +4515,22 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         turn_ctx.process_baseline = _turn_process_baseline
         # task_id is session-scoped: gate the reap on this claim still being current so a replacement
         # turn's fresh process isn't killed by this turn's stale baseline.
-        worker = self._RunAgentWorker(
+        worker = TurnWorker(
             agent_timeout=_agent_timeout, agent_warning=_agent_warning, task_id=_turn_task_id,
             process_baseline=_turn_process_baseline, worker_done=threading.Event(),
-            timeout_fired=threading.Event(), cleanup_lock=threading.Lock(),
+            turn_done=threading.Event(), timeout_fired=threading.Event(), cleanup_lock=threading.Lock(),
             is_current=(
                 (lambda: self._is_session_run_current(session_key, run_generation))
                 if run_generation is not None
                 else (lambda: True)
             ),
         )
+        turn_ctx._worker = worker
 
         def _run_sync_with_timeout_lifecycle():
             try:
                 return run_sync()
             finally:
-                worker.worker_done.set()
                 # `.turn.agent` stays reachable until the *next* turn is claimed; clearing the
                 # ownership markers now means a /stop on the finished turn no longer reaps background
                 # work it left running.
@@ -4542,6 +4542,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 if _finished_agent is not None:
                     _finished_agent._gateway_turn_process_task_id = ""
                     _finished_agent._gateway_turn_process_baseline = frozenset()
+                worker.worker_done.set()
+                self._release_finished_turn_agent(turn_ctx, worker)
 
         if _agent_timeout is not None:
             threading.Thread(
@@ -4559,7 +4561,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         return worker
 
     @staticmethod
-    def _reaper_kwargs(worker: GatewayRunner._RunAgentWorker) -> dict:
+    def _reaper_kwargs(worker: TurnWorker) -> dict:
         """Shared kwargs of the watchdog + timeout-reaper threads."""
         return {
             **{k: getattr(worker, k) for k in ("task_id", "process_baseline", "worker_done", "timeout_fired", "cleanup_lock")},
@@ -4635,7 +4637,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         }
 
     async def _run_agent_await_turn_worker(
-        self, worker: GatewayRunner._RunAgentWorker, turn_ctx: TurnContext,
+        self, worker: TurnWorker, turn_ctx: TurnContext,
         _interrupt_detected: asyncio.Event, interrupt_monitor: asyncio.Task,
     ) -> Any:
         """Poll the executor future (inactivity timeout + backup interrupt checks); return its result,
@@ -5615,6 +5617,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             else spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
         )
 
+        worker = None
         try:
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
@@ -5646,10 +5649,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 if turn_ctx._run_still_current():
                     return await self._run_agent_silence_followup(response, turn_ctx)
         finally:
-            await self._run_agent_cleanup_turn_tasks(
-                turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
-                _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
-            )
+            try:
+                await self._run_agent_cleanup_turn_tasks(
+                    turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
+                    _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
+                )
+            finally:
+                if worker is not None:
+                    worker.turn_done.set()
+                    self._release_finished_turn_agent(turn_ctx, worker)
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
