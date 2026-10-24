@@ -47,6 +47,12 @@ keys. The lease's default bounded/fail-closed behavior remains available to
 callers that do not supply a durable waiting owner. Cross-process turn leases
 in `agent/turn_facade_lease.py` are unchanged.
 
+Recovered follow-ups consumed in-band must publish their raw turn outcome on the
+consumed event and its absorbed inputs. Intentional silence is a successful turn,
+not missing execution. Admission and an unrelated predecessor result are not proof
+of execution. Preserve the existing notices for accepted inputs that never run
+and the declined or possible-duplicate recovery paths.
+
 ## Proof And Retirement
 
 `tests/gateway/test_turn_lease_queue.py` covers same-key and aliased-key dispatch,
@@ -55,6 +61,11 @@ failed spool writes, bounded waits, busy-ack deduplication, media and id-less
 recovery, recovery-spool reuse, reconnects, and spool retirement on deliberate drops.
 `tests/gateway/test_turn_lease.py` covers the real preparation/dispatch boundary,
 including no transcript access or goal judgment while waiting.
+`tests/gateway/test_queued_followup_processing_hooks.py` drives recovered inputs
+through busy admission and real recursive execution, including silent success,
+absorbed inputs, and failed or interrupted turns.
+`tests/gateway/test_shutdown_followup_restart.py` retains the non-run notices,
+successor ownership, and declined or possible-duplicate guards.
 
 Retire this patch when an accepted upstream release preserves admitted inputs
 across the same generation-overlap boundary with equivalent serialization and

@@ -19,7 +19,13 @@ def address(source, session_id):
     return f"hermes:{source.profile or 'default'}/{session_id}"
 
 
-async def cli(runner, source, *args):
+# A Hermes relay is normally `posted` until the target session stores it, so
+# reconcile for a bounded time instead of failing a retirement that is about to
+# confirm. The subprocess deadline must outlast relay's own wait.
+RELAY_CONFIRM_WAIT = 60
+
+
+async def cli(runner, source, *args, timeout=30):
     from tools.environments.local import served_profile_child_env
     home = runner._resolve_profile_home_for_source(source)
     env = served_profile_child_env(target_home=home, inherit_credentials=True)
@@ -32,7 +38,7 @@ async def cli(runner, source, *args):
     proc = await asyncio.create_subprocess_exec(*executable, *args[1:], env=env, stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.PIPE)
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), 30)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
     except BaseException:
         if proc.returncode is None:
             proc.kill()
@@ -237,7 +243,8 @@ async def receipt(runner, source, state, item, dest):
     receipt_id = sent.get("id")
     if not receipt_id:
         raise RuntimeError("Handoff did not return a relay receipt")
-    readback = await cli(runner, source, "relay", "--json", "status", str(receipt_id))
+    readback = await cli(runner, source, "relay", "--json", "status", "--wait", f"{RELAY_CONFIRM_WAIT}s",
+                         str(receipt_id), timeout=RELAY_CONFIRM_WAIT + 30)
     if (readback.get("id") != receipt_id or readback.get("target") != target
             or readback.get("status") not in {"delivered", "replied"} or readback.get("error")):
         raise RuntimeError(f"Handoff receipt {receipt_id} is not confirmed at {target}: {readback.get('status')}")
