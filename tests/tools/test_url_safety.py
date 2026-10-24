@@ -141,12 +141,13 @@ class TestProxyEnvironmentDnsDelegation:
         with patch("tools.url_safety.urlparse", side_effect=ValueError("bad url")):
             assert is_safe_url("http://evil.com/") is False
 
-    def test_benchmark_range_is_public_when_resolved(self):
-        """RFC 2544 198.18.0.0/15 is a fake-IP proxy's DNS answer, not an internal host."""
-        with _resolves_to("198.18.0.23"):
-            assert is_safe_url("https://example.com/file.jpg", allow_private=False) is True
-        with _resolves_to("198.18.4.162"):
-            assert is_safe_url("https://youtu.be/MgRynDGk-4Y", allow_private=False) is True
+    def test_undeclared_benchmark_range_is_blocked_when_resolved(self):
+        with patch("hermes_cli.config.read_raw_config", dict), _resolves_to("198.18.0.23"):
+            _reset_allow_private_cache()
+            assert is_safe_url("https://example.com/file.jpg", allow_private=False) is False
+            with pytest.raises(SSRFConnectionBlocked):
+                _resolved_http_connect_ips("example.com", 443, "https", allow_private=False)
+            _reset_allow_private_cache()
 
     @pytest.mark.parametrize("host", ["198.18.0.23", "0xc6120017", "0306.022.0.027", "198.18.23"])
     def test_literal_benchmark_host_stays_blocked(self, host):
@@ -166,8 +167,7 @@ class TestProxyEnvironmentDnsDelegation:
         ("http://multimedia.nt.qq.com.cn/download?id=123", False),
     ])
     def test_qq_multimedia_hostname_exception(self, url, expected):
-        # 198.18.0.0/15 is public as a resolved answer (fake-IP proxies). The QQ exception is
-        # about other private answers, so pin the resolver there.
+        # The existing QQ exception covers ordinary private answers as well as benchmark space.
         with _resolves_to("10.1.2.3"):
             assert is_safe_url(url) is expected
 
@@ -188,7 +188,7 @@ class TestAsyncIsSafeUrl:
 class TestSSRFGuardedHttpxClient:
     @pytest.mark.parametrize("host", ["198.18.0.23", "0xc6120017", "0306.022.0.027", "198.18.23"])
     def test_connect_blocks_literal_benchmark_host(self, host):
-        with pytest.raises(SSRFConnectionBlocked, match="benchmark address"):
+        with pytest.raises(SSRFConnectionBlocked):
             _resolved_http_connect_ips(host, 443, "https")
 
     def test_connect_resolution_checks_private_ip_beyond_candidate_cap(self):
@@ -582,17 +582,39 @@ class TestDeclaredFakeIpSentinelRanges:
         with _resolves_to("198.18.0.55"):
             assert _resolved_http_connect_ips("example.com", 443, "https") == ["198.18.0.55"]
 
+    @pytest.mark.parametrize("network, host, answer", [
+        ("198.18.0.0/15", "198.18.0.23", "198.18.0.23"),
+        ("198.18.0.0/15", "0xc6120017", "198.18.0.23"),
+        ("198.18.0.0/15", "0306.022.0.027", "198.18.0.23"),
+        ("198.18.0.0/15", "198.18.23", "198.18.0.23"),
+        ("198.18.0.0/15", "[::ffff:198.18.0.23]", "::ffff:198.18.0.23"),
+        ("198.18.0.0/15", "[::ffff:0:c612:17]", "::ffff:0:c612:17"),
+        ("192.0.2.0/24", "192.0.2.23", "192.0.2.23"),
+    ])
+    def test_declaration_allows_dns_answers_not_literal_hosts(self, monkeypatch, network, host, answer):
+        monkeypatch.setattr("hermes_cli.config.read_raw_config",
+                            lambda: {"security": {"fake_ip_ranges": [network]}})
+        _reset_allow_private_cache()
+        try:
+            with _resolves_to(answer):
+                assert is_safe_url("https://example.com/", allow_private=False) is True
+                assert _resolved_http_connect_ips("example.com", 443, "https", allow_private=False) == [answer]
+                assert is_safe_url(f"https://{host}/", allow_private=False) is False
+                with pytest.raises(SSRFConnectionBlocked, match="fake-IP address"):
+                    _resolved_http_connect_ips(host.strip("[]"), 443, "https", allow_private=False)
+        finally:
+            _reset_allow_private_cache()
+
     def test_declaration_excuses_only_the_declared_block(self, declared):
         # Real private answers and the cloud-metadata floor stay blocked under the declaration...
         with _resolves_to("192.168.99.99"):
             assert is_safe_url("https://example.com/") is False
         with _resolves_to("169.254.169.254"):
             assert is_safe_url("http://example.com/") is False
-        # ...and the sentinel block itself stays public once the declaration is gone: it is the
-        # range fake-IP proxies answer DNS from.
+        # ...and removing the declaration restores the ordinary private verdict.
         _reset_allow_private_cache()
         with patch("hermes_cli.config.read_raw_config", dict), _resolves_to("198.18.0.23"):
-            assert is_safe_url("https://example.com/file.jpg") is True
+            assert is_safe_url("https://example.com/file.jpg") is False
         assert is_safe_url("https://198.18.0.23/file.jpg") is False
 
     @pytest.mark.parametrize(

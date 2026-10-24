@@ -14,10 +14,10 @@ from gateway.session import Platform, SessionSource
 
 GROUP_CHAT = "-1001234567890"
 OTHER_GROUP = "-1009876543210"
-BOT_A = "111111111"
-BOT_B = "222222222"
-BOT_C = "333333333"
-HUMAN = "100200300"
+BOT_A = "1111111111"
+BOT_B = "2222222222"
+BOT_C = "3333333333"
+HUMAN = "1002003000"
 
 
 @pytest.fixture(autouse=True)
@@ -128,7 +128,10 @@ async def test_busy_path_counts_a_bot_message_once_before_steering(monkeypatch, 
     runner._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
     runner._delivery_adapter_for = lambda source: SimpleNamespace(_pending_messages={})
     runner._peek_session_state = lambda key: SimpleNamespace(turn=SimpleNamespace(agent=object()))
-    steer = AsyncMock(return_value=SimpleNamespace(effective_mode="steer", redirected=False, steered=True))
+    steer = AsyncMock(return_value=runner._BusySteerOutcome(
+        effective_mode="steer", demoted_for_subagents=False,
+        demoted_for_compression=False, steered=True, redirected=False,
+    ))
     runner._resolve_busy_steer_or_redirect = steer
     events = [MessageEvent(text="more", message_id=str(i), source=_bot(BOT_A)) for i in range(3)]
 
