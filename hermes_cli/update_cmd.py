@@ -2213,8 +2213,10 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
         raise RuntimeError("current is not a release; remove the obsolete source pointer before updating")
     if current is not None and not _release_is_ready(current, current.name):
         raise RuntimeError("current release is not ready; refusing to activate from an invalid pointer")
-    from hermes_cli.update_cmd_candidate import select_update_candidate
-    fetched = select_update_candidate(source, home, fetched, getattr(args, "replace_candidate", None))
+    from hermes_cli.update_cmd_candidate import candidate_branch, select_update_candidate
+    selected = select_update_candidate(source, home, fetched, getattr(args, "replace_candidate", None))
+    selected_branch = branch if selected == fetched else candidate_branch(home, current, source=source)
+    fetched = selected
     # Migration metadata and the source plist are captured with the candidate
     # inside one transaction at activation, not before staging/handoff.
     # A deferred candidate must be promoted on the next normal update, even
@@ -2226,7 +2228,7 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
     # stage_release archives the selected target (including any local carry-forward
     # merge), builds web and its own locked environment in a build-aside directory,
     # then atomically publishes it.
-    candidate, _ = stage_release(source, home, sha=fetched)
+    candidate, _ = stage_release(source, home, sha=fetched, branch=selected_branch)
     if candidate != paths.release(fetched) or not _release_is_ready(candidate, fetched):
         raise RuntimeError("staged release does not match fetched commit")
     _write_fleet_restart_pending_marker(
