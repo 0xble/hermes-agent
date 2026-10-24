@@ -18,9 +18,18 @@ def _response(data=None):
 
 
 @pytest.fixture(autouse=True)
-def _clear_sessions():
+def _clear_sessions(monkeypatch):
     import tools.browser_camofox as camofox
 
+    original_get = camofox._get
+
+    def get(path, *args, **kwargs):
+        if path == "/browser/identities":
+            return {"identities": [{"alias": alias, "userId": "hermes_camofox_" + hashlib.sha256(alias.encode()).hexdigest()[:24]}
+                                   for alias in ("brianle", "lpg", "meridian")]}
+        return original_get(path, *args, **kwargs)
+
+    monkeypatch.setattr(camofox, "_get", get)
     with camofox._sessions_lock:
         camofox._sessions.clear()
     yield
@@ -40,7 +49,7 @@ def test_account_identities_are_stable_and_isolated(tmp_path, monkeypatch):
     assert brian == brian_again
     assert re.fullmatch(r"hermes_camofox_[0-9a-f]{24}", brian["user_id"])
     assert brian["user_id"] == "hermes_camofox_" + hashlib.sha256(
-        f"camofox-account:{tmp_path / 'browser_auth' / 'camofox'}:brianle".encode()
+        b"brianle"
     ).hexdigest()[:24]
     assert brian["user_id"] != lpg["user_id"]
     assert brian["session_key"] != lpg["session_key"]
@@ -50,7 +59,7 @@ def test_account_identities_are_stable_and_isolated(tmp_path, monkeypatch):
     ).hex[:16]
 
 
-def test_account_identity_is_scoped_to_hermes_home(tmp_path, monkeypatch):
+def test_account_identity_is_shared_but_task_keys_are_scoped_to_hermes_home(tmp_path, monkeypatch):
     from tools.browser_camofox_state import get_camofox_account_identity
     import tools.browser_camofox_state as state
 
@@ -58,7 +67,8 @@ def test_account_identity_is_scoped_to_hermes_home(tmp_path, monkeypatch):
         first = get_camofox_account_identity("brianle", "task")
     with patch.object(state, "get_hermes_home", return_value=tmp_path / "two"):
         second = get_camofox_account_identity("brianle", "task")
-    assert first["user_id"] != second["user_id"]
+    assert first["user_id"] == second["user_id"]
+    assert first["session_key"] != second["session_key"]
     assert re.fullmatch(r"hermes_camofox_[0-9a-f]{24}", second["user_id"])
 
 

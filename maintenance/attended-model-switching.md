@@ -153,6 +153,22 @@ repicking, stale expiry, one-turn restoration, immediate reset and independent
 reasoning idle expiry. Pair it with `test_attended_model.py`,
 `test_session_model_override_persistence.py` and the model-command regressions.
 
+Run `tests/gateway/test_attended_busy_activity.py` when changing busy admission.
+Genuine replies must refresh activity at receipt on both runner and adapter paths,
+including Telegram grace queueing and foreign-owner handover, without counting automation or refreshing again when the same event drains. The old turn owner must observe the successor's durable activity at the next API boundary, but never adopt a replacement session's timestamp. Receipt tasks are retained until completion and capture the timestamp before worker hops. An in-flight receipt is joined during drain, and out-of-order workers cannot move the local activity clock backward. Durable refresh is opt-in for the off-loop routing snapshot and committed request boundary, not every cached getter.
+
+Activity ordering compares instants, not naive wall times. The repeated DST hour
+must advance both activity and `updated_at`, survive durable reload with its fold
+intact even when a turn marker updates the row, and reject older receipts.
+Scheduled receipt bookkeeping retries once after an ordinary exception even
+when steering consumes the event. Cancellation propagates immediately, and
+disabled routing or missing sessions are terminal, not retryable failures.
+A concurrent drain joins that same task, and both attempts retain the original
+arrival time. Store activity publishes only after persistence succeeds, so a
+failed write cannot make its retry look like an already-recorded receipt. Run
+`tests/gateway/test_session_store_lock_io.py` for refresh reads outside the store
+lock and concurrent activity or session replacement during those reads.
+
 Run `tests/gateway/test_model_role_lifecycle.py` for request-boundary profile
 edits, busy assignment timing, stale hydration/one-turn restores, failed
 snapshot publication, transient selection guards and guarded async boundaries.

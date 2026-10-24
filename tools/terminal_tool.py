@@ -1665,7 +1665,7 @@ TERMINAL_SCHEMA = {
                 "default": False
             },
             "notify": {
-                "description": "With background=true. true: one notification on exit; use it for anything that ends (builds, tests, deploys), or the job runs silently. ['pattern', ...]: notify when a line matches, only for one-shot readiness on processes that never exit; rate-limited. Omit for servers/daemons.",
+                "description": "With background=true. true: one notification on exit; use it for anything that ends (builds, tests, deploys), or the job runs silently. ['pattern', ...]: notify when a line matches, only for one-shot readiness on processes that never exit; rate-limited. Omit for servers/daemons. Use JSON booleans true/false, not strings.",
                 "anyOf": [
                     {"type": "boolean"},
                     {"type": "array", "items": {"type": "string"}}
@@ -1760,7 +1760,10 @@ def _handle_terminal(args, **kw):
         else:
             return tool_error(
                 "notify must be true/false (notify on exit) or a list of "
-                "strings (notify on output pattern match)."
+                "strings (notify on output pattern match). Use JSON booleans, "
+                "not strings: retry with background=true, notify=true for exit "
+                "notification or notify=false to disable it. For pattern "
+                "matching use notify=['ready']."
             )
     if heartbeat:
         notify_on_complete = True  # the heartbeat rides the completion delivery path

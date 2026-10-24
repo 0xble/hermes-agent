@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -138,8 +138,12 @@ async def test_opening_turn_finalizes_before_later_switch_in(opening, monkeypatc
     assert not runner._session_state(quick_key).conversation.attended_new_session
     assert not runner._is_session_running(quick_key)
 
-    expired = datetime.now(timezone.utc) - timedelta(hours=1)
-    runner.session_store.mark_user_activity(key, expired)
+    # Seed elapsed idle time directly: a receipt cannot backdate durable activity.
+    expired = datetime.now() - timedelta(hours=1)
+    entry = runner.session_store.lookup_by_session_key(key)
+    assert entry is not None
+    entry.last_user_activity_at = expired
+    runner.session_store.update_session(key, touch_activity=False)
     state.last_user_activity_at = expired.timestamp()
     state.last_api_call_at = expired.timestamp()
 
