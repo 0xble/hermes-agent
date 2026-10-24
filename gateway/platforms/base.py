@@ -3987,25 +3987,15 @@ class BasePlatformAdapter(ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
-        returned: dict[str, SendResult] = {}
-        try:
-            result = await self._send_with_retry_body(
-                chat_id, content, reply_to=reply_to, metadata=metadata,
-                max_retries=max_retries, base_delay=base_delay)
-            returned["result"] = result
-            return result
-        finally:
-            # A queued follow-up, /stop, or preemption cancels this task while the platform
-            # call is in flight. Python raises that cancel at this return, so the caller
-            # never sees the result and the ledger write after the send is skipped. A result
-            # already returned successfully is not ambiguous. A cancel that aborts the body, or
-            # a failed result, leaves the row 'attempting' for the duplicate-marked sweep.
-            captured = returned.get("result")
-            task = asyncio.current_task()
-            pending = _PENDING_LEDGER_SETTLEMENT.get()
-            if (pending is not None and captured is not None and getattr(captured, "success", False)
-                    and task is not None and task.cancelling()):
+        result = await self._send_with_retry_body(
+            chat_id, content, reply_to=reply_to, metadata=metadata,
+            max_retries=max_retries, base_delay=base_delay)
+        task = asyncio.current_task()
+        pending = _PENDING_LEDGER_SETTLEMENT.get()
+        if pending is not None and task is not None and task.cancelling():
+            if getattr(result, "success", False):
                 self._settle_delivered_obligation_sync(pending[0])
+        return result
 
     async def _send_with_retry_body(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
@@ -4925,11 +4915,9 @@ class BasePlatformAdapter(ABC):
             # The ledger now owns the crash recovery. It carries text only, so a caller with
             # attachments still to send keeps the marker until they are delivered.
             await self._release_turn_marker(event)
-        # A queued follow-up, /stop, or preemption cancels this task at the next await after
-        # Telegram has already accepted the message. That used to skip the ledger write, leaving
-        # the row 'attempting' with attempts=0 so a later boot resent a copy. The send's wrapper
-        # records a result it already returned before that cancellation propagates. A cancel that
-        # aborts the transport never produces a result, so that row stays attempting.
+        # A turn can be cancelled after transport success but before finalization. The send
+        # wrapper settles that success synchronously so recovery cannot resend it. A cancelled
+        # transport produces no result and stays attempting.
         settlement = _PENDING_LEDGER_SETTLEMENT.set(
             (obligation_id, event, delivery_adapter) if obligation_id is not None else None)
         try:
@@ -4937,6 +4925,11 @@ class BasePlatformAdapter(ABC):
                 chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         finally:
             _PENDING_LEDGER_SETTLEMENT.reset(settlement)
+        # Let records_delivery count the captured result before cancellation propagates,
+        # but suspend before refusal callbacks or a failure write can run.
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            await asyncio.sleep(0)
         if (obligation_id is None and not result.success and result.pre_send
                 and self._outbox_covers_final(event, delivery_adapter)):
             obligation_id = await self._record_delivery_obligation(
