@@ -53,12 +53,21 @@ def test_tail_reads_answer_like_the_owner(tmp_path):
                                        {'role': 'user', 'content': 'failed turn'}])
         db.create_session('other', 'cli')
         db.append_messages_batch('other', [{'role': 'assistant', 'content': 'x'}])
+        db.set_session_title('s', 'Straße')
+        db.set_session_title('other', 'Another Subject')
         rows = [r[0] for r in db._read_all('SELECT id FROM messages ORDER BY id')]
         epoch = begin_runtime_epoch(db, instance_id='fixture')
         scope = dict(epoch=epoch, execution_id='w', session_id='s', generation=0)
         register_worker_execution(db, **scope, kind='compute', adoption_secret='secret')
         store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
         try:
+            from agent.runtime_session_store import WorkerPersistenceError
+            for title in ('STRASSE', 'Another Subject', 'No Match', ''):
+                for exclude in (None, 's'):
+                    assert store.has_auto_title_collision(title, exclude_session_id=exclude) == (
+                        db.has_auto_title_collision(title, exclude_session_id=exclude))
+            with pytest.raises(WorkerPersistenceError, match='permission_denied'):
+                store.has_auto_title_collision('Another Subject', exclude_session_id='other')
             assert store.latest_conversation_role('s') == db.latest_conversation_role('s') == 'user'
             for row_id in [*rows, 10**6]:  # another transcript's row is not this session's
                 assert store.get_message_role('s', row_id) == db.get_message_role('s', row_id)

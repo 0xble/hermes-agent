@@ -151,10 +151,9 @@ def test_unmanaged_home_can_seed_missing_config(home, tmp_path, monkeypatch):
     assert target.read_text(encoding="utf-8") == template.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("writer", ["import-agent dump_yaml_file", "atomic_write_text"])
+@pytest.mark.parametrize("writer", ["atomic_yaml_write", "atomic_write_text"])
 def test_direct_atomic_config_writers_are_guarded(home, live_release, tmp_path, monkeypatch, writer):
-    from hermes_cli.agent_import import dump_yaml_file
-    from utils import atomic_write_text
+    from utils import atomic_write_text, atomic_yaml_write
 
     dev_root = tmp_path / "dev-worktree"
     dev_root.mkdir()
@@ -162,7 +161,7 @@ def test_direct_atomic_config_writers_are_guarded(home, live_release, tmp_path, 
     target = home / "config.yaml"
     before = target.read_bytes()
     write = {
-        "import-agent dump_yaml_file": lambda: dump_yaml_file(target, {"_config_version": 50}),
+        "atomic_yaml_write": lambda: atomic_yaml_write(target, {"_config_version": 50}),
         "atomic_write_text": lambda: atomic_write_text(target, "_config_version: 50\n"),
     }[writer]
 

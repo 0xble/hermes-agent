@@ -30,7 +30,7 @@ def _spawn(parent, **options):
         child = MagicMock(
             reasoning_config=copy.deepcopy(kwargs["reasoning_config"]),
             reasoning_override=None,
-            _session_db=kwargs["state_db"],
+            _session_db=kwargs["session_db"],
         )
         children.append(child)
         return child
@@ -148,7 +148,7 @@ def test_provider_child_keeps_its_own_handle_on_parent_profile_database(config_f
     child_db = None
     try:
         built, _ = _spawn(parent)
-        child_db = built["state_db"]
+        child_db = built["session_db"]
         assert child_db is not db
         assert child_db.db_path == db.db_path
         db.close()

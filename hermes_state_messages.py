@@ -70,7 +70,8 @@ _DISPLAY_INDEX_MISSING_SQL = ("SELECT 1 FROM messages WHERE session_id = ?" + _D
                               + " AND (display_order IS NULL OR display_identity IS NULL) LIMIT 1")
 _ACTIVE_IDS_SQL = "SELECT id FROM messages WHERE session_id = ? AND active = 1 ORDER BY id"
 _DISPLAY_FOLD_COLUMNS_SQL = ("SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, "
-                             "display_kind, display_metadata, display_order, display_identity FROM messages")
+                             "display_kind, display_metadata, display_order, display_identity, "
+                             "message_uid, _compressed_summary FROM messages")
 _DISPLAY_FOLD_SCAN_SQL = (_DISPLAY_FOLD_COLUMNS_SQL + " INDEXED BY idx_messages_session_id "
                           "WHERE session_id = ? AND id > ?" + _DISPLAY_ACTIVE_CLAUSE + " ORDER BY id LIMIT 1000")
 # The WHERE clauses repeat each partial index's own predicate so SQLite can serve them from the index.
@@ -1227,13 +1228,15 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                 conn.execute("BEGIN")
                 try:
                     last_id = 0
+                    uid_identity: dict[str, bytes] = {}
                     while True:
                         rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id)).fetchall()
                         if not rows:
                             break
                         for row in rows:
                             plan[row["id"]] = (
-                                row["display_identity"], self._display_identity(self._display_dedupe_key(row)))
+                                row["display_identity"], self._fold_summary_carrier(
+                                    row, self._display_identity(self._display_dedupe_key(row)), uid_identity))
                         last_id = rows[-1]["id"]
                 finally:
                     if conn.in_transaction:
@@ -1312,12 +1315,23 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             for start in range(0, len(stale), 500):
                 chunk = stale[start:start + 500]
                 for row in conn.execute(f"{_DISPLAY_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})", chunk):
-                    fresh[row["id"]] = self._display_identity(self._display_dedupe_key(row))
+                    identity = self._display_identity(self._display_dedupe_key(row))
+                    if row["message_uid"] and row["_compressed_summary"]:
+                        original = conn.execute(
+                            _DISPLAY_FOLD_COLUMNS_SQL + " WHERE session_id = "
+                            "(SELECT session_id FROM messages WHERE id = ?) AND message_uid = ? "
+                            "AND id < ?" + _DISPLAY_ACTIVE_CLAUSE + " ORDER BY id LIMIT 1",
+                            (row["id"], row["message_uid"], row["id"])).fetchone()
+                        if original is not None:
+                            identity = self._display_identity(self._display_dedupe_key(original))
+                    fresh[row["id"]] = identity
         first_id: dict[bytes, int] = {}
         updates = []
         for row_id, stored, order in visible:
             identity = fresh[row_id] if row_id in fresh else plan[row_id][1]
-            folded = first_id.setdefault(identity, row_id)
+            kept_order = order if stored == identity else None
+            folded = first_id.setdefault(
+                identity, row_id if kept_order is None else int(kept_order))
             if folded != order or identity != stored:
                 updates.append((folded, identity, row_id))
         if updates:

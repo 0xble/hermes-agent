@@ -7,6 +7,8 @@ inside the carrier: every word of that reply twice after ``/compress`` and on re
 resume/compress E2E caught it on the v0.22.3 release attempt). Real SessionDB, real
 ``archive_and_compact``.
 """
+import pytest
+
 from agent.context_compressor import (
     SUMMARY_PREFIX,
     _MERGED_PRIOR_CONTEXT_HEADER,
@@ -16,8 +18,11 @@ from agent.context_compressor import (
 from hermes_state import SessionDB
 
 
-def test_summary_carrier_does_not_show_its_message_twice(tmp_path):
+@pytest.mark.parametrize('planned', [False, True])
+def test_summary_carrier_does_not_show_its_message_twice(tmp_path, monkeypatch, planned):
     with SessionDB(db_path=tmp_path / "state.db") as db:
+        if not planned:
+            monkeypatch.setattr(db, '_display_fold_plan', lambda _sid: None)
         db.create_session("s", source="test")
         history = [
             {"role": "user", "content": "turn one", "timestamp": 1.0},

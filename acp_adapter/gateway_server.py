@@ -861,16 +861,20 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
 
     async def _refresh_unknown_for_prompt(self, session_id):
         # Stop during the owner's read must cancel the still-unsent editor input.
-        self._submitting.add(session_id)
+        input_id = object()
+        self._submitting[session_id] = input_id
         try:
             await self._refresh_unknown(session_id)
         except BaseException:
-            self._pending_cancels.discard(session_id)
+            if self._pending_cancels.get(session_id) is input_id:
+                self._pending_cancels.pop(session_id, None)
             raise
         finally:
-            self._submitting.discard(session_id)
-        cancelled = session_id in self._pending_cancels
-        self._pending_cancels.discard(session_id)
+            if self._submitting.get(session_id) is input_id:
+                self._submitting.pop(session_id, None)
+        cancelled = self._pending_cancels.get(session_id) is input_id
+        if cancelled:
+            self._pending_cancels.pop(session_id, None)
         return cancelled
 
     async def _refresh_unknown(self, session_id):

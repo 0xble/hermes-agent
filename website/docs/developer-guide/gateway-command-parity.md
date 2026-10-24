@@ -26,13 +26,14 @@ narrower routes (`hermes_cli/gateway_chat_commands.py`).
 setting to this local session (its next turn and `config.get`), saving config.yaml only where the
 handler does; `client-local (cli_only)` commands are terminal/UI features of a client.
 
-104 registry commands: 29 control, 19 read, 56 refused.
+106 registry commands: 29 control, 19 read, 58 refused.
 
 | Command | Gateway (`slash.exec`) | Classic CLI | Ink | Desktop | ACP | Notes |
 |---|---|---|---|---|---|---|
 | `/agents` (/tasks) | refused | HermesCLI._handle_agents_command | delegation.pause | action: agents | slash.exec: refused | gateway-wide: lists every chat's running agents and the process's async jobs |
 | `/approvals` | control | HermesCLI._handle_approvals_command | slash.exec | slash.exec | slash.exec | per-session setting (gateway handler) |
 | `/approve` | control | messaging-only: unknown command | slash.exec | slash.exec | slash.exec | messaging-only |
+| `/attend` | refused | messaging-only: unknown command | slash.exec: refused | slash.exec: refused | slash.exec: refused | messaging-only |
 | `/autoprune` | control | HermesCLI._handle_autoprune_command | slash.exec | slash.exec | slash.exec |  |
 | `/battery` | refused | HermesCLI._handle_battery_command | sidecar: system.battery (preference not saved) | slash.exec: refused | slash.exec: refused | client-local (cli_only) |
 | `/bg` | refused | HermesCLI._handle_background_command | prompt.background | action: background | slash.exec: refused |  |
@@ -101,6 +102,7 @@ handler does; `client-local (cli_only)` commands are terminal/UI features of a c
 | `/reload-skills` (/reload_skills) | refused | HermesCLI._cmd_reload_skills | commands.catalog, skills.reload | unavailable: advanced | slash.exec: refused |  |
 | `/restart` | refused | messaging-only: unknown command | slash.exec: refused | unavailable: terminal | slash.exec: refused | messaging-only |
 | `/resume` | refused | HermesCLI._handle_resume_command | local | picker: session | slash.exec: refused | switches the messaging chat's session; local clients resume by id |
+| `/retire` | refused | messaging-only: unknown command | slash.exec: refused | unavailable: messaging | slash.exec: refused | messaging-only |
 | `/retry` | refused | HermesCLI._cmd_retry | canonical route | action: retry | session.mutate rewind + resubmit |  |
 | `/review` | control | HermesCLI._handle_review_command | slash.exec | slash.exec | slash.exec |  |
 | `/rollback` | refused | HermesCLI._handle_rollback_command | rollback.diff, rollback.list, rollback.restore | action: rollback | slash.exec: refused | restores filesystem checkpoints |

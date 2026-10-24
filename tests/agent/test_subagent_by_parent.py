@@ -38,6 +38,9 @@ def _launch(parent, **kwargs):
 def test_lifecycle_launch_reaches_the_shared_fork_builder_with_selected_reasoning(config_file):
     from tools import delegate_tool
 
+    raw = _authored()
+    raw["delegation"]["max_iterations"] = 19
+    config_file(raw)
     parent = _parent()
     parent.session_id = "parent-plugin"
     with patch.object(delegate_tool, "_build_child_agent", wraps=delegate_tool._build_child_agent) as builder:

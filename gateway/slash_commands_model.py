@@ -712,14 +712,15 @@ class GatewayModelCommandsMixin:
         # A restricted env owner grant requires principal membership. General inbound
         # authorization also accepts roles, relays, bots and pairing, which are not owner grants.
         from gateway.authz_mixin import (
-            GatewayAuthorizationMixin, _ALLOWED_USERS_ENV, _ALLOW_ALL_ENV, _auth_env, _coerce_allow_set, _env_truthy,
+            GatewayAuthorizationMixin, _auth_env, _coerce_allow_set, _env_truthy, authz_field,
             _principal_matches_allowlist, _registry_entry,
         )
 
         platform = getattr(source, "platform", None)
         entry = _registry_entry(platform)
-        allow_env = _ALLOWED_USERS_ENV.get(platform) or getattr(entry, "allowed_users_env", "")
-        allow_all_env = _ALLOW_ALL_ENV.get(platform) or getattr(entry, "allow_all_env", "")
+        platform_name = getattr(platform, "value", "")
+        allow_env = authz_field(platform_name, "allowed_users_env", entry) or ""
+        allow_all_env = authz_field(platform_name, "allow_all_env", entry) or ""
         platform_allowed = _coerce_allow_set(_auth_env(allow_env))
         configured = platform_allowed | _coerce_allow_set(_auth_env("GATEWAY_ALLOWED_USERS"))
         user_id = getattr(source, "user_id", None)

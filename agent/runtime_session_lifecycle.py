@@ -47,6 +47,12 @@ class RuntimeSessionLifecycleMixin:
     def get_next_title_in_lineage(self, base_title):
         return self._apply('session.next_title', {'base_title': base_title})['value']
 
+    def has_auto_title_collision(self, title, *, exclude_session_id=None):
+        if exclude_session_id is not None:
+            self._session(exclude_session_id)
+        return self._apply('session.title_collision', {
+            'title': title, 'exclude_session_id': exclude_session_id})['value']
+
     def touch_session_activity(self, session_id, ts=None, *, description=None, provenance=None):
         self._session(session_id)
         self._apply('session.activity', {'ts': ts, 'description': description, 'provenance': provenance})

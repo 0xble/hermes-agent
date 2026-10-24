@@ -107,6 +107,20 @@ def worker_next_title(db, conn, session_id, payload):
     return {'value': f'{base} #{max([1, *numbers]) + 1}'}
 
 
+def worker_title_collision(db, conn, session_id, payload):
+    from hermes_state_titles import _auto_title_matches
+    if (set(payload) != {'title', 'exclude_session_id'} or not isinstance(payload['title'], str)
+            or payload['exclude_session_id'] not in (None, session_id)):
+        raise RuntimeStoreError('invalid_params')
+    if not payload['title']:
+        return {'value': False}
+    conn.create_function('auto_title_matches', 2, _auto_title_matches, deterministic=True)
+    return {'value': conn.execute(
+        'SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL '
+        'AND auto_title_matches(title, ?) LIMIT 1',
+        (payload['exclude_session_id'] or '', payload['title'].casefold())).fetchone() is not None}
+
+
 def worker_activity(db, conn, session_id, payload):
     import math
     from agent.session_activity import bound_activity_description, normalize_activity_provenance
@@ -187,6 +201,7 @@ WORKER_LIFECYCLE_HANDLERS = {
     'session.title': worker_title,
     'session.title_source': worker_title_source,
     'session.next_title': worker_next_title,
+    'session.title_collision': worker_title_collision,
     'session.activity': worker_activity,
     'session.activity_clear': worker_activity_clear,
     'session.billing_route': worker_billing_route,

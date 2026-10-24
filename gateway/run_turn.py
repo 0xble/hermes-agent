@@ -31,6 +31,7 @@ from gateway.platforms.event import MessageEvent, turn_origin_for_event
 from gateway.session_context import bound_turn_origin, set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
+from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
 from gateway.response_filters import (
     display_kind_for_event, display_metadata_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
     strip_edge_silence_markers,
@@ -160,7 +161,7 @@ def bound_model_input_without_hygiene(history: list[Any], limit: int) -> list[An
     return history[:head_end] + history[tail_start:]
 
 
-class GatewayTurnMixin(GatewayLoopWakeMixin):
+class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
     def _resolve_session_agent_runtime(

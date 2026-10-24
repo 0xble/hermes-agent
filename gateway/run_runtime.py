@@ -557,17 +557,8 @@ async def recover_gateway_native_sessions(runner):
     results = {}
     for authority in authorities:
         with owner_scope(authority):
-            entries = await asyncio.to_thread(runner.session_store.list_sessions)
             recover_local_sessions(authority, schedule=True)
             await recover_webhook_finalizations(authority)
-            pending = {row['target_session_id'] for row in authority.db._read_all(
-                "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
-            # The session-store lock guards state.db writes; never wait on it from the loop thread.
-            session_entries = entries
-            bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
-                        for entry in session_entries if entry.origin is not None
-                        for owner in [authority.logical_owner(entry.session_id)] if owner in pending]
-            outcome = await authority.recover_native_sessions(bindings)
         results.update(await recover_profile_native_sessions(runner, authority))
     return results
 
@@ -576,10 +567,12 @@ async def recover_profile_native_sessions(runner, authority):
     """Bind one authority's queued native rows to the adapters connected now."""
     from gateway.session_authorities import owner_scope
     with owner_scope(authority):
-        pending = {row['target_session_id'] for row in authority.db._read_all(
-            "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
+        pending_rows = await asyncio.to_thread(authority.db._read_all,
+            "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")
+        pending = {row['target_session_id'] for row in pending_rows}
+        entries = await asyncio.to_thread(runner.session_store.list_sessions)
         bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
-                    for entry in runner.session_store.list_sessions() if entry.origin is not None
+                    for entry in entries if entry.origin is not None
                     for owner in [authority.logical_owner(entry.session_id)] if owner in pending]
         outcome = await authority.recover_native_sessions(bindings)
     for sid, verdict in outcome.items():

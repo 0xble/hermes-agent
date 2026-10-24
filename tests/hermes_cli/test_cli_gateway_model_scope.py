@@ -60,10 +60,12 @@ def _prepare_for_chat(monkeypatch, cli_mod, stub):
     """Enough of HermesCLI for the real ``chat``: its retire, ``_init_agent``, the agent thread
     and the one-turn restore all run. Only the terminal UI around the turn is stubbed."""
     for name in ("chat", "_chat_run_agent", "_chat_release_turn_audio", "_init_agent",
-                 "_resolve_turn_agent_config", "_restore_model_runtime_snapshot"):
+                 "_resolve_turn_agent_config", "_restore_model_runtime_snapshot",
+                 "_revive_blocked_goal_for_user_turn"):
         setattr(stub, name, getattr(cli_mod.HermesCLI, name).__get__(stub))
     monkeypatch.setattr(cli_mod, "ChatConsole", lambda *a, **k: SimpleNamespace(print=lambda *a, **k: None))
     stub._ensure_runtime_credentials = lambda: True
+    stub._get_goal_manager = lambda: None
     stub.finalize_preloaded_skills = lambda: None
     stub._install_tool_callbacks = lambda: None
     stub._ensure_gateway_session = lambda: None

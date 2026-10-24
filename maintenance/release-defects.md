@@ -728,6 +728,26 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   - `hermes_cli/cli_model_switch_mixin.py` kept upstream's trailing `restore_reasoning(...)` call after the fork had replaced that local with `_restore_reasoning()`, which already reapplies the snapshot after `switch_model`.
   - The desktop slash-session test imported in an order `perfectionist/sort-imports` rejects.
 - Guard: `uvx pyflakes` over the merged tree reports no undefined name that is absent on both parents, plus exact-head hosted CI for `gateway.run` import and the display-read suites.
+- The next hosted run exposed attribute and projection losses not visible to undefined-name scans:
+  - Display-fold projections omitted the summary-carrier UID and flag. Both the off-lock plan and
+    its stale-row fallback now use the same carrier identity and retained-slot rule as the full fold.
+  - The fork turn mixin lost the upstream persistence mixin base, hiding usage-window wording and
+    response-before-limit-offer methods. Existing fork overrides still win in the restored MRO.
+  - Prune rewrite calls the shared upstream transcript transaction helper, retaining rollback row
+    snapshots and the explicit session target rather than a removed private method.
+  - Primary-runtime snapshot reads optional reasoning configuration once, after the guarded lookup.
+  - `/allow` reads authorization environment names from the shared registry rather than removed maps.
+  - Native startup recovery runs once per profile and offloads session-store reads, preserving the
+    event-loop blocking guard. ACP unknown-state refresh uses per-input dict identities consistently.
+  - Managed workers expose the upstream automatic-title collision read through a scoped, receipted
+    owner operation. Only a boolean is returned and exclusion stays bound to the assigned session.
+  - Fixtures follow the real `session_db` constructor, `_Batch` dataclass, blocked-goal hook, and
+    authored max-iteration config. The deleted importer wrapper's config-write refusal is exercised
+    on its unchanged shared `atomic_yaml_write` implementation. No assertion is relaxed.
+  - Gateway contract, command-parity document and prompt-surface snapshots use their generators.
+- Guards: display-fold off-lock and carrier suites, managed-store surface parity with Unicode
+  collision and cross-session refusal coverage, usage-limit delivery, runtime bootstrap, ACP
+  cancellation, provider fork contracts and retry/recovery admission tests, plus exact-head CI.
 - Retire once the next release sync no longer carries these merge points.
 
 ## v0.21.6 merge integration
