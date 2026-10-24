@@ -279,6 +279,33 @@ _CRON_HINT = (
     "context for this run, not as a request to schedule another job.]\n\n"
 )
 
+# ``deliver: local`` jobs are only saved to local output; the shared hint's DELIVERY sentence would
+# be false for them and would forbid relays their own instructions require. Only that sentence
+# differs — SILENT / FAILURE / RECURSION text is reused byte-for-byte.
+_CRON_HINT_DELIVERY = (
+    "DELIVERY: Your final response will be automatically delivered "
+    "to the user — do NOT use send_message or try to deliver "
+    "the output yourself. Just produce your report/output as your "
+    "final response and the system handles the rest. "
+)
+_CRON_HINT_LOCAL = _CRON_HINT.replace(
+    _CRON_HINT_DELIVERY,
+    "DELIVERY: This job delivers locally: your final response is saved to local output only "
+    "and is not sent anywhere (failure notices still follow the job's failure lane). If your task "
+    "instructions say to relay or send the result somewhere, do that yourself with the tool they "
+    "name; otherwise just produce your output as the final response. ",
+)
+if _CRON_HINT_LOCAL == _CRON_HINT:  # pragma: no cover - import-time drift guard
+    raise RuntimeError("cron DELIVERY sentence drifted from _CRON_HINT")
+
+
+def _cron_hint_for(job: dict) -> str:
+    """Pick the hint matching the scheduler's own delivery resolution: local-only when every
+    comma-separated ``deliver`` token is ``local`` (missing/empty ``deliver`` resolves to local)."""
+    deliver = _delivery._normalize_deliver_value(_delivery._delivery_lane_value(job))
+    tokens = [t.strip() for t in deliver.split(",") if t.strip()]
+    return _CRON_HINT_LOCAL if all(t == "local" for t in tokens) else _CRON_HINT
+
 
 def _build_job_prompt(
     job: dict, prerun_script: Optional[tuple] = None, extra_prompt: Optional[str] = None,
@@ -333,7 +360,7 @@ def _build_job_prompt(
         prompt = f"{notepad_section}{prompt}"
         has_injected_data = True
 
-    prompt = _CRON_HINT + prompt
+    prompt = _cron_hint_for(job) + prompt
     skill_names = _job_skill_names(job)
     if not skill_names:
         return _scan_assembled_cron_prompt(
