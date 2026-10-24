@@ -36,25 +36,27 @@ def record_publication_write(*, wait_s=0.0, hold_s=0.0, rows_written=0):
 
 
 @contextmanager
-def state_lock(lock, *, deadline: float | None = None):
-    """Bound writers, and publication's degraded reads, before entering a transaction.
+def state_lock(lock, *, db_path, deadline: float | None = None):
+    """Bound only compaction publication's admission, including degraded reads.
 
-    Never interrupt an acquired transaction. Ordinary readers retain their existing
-    behavior. Publication reads on the degraded writer connection get the same
-    patience as a writer, so display-plan preparation cannot bypass the bound.
+    Ordinary writers retain their unbounded mutex wait: their SQLite retry budget
+    must not turn a queued transcript append into a failed write. Never interrupt
+    an acquired transaction.
     """
     metrics = _metrics.get()
-    if deadline is None and metrics is None:
+    if metrics is None:
         with lock:
             yield
         return
     started = time.monotonic()
-    if deadline is None:
-        assert metrics is not None
-        deadline = started + metrics["patience_s"]
-    acquired = lock.acquire(timeout=max(0.0, deadline - started))
+    publication_deadline = started + metrics["patience_s"]
+    deadline = publication_deadline if deadline is None else min(deadline, publication_deadline)
+    patience_s = max(0.0, deadline - started)
+    acquired = lock.acquire(timeout=patience_s)
     record_publication_write(wait_s=time.monotonic() - started)
     if not acquired:
+        from hermes_state_lockowners import log_write_lock_holders
+        log_write_lock_holders(db_path, patience_s)
         raise LocalStateLockTimeout("database is locked (local SessionDB connection mutex patience exhausted)")
     try:
         yield

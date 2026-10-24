@@ -13,22 +13,25 @@ if TYPE_CHECKING:
     from agent.conversation_compression import _CompressionLease, _Attempt, _CommitOutcome
 
 from hermes_state_errors import is_sqlite_lock_error
-from hermes_state_publication import publication_metrics, record_publication_attempt
+from hermes_state_publication import publication_metrics, record_publication_attempt, raise_if_nonretryable_contention
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("agent.conversation_compression")
 
 
 def _publication_stages(fn):
+    """Keep publication accounting out of preparation, memory jobs and post-commit writes."""
     @functools.wraps(fn)
-    def measured(*args, **kwargs):
+    def measured(*args, publication_seed=None, **kwargs):
         with publication_metrics(20.0) as metrics:
             try:
                 return fn(*args, **kwargs)
             finally:
-                kwargs["attempt"].seed.update({k: v for k, v in metrics.items() if k != "patience_s"})
+                if publication_seed is not None:
+                    publication_seed.update({k: v for k, v in metrics.items() if k != "patience_s"})
     return measured
 
 
+@_publication_stages
 def retry_publication(fn, *args, **kwargs):
     """Replay only lock/busy publication failures, whose transaction was rolled back.
 
@@ -40,6 +43,7 @@ def retry_publication(fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except sqlite3.OperationalError as exc:
+            raise_if_nonretryable_contention(exc)
             if attempt == 2 or not is_sqlite_lock_error(exc):
                 raise
             logger.info("Compaction publication busy, retrying the generated candidate (%s/3)", attempt + 2)
@@ -179,7 +183,6 @@ def _failed_publication(agent, messages, compressed, *, in_place, old_session_id
     return compressed, made_progress, split_status, old_session_id
 
 
-@_publication_stages
 def _commit_compaction(
     agent: Any, messages: list, compressed: list, *, in_place: bool, lease: _CompressionLease,
     new_system_prompt: str, system_message: str, compressed_user_turn_outcome: str,
@@ -231,7 +234,8 @@ def _commit_compaction(
                 persisted, tail_count, covered_ids, unresolved_held = _prepare_in_place(
                     agent, messages, compressed, _tail_tagged_ids, verbatim_tail, original_messages)
                 retry_publication(agent._session_db.archive_and_compact,
-                    agent.session_id, persisted, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
+                    agent.session_id, persisted, publication_seed=attempt.seed,
+                    model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=_held_watermark(agent, lease.watermark, messages, verbatim_tail),
                     lock_holder=lease.holder, tail_count=tail_count, carried_messages=carried_messages,
                     covered_ids=covered_ids, unresolved_held=unresolved_held,
@@ -274,6 +278,7 @@ def _commit_compaction(
                 _publish_rotated_compaction(
                     agent, messages, compressed, new_system_prompt=new_system_prompt, lease=lease,
                     old_session_id=old_session_id, compressed_user_turn_outcome=compressed_user_turn_outcome,
+                    publication_seed=attempt.seed,
                 )
                 if verbatim_tail:
                     stamp_db_persisted_markers(verbatim_tail)

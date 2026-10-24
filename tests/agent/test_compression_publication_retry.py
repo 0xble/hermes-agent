@@ -8,10 +8,11 @@ from agent.conversation_compression import CompressionCommitFence, _attempt_stal
 from agent.conversation_compression_publication import retry_publication
 from hermes_state import SessionDB
 from hermes_state_errors import CompressionLeaseLostError
-from hermes_state_publication import publication_metrics
+from hermes_state_publication import LocalStateLockTimeout
 
 
 @pytest.mark.parametrize("error", [
+    LocalStateLockTimeout("database is locked (local mutex patience exhausted)"),
     sqlite3.DatabaseError("database disk image is malformed"),
     sqlite3.OperationalError("disk I/O error"),
     CompressionLeaseLostError("lost holder"),
@@ -38,8 +39,9 @@ def test_busy_retry_rolls_back_each_failed_transaction_and_counts_attempted_rows
                 if calls < 3:
                     raise sqlite3.OperationalError("database is locked")
             return db._execute_write(write)
-        with publication_metrics(0.1) as metrics, patch.object(db, "_sleep_before_write_retry", return_value=False):
-            retry_publication(publish)
+        metrics = {}
+        with patch.object(db, "_sleep_before_write_retry", return_value=False):
+            retry_publication(publish, publication_seed=metrics)
         assert calls == metrics["publish_attempts"] == 3
         assert metrics["publish_rows_written"] >= 3
         assert metrics["publish_wait_ms"] >= 0 and metrics["publish_hold_ms"] > 0

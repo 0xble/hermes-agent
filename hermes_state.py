@@ -474,9 +474,9 @@ def _storage_write_in_progress():
         thread._hermes_storage_write_ended_at = time.time()
 
 
-def storage_write_activity(thread_id: Optional[int]) -> Tuple[bool, Optional[float]]:
+def storage_write_activity(thread_id: Optional[int]) -> tuple[bool, Optional[float]]:
     """``(in_progress, last_ended_at)`` of SessionDB writes on thread *thread_id*."""
-    thread = threading._active.get(thread_id) if thread_id is not None else None  # noqa: SLF001
+    thread = threading._active.get(thread_id) if thread_id is not None else None
     if thread is None:
         return False, None
     return (getattr(thread, "_hermes_storage_write_depth", 0) > 0,
@@ -993,7 +993,7 @@ class SessionDB(
                     # permits == maxsize, load-bearing if they drift): surplus.
                     self._close_read_conn(conn)
             return
-        with state_lock(self._lock):
+        with state_lock(self._lock, db_path=self.db_path):
             if self._conn is None:  # close() raced a still-unwinding reader
                 self._reopen_after_close_locked(context="read")
             conn = cast(sqlite3.Connection, self._conn)
@@ -1085,7 +1085,7 @@ class SessionDB(
             generation_clean = self._db_generation_probe_clean()
             fn_started = False
             try:
-                with state_lock(self._lock, deadline=deadline):
+                with state_lock(self._lock, db_path=self.db_path, deadline=deadline):
                     if generation_clean:
                         self._raise_if_db_generation_flagged()
                     else:

@@ -1,8 +1,6 @@
-"""Writer patience includes the in-process mutex, not just SQLite's busy handler."""
+"""Only compaction publication bounds the in-process mutex admission wait."""
 
-import sqlite3
 import threading
-import time
 from unittest.mock import patch
 
 import pytest
@@ -10,7 +8,10 @@ import pytest
 from hermes_state import SessionDB
 
 
-def test_writer_patience_bounds_local_mutex_wait(tmp_path):
+@pytest.mark.parametrize("operation", ["write", "degraded_read"])
+def test_publication_mutex_timeout_attributes_holders(tmp_path, operation):
+    from hermes_state_publication import LocalStateLockTimeout, publication_metrics
+
     db = SessionDB(tmp_path / "wait.db")
     held = threading.Event()
     release = threading.Event()
@@ -18,22 +19,78 @@ def test_writer_patience_bounds_local_mutex_wait(tmp_path):
     def reader():
         with db._lock:
             held.set()
-            release.wait(2)
+            release.wait(10)
 
     thread = threading.Thread(target=reader)
     thread.start()
-    assert held.wait(2)
-    timer = threading.Timer(0.4, release.set)
-    timer.start()
+    assert held.wait(10)
     try:
-        started = time.monotonic()
-        with pytest.raises(sqlite3.OperationalError, match="locked"):
-            db._execute_write(lambda conn: conn.execute("SELECT 1"), patience_s=0.03)
-        assert time.monotonic() - started < 0.3
+        db._wal_active = False
+        with publication_metrics(0), patch("hermes_state_lockowners.log_write_lock_holders") as holders:
+            with pytest.raises(LocalStateLockTimeout, match="local SessionDB connection mutex"):
+                if operation == "write":
+                    db._execute_write(lambda conn: conn.execute("SELECT 1"), patience_s=0)
+                else:
+                    db._read_one("SELECT 1")
+        holders.assert_called_once_with(db.db_path, 0)
     finally:
         release.set()
-        thread.join(2)
-        timer.cancel()
+        thread.join(10)
+        db.close()
+
+
+@pytest.mark.parametrize("operation", ["append_message", "set_session_title"])
+def test_ordinary_writer_waits_for_mutex_without_dropping_data(tmp_path, operation):
+    db = SessionDB(tmp_path / "ordinary.db")
+    db.create_session("s", "test")
+    lock = db._lock
+    waiting = threading.Event()
+    waits, errors = [], []
+
+    class ObservedLock:
+        def acquire(self, blocking=True, timeout=-1):
+            waits.append(timeout)
+            waiting.set()
+            return lock.acquire(blocking, timeout)
+
+        def release(self):
+            lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self.release()
+
+    def write():
+        try:
+            if operation == "append_message":
+                db.append_message("s", "user", "must survive mutex contention")
+            else:
+                db.set_session_title("s", "must survive mutex contention")
+        except Exception as exc:
+            errors.append(exc)
+
+    db._lock = ObservedLock()
+    thread = threading.Thread(target=write)
+    try:
+        # An expired SQLite retry budget must not become an ordinary writer's
+        # mutex timeout. Hold the real mutex until the writer queues behind it.
+        with patch.object(db, "_TRANSCRIPT_WRITE_PATIENCE_S", 0), patch.object(db, "_WRITE_PATIENCE_S", 0):
+            with lock:
+                thread.start()
+                assert waiting.wait(10)
+            thread.join(10)
+        assert not thread.is_alive()
+        assert errors == []
+        assert waits and all(timeout == -1 for timeout in waits)
+        if operation == "append_message":
+            assert [row["content"] for row in db.get_messages("s")] == ["must survive mutex contention"]
+        else:
+            assert db.get_session_title("s") == "must survive mutex contention"
+    finally:
+        thread.join(10)
         db.close()
 
 

@@ -3418,7 +3418,7 @@ def _compression_child_source(agent: Any, parent_session_id: str) -> str:
 
 def _publish_rotated_compaction(
     agent: Any, messages: list, compressed: list, *, new_system_prompt: str, lease: _CompressionLease,
-    old_session_id: str, compressed_user_turn_outcome: str,
+    old_session_id: str, compressed_user_turn_outcome: str, publication_seed: Optional[dict] = None,
 ) -> None:
     """Rotate the session: flush the parent, publish the child, re-point the agent.
     Flushes current-turn msgs to the OLD session, passing the durable prefix (messages[:persist idx]) so
@@ -3453,7 +3453,7 @@ def _publish_rotated_compaction(
     from agent.context_compressor import _DB_PERSISTED_MARKER
     from tools.approval_yolo import with_session_yolo
     from agent.conversation_compression_publication import retry_publication
-    retry_publication(agent._session_db.publish_compression_child,
+    retry_publication(agent._session_db.publish_compression_child, publication_seed=publication_seed,
         parent_session_id=old_session_id, child_session_id=new_session_id,
         source=_compression_child_source(agent, old_session_id), model=agent.model,
         model_config=with_session_yolo(agent._session_init_model_config, old_session_id),

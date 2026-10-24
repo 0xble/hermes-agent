@@ -532,6 +532,70 @@ def test_publication_busy_retries_the_same_generated_summary(published, tmp_path
         db.close()
 
 
+@pytest.mark.parametrize("in_place", [True, False])
+def test_publication_context_excludes_memory_and_rotation_flush(published, tmp_path, in_place):
+    import threading
+    from agent.memory_provider import spawn_context_thread
+    from hermes_state import SessionDB
+    from hermes_state_publication import _metrics, record_publication_write
+
+    agent = _Agent(_compressor())
+    agent.compression_in_place = in_place
+    agent._session_init_model_config = {}
+    db = SessionDB(tmp_path / "context.db")
+    agent._session_db = db
+    db.create_session(agent.session_id, "cli")
+    contexts, workers, publication = [], [], []
+    resume = threading.Event()
+
+    def unrelated_write(*_args, **_kwargs):
+        contexts.append(_metrics.get())
+        record_publication_write(wait_s=99, hold_s=99, rows_written=999999)
+
+    def memory_worker():
+        assert resume.wait(10)
+        unrelated_write()
+        # Exercise the degraded reader after the publishing context has closed.
+        db._wal_active = False
+        db.get_session_title(agent.session_id)
+
+    def commit_memory(_messages):
+        unrelated_write()
+        thread = spawn_context_thread(memory_worker, name="compaction-memory-test")
+        workers.append(thread)
+        thread.start()
+
+    method = "archive_and_compact" if in_place else "publish_compression_child"
+    publish = getattr(db, method)
+
+    def observed_publish(*args, **kwargs):
+        publication.append(_metrics.get())
+        return publish(*args, **kwargs)
+
+    try:
+        with patch.object(agent, "commit_memory_session", side_effect=commit_memory), \
+                patch.object(agent, "_flush_messages_to_session_db", side_effect=unrelated_write, create=True), \
+                patch.object(db, method, side_effect=observed_publish), \
+                patch.object(agent.context_compressor, "_generate_summary", return_value="SANITIZED SUMMARY"):
+            compressed, _ = compress_context(agent, _messages(), "system prompt", approx_tokens=80_000)
+        assert len(compressed) < len(_messages())
+        assert len(publication) == 1 and publication[0] is not None
+        settled = publication[0].copy()
+        resume.set()
+        for thread in workers:
+            thread.join(10)
+            assert not thread.is_alive()
+        assert len(contexts) == (2 if in_place else 3)
+        assert all(context is None for context in contexts)
+        assert publication[0] == settled
+        assert publication[0]["publish_rows_written"] < 999999
+    finally:
+        resume.set()
+        for thread in workers:
+            thread.join(10)
+        db.close()
+
+
 @pytest.mark.parametrize("at_deadline", [False, True])
 def test_publication_failure_does_not_select_another_summary_model(published, tmp_path, at_deadline):
     import sqlite3

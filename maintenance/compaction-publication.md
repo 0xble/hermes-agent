@@ -15,10 +15,20 @@ finishes unchanged at its deadline may still recover on the next model route,
 after the first worker has fully settled. The fence records actual publication
 failure separately so storage errors cannot enter that recovery path.
 
-Writer patience includes acquisition of the SessionDB instance mutex, not only
-SQLite's `BEGIN IMMEDIATE`. Compression lease timestamps must be calculated after
-that wait, inside the write callback. Atomic publication, lease ownership, covered
-row checks, FTS triggers, display reconciliation, and rewind flags stay intact.
+Compaction publication patience includes acquisition of the SessionDB instance
+mutex, not only SQLite's `BEGIN IMMEDIATE`. Ordinary writers retain their existing
+unbounded mutex admission and SQLite retry budgets, so a long local holder cannot
+turn a queued transcript append into a failed write. Publication mutex timeouts
+log holder diagnostics before propagating and are terminal to both retry layers.
+
+Publication accounting is scoped to the publication retry call, not the whole
+commit phase. Memory extraction, rotation flushes, title and prompt updates, and
+pre-publication preparation do not inherit its bounded-lock context or inflate
+its metrics. Memory-provider background threads therefore cannot retain and
+mutate a completed attempt's metrics. Compression lease timestamps must be
+calculated after the wait, inside the write callback. Atomic publication, lease
+ownership, covered row checks, FTS triggers, display reconciliation, and rewind
+flags stay intact.
 
 ## Incident Evidence
 
@@ -50,7 +60,13 @@ compaction, rollback, display, FTS, and lease suites. Run them with
 `scripts/run_tests.sh`, then the exact-head `bin/ci gate` through `heavy-slot`.
 
 Upstream main `5894e750c3dba980d43b25aa29e3958149ba2c61` and relevant open PRs
-were checked. This patch is removable when upstream writer patience covers the
-local mutex, refresh timestamps are written fresh, publication-only retries reuse
+were checked. The follow-up checked guidance at upstream main
+`bac34e9e9946c9c6a9ce7ce64efadd47f8fa375b` and related closed
+[PR #120821](https://github.com/NousResearch/hermes-agent/pull/120821), which addresses
+generation fencing rather than local mutex admission. The existing atomic
+publication and generation guards remain the owners of persistence correctness.
+This patch is removable when upstream compaction publication patience covers the
+local mutex without failing ordinary queued writers, refresh timestamps are
+written fresh, publication-only retries reuse
 the generated candidate, and generation fallback excludes publication failures.
 It complements fork PR #752's transcript phase timing rather than replacing it.
