@@ -252,6 +252,41 @@ async def _apply_session_settings(
     }
 
 
+async def _session_settings_readback(runner, dest: SessionSource, entry, selection) -> dict[str, Any]:
+    """Optional inspection must not turn a successful topic mutation into a retry."""
+    from gateway.run import _load_gateway_config
+    from gateway.run_session_readback import read_session_settings
+
+    readback = {
+        "model": None, "provider": None, "effective_model": None,
+        "effective_provider": None, "effective_effort": None, "warnings": [],
+    }
+    if selection is not None and not (isinstance(selection, tuple) and selection[0] == "role"):
+        _ctx, result = selection
+        readback.update(model=result.new_model, provider=result.target_provider)
+    try:
+        if isinstance(selection, tuple) and selection and selection[0] == "role":
+            route = await asyncio.to_thread(_resolve_topic_model_ref, "@" + selection[1], dest, runner)
+            readback.update(model=route.model, provider=route.provider)
+        async with runner._async_profile_scope_for_source(dest):
+            profile_home = runner._profile_scope_key_for_source(dest)
+            user_config = await asyncio.to_thread(
+                _load_gateway_config, *([profile_home / "config.yaml"] if profile_home is not None else []),
+            )
+            effective_model, runtime, reasoning = await read_session_settings(
+                runner, source=dest, session_key=entry.session_key, user_config=user_config,
+            )
+            readback.update(
+                effective_model=effective_model, effective_provider=runtime.get("provider") or None,
+                effective_effort=_reasoning_effort(reasoning or {}),
+            )
+    except Exception:
+        logger.warning("Topic %s settings readback failed after successful changes", dest.thread_id, exc_info=True)
+        readback.update(effective_model=None, effective_provider=None, effective_effort=None)
+        readback["warnings"].append("Topic changes succeeded, but settings readback is unavailable.")
+    return readback
+
+
 async def _origin_line(runner, adapter, source: SessionSource) -> str:
     """Build the caller-owned origin line for a topic opening brief.
 
@@ -497,43 +532,15 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
             raise TopicRequestError(
                 f"Topic {thread_id} and session {entry.session_id} are set up, but the opening brief "
                 f"was not delivered: {exc}. Send it with relay to {relay}.") from exc
-    profile_home = None
-    if model and isinstance(model, tuple) and model and model[0] == "role":
-        route = _resolve_topic_model_ref("@" + model[1], dest, runner)
-        effective_model, effective_provider = route.model, route.provider
-        # The role was resolved from the routed profile; the reasoning readback
-        # must use that same profile, not the launch profile.
-        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
-                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
-            profile_home = runner._resolve_profile_home_for_source(dest)
-    else:
-        effective_model = getattr(model[1], "new_model", None) if model else None
-        effective_provider = getattr(model[1], "target_provider", None) if model else None
-        if model:
-            profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
-        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
-                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
-            profile_home = runner._resolve_profile_home_for_source(dest)
-        with_context = getattr(runner, "_model_switch_context", None)
-        if callable(with_context):
-            effective = with_context(
-                dest, entry.session_key, profile_home=profile_home, persist_global=False,
-            )
-            effective_model = effective.current_model
-            effective_provider = effective.current_provider
-    effective_config = runner._resolve_session_reasoning_config(
-        source=dest, session_key=entry.session_key, model=effective_model or "",
-        profile_home=profile_home,
-    )
+    readback = await _session_settings_readback(runner, dest, entry, model)
+    warnings.extend(readback.pop("warnings"))
     return {
         "action": "create", "thread_id": str(thread_id), "session_id": entry.session_id,
         "relay": relay, "title": title,
-        "icon": spec.icon if icon_id else None, "model": effective_model,
-        "provider": effective_provider,
+        "icon": spec.icon if icon_id else None,
         "reasoning": effort, "brief_delivered": bool(brief), "warnings": warnings,
         "model_status": settings["model_status"], "reasoning_status": settings["reasoning_status"],
-        "effective_model": effective_model, "effective_provider": effective_provider,
-        "effective_effort": _reasoning_effort(effective_config),
+        **readback,
         "model_effective_when": settings["model_effective_when"],
         "reasoning_effective_when": settings["reasoning_effective_when"],
     }
@@ -582,42 +589,15 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
             runner, dest, entry, model, effort, reasoning_reset=reasoning_reset,
         )
         warnings = settings["warnings"]
-    profile_home = None
-    if model and isinstance(model, tuple) and model and model[0] == "role":
-        route = _resolve_topic_model_ref("@" + model[1], dest, runner)
-        effective_model, effective_provider = route.model, route.provider
-        # The role was resolved from the routed profile; the reasoning readback
-        # must use that same profile, not the launch profile.
-        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
-                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
-            profile_home = runner._resolve_profile_home_for_source(dest)
-    else:
-        effective_model = getattr(model[1], "new_model", None) if model else None
-        effective_provider = getattr(model[1], "target_provider", None) if model else None
-        if model:
-            profile_home = getattr(getattr(model[0], "config_path", None), "parent", None)
-        if (getattr(getattr(runner, "config", None), "multiplex_profiles", False)
-                and callable(getattr(runner, "_resolve_profile_home_for_source", None))):
-            profile_home = runner._resolve_profile_home_for_source(dest)
-        effective_ctx = runner._model_switch_context(
-            dest, entry.session_key, profile_home=profile_home, persist_global=False,
-        )
-        effective_model = effective_ctx.current_model
-        effective_provider = effective_ctx.current_provider
-    effective_config = runner._resolve_session_reasoning_config(
-        source=dest, session_key=entry.session_key, model=effective_model or "",
-        profile_home=profile_home,
-    )
+    readback = await _session_settings_readback(runner, dest, entry, model)
+    warnings.extend(readback.pop("warnings"))
     return {
         "action": "edit", "thread_id": thread_id, "session_id": entry.session_id,
         "relay": relay_address(runner, source, entry.session_id), "name": name, "title": title,
         "icon": spec.icon if icon_id else None,
-        "model": effective_model,
-        "provider": effective_provider,
         "reasoning": effort, "warnings": warnings,
         "model_status": settings["model_status"], "reasoning_status": settings["reasoning_status"],
-        "effective_model": effective_model, "effective_provider": effective_provider,
-        "effective_effort": _reasoning_effort(effective_config),
+        **readback,
         "model_effective_when": settings["model_effective_when"],
         "reasoning_effective_when": settings["reasoning_effective_when"],
     }

@@ -9,6 +9,7 @@ An agent in a Telegram DM session can create or edit a DM topic as its own Herme
 - A create request requires an explicit icon when Telegram returns a non-empty native icon set. A missing or unsupported icon lists the available choices before any topic is created. If the set is empty or cannot be fetched, creation proceeds without an icon and returns a warning. The result reports the emoji actually applied, or `null` when no icon was applied. Edit keeps the icon optional.
 - A setup failure after Telegram created the topic names the topic and the full `edit` call that finishes it.
 - Source copies use `replace_source`, so the wire-invisible routing provenance (receiving bot, identity) survives and a multiplexed shared-bot turn acts through the bot that received it.
+- Results keep `model` and `provider` as requested picks, or `null` when unchanged. `effective_model`, `effective_provider` and `effective_effort` describe the destination's next-turn route through detached snapshots shared with turn setup, including session picks, channel overrides, attended routing and the owning profile's config. Config reads and cold provider credential hydration stay off the gateway loop. Inspection does not hydrate live conversation state, expire durable picks, consume notices or update last-resolved-model caches. An undeclared reasoning effort reports the normal `medium` default. If optional readback fails after successful creation or editing, the operation still returns its successful result with all `effective_*` fields `null` and a short warning, so callers do not retry an already-applied mutation.
 
 The tool owns no state. Telegram owns the remote topic; `gateway/telegram_topic_sessions.py` owns topic and session setup and is shared with `/topic edit`; `GatewayModelCommandsMixin.resolve_session_model_selection` and `commit_session_model_selection` expose the `/model` resolve and commit without a slash event; the routing entry persists model and reasoning picks across restarts. The work runs on the gateway event loop through `_dispatch_on_gateway_loop`, because the Bot API client, the model-switch lock and turn admission belong to it.
 
@@ -45,7 +46,7 @@ The reproduced failure was a relay-style `title\nobjective\n---` envelope, which
 
 ## Verification
 
-`scripts/run_tests.sh tests/gateway/test_telegram_topic_briefs.py tests/gateway/test_telegram_topic_tool.py tests/gateway/test_telegram_topic_mode.py tests/gateway/test_telegram_topic_edit.py tests/gateway/test_telegram_rich_messages.py tests/gateway/test_session_reasoning_override_persistence.py tests/gateway/test_model_command_reasoning_flag.py tests/hermes_cli/test_tools_config.py`.
+`scripts/run_tests.sh tests/gateway/test_telegram_topic_briefs.py tests/gateway/test_telegram_topic_tool.py tests/gateway/test_topic_model_readback.py tests/gateway/test_telegram_topic_mode.py tests/gateway/test_telegram_topic_edit.py tests/gateway/test_telegram_rich_messages.py tests/gateway/test_session_reasoning_override_persistence.py tests/gateway/test_model_command_reasoning_flag.py tests/hermes_cli/test_tools_config.py`.
 
 The topic-tool tests drive a real `SessionStore` and `SessionDB` and fake only Telegram and model resolution. They cover the restart path: a fresh runner over the same store rehydrates the chosen model and reasoning.
 

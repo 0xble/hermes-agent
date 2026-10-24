@@ -67,7 +67,17 @@ def _model_result(model="gpt-test", provider="openai-codex"):
 
 
 @pytest.fixture
-def home(tmp_path):
+def home(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda *_: {
+        "model": {"default": "gpt-test", "provider": "openai-codex"},
+    })
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
+        "provider": "openai-codex", "api_key": "sk-x",
+    })
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", lambda provider, **_: {
+        "provider": provider, "api_key": "sk-x",
+    })
+    monkeypatch.setattr("gateway.run._credential_pool_for_provider", lambda _: None)
     db = SessionDB(db_path=tmp_path / "state.db")
     db.enable_telegram_topic_mode(chat_id=CHAT, user_id=CHAT)
     yield SimpleNamespace(path=tmp_path, db=db)
