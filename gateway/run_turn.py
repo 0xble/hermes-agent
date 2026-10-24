@@ -43,7 +43,7 @@ from gateway.session import (
 )
 from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
 from gateway.attended_model import (
-    format_attended_switch_back_notice, format_attended_switch_notice,
+    _stamp_seconds, format_attended_switch_back_notice, format_attended_switch_notice,
     is_active, parse_attended_config, resolve_attended_model,
 )
 from gateway.session_transcript import TranscriptReadError
@@ -193,10 +193,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         )
         return self._commit_session_agent_runtime(skey, resolved)
 
-    def _load_attended_activity_stamp(self, session_key: str):
+    def _load_attended_activity_stamp(self, session_key: str, *, refresh: bool = False):
         """Read the durable activity stamp without changing live session state."""
         with suppress(Exception):
-            stamp = self.session_store.get_last_user_activity_at(session_key)
+            stamp = self.session_store.get_last_user_activity_at(session_key, refresh=refresh)
             if stamp is not None and hasattr(stamp, "timestamp"):
                 stamp = stamp.timestamp()
             return stamp
@@ -230,7 +230,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             with suppress(Exception):
                 from gateway.run import _resolve_gateway_model
                 model = model or _resolve_gateway_model(user_config)
-        stamp = self._load_attended_activity_stamp(session_key)
+        stamp = self._load_attended_activity_stamp(session_key, refresh=True)
         cfg = parse_attended_config(user_config or {})
         stamp, new_session = self._ensure_attended_new_session_activity(session_key, cfg, stamp)
         reasoning_override = None
@@ -276,6 +276,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             if session_key and conversation:
                 state = self._session_state(session_key)
                 for name, value in conversation.items():
+                    if name == "last_user_activity_at":
+                        # Receipts may advance after the worker read. Compare the same instants
+                        # the attended resolver accepts, rather than ordering raw store values.
+                        current = _stamp_seconds(state.conversation.last_user_activity_at)
+                        incoming = _stamp_seconds(value)
+                        if current is not None and (incoming is None or current > incoming):
+                            continue
                     setattr(state.conversation, name, value)
             if runner:
                 for name, value in runner.items():
@@ -327,11 +334,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         new_session_pending = bool(new_session or getattr(conversation, "attended_new_session", False))
         new_session = new_session_pending and cfg.start_new_sessions
         stamp = conversation.last_user_activity_at
-        if stamp is None:
+        if stamp is None or allow_switch_back:
             if activity_stamp is not _NO_ATTENDED_ACTIVITY_STAMP:
-                stamp = activity_stamp
+                durable_stamp = activity_stamp
             else:
-                stamp = self._load_attended_activity_stamp(session_key)
+                durable_stamp = self._load_attended_activity_stamp(session_key, refresh=allow_switch_back)
+            if durable_stamp is not None and (stamp is None or durable_stamp > stamp):
+                stamp = durable_stamp
         if new_session:
             # Routing is probed repeatedly before the first request (including image preparation).
             # Keep first-turn silence through every probe, not just the first route resolution.
