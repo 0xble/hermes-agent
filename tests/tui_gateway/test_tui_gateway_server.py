@@ -6667,6 +6667,7 @@ def test_prompt_submit_truncates_by_message_id(monkeypatch):
     monkeypatch.setattr(
         server, "_start_agent_build", lambda *a, **k: None
     )
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     monkeypatch.setattr(
         server, "_start_inflight_turn", lambda *a, **k: None
     )
@@ -6724,6 +6725,7 @@ def test_prompt_submit_truncation_falls_back_to_sid_when_session_key_null(monkey
     )
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
     try:
@@ -6916,6 +6918,7 @@ def test_prompt_submit_truncates_by_row_id(monkeypatch):
     monkeypatch.setattr(
         server, "_start_agent_build", lambda *a, **k: started.append(k)
     )
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
 
     try:
         resp = server.handle_request(
@@ -6965,6 +6968,7 @@ def test_prompt_submit_truncates_by_string_row_id(monkeypatch):
     server._sessions["str-row-id-trunc-sid"] = sess
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
 
     try:
         resp = server.handle_request(
@@ -14087,6 +14091,7 @@ def test_prompt_submit_row_id_accepts_full_lineage_ordinal(monkeypatch):
     server._sessions["lineage-row-sid"] = sess
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
 
     try:
         resp = server.handle_request(
@@ -22034,6 +22039,7 @@ def test_prompt_submit_row_id_resolves_via_db_when_memory_lacks_stamps(monkeypat
     server._sessions["db-row-resolve-sid"] = sess
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
 
     try:
         resp = server.handle_request(
@@ -22096,6 +22102,7 @@ def test_prompt_submit_row_id_real_sessiondb_resolve_without_memory_stamps(
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
     try:
@@ -22292,6 +22299,7 @@ def test_prompt_submit_row_id_misaligned_memory_role_shift_targets_real_turn(
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
     try:
@@ -22570,6 +22578,7 @@ def test_prompt_submit_rebind_map_clears_active_row_hidden_by_sequence_repair(
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
     try:

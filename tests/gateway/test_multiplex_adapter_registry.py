@@ -362,7 +362,8 @@ class TestSecondaryProfileFatalRecovery:
             monkeypatch, runner, replacement, scoped_homes
         )
 
-        async def connect(adapter, platform, *, is_reconnect=False):
+        async def connect(adapter, platform, *, is_reconnect=False, predecessor=None):
+            assert predecessor is stale
             assert adapter is replacement
             assert platform is Platform.DISCORD
             assert is_reconnect is True
@@ -427,7 +428,8 @@ class TestSecondaryProfileFatalRecovery:
         connect_started = asyncio.Event()
         release_connect = asyncio.Event()
 
-        async def connect(adapter, platform, *, is_reconnect=False):
+        async def connect(adapter, platform, *, is_reconnect=False, predecessor=None):
+            assert predecessor is None
             connect_started.set()
             await release_connect.wait()
             return connect_result
@@ -477,7 +479,8 @@ class TestSecondaryStartupFailureRecovery:
             runner, "_connect_initial_adapter_with_timeout", fail_initial_connect
         )
 
-        async def reconnect_ok(adapter, platform, *, is_reconnect=False):
+        async def reconnect_ok(adapter, platform, *, is_reconnect=False, predecessor=None):
+            assert predecessor is failed
             assert is_reconnect is True
             assert adapter is replacement
             return True
@@ -540,7 +543,8 @@ class TestSecondaryStartupFailureRecovery:
 
         monkeypatch.setattr(runner, "_connect_initial_adapter_with_timeout", explode)
 
-        async def reconnect_ok(adapter, platform, *, is_reconnect=False):
+        async def reconnect_ok(adapter, platform, *, is_reconnect=False, predecessor=None):
+            assert predecessor is failed
             return True
 
         monkeypatch.setattr(runner, "_connect_adapter_with_timeout", reconnect_ok)
