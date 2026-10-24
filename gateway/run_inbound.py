@@ -1641,7 +1641,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return
         if getattr(event, "_attended_activity_task", None) is not None:
             return
-        event._attended_activity_received_at = time.time()
+        if getattr(event, "_attended_activity_received_at", None) is None:
+            event._attended_activity_received_at = time.time()
         task = asyncio.create_task(self._mark_attended_user_activity(
             event, source, session_key, retry_on_failure=True,
         ))
