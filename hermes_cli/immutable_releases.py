@@ -63,6 +63,28 @@ def release_sha(source: Path) -> str:
     return result.stdout.strip()
 
 
+def merge_release_commits(source: Path, target: str, live: str) -> str:
+    """Build a local-only release commit without moving the checkout or index."""
+    from hermes_cli.update_custody import run_git
+
+    def run(args, *, check=True):
+        return run_git(["git"], args, cwd=source, check=check, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+
+    merged = run(["merge-tree", "--write-tree", target, live], check=False)
+    if merged.returncode != 0:
+        detail = (merged.stdout + merged.stderr).strip()
+        raise RuntimeError(f"candidate merge conflict: {detail}" if merged.returncode == 1 else detail)
+    tree = merged.stdout.splitlines()[0]
+    commit = run(["-c", "user.name=Hermes Update", "-c", "user.email=hermes-update@localhost",
+                  "commit-tree", tree, "-p", target, "-p", live,
+                  "-m", f"Carry installed candidate {live} into update {target}"]).stdout.strip()
+    # Archives work from local objects, but a live synthetic commit must survive
+    # garbage collection even though it belongs to no published branch.
+    run(["update-ref", f"refs/hermes/carry-forward/{commit}", commit])
+    return commit
+
+
 def _content_digest(release: Path) -> str:
     digest = hashlib.sha256()
     for name in ("pyproject.toml", "uv.lock"):

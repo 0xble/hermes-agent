@@ -67,7 +67,7 @@ _MUTATOR_CONFIG = ("-c", "core.fsmonitor=false", "-c", "credential.helper=", "-c
 # tidy's merge, whose output the update moves into the object store.
 LOCAL_MUTATORS = frozenset({
     "add", "am", "apply", "checkout", "checkout-index", "cherry-pick", "clean", "commit", "gc",
-    "merge", "mv", "pack-objects", "read-tree", "rebase", "reset", "restore", "revert", "rm", "stash",
+    "merge", "merge-tree", "commit-tree", "mv", "pack-objects", "read-tree", "rebase", "reset", "restore", "revert", "rm", "stash",
     "switch", "update-index", "update-ref", "symbolic-ref", "tag", "branch", "worktree",
 })
 # Mutators that move the checkout to another commit: what they read from a promisor remote is
