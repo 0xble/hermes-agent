@@ -27,6 +27,32 @@ def test_delivery_manager_waits_for_inflight_background_discovery(monkeypatch):
     assert joined == [True]
 
 
+@pytest.mark.parametrize("sweep_error", [None, RuntimeError("transient startup sweep failure")])
+def test_finished_startup_sweep_still_allows_lazy_discovery(monkeypatch, sweep_error):
+    """Once the startup worker has exited, lazy discovery may recover the manager."""
+    import threading
+
+    import hermes_cli.plugins as plugins
+
+    class Manager:
+        _discovered = False
+        _discovery_complete = False
+
+        def discover_and_load(self, force=False):
+            self._discovered = self._discovery_complete = True
+
+    manager = Manager()
+    finished = threading.Thread(target=lambda: None)
+    finished.start()
+    finished.join()
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(plugins, "_background_discovery_thread", finished)
+    monkeypatch.setattr(plugins, "_background_discovery_error", sweep_error)
+
+    assert plugins._delivery_manager() is manager
+    assert manager._discovery_complete
+
+
 def test_tool_dispatch_blocks_until_discovery_finishes_then_honors_veto(monkeypatch):
     import json
     import threading
