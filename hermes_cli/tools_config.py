@@ -82,6 +82,7 @@ CONFIGURABLE_TOOLSETS = [
     ("kanban",          "📌 Kanban",                    "opt-in task board tools for this platform"),
     ("memory",          "💾 Memory",                    "persistent memory across sessions"),
     ("compression",     "🧹 Agent Context Compaction",   "agent-requested context compaction"),
+    ("steering",        "↪ Message Deferral",            "defer unrelated auto-steered messages"),
     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
     ("connections",     "🔌 Connections",               "remote connector tools and account authorization"),

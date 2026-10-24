@@ -5,7 +5,7 @@
       "stable": 1935,
       "volatile": 1813
     },
-    "tool_tokens": 14964,
+    "tool_tokens": 15104,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -25,6 +25,7 @@
       "browser_vision",
       "clarify",
       "compact_context",
+      "defer_message",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -52,7 +53,7 @@
       "stable": 1445,
       "volatile": 1813
     },
-    "tool_tokens": 14964,
+    "tool_tokens": 15104,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -72,6 +73,7 @@
       "browser_vision",
       "clarify",
       "compact_context",
+      "defer_message",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -99,7 +101,7 @@
       "stable": 1866,
       "volatile": 1812
     },
-    "tool_tokens": 14964,
+    "tool_tokens": 15104,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -119,6 +121,7 @@
       "browser_vision",
       "clarify",
       "compact_context",
+      "defer_message",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -146,7 +149,7 @@
       "stable": 2612,
       "volatile": 1810
     },
-    "tool_tokens": 15119,
+    "tool_tokens": 15260,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -166,6 +169,7 @@
       "browser_vision",
       "clarify",
       "compact_context",
+      "defer_message",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -193,7 +197,7 @@
       "stable": 1445,
       "volatile": 1813
     },
-    "tool_tokens": 14964,
+    "tool_tokens": 15104,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -213,6 +217,7 @@
       "browser_vision",
       "clarify",
       "compact_context",
+      "defer_message",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -240,7 +245,7 @@
       "stable": 1317,
       "volatile": 1814
     },
-    "tool_tokens": 14964,
+    "tool_tokens": 15104,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -260,6 +265,7 @@
       "browser_vision",
       "clarify",
       "compact_context",
+      "defer_message",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -287,7 +293,7 @@
       "stable": 1579,
       "volatile": 1814
     },
-    "tool_tokens": 15598,
+    "tool_tokens": 15739,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -307,6 +313,7 @@
       "browser_vision",
       "clarify",
       "compact_context",
+      "defer_message",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -335,7 +342,7 @@
       "stable": 1349,
       "volatile": 1814
     },
-    "tool_tokens": 14964,
+    "tool_tokens": 15104,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -355,6 +362,7 @@
       "browser_vision",
       "clarify",
       "compact_context",
+      "defer_message",
       "delegate_task",
       "execute_code",
       "manage_connections",
@@ -382,7 +390,7 @@
       "stable": 1436,
       "volatile": 1815
     },
-    "tool_tokens": 15014,
+    "tool_tokens": 15155,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -402,6 +410,7 @@
       "browser_vision",
       "clarify",
       "compact_context",
+      "defer_message",
       "delegate_task",
       "execute_code",
       "manage_connections",

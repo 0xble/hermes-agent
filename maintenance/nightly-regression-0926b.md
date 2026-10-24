@@ -6,6 +6,8 @@ Load when changing process heartbeat delivery, state DB writability preflight an
 
 A heartbeat carries output written before it was armed and cannot follow the completion notice. A concurrent opener may quarantine a damaged state DB between a peer's `is_file` and `os.access` checks, or recreate that primary or a SQLite WAL before the failed access verdict is consumed. Revalidate the current file before refusing: a vanished path or a readable/writable replacement is not read-only. Preserve the directory check, home-scoped chmod repair, genuinely read-only refusal and WAL warning. The native ACP E2E must actually summarize an old tool result through the ACP provider while preserving the active tail and validating subsequent prompt grounding.
 
+SQLite may also unlink a `-wal` or `-shm` sidecar between the permission helper's `lstat` and path `chmod`. Tolerate that sidecar absence without opening or closing an existing inode, which would release this process's POSIX locks. Missing-main-database errors at `chmod` and permission failures must still propagate, and surviving files retain their content, identity, and `0600` mode. The deterministic permission cases in `tests/hermes_state/test_zeroed_state_db.py` cover these boundaries.
+
 ## Provenance and patch
 
 Fork patch identity: `nightly-regression-0926b`.
