@@ -178,7 +178,11 @@ class TestTelegramBotCommands:
 class TestSlackSubcommandMap:
 
     def test_values_are_slash_prefixed(self):
-        for key, val in slack_subcommand_map().items():
+        mapping = slack_subcommand_map()
+        for cmd in COMMAND_REGISTRY:
+            if cmd.name in _SLACK_VIA_HERMES_ONLY:
+                assert mapping[cmd.name] == f"/{cmd.name}"
+        for key, val in mapping.items():
             assert val.startswith("/"), f"Slack mapping for '{key}' should start with /"
 
 
@@ -196,7 +200,9 @@ class TestSlackNativeSlashes:
 
 
     def test_names_respect_slack_limits(self):
-        for name, _desc, _hint in slack_native_slashes():
+        slashes = slack_native_slashes()
+        assert len(slashes) <= 50
+        for name, _desc, _hint in slashes:
             # Slack: lowercase a-z, 0-9, hyphens, underscores; max 32 chars
             assert len(name) <= 32, f"slash {name!r} exceeds 32 chars"
             assert name == name.lower()

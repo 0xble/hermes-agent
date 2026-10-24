@@ -42,6 +42,15 @@ approval:
     second_one: "{count} segundo"
     second_other: "{count} segundos"
 gateway:
+  attend:
+    usage: "Uso: /attend, /attend off ou /attend status."
+    disabled: "O roteamento durante o uso ativo não está configurado. Configure primeiro model.attended."
+    pinned: "Modelo para uso ativo fixado ({model}). Use /attend off para liberá-lo. As escolhas explícitas com /model continuam tendo prioridade."
+    released: "Modelo para uso ativo liberado. O temporizador de inatividade de {minutes} minutos começa agora."
+    status_pinned: "Uso ativo: modelo fixado. Rota atual: {model}."
+    status_unpinned: "Uso ativo: modelo não fixado. Rota atual: {model}."
+    session_changed: "A sessão mudou. Execute /attend novamente."
+    configured_model: "rota configurada"
   approval_expired: "⚠️ A aprovação expirou (o agente já não está à espera). Peça ao agente para tentar novamente."
   draining: "⏳ A aguardar que {count} agente(s) ativo(s) terminem antes de reiniciar..."
   goal_cleared: "✓ Objetivo removido."
@@ -1475,6 +1484,8 @@ platform:
     prompt_other: "✏️ Outro (digitar resposta)"
     prompt_expired: ⌛ Essa solicitação não está mais aguardando resposta. Envie sua resposta como uma mensagem normal.
 slash:
+  attend:
+    description: "Fixar o modelo para uso ativo até ser liberado"
   approve:
     description: "Aprovar um comando perigoso pendente"
   bg:
