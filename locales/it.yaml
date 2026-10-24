@@ -42,6 +42,15 @@ approval:
     second_one: "{count} secondo"
     second_other: "{count} secondi"
 gateway:
+  attend:
+    usage: "Uso: /attend, /attend off oppure /attend status."
+    disabled: "L’instradamento durante l’uso attivo non è configurato. Imposta prima model.attended."
+    pinned: "Modello per l’uso attivo fissato ({model}). Usa /attend off per sbloccarlo. Le scelte esplicite con /model mantengono la priorità."
+    released: "Vincolo al modello per l’uso attivo rimosso. Il timer di inattività di {minutes} minuti parte ora."
+    status_pinned: "Uso attivo: modello fissato. Instradamento attuale: {model}."
+    status_unpinned: "Uso attivo: modello non fissato. Instradamento attuale: {model}."
+    session_changed: "La sessione è cambiata. Esegui nuovamente /attend."
+    configured_model: "instradamento configurato"
   approval_expired: "⚠️ Approvazione scaduta (l'agente non è più in attesa). Chiedi all'agente di riprovare."
   draining: "⏳ Attendo il completamento di {count} agente/i attivo/i prima di riavviare..."
   goal_cleared: "✓ Obiettivo cancellato."
@@ -1475,6 +1484,8 @@ platform:
     prompt_other: "✏️ Altro (digita)"
     prompt_expired: ⌛ Quella richiesta non attende più una risposta. Invia la tua risposta come messaggio normale.
 slash:
+  attend:
+    description: "Fissa il modello per l’uso attivo finché non viene sbloccato"
   approve:
     description: "Approva un comando pericoloso in attesa"
   bg:

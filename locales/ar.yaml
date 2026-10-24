@@ -42,6 +42,15 @@ approval:
     second_one: "{count} ثانية"
     second_other: "{count} ثوانٍ"
 gateway:
+  attend:
+    usage: "الاستخدام: /attend أو /attend off أو /attend status."
+    disabled: "لم يُضبط توجيه النموذج أثناء الاستخدام النشط. اضبط model.attended أولًا."
+    pinned: "تم تثبيت النموذج للاستخدام النشط ({model}). استخدم /attend off لإلغاء التثبيت. تظل اختيارات /model الصريحة ذات أولوية."
+    released: "أُلغي تثبيت النموذج للاستخدام النشط. يبدأ الآن مؤقت الخمول لمدة {minutes} دقيقة."
+    status_pinned: "الاستخدام النشط: النموذج مثبت. المسار الحالي: {model}."
+    status_unpinned: "الاستخدام النشط: النموذج غير مثبت. المسار الحالي: {model}."
+    session_changed: "تغيرت الجلسة. شغّل /attend مرة أخرى."
+    configured_model: "المسار المضبوط"
   approval_expired: "⚠️ انتهت صلاحية الموافقة (لم يعد الوكيل ينتظر). اطلب من الوكيل المحاولة مرة أخرى."
   draining: "⏳ جارٍ إنهاء {count} وكيل نشط قبل إعادة التشغيل..."
   goal_cleared: "✓ تم مسح الهدف."
@@ -1475,6 +1484,8 @@ platform:
     prompt_other: "✏️ غير ذلك (اكتب الإجابة)"
     prompt_expired: ⌛ لم يعد هذا الطلب ينتظر إجابة. أرسل ردك كرسالة عادية.
 slash:
+  attend:
+    description: "تثبيت نموذج الاستخدام النشط حتى إلغاء التثبيت"
   approve:
     description: "الموافقة على أمر خطير قيد الانتظار"
   bg:
