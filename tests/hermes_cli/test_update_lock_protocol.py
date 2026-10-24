@@ -544,13 +544,14 @@ def test_a_refusal_over_a_dead_updaters_lock_uses_the_held_wording(tmp_path):
 
 # --- D17: a "held?" probe never makes a concurrent update fail --------------------------------
 
+# The prober probes until told to stop, so it never runs out before the parent has collided
+# with it: the test ends on observed contention, not on how much work fits in a time window.
 _PROBER = """
 import fcntl, os, sys, time
 from pathlib import Path
-path = sys.argv[2]
-stop = Path(sys.argv[3])
-end = time.monotonic() + 30
-n = 0
+path, stop = sys.argv[2], Path(sys.argv[4])
+Path(sys.argv[3]).write_text("go", encoding="utf-8")
+end = time.monotonic() + 300  # orphan backstop only; the test stops us
 while not stop.exists() and time.monotonic() < end:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -560,46 +561,57 @@ while not stop.exists() and time.monotonic() < end:
     except OSError:
         pass
     os.close(fd)
-    n += 1
-    if n == 1:
-        Path(sys.argv[4]).write_text("go", encoding="utf-8")
     time.sleep(0.001)  # the next probe's process spawn
-print(n)
-assert stop.exists(), "acquisition workload did not finish before the watchdog"
 """
+
+# Acquires that must find a probe holding the lock before the test may pass. The pre-D17
+# acquire refused every one of them (257 of 3283 tight-loop acquires collided).
+_REQUIRED_COLLISIONS = 20
 
 
 @posix_only
-def test_held_probe_never_fails_a_concurrent_acquire(tmp_path):
+def test_held_probe_never_fails_a_concurrent_acquire(tmp_path, monkeypatch):
     from hermes_cli import update_lock
 
     install = tmp_path / "install"
     install.mkdir()
     lock_path = update_lock.checkout_lock_path(install)
     lock_path.touch()
-    stop = tmp_path / "stop-probing"
-    prober = _python(tmp_path, _PROBER, lock_path, stop, tmp_path / "go", stdout=subprocess.PIPE, text=True)
+    # Count, from the acquire path itself, the acquires whose first try found the lock held.
+    # Nothing else holds it, so each one is a real collision with a probe.
+    real_try_lock = update_lock._try_lock
+    tries: list[bool] = []
+
+    def observed_try_lock(fd):
+        got = real_try_lock(fd)
+        tries.append(got)
+        return got
+
+    monkeypatch.setattr(update_lock, "_try_lock", observed_try_lock)
+    prober = _python(tmp_path, _PROBER, lock_path, tmp_path / "go", tmp_path / "stop")
     _wait_for(tmp_path / "go", prober)
-    attempts = refused = 0
+    attempts = refused = collisions = 0
+    deadline = time.monotonic() + 120  # reached only when collisions stop happening at all
     try:
-        for _ in range(64):
-            assert prober.poll() is None, "prober exited before the acquisition workload finished"
+        while collisions < _REQUIRED_COLLISIONS:
+            assert prober.poll() is None, f"prober exited {prober.returncode}"
+            assert time.monotonic() < deadline, f"only {collisions} collisions in {attempts} acquires"
             attempts += 1
+            tries.clear()
             if update_lock._acquire_checkout(install) is not None:
                 refused += 1
             else:
                 update_lock._release_checkout()
+            collisions += bool(tries) and not tries[0]
     finally:
-        stop.touch()
+        (tmp_path / "stop").touch()
         try:
-            probes, _ = prober.communicate(timeout=5)
-        finally:
-            if prober.poll() is None:
-                prober.kill()
-                prober.wait()
-    assert prober.returncode == 0
-    assert int(probes) > 0, "the independent process must actually probe the lock"
-    assert refused == 0, f"{refused}/{attempts} acquires failed against a probe with no real holder"
+            prober.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            prober.kill()
+            prober.wait()
+    assert refused == 0, (f"{refused}/{attempts} acquires ({collisions} collided with a probe) "
+                          "failed against a probe with no real holder")
 
 
 # --- oversized numeric marker fields never raise ---------------------------------------------

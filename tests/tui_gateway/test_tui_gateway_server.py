@@ -6641,7 +6641,24 @@ def test_prompt_submit_refuses_unconfirmed_nonempty_truncation(monkeypatch):
         server._sessions.pop("unconfirmed-trunc-sid", None)
 
 
-def test_prompt_submit_truncates_by_message_id(monkeypatch):
+@pytest.fixture
+def _submit_truncation_only(monkeypatch):
+    """Keep fake-agent rewind tests out of real turns and reap their dispatchers."""
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
+
+    def submit(request):
+        session = server._sessions[request["params"]["session_id"]]
+        try:
+            return server.handle_request(request)
+        finally:
+            _join_turn_thread(session)
+
+    return submit
+
+
+def test_prompt_submit_truncates_by_message_id(monkeypatch, _submit_truncation_only):
     """#82756: truncate_before_message_id resolves target message and cuts history accurately."""
     replaced = []
 
@@ -6664,15 +6681,9 @@ def test_prompt_submit_truncates_by_message_id(monkeypatch):
     ]
     server._sessions["msg-id-trunc-sid"] = _session(history=list(history))
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
-    monkeypatch.setattr(
-        server, "_start_agent_build", lambda *a, **k: None
-    )
-    monkeypatch.setattr(
-        server, "_start_inflight_turn", lambda *a, **k: None
-    )
 
     try:
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",
@@ -6691,7 +6702,9 @@ def test_prompt_submit_truncates_by_message_id(monkeypatch):
         server._sessions.pop("msg-id-trunc-sid", None)
 
 
-def test_prompt_submit_truncation_falls_back_to_sid_when_session_key_null(monkeypatch):
+def test_prompt_submit_truncation_falls_back_to_sid_when_session_key_null(
+    monkeypatch, _submit_truncation_only
+):
     """#81904: a NULL session_key must not FK-fail the truncation persist.
 
     CLI-origin sessions resumed in the Desktop have no session_key; the
@@ -6723,11 +6736,9 @@ def test_prompt_submit_truncation_falls_back_to_sid_when_session_key_null(monkey
         history=list(history), session_key=None
     )
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
-    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
     try:
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",
@@ -6888,7 +6899,7 @@ def test_prompt_submit_refuses_ordinal_only_when_durable_history_is_unstamped(mo
         server._sessions.pop("unstamped-durable-sid", None)
 
 
-def test_prompt_submit_truncates_by_row_id(monkeypatch):
+def test_prompt_submit_truncates_by_row_id(monkeypatch, _submit_truncation_only):
     """#82959: prompt.submit with truncate_before_row_id must cut at the target row id."""
     replaced = []
 
@@ -6912,13 +6923,9 @@ def test_prompt_submit_truncates_by_row_id(monkeypatch):
     sess = _session(history=list(history))
     server._sessions["row-id-trunc-sid"] = sess
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
-    started = []
-    monkeypatch.setattr(
-        server, "_start_agent_build", lambda *a, **k: started.append(k)
-    )
 
     try:
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",
@@ -6940,7 +6947,7 @@ def test_prompt_submit_truncates_by_row_id(monkeypatch):
         server._sessions.pop("row-id-trunc-sid", None)
 
 
-def test_prompt_submit_truncates_by_string_row_id(monkeypatch):
+def test_prompt_submit_truncates_by_string_row_id(monkeypatch, _submit_truncation_only):
     """#82959: String row IDs in history match correctly against integer truncate_before_row_id."""
     replaced = []
 
@@ -6964,10 +6971,9 @@ def test_prompt_submit_truncates_by_string_row_id(monkeypatch):
     sess = _session(history=list(history))
     server._sessions["str-row-id-trunc-sid"] = sess
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
-    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
 
     try:
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",
@@ -7069,7 +7075,9 @@ def test_prompt_submit_row_id_not_found(monkeypatch):
         server._sessions.pop("missing-row-sid", None)
 
 
-def test_prompt_submit_resolves_row_id_absorbed_into_marker_merge(monkeypatch):
+def test_prompt_submit_resolves_row_id_absorbed_into_marker_merge(
+    monkeypatch, _submit_truncation_only
+):
     """#94486: after a mid-session model switch, the marker is persisted as
     role=user (#48338) and the next real user row merges into it under
     repair. The merged row must stay addressable (plain row's _row_id kept,
@@ -7114,8 +7122,6 @@ def test_prompt_submit_resolves_row_id_absorbed_into_marker_merge(monkeypatch):
         def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_kwargs):
             replaced.append((key, list(messages)))
 
-    import contextlib
-
     @contextlib.contextmanager
     def _fake_session_db(_session):
         yield _FakeDB()
@@ -7128,12 +7134,9 @@ def test_prompt_submit_resolves_row_id_absorbed_into_marker_merge(monkeypatch):
     server._sessions["merged-marker-sid"] = _session(history=list(live))
     monkeypatch.setattr(server, "_session_db", _fake_session_db)
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
-    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
 
     try:
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",
@@ -7189,7 +7192,9 @@ def _mk_merge_fake_db(verbatim, repaired, replaced):
     return _FakeDB()
 
 
-def test_prompt_submit_resolves_row_id_swallowed_by_marker_merge(monkeypatch):
+def test_prompt_submit_resolves_row_id_swallowed_by_marker_merge(
+    monkeypatch, _submit_truncation_only
+):
     """#94486 (live-session shape): model-switch markers persist as role=user
     (#48338), so the just-sent prompt forms a user;user run that
     repair_message_sequence merges into the FIRST row — the target's _row_id
@@ -7199,7 +7204,6 @@ def test_prompt_submit_resolves_row_id_swallowed_by_marker_merge(monkeypatch):
     path already applies ('repair can merge a physical user;user pair while
     preserving only the first row id').
     """
-    import contextlib
     import copy
 
     from agent.agent_runtime_helpers import repair_message_sequence
@@ -7242,12 +7246,9 @@ def test_prompt_submit_resolves_row_id_swallowed_by_marker_merge(monkeypatch):
     server._sessions["marker-merge-sid"] = _session(history=list(live))
     monkeypatch.setattr(server, "_session_db", _fake_session_db)
     monkeypatch.setattr(server, "_get_db", lambda: fake_db)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
 
     try:
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",
@@ -7277,7 +7278,9 @@ def test_prompt_submit_resolves_row_id_swallowed_by_marker_merge(monkeypatch):
         server._sessions.pop("marker-merge-sid", None)
 
 
-def test_prompt_submit_resolves_row_id_swallowed_by_plain_user_merge(monkeypatch):
+def test_prompt_submit_resolves_row_id_swallowed_by_plain_user_merge(
+    monkeypatch, _submit_truncation_only
+):
     """Same swallowed-id class with NO display marker: an interrupted turn
     persists no assistant row, the user's resend lands as a second consecutive
     plain user row, and repair merges it into the earlier one — the resend's
@@ -7285,7 +7288,6 @@ def test_prompt_submit_resolves_row_id_swallowed_by_plain_user_merge(monkeypatch
     preservation keyed on display_kind cannot reach this shape; reading the
     un-repaired transcript for identity can.
     """
-    import contextlib
     import copy
 
     from agent.agent_runtime_helpers import repair_message_sequence
@@ -7320,12 +7322,9 @@ def test_prompt_submit_resolves_row_id_swallowed_by_plain_user_merge(monkeypatch
     server._sessions["plain-merge-sid"] = _session(history=list(live))
     monkeypatch.setattr(server, "_session_db", _fake_session_db)
     monkeypatch.setattr(server, "_get_db", lambda: fake_db)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
 
     try:
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",

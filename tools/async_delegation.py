@@ -1278,6 +1278,46 @@ def _event_delivery(fn, evt: dict[str, Any], claim_id: str) -> None:
         fn(str(evt.get("delegation_id") or ""), claim_id)
 
 
+def retirement_inventory(session_key: str, session_id: str) -> list[dict[str, Any]]:
+    """Live work and undelivered results owned by one exact gateway conversation."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute("""SELECT delegation_id, state, task_json FROM async_delegations
+            WHERE (origin_session=? OR parent_session_id=?)
+              AND (state IN ('queued','admitted','running','stalling','finalizing') OR delivery_state='pending')""",
+            (session_key, session_id)).fetchall()
+    return [{"delegation_id": row[0], "state": row[1],
+             "goal": _json_object(row[2]).get("goal") or "Background delegation"} for row in rows]
+
+
+def transfer_retirement_owner(delegation_id: str, old_key: str, old_sid: str, new_key: str, new_sid: str) -> None:
+    """Move the durable completion route without stopping or respawning its child."""
+    with _records_lock, _DB_LOCK, _transaction() as conn:
+        row = conn.execute("SELECT origin_session, parent_session_id FROM async_delegations WHERE delegation_id=?",
+                           (delegation_id,)).fetchone()
+        if row == (new_key, new_sid):
+            return
+        if row is None or row[0] != old_key or row[1] != old_sid:
+            raise RuntimeError("Delegation ownership changed before retirement handoff")
+        conn.execute("""UPDATE async_delegations SET origin_session=?, parent_session_id=?, updated_at=?
+                        WHERE delegation_id=?""", (new_key, new_sid, time.time(), delegation_id))
+        record = _records.get(delegation_id)
+        if record is not None:
+            record.update(session_key=new_key, parent_session_id=new_sid)
+
+
+def refresh_retirement_route(evt: dict[str, Any]) -> None:
+    """Reconcile snapshots queued before an authoritative ownership transfer."""
+    if evt.get("type") != "async_delegation" or not evt.get("delegation_id"):
+        return
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute("SELECT origin_session, parent_session_id FROM async_delegations WHERE delegation_id=?",
+                           (evt["delegation_id"],)).fetchone()
+    if row and row[0] and row[0] != evt.get("session_key"):
+        evt.update(session_key=row[0], parent_session_id=row[1])
+        for field in ("platform", "chat_id", "thread_id", "chat_type"):
+            evt.pop(field, None)
+
+
 def get_durable_delegation(delegation_id: str) -> Optional[dict[str, Any]]:
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute("""SELECT origin_session, state, dispatched_at, completed_at,

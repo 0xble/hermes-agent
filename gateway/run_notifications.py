@@ -2500,6 +2500,25 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         their claims are acked only after adapter acceptance). True after acceptance, False to requeue
         the group, None when nothing is deliverable here (retry siblings requeued)."""
         # The group shares one session_key, hence one profile: scope the pre-checks and sibling claims too.
+        # A retirement can move a subset while this batch waits. Re-resolve the
+        # durable routes and regroup before taking any delivery claim.
+        from tools.async_delegation import refresh_retirement_route
+        buckets = {}
+        for evt in group:
+            async with self._completion_event_scope(evt):
+                await asyncio.to_thread(refresh_retirement_route, evt)
+            self._enrich_async_delegation_routing(evt)
+            route = self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS)
+            buckets.setdefault(route, []).append(evt)
+        if len(buckets) > 1:
+            retry = []
+            for subgroup in buckets.values():
+                async with self._completion_event_scope(subgroup[0]):
+                    result = await self._deliver_async_delegation_group_scoped(subgroup)
+                if result is False:
+                    retry.extend(subgroup)
+            group[:] = retry
+            return False if retry else True
         original = list(group)
         async with self._completion_event_scope(group[0]):
             outcome = await self._deliver_async_delegation_group_scoped(group)
@@ -3054,6 +3073,14 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             session = await asyncio.to_thread(process_registry.get, session_id)
             if session is None:
                 break
+            # A retiring topic can transfer a live process. Its mutable registry
+            # route is authoritative, not this watcher's launch-time snapshot.
+            if getattr(session, "session_key", "") and session.session_key != watcher.get("session_key"):
+                from tools.process_registry import _WATCHER_ROUTE_KEYS
+                watcher.update(session_key=session.session_key, parent_session_id=session.parent_session_id,
+                               **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS})
+                platform_name = watcher.get("platform", "")
+                chat_id, thread_id = watcher.get("chat_id", ""), watcher.get("thread_id", "")
             async with self._completion_event_scope(watcher):
                 surface = should_surface_notification({
                     "owner_task_id": getattr(session, "owner_task_id", ""),
