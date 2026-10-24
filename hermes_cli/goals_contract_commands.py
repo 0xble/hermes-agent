@@ -95,7 +95,9 @@ class GoalContractCommandsMixin:
         if "goal" in changed:
             return {
                 "ok": False, "error_code": "destructive_change_requires_command",
-                "error": f"Destructive goal changes require /goal replace <text> or {goal_remove_usage()}. Goal unchanged and still running.",
+                "error": f"Use goal_set action=replace through session controls with a current user instruction "
+                         f"or approval, or an explicit /goal replace <text> or {goal_remove_usage()}. "
+                         "Goal unchanged and still running.",
             }
 
         item_diffs = {key: _requirement_diff(key, before[key], after[key]) for key in changed}
@@ -103,7 +105,9 @@ class GoalContractCommandsMixin:
         if destructive:
             return {
                 "ok": False, "error_code": "destructive_change_requires_command",
-                "error": f"Destructive goal changes require /goal replace <text> or {goal_remove_usage()}. Goal unchanged and still running.",
+                "error": f"Use goal_set action=replace through session controls with a current user instruction "
+                         f"or approval, or an explicit /goal replace <text> or {goal_remove_usage()}. "
+                         "Goal unchanged and still running.",
             }
 
         if evidence and len(" ".join(evidence.split())) < _REVISION_EVIDENCE_MIN_CHARS:
@@ -117,7 +121,9 @@ class GoalContractCommandsMixin:
         if verification_removed and not evidence:
             return {
                 "ok": False, "error_code": "destructive_change_requires_command",
-                "error": f"Destructive goal changes require /goal replace <text> or {goal_remove_usage()}. Goal unchanged and still running.",
+                "error": f"Use goal_set action=replace through session controls with a current user instruction "
+                         f"or approval, or an explicit /goal replace <text> or {goal_remove_usage()}. "
+                         "Goal unchanged and still running.",
             }
         if evidence:
             if evidence_error:
@@ -126,8 +132,9 @@ class GoalContractCommandsMixin:
                 return {
                     "ok": False, "error_code": "evidence_cannot_retire_verification",
                     "error": "recorded evidence has no per-check retirement disposition; "
-                             "retain every existing verification check or ask the user to use "
-                             "/goal remove check <n>. Goal unchanged and still running.",
+                             "retain every existing verification check or propose goal_set action=replace "
+                             "through session controls. Explicit /goal remove check <n> is also available. "
+                             "Goal unchanged and still running.",
                 }
 
         authority = "evidence" if evidence else "agent_addition"

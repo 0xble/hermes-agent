@@ -126,7 +126,8 @@ A goal names the end state, not the route. Plans change during long work, and a 
 - **Constraints are hard limits only.** Include things that must never happen or must stay true, not preferences.
 - **Keep the steps in a plan file.** Put the checklist, the PR list and the order of work in a plan the agent updates, and reference it from the goal. Codex's guidance is the same: keep the objective short and point it at a file for detail.
 - **Leave long waits out.** Multi-day soaks, weekly runs or "three clean days" don't finish inside a session. Finish the deliverable, then hand the wait to a cron or watcher.
-- **Revise instead of accumulating.** When scope changes, revise the goal (see below) rather than adding contradictory subgoals.
+- **Keep Methods In The Plan.** A new implementation route does not require a contract change. If the objective or acceptance must change, use the authorized replacement path below rather than accumulating contradictory subgoals.
+- **Check For Impossible Acceptance.** A self-contradictory criterion or an already-falsified historical claim cannot be repaired by a later passing window. Name the conflict and propose prospective verification, retaining the original criterion until its authorized replacement.
 
 ### Evidence the judge can see
 
@@ -136,10 +137,11 @@ The continuation prompt asks the agent to end a completion claim with an Evidenc
 
 ### Revising a goal
 
-With the `goal-lifecycle` plugin installed, the agent can revise the active goal through its `goal_set` tool (`action=revise`) with a reason. Each revision is versioned and sent to you as a notice. Both the judge and the agent's continuation prompt show the current version plus every revision and the requirement it replaced. A replaced requirement keeps binding the agent unless the user message cited for that revision plainly asks for the change.
+With the `goal-lifecycle` plugin installed, `goal_set action=revise` adds requirements while retaining every existing objective, criterion and hard limit. A quote or evidence never authorizes destructive revision. Revision history is a durable audit trail, not extra instructions appended to the current contract.
 
-- The agent may reword or restructure the outcome, verification, boundaries and stop condition. The judge still holds it to any earlier requirement such a revision weakened.
-- Changing the objective or the constraints, or dropping a subgoal, needs your authority. The agent must quote your instruction verbatim from a message you sent since the goal was set, or the revision is rejected. The judge sees your full message beside the change, and the earlier requirement still binds unless that message plainly asks for this change.
+Use `goal_set action=replace` to propose a changed objective or acceptance. Hermes authors the replacement. The core session-control path checks a verbatim instruction from your latest message, or shows 1 precise approval card when that instruction cannot authorize it. A pending request does not change the goal. Hermes should not ask you to clear the goal or compose a slash command to repair it. If you have already cleared the old goal and ask for a better one, Hermes can author and set the requested goal immediately.
+
+Replacement preserves unrelated subgoals, omitted contract fields, lifecycle status and remaining turn budget. Explicitly supplied contract fields change only through the same authority gate, and an explicit empty field removes that field. User removal controls such as `/goal remove check <N>` and `/subgoal remove <N>` remain available. `/goal replace <text>` is also an explicit user replacement path. Existing cross-session controls retain their own authority rules, they are not a way around self-replacement approval.
 
 ## Adding criteria mid-goal: `/subgoal`
 

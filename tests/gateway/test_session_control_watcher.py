@@ -124,7 +124,7 @@ def test_control_card_leads_with_decision_and_nonblocking_note():
     assert "Target: Target session" in text
     assert "Requested by: Requester session" in text
     assert "Proposed goal: new objective" in text
-    assert "Proposed contract (replaces the current one):" in text
+    assert "Proposed contract edits (omitted fields unchanged):" in text
     assert "Approve only if this still matches the target's current state." in text
     assert "Session control request" not in text
 
@@ -868,9 +868,14 @@ def test_replace_card_shows_contract_and_max_turns_that_approval_installs():
     assert "Proposed goal: finish writing docs" in text
     assert "- Constraints: deploy production now" in text
     assert "Max turns: 999" in text
+    record["payload"]["contract"]["boundaries"] = ""
+    text = GatewaySessionControlsMixin._control_text(record)
+    assert "- Boundaries: (remove)" in text
+    assert "omitted fields unchanged" in text
     record["payload"] = {"goal": "finish writing docs"}
     text = GatewaySessionControlsMixin._control_text(record)
-    assert "Proposed contract: none (the current contract is dropped)" in text
+    assert "Proposed contract: unchanged" in text
+    assert "Subgoals: unchanged" in text
     assert "Max turns: unchanged" in text
     record["payload"] = {"goal": "finish writing docs", "max_turns": 0}
     assert "Max turns: unlimited" in GatewaySessionControlsMixin._control_text(record)

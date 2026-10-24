@@ -107,15 +107,15 @@ class GatewaySessionControlsMixin:
             current = affected.removesuffix(suffix)
             lines = [f"Affected: {cls._clip(current or '(state unavailable)', 600)}",
                      f"Proposed goal: {cls._clip(new, REPLACEMENT_MAX_CHARS)}"]
-            # Approval installs every one of these, so every one is shown: a missing contract
-            # drops the current one, and max_turns changes the budget. The budget line is left
-            # out only when it would say unlimited and the goal is already unlimited.
-            contract = {f: v for f, v in replacement_contract(payload).items() if v}
+            # Show the complete proposed delta. Omission preserves existing requirements,
+            # while an explicit empty field removes that field through the same approval.
+            contract = replacement_contract(payload)
             if contract:
-                lines.append("Proposed contract (replaces the current one):")
-                lines.extend(f"- {_CONTRACT_LABELS[f]}: {v}" for f, v in contract.items())
+                lines.append("Proposed contract edits (omitted fields unchanged):")
+                lines.extend(f"- {_CONTRACT_LABELS[f]}: {v or '(remove)'}" for f, v in contract.items())
             else:
-                lines.append("Proposed contract: none (the current contract is dropped)")
+                lines.append("Proposed contract: unchanged")
+            lines.append("Subgoals: unchanged")
             max_turns = payload.get("max_turns")
             if not (max_turns in (None, 0) and record.get("current_max_turns") == 0):
                 budget = {None: "unchanged", 0: "unlimited"}.get(max_turns, max_turns)

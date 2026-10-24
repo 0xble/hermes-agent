@@ -366,8 +366,11 @@ def test_goal_replace_records_continuation_prompt(state):
 @pytest.mark.parametrize("via", ["quote", "button", "session"])
 @pytest.mark.parametrize("replacement_count", [1, 2])
 def test_replacement_prompts_bind_only_the_current_contract(state, via, replacement_count):
-    """Both real authority paths supersede all prior contracts/criteria. Revision rows stay an audit
-    trail: neither the continuation nor the judge sees them, so nothing earlier comes back as binding."""
+    """Explicitly removed/replaced requirements stay audit-only, not binding prompt history.
+
+    Omission preserves requirements, so this test uses explicit empty contract edits and the
+    existing user subgoal-removal control rather than relying on an objective change to erase them.
+    """
     import copy
     from unittest.mock import MagicMock, patch
     from hermes_cli.goals import GoalContract, GoalManager, judge_goal, load_goal
@@ -392,7 +395,8 @@ def test_replacement_prompts_bind_only_the_current_contract(state, via, replacem
         result = apply_control(
             "goal", "replace", target_sid, requester_sid="requester", reason="user pivot",
             user_quote=quote if via == "quote" else "",
-            payload={"goal": goal, "contract": {"verification": verification}},
+            payload={"goal": goal, "contract": {"outcome": "", "verification": verification,
+                                                 "constraints": "", "boundaries": "", "stop_when": ""}},
         )
         if via == "button":
             assert result["status"] == "pending"
@@ -402,12 +406,14 @@ def test_replacement_prompts_bind_only_the_current_contract(state, via, replacem
         assert record["status"] == "applied"
         return GoalManager(target_sid)
 
+    assert manager.remove_subgoal(1) == "production shard"
     manager = replace("write a local design note", "design note exists")
     manager.add_subgoal("include local examples")
     assert manager.revise(reason="reword local verification", contract={
         "verification": "design note exists. Peer reviewed",
     })["ok"]
     if replacement_count == 2:
+        assert manager.remove_subgoal(1) == "include local examples"
         manager = replace("write a local checklist", "local checklist exists")
         assert manager.state.subgoals == []
         assert manager.revise(reason="reword checklist verification", contract={
