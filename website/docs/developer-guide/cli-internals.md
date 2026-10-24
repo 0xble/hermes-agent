@@ -120,16 +120,29 @@ contained in `origin/main` or the fetched target, `update_cmd_candidate.py` carr
 it forward using `git merge-tree --write-tree` and `git commit-tree`. The result
 contains both the fetched target and the live candidate. A local
 `refs/hermes/carry-forward/<SHA>` ref keeps this merge reachable for later updates.
+Activation prunes these refs except for the current and previous releases.
 `stage_release` archives that selected SHA directly from the local object store.
-The merge does not need a push, fetch or remote branch.
+The merge does not need a push or a published synthetic branch. In partial
+clones both sides are prefetched outside checkout-lock custody before merging.
 
-A candidate already merged into main or contained in the target needs no carry.
-If the target is already contained in the live candidate, the live release is
-reused. A conflicting merge refuses the update before staging or promotion,
+Selection unwraps our carry merges to the actual candidate instead of merging
+synthetic history back into main. An ancestor candidate, or a squash-equivalent
+candidate whose merge tree equals the target tree, needs no carry. Updates then
+return to the bare published target. An unchanged combined tree reuses the live
+release without creating another commit or retention ref.
+
+Install stamps retain the original source branch across carries. Older releases
+can recover it from their update receipt's argv and exact release transition,
+or an unambiguous named Git ref. Before carrying unlanded content, selection
+checks that branch's current head directly on origin, not a stale tracking ref.
+A changed or unavailable branch, or missing provenance, refuses the update
+instead of resurrecting stale code. A local-only checkout uses its local ref.
+
+A conflicting merge also refuses the update before staging or promotion,
 prints the full live SHA and records a failed `candidate_carry_forward` step.
 `hermes update --replace-candidate <exact-live-SHA>` explicitly authorizes replacing
 only that installed candidate. The authorization must be a complete 40-hex SHA
-and match the current release exactly. It does not bypass the separate
+and match the current release exactly, ignoring hex letter case. It does not bypass the separate
 `--allow-drop-main` guard.
 
 Successful selection prints the carried or replaced SHA and records
