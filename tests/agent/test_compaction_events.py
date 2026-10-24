@@ -495,3 +495,38 @@ def test_an_in_place_engine_whose_split_fails_after_the_archive_is_still_a_compa
     assert (name, payload["outcome"], payload["split_status"]) == ("compaction", "committed", "failed_not_indexed")
     # The candidate's counts are replaced by the transcript that survived.
     assert payload["messages_after"] == len(compressed)
+
+
+@pytest.mark.parametrize("in_place", [True, False])
+def test_publication_busy_retries_the_same_generated_summary(published, tmp_path, in_place):
+    import sqlite3
+    from hermes_state import SessionDB
+
+    agent = _Agent(_compressor())
+    agent.compression_in_place = in_place
+    db = SessionDB(tmp_path / "publish.db")
+    agent._session_db = db
+    db.create_session(agent.session_id, "cli")
+    method = "archive_and_compact" if in_place else "publish_compression_child"
+    publish = getattr(db, method)
+    candidates = []
+
+    def flaky(*args, **kwargs):
+        candidates.append(args[1] if in_place else kwargs["messages"])
+        if len(candidates) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return publish(*args, **kwargs)
+
+    try:
+        with patch.object(db, method, side_effect=flaky), \
+                patch.object(agent.context_compressor, "_generate_summary", return_value="SANITIZED SUMMARY") as generate:
+            compressed, _ = compress_context(agent, _messages(), "system prompt", approx_tokens=80_000)
+        assert len(compressed) < len(_messages())
+        assert generate.call_count == 1
+        assert len(candidates) == 3 and all(candidate is candidates[0] for candidate in candidates)
+        assert any("SANITIZED SUMMARY" in str(m.get("content")) for m in db.get_messages(agent.session_id))
+        [(_sid, name, payload)] = published
+        assert name == "compaction" and payload["outcome"] == "committed"
+    finally:
+        db.close()
+
