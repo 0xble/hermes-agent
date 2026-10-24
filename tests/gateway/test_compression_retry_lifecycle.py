@@ -155,7 +155,7 @@ async def test_retry_has_one_pending_adapter_lifecycle(locked_lane):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["queue", "interrupt"])
 async def test_deferred_wake_cannot_absorb_same_sender_text(locked_lane, mode):
-    runner, adapter, event, key, _db, _sid = locked_lane
+    runner, adapter, event, key, db, sid = locked_lane
     adapter._active_sessions[key] = asyncio.Event()
     adapter._busy_text_mode = mode
     runner._busy_input_mode = "queue"
@@ -167,26 +167,24 @@ async def test_deferred_wake_cannot_absorb_same_sender_text(locked_lane, mode):
     try:
         assert await runner._handle_message(wake) is None
         assert adapter._pending_messages[key] is wake
+        # The lock can commit before the retained head's retry backoff expires.
+        db.release_compression_lock(sid, "worker")
         await adapter._handle_message_while_active(human, key)
         await adapter._flush_text_debounce_now(key)
         assert adapter._pending_messages[key] is wake
         assert wake.text == "process finished"
         assert wake.metadata == {"notification_category": "process"}
         assert human.text == "human instruction" and not human.internal
-        if mode == "queue":
-            assert adapter._text_debounce_store()[key].event is human
-            adapter.get_pending_message(key)
-            assert await adapter._flush_text_debounce_now(key)
-            assert adapter._pending_messages[key] is human
-        else:
-            assert runner._overflow_queue(key) == [human]
+        assert runner._overflow_queue(key) == [human]
+        assert key not in adapter._text_debounce_store()
     finally:
         adapter._discard_text_debounce(key)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["queue", "interrupt"])
-async def test_later_human_inputs_follow_retained_retry(locked_lane, mode):
+@pytest.mark.parametrize("third_kind", ["human", "relay", "internal"])
+async def test_later_inputs_follow_retained_retry(locked_lane, mode, third_kind):
     runner, adapter, event, key, db, sid = locked_lane
     adapter._busy_text_mode = mode
     runner._busy_input_mode = "queue"
@@ -232,8 +230,16 @@ async def test_later_human_inputs_follow_retained_retry(locked_lane, mode):
         await adapter.handle_message(event)
         await async_wait_until(lambda: adapter._requeue_counts.get(key, 0) >= 2, timeout=10)
         owner = adapter._session_tasks[key]
-        await adapter.handle_message(replace(event, text="second", message_id="2"))
-        await adapter.handle_message(replace(event, text="third", message_id="3"))
+        second = replace(event, text="second", message_id="2")
+        third = replace(event, text="third", message_id="3")
+        if third_kind == "relay":
+            third.text += "\n[relay from=hermes:default/canary-source receipt=canary-C]"
+        elif third_kind == "internal":
+            third.internal = True
+            third.metadata = {"notification_category": "process"}
+        expected = [event.text, second.text, third.text]
+        await adapter.handle_message(second)
+        await adapter.handle_message(third)
         await adapter._flush_text_debounce_now(key)
         assert adapter._pending_messages[key] is event
         assert event.text == "hello" and event.message_id == "1"
@@ -241,7 +247,6 @@ async def test_later_human_inputs_follow_retained_retry(locked_lane, mode):
         adapter.on_processing_start.assert_awaited_once_with(event)
         assert adapter.sent == []
         db.release_compression_lock(sid, "worker")
-        expected = ["hello", "second\nthird"] if mode == "queue" else ["hello", "second", "third"]
         await async_wait_until(lambda: len(executed) == len(expected), timeout=10)
         assert executed == expected
         await async_wait_until(lambda: key not in adapter._active_sessions, timeout=10)

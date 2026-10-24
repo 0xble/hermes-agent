@@ -26,7 +26,7 @@ from gateway.response_filters import (
 )
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import canonical_whatsapp_identifier
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -1006,6 +1006,16 @@ class GatewayBusySessionMixin:
             and self._effective_busy_text_mode(event.source) == "queue"
             and effective_mode != "steer"
         ):
+            # A retained head cannot absorb a debounce buffer. Keep every arrival
+            # in the existing FIFO, including the lock-release/backoff boundary.
+            adapter = cast("GatewayRunner", self)._delivery_adapter_for(event.source)
+            pending = getattr(adapter, "_pending_messages", {}).get(session_key)
+            if (
+                getattr(pending, "_gateway_compression_deferred", False)
+                or await self._session_has_compression_in_flight(session_key)
+            ):
+                self._queue_or_replace_pending_event(session_key, event)
+                return True
             return False
 
         running_agent = _busy_state.turn.agent if _busy_state else None
