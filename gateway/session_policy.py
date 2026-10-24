@@ -78,6 +78,7 @@ SELECTION_KEYS = ('default', 'provider', 'base_url', 'api_mode', 'selection_prof
                   'api_key_env')
 BYPASS_FIELDS = ('safe_mode', 'ignore_user_config')
 _ACTIVE_POLICY: ContextVar = ContextVar('local_session_policy', default=None)
+_TURN_ALIASES: ContextVar = ContextVar('live_alias_read', default=None)
 _TURN_PROFILE: ContextVar = ContextVar('follow_profile_read', default=None)  # (policy, live) for a turn
 # Creation label -> agent surface. ``tool`` (third-party integrations, ``hermes chat --source tool``) and
 # ``oneshot`` (finite ``chat -q`` / ``-z`` runs) run as the CLI but keep their own stored label, so human
@@ -230,6 +231,23 @@ class LocalSessionPolicy:
             for part in source:
                 value = value.get(part) if isinstance(value, dict) else None
             config['model']['api_key'] = value
+        from hermes_cli.live_model_aliases import is_live_alias
+        if model is None:
+            default = config.get("model") or {}
+            reference = default.get("default") if isinstance(default, dict) else default
+            if is_live_alias(reference):
+                model = reference
+        if is_live_alias(model):
+            alias = _policy_live_alias(self, authority, model)
+            from hermes_cli.model_switch import DirectAlias, direct_alias_runtime_request
+            provider, key = direct_alias_runtime_request(
+                DirectAlias(alias.model, alias.provider, alias.base_url, alias.api_key))
+            config["model"] = {"default": alias.model, "provider": provider, "base_url": alias.base_url}
+            if secrets and key:
+                config["model"]["api_key"] = key
+            if not session_pinned(config, "reasoning", "reasoning" in json.loads(self.request_json)):
+                config["_live_alias_reasoning"] = alias.reasoning_config
+            model = alias.model
         return config, model
 
     @cached_property
@@ -266,11 +284,16 @@ class LocalSessionPolicy:
         state = peek(session_key) if session_key and peek is not None else None
         if state is not None and state.conversation.reasoning_override is not None:
             return dict(state.conversation.reasoning_override)
-        if not self.follows_profile:
+        from hermes_cli.live_model_aliases import is_live_alias
+        if not self.follows_profile and not is_live_alias(self.model):
             return self.reasoning_config
         from gateway.session_authorities import active_authority
-        from hermes_constants import resolve_reasoning_config
         config, model = self.effective(active_authority(runner), secrets=False)
+        if "_live_alias_reasoning" in config:
+            return config["_live_alias_reasoning"]
+        if not self.follows_profile:
+            return self.reasoning_config
+        from hermes_constants import resolve_reasoning_config
         return resolve_reasoning_config(config, model or '')
 
     def current_service_tier(self, runner, session_key):
@@ -338,7 +361,24 @@ class LocalSessionPolicy:
     @property
     def reasoning_config(self):
         from hermes_constants import resolve_reasoning_config
-        return resolve_reasoning_config(self.config(), self.model or '')
+        config, model = self.effective()
+        if "_live_alias_reasoning" in config:
+            return config["_live_alias_reasoning"]
+        return resolve_reasoning_config(config, model or '')
+
+
+def _policy_live_alias(policy, authority, reference):
+    from hermes_cli.live_model_aliases import current_config, resolve_live_alias
+    cache = _TURN_ALIASES.get()
+    if cache is not None and reference in cache:
+        return cache[reference]
+    snapshot = policy.read_profile(authority)
+    if snapshot is None:
+        snapshot = profile_config(authority) if authority is not None else current_config()
+    alias = resolve_live_alias(reference, snapshot)
+    if cache is not None:
+        cache[reference] = alias
+    return alias
 
 
 def profile_target(config):
@@ -1079,6 +1119,7 @@ def policy_scope(policy, *, authority=None):
                 terminal[path[1]] = value
     # A following session's turn reads its profile once; every resolution in the turn uses that read.
     profile_token = _TURN_PROFILE.set((policy, policy.read_profile(authority)))
+    alias_token = _TURN_ALIASES.set({})
     active = policy
     if policy.follows_profile:
         from dataclasses import replace
@@ -1100,6 +1141,7 @@ def policy_scope(policy, *, authority=None):
         _ACTIVE_POLICY.reset(policy_token)
         reset_terminal_scope(terminal_token)
         cwd_token.var.reset(cwd_token)
+        _TURN_ALIASES.reset(alias_token)
         _TURN_PROFILE.reset(profile_token)
 
 
@@ -1161,9 +1203,11 @@ def profile_read_scope(policy, authority):
     ``policy_scope`` does, without that scope's workspace and terminal setup (a session control
     reads the route, it runs nothing)."""
     token = _TURN_PROFILE.set((policy, policy.read_profile(authority)))
+    alias_token = _TURN_ALIASES.set({})
     try:
         yield
     finally:
+        _TURN_ALIASES.reset(alias_token)
         _TURN_PROFILE.reset(token)
 
 

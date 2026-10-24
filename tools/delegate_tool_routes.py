@@ -17,6 +17,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
+from hermes_cli.live_model_aliases import with_live_alias_snapshot
+
 from agent.delegation_provider import (
     RESERVED_TASK_PARAMETERS, ROUTE_KEYS, DelegationProvider, DelegationRouteError,
 )
@@ -217,14 +219,19 @@ def _profile_route(home: Path) -> TaskRoute:
         rt.get("api_key") or "no-key-required", rt.get("api_mode"), dict(rt.get("request_overrides") or {}),
         command=rt.get("command"), args=list(rt.get("args") or []),
     )
+    from hermes_cli.live_model_aliases import is_live_alias, resolve_live_alias
+    block = cfg.get("model") or {}
+    reference = block.get("default") if isinstance(block, dict) else block
+    reasoning = (resolve_live_alias(reference, cfg).reasoning_config if is_live_alias(reference)
+                 else resolve_reasoning_config(cfg, model or ""))
     return TaskRoute(creds, {"fallback_providers": fallback if isinstance(fallback, list) else []},
-                     ResolvedReasoning(resolve_reasoning_config(cfg, model or "")), home)
+                     ResolvedReasoning(reasoning), home)
 
 
 def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
     """A route without a fallback chain of its own takes ``delegation.fallback_providers`` (an explicit ``[]`` on the
     route still disables fallback). A profile route keeps its profile's own chain."""
-    if route.get("profile") or route.get("fallback_providers") is not None:
+    if route.get("profile") or route.get("inherit") is True or route.get("fallback_providers") is not None:
         return route
     inherited = config.get("fallback_providers")
     return route if inherited is None else {**route, "fallback_providers": inherited}
@@ -234,11 +241,35 @@ def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> Ta
     if route.get("profile"):
         return replace(_profile_route(_profile_home(route["profile"])), backend=backend)
     from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
-    creds = _resolve_delegation_credentials(route, parent_agent)
+    if route.get("inherit") is True:
+        from tools.delegate_tool_config import ResolvedReasoning
+        return TaskRoute(_resolve_delegation_credentials({}, parent_agent), {},
+                         ResolvedReasoning(getattr(parent_agent, "reasoning_config", None)), backend=backend)
+    from hermes_cli.live_model_aliases import is_live_alias, resolve_live_alias
+    reasoning = route.get("reasoning_effort")
+    if is_live_alias(route.get("model")):
+        if route.get("provider") or route.get("base_url"):
+            raise DelegationRouteError("A live alias owns its provider and base_url.")
+        from tools.delegate_tool_config import ResolvedReasoning, _credential_bundle
+        live = resolve_live_alias(route["model"])
+        runtime = live.runtime()
+        runtime["model"] = live.model
+        creds = _credential_bundle(
+            live.model, runtime.get("provider"), runtime.get("base_url"),
+            runtime.get("api_key") or "no-key-required", runtime.get("api_mode"),
+            runtime.get("request_overrides"), command=runtime.get("command"), args=runtime.get("args"))
+        route = {**route, "model": live.model, "provider": runtime["provider"]}
+        parent_override = getattr(parent_agent, "reasoning_override", None)
+        if parent_override is not None and parent_override == getattr(parent_agent, "reasoning_config", None):
+            reasoning = ResolvedReasoning(parent_override)
+        elif "reasoning_effort" not in route:
+            reasoning = ResolvedReasoning(live.reasoning_config)
+    else:
+        creds = _resolve_delegation_credentials(route, parent_agent)
     if route.get("service_tier") not in (None, ""):
         from tools.delegate_tool_tuning import task_service_tier
         creds = {**creds, **task_service_tier(str(route["service_tier"]), creds, parent_agent)}
-    return TaskRoute(creds, route, route.get("reasoning_effort"), None, None, backend)
+    return TaskRoute(creds, route, reasoning, None, None, backend)
 
 
 def _route_to_task_route(route: dict[str, Any], parent_agent: Any, cache: dict[str, TaskRoute],
@@ -290,7 +321,8 @@ def _undeclared_error(provider: DelegationProvider, index: int, names: list[str]
 
 
 def _route_one(provider: DelegationProvider, declared: dict[str, dict[str, Any]], index: int,
-               task: Mapping[str, Any], config: Mapping[str, Any], saved: str) -> dict[str, Any]:
+               task: Mapping[str, Any], config: Mapping[str, Any], saved: str,
+               parent_model: str = "") -> dict[str, Any]:
     undeclared = sorted(name for name, value in task.items()
                         if value is not None and name not in declared and name not in RESERVED_TASK_PARAMETERS)
     if undeclared:
@@ -300,7 +332,8 @@ def _route_one(provider: DelegationProvider, declared: dict[str, dict[str, Any]]
         error = _param_error(index, name, value, declared[name])
         if error:
             raise DelegationRouteError(error)
-    payload = {"goal": task.get("goal"), "context": task.get("context"), "index": index, **params}
+    payload = {"goal": task.get("goal"), "context": task.get("context"), "index": index, **params,
+               "parent_model": parent_model}
     try:
         return _clean_route(provider.name, provider.route_task(payload, config))
     except DelegationRouteError as exc:
@@ -310,6 +343,7 @@ def _route_one(provider: DelegationProvider, declared: dict[str, dict[str, Any]]
         raise DelegationRouteError(f"Task {index}: delegation backend '{provider.name}' failed: {exc}") from exc
 
 
+@with_live_alias_snapshot
 def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, Any], parent_agent: Any,
                         ) -> tuple[list[TaskRoute], Optional[str]]:
     """One :class:`TaskRoute` per task from the session's backend (its ``/delegation`` override, else
@@ -329,7 +363,8 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
     routes: list[TaskRoute] = []
     for i, task in enumerate(task_list):
         try:
-            route = _route_one(provider, declared, i, task, config, saved)
+            route = _route_one(provider, declared, i, task, config, saved,
+                               str(getattr(parent_agent, "model", "") or ""))
             _check_backend_effort(i, route, config)
             routes.append(_route_to_task_route(route, parent_agent, cache, config, provider.name))
         except ValueError as exc:  # DelegationRouteError, the credential resolver's and the tier check's refusals
@@ -340,5 +375,8 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
 def route_for_config(routing_cfg: dict[str, Any], parent_agent: Any) -> TaskRoute:
     """The route an internal caller's explicit config block describes (``/review`` ->
     ``auxiliary.review``); bypasses the provider, as those callers own their route."""
-    from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
+    from hermes_cli.live_model_aliases import is_live_alias
+    if is_live_alias(routing_cfg.get("model")):
+        return _resolve_route(routing_cfg, parent_agent, "default")
+    from tools.delegate_tool import _resolve_delegation_credentials
     return TaskRoute(_resolve_delegation_credentials(routing_cfg, parent_agent), routing_cfg)

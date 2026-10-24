@@ -372,6 +372,15 @@ def resolve_startup_model_route(
     if not raw:
         return None
 
+    from hermes_cli.live_model_aliases import is_live_alias, resolve_live_alias
+    if is_live_alias(raw):
+        if explicit_provider:
+            raise ValueError("A live alias owns its provider. Drop --provider.")
+        live = resolve_live_alias(raw, alias_config)
+        alias_provider, alias_key = direct_alias_runtime_request(
+            DirectAlias(live.model, live.provider, live.base_url, live.api_key))
+        return StartupModelRoute(live.model, alias_provider, live.base_url, alias_key or "")
+
     if alias_config is None:
         _ensure_direct_aliases()
     aliases = DIRECT_ALIASES if alias_config is None else _load_direct_aliases(alias_config)
@@ -469,6 +478,7 @@ class ModelSwitchResult:
     # provider's route. ``resolved_via_alias`` alone is also set by a built-in shortcut, an endpointless
     # entry or a process provider's declared id, which name a model like a plain pick.
     alias_endpoint_applied: bool = False
+    live_alias: str = ""
 
 
 @dataclass(frozen=True)
@@ -1762,6 +1772,22 @@ def switch_model(
     step returns a failure :class:`ModelSwitchResult` to stop the chain, or ``None`` to continue.
     ``user_providers`` / ``custom_providers`` are the config.yaml ``providers:`` dict and
     ``custom_providers:`` list."""
+    from hermes_cli.live_model_aliases import is_live_alias, resolve_live_alias
+    if is_live_alias(raw_input):
+        try:
+            if explicit_provider:
+                raise ValueError("A live alias owns its provider. Drop --provider.")
+            live = resolve_live_alias(raw_input)
+            runtime = live.runtime()
+            return ModelSwitchResult(
+                success=True, new_model=live.model, target_provider=runtime["provider"],
+                provider_changed=runtime["provider"] != current_provider,
+                api_key=runtime.get("api_key") or "", base_url=runtime.get("base_url") or "",
+                api_mode=runtime.get("api_mode") or "", request_overrides=runtime.get("request_overrides"),
+                is_global=is_global, live_alias=live.reference,
+                alias_endpoint_applied=bool(live.base_url))
+        except Exception as exc:
+            return ModelSwitchResult(success=False, error_message=str(exc))
     st = _Switch(
         raw_input=raw_input, current_provider=current_provider, current_model=current_model,
         current_base_url=current_base_url, current_api_key=current_api_key, is_global=is_global,
@@ -1795,7 +1821,7 @@ def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg:
     (``_apply_main_model_assignment`` / ``_resolve_assignment_credentials``)."""
     model_cfg = current_model_cfg if isinstance(current_model_cfg, dict) else {}
     updates: dict[str, Any] = {
-        "default": result.new_model, "provider": result.target_provider,
+        "default": result.live_alias or result.new_model, "provider": result.target_provider,
         "base_url": result.base_url or None, "api_mode": result.api_mode or None,
     }
     if "context_length" in model_cfg:

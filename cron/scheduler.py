@@ -1768,6 +1768,12 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
     from hermes_cli.auth import AuthError
 
     model = jc.model
+    from hermes_cli.live_model_aliases import is_live_alias, resolve_live_alias
+    if is_live_alias(model):
+        if job.get("provider") or job.get("base_url"):
+            raise ValueError("A live alias owns its provider and base_url. Remove job route overrides.")
+        live = resolve_live_alias(model, jc.cfg)
+        return live.runtime(), live.model
     requested = job.get("provider") or jc.cron_default_provider or None
     try:
         # Do NOT pass HERMES_INFERENCE_PROVIDER as `requested`: it would override persisted config
@@ -2482,6 +2488,9 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
+    from hermes_cli.live_model_aliases import is_live_alias, resolve_live_alias
+    if is_live_alias(jc.model) and job.get("reasoning_effort") is None:
+        setup.reasoning_config = resolve_live_alias(jc.model, _cfg).reasoning_config
     # Mid-run provider ladder: same rule as resolution above, so a pinned job cannot be swapped
     # onto the global chain by a 5xx/429 either.
     setup.fallback_model = _job_fallback_chain(job, _cfg)

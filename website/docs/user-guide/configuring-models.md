@@ -403,6 +403,40 @@ Both paths feed the same loader (`hermes_cli/model_switch.py`). Entries declared
 
 Then `/model fav` or `/model grok` in chat. User aliases shadow built-in short names (`sonnet`, `kimi`, `opus`, etc.). See [Custom model aliases](../reference/slash-commands.md#custom-model-aliases) for the full reference.
 
+### Live Alias References
+
+A bare pick such as `/model fav` keeps upstream's copy-on-pick behavior: it selects the
+alias's concrete model once. Opt in to live routing with `/model alias:fav`. The consumer
+stores `alias:fav`, not the resolved model. `alias:` is a reference marker, not a second
+registry. Its name must exist in the top-level `model_aliases` mapping.
+
+```yaml
+model_aliases:
+  attended:
+    model: claude-sonnet-4.6
+    provider: anthropic
+    reasoning_effort: high
+model:
+  default: alias:attended
+```
+
+The same reference works for `hermes chat --model alias:attended`, a gateway topic's
+session model selection, a cron job's `model`, `cron.model`, and a delegation backend's
+returned `model` route option. For example, a backend may return
+`{"model": "alias:attended"}` instead of copying a provider/model pair. Do not combine a
+live reference with an explicit provider or endpoint: the alias owns the whole route.
+
+Each next turn, cron fire or child spawn reads the current alias, including its provider,
+endpoint, credential and optional `reasoning_effort`. Editing the alias requires no
+restart or rewrite of its consumers. A launched child keeps its resolved launch route,
+including when it resumes. An unknown, deleted or malformed live alias refuses the
+request rather than choosing an unrelated model. Recursive aliases are not supported.
+
+An explicit per-session or per-job reasoning pin still wins. Without a pin, an alias's
+`reasoning_effort` wins over normal global and per-model defaults. Omitting that alias
+field uses the current profile's normal reasoning defaults. Bare picks and unmarked
+model strings retain their existing behavior.
+
 ### `hermes model` subcommand
 
 ```bash

@@ -117,7 +117,7 @@ async def prepare_model(authority, live, payload, prepared):
     elif 'api_key' not in frozen['model']:
         frozen['model'].pop('api_key_from', None)
     # Creation identity (request_json) remains immutable; runtime selection lives in the policy.
-    policy = replace(old, model=result.new_model, config_json=json.dumps(frozen))
+    policy = replace(old, model=result.live_alias or result.new_model, config_json=json.dumps(frozen))
     secrets = recover_config_secrets(authority, old) if old.config_secret_ref else {}
     # The picked entry's private subtree is replaced whole: a key or header its current declaration
     # withdrew must not follow it to the new endpoint.

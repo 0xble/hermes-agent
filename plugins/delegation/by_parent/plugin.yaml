@@ -1,0 +1,4 @@
+name: by_parent
+version: 1.0.0
+description: "Route new children from the live parent model using upstream model_aliases."
+kind: backend

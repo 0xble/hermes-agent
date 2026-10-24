@@ -295,15 +295,24 @@ class SubagentLifecycleService:
         )
         # Routing precedence: request.provider > delegation config > parent.
         routing_cfg = {"provider": request.provider, "model": request.model or ""} if request.provider is not None else _load_config()
+        route = None
+        if request.provider is None:
+            from tools.delegate_tool_routes import resolve_task_routes
+            routes, error = resolve_task_routes([{"goal": request.goal}], routing_cfg, parent)
+            if error or routes[0].error:
+                raise SubagentLifecycleError(error or routes[0].error)
+            route = routes[0]
         try:
-            creds = _resolve_delegation_credentials(routing_cfg, parent)
+            creds = route.creds if route is not None else _resolve_delegation_credentials(routing_cfg, parent)
         except ValueError as exc:
             raise SubagentLifecycleError(str(exc)) from exc
+        from tools.delegate_tool import _route_overrides
+        overrides = _route_overrides(route) if route is not None else _credential_overrides(creds, routing_cfg)
         child = _build_child_preserving_parent_tools(
             task_index=0, goal=request.goal, context=request.context,
             toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
             model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
-            task_count=1, parent_agent=parent, role=request.role, **_credential_overrides(creds, routing_cfg),
+            task_count=1, parent_agent=parent, role=request.role, **overrides,
         )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:

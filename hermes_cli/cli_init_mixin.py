@@ -42,7 +42,7 @@ def _gateway_launch(cli):
     """This run's explicit launch flags as gateway ``session.create`` policy (main handed them to AIAgent)."""
     explicit_model = getattr(cli, "_explicit_model_override", False)
     provider = getattr(cli, "_explicit_provider", None)
-    return {"model": cli.model if explicit_model else None,
+    return {"model": (getattr(cli, "_live_model_alias", "") or cli.model) if explicit_model else None,
             "provider": provider if explicit_model and provider not in {None, "", "auto"} else None,
             "api_key": getattr(cli, "_explicit_api_key", None),
             "base_url": getattr(cli, "_explicit_base_url", None),
@@ -211,6 +211,8 @@ class CLIInitMixin:
         # resume must not clobber an explicit -m with the session's stored model.
         self._explicit_model_override = bool(model)
         self.model = model or _config_model or ""
+        from hermes_cli.live_model_aliases import is_live_alias
+        self._live_model_alias = self.model if is_live_alias(self.model) else ""
         _cfg_provider = _model_config.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER")
         _startup_provider_override = _startup_base_url_override = _startup_api_key_override = ""
         if self.model:

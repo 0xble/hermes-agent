@@ -252,6 +252,8 @@ class GatewayModelCommandsMixin:
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.runtime_capabilities or {}),
         }
+        if getattr(result, "live_alias", ""):
+            self._session_model_overrides[ctx.session_key] = {"model": result.live_alias}
         if one_turn:
             # A repeated --once before the turn runs must keep the EARLIEST snapshot: the later
             # command's snapshot is the first temporary model, not the user's standing override.

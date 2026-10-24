@@ -27,6 +27,8 @@ Route vocabulary (:meth:`DelegationProvider.route_task` returns a dict with any 
   scope helpers a multiplexed gateway uses for a routed turn. A profile route ignores the other
   route keys; the profile's own config decides them.
 * ``label`` - short text shown with the child's progress and result (e.g. the option title).
+* ``inherit: true`` - inherit the live parent's whole route, fallback chain and reasoning, ignoring
+  global delegation route defaults. Other route fields are ignored.
 
 A backend's own settings live under ``delegation.backends.<backend name>`` (:meth:`DelegationProvider.settings`),
 never beside the core ``delegation`` keys.
@@ -43,14 +45,14 @@ from agent.provider_base import ProviderBase
 #: refused at schema-build time: plugins add parameters, they never redefine core ones, and the
 #: raw route fields (``provider``/``model``/``base_url``/``api_key``) never become model-facing.
 RESERVED_TASK_PARAMETERS = frozenset({
-    "goal", "context", "index", "output_schema", "images", "group", "role", "toolsets",
-    "acp_command", "acp_args", "provider", "model", "base_url", "api_key", "api_mode",
+    "goal", "context", "index", "output_schema", "images", "group", "role", "toolsets", "parent_model",
+    "acp_command", "acp_args", "provider", "model", "base_url", "api_key", "api_mode", "inherit",
 })
 
 #: Keys a route may carry; anything else in a provider's answer is ignored.
 ROUTE_KEYS = frozenset({
     "model", "provider", "base_url", "api_key", "api_mode", "request_overrides",
-    "reasoning_effort", "service_tier", "fallback_providers", "profile", "label",
+    "reasoning_effort", "service_tier", "fallback_providers", "profile", "label", "inherit",
 })
 
 

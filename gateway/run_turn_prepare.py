@@ -64,6 +64,15 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True) -> tuple[str
     return model, _runtime_agent_kwargs(runtime)
 
 
+def _live_session_alias(runner, session_key, reference):
+    from hermes_cli.live_model_aliases import resolve_live_alias
+    from gateway.run import _runtime_agent_kwargs
+    live = resolve_live_alias(reference)
+    if session_key:
+        runner._session_state(session_key).conversation.live_alias_reasoning = (live.reasoning_config,)
+    return live.model, _runtime_agent_kwargs(live.runtime())
+
+
 def _recover_or_remember_model(runner, skey, model):
     """Last step of ``_resolve_session_agent_runtime``: remember a good model, recover an empty one."""
     # Final safety net: an empty model (transient config-cache miss) makes every API call 400 and
@@ -108,15 +117,30 @@ class GatewayTurnPrepareMixin:
         # Every exit path starts clean: a stale notice must never attach to another session's next
         # turn (#74349). Set again below only when THIS resolution fell back.
         self._pre_agent_fallback_notice = None
+        skey = self._resolve_session_key_or_none(source, session_key)
+        state = self._peek_session_state(skey) if skey else None
+        if state is not None:
+            state.conversation.live_alias_reasoning = None
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
             return _resolve_policy_agent_runtime(self, policy, fallback=fallback)
-        skey = self._resolve_session_key_or_none(source, session_key)
         model = _resolve_gateway_model(user_config)
         if skey:
             self._rehydrate_session_model_override(skey)
         _override_state = self._peek_session_state(skey) if skey else None
         override = _override_state.conversation.model_override if _override_state else None
+        from hermes_cli.live_model_aliases import is_live_alias
+        reference = (override or {}).get("model") or model
+        cfg = getattr(self, "config", None)
+        if not override and cfg and source is not None:
+            channel = _get_channel_override(
+                cfg, source.platform, str(source.chat_id) if source.chat_id else "",
+                thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
+                parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None)
+            if channel and channel.model:
+                reference = channel.model
+        if is_live_alias(reference):
+            return _live_session_alias(self, skey, reference)
         if override:
             override_model = override.get("model", model)
             override_runtime = {

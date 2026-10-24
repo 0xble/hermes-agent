@@ -81,6 +81,49 @@ delegation:
 hermes plugins enable delegation-tiers
 ```
 
+## By-Parent Backend
+
+The bundled `by_parent` backend selects from the parent's **live concrete model** at
+spawn time, including after `/model` or a provider fallback:
+
+```yaml
+delegation:
+  backend: by_parent
+  model: default-child
+  reasoning_effort: high
+  backends:
+    by_parent:
+      routes:
+        alias:attended: worker
+        claude-sonnet-4.6: inherit
+model_aliases:
+  attended:
+    model: gpt-5.4
+    provider: openai
+    reasoning_effort: high
+  worker:
+    model: gpt-5.4-mini
+    provider: openai
+    reasoning_effort: medium
+```
+
+Keys are exact concrete model IDs or explicit `alias:name` references. Values are plain
+names in `model_aliases`, or `inherit`. Alias keys are expanded from current config
+before exact matching. Duplicate expanded keys, unknown aliases and malformed entries
+refuse the spawn, including malformed entries that would not match this parent.
+
+A match replaces the global delegation route, reasoning and fallback chain. `inherit`
+preserves the parent's whole live route, reasoning, request overrides and fallback
+chain. An unmatched parent keeps the normal delegation defaults. Tuning such as depth,
+iteration and compression limits remains global. Explicit lifecycle launch models still
+win over the selected model. An explicit launch provider, or an internal caller's explicit credential route, bypasses the
+backend. The lifecycle API otherwise consults the selected backend.
+Already launched children do not move when aliases or mappings change.
+
+This is the plugin version of the fork's former `delegation.by_parent`: move its map
+to `delegation.backends.by_parent.routes`, replace preset references with upstream
+aliases, and select `delegation.backend: by_parent`. No preset registry is required.
+
 ## The interface
 
 `DelegationProvider` (`agent/delegation_provider.py`) subclasses the shared `ProviderBase`. Every
@@ -92,7 +135,7 @@ is the default route, and `self.settings(config)` is your backend's own block,
 | Member | Required | Contract |
 |---|---|---|
 | `name` | yes | The `delegation.backend` value. `default` belongs to the bundled default strategy. |
-| `route_task(task, config)` | yes | Return the route dict for one task. `task` carries `goal`, `context`, `index` and the values the model supplied for your parameters. Raise `DelegationRouteError` to refuse; its message is the tool error the model reads. |
+| `route_task(task, config)` | yes | Return the route dict for one task. `task` carries `goal`, `context`, `index`, the host-supplied live `parent_model`, and the values the model supplied for your parameters. Raise `DelegationRouteError` to refuse; its message is the tool error the model reads. |
 | `task_parameters(config)` | no | `{name: json_schema}` merged into `tasks.items.properties`. Core enforces `enum` before `route_task` runs and refuses core-owned names (`goal`, `context`, `index`, `output_schema`, `images`, `group`, `role`, `toolsets`, `provider`, `model`, `base_url`, `api_key`, `api_mode`, `acp_command`, `acp_args`). |
 | `description(config)` | no | Guidance appended to the `delegate_task` description. |
 | `is_available()` | no | No network calls. `False` fails delegation closed while your backend is selected: `delegate_task` returns a tool error naming it and the fix (`/delegation default`, or `hermes config set delegation.backend default`); it never switches to `default` on its own. |
@@ -123,6 +166,10 @@ A route is a dict with any of:
   session database (it is the parent's work) and it keeps the parent's toolset. Other route keys are
   ignored on a profile route.
 - `label`: short text identifying the route (an option title, a profile name).
+- `inherit: true`: inherit the parent's whole route, reasoning and fallback chain, bypassing global
+  delegation route defaults. Other route fields are ignored.
+- A `model` of `alias:name` is a live reference to upstream `model_aliases`. It is resolved at
+  spawn time, never inside an already launched child. Do not also set `provider` or `base_url`.
 
 Unknown keys are dropped. On a profile route, `service_tier` and `reasoning_effort` are ignored too.
 

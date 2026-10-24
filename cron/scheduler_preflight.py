@@ -102,6 +102,13 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.live_model_aliases import is_live_alias, resolve_live_alias
+        block = cfg.get("model") or {}
+        default = block.get("default") if isinstance(block, dict) else block
+        reference = job.get("model") or _cron_cfg.get("model") or default
+        if is_live_alias(reference):
+            resolve_live_alias(reference, cfg).runtime()
+            return None
         kwargs = {"requested": requested, "target_model": model}
         if job.get("base_url"):
             kwargs["explicit_base_url"] = job.get("base_url")

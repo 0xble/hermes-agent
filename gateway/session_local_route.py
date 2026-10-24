@@ -15,6 +15,12 @@ def resolve_launch_route(params: dict, config: dict) -> dict:
     model = params.get('model')
     if not isinstance(model, str) or not model.strip() or 'base_url' in params or 'api_key' in params:
         return params
+    from hermes_cli.live_model_aliases import is_live_alias, resolve_live_alias
+    if is_live_alias(model):
+        if params.get("provider"):
+            raise ValueError("A live alias owns its provider. Drop --provider.")
+        resolve_live_alias(model, config)
+        return params
     from hermes_cli.model_switch import resolve_startup_model_route
     model_cfg = config.get('model')
     if not isinstance(model_cfg, dict):
