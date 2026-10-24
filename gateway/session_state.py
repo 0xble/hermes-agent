@@ -14,6 +14,17 @@ _UNSET_TIER = object()
 SERVICE_TIER_UNSET = _UNSET_TIER  # public alias
 
 
+def session_opening_pending(entry, *, attended_new_session: bool = False) -> bool:
+    """Share the creation/fresh-reset boundary before inbound activity advances it."""
+    return bool(
+        attended_new_session
+        or (entry is not None and (
+            entry.created_at == entry.updated_at
+            or getattr(entry, "is_fresh_reset", False)
+        ))
+    )
+
+
 @dataclass
 class TurnState:
     """State scoped to one running gateway turn.  ``lease_tokens`` is NOT touched by
