@@ -228,7 +228,8 @@ def _failed_update_detail(home: Path, receipt: dict | None, exit_code: int) -> s
         if release is None or release.name != expected:
             expected = None
     # Immutable source HEAD is frozen, so equality alone cannot rule out a promotion.
-    changed_runtime = any(receipt.get(key) for key in ("release_transition", "gateway_restart", "fleet"))
+    changed_runtime = (any(receipt.get(key) for key in ("release_transition", "gateway_restart", "fleet"))
+                       or any(step.get("name") == "zip_source_swap" for step in receipt.get("steps") or []))
     pending_runtime = any((home / name).exists() for name in ("release-txn.json", "fleet_restart_pending"))
     tree_verified, local_changes = _local_changes_evidence(receipt)
     valid_sha = isinstance(previous, str) and re.fullmatch(r"[0-9a-fA-F]{40}", previous)

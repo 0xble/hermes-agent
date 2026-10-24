@@ -1972,8 +1972,6 @@ def _handle_update_called_process_error(
         print(f"⚠ {stage}: {e}")
         print("→ Falling back to ZIP download...")
         print()
-        _completion_receipt.record_step(
-            "local_changes_stash", False, "unverified: ZIP update started", replace=True)
         _update_via_zip(
             args, had_desktop_app_before_update=had_desktop_app_before_update,
             target_sha=target_sha, completion_request=completion_request,
@@ -2667,8 +2665,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
     branch = completion_request["branch"]
 
     if use_zip_update:
-        _completion_receipt.record_step(
-            "local_changes_stash", False, "unverified: ZIP update started", replace=True)
         try:
             _update_via_zip(
                 args, had_desktop_app_before_update=had_desktop_app_before_update,

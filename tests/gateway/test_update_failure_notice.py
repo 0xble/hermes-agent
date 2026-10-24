@@ -180,7 +180,7 @@ def test_pre_stash_failure_never_claims_restoration_or_unchanged_zip(
         monkeypatch.setattr(update_cmd, "_refuse_before_commit_point", fail)
     else:
         monkeypatch.setattr(update_cmd, "_current_branch_name", fail)
-    monkeypatch.setattr(update_cmd, "_update_via_zip", fail_zip)
+    monkeypatch.setattr("hermes_cli.update_cmd_zip._download_and_swap_zip", fail_zip)
 
     with update_receipt.update_receipt_scope():
         with pytest.raises(RuntimeError, match="ZIP swap rollback failed|checkout failed before stash"):
@@ -200,6 +200,104 @@ def test_pre_stash_failure_never_claims_restoration_or_unchanged_zip(
     assert "Nothing changed" not in detail
     assert "Runtime state is unverified" in detail
     assert "Local changes" not in detail
+
+
+@pytest.mark.parametrize("route", ["direct", "fallback"])
+@pytest.mark.parametrize("result", ["success", "swap-failed", "completion-failed", "parked-failed"])
+def test_zip_receipt_preserves_stash_disposition_and_settles_before_completion(
+    update_tree, tmp_path, monkeypatch, route, result,
+):
+    from copy import deepcopy
+    from hermes_cli import update_cmd, update_cmd_stash, update_receipt
+    from tests.hermes_cli.test_update_target_identity import git
+
+    source = update_tree.clone
+    git(source, "checkout", "-q", "main")
+    sha = git(source, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    request = pending(home, reason=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_receipt, "_receipt_dir", lambda: home / "logs/update_receipts")
+    monkeypatch.setattr(update_receipt, "_code_identity", lambda **_: {"sha": git(source, "rev-parse", "HEAD")})
+    monkeypatch.setattr("gateway.update_notifications.__file__", str(source / "gateway/update_notifications.py"))
+    update_tree.args.channel = "main"
+    stash = None
+    handoff_steps = []
+
+    def choose_park():
+        nonlocal stash
+        if result == "parked-failed":
+            (source / "content.txt").write_text("local edits\n")
+            stash = update_cmd._stash_local_changes_if_needed(["git"], source)
+            assert stash is not None
+            assert not update_cmd._restore_stashed_changes(
+                ["git"], source, stash, prompt_user=True, input_fn=lambda *_: "n")
+            assert update_cmd_stash._pending_autostash is None
+
+    if route == "direct":
+        prepare = update_cmd._prepare_git_command
+
+        def select_zip(**kw):
+            _, cmd, fork = prepare(**kw)
+            choose_park()
+            return True, cmd, fork
+
+        monkeypatch.setattr(update_cmd, "_prepare_git_command", select_zip)
+    else:
+        def fail_git(*_a, **_kw):
+            choose_park()
+            raise subprocess.CalledProcessError(1, ["git", "status"])
+
+        monkeypatch.setattr(update_cmd, "_refuse_before_commit_point", fail_git)
+        monkeypatch.setattr(update_cmd, "_should_zip_fallback_on_update_error", lambda _: True)
+
+    def swap(*_a, **_kw):
+        if stash:
+            assert git(source, "rev-parse", "refs/stash") == stash
+        (source / "content.txt").write_text("ZIP source without changing git HEAD\n")
+        if result in {"swap-failed", "parked-failed"}:
+            raise RuntimeError("ZIP swap failed")
+        return update_tree.newer
+
+    def complete(_request):
+        current = update_receipt._current.get()
+        assert current is not None
+        handoff_steps.extend(deepcopy(current.data["steps"]))
+        assert next(s for s in handoff_steps if s["name"] == "zip_source_swap")["ok"] is True
+        if result == "completion-failed":
+            raise RuntimeError("completion failed")
+
+    monkeypatch.setattr("hermes_cli.update_cmd_zip._download_and_swap_zip", swap)
+    monkeypatch.setattr(update_cmd, "_complete_source_update", complete)
+    with update_receipt.update_receipt_scope():
+        if result == "success":
+            update_cmd._cmd_update_impl(update_tree.args, gateway_mode=False)
+        else:
+            with pytest.raises(RuntimeError, match="ZIP swap failed|completion failed"):
+                update_cmd._cmd_update_impl(update_tree.args, gateway_mode=False)
+        path = update_receipt.finalize_update_receipt(
+            "success" if result == "success" else "failed", stop_reason="injected ZIP failure")
+    assert path is not None
+    receipt = json.loads(path.read_text())
+    assert receipt["pre_update"]["sha"] == receipt["post_update"]["sha"] == sha
+    stash_steps = [s for s in receipt["steps"] if s["name"] == "local_changes_stash"]
+    if result == "parked-failed":
+        assert [s["detail"] for s in stash_steps] == [f"parked: {stash} (restore declined)"]
+    elif result in {"success", "completion-failed"}:
+        assert all(s["ok"] is True for s in stash_steps)
+        assert all(s["ok"] is True for s in handoff_steps if s["name"] == "local_changes_stash")
+    if result != "success":
+        (home / ".update_process_exit_code").write_text("1")
+        outcome = final_outcome(home, request)
+        assert outcome is not None
+        success, detail = outcome
+        assert success is False
+        assert "Nothing changed" not in detail
+        assert "Runtime state is unverified" in detail
+        if stash:
+            assert f"Local changes remain in stash {stash}" in detail
+            assert f"git stash apply {stash}" in detail
 
 
 @pytest.mark.parametrize("dirty", [False, True])
