@@ -10,25 +10,57 @@ When the attended configuration is unset or disabled, all attended activity trac
 
 ## Attended Session Pin
 
-`/attend` pins this session to the live attended configuration until `/attend off`.
-`/attend status` reports the pin and current effective route. All 3 forms dispatch
-while a turn is running without interrupting it. The pin is 1 persisted boolean on
-the session routing entry, not a concrete model override, and survives gateway
-restart. Existing explicit `/model` picks and held roles retain precedence.
+`/attend` pins this session to the live attended configuration permanently,
+until `/attend off` or a session boundary. `/attend 30m`, `/attend 2h`,
+`/attend 1h30m`, and `/attend 1d` pin it for a positive duration.
+`/attend status` reports whether the pin is permanent, timed, or inactive and
+shows the current effective route. Timed confirmations and status include the
+release date and time in the owning profile's local timezone, with AM/PM and
+the timezone abbreviation. Status also shows the remaining duration. These
+forms dispatch while a turn is running without interrupting it.
 
-Pinned sessions have no attended idle expiry or switch-back notice. Legacy idle
-expiry of temporary model and reasoning picks is also suspended, while an explicit
-model-pick TTL still expires on its own deadline. Unpinning atomically resets
-`last_user_activity_at` to now, restoring the configured idle window without
-reverting immediately. Releasing an already-unpinned session reports its current
-status without restarting that idle window. The pin survives non-boundary
-session repoints, including topic-binding repair, delegation completion, and CLI
-handoff. Session reset, `/resume`, and `/branch` start unpinned conversations.
+Durations use the shared `parse_duration_seconds` parser, including seconds,
+minutes, hours, days, weeks, fractional units such as `1.5h`, and compact
+combinations such as `1h30m`. `/attend` requires a unit. Zero, negative,
+non-finite, malformed, and out-of-range durations return usage without mutating
+session state. Examples of invalid input are `/attend 0m`, `/attend -2h`,
+`/attend NaN`, `/attend 30`, and `/attend tomorrow`. Re-pinning with a duration
+replaces the deadline with now plus that duration. Re-pinning with plain
+`/attend` removes the deadline and makes the pin permanent.
+
+The pin is a persisted `attended_pinned` boolean plus the nullable
+`attended_pin_until` Unix timestamp on the session routing entry, not a concrete
+model override, and survives gateway restart. A legacy true boolean without a
+deadline remains a permanent pin. Existing explicit `/model` picks and held
+roles retain precedence.
+
+Active pinned sessions have no attended idle expiry or switch-back notice.
+Legacy idle expiry of temporary model and reasoning picks is also suspended,
+while an explicit model-pick TTL still expires on its own deadline. At or after
+the timed deadline, pure resolution treats the pin as inactive and uses
+`max(last_user_activity_at, attended_pin_until)` as the activity floor. Thus the
+normal idle window starts at the deadline, not at the last message before the
+pin, and subsequent genuine activity can extend it. Expiry performs no routing
+persistence write and no immediate model switch. The historical boolean and
+deadline remain until a re-pin, explicit release, or session boundary. The
+existing API-call quiet window and destination compression guard still apply
+before the next real API-request boundary can switch back.
+
+Unpinning atomically resets `last_user_activity_at` to now, restoring the
+configured idle window without reverting immediately. Releasing an
+already-unpinned or expired session reports its current status without
+restarting that idle window. The pin and deadline survive non-boundary session
+repoints, including topic-binding repair, delegation completion, and CLI
+handoff. Session reset, `/resume`, and `/branch` start unpinned conversations
+with no deadline.
 
 Run `tests/gateway/test_attend_command.py` alongside the attended routing, busy
-activity, API-boundary, and topic readback tests. `expiry_time` has no live gateway
-caller, but returns no deadline for a pin. The synchronous and asynchronous
-turn-expiry paths and inspection path all share the pinned activity predicate.
+activity, API-boundary, and topic readback tests. `expiry_time` returns no deadline
+for a permanent pin and returns the deadline activity floor plus the idle window
+for a timed pin. `/attend` commands are
+excluded from generic receipt-activity stamping, so inspections and rejected
+input cannot extend the idle window. The synchronous and asynchronous turn-expiry
+paths and inspection path all share the pinned activity predicate.
 
 ## Precedence and Telegram topic edits
 

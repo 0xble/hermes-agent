@@ -43,11 +43,13 @@ approval:
     second_other: "{count} segundos"
 gateway:
   attend:
-    usage: "Uso: /attend, /attend off ou /attend status."
+    usage: "Uso: /attend [duration], /attend off ou /attend status. A duração deve ser positiva, por exemplo 30m, 2h, 1h30m ou 1d. Sem duração, a fixação é permanente."
     disabled: "O roteamento durante o uso ativo não está configurado. Configure primeiro model.attended."
-    pinned: "Modelo para uso ativo fixado ({model}). Use /attend off para liberá-lo. As escolhas explícitas com /model continuam tendo prioridade."
+    pinned: "Modelo para uso ativo fixado permanentemente ({model}). Use /attend off para liberá-lo. As escolhas explícitas com /model continuam tendo prioridade."
+    pinned_timed: "Modelo para uso ativo fixado ({model}) por {duration}, até {until}. Use /attend off para liberá-lo. As escolhas explícitas com /model continuam tendo prioridade."
     released: "Modelo para uso ativo liberado. O temporizador de inatividade de {minutes} minutos começa agora."
-    status_pinned: "Uso ativo: modelo fixado. Rota atual: {model}."
+    status_pinned: "Uso ativo: modelo fixado permanentemente. Rota atual: {model}."
+    status_timed: "Uso ativo: modelo fixado por mais {remaining}, até {until}. Rota atual: {model}."
     status_unpinned: "Uso ativo: modelo não fixado. Rota atual: {model}."
     session_changed: "A sessão mudou. Execute /attend novamente."
     configured_model: "rota configurada"
@@ -1485,7 +1487,7 @@ platform:
     prompt_expired: ⌛ Essa solicitação não está mais aguardando resposta. Envie sua resposta como uma mensagem normal.
 slash:
   attend:
-    description: "Fixar o modelo para uso ativo até ser liberado"
+    description: "Fixar o modelo para uso ativo permanentemente ou por uma duração"
   approve:
     description: "Aprovar um comando perigoso pendente"
   bg:
