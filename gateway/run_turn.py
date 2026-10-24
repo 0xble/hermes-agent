@@ -5076,6 +5076,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             _head_origin = bound_turn_origin()
             if pending_event is not None:
                 set_turn_origin(turn_origin_for_event(pending_event))
+            _consumed_events = (
+                (pending_event, *getattr(pending_event, "_hermes_absorbed_events", ()))
+                if pending_event is not None else ()
+            )
+            # In-band turns bypass _handle_message_with_agent. Record their own
+            # result, including absorbed inputs, rather than borrowing the chain head's.
+            for consumed_event in _consumed_events:
+                consumed_event._agent_turn_succeeded = False
             try:
                 followup_result = await self._run_agent(
                     message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
@@ -5091,6 +5099,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     persist_user_display_metadata={
                         **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
                 )
+                from gateway.run import _should_clear_resume_pending_after_turn
+                for consumed_event in _consumed_events:
+                    consumed_event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(followup_result)
             finally:
                 set_turn_origin(_head_origin)
         except asyncio.CancelledError:
