@@ -1,7 +1,9 @@
 """Topic results distinguish the requested pick from the destination's runtime route."""
 
 import asyncio
+import copy
 import threading
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -129,3 +131,93 @@ async def test_cold_topic_readback_keeps_gateway_loop_responsive(home, monkeypat
     assert yielded and all(yielded), "credential lookup blocked the gateway loop"
     assert result["effective_model"] == "session-model"
     assert result["effective_provider"] == "cold-provider"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "edit"])
+@pytest.mark.parametrize("failure", ["runtime", "reasoning", "role"])
+async def test_readback_failure_preserves_successful_topic_operation(home, monkeypatch, operation, failure):
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    entry = await _seed_caller(runner, home, thread_id="4242")
+
+    def unavailable(*_, **__):
+        raise RuntimeError("provider unavailable")
+
+    if failure == "runtime":
+        monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", unavailable)
+    elif failure == "reasoning":
+        runner._load_reasoning_config = unavailable
+    else:
+        # Validation succeeds, then the role disappears before the result is built.
+        resolve = runner._set_session_model_role
+
+        async def set_role(session_key, role):
+            await resolve(session_key, role)
+            monkeypatch.setattr("gateway.telegram_topic_sessions._resolve_topic_model_ref", unavailable)
+
+        runner._set_session_model_role = set_role
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda *_: {
+            "model": {"default": "base", "attended": {"model": "attended-model"}},
+        })
+    spec = TopicSpec(name="Room", icon="💡", message="start here", model="@attended" if failure == "role" else "")
+    if operation == "create":
+        result = await create_topic_session(runner, _source(), spec)
+        assert result["brief_delivered"] is True
+        assert len(adapter.created) == len(adapter.admitted) == 1
+    else:
+        result = await edit_topic_session(runner, _source(), "4242", spec)
+        assert len(adapter.renamed) == 1
+    assert result["action"] == operation
+    assert result["thread_id"] == "4242"
+    assert result["session_id"] == entry.session_id
+    assert home.db.get_session_title(entry.session_id) == "Room"
+    assert home.db.get_telegram_topic_binding(chat_id=_source().chat_id, thread_id="4242")["session_id"] == entry.session_id
+    assert result["warnings"] and "readback" in result["warnings"][-1].lower()
+    assert all(result[key] is None for key in ("effective_model", "effective_provider", "effective_effort"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["fallback", "temporary", "expired", "new_session", "cold"])
+async def test_readback_failure_preserves_turn_state(home, monkeypatch, scenario):
+    from gateway.telegram_topic_sessions import _session_settings_readback
+
+    runner = _runner(home, FakeTelegram())
+    config = {"model": {"default": "default-model", "attended": {
+        "model": "attended-model", "provider": "attended-provider",
+    }, "idle_revert_minutes": 15}}
+    _runtime(monkeypatch, runner, config)
+    source = _source(thread_id="4242")
+    entry = await _seed_caller(runner, home, thread_id="4242")
+    key = entry.session_key
+    if scenario != "cold":
+        conversation = runner._session_state(key).conversation
+        conversation.pending_attended_notice = "already staged"
+        conversation.pre_agent_fallback_notice = "session fallback"
+        conversation.last_resolved_model = "previous-model"
+        if scenario in {"temporary", "expired"}:
+            deadline = time.time() + (43200 if scenario == "temporary" else -1)
+            override = {"model": "picked-model", "provider": "pick-provider", "expires_at": deadline}
+            await runner._persist_session_model_override(key, override, scope="temporary")
+        if scenario == "new_session":
+            conversation.attended_new_session = True
+        if scenario == "fallback":
+            monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
+                "provider": "default-provider", "api_key": "fixture", "_fallback_notice": "new fallback",
+            })
+    runner._pre_agent_fallback_notice = "runner fallback"
+    runner._pre_agent_fallback_notices = {key: "queued fallback"}
+    sessions_before = copy.deepcopy(runner.__dict__.get("_sessions", {}))
+    notices_before = copy.deepcopy(runner._pre_agent_fallback_notices)
+    stored_before = copy.deepcopy(runner.session_store.get_model_override(key))
+    reasoning_before = runner.session_store.get_reasoning_override(key)
+
+    result = await _session_settings_readback(runner, source, entry, None)
+
+    assert runner.__dict__.get("_sessions", {}) == sessions_before
+    assert runner._pre_agent_fallback_notice == "runner fallback"
+    assert runner._pre_agent_fallback_notices == notices_before
+    assert runner.session_store.get_model_override(key) == stored_before
+    assert runner.session_store.get_reasoning_override(key) == reasoning_before
+    expected = {"temporary": "picked-model", "new_session": "attended-model"}.get(scenario, "default-model")
+    assert result["effective_model"] == expected
