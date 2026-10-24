@@ -20,7 +20,10 @@ Pinned sessions have no attended idle expiry or switch-back notice. Legacy idle
 expiry of temporary model and reasoning picks is also suspended, while an explicit
 model-pick TTL still expires on its own deadline. Unpinning atomically resets
 `last_user_activity_at` to now, restoring the configured idle window without
-reverting immediately. Session reset creates a new, unpinned conversation.
+reverting immediately. Releasing an already-unpinned session reports its current
+status without restarting that idle window. The pin survives non-boundary
+session repoints, including topic-binding repair, delegation completion, and CLI
+handoff. Session reset, `/resume`, and `/branch` start unpinned conversations.
 
 Run `tests/gateway/test_attend_command.py` alongside the attended routing, busy
 activity, API-boundary, and topic readback tests. `expiry_time` has no live gateway
