@@ -44,7 +44,7 @@ from gateway.session import (
 from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
 from gateway.attended_model import (
     _stamp_seconds, format_attended_switch_back_notice, format_attended_switch_notice,
-    is_active, parse_attended_config, resolve_attended_model,
+    is_active, parse_attended_config,
 )
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
@@ -322,7 +322,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         """Return the one authoritative desired route decision for a gateway session."""
         if not session_key:
             return None
-        from gateway.run import _get_channel_override, _resolve_gateway_model
         cfg = parse_attended_config(user_config or {})
         state = self._session_state(session_key)
         conversation = state.conversation
@@ -347,34 +346,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             # Inbound finalization clears the marker on success, failure, and interruption.
             stamp, _ = self._ensure_attended_new_session_activity(session_key, cfg, stamp)
         self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
-        channel_model = ""
-        channel_provider = ""
-        gateway_config = getattr(self, "config", None)
-        if source is not None and gateway_config is not None:
-            with suppress(Exception):
-                ch = _get_channel_override(
-                    gateway_config, source.platform, str(source.chat_id) if source.chat_id else "",
-                    thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
-                    parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
-                )
-                channel_model = getattr(ch, "model", "") or ""
-                channel_provider = getattr(ch, "provider", "") or ""
-        default_model = _resolve_gateway_model(user_config)
-        model_value = (override or {}).get("model")
-        model_provider = (override or {}).get("provider")
-        # A held role may differ even when setup supplied a default baseline.
-        if default_reasoning is None or (model_role and not model_value):
-            default_reasoning = {}
-            with suppress(Exception):
-                default_reasoning = self._load_attended_reasoning_config(
-                    str(model_value or channel_model or default_model or ""), user_config,
-                    model_role=model_role if not model_value else None,
-                )
-        if attended_reasoning is None:
-            attended_reasoning = {}
-            with suppress(Exception):
-                if cfg.model:
-                    attended_reasoning = self._load_attended_reasoning_config(cfg.model, user_config)
         model_scope = assignment.get("model_scope", getattr(conversation, "model_override_scope", "session"))
         if "reasoning_override" in assignment:
             reasoning_value = assignment["reasoning_override"]
@@ -392,46 +363,18 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         reasoning_scope = (getattr(conversation, "reasoning_override_scope", "session")
                            if reasoning_scope is None else reasoning_scope)
         previous_decision = conversation.last_attended_decision
-        decision = resolve_attended_model(
-            {
-                "model_override": model_value if model_scope not in ("session", "temporary", "once") else None,
-                "once_model": model_value if model_scope == "once" else None,
-                "session_model": model_value if model_scope == "session" else None,
-                "temporary_model": model_value if model_scope == "temporary" else None,
-                "model_override_provider": model_provider,
-                "default_model": default_model,
-                "default_provider": (user_config or {}).get("model", {}).get("provider", "")
-                if isinstance((user_config or {}).get("model"), dict) else "",
-                "channel_model": channel_model,
-                "channel_provider": channel_provider,
-                "last_user_activity_at": stamp,
-                "new_session": new_session,
-                "model_role": model_role,
-                "default_reasoning": default_reasoning,
-                "explicit_model_reasoning": default_reasoning,
-                "attended_reasoning": attended_reasoning,
-                "session_reasoning": reasoning_value if reasoning_scope == "session" else None,
-                "temporary_reasoning": reasoning_value if reasoning_scope == "temporary" else None,
-            },
-            time.time(), user_config or {},
+        from gateway.run_session_readback import resolve_attended_snapshot
+        decision = resolve_attended_snapshot(
+            self, source=source, user_config=user_config, override=override,
+            model_role=model_role, model_scope=model_scope, stamp=stamp, new_session=new_session,
+            reasoning_value=reasoning_value, reasoning_scope=reasoning_scope,
+            default_reasoning=default_reasoning, attended_reasoning=attended_reasoning,
         )
         load_route_active = getattr(self, "_load_attended_route_active", None)
         durable_route_active = load_route_active(session_key) if callable(load_route_active) else None
-        switched_back = bool(
-            decision.reason == "default"
-            # An unresolved hold falls back immediately. Only automatic attended
-            # expiry waits for a quiet API boundary, not a role's missing config.
-            and not model_role
-            and (
-                (
-                    previous_decision is not None
-                    and previous_decision.reason == "attended"
-                    and previous_decision.active
-                    and previous_decision.idle_model
-                    and previous_decision.idle_model != previous_decision.model
-                )
-                or durable_route_active is True
-            )
+        from gateway.run_session_readback import attended_switch_back_pending
+        switched_back = attended_switch_back_pending(
+            decision, previous_decision, model_role, durable_route_active,
         )
         api_quiet = True
         awaiting_first_message = False
@@ -500,14 +443,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             )
         if decision.reason not in {"attended", "role"}:
             return None
-        route = {
-            "active": True,
-            "model": decision.model,
-            "provider": decision.provider,
-            "reasoning_effort": decision.reasoning_effort,
-            "decision_key": decision.decision_key,
-            "role": decision.role,
-        }
+        from gateway.run_session_readback import attended_runtime_route
+        route = attended_runtime_route(decision)
         target_model = cfg.model or decision.model
         session_last_model = last_model or conversation.last_resolved_model or ""
         if (

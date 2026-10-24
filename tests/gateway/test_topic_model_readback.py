@@ -178,7 +178,7 @@ async def test_readback_failure_preserves_successful_topic_operation(home, monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["fallback", "temporary", "expired", "new_session", "cold"])
+@pytest.mark.parametrize("scenario", ["fallback", "temporary", "expired", "new_session", "cold", "deferred"])
 async def test_readback_failure_preserves_turn_state(home, monkeypatch, scenario):
     from gateway.telegram_topic_sessions import _session_settings_readback
 
@@ -201,13 +201,22 @@ async def test_readback_failure_preserves_turn_state(home, monkeypatch, scenario
             await runner._persist_session_model_override(key, override, scope="temporary")
         if scenario == "new_session":
             conversation.attended_new_session = True
+        if scenario == "deferred":
+            from gateway.attended_model import resolve_attended_model
+            conversation.last_user_activity_at = time.time() - 86400
+            conversation.last_attended_decision = resolve_attended_model({
+                "last_user_activity_at": time.time(), "default_model": "default-model",
+            }, time.time(), config)
         if scenario == "fallback":
             monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
                 "provider": "default-provider", "api_key": "fixture", "_fallback_notice": "new fallback",
             })
     runner._pre_agent_fallback_notice = "runner fallback"
     runner._pre_agent_fallback_notices = {key: "queued fallback"}
-    sessions_before = copy.deepcopy(runner.__dict__.get("_sessions", {}))
+    from gateway.session_state import SERVICE_TIER_UNSET
+    sessions_before = copy.deepcopy(
+        runner.__dict__.get("_sessions", {}), {id(SERVICE_TIER_UNSET): SERVICE_TIER_UNSET},
+    )
     notices_before = copy.deepcopy(runner._pre_agent_fallback_notices)
     stored_before = copy.deepcopy(runner.session_store.get_model_override(key))
     reasoning_before = runner.session_store.get_reasoning_override(key)
@@ -219,5 +228,9 @@ async def test_readback_failure_preserves_turn_state(home, monkeypatch, scenario
     assert runner._pre_agent_fallback_notices == notices_before
     assert runner.session_store.get_model_override(key) == stored_before
     assert runner.session_store.get_reasoning_override(key) == reasoning_before
-    expected = {"temporary": "picked-model", "new_session": "attended-model"}.get(scenario, "default-model")
+    expected = {"temporary": "picked-model", "new_session": "attended-model", "deferred": "attended-model"}.get(scenario, "default-model")
     assert result["effective_model"] == expected
+    model, runtime = await runner._resolve_session_agent_runtime_async(
+        source=source, session_key=key, user_config=config,
+    )
+    assert (result["effective_model"], result["effective_provider"]) == (model, runtime.get("provider"))
