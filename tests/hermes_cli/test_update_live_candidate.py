@@ -246,6 +246,32 @@ def test_rewritten_named_candidate_refuses_stale_resurrection(installed, capsys,
     assert not (releases.read_pointer(installed.home / "current") / "candidate.txt").exists()
 
 
+def test_old_carry_receipt_does_not_misidentify_target_branch_as_candidate(installed):
+    receipts = installed.home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True, exist_ok=True)
+    (receipts / "update_original.json").write_text(json.dumps({
+        "argv": ["hermes", "update", "--branch", "candidate"],
+        "release_transition": {"to_sha": installed.live},
+    }))
+    first = releases.merge_release_commits(installed.source, installed.target, installed.live)
+    combined = releases.merge_release_commits(installed.source, installed.target, first)
+    staged, _ = releases.stage_release(installed.source, installed.home, sha=combined)
+    releases.activate_release(installed.home, staged)
+    git(installed.source, "update-ref", "-d", f"refs/hermes/carry-forward/{first}")
+    (receipts / "update_old_carry.json").write_text(json.dumps({
+        "argv": ["hermes", "update", "--branch", "main"],
+        "release_transition": {"to_sha": combined}, "carried_candidates": [installed.live],
+    }))
+    git(installed.source, "remote", "add", "origin", ".")
+    commit_file(installed.source, "next.txt", "next target\n")
+    git(installed.source, "fetch", ".", "main")
+    selected = apply(installed)
+    assert selected.name != combined
+    assert update_receipt._current.get().data["carried_candidates"] == [installed.live]
+    assert json.loads((selected / "install-stamp.json").read_text())["sourceBranch"] == "candidate"
+    assert git(installed.source, "rev-parse", f"{selected.name}^2") == installed.live
+
+
 def test_activation_prunes_unneeded_carry_refs_but_retains_rollback(installed):
     (installed.home / "release-layout.json").write_text(json.dumps({"source": str(installed.source)}))
     first = apply(installed)
