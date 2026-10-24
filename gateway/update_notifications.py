@@ -206,6 +206,8 @@ def _local_changes_evidence(receipt: dict) -> tuple[bool, str]:
             if re.fullmatch(r"[0-9a-fA-F]{40}", stash):
                 return False, f"Local changes remain in stash {stash}; restore with git stash apply {stash}."
             return False, "Local changes remain in stash; see the update output before restoring them."
+        if detail.startswith("unverified: "):
+            return False, ""
         if detail.startswith("discarded: "):
             return False, "Local changes were discarded."
         return False, "Local changes were not confirmed restored; see the update output."

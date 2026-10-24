@@ -93,7 +93,7 @@ def _track_preparation_moves(checkout_move):
     _record_stash_disposition("not_needed", "", "checkout preparation has not touched source files")
 
     def move(*targets, **bound):
-        record_step("local_changes_stash", False, "checkout preparation may have changed source files", replace=True)
+        record_step("local_changes_stash", False, "unverified: checkout preparation may have changed source files", replace=True)
         return (checkout_move or _no_move)(*targets, **bound)
 
     return move

@@ -1972,6 +1972,8 @@ def _handle_update_called_process_error(
         print(f"⚠ {stage}: {e}")
         print("→ Falling back to ZIP download...")
         print()
+        _completion_receipt.record_step(
+            "local_changes_stash", False, "unverified: ZIP update started", replace=True)
         _update_via_zip(
             args, had_desktop_app_before_update=had_desktop_app_before_update,
             target_sha=target_sha, completion_request=completion_request,
@@ -2665,6 +2667,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
     branch = completion_request["branch"]
 
     if use_zip_update:
+        _completion_receipt.record_step(
+            "local_changes_stash", False, "unverified: ZIP update started", replace=True)
         try:
             _update_via_zip(
                 args, had_desktop_app_before_update=had_desktop_app_before_update,
@@ -2740,7 +2744,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             return
 
         # The fetch-only proof must not survive into a phase that may stash or rewrite files.
-        _record_update_step("local_changes_stash", False, "checkout preparation started")
+        _completion_receipt.record_step(
+            "local_changes_stash", False, "unverified: checkout preparation started", replace=True)
         current_branch = _current_branch_name(git_cmd, check=True)
         _commit.record_run_start(git_cmd, _m().PROJECT_ROOT)
         _refuse_before_commit_point(git_cmd, target_ref, _windows_gateway_resume)

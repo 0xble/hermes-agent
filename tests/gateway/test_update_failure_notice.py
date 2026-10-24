@@ -129,9 +129,77 @@ def test_fetch_failure_proves_unchanged_only_before_source_cleanup(
         assert git(source, "diff") != before
         assert "Nothing changed" not in detail
         assert "Runtime state is unverified" in detail
+        assert "Local changes" not in detail
     else:
         assert git(source, "diff") == before
         assert detail == f"Nothing changed. Still on {sha[:12]}. Cause: fetch_failed"
+
+
+@pytest.mark.parametrize("failure", ["direct-zip", "fallback-zip", "refusal", "branch-name"])
+def test_pre_stash_failure_never_claims_restoration_or_unchanged_zip(
+    update_tree, tmp_path, monkeypatch, failure,
+):
+    from hermes_cli import update_cmd, update_receipt
+    from tests.hermes_cli.test_update_target_identity import git
+
+    source = update_tree.clone
+    git(source, "checkout", "-q", "main")
+    sha = git(source, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    request = pending(home, reason=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_receipt, "_receipt_dir", lambda: home / "logs/update_receipts")
+    monkeypatch.setattr(update_receipt, "_code_identity", lambda **_: {"sha": git(source, "rev-parse", "HEAD")})
+    monkeypatch.setattr("gateway.update_notifications.__file__", str(source / "gateway/update_notifications.py"))
+    update_tree.args.channel = "main"
+
+    def fail(*_a, **_kw):
+        raise RuntimeError("checkout failed before stash")
+
+    def fail_zip(*_a, **_kw):
+        # A failed swap can leave mixed files without changing .git HEAD.
+        (source / "content.txt").write_text("partially swapped source\n")
+        raise RuntimeError("ZIP swap rollback failed")
+
+    if failure == "direct-zip":
+        prepare = update_cmd._prepare_git_command
+
+        def select_zip(**kw):
+            _, cmd, fork = prepare(**kw)
+            return True, cmd, fork
+
+        monkeypatch.setattr(update_cmd, "_prepare_git_command", select_zip)
+    elif failure == "fallback-zip":
+        def fail_git(*_a, **_kw):
+            raise subprocess.CalledProcessError(1, ["git", "status"])
+
+        monkeypatch.setattr(update_cmd._check, "report_pack_tidy", fail_git)
+        monkeypatch.setattr(update_cmd, "_should_zip_fallback_on_update_error", lambda _: True)
+    elif failure == "refusal":
+        monkeypatch.setattr(update_cmd, "_refuse_before_commit_point", fail)
+    else:
+        monkeypatch.setattr(update_cmd, "_current_branch_name", fail)
+    monkeypatch.setattr(update_cmd, "_update_via_zip", fail_zip)
+
+    with update_receipt.update_receipt_scope():
+        with pytest.raises(RuntimeError, match="ZIP swap rollback failed|checkout failed before stash"):
+            update_cmd._cmd_update_impl(update_tree.args, gateway_mode=False)
+        path = update_receipt.finalize_update_receipt("failed", stop_reason="injected update failure")
+    assert path is not None
+    receipt = json.loads(path.read_text())
+    assert receipt["pre_update"]["sha"] == receipt["post_update"]["sha"] == sha
+    assert git(source, "stash", "list") == ""
+    assert bool(git(source, "diff")) == failure.endswith("zip")
+    (home / ".update_process_exit_code").write_text("1")
+    outcome = final_outcome(home, request)
+    assert outcome is not None
+    success, detail = outcome
+    assert success is False
+    assert "Cause: injected update failure" in detail
+    assert "Nothing changed" not in detail
+    assert "Runtime state is unverified" in detail
+    assert "Local changes" not in detail
 
 
 @pytest.mark.parametrize("dirty", [False, True])
