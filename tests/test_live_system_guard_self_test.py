@@ -22,6 +22,8 @@ import signal
 import subprocess
 import sys
 import types
+from contextlib import contextmanager
+from unittest.mock import Mock
 
 import pytest
 
@@ -115,6 +117,191 @@ def test_os_kill_blocks_negative_one():
 def test_os_killpg_blocks_foreign_pgid():
     with pytest.raises(RuntimeError, match="live-system guard"):
         os.killpg(FOREIGN_PID, signal.SIGTERM)
+
+
+@contextmanager
+def _record_signal_delivery(request, *, deliver=False):
+    """Install the real fixture above recording sinks, never bypass its checks."""
+    from tests._fixtures.live_system_guard import _live_system_guard
+
+    with pytest.MonkeyPatch.context() as patch:
+        kill = Mock(wraps=os.kill if deliver else None)
+        killpg = Mock(wraps=os.killpg if deliver else None) if hasattr(os, "killpg") else None
+        patch.setattr(os, "kill", kill)
+        if killpg is not None:
+            patch.setattr(os, "killpg", killpg)
+        guard = _live_system_guard.__wrapped__(request, patch)
+        next(guard)
+        try:
+            yield kill, killpg
+        finally:
+            with pytest.raises(StopIteration):
+                next(guard)
+
+
+def _missing_signal_target(state, primitive, pid, target, lookup, monkeypatch):
+    import psutil
+
+    if state == "missing_during_parents":
+        target.parents.side_effect = psutil.NoSuchProcess(pid)
+    else:
+        lookup.side_effect = psutil.NoSuchProcess(pid)
+    if not state.startswith("missing_leader_"):
+        return ProcessLookupError
+    # A group outlives its leader whether its remaining member is owned or
+    # foreign. Neither case permits delivery based on the absent leader.
+    member = Mock(pid=pid + 1)
+    member.parents.return_value = (
+        [types.SimpleNamespace(pid=os.getpid())]
+        if state == "missing_leader_owned_member" else []
+    )
+
+    def leader_gone(value):
+        if value == member.pid:
+            return member
+        raise psutil.NoSuchProcess(value)
+
+    lookup.side_effect = leader_gone
+    pids = Mock(return_value=[member.pid])
+    getpgid = Mock(return_value=pid)
+    monkeypatch.setattr(psutil, "pids", pids)
+    monkeypatch.setattr(os, "getpgid", getpgid, raising=False)
+    if state == "missing_leader_reaped_member":
+        getpgid.side_effect = ProcessLookupError()
+    elif state == "missing_leader_unverifiable_member":
+        getpgid.side_effect = PermissionError()
+    elif state == "missing_leader_unverifiable_scan":
+        pids.side_effect = psutil.AccessDenied(member.pid)
+    return (
+        RuntimeError if primitive == "killpg" and state != "missing_leader_reaped_member"
+        else ProcessLookupError
+    )
+
+
+@pytest.mark.parametrize("primitive", ["kill", pytest.param("killpg", marks=pytest.mark.platforms("posix"))])
+@pytest.mark.parametrize(
+    "state",
+    [
+        "owned", "foreign", "foreign_ancestor_gone", "missing_before", "missing_during_parents",
+        "access_denied_before", "access_denied_parents", "access_denied_identity",
+        "unexpected_lookup_error", "initial_owned", "initial_recycled",
+        "initial_unverifiable", "recycled_during_parents",
+        "missing_leader_owned_member", "missing_leader_foreign_member",
+        "missing_leader_unverifiable_member", "missing_leader_unverifiable_scan",
+        "missing_leader_reaped_member",
+    ],
+)
+def test_signal_guard_only_delivers_to_verified_owned_targets(request, monkeypatch, primitive, state):
+    """Vanished PIDs are not an allowlist, and a missing leader is not a missing group."""
+    import psutil
+
+    pid = 987654321
+    target = Mock(pid=pid)
+    target.create_time.return_value = 10.0
+    target.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
+    owner = Mock()
+    owner.children.return_value = [target] if state.startswith("initial_") else []
+    lookup = Mock(side_effect=lambda value: owner if value == os.getpid() else target)
+    monkeypatch.setattr(psutil, "Process", lookup)
+    monkeypatch.setattr(psutil, "pids", Mock(return_value=[]))
+
+    with _record_signal_delivery(request) as (kill, killpg):
+        sink = kill if primitive == "kill" else killpg
+        assert sink is not None
+        if state == "initial_owned":
+            target.parents.return_value = []  # Identity survives reparenting.
+        expected = RuntimeError
+        if state in {"owned", "initial_owned"}:
+            expected = None
+        elif state == "foreign":
+            target.parents.return_value = []
+        elif state == "foreign_ancestor_gone":
+            # A vanished ancestor does not prove that this specific target vanished.
+            target.parents.side_effect = psutil.NoSuchProcess(pid + 1)
+        elif state.startswith("missing_"):
+            expected = _missing_signal_target(state, primitive, pid, target, lookup, monkeypatch)
+        elif state == "access_denied_before":
+            lookup.side_effect = psutil.AccessDenied(pid)
+        elif state == "access_denied_parents":
+            target.parents.side_effect = psutil.AccessDenied(pid)
+        elif state in {"access_denied_identity", "initial_unverifiable"}:
+            target.create_time.side_effect = psutil.AccessDenied(pid)
+        elif state == "unexpected_lookup_error":
+            lookup.side_effect = ValueError("unverifiable process identity")
+            expected = ValueError
+        elif state == "initial_recycled":
+            target.create_time.return_value = 20.0
+        elif state == "recycled_during_parents":
+            replacement = Mock(pid=pid)
+            replacement.create_time.return_value = 20.0
+            lookup.side_effect = [target, replacement]
+
+        if expected is None:
+            getattr(os, primitive)(pid, signal.SIGTERM)
+            sink.assert_called_once_with(pid, signal.SIGTERM)
+        else:
+            with pytest.raises(expected):
+                getattr(os, primitive)(pid, signal.SIGTERM)
+            sink.assert_not_called()
+        other = killpg if primitive == "kill" else kill
+        if other is not None:
+            other.assert_not_called()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("primitive", ["kill", "killpg"])
+@pytest.mark.parametrize("interleave", ["live", "reap_before_handle", "reap_during_parents"])
+def test_signal_guard_handles_owned_child_exit_interleavings(request, monkeypatch, primitive, interleave):
+    """Synchronize real child exit at the two inspection boundaries, without delays."""
+    import psutil
+
+    with _record_signal_delivery(request, deliver=True) as sinks, subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    ) as child:
+        original_process = psutil.Process
+        original_init = psutil.Process.__init__
+        original_parents = psutil.Process.parents
+        identity = original_process(child.pid).create_time()
+        assert original_process(child.pid).ppid() == os.getpid()
+        assert os.getpgid(child.pid) == child.pid
+        assert child.stdin is not None
+
+        def reap():
+            child.stdin.close()
+            assert child.wait(timeout=5) == 0
+
+        def inspect_process(process, pid=None):
+            if pid == child.pid and interleave == "reap_before_handle":
+                reap()
+            original_init(process, pid)
+
+        def inspect_parents(process):
+            if process.pid == child.pid and interleave == "reap_during_parents":
+                reap()
+            return original_parents(process)
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(original_process, "__init__", inspect_process)
+                patch.setattr(original_process, "parents", inspect_parents)
+                sink = sinks[0] if primitive == "kill" else sinks[1]
+                assert sink is not None
+                if interleave == "live":
+                    getattr(os, primitive)(child.pid, signal.SIGTERM)
+                    assert child.wait(timeout=5) == -signal.SIGTERM
+                    sink.assert_called_once_with(child.pid, signal.SIGTERM)
+                else:
+                    with pytest.raises(ProcessLookupError):
+                        getattr(os, primitive)(child.pid, signal.SIGTERM)
+                    for sink in sinks:
+                        assert sink is not None
+                        sink.assert_not_called()
+        finally:
+            if child.poll() is None:
+                assert original_process(child.pid).create_time() == identity
+                reap()
 
 
 # ──────────────────── subprocess regex bypasses ────────────────

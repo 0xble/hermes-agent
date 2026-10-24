@@ -81,43 +81,67 @@ def _live_system_guard(request, monkeypatch):
 
     test_pid = _os.getpid()
     lookalike_ok = request.node.get_closest_marker(_GATEWAY_LOOKALIKE_MARK) is not None
-    # Capture the test process's existing children at fixture start —
-    # any *new* children spawned by the test are also allowlisted via
-    # the live psutil walk below. Static set keeps the fast path cheap.
+    # Keep identities, not bare PIDs: an initial child can be reparented,
+    # but its PID must never allowlist a later, unrelated process.
     try:
         import psutil as _psutil
-        _initial_children = {
-            c.pid for c in _psutil.Process(test_pid).children(recursive=True)
-        }
-    except Exception:
+    except ImportError:
         _psutil = None
-        _initial_children = set()
+    _initial_children = {}
+    if _psutil is not None:
+        try:
+            children = _psutil.Process(test_pid).children(recursive=True)
+        except _psutil.Error:
+            children = []
+        for child in children:
+            try:
+                _initial_children[child.pid] = child.create_time()
+            except _psutil.Error:
+                continue  # Unverifiable children still need a live ancestry check.
 
     def _is_own_subtree(pid: int) -> bool:
-        # PID 0 means "our own process group"; -1 means "every process we
-        # can signal". Both are dangerous when paired with SIGTERM/SIGKILL,
-        # but pid 0 is technically scoped to our group so allow it; pid -1
-        # is treated as foreign (refuse).
+        # PID 0 means our group; -1 means every signalable process.
         if pid == 0:
             return True
         if pid < 0:
             return False
-        if pid == test_pid or pid in _initial_children:
+        if pid == test_pid:
             return True
         if _psutil is None:
             return False
         try:
             walker = _psutil.Process(pid)
-        except Exception:
-            # Stale PID — kill would be a no-op anyway, allow it.
-            return True
-        try:
-            for parent in walker.parents():
-                if parent.pid == test_pid:
-                    return True
-        except Exception:
+            identity = walker.create_time()
+            if pid in _initial_children:
+                owned = identity == _initial_children[pid]
+            else:
+                owned = any(parent.pid == test_pid for parent in walker.parents())
+            # Ancestry and initial-child membership apply only to the same
+            # process that is still present after inspection.
+            return owned and _psutil.Process(pid).create_time() == identity
+        except _psutil.NoSuchProcess as exc:
+            if exc.pid != pid:
+                return False  # A missing ancestor is not proof the target is gone.
+            import errno
+            raise ProcessLookupError(errno.ESRCH, "signal target vanished", pid) from exc
+        except _psutil.Error:
+            return False  # AccessDenied and other unverifiable identities fail closed.
+
+    def _group_is_gone(pgid: int) -> bool:
+        # A group can outlive its leader. Inspect membership without even a
+        # signal-0 call; an incomplete scan cannot establish a missing group.
+        if _psutil is None:
             return False
-        return False
+        try:
+            for pid in _psutil.pids():
+                try:
+                    if _os.getpgid(pid) == pgid:
+                        return False
+                except ProcessLookupError:
+                    continue
+        except (OSError, _psutil.Error):
+            return False
+        return True
 
     real_kill = _os.kill
 
@@ -157,7 +181,15 @@ def _live_system_guard(request, monkeypatch):
             # Signal 0 is a pure liveness probe — never destructive.
             if int(sig) == 0:
                 return real_killpg(pgid, sig, *args, **kwargs)
-            if int(pgid) == own_pgid or _is_own_subtree(int(pgid)):
+            owned = int(pgid) == own_pgid
+            if not owned:
+                try:
+                    owned = _is_own_subtree(int(pgid))
+                except ProcessLookupError:
+                    if _group_is_gone(int(pgid)):
+                        raise
+                    # A leaderless or uninspectable group is not allowlisted.
+            if owned:
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
