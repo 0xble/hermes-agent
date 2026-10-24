@@ -248,8 +248,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if attended_model:
             with suppress(Exception):
                 attended_reasoning = self._load_reasoning_config(attended_model) or {}
+        from gateway.session_attended import session_attended_pinned
         return {
             "activity_stamp": stamp,
+            "attended_pinned": session_attended_pinned(store, session_key),
             "new_session": new_session,
             "reasoning_override": reasoning_override,
             "reasoning_scope": reasoning_scope,
@@ -317,7 +319,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, new_session=False,
         reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
         reasoning_scope=None, default_reasoning=None, attended_reasoning=None,
-        allow_switch_back=False, assignment=None,
+        attended_pinned=_NO_ATTENDED_ACTIVITY_STAMP, allow_switch_back=False, assignment=None,
     ):
         """Return the one authoritative desired route decision for a gateway session."""
         if not session_key:
@@ -364,11 +366,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                            if reasoning_scope is None else reasoning_scope)
         previous_decision = conversation.last_attended_decision
         from gateway.run_session_readback import resolve_attended_snapshot
+        if attended_pinned is _NO_ATTENDED_ACTIVITY_STAMP:
+            from gateway.session_attended import session_attended_pinned
+            attended_pinned = session_attended_pinned(getattr(self, "session_store", None), session_key)
         decision = resolve_attended_snapshot(
             self, source=source, user_config=user_config, override=override,
             model_role=model_role, model_scope=model_scope, stamp=stamp, new_session=new_session,
             reasoning_value=reasoning_value, reasoning_scope=reasoning_scope,
             default_reasoning=default_reasoning, attended_reasoning=attended_reasoning,
+            attended_pinned=attended_pinned,
         )
         load_route_active = getattr(self, "_load_attended_route_active", None)
         durable_route_active = load_route_active(session_key) if callable(load_route_active) else None
@@ -418,7 +424,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, new_session=False,
         reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
         reasoning_scope=None, default_reasoning=None, attended_reasoning=None,
-        allow_switch_back=False, assignment=None,
+        attended_pinned=_NO_ATTENDED_ACTIVITY_STAMP, allow_switch_back=False, assignment=None,
     ):
         """Build the detached attended route and stage its one-line notice on the session."""
         decision = self._attended_resolution_for_session(
@@ -426,7 +432,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             activity_stamp=activity_stamp, new_session=new_session,
             reasoning_override=reasoning_override,
             reasoning_scope=reasoning_scope, default_reasoning=default_reasoning,
-            attended_reasoning=attended_reasoning, allow_switch_back=allow_switch_back, assignment=assignment,
+            attended_reasoning=attended_reasoning, attended_pinned=attended_pinned,
+            allow_switch_back=allow_switch_back, assignment=assignment,
         )
         if decision is None:
             return None
@@ -475,6 +482,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         """Timed model picks use their deadline, reasoning and untimed picks retain idle expiry."""
         cfg = parse_attended_config(user_config or {})
         from gateway.model_pick import model_pick_deadline
+        from gateway.session_attended import session_attended_pinned
         deadline = model_pick_deadline(self._session_model_override(session_key))
         expired = bool(deadline and time.time() >= deadline)
         if not cfg.enabled and not expired:
@@ -488,7 +496,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             else:
                 stamp = self._load_attended_activity_stamp(session_key)
             self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
-        if not expired and is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
+        if not expired and is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes, pinned=session_attended_pinned(getattr(self, "session_store", None), session_key)):
             return
         if (expired or not deadline) and conversation.model_override is not None and conversation.model_override_scope == "temporary":
             persist = self._expire_session_model_pick
@@ -509,7 +517,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     logger.debug("Failed to expire temporary attended model pick", exc_info=True)
             else:
                 logger.debug("Skipping synchronous attended expiry on the gateway loop")
-        if (cfg.enabled and not is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes)
+        if (cfg.enabled and not is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes, pinned=session_attended_pinned(getattr(self, "session_store", None), session_key))
                 and conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary"):
             self._clear_attended_reasoning_override_threadsafe(session_key)
 
@@ -542,6 +550,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         """Async-loop-safe deadline and legacy idle expiry, including after restart."""
         cfg = parse_attended_config(user_config or {})
         from gateway.model_pick import model_pick_deadline
+        from gateway.session_attended import session_attended_pinned
+        pinned = await asyncio.to_thread(session_attended_pinned, getattr(self, "session_store", None), session_key)
         deadline = model_pick_deadline(self._session_model_override(session_key))
         expired = bool(deadline and time.time() >= deadline)
         if not cfg.enabled and not expired:
@@ -555,14 +565,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             else:
                 stamp = activity_stamp
             self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
-        if not expired and is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
+        if not expired and is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes, pinned=pinned):
             return
         if (expired or not deadline) and conversation.model_override is not None and conversation.model_override_scope == "temporary":
             try:
                 await self._expire_session_model_pick(session_key, conversation.model_override)
             except Exception:
                 logger.debug("Failed to expire temporary attended model pick", exc_info=True)
-        if (cfg.enabled and not is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes)
+        if (cfg.enabled and not is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes, pinned=pinned)
                 and conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary"):
             await self._clear_attended_reasoning_override_async(session_key)
 
@@ -765,6 +775,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         self._pre_agent_fallback_notice = None
         activity_stamp = _NO_ATTENDED_ACTIVITY_STAMP
         attended_snapshot = {}
+        attended_snapshot_epoch = None
         if skey:
             state = self._session_state(skey)
             async with self._session_model_override_lock(skey):
@@ -781,6 +792,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             if attended_enabled:
                 current_override = self._session_model_override(skey) or {}
                 attended_cfg = parse_attended_config(user_config or {})
+                attended_snapshot_epoch = self._session_model_override_epoch(skey)
                 attended_snapshot = await asyncio.to_thread(
                     self._load_attended_resolution_snapshot,
                     skey, str(current_override.get("model") or ""), attended_cfg.model, user_config,
@@ -796,6 +808,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     attended_snapshot["reasoning_scope"] = "session"
         while True:
             override, last_model, epoch = self._snapshot_session_runtime_state(skey)
+            if attended_snapshot and epoch != attended_snapshot_epoch:
+                # /attend can race credential loading just like /model. Retry with a fresh
+                # off-loop snapshot rather than committing the pin from the prior epoch.
+                attended_snapshot_epoch = epoch
+                attended_snapshot = await asyncio.to_thread(
+                    self._load_attended_resolution_snapshot,
+                    skey, str((override or {}).get("model") or ""), attended_cfg.model, user_config,
+                )
+                continue
             attended_route = self._attended_route_for_session(
                 source=source, session_key=skey, user_config=user_config, override=override,
                 last_model=last_model, activity_stamp=activity_stamp,
@@ -805,6 +826,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 reasoning_scope=attended_snapshot.get("reasoning_scope") if attended_snapshot else None,
                 default_reasoning=attended_snapshot.get("default_reasoning") if attended_snapshot else None,
                 attended_reasoning=attended_snapshot.get("attended_reasoning") if attended_snapshot else None,
+                attended_pinned=attended_snapshot.get("attended_pinned", False),
             )
             resolved = await asyncio.to_thread(
                 self._load_session_agent_runtime, source=source, skey=skey, user_config=user_config,
