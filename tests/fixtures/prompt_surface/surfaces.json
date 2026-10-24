@@ -5,7 +5,7 @@
       "stable": 1935,
       "volatile": 1813
     },
-    "tool_tokens": 14953,
+    "tool_tokens": 15097,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -19,6 +19,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -52,7 +53,7 @@
       "stable": 1445,
       "volatile": 1813
     },
-    "tool_tokens": 14953,
+    "tool_tokens": 15097,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -66,6 +67,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -99,7 +101,7 @@
       "stable": 1866,
       "volatile": 1812
     },
-    "tool_tokens": 14953,
+    "tool_tokens": 15097,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -113,6 +115,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -146,7 +149,7 @@
       "stable": 2612,
       "volatile": 1810
     },
-    "tool_tokens": 15109,
+    "tool_tokens": 15253,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -160,6 +163,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -193,7 +197,7 @@
       "stable": 1445,
       "volatile": 1813
     },
-    "tool_tokens": 14953,
+    "tool_tokens": 15097,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -207,6 +211,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -240,7 +245,7 @@
       "stable": 1317,
       "volatile": 1814
     },
-    "tool_tokens": 14953,
+    "tool_tokens": 15097,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -254,6 +259,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -287,7 +293,7 @@
       "stable": 1579,
       "volatile": 1814
     },
-    "tool_tokens": 15587,
+    "tool_tokens": 15732,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -301,6 +307,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -335,7 +342,7 @@
       "stable": 1349,
       "volatile": 1814
     },
-    "tool_tokens": 14953,
+    "tool_tokens": 15097,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -349,6 +356,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -382,7 +390,7 @@
       "stable": 1436,
       "volatile": 1815
     },
-    "tool_tokens": 15003,
+    "tool_tokens": 15148,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -396,6 +404,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
