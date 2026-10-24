@@ -1896,6 +1896,8 @@ def _prepare_git_command(*, checkout_move=None) -> tuple[bool, list, bool]:
 
     # Before stash/branch logic: npm rewrites package-lock.json non-deterministically and
     # line-ending churn is machine-made dirt; both would otherwise force an autostash every update.
+    from hermes_cli.update_cmd_stash import _track_preparation_moves
+    checkout_move = _track_preparation_moves(checkout_move)
     _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT, checkout_move=checkout_move)
     _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT, checkout_move=checkout_move)
 
@@ -2202,6 +2204,7 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
     from hermes_cli.immutable_releases import (
         ReleasePaths, read_pointer, release_sha, stage_release, _release_is_ready,
     )
+    _record_update_step("immutable_source_untouched", True, "fetch-only release apply leaves source files and venv untouched")
     source = _m().PROJECT_ROOT.resolve()
     home = get_hermes_home()
     paths = ReleasePaths.for_home(home)
@@ -2213,10 +2216,9 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
         raise RuntimeError("current is not a release; remove the obsolete source pointer before updating")
     if current is not None and not _release_is_ready(current, current.name):
         raise RuntimeError("current release is not ready; refusing to activate from an invalid pointer")
-    # Migration metadata and the source plist are captured with the candidate
-    # inside one transaction at activation, not before staging/handoff.
-    # A deferred candidate must be promoted on the next normal update, even
-    # when the remote has not advanced beyond that exact staged commit.
+    # Capture migration metadata and the source plist transactionally at activation,
+    # not at staging/handoff. Promote a deferred candidate on the next normal update
+    # even when the remote has not advanced beyond it.
     if current is not None and current.name == fetched:
         _catch_up_immutable_release(defer=opts.no_gateway_restart, sha=fetched, source=source)
         _apply_pending_fleet_restart_catchup(defer=opts.no_gateway_restart)
@@ -2737,6 +2739,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _windows_gateway_resume=_windows_gateway_resume)
             return
 
+        # The fetch-only proof must not survive into a phase that may stash or rewrite files.
+        _record_update_step("local_changes_stash", False, "checkout preparation started")
         current_branch = _current_branch_name(git_cmd, check=True)
         _commit.record_run_start(git_cmd, _m().PROJECT_ROOT)
         _refuse_before_commit_point(git_cmd, target_ref, _windows_gateway_resume)
