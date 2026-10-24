@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.native_plan is None or args.native_output is None or args.repeat != 1:
                 parser.error("native requires --native-plan and --native-output, not --repeat")
             from tests.drills.zero_cut_handover.native import run_native
-            result = run_native(home=args.home, peer=args.peer, plan=json.loads(args.native_plan.read_text()),
+            result = run_native(home=args.home, peer=args.peer, plan=json.loads(args.native_plan.read_text(encoding="utf-8-sig")),
                                 output=args.native_output, live=True)
             print(json.dumps(result, sort_keys=True))
             return 0 if result["passed"] else 1

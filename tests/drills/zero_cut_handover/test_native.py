@@ -107,3 +107,30 @@ def test_no_guard_or_preflight_failure_can_launch_route(tmp_path):
                           effects=None, live=False)
     assert not calls
     assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_native_cli_reads_utf8_plan_with_optional_bom(tmp_path, monkeypatch, capsys, encoding):
+    import json
+    from scripts import zero_cut_drills
+
+    value = plan(tmp_path)
+    value["reservation"] = "parent-owned café"
+    source = tmp_path / "plan.json"
+    source.write_text(json.dumps(value, ensure_ascii=False), encoding=encoding)
+    calls = []
+
+    def run_native(**kwargs):
+        calls.append(kwargs)
+        return {"passed": True}
+
+    monkeypatch.setenv("ZERO_CUT_DRILLS_LIVE", "1")
+    monkeypatch.setattr(native, "run_native", run_native)
+    result = zero_cut_drills.main([
+        "--home", str(tmp_path / "home"), "--peer", "peer", "--drills", "native",
+        "--native-plan", str(source), "--native-output", str(tmp_path / "output"),
+    ])
+    assert result == 0
+    assert len(calls) == 1
+    assert calls[0]["plan"] == value
+    assert json.loads(capsys.readouterr().out) == {"passed": True}
