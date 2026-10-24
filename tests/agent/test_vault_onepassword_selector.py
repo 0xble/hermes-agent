@@ -33,14 +33,16 @@ def backend():
 
 
 @pytest.mark.parametrize("method,flags,value", [
-    ("resolve_password", ("--fields", "label=password", "--reveal"), "dummy-password"),
+    ("resolve_password", ("--format", "json", "--reveal"), "dummy-password"),
     ("resolve_otp", ("--otp",), "123456"),
 ])
 def test_legacy_handles_resolve_each_items_vault(backend, method, flags, value):
     for item_id, vault_id in [("item-a", "vault-a"), ("item-b", "vault-b")]:
         backend._listing_vault_hint = Mock(return_value=vault_id)
         backend._run.reset_mock()
-        backend._run.side_effect = [json.dumps(item(item_id, vault_id)), value + "\r\n"]
+        secret = json.dumps(dict(item(item_id, vault_id), fields=[
+            {"purpose": "PASSWORD", "value": value}])) if method == "resolve_password" else value
+        backend._run.side_effect = [json.dumps(item(item_id, vault_id)), secret + "\r\n"]
         assert getattr(backend, method)("op:" + item_id) == value
         assert backend._run.call_args_list[0].args == (
             "item", "get", item_id, "--vault", vault_id, "--format", "json")
@@ -85,7 +87,7 @@ def test_moved_item_retries_once_with_a_fresh_listing(backend):
     backend._run.side_effect = [
         RuntimeError("op failed: item not found in vault"),
         json.dumps(item(vault="vault-new")),
-        "dummy-password\n",
+        json.dumps(dict(item(vault="vault-new"), fields=[{"purpose": "PASSWORD", "value": "dummy-password"}])),
     ]
     assert backend.resolve_password("op:item-a") == "dummy-password"
     assert backend._listing_vault_hint.call_args_list[0].kwargs == {}
@@ -125,11 +127,13 @@ def test_fill_metadata_expires_before_secret_read(backend, monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(onepassword.time, "monotonic", lambda: now[0])
     backend._listing_vault_hint = Mock(return_value="vault-a")
-    backend._run.side_effect = [json.dumps(item()), json.dumps(item()), "dummy-password\n"]
+    backend._run.side_effect = [json.dumps(item()), json.dumps(item()), json.dumps(dict(
+        item(), fields=[{"purpose": "PASSWORD", "value": "dummy-password"}]))]
     assert backend.get_meta("op:item-a") is not None
     now[0] += onepassword._FILL_METADATA_TTL_SECONDS + 1
     assert backend.resolve_password("op:item-a") == "dummy-password"
-    metadata_calls = [call for call in backend._run.call_args_list if "--format" in call.args]
+    metadata_calls = [call for call in backend._run.call_args_list
+                      if "--format" in call.args and "--reveal" not in call.args]
     assert len(metadata_calls) == 2
 
 
@@ -143,7 +147,8 @@ def test_missing_vault_fails_closed_for_all_cli_accounts(backend):
 
 def test_fresh_backend_uses_one_cold_listing_then_verified_vault(backend):
     backend._listing_vault_hint = Mock(return_value="vault-new")
-    backend._run.side_effect = [json.dumps(item(vault="vault-new")), "dummy-password\n"]
+    backend._run.side_effect = [json.dumps(item(vault="vault-new")), json.dumps(dict(
+        item(vault="vault-new"), fields=[{"purpose": "PASSWORD", "value": "dummy-password"}]))]
     assert backend.resolve_password("op:item-a") == "dummy-password"
     assert backend._run.call_args_list[0].args == (
         "item", "get", "item-a", "--vault", "vault-new", "--format", "json")
