@@ -193,23 +193,23 @@ def _update_recovery_pending(home: Path) -> bool:
     ))
 
 
-def _local_changes_detail(receipt: dict) -> str:
+def _local_changes_evidence(receipt: dict) -> tuple[bool, str]:
     """HEAD equality says nothing about edits removed from the tree by autostash."""
     for step in reversed(receipt.get("steps") or []):
         if step.get("name") != "local_changes_stash":
             continue
         detail = step.get("detail") or ""
-        if step.get("ok") is True and detail.startswith("restored: "):
-            return ""
+        if step.get("ok") is True and detail.startswith(("restored: ", "not_needed: ")):
+            return True, ""
         if detail.startswith("parked: "):
             stash = detail.removeprefix("parked: ").split(" ", 1)[0]
             if re.fullmatch(r"[0-9a-fA-F]{40}", stash):
-                return f"Local changes remain in stash {stash}; restore with git stash apply {stash}."
-            return "Local changes remain in stash; see the update output before restoring them."
+                return False, f"Local changes remain in stash {stash}; restore with git stash apply {stash}."
+            return False, "Local changes remain in stash; see the update output before restoring them."
         if detail.startswith("discarded: "):
-            return "Local changes were discarded."
-        return "Local changes were not confirmed restored; see the update output."
-    return ""
+            return False, "Local changes were discarded."
+        return False, "Local changes were not confirmed restored; see the update output."
+    return False, ""
 
 
 def _failed_update_detail(home: Path, receipt: dict | None, exit_code: int) -> str:
@@ -227,11 +227,11 @@ def _failed_update_detail(home: Path, receipt: dict | None, exit_code: int) -> s
     # Immutable source HEAD is frozen, so equality alone cannot rule out a promotion.
     changed_runtime = any(receipt.get(key) for key in ("release_transition", "gateway_restart", "fleet"))
     pending_runtime = any((home / name).exists() for name in ("release-txn.json", "fleet_restart_pending"))
-    local_changes = _local_changes_detail(receipt)
+    tree_verified, local_changes = _local_changes_evidence(receipt)
     valid_sha = isinstance(previous, str) and re.fullmatch(r"[0-9a-fA-F]{40}", previous)
     if (receipt.get("outcome") in {"failed", "partial"} and valid_sha and previous == post
             and expected and not disagreement and not changed_runtime and not pending_runtime
-            and not receipt.get("user_action") and not local_changes and not _update_recovery_pending(home)):
+            and tree_verified and not receipt.get("user_action") and not _update_recovery_pending(home)):
         return f"Nothing changed. Still on {expected[:12]}. Cause: {cause}"
     detail = f"Cause: {cause} Runtime state is unverified; see the update output."
     return f"{detail} {local_changes}" if local_changes else detail

@@ -62,6 +62,7 @@ def finalize_update(home, *, outcome="success", fleet_state="current", noop=Fals
     with patch.object(update_receipt, "_receipt_dir", return_value=home / "logs" / "update_receipts"), \
          patch.object(update_receipt, "_code_identity", return_value={"sha": sha}):
         update_receipt.begin_update_receipt()
+        update_receipt.record_step("local_changes_stash", True, "not_needed: clean working tree, no autostash taken")
         if not noop:
             update_receipt.record_gateway_restart(restarted_services=["gateway"])
         path = update_receipt.finalize_update_receipt(outcome, fleet=[] if noop else [{

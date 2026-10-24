@@ -93,6 +93,7 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path, *, checkout_mo
     _pending_autostash = None
     status = _git_run(git_cmd, ["status", "--porcelain", "-z"], cwd, check=True)
     if not status.stdout.strip():
+        _record_stash_disposition("not_needed", "", "clean working tree, no autostash taken")
         return None
     # Unmerged index entries (interrupted merge/rebase) make `git stash` fail with
     # "needs merge"; `git reset` drops only the index conflict state, not the tree.
@@ -118,6 +119,7 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path, *, checkout_mo
         stash_ref = _push_stash(git_cmd, cwd, stash_name, prev_stash)
     _pending_autostash = (
         stash_ref, len([entry for entry in status.stdout.split("\0") if entry]))
+    _record_stash_disposition("parked", stash_ref, "restore pending")
     return stash_ref
 
 
@@ -172,9 +174,14 @@ def _clear_pending_autostash() -> None:
     parked stashes already clear the pending state in _record_stash_disposition.
     """
     global _pending_autostash
+    _record_pending_autostash()
+    _pending_autostash = None
+
+
+def _record_pending_autostash() -> None:
+    """Receipt close must name parked work without suppressing its stdout notice."""
     if _pending_autostash is not None:
         _record_stash_disposition("parked", _pending_autostash[0], "update stopped without a confirmed restore")
-    _pending_autostash = None
 
 
 def _unrestored_autostash_notice() -> Optional[str]:
