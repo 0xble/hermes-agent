@@ -20,6 +20,22 @@ _TITLE_INVISIBLE_RE = re.compile(r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufef
 _NUMBERED_TITLE_RE = re.compile(r'^(.*?) #(\d+)$')
 
 
+def _auto_title_matches(stored: str, candidate: str) -> bool:
+    """Only a stored alias can lose its suffix, never the requested subject's number."""
+    return stored.casefold() == candidate or _NUMBERED_TITLE_RE.sub(r'\1', stored).casefold() == candidate
+
+
+def _auto_title_collides(conn, title: str, exclude_session_id: str) -> bool:
+    """True when another session holds *title* under the automatic-title equivalence rule."""
+    # SQLite's lower()/NOCASE do not implement Unicode casefolding.
+    conn.create_function("auto_title_matches", 2, _auto_title_matches, deterministic=True)
+    return conn.execute(
+        "SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL "
+        "AND auto_title_matches(title, ?) LIMIT 1",
+        (exclude_session_id or "", title.casefold()),
+    ).fetchone() is not None
+
+
 def next_title_in_lineage(conn, base_title: str) -> str:
     """Next title in a lineage ("my session" -> "my session #2") as seen by *conn*: strip any
     " #N" suffix, then increment the highest existing number."""
@@ -80,13 +96,16 @@ class SessionTitlesMixin:
             SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
             """, (descendant_id, ancestor_id, descendant_id)).fetchone() is not None
 
-    def _set_session_title(self, session_id: str, title: str, *, source: str) -> bool:
+    def _set_session_title(self, session_id: str, title: str, *, source: str,
+                           reject_auto_collision: bool = False) -> bool:
         """Write a title, enforcing provenance precedence. A ``user`` write always lands;
         ``derived``/``llm`` land only when the row is untitled or holds strictly lower
         authority (derived upgrades to llm exactly once, nothing overwrites a user name,
         re-running the titler on an llm row is a no-op). No writer may move a hidden
         canonical Bot Chat off its title. Read and write are one compare-and-swap
-        transaction, so a manual ``/title`` racing an in-flight generation is not clobbered."""
+        transaction, so a manual ``/title`` racing an in-flight generation is not clobbered.
+        ``reject_auto_collision`` refuses an automatic title equivalent to another session's
+        inside that same write transaction, so concurrent workers cannot both pass a check."""
         title = self.sanitize_title(title)
         is_user = source == self.TITLE_SOURCE_USER
         new_rank = self._title_rank(source) if not is_user else None
@@ -109,6 +128,8 @@ class SessionTitlesMixin:
                                      "To start fresh, create a new bot instead.")
                 return 0
             if not is_user and current["title"] is not None and self._title_rank(current["title_source"]) >= new_rank:
+                return 0
+            if reject_auto_collision and not is_user and title and _auto_title_collides(conn, title, session_id):
                 return 0
             if title:
                 self._resolve_title_conflict(conn, session_id, title)
@@ -193,19 +214,27 @@ class SessionTitlesMixin:
         ValueError on conflict or validation failure."""
         return self._set_session_title(session_id, title, source=self.TITLE_SOURCE_USER)
 
-    def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
-        """Set an automatic title; False (untouched) when a higher-authority title holds the row."""
+    def set_auto_title(self, session_id: str, title: str, *, source: str, reject_collision: bool = False) -> bool:
+        """Set an automatic title; False (untouched) when a higher-authority title holds the row,
+        or, with ``reject_collision``, when another session holds an equivalent title."""
         if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
             raise ValueError(f"invalid automatic title source: {source!r}")
-        return self._set_session_title(session_id, title, source=source)
+        return self._set_session_title(session_id, title, source=source, reject_auto_collision=reject_collision)
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
         row = self._read_one("SELECT title FROM sessions WHERE id = ?", (session_id,))
         return row["title"] if row else None
 
+    def has_auto_title_collision(self, title: str, *, exclude_session_id: Optional[str] = None) -> bool:
+        """Check one candidate without transferring or sorting the title inventory."""
+        if not title:
+            return False
+        with self._read_ctx() as conn:
+            return _auto_title_collides(conn, title, exclude_session_id or "")
+
     def list_recent_session_titles(self, exclude_session_id: Optional[str] = None, limit: int = 20):
-        """Return recent non-empty titles, newest first, excluding the active session."""
+        """Return non-empty titles, newest first, excluding the active session."""
         params = []
         where = "title IS NOT NULL AND TRIM(title) != ''"
         if exclude_session_id:
