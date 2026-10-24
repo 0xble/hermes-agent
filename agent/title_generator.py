@@ -942,7 +942,7 @@ def _has_upgraded_title(session_db, session_id: str) -> bool:
         return True
 
 
-def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):
+def _persist_session_title(session_db, session_id, title, *, source, dedupe=True, reject_collision=False):
     """Persist at *source* authority via ``set_auto_title`` (precedence check + write in one
     transaction, so a manual ``/title`` is never overwritten); None when a higher authority held the row.
     ``ValueError`` = unique-title index collision → append ``#N`` via ``get_next_title_in_lineage``;
@@ -956,9 +956,11 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
 
     def _set(candidate):
         if auto_fn is not None:
-            if auto_fn(session_id, candidate, source=source):
+            kwargs = {"reject_collision": True} if reject_collision else {}
+            if auto_fn(session_id, candidate, source=source, **kwargs):
                 return candidate
-            logger.debug("Skipping %s title: a higher-authority title already holds session %s", source, session_id)
+            logger.debug("Skipping %s title: a higher-authority or equivalent title holds session %s",
+                         source, session_id)
             return None
         legacy_fn = getattr(session_db, "set_auto_title_if_empty", None)  # older store without provenance
         if legacy_fn is not None:
@@ -1098,17 +1100,14 @@ def auto_title_session(
         if not title:
             return
         # Only a usable final candidate may acquire final authority. A derived
-        # replacement has not passed the model candidate's earlier checks.
-        if source == "llm":
-            if is_junk_title(title):
-                logger.debug("Auto-title held: unsupported final subject")
-                return
-            with suppress(Exception):
-                if session_db.has_auto_title_collision(title, exclude_session_id=session_id):
-                    logger.debug("Auto-title held: duplicate final subject")
-                    return
+        # replacement has not passed the model candidate's earlier checks, and an
+        # earlier collision read can be stale, so the write rechecks atomically.
+        if source == "llm" and is_junk_title(title):
+            logger.debug("Auto-title held: unsupported final subject")
+            return
         try:
-            persisted = _persist_session_title(session_db, session_id, title, source=source)
+            persisted = _persist_session_title(session_db, session_id, title, source=source,
+                                               reject_collision=source == "llm")
         except Exception as e:
             logger.debug("Failed to set auto-generated title: %s", e)
             return

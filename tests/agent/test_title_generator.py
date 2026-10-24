@@ -534,7 +534,7 @@ class TestAutoTitleSession:
                 title_callback=lambda title, source: seen.append((title, source)),
             )
         db.set_auto_title.assert_called_once_with(
-            "sess-1", "Readable Session", source="llm"
+            "sess-1", "Readable Session", source="llm", reject_collision=True
         )
         # The stage reaches the consumer, so one that spends a rate-limited
         # remote call per title can take this and skip the derived one.
