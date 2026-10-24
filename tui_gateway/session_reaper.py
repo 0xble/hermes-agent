@@ -298,9 +298,12 @@ def _repair_missing_ws_orphan_reaps() -> None:
     # Reuse that cleanup (including surviving viewers), never revoke a fence from
     # a stale liveness snapshot.
     with _sessions_lock:
-        closed_transports = [session.get("transport") for session in _sessions.values()
-                             if session.get("transport") is not _detached_ws_transport
-                             and _transport_is_dead(session.get("transport"))]
+        closed_transports = [
+            peer for session in _sessions.values()
+            for peer in (session["transport"].transports()
+                         if isinstance(session.get("transport"), FanoutTransport)
+                         else [session.get("transport")])
+            if peer is not _detached_ws_transport and _transport_is_dead(peer)]
     for transport in closed_transports:
         _close_sessions_for_transport(transport)
     with _sessions_lock:

@@ -677,12 +677,16 @@ def _close_session_by_id(
 
 
 def _ws_session_is_detached(session: dict | None) -> bool:
-    """True if a live session is still bound to the disconnected-WS sentinel."""
-    return bool(session and not session.get("_finalized") and session.get("transport") is _detached_ws_transport)
+    """True for a parked mailbox (or a legacy disconnected-WS sentinel)."""
+    if not session or session.get("_finalized"):
+        return False
+    transport = session.get("transport")
+    return (transport is _detached_ws_transport
+            or isinstance(transport, FanoutTransport) and not transport.transports())
 
 
 def _ws_session_is_orphaned(session: dict | None) -> bool:
-    """True if a WS session sits on ``_detached_ws_transport`` (where ``handle_ws`` parks disconnected clients), idle."""
+    """True if a WS session has no attached peer and is idle."""
     return bool(_ws_session_is_detached(session) and not session.get("running"))
 
 
@@ -1045,7 +1049,8 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
                 if live:
                     _rebind_live_transport(sid, current, live[-1])
                 else:
-                    current["transport"] = _detached_ws_transport
+                    # Keep the empty mailbox and any in-flight detached writer.
+                    # Reconnect changes membership, never the ordering authority.
                     current.pop("_client_gone_interrupt_requested", None)
                     current.pop("_client_gone_interrupt_polls", None)
                     should_schedule_reap = True
@@ -1058,6 +1063,22 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
         elif should_schedule_reap:
             detached += 1
     return reaped, detached
+
+
+def _shutdown_live_sessions() -> None:
+    # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
+    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
+        with contextlib.suppress(Exception):
+            step()
+    with _sessions_lock:
+        sessions = list(_sessions.items())
+    for sid, _session in sessions:
+        _close_session_by_id(sid, end_reason="tui_shutdown")
+    # Session events now use daemon mailbox writers even on stdio. A graceful
+    # exit must wait for final admitted frames rather than lose them at exit.
+    for _sid, session in sessions:
+        if isinstance(publisher := session.get("transport"), FanoutTransport):
+            publisher.flush()
 
 
 def register(server) -> None:

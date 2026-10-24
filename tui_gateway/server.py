@@ -391,14 +391,7 @@ def _load_interim_assistant_messages() -> bool:
 
 
 def _shutdown_sessions() -> None:
-    # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
-    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
-        with contextlib.suppress(Exception):
-            step()
-    with _sessions_lock:
-        sids = list(_sessions)
-    for sid in sids:
-        _close_session_by_id(sid, end_reason="tui_shutdown")
+    _shutdown_live_sessions()
 
 
 # Session reaping / flushing knobs (session_reaper.py). TTL is the last-resort net for disconnect paths that
@@ -684,16 +677,16 @@ def write_json(obj: dict) -> bool:
     Every event frame gets a per-session monotonic ``seq`` + replay-ring entry so ``session.events.since`` can resume."""
     from tui_gateway.event_replay import _stamp_event
     from tui_gateway.hosted_room_member_activity import project_room_member_activity
-    _stamp_event(obj)
     params = obj.get("params")
     if obj.get("method") == "event" or (isinstance(obj.get("id"), str) and "method" in obj):
         # Event notifications AND server→client requests carry ``params.session_id``; both route to the
         # owning session's transport. A room member's hidden session has no transport: its frames would
         # die at stdio below.
-        project_room_member_activity(obj, _sessions)
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+            return _publish_session_frame(obj, t)
+        _stamp_event(obj)
+        project_room_member_activity(obj, _sessions)
     return (current_transport() or _stdio_transport).write(obj)
 
 
@@ -2815,7 +2808,7 @@ def _init_session(
             # In-session /model switch, honored on rebuild (/new, resume) — never leaks to siblings via env vars.
             "model_override": None,
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
-            "transport": current_transport() or _stdio_transport,
+            "transport": _new_session_publisher(current_transport() or _stdio_transport),
             "auth_user_id": _transport_auth_user_id(current_transport()),
         }
         _session_todo_state(_sessions[sid])
@@ -2900,7 +2893,7 @@ def _deferred_session_record(
         "running": False, "session_key": session_key, "show_reasoning": _load_show_reasoning(),
         "slash_worker": None, "source": source, "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {}, "todo_state": todo_state,
-        "transport": current_transport() or _stdio_transport,
+        "transport": _new_session_publisher(current_transport() or _stdio_transport),
         "auth_user_id": _transport_auth_user_id(current_transport()),
     }
 
@@ -2950,7 +2943,7 @@ def _claim_parked_runtimes(session_key: str, *, keep_sid: str, profile_home=_ANY
             (old_sid, old) for old_sid, old in list(_sessions.items())
             if old_sid != keep_sid and not old.get("_finalized")
             and _session_lookup_key(old, fallback=old_sid) == session_key
-            and _live_profile_matches(old, profile_home) and old.get("transport") is _detached_ws_transport]
+            and _live_profile_matches(old, profile_home) and _ws_session_is_detached(old)]
     for old_sid, _old in candidates:
         _cancel_ws_orphan_reap(old_sid)
         if (popped := _pop_session_by_id(old_sid)) is not None:
