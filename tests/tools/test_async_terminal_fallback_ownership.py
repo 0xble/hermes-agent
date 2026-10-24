@@ -11,16 +11,16 @@ from tools import async_delegation as ad
 from tools.process_registry import process_registry
 
 
-def _record(delegation_id="deleg_race"):
+def _record(delegation_id="deleg_race", *, session_key="synthetic-parent", parent_session_id="root"):
     return {
         "delegation_id": delegation_id,
         "status": "running",
         "_durable_state": "running",
         "dispatched_at": time.time(),
         "completed_at": time.time(),
-        "session_key": "synthetic-parent",
+        "session_key": session_key,
         "origin_ui_session_id": "ui",
-        "parent_session_id": "root",
+        "parent_session_id": parent_session_id,
         "goal": "preserve the real result",
         "is_batch": True,
         "goals": ["first", "second"],
@@ -465,12 +465,12 @@ def test_missing_lifecycle_row_keeps_result_in_memory_without_phantom_outbox(tmp
         assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone() == (0,)
 
 
-def _unproven_loser(tmp_path, monkeypatch, q):
+def _unproven_loser(tmp_path, monkeypatch, q, *, session_key="synthetic-parent", parent_session_id="root"):
     """A competing winner owns the row; this writer's reconciliation is unavailable."""
     monkeypatch.setattr(ad, "_unresolved", {})
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(process_registry, "completion_queue", q)
-    record = _record("deleg_consumer_loser")
+    record = _record("deleg_consumer_loser", session_key=session_key, parent_session_id=parent_session_id)
     _persist_running(record)
     winner, loser = _result("consumer winner"), _result("consumer loser")
     assert ad._persist_completion(_winner_event(record, winner), winner, expected_state="running")
@@ -552,11 +552,12 @@ def test_failed_gateway_primary_requeues_permanently_rejected_sibling(tmp_path, 
     q = queue.Queue()
     reconcile = ad._reconcile_terminal_write
     persist_completion = ad._persist_completion
-    loser_record, winner = _unproven_loser(tmp_path, monkeypatch, q)
+    loser_record, winner = _unproven_loser(
+        tmp_path, monkeypatch, q, session_key="agent:main:telegram:dm:12345:678", parent_session_id="")
     loser = _drain_one(q)
     monkeypatch.setattr(ad, "_reconcile_terminal_write", reconcile)
     monkeypatch.setattr(ad, "_persist_completion", persist_completion)
-    primary_record = _record("deleg_retry_primary")
+    primary_record = _record("deleg_retry_primary", session_key=loser_record["session_key"], parent_session_id="")
     _persist_running(primary_record)
     ad._push_completion_event(primary_record, _result("primary owned result"), "completed")
     primary = _drain_one(q)
@@ -572,8 +573,6 @@ def test_failed_gateway_primary_requeues_permanently_rejected_sibling(tmp_path, 
     runner._background_tasks = set()
     runner._ensure_completion_batch_state()
     for evt in group:
-        evt["session_key"] = "agent:main:telegram:dm:12345:678"
-        evt.pop("parent_session_id", None)
         runner._enrich_async_delegation_routing(evt)
     monkeypatch.setattr(runner, "_completion_delivery_ready", AsyncMock(return_value=True))
     injection = AsyncMock(side_effect=[False, True, True])
@@ -604,8 +603,6 @@ def test_failed_gateway_primary_requeues_permanently_rejected_sibling(tmp_path, 
     assert ad.restore_undelivered_completions(replay) == 1
     winner_event = _drain_one(replay)
     assert winner_event["results"] == winner["results"]
-    winner_event["session_key"] = primary["session_key"]
-    winner_event.pop("parent_session_id", None)
     assert asyncio.run(runner._deliver_async_delegation_group([winner_event])) is True
     assert _row(loser_record["delegation_id"])[1] == "delivered"
     assert ad.restore_undelivered_completions(queue.Queue()) == 0
@@ -659,7 +656,8 @@ def test_gateway_watcher_never_injects_an_unproven_terminal_result(tmp_path, mon
     from collections import OrderedDict
 
     q = queue.Queue()
-    record, _winner = _unproven_loser(tmp_path, monkeypatch, q)
+    record, _winner = _unproven_loser(
+        tmp_path, monkeypatch, q, session_key="agent:main:telegram:dm:12345:678", parent_session_id="")
     monkeypatch.setattr(ad, "_owner_liveness", lambda: None)
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = object.__new__(GatewayRunner)
@@ -673,9 +671,7 @@ def test_gateway_watcher_never_injects_an_unproven_terminal_result(tmp_path, mon
     runner._completion_delivery_retention = 2048
     runner._background_tasks = set()
     runner._completion_notification_batch_window = 0
-    event = q.queue[0]
-    event["session_key"] = "agent:main:telegram:dm:12345:678"
-    event.pop("parent_session_id", None)  # no /new-boundary lookup: reach the durable claim
+
     sleeps = []
 
     async def _bounded_sleep(_delay):

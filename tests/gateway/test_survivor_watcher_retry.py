@@ -33,6 +33,7 @@ async def test_transient_watcher_delivery_failure_retries_until_delivered(tmp_pa
     session = ProcessSession(
         id="proc_transient", command="echo finished", task_id="task", session_key="session",
         survive_restart=True, exited=True, exit_code=0,
+        watcher_platform="telegram", watcher_chat_id="123",
         delivered_path=str(tmp_path / "home" / "process-runs" / "proc_transient" / "delivered"),
     )
     registry._finished[session.id] = session
@@ -65,7 +66,8 @@ async def test_transient_watcher_delivery_failure_retries_until_delivered(tmp_pa
         assert len(delays) <= 3
 
     monkeypatch.setattr("gateway.run_notifications.asyncio.sleep", sleep)
-    watcher = {"session_id": session.id, "check_interval": 0.01, "platform": "telegram", "chat_id": "123"}
+    watcher = {"session_id": session.id, "session_key": session.session_key,
+               "check_interval": 0.01, "platform": "telegram", "chat_id": "123"}
     await runner._run_process_watcher(watcher)
     assert sends == (["claimed", "claimed"] if failure == "send-raises" else ["claimed"])
     assert registry._survivor_delivery_state(session) == "delivered"

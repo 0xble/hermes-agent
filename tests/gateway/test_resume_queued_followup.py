@@ -563,6 +563,9 @@ async def test_overlapping_off_loop_recovery_claims_spool_once(tmp_path, monkeyp
     runner, _adapter, source, key, _db = _spooled_runner(tmp_path, monkeypatch)
     assert flush_pending_to_file({key: MessageEvent(text="queued", source=source, user_id="u1")}) == 1
     runner._schedule_resume_pending_sessions = MagicMock(return_value=0)
+    # Observe claim publication before the separate replay scheduler consumes it.
+    runner._schedule_startup_restore_drain = MagicMock()
+    spool, = (tmp_path / "pending_messages").glob("*.json")
     candidates = runner._resume_pending_candidates()
     claimed = threading.Event()
     release = threading.Event()
@@ -589,6 +592,9 @@ async def test_overlapping_off_loop_recovery_claims_spool_once(tmp_path, monkeyp
 
     assert claim_count == 1
     assert len(runner._startup_restore_queue) == 1
+    assert runner._startup_restore_queue[0].text == "queued"
+    assert getattr(runner._startup_restore_queue[0], "_hermes_recovery_spool", None) == spool
+    assert spool.exists()
 
 
 @pytest.mark.asyncio

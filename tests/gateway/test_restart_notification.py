@@ -568,6 +568,7 @@ async def test_survivor_text_watcher_retries_failed_send_before_acknowledging(tm
     registry = ProcessRegistry()
     registry._finished["proc_retry"] = ProcessSession(
         id="proc_retry", command="echo ok", task_id="task", session_key="session", survive_restart=True,
+        watcher_platform="telegram", watcher_chat_id="123",
         exited=True, exit_code=0, log_path=str(run_dir / "out.log"),
         delivered_path=str(run_dir / "delivered"), output_buffer="ok")
     monkeypatch.setattr(registry_module, "process_registry", registry)
@@ -584,7 +585,7 @@ async def test_survivor_text_watcher_retries_failed_send_before_acknowledging(tm
 
     adapter.send = send
     await asyncio.wait_for(runner._run_process_watcher({
-        "session_id": "proc_retry", "check_interval": 0.01,
+        "session_id": "proc_retry", "session_key": "session", "check_interval": 0.01,
         "platform": "telegram", "chat_id": "123"}), timeout=5)
     assert sent == ["claimed", "claimed"]
     assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
