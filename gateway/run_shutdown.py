@@ -758,6 +758,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
 
     def _exit_external_drain(self) -> None:
         """Cancel external drain: re-accept new turns. Idempotent; never resurrects a stopping gateway."""
+        if (getattr(self, "_zero_cut_handover_state", None) or {}).get("accepted"):
+            return  # an accepted polling transfer is not a reversible NAS drain
         if not self._external_drain_active:
             return
         self._external_drain_active = False
@@ -2208,6 +2210,23 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                         reason: Optional[str] = None) -> bool:
         if self._restart_task_started:
             return False
+        from gateway.config import is_zero_cut_handover_enabled
+        if is_zero_cut_handover_enabled(getattr(self, "config", None)):
+            self._restart_task_started = True
+
+            async def hand_over():
+                try:
+                    from hermes_cli.gateway_handover import planned_handover
+                    if await asyncio.to_thread(planned_handover) is not True:
+                        logger.error("Planned restart handover refused, existing work left intact")
+                except Exception:
+                    logger.exception("Planned restart handover failed, no destructive fallback")
+                finally:
+                    self._restart_task_started = False
+
+            # Not a shutdown request: active turns and completion delivery keep their owners.
+            self._restart_task = Context().run(lambda: asyncio.create_task(hand_over()))
+            return True
         self._restart_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
         self._restart_requested = True
         self._restart_detached = detached

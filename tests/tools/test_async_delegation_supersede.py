@@ -105,7 +105,12 @@ def test_unit_replaced_from_its_stop_hook_reports_only_through_the_replacement(m
     assert row["state"] != "running" and row["delivery_state"] == "superseded"  # recorded, never replayed
     import queue
     replay = queue.Queue()
-    ad.restore_undelivered_completions(replay)  # after a restart, only the replacement is still owed to the parent
+    # A successor must not steal completion delivery while the original parent is
+    # still alive. Model an actual owner death before asserting startup recovery.
+    assert ad.restore_undelivered_completions(replay) == 0
+    assert replay.empty()
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda _pid, _started: False)
+    ad.restore_undelivered_completions(replay)  # after owner death, only the replacement is still owed to the parent
     assert [replay.get_nowait()["delegation_id"] for _ in range(replay.qsize())] == replacements
 
 

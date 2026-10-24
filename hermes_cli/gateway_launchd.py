@@ -413,8 +413,17 @@ def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a
     the default active slot is byte-identical to the historical output.
     """
     from html import escape
-    # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
-    working_dir = str(_gw().get_hermes_home() / "current") if release_target else _gw()._stable_service_working_dir()
+    # Both slots alternate roles. Pin their interpreter/cwd/PATH together only
+    # under the opt-in handover policy. Legacy single-slot definitions retain
+    # lexical current aliases, while both modes bind the selected code root.
+    launch_root = None
+    if release_target is not None:
+        from gateway.config import is_zero_cut_handover_enabled
+        from hermes_cli.config import load_config_readonly
+        launch_root = (Path(release_target).resolve()
+                       if is_zero_cut_handover_enabled(load_config_readonly())
+                       else _gw().get_hermes_home() / "current")
+    working_dir = str(launch_root) if launch_root is not None else _gw()._stable_service_working_dir()
     hermes_home = str(_gw().get_hermes_home().resolve())
     log_dir = _gw().get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -427,7 +436,7 @@ def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a
         root = Path(release_target)
         if not (root / ".venv" / "bin" / "python").is_file():
             raise RuntimeError(f"candidate launchd interpreter unavailable: {root}")
-        priority_dirs = [str(_gw().get_hermes_home() / "current" / ".venv" / "bin"),
+        priority_dirs = [str(launch_root / ".venv" / "bin"),
                          *[entry for entry in priority_dirs if entry != str(root / ".venv" / "bin")]]
     _gw()._append_node_dir_for_service(priority_dirs)
     sane_path = ":".join(dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]))
@@ -435,8 +444,7 @@ def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).
     stdout_log, stderr_log = log_dir / "gateway.log", log_dir / "gateway.error.log"
-    interpreter = (str(_gw().get_hermes_home() / "current" / ".venv" / "bin" / "python")
-                   if release_target else None)
+    interpreter = str(launch_root / ".venv" / "bin" / "python") if launch_root is not None else None
     command = _timestamped_stderr_gateway_command(
         stderr_log, external_supervisor=True, interpreter=interpreter,
         release_root=release_target)
@@ -673,6 +681,10 @@ def refresh_launchd_plist_if_needed() -> bool | str:
 
 def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
     """Re-register the installed bytes (including a saved source-checkout plist)."""
+    from hermes_cli.gateway_handover import planned_handover
+    handed_over = planned_handover()
+    if handed_over is not None:
+        return handed_over
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"
@@ -907,6 +919,12 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    from hermes_cli.gateway_handover import planned_handover
+    handed_over = planned_handover()
+    if handed_over is not None:
+        if not handed_over:
+            raise RuntimeError("planned handover refused, existing work left intact")
+        return
     from hermes_cli.gateway_guardian import set_intent
     set_intent(_gw().get_hermes_home(), stopped=False)
     label = _gw().get_launchd_label()

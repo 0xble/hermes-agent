@@ -874,12 +874,23 @@ def restore_undelivered_completions(target_queue) -> int:
     recover_abandoned_delegations()
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
+        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
+                                      owner_pid, owner_started_at
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
+        alive = _owner_liveness()
+        rows = [row[:4] for row in rows if alive is not None and not alive(row[4], row[5])]
         restored = _replay_pending(conn, rows, target_queue, now)
-        restored += _replay_outbox_pending(conn, _outbox_delivery_rows(conn), target_queue, now)
+        outbox_rows = conn.execute("""SELECT e.event_id, e.event_json, e.created_at, e.updated_at,
+                                            d.owner_pid, d.owner_started_at
+            FROM async_delegation_events e
+            LEFT JOIN async_delegations d ON d.delegation_id=e.delegation_id
+            WHERE e.delivery_state='pending' AND e.event_json IS NOT NULL
+            ORDER BY e.created_at, e.event_id""").fetchall()
+        outbox_rows = [row[:4] for row in outbox_rows if alive is not None
+                       and not alive(row[4], row[5])]
+        restored += _replay_outbox_pending(conn, outbox_rows, target_queue, now)
         return restored
 
 
@@ -1347,6 +1358,18 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
             _executor._max_workers = max_workers
             _executor_max_workers = max_workers
         return _executor
+
+
+def owned_pending_count() -> int:
+    """Terminal completions still owed by this live owner, before or after queue dispatch."""
+    if not _db_path().exists():
+        return 0
+    with _DB_LOCK, _transaction() as conn:
+        return conn.execute("""SELECT COUNT(*) FROM async_delegations
+            WHERE owner_pid=? AND delivery_state='pending'""", (os.getpid(),)).fetchone()[0] + conn.execute(
+            """SELECT COUNT(*) FROM async_delegation_events e JOIN async_delegations d
+            ON d.delegation_id=e.delegation_id WHERE d.owner_pid=? AND e.delivery_state='pending'""",
+            (os.getpid(),)).fetchone()[0]
 
 
 def active_count() -> int:

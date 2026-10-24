@@ -138,7 +138,7 @@ async def test_promote_connects_once_starts_cron_and_is_idempotent(monkeypatch):
     first = await zcs.promote(runner)
     second = await zcs.promote(runner)
     assert first == {"promoted": True, "already": False, "failed": []}
-    assert second == {"promoted": True, "already": True}
+    assert second == {"promoted": True, "already": True, "failed": []}
     assert runner.adapters[platform] is adapter
     assert runner._zero_cut_cron_handles == ("stop", "provider", "cron", "house")
     assert calls.count("publish") == 1
@@ -168,9 +168,11 @@ async def test_promote_queues_failed_primary_connect_for_reconnect(monkeypatch):
     zcs.defer_platform(runner, platform, config)
     zcs.mark_ready()
     result = await zcs.promote(runner)
-    assert result == {"promoted": True, "already": False, "failed": ["telegram"]}
+    assert result == {"promoted": False, "failed": ["telegram"]}
     assert runner._failed_platforms[platform] == {"adapter": adapter, "config": config}
     assert runner.adapters == {}
+    assert zcs.is_standby() is True
+    assert zcs.readiness()["deferred"] == ["telegram"]
 
 
 @pytest.mark.asyncio
@@ -476,9 +478,10 @@ async def test_promote_secondary_connect_raise_is_queued_for_reconnect(monkeypat
     zcs.defer_platform(runner, Platform.TELEGRAM, object(), profile="work")
     zcs.mark_ready()
     result = await zcs.promote(runner)
-    assert result == {"promoted": True, "already": False, "failed": ["work:telegram"]}
+    assert result == {"promoted": False, "failed": ["work:telegram"]}
     assert reconnects == [("work", Platform.TELEGRAM)]
-    assert zcs.is_standby() is False
+    assert zcs.is_standby() is True
+    assert zcs.readiness()["deferred"] == ["work:telegram"]
 
 
 def _hold_lock(path):

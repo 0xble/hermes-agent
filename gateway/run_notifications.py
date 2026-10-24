@@ -2060,9 +2060,15 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
     async def _completion_event_scope(self, evt: dict):
         # Scope setup reads the routing store too; entering the context itself must
         # stay on-loop so the target profile's contextvars cover the awaited body.
-        source = await asyncio.to_thread(self._build_process_event_source, evt)
-        async with self._completion_event_context(evt, source):
-            yield
+        # Queue removal is not delivery settlement. Keep this owner live across routing/database
+        # awaits before a batch, wake, or transport claim has been installed.
+        self._completion_events_active = getattr(self, "_completion_events_active", 0) + 1
+        try:
+            source = await asyncio.to_thread(self._build_process_event_source, evt)
+            async with self._completion_event_context(evt, source):
+                yield
+        finally:
+            self._completion_events_active -= 1
 
     def _completion_event_context(self, evt: dict, source):
         """Profile runtime scope of the session a completion event targets (a no-op context when the

@@ -63,6 +63,7 @@ def test_release_plist_executes_selected_release_with_managed_source_launcher(tm
     from hermes_cli._launchers import resolve_store_python
     from pm.environments import store_root
 
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"gateway": {"zero_cut_handover": {"enabled": False}}})
     home = tmp_path / "profile"
     source = tmp_path / "source"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -1556,3 +1557,52 @@ def test_candidate_import_smoke_rejects_disabled_enabled_manifest_only_language_
 
     with pytest.raises(RuntimeError, match="disabled via config"):
         releases.smoke_plugins(source, home)
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("slot", ["a", "b"])
+def test_saved_release_plist_policy_survives_pointer_movement(tmp_path, monkeypatch, enabled, slot):
+    """Execute saved definitions after current moves, including the actual process cwd."""
+    import plistlib
+    import shutil
+    import venv
+    from hermes_cli import gateway, stderr_timestamp
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: sys.executable)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+        "gateway": {"zero_cut_handover": {"enabled": enabled}}})
+    for marker in ("A", "B"):
+        root = home / "releases" / marker
+        _fake_release(root, marker)
+        (root / ".venv/bin/python").unlink()
+        venv.EnvBuilder(with_pip=False).create(root / ".venv")
+        package = root / "hermes_cli"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        shutil.copy2(stderr_timestamp.__file__, package / "stderr_timestamp.py")
+        (root / "hermes_bootstrap.py").write_text(
+            "import os,pathlib\n"
+            "with pathlib.Path(os.environ['HERMES_HOME'], 'bootstraps').open('a') as f: f.write(str(pathlib.Path(__file__).parent)+'\\n')\n")
+        (package / "main.py").write_text(
+            "import json,os,pathlib,sys\n"
+            "pathlib.Path(os.environ['HERMES_HOME'],'observed.json').write_text(json.dumps({'root':str(pathlib.Path(__file__).parent.parent),'python':sys.executable,'cwd':os.getcwd(),'path':os.environ['PATH'].split(':')[0],'argv':sys.argv[1:]}))\n")
+    for selected, moved in (("A", "B"), ("B", "A")):
+        root = home / "releases" / selected
+        other = home / "releases" / moved
+        releases.promote(home, root)
+        saved = plistlib.loads(gateway.generate_launchd_plist(release_target=root, slot=slot).encode())
+        releases.promote(home, other)
+        (home / "bootstraps").unlink(missing_ok=True)
+        subprocess.run(saved["ProgramArguments"], cwd=saved["WorkingDirectory"],
+                       env={**os.environ, **saved["EnvironmentVariables"]}, check=True, timeout=30)
+        observed = json.loads((home / "observed.json").read_text())
+        launch_root = root if enabled else home / "current"
+        assert observed == {"root": str(root), "python": str(launch_root / ".venv/bin/python"),
+                            "cwd": str(root if enabled else other), "path": str(launch_root / ".venv/bin"),
+                            "argv": ["gateway", "run", "--external-supervisor"]}
+        assert (home / "bootstraps").read_text().splitlines() == [str(root), str(root)]
+        assert saved["WorkingDirectory"] == str(launch_root)
+        assert saved["EnvironmentVariables"].get("HERMES_GATEWAY_SLOT", "a") == slot

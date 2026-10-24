@@ -22,9 +22,49 @@ def _status(runner) -> dict[str, Any]:
         }
     active = runner._running_agent_count()
     queued = _queued_followups(runner)
+    work = _owned_work(runner)
     state["active_turns"] = active
-    state["idle"] = bool(state["token_lock_released"] and active == 0 and not queued)
+    state["active_work"] = work
+    state["idle"] = bool(state["token_lock_released"] and work == 0 and not queued)
     return dict(state)
+
+
+def _owned_work(runner) -> int:
+    """Retire only after finite work AND its delivery settle, never after an idle chat gap.
+
+    Reuse the same owners as explicit shutdown, but do not exclude delegations, ordinary commands,
+    or wedged work. An unreadable owner is uncertainty, not permission to destroy it.
+    """
+    try:
+        count = getattr(runner, "_active_work_count", runner._running_agent_count)()
+        from tools.process_registry import process_registry as registry
+        count += registry.count_running() + registry.completion_queue.qsize()
+        from gateway.delivery_ledger import owned_pending_count as deliveries
+        from tools.async_delegation import owned_pending_count as delegations
+        from tools.approval import pending_gateway_approval_count
+        count += deliveries() + delegations() + pending_gateway_approval_count()
+        from gateway.run import _profile_runtime_scope
+        from pathlib import Path
+        primary = getattr(runner, "_primary_profile_name", None)
+        for profile, home in (getattr(runner, "_served_profile_homes", None) or {}).items():
+            if profile != primary:
+                with _profile_runtime_scope(Path(home), {}):
+                    count += deliveries() + delegations()
+        count += len(registry.pending_watchers)
+        count += sum(
+            not task.done() and not getattr(task, "_hermes_supervised_watcher", False)
+            and task is not getattr(runner, "_zero_cut_handover_task", None)
+            and task.get_name() not in {"zero-cut-handover", "zero-cut-adopt-predecessor-duties"}
+            for task in getattr(runner, "_background_tasks", ())
+        )
+        for name in ("_completion_deliveries_inflight", "_completion_notification_batches",
+                     "_async_delegation_batches", "_completion_notification_batch_flush_tasks",
+                     "_async_delegation_batch_flush_tasks", "_pending_approvals"):
+            count += len(getattr(runner, name, ()) or ())
+        return count + getattr(runner, "_completion_events_active", 0)
+    except Exception:
+        logger.exception("Cannot prove handover owner idle")
+        return 1
 
 
 def _queued_followups(runner) -> int:
@@ -37,7 +77,7 @@ def _queued_followups(runner) -> int:
     # turn count drops before the adapter finishes delivering the final and starting that follow-up.
     # Exiting in that gap flushed the follow-up to disk and left the final unconfirmed, so the
     # successor re-sent it as a "may be a duplicate" recovery (found in a real drill).
-    for adapter in (getattr(runner, "adapters", {}) or {}).values():
+    for adapter in _telegram_adapters(runner):
         for name in ("_active_sessions", "_pending_messages"):
             values = getattr(adapter, name, None)
             if isinstance(values, dict):
@@ -46,10 +86,15 @@ def _queued_followups(runner) -> int:
 
 
 def _telegram_adapters(runner):
-    for adapter in (getattr(runner, "adapters", {}) or {}).values():
-        platform = getattr(adapter, "platform", None)
-        if getattr(platform, "value", platform) == "telegram":
-            yield adapter
+    seen = set()
+    maps = [getattr(runner, "adapters", {}) or {},
+            *(getattr(runner, "_profile_adapters", {}) or {}).values()]
+    for adapters in maps:
+        for adapter in adapters.values():
+            platform = getattr(adapter, "platform", None)
+            if getattr(platform, "value", platform) == "telegram" and id(adapter) not in seen:
+                seen.add(id(adapter))
+                yield adapter
 
 
 async def _handover(runner) -> None:
@@ -62,7 +107,8 @@ async def _handover(runner) -> None:
             if not result.get("settled"):
                 _fail(runner, result.get("reason", "telegram updates did not settle"))
                 return
-        runner._draining = True
+        # This is not shutdown. Keep local follow-ups, completion wakes and approval threads runnable.
+        # Polling has stopped and _external_drain_active gates new autonomous/cron/API admission.
         state = runner._zero_cut_handover_state
         state["updates_settled"] = True
         for adapter in adapters:
@@ -75,6 +121,7 @@ async def _handover(runner) -> None:
 
 
 async def _wait_for_idle(runner) -> None:
+    runner._zero_cut_handover_task = asyncio.current_task()
     while True:
         status = _status(runner)
         if status["idle"]:

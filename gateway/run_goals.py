@@ -220,6 +220,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _heartbeat_poll_once(self, watch: dict) -> None:
         """Wake each idle watched session once; leave busy sessions' ticks unclaimed."""
+        if getattr(self, "_external_drain_active", False):
+            return
         for quick_key, (source, session_id) in list(watch.items()):
             try:
                 with self._profile_scope_for_source(source):
@@ -906,6 +908,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         no live, admitted, queued or restart-recovering turn owns it, then recovery skips it and
         schedules the next tick without pausing the loop.
         """
+        if getattr(self, "_external_drain_active", False):
+            return
         from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
 
         route = state.route or {}
@@ -1134,6 +1138,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         elapsed timed wait produces no turn, so without this the goal stays parked until an
         unrelated message arrives. The barrier is cleared only after the adapter admitted the
         continuation; a busy or unroutable session keeps it for the next scan."""
+        if getattr(self, "_external_drain_active", False):
+            return
         from hermes_cli.goals import GoalManager
 
         store = getattr(self, "session_store", None)

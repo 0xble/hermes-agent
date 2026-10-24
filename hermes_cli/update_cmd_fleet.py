@@ -929,7 +929,11 @@ def _acknowledged_release_launchd_label(home: Path, root: Path) -> str | None:
             return None
         # A durable ACK is historical. Credit it only while the very gateway it
         # acknowledged is still in this label's live supervised process tree.
-        from hermes_cli.gateway_launchd import _launchctl_supervised_pid
+        from hermes_cli.gateway_launchd import _launchctl_supervised_pid, get_launchd_slot_labels
+        serving_label = ack.get("launchd_label", label)
+        if serving_label != label and serving_label not in get_launchd_slot_labels():
+            return None
+        label = serving_label
         supervisor_pid = _launchctl_supervised_pid(label)
         if not supervisor_pid or supervisor_pid != ack["launchd_pid"]:
             return None
@@ -1091,7 +1095,23 @@ def _restart_macos_launchd_gateways(
     from hermes_cli.update_cmd_posix_pause import already_restarted
     current_label = get_launchd_label()
     resumed = already_restarted()["labels"]  # paused for the update, restarted on the new code
-    if acknowledged_label == current_label:
+    from hermes_cli.config import load_config_readonly
+    from gateway.config import is_zero_cut_handover_enabled
+    protected_handover_labels = set()
+    if is_zero_cut_handover_enabled(load_config_readonly()):
+        from hermes_cli.gateway_launchd import get_launchd_slot_labels
+        from hermes_cli.gateway_handover import planned_handover
+        protected_handover_labels.update(get_launchd_slot_labels())
+        if acknowledged_label not in protected_handover_labels:
+            if planned_handover() is not True:
+                failed_or_stale_units.append(current_label)
+            else:
+                restarted_services.append(current_label)
+        else:
+            restarted_services.append(acknowledged_label)
+    if current_label in protected_handover_labels:
+        pass  # both serving and draining slots belong to the shared handover, never a second restart
+    elif acknowledged_label == current_label:
         # The release transaction already booted this exact label and the new
         # gateway acknowledged its loaded root. Fleet verification still checks
         # its successor; only the second mutating relaunch is omitted.
@@ -1121,7 +1141,7 @@ def _restart_macos_launchd_gateways(
         print(f"  ↻ legacy-labelled units of this install join the restart: {', '.join(legacy_labels)}")
     from hermes_cli.update_fleet_scope import describe_skipped_runtime, launchd_label_foreign_home
     for label in derived_labels + legacy_labels:
-        if label == current_label or label in resumed:
+        if label == current_label or label in resumed or label in protected_handover_labels:
             continue
         # Labels are account-global: root B's default profile derives the same bare label root A
         # installed. A plist pinning a foreign HERMES_HOME is another install's job (#93349).
