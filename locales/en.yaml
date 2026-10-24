@@ -51,6 +51,15 @@ gateway:
   no_active_goal: "No active goal."
   config_read_failed: "⚠️ Could not read config.yaml: {error}"
   config_save_failed: "⚠️ Could not save config: {error}"
+  attend:
+    usage: "Usage: /attend, /attend off, or /attend status."
+    disabled: "Attended routing is not configured. Set model.attended first."
+    pinned: "Pinned to the attended model ({model}). /attend off to release. Explicit /model picks still win."
+    released: "Attended pin released. The {minutes}-minute idle timer starts now."
+    status_pinned: "Attended: pinned. Current route: {model}."
+    status_unpinned: "Attended: not pinned. Current route: {model}."
+    session_changed: "The session changed. Run /attend again."
+    configured_model: "configured route"
   model:
     error_prefix: "Error: {error}"
     switched: "Model switched to `{model}`"
@@ -1546,6 +1555,8 @@ platform:
     prompt_other: "✏️ Other (type answer)"
     prompt_expired: "⌛ That prompt is no longer waiting for an answer. Send your reply as a normal message."
 slash:
+  attend:
+    description: "Pin the attended model until released"
   approve:
     description: "Approve a pending dangerous command"
   bg:

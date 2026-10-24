@@ -364,11 +364,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                            if reasoning_scope is None else reasoning_scope)
         previous_decision = conversation.last_attended_decision
         from gateway.run_session_readback import resolve_attended_snapshot
+        from gateway.session_attended import session_attended_pinned
         decision = resolve_attended_snapshot(
             self, source=source, user_config=user_config, override=override,
             model_role=model_role, model_scope=model_scope, stamp=stamp, new_session=new_session,
             reasoning_value=reasoning_value, reasoning_scope=reasoning_scope,
-            default_reasoning=default_reasoning, attended_reasoning=attended_reasoning,
+            default_reasoning=default_reasoning, attended_reasoning=attended_reasoning, attended_pinned=session_attended_pinned(getattr(self, "session_store", None), session_key),
         )
         load_route_active = getattr(self, "_load_attended_route_active", None)
         durable_route_active = load_route_active(session_key) if callable(load_route_active) else None
@@ -475,6 +476,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         """Timed model picks use their deadline, reasoning and untimed picks retain idle expiry."""
         cfg = parse_attended_config(user_config or {})
         from gateway.model_pick import model_pick_deadline
+        from gateway.session_attended import session_attended_pinned
         deadline = model_pick_deadline(self._session_model_override(session_key))
         expired = bool(deadline and time.time() >= deadline)
         if not cfg.enabled and not expired:
@@ -488,7 +490,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             else:
                 stamp = self._load_attended_activity_stamp(session_key)
             self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
-        if not expired and is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
+        if not expired and is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes, pinned=session_attended_pinned(getattr(self, "session_store", None), session_key)):
             return
         if (expired or not deadline) and conversation.model_override is not None and conversation.model_override_scope == "temporary":
             persist = self._expire_session_model_pick
@@ -509,7 +511,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     logger.debug("Failed to expire temporary attended model pick", exc_info=True)
             else:
                 logger.debug("Skipping synchronous attended expiry on the gateway loop")
-        if (cfg.enabled and not is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes)
+        if (cfg.enabled and not is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes, pinned=session_attended_pinned(getattr(self, "session_store", None), session_key))
                 and conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary"):
             self._clear_attended_reasoning_override_threadsafe(session_key)
 
@@ -542,6 +544,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         """Async-loop-safe deadline and legacy idle expiry, including after restart."""
         cfg = parse_attended_config(user_config or {})
         from gateway.model_pick import model_pick_deadline
+        from gateway.session_attended import session_attended_pinned
+        pinned = await asyncio.to_thread(session_attended_pinned, getattr(self, "session_store", None), session_key)
         deadline = model_pick_deadline(self._session_model_override(session_key))
         expired = bool(deadline and time.time() >= deadline)
         if not cfg.enabled and not expired:
@@ -555,14 +559,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             else:
                 stamp = activity_stamp
             self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
-        if not expired and is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes):
+        if not expired and is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes, pinned=pinned):
             return
         if (expired or not deadline) and conversation.model_override is not None and conversation.model_override_scope == "temporary":
             try:
                 await self._expire_session_model_pick(session_key, conversation.model_override)
             except Exception:
                 logger.debug("Failed to expire temporary attended model pick", exc_info=True)
-        if (cfg.enabled and not is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes)
+        if (cfg.enabled and not is_active(stamp, now=time.time(), idle_revert_minutes=cfg.idle_revert_minutes, pinned=pinned)
                 and conversation.reasoning_override is not None and conversation.reasoning_override_scope == "temporary"):
             await self._clear_attended_reasoning_override_async(session_key)
 

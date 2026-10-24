@@ -255,7 +255,9 @@ def _stamp_seconds(value: Any) -> Optional[float]:
         return None
 
 
-def is_active(last_user_activity_at: Any, *, now: Optional[float], idle_revert_minutes: float) -> bool:
+def is_active(last_user_activity_at: Any, *, now: Optional[float], idle_revert_minutes: float, pinned: bool = False) -> bool:
+    if pinned:
+        return True
     stamp = _stamp_seconds(last_user_activity_at)
     if stamp is None:
         return False
@@ -312,7 +314,7 @@ def resolve_attended_model(
             role_route = None
     # An invalid hold has an explicit default fallback, not automatic attended routing.
     active = not (model_role and role_route is None) and cfg.enabled and (new_session or is_active(
-        get("last_user_activity_at"), now=now_value, idle_revert_minutes=cfg.idle_revert_minutes
+        get("last_user_activity_at"), now=now_value, idle_revert_minutes=cfg.idle_revert_minutes, pinned=get("attended_pinned") is True
     ))
 
     explicit_model = (
@@ -355,7 +357,7 @@ def resolve_attended_model(
             or _effort_label(get("attended_reasoning")) or default_reasoning
         )
         return AttendedResolution(
-            model, provider, effort, "attended", True, idle_model=channel_model or default_model,
+            model, provider, effort, "attended", True, idle_model="" if get("attended_pinned") is True else channel_model or default_model,
             new_session=new_session,
         )
 
@@ -428,6 +430,8 @@ def attended_request_context_too_large(agent, loop_state, *, model, runtime) -> 
         return False
 
 
-def expiry_time(last_user_activity_at: Any, idle_revert_minutes: float) -> Optional[float]:
+def expiry_time(last_user_activity_at: Any, idle_revert_minutes: float, *, pinned: bool = False) -> Optional[float]:
+    if pinned:
+        return None
     stamp = _stamp_seconds(last_user_activity_at)
     return None if stamp is None else stamp + idle_revert_minutes * 60.0
