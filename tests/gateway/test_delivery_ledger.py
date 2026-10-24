@@ -98,7 +98,7 @@ def _orphan(oid):
     """Make the row look like it belongs to a dead process."""
     with dl._connect() as conn:
         conn.execute(
-            "UPDATE delivery_obligations SET owner_pid=999999999, "
+            "UPDATE delivery_obligations SET owner_pid=2147483647, "
             "owner_started_at=1 WHERE obligation_id=?",
             (oid,),
         )
@@ -613,7 +613,7 @@ class TestGatewayRedeliverySweep:
         runner.adapters = {Platform.TELEGRAM: adapter}
         await runner._redeliver_pending_obligations()
         with dl._connect() as conn:
-            conn.execute("UPDATE delivery_obligations SET owner_pid=999999999, owner_started_at=1, "
+            conn.execute("UPDATE delivery_obligations SET owner_pid=2147483647, owner_started_at=1, "
                          "updated_at=0 WHERE state='failed'")
         await runner._redeliver_pending_obligations()
         assert [s for s in sends if s in ("Intro", "one", "two") or s.endswith("Intro")][-1] == "two"
@@ -1236,19 +1236,23 @@ async def test_concurrent_final_sends_settle_only_their_own_obligation():
 
 
 @pytest.mark.asyncio
-async def test_cancel_after_failed_send_leaves_attempting_for_recovery():
-    """A refused send plus a cancel must not be marked failed without the finalizer's
-    refusal and redelivery handling. The row keeps today's ambiguous-recovery state."""
+@pytest.mark.parametrize("success", [False, True])
+async def test_cancel_after_captured_send_preserves_accounting_and_settlement(success):
+    """Captured results are counted before cancellation, without caller failure handling."""
     import asyncio
     from concurrent.futures import ThreadPoolExecutor
     from gateway.platforms.base import SendResult
+    from hermes_cli.observability import shared_metrics_gateway as metrics
 
-    async def refuse_then_cancel(**kwargs):
+    async def send_then_cancel(**kwargs):
         asyncio.current_task().cancel()
-        return SendResult(success=False, error="Flood control exceeded. Retry in 30 seconds")
+        return SendResult(
+            success=success,
+            error=None if success else "Flood control exceeded. Retry in 30 seconds",
+        )
 
-    adapter = _LedgerAdapter(refuse_then_cancel)
-    adapter._base._send_with_retry_body = lambda chat_id, content, **kw: refuse_then_cancel(content=content)
+    adapter = _LedgerAdapter(send_then_cancel)
+    adapter._base._send_with_retry_body = lambda chat_id, content, **kw: send_then_cancel(content=content)
     key = "agent:main:telegram:dm:2027045491:113596"
     refused = []
 
@@ -1259,7 +1263,8 @@ async def test_cancel_after_failed_send_leaves_attempting_for_recovery():
     # Force that legal ordering, with real ledger writes on a real worker, so
     # the assertion cannot pass merely because a cancelled future won the race.
     with ThreadPoolExecutor(max_workers=1) as worker, \
-            patch.object(dl, "mark_failed", wraps=dl.mark_failed) as mark_failed:
+            patch.object(dl, "mark_failed", wraps=dl.mark_failed) as mark_failed, \
+            patch.object(metrics, "_submit") as submit_metrics:
         def submit_and_finish(executor, func, *args):
             result = worker.submit(func, *args).result(timeout=5)
             loop = asyncio.get_running_loop()
@@ -1274,7 +1279,14 @@ async def test_cancel_after_failed_send_leaves_attempting_for_recovery():
             with pytest.raises(asyncio.CancelledError):
                 await send
     row = _row(dl.compute_obligation_id(key, "m-refused", "refused text"))
-    assert row["state"] == "attempting"
+    assert row is not None
+    assert row["state"] == ("delivered" if success else "attempting")
     assert row["attempts"] == 0
     mark_failed.assert_not_called()
     assert refused == []
+    delivery_metrics = [
+        call for call in submit_metrics.call_args_list
+        if len(call.args) >= 5 and call.args[2] is metrics._record_delivery
+    ]
+    assert len(delivery_metrics) == 1
+    assert delivery_metrics[0].args[4].success is success

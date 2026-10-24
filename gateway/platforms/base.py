@@ -3995,9 +3995,6 @@ class BasePlatformAdapter(ABC):
         if pending is not None and task is not None and task.cancelling():
             if getattr(result, "success", False):
                 self._settle_delivered_obligation_sync(pending[0])
-            # A return is not a cancellation checkpoint. Suspend before the caller
-            # can submit a failure write or run refusal callbacks with cancel pending.
-            await asyncio.sleep(0)
         return result
 
     async def _send_with_retry_body(
@@ -4912,11 +4909,9 @@ class BasePlatformAdapter(ABC):
             # The ledger now owns the crash recovery. It carries text only, so a caller with
             # attachments still to send keeps the marker until they are delivered.
             await self._release_turn_marker(event)
-        # A queued follow-up, /stop, or preemption cancels this task at the next await after
-        # Telegram has already accepted the message. That used to skip the ledger write, leaving
-        # the row 'attempting' with attempts=0 so a later boot resent a copy. The send's wrapper
-        # records a result it already returned before that cancellation propagates. A cancel that
-        # aborts the transport never produces a result, so that row stays attempting.
+        # A turn can be cancelled after transport success but before finalization. The send
+        # wrapper settles that success synchronously so recovery cannot resend it. A cancelled
+        # transport produces no result and stays attempting.
         settlement = _PENDING_LEDGER_SETTLEMENT.set(
             (obligation_id, event, delivery_adapter) if obligation_id is not None else None)
         try:
@@ -4924,6 +4919,11 @@ class BasePlatformAdapter(ABC):
                 chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         finally:
             _PENDING_LEDGER_SETTLEMENT.reset(settlement)
+        # Let records_delivery count the captured result before cancellation propagates,
+        # but suspend before refusal callbacks or a failure write can run.
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            await asyncio.sleep(0)
         if (obligation_id is None and not result.success and result.pre_send
                 and self._outbox_covers_final(event, delivery_adapter)):
             obligation_id = await self._record_delivery_obligation(

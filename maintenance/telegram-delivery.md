@@ -28,20 +28,23 @@ A captured successful final stays delivered when its turn is cancelled. A cancel
 refusal or an interrupted transport stays attempting for the existing ambiguous-send
 recovery, without running refusal callbacks or submitting a failure write first.
 Cancellation is delivered at a real suspension, not at a coroutine return. The send
-wrapper therefore settles a known success synchronously, then yields through
-`asyncio.sleep(0)` before either result can reach caller finalization.
+wrapper therefore settles a known success synchronously, then returns through
+`records_delivery` so the captured result is counted exactly once. After resetting
+the settlement ContextVar, `send_final_ledgered` yields through `asyncio.sleep(0)`
+only when cancellation is pending, before refusal callbacks or failure finalization.
 
 This repairs the fork-local settlement introduced by #704. Current upstream guidance
-was checked at `8edc5ea255aaf17b1f1f944bc2dcce52fce06fa8`. Related upstream
+was checked at `dd5bc7ee13f12c6fbf70ca47d05135f63e76258a`. Related upstream
 [#107135](https://github.com/NousResearch/hermes-agent/pull/107135) owns replay
 claim/send/refund cancellation, and
 [#105810](https://github.com/NousResearch/hermes-agent/pull/105810) owns polling
 recovery, not this final-producer checkpoint. Reuse the existing ContextVar and
 ledger state machine rather than importing another recovery lifecycle.
 
-`test_cancel_after_failed_send_leaves_attempting_for_recovery` forces a real worker
+`test_cancel_after_captured_send_preserves_accounting_and_settlement` forces a real worker
 to finish before cancellation is delivered and drains that worker before observing
-the row. It also proves no failure writer or non-suspending refusal callback ran.
+the row. Both captured success and refusal count exactly 1 delivery metric. The test
+also proves no failure writer or non-suspending refusal callback ran.
 The adjacent success, interrupted-send and concurrent-obligation tests retain their
 contracts. Retire this adaptation when released upstream provides equivalent
 final-producer cancellation ordering. Roll back only this checkpoint and its test
