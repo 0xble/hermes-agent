@@ -99,6 +99,47 @@ async def test_topic_readback_uses_runtime_precedence(home, monkeypatch, operati
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("start_new_sessions", [True, False])
+async def test_unseeded_create_readback_matches_attended_first_turn(home, monkeypatch, start_new_sessions):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    runner = _runner(home, FakeTelegram(thread_id=6001))
+    config = {
+        "model": {"default": "default-model", "provider": "default-provider", "attended": {
+            "model": "attended-model", "provider": "attended-provider",
+            "reasoning_effort": "high", "start_new_sessions": start_new_sessions,
+        }},
+        "agent": {"reasoning_effort": "low"},
+    }
+    _runtime(monkeypatch, runner, config)
+    await _seed_caller(runner, home)
+    source = _source(thread_id="6001")
+    key = runner._session_key_for_source(source)
+    assert await runner.async_session_store.lookup_by_session_key(key) is None
+
+    result = await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡"))
+
+    expected = ("attended-model", "attended-provider", "high") if start_new_sessions else (
+        "default-model", "default-provider", "low",
+    )
+    assert (result["effective_model"], result["effective_provider"], result["effective_effort"]) == expected
+    entry = await runner.async_session_store.lookup_by_session_key(key)
+    assert result["session_id"] == entry.session_id
+    assert entry.created_at == entry.updated_at
+    assert runner._peek_session_state(key) is None
+
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    _, is_new = await runner._hmwa_open_session(entry, key, source)
+    assert is_new
+    model, runtime = await runner._resolve_session_agent_runtime_async(
+        source=source, session_key=key, user_config=config,
+    )
+    reasoning = runner._resolve_session_reasoning_config(session_key=key, model=model, user_config=config)
+    assert (model, runtime["provider"], reasoning["effort"]) == expected
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["create", "edit"])
 async def test_cold_topic_readback_keeps_gateway_loop_responsive(home, monkeypatch, operation):
     runner = _runner(home, FakeTelegram())
@@ -190,6 +231,8 @@ async def test_readback_failure_preserves_turn_state(home, monkeypatch, scenario
     source = _source(thread_id="4242")
     entry = await _seed_caller(runner, home, thread_id="4242")
     key = entry.session_key
+    # These are existing, idle conversations, not untouched first-turn sessions.
+    await runner.async_session_store.mark_user_activity(key, when=datetime.fromtimestamp(time.time() - 86400))
     if scenario != "cold":
         conversation = runner._session_state(key).conversation
         conversation.pending_attended_notice = "already staged"

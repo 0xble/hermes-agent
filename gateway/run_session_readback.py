@@ -9,7 +9,7 @@ from dataclasses import replace
 from gateway.attended_model import is_active, parse_attended_config, resolve_attended_model
 from gateway.model_pick import model_pick_deadline
 from gateway.session import sanitize_reasoning_override
-from gateway.session_state import ConversationState
+from gateway.session_state import ConversationState, session_opening_pending
 
 
 def resolve_attended_snapshot(
@@ -127,7 +127,9 @@ def _load_session_settings(runner, *, source, session_key, user_config, conversa
         conversation.model_override = None
     if conversation.reasoning_override_scope == "temporary" and cfg.enabled and not active:
         conversation.reasoning_override = None
-    new_session = conversation.attended_new_session and cfg.start_new_sessions
+    new_session = cfg.enabled and cfg.start_new_sessions and session_opening_pending(
+        store.lookup_by_session_key(session_key), attended_new_session=conversation.attended_new_session,
+    )
     if new_session and stamp is None:
         stamp = now
     decision = resolve_attended_snapshot(
