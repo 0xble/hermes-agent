@@ -280,6 +280,7 @@ def _build_child_agent(
         child_model=rt.get("model"),
         child_provider=rt.get("provider"),
         child_base_url=rt.get("base_url"),
+        child_api_key=rt.get("api_key"),
         explicit_overrides=override_request_overrides,
         inherit_parent_route=not override_provider and not override_base_url,
     )
@@ -299,7 +300,11 @@ def _build_child_agent(
                 ),
                 session_db=child_session_db, parent_session_id=parent_sid,
                 request_overrides=request_overrides or {},
-                service_tier=_resolve_child_service_tier(parent_agent, override_request_overrides),
+                service_tier=_resolve_child_service_tier(
+                    parent_agent, override_request_overrides, child_model=rt.get("model"),
+                    child_provider=rt.get("provider"), child_base_url=rt.get("base_url"),
+                    child_api_key=rt.get("api_key"),
+                ),
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
             )
