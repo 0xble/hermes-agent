@@ -34,8 +34,10 @@ reply and refund unrun loop ticks.
 
 Retire a waiting event's spool after a durable user row, on deliberate input
 rejection, or on user cancellation (`/stop`, `/new`, `/reset`). Retain undurable
-input only for process shutdown or a crash. Settle an in-flight spool writer
-before cancellation finalizes replay ownership. Recovered waiters reuse their
+input only for shutdown cancellation of a still-current generation or a crash.
+User cancellation and deliberate rejection retire the input even after draining
+begins. Settle an in-flight spool writer before cancellation finalizes replay
+ownership. Recovered waiters reuse their
 existing spool, and reconnect scans skip still-running routing keys. Startup
 follow-up recovery retains its authorization, profile routing, media,
 identity-based duplicate handling, and visible stale-input decisions.

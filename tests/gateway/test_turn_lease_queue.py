@@ -221,7 +221,9 @@ async def test_agent_cleanup_can_admit_next_generation_while_outer_lease_is_held
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exit_kind", ["stop", "drop", "shutdown"])
+@pytest.mark.parametrize("exit_kind", [
+    "stop", "stop-during-shutdown", "drop", "drop-during-shutdown", "shutdown",
+])
 async def test_wait_spool_follows_inbound_exit_intent(monkeypatch, tmp_path, exit_kind):
     from tests.gateway.test_stop_pauses_goal_and_holds_wakes import _runner
 
@@ -255,7 +257,8 @@ async def test_wait_spool_follows_inbound_exit_intent(monkeypatch, tmp_path, exi
     try:
         await asyncio.wait_for(spooled.wait(), 3)
         path = event._gateway_lease_wait_spool
-        if exit_kind == "stop":
+        runner._draining = exit_kind.endswith("during-shutdown")
+        if exit_kind.startswith("stop"):
             stop = _event()
             stop.source, stop.text = source, "/stop"
             await adapter._dispatch_active_session_command(stop, key, "stop")

@@ -1854,6 +1854,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
+        _preserve_lease_wait_on_shutdown = False
         try:
             # Mark genuine user activity inside the claimed turn, before resolving the model. This
             # preserves the attended route's same-turn semantics without delaying the sentinel claim.
@@ -1886,6 +1887,13 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
+        except asyncio.CancelledError:
+            # Shutdown may replay an unfinished turn, but a stop/reset invalidates
+            # its generation even when the gateway is already draining.
+            _preserve_lease_wait_on_shutdown = (
+                self._draining and self._is_session_run_current(_quick_key, _run_generation)
+            )
+            raise
         finally:
             with suppress(Exception):
                 self._session_state(_quick_key).conversation.attended_new_session = False
@@ -1899,7 +1907,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             if getattr(event, "_gateway_lease_wait_spool", None) is not None:
                 from gateway.run_turn_lease_wait import retire_lease_wait
                 with suppress(Exception):
-                    await asyncio.to_thread(retire_lease_wait, self, event, discard=not self._draining)
+                    await asyncio.to_thread(
+                        retire_lease_wait, self, event, discard=not _preserve_lease_wait_on_shutdown,
+                    )
             if not getattr(event, "_turn_marker_handoff", False):
                 await self._clear_durable_active_turn(event)
             # Release only this turn's generation. Eviction may immediately admit a replacement
