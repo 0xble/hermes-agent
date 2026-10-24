@@ -1,6 +1,7 @@
 """Attended holds outlive idle windows without overriding explicit route choices."""
 import asyncio
 import time
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -155,6 +156,83 @@ async def test_failed_pin_save_leaves_session_unchanged_and_reset_unpins(attende
     await runner._handle_attend_command(MessageEvent(text="/attend", source=source))
     reset = await asyncio.to_thread(runner.session_store.reset_session, entry.session_key)
     assert not reset.attended_pinned
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ["repin", "handoff", "resume", "branch", "reset"])
+async def test_attended_pin_follows_repins_but_not_conversation_boundaries(attended, tmp_path, transition):
+    runner, source, entry = attended
+    key = entry.session_key
+    await runner._handle_attend_command(MessageEvent(text="/attend", source=source))
+    if transition == "reset":
+        switched = await asyncio.to_thread(runner.session_store.reset_session, key)
+    else:
+        kwargs = {"expected_session_id": entry.session_id}
+        if transition == "handoff":
+            kwargs["preserve_prompt_pin"] = False
+        if transition in {"resume", "branch"}:
+            kwargs["preserve_attended_pin"] = False
+        switched = await runner.async_session_store.switch_session(key, "retargeted", **kwargs)
+    expected = transition in {"repin", "handoff"}
+    assert switched is not None and switched.attended_pinned is expected
+    assert await asyncio.to_thread(runner.session_store.get_attended_pinned, key) is expected
+    reader = SessionStore(tmp_path / "sessions", runner.config)
+    try:
+        restored = await asyncio.to_thread(reader.lookup_by_session_key, key)
+        assert restored.attended_pinned is expected
+    finally:
+        await asyncio.to_thread(reader.close_all_db_handles)
+
+
+@pytest.mark.asyncio
+async def test_attend_off_without_pin_does_not_restart_idle_window(attended):
+    runner, source, entry = attended
+    key = entry.session_key
+    await runner.async_session_store.mark_user_activity(key, when=datetime.fromtimestamp(1))
+    state = runner._session_state(key)
+    state.conversation.last_user_activity_at = 1.0
+    stamp = entry.last_user_activity_at
+    reply = await runner._handle_attend_command(MessageEvent(text="/attend off", source=source))
+    assert "not pinned" in reply
+    assert not entry.attended_pinned
+    assert entry.last_user_activity_at == stamp
+    assert state.conversation.last_user_activity_at == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pin_during_resolution", [False, True])
+async def test_async_route_resolution_reads_attended_pin_off_loop(attended, monkeypatch, pin_during_resolution):
+    runner, source, entry = attended
+    event = MessageEvent(text="/attend", source=source)
+    if not pin_during_resolution:
+        await runner._handle_attend_command(event)
+    await runner.async_session_store.mark_user_activity(entry.session_key, when=datetime.fromtimestamp(1))
+    loop_thread = threading.get_ident()
+    getter = runner.session_store.get_attended_pinned
+    reads = []
+
+    def checked_getter(key):
+        assert threading.get_ident() != loop_thread
+        reads.append(key)
+        return getter(key)
+
+    monkeypatch.setattr(runner.session_store, "get_attended_pinned", checked_getter)
+    loop = asyncio.get_running_loop()
+    loader = runner._load_session_agent_runtime
+    changed = False
+
+    def racing_loader(**kwargs):
+        nonlocal changed
+        if pin_during_resolution and not changed:
+            changed = True
+            asyncio.run_coroutine_threadsafe(runner._handle_attend_command(event), loop).result(timeout=10)
+        return loader(**kwargs)
+
+    monkeypatch.setattr(runner, "_load_session_agent_runtime", racing_loader)
+    model, _runtime = await runner._resolve_session_agent_runtime_async(
+        source=source, session_key=entry.session_key, user_config=CONFIG,
+    )
+    assert reads and model == "opus"
 
 
 def test_old_session_payload_defaults_unpinned_and_disabled_config_is_inert():

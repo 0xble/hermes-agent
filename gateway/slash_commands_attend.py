@@ -24,8 +24,8 @@ class GatewayAttendCommandsMixin:
         entry = await self.async_session_store.get_or_create_session(source)
         key = entry.session_key
         async with self._session_model_override_lock(key):
-            if action == "status":
-                pinned = await asyncio.to_thread(session_attended_pinned, self.session_store, key)
+            pinned = await asyncio.to_thread(session_attended_pinned, self.session_store, key)
+            if action == "status" or (action == "off" and not pinned):
                 model, _runtime, _reasoning = await read_session_settings(
                     self, source=source, session_key=key, user_config=config,
                 )

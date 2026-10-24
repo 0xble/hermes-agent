@@ -99,12 +99,14 @@ async def test_plain_branch_binds_new_thread_and_keeps_origin(store):
 async def test_here_or_no_thread_branches_in_place(store, text, adapter):
     source = _discord_channel_source()
     parent = _seed(store, source)
+    store.set_attended_pinned(parent.session_key, True, expected_session_id=parent.session_id)
     runner = _runner(store, adapter)
 
     reply = await runner._handle_branch_command(MessageEvent(text=text, source=source))
 
     current = store.get_or_create_session(source)
     assert current.session_id != parent.session_id
+    assert not current.attended_pinned
     row = store._db.get_session(current.session_id)
     assert row["parent_session_id"] == parent.session_id
     assert store._db.get_session_title(current.session_id) == "side quest"

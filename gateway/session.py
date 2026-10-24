@@ -1538,7 +1538,7 @@ class SessionStore(
     # restart-resume freshness gate (#85709).
     def switch_session(
         self, session_key: str, target_session_id: str, *, expected_session_id: Optional[str] = None,
-        preserve_prompt_pin: bool = True,
+        preserve_prompt_pin: bool = True, preserve_attended_pin: bool = True,
     ) -> Optional[SessionEntry]:
         """Point a session key at an existing session ID (``/resume``): ends the current row and
         reopens the target so resume matches the CLI.
@@ -1547,7 +1547,8 @@ class SessionStore(
         the key no longer points at that session, so a caller that resolved against a snapshot
         across an await (async-delegation re-pin) cannot overwrite a concurrent /new or /resume.
         Prompt pins follow non-boundary repoints by default; /resume opts out explicitly because it
-        starts a different conversation on the same routing key.
+        starts a different conversation on the same routing key. Attended pins also follow
+        non-boundary repoints; /resume and /branch explicitly drop them.
         """
         with self._lock:
             old_entry = self._entry_locked(session_key)
@@ -1569,6 +1570,7 @@ class SessionStore(
                 # The user's activity belongs to the route, not the session row it points at.
                 last_user_activity_at=old_entry.last_user_activity_at,
                 attended_route_active=old_entry.attended_route_active,
+                attended_pinned=old_entry.attended_pinned if preserve_attended_pin else False,
                 model_role=old_entry.model_role,
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
