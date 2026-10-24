@@ -907,6 +907,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     ) -> Optional[str]:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
+        # Steered input can stay in this turn and never reach turn-start admission.
+        schedule_activity: Any = getattr(self, "_schedule_attended_user_activity", None)
+        if callable(schedule_activity):
+            schedule_activity(event, source, _quick_key)
         from gateway.cron_review import fail_busy_review
         if fail_busy_review(event):
             # The runner slot can still be live when the adapter guard is not (reconnect,
@@ -1631,11 +1635,43 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
             return event, source, is_internal
 
-    async def _mark_attended_user_activity(self, event, source, session_key: str | None = None) -> bool:
+    def _schedule_attended_user_activity(self, event, source, session_key: str):
+        """Keep receipt-time bookkeeping alive without delaying busy input or commands."""
+        if not is_genuine_user_message(event) or getattr(event, "_attended_activity_marked", False):
+            return
+        if getattr(event, "_attended_activity_task", None) is not None:
+            return
+        event._attended_activity_received_at = time.time()
+        task = asyncio.create_task(self._mark_attended_user_activity(
+            event, source, session_key, retry_on_failure=True,
+        ))
+        event._attended_activity_task = task
+        self._retain_background_task(task)
+
+    async def _mark_attended_user_activity(
+        self, event, source, session_key: str | None = None, *, retry_on_failure: bool = False,
+    ) -> bool:
         """Persist genuine Brian activity only for an existing session when attended routing is enabled."""
         if not is_genuine_user_message(event):
             return False
+        if getattr(event, "_attended_activity_marked", False):
+            return True
+        pending = getattr(event, "_attended_activity_task", None)
+        if pending is not None and pending is not asyncio.current_task():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                if not pending.cancelled():
+                    raise
+            except Exception:
+                logger.debug("attended-model receipt task failed", exc_info=True)
+            if getattr(event, "_attended_activity_marked", False):
+                return True
+        stamp = getattr(event, "_attended_activity_received_at", None)
+        if stamp is None:
+            stamp = event._attended_activity_received_at = time.time()
         try:
+            from datetime import datetime
             from gateway.run import _load_gateway_config
             from gateway.attended_model import parse_attended_config
             attended_cfg = await asyncio.to_thread(
@@ -1658,12 +1694,20 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             ):
                 # Preserve the creation boundary before mark_user_activity updates updated_at.
                 state.conversation.attended_new_session = True
-            await self.async_session_store.mark_user_activity(entry.session_key)
-            stamp = time.time()
-            state.conversation.last_user_activity_at = stamp
+            await self.async_session_store.mark_user_activity(
+                entry.session_key, when=datetime.fromtimestamp(stamp),
+            )
+            previous = state.conversation.last_user_activity_at
+            if previous is None or stamp > previous:
+                state.conversation.last_user_activity_at = stamp
+            event._attended_activity_marked = True
             return True
         except Exception:
             logger.debug("attended-model activity stamp failed", exc_info=True)
+            if retry_on_failure:
+                # Steering consumes the event, so only ordinary failures retry here.
+                # False eligibility results and task cancellation are terminal.
+                return await self._mark_attended_user_activity(event, source, session_key)
             return False
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
@@ -1731,7 +1775,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if _handled:
             # Activity bookkeeping is telemetry for an already-dispatched command.  Do not hold the
             # adapter's bounded command response on the opt-in config/store worker hop.
-            asyncio.create_task(self._mark_attended_user_activity(event, source, _quick_key))
+            self._schedule_attended_user_activity(event, source, _quick_key)
             return _result
 
         # Non-command messages are stamped after the session slot is claimed, immediately before
