@@ -118,6 +118,8 @@ class GatewayBusySessionMixin:
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
             return
+        from gateway.busy_auto import stamp_busy_arrival
+        stamp_busy_arrival(queued_event)
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         elif overflow := self._overflow_queue(session_key):

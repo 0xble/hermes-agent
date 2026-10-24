@@ -10,6 +10,7 @@ from typing import Any
 
 from agent.i18n import t
 from hermes_cli.gateway_client import GatewayClientError
+from hermes_cli.pending_input import input_payload, replace_input_payload
 from rich.markup import escape as _escape
 
 
@@ -357,7 +358,7 @@ class CLILoopsMixin:
     def _pending_input_items(self) -> list:
         """Snapshot of queued next-turn prompts (raw items; may include ``_VoiceInputMessage``)."""
         with self._pending_input.mutex:
-            return list(self._pending_input.queue)
+            return [input_payload(item) for item in self._pending_input.queue]
 
     def _mutate_pending_input(self, mutate) -> tuple[list, list]:
         """Apply ``mutate(items) -> items`` to the queued prompts under the queue's own mutex,
@@ -372,7 +373,7 @@ class CLILoopsMixin:
             q.unfinished_tasks = len(after)
             if after:
                 q.not_empty.notify_all()
-        return before, after
+        return ([input_payload(item) for item in before], [input_payload(item) for item in after])
 
     def _gateway_queue_store(self):
         """The gateway session store when this CLI is a viewer of the gateway's session, else None."""
@@ -500,8 +501,9 @@ class CLILoopsMixin:
             if 1 <= local <= len(items):
                 # A voice-queued item keeps its sentinel so the concise voice-response
                 # prefix still applies (#65827).
-                voice = isinstance(items[local - 1], _VoiceInputMessage)
-                items[local - 1] = _VoiceInputMessage(new_text) if voice else new_text
+                voice = isinstance(input_payload(items[local - 1]), _VoiceInputMessage)
+                payload = _VoiceInputMessage(new_text) if voice else new_text
+                items[local - 1] = replace_input_payload(items[local - 1], payload)
             return items
 
         before, after = self._mutate_pending_input(_edit)

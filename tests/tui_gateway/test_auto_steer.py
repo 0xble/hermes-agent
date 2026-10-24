@@ -52,6 +52,53 @@ def test_later_queued_text_cannot_merge_or_scrub_a_deferred_envelope(first):
     assert later["text"] == "later queued input" and later["transport"] is second_transport
 
 
+@pytest.mark.parametrize("queue_first", [True, False])
+def test_deferred_inputs_keep_submission_order_with_explicit_queue(monkeypatch, queue_first):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "auto")
+    monkeypatch.setattr(server, "_session_compression_in_flight", lambda _: False)
+    monkeypatch.setattr(server, "_persist_queued_user_row", Mock())
+    monkeypatch.setattr(server, "_emit", Mock())
+    agent = SimpleNamespace(_current_turn_id="turn", _supports_active_turn_redirect=True,
+                            redirect=Mock(return_value=True), steer=Mock(return_value=True), interrupt=Mock())
+    session = dict(agent=agent, running=True, history_lock=threading.RLock(), history=[],
+                   attached_images=[], inflight_turn={"user": "original"})
+    transports = {text: object() for text in ("A", "B", "C", "D")}
+    if queue_first:
+        server._handle_busy_submit("rid", "sid", session, "C", transports["C"], queued=True)
+    tokens = []
+    for text in ("A", "B"):
+        assert server._handle_busy_submit("rid", "sid", session, text, transports[text])["result"]["status"] == "steered"
+        tokens.append(re.search(r"Auto-steer message_id: ([a-f0-9-]+)", agent.redirect.call_args.args[0]).group(1))
+    if not queue_first:
+        server._handle_busy_submit("rid", "sid", session, "C", transports["C"], queued=True)
+    else:
+        # C and D cannot merge across the intervening auto inputs, even before those defer.
+        server._handle_busy_submit("rid", "sid", session, "D", transports["D"], queued=True)
+    for token in reversed(tokens):
+        for _ in range(2):
+            result = defer_message(agent, {"message_id": token})
+            assert result["accepted"] and result["message_id"] == token
+    entries = [session["queued_prompt"], *session.get("queued_prompts", [])]
+    assert [entry["text"] for entry in entries] == (["C", "A", "B", "D"] if queue_first else ["A", "B", "C"])
+    assert all(entry["transport"] is transports[entry["text"]] for entry in entries)
+    agent.interrupt.assert_not_called()
+    # Drive the real consumer: sorting the visible snapshot alone is not sufficient.
+    dispatched = []
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _: False)
+    monkeypatch.setattr(server, "_transport_is_dead", lambda _: False)
+    attached = []
+    monkeypatch.setattr(server, "_attach_session_transport", lambda _session, transport: attached.append(transport))
+    monkeypatch.setattr(server, "_replace_queued_user_row_for_turn", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda _rid, _sid, _session, text, **kwargs: dispatched.append(text))
+    for _ in entries:
+        session["running"] = False
+        assert server._drain_queued_prompt("drain", "sid", session)
+    assert dispatched == [entry["text"] for entry in entries]
+    assert attached == [entry["transport"] for entry in entries]
+    session["running"] = False
+    assert not server._drain_queued_prompt("drain", "sid", session)
+
+
 def test_auto_forced_queue_does_not_offer_deferral(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "auto")
     monkeypatch.setattr(server, "_persist_queued_user_row", lambda *args: None)

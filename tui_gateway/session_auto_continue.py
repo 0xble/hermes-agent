@@ -145,9 +145,17 @@ def _ac_inflight_original(session: dict) -> str:
     return str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
 
 
+def _ac_prompt_arrival(session: dict) -> int:
+    """Allocate under history_lock, before an auto offer can defer queue admission."""
+    order = session.get("_prompt_arrival_order", 0) + 1
+    session["_prompt_arrival_order"] = order
+    return order
+
+
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
                     turn_author: dict | None = None, display_kind: str | None = None,
-                    moa_token: str | None = None, preserve_event: bool = False) -> dict | None:
+                    moa_token: str | None = None, preserve_event: bool = False,
+                    arrival_order: int | None = None) -> dict | None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing and authored ones stay separate
     envelopes so attachment chronology and the sender survive. ``transport`` is pinned so the drained turn
@@ -163,7 +171,10 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     # A text-only self-copy of the live prompt would restart it on drain; an authored copy is another sender's message.
     if not preserve_event and text_only and not turn_author and not moa_token and text.strip() == _ac_inflight_original(session) != "":
         return None
+    if arrival_order is None:
+        arrival_order = _ac_prompt_arrival(session)
     queued = {"text": text, "transport": transport,
+              "_arrival_order": arrival_order, "_last_arrival_order": arrival_order,
               **({"image_paths": image_paths} if image_paths else {}),
               **({"turn_author": turn_author} if turn_author else {}),
               **({"display_kind": display_kind} if display_kind else {}),
@@ -175,14 +186,15 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
             and not existing.get("image_paths") and not existing.get("turn_author")
             and existing.get("display_kind") == display_kind
             and not moa_token and not existing.get("moa_token")
-            and not session.get("queued_prompts")):
+            and not session.get("queued_prompts")
+            and existing.get("_last_arrival_order", arrival_order - 1) == arrival_order - 1):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        existing["_last_arrival_order"] = arrival_order
         return existing
-    if existing:
-        session.setdefault("queued_prompts", []).append(queued)
-    else:
-        session["queued_prompt"] = queued
+    entries = [*([existing] if existing else []), *(session.get("queued_prompts") or []), queued]
+    entries.sort(key=lambda entry: entry.get("_arrival_order", -1))
+    _ac_set_queue(session, entries)
     return queued
 
 
@@ -425,6 +437,9 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     with session["history_lock"]:
         if not session.get("running"):
             return None  # turn ended since prompt.submit's busy check; caller retries on the idle session
+        # Allocate before offering auto input, not when its deferred handoff eventually runs.
+        # In-place steer/interrupt corrections retain their existing queue/merge behavior.
+        arrival_order = _ac_prompt_arrival(session) if mode in ("auto", "queue") else None
         # Typed while the turn ran, in any busy mode: the running turn no longer counts as unattended.
         session["_turn_user_input"] = True
         image_paths = list(session.get("attached_images", []))
@@ -439,7 +454,8 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
                 if not session.get("running") or session.get("agent") is not agent:
                     return False
                 envelope = _enqueue_prompt(session, text, transport, turn_author=turn_author,
-                                           display_kind=display_kind, preserve_event=True)
+                                           display_kind=display_kind, preserve_event=True,
+                                           arrival_order=arrival_order)
                 if envelope is None:
                     return False
                 # Queue acceptance is the handoff commit. Persistence retries on drain, and
@@ -476,7 +492,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
         envelope = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author,
-                        display_kind=display_kind, moa_token=moa_token)
+                        display_kind=display_kind, moa_token=moa_token, arrival_order=arrival_order)
         # Durable AT ACCEPT (not when the turn runs): a cold resume sees the queued message and a
         # backend restart cannot lose it. Lives on the envelope, never the shared session slot.
         if envelope is not None:

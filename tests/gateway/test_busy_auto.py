@@ -77,6 +77,37 @@ async def test_defer_original_once_then_promote_in_arrival_order(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("queue_first", [True, False])
+async def test_explicit_queue_and_deferred_auto_keep_input_order(monkeypatch, queue_first):
+    from agent.steer_deferral import defer_message
+
+    runner, agent, adapter = setup(monkeypatch)
+    auto = event("auto follow-up", reply_to_message_id="anchor")
+    command = event("/queue explicit follow-up")
+
+    async def queue_explicit():
+        await runner._busy_queue_command(command, "key", command.source)
+
+    if queue_first:
+        await queue_explicit()
+    assert await runner._handle_active_session_busy_message(auto, "key")
+    token = message_id(agent)
+    if not queue_first:
+        await queue_explicit()
+    for _ in range(2):
+        result = await asyncio.to_thread(defer_message, agent, {"message_id": token})
+        assert result["accepted"] and result["message_id"] == token
+    head = adapter._pending_messages.pop("key")
+    tail = runner._promote_queued_event("key", adapter, None)
+    expected = ["explicit follow-up", "auto follow-up"] if queue_first else ["auto follow-up", "explicit follow-up"]
+    assert [head.text, tail.text] == expected
+    assert (tail if queue_first else head) is auto
+    assert auto.reply_to_message_id == "anchor"
+    assert runner._promote_queued_event("key", adapter, None) is None
+    agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_late_steer_finalizer_preserves_the_original_event_and_reply_anchor(monkeypatch):
     from agent.steer_deferral import requeue_undelivered_steers
 
