@@ -219,9 +219,14 @@ def test_fallback_to_locked_writer_when_read_conn_unavailable(db, monkeypatch):
     while the pool holds a connection and this test would pass while
     exercising nothing.
     """
-    monkeypatch.setattr(db, "_checkout_read_conn", lambda: None)
+    import hermes_state_search_runtime
+
+    monkeypatch.setattr(db, "_checkout_read_conn", lambda **_kwargs: None)
+    monkeypatch.setattr(hermes_state_search_runtime, "_READER_WAIT_S", 0)
     assert db.get_session("s1")["id"] == "s1"
-    assert db.search_messages("graphiti", limit=5)
+    # Only ordinary reads retain the legacy fallback. Search fails explicitly.
+    with pytest.raises(sqlite3.OperationalError, match="search reader queue wait expired"):
+        db.search_messages("graphiti", limit=5)
 
 
 @pytest.mark.requires_wal

@@ -16,6 +16,21 @@ _MALFORMED_SCHEMA_MARKERS = ("malformed database schema",)
 _MALFORMED_DB_MARKERS = (*_MALFORMED_SCHEMA_MARKERS, "database disk image is malformed")
 
 
+def is_fts_query_syntax_error(exc: BaseException) -> bool:
+    """Only FTS5 parser diagnostics, never contention, interruption or broken schema.
+
+    A known non-SQLITE_ERROR code wins over text. SQLITE_ERROR alone is too broad
+    (it also covers missing tables), so require the parser's exact message shape.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and code & 0xFF != sqlite3.SQLITE_ERROR:
+        return False
+    text = str(exc).lower()
+    return text == "unterminated string" or text.startswith("fts5: syntax error near ")
+
+
 def is_malformed_db_error(exc: BaseException) -> bool:
     """Malformed-schema OR generic corrupt-image error. Diagnostics / offline
     recovery only — runtime repair must use :func:`is_malformed_schema_error`."""
