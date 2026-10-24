@@ -1210,124 +1210,17 @@ _COUNT_TOP_FILE_INPUTS_JS = (
 )
 
 
-def _stage_upload_file(path: str, uploads_dir: str) -> str:
-    """Return a path Camofox will accept: ``path`` itself when already inside ``uploads_dir``,
-    else a copy at ``<uploads_dir>/hermes/<digest>/<original name>``. The digest is a directory so
-    the page sees the original file name. The copy is kept, because the page may read the file
-    lazily after the attach returns."""
-    import hashlib
-    import shutil
-    from pathlib import Path
-    source = Path(path).expanduser().resolve()
-    root = Path(uploads_dir).expanduser().resolve()
-    if source.is_relative_to(root):
-        return str(source)
-    digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
-    target = root / "hermes" / digest / source.name
-    if not target.exists():
-        # Publish atomically: a failed or concurrent copy must never leave a partial file at the
-        # final path, because later calls reuse whatever is there.
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.parent / f".{source.name}.{uuid.uuid4().hex}.tmp"
-        try:
-            shutil.copyfile(source, tmp)
-            os.replace(tmp, target)
-        finally:
-            tmp.unlink(missing_ok=True)
-    return str(target)
-
-
 def camofox_upload(paths: list, ref: Optional[str] = None, selector: Optional[str] = None,
                    task_id: Optional[str] = None) -> str:
-    """Attach local files to the page's upload control via Camofox's file-chooser interception."""
-    from pathlib import Path
-    from agent.file_safety import get_read_block_error
-    if not paths:
-        return tool_error("paths must name at least one local file", success=False)
-    resolved = []
-    for raw in paths:
-        # The raw string is checked before anything touches the filesystem: resolving an NT/device
-        # namespace path can itself trigger outbound SMB auth, and resolving can launder it.
-        blocked = get_read_block_error(str(raw))
-        if blocked:
-            return tool_error(blocked, success=False)
-        candidate = str(Path(str(raw)).expanduser().resolve())
-        blocked = get_read_block_error(candidate)
-        if blocked:
-            return tool_error(blocked, success=False)
-        if not Path(candidate).is_file():
-            return tool_error(f"Not a file: {raw}", success=False)
-        resolved.append(candidate)
-    # Camofox only accepts files under its uploads root; its own default is ~/.camofox/uploads.
-    uploads_dir = (_env_or_cfg("CAMOFOX_UPLOADS_DIR", _get_camofox_config(), "uploads_dir")
-                   or os.path.join(os.path.expanduser("~"), ".camofox", "uploads"))
-    try:
-        server_paths = [_stage_upload_file(p, uploads_dir) for p in resolved]
-    except OSError as exc:
-        return tool_error(f"Could not stage the file in the Camofox uploads directory: {exc}", success=False)
-    body: Dict[str, Any] = {"path": server_paths}
-    if ref:
-        body["ref"] = ref.lstrip("@")
-    elif selector:
-        body["selector"] = selector
-
-    def run(session):
-        if ref or selector:
-            # Camofox attaches to the first top-level input[type=file] before it consults the
-            # trigger, so a named trigger in a frame would be bypassed and the file would land on
-            # an unrelated field. A named trigger requires a verified zero count.
-            try:
-                count = _post(_tab_path(session, "evaluate"), {
-                    "userId": session["user_id"],
-                    "expression": _COUNT_TOP_FILE_INPUTS_JS}).get("result")
-            except requests.HTTPError as exc:
-                if classify_camofox_http_error(exc, endpoint="evaluate") != "capability":
-                    raise
-                count = None
-            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
-                return tool_error(
-                    "Cannot verify the top-level page's file-input count; Camofox may attach to "
-                    "the first top-level input instead of the named trigger. No upload was sent. "
-                    "Use a server with a working /evaluate route, omit ref/selector only if the "
-                    "first top-level input is the intended target, or use another upload route.",
-                    success=False)
-            if count > 0:
-                return tool_error(
-                    f"The top-level page has {count} file input(s); Camofox would attach to the first "
-                    "one instead of the named trigger. Omit ref/selector if that input is the target; "
-                    "otherwise use another upload route.", success=False)
-        try:
-            data = _post(_tab_path(session, "upload"), {"userId": session["user_id"], **body},
-                         timeout=max(_get_command_timeout(), _UPLOAD_HTTP_TIMEOUT_S))
-        except requests.HTTPError as exc:
-            if _upload_root_mismatch(exc):
-                # Hermes staged into a directory the server does not serve from; a bare 400 hides that.
-                return tool_error(
-                    f"Camofox rejected the staged file: it is not under the server's uploads directory. "
-                    f"Hermes staged into {uploads_dir}. Set browser.camofox.uploads_dir (or "
-                    f"CAMOFOX_UPLOADS_DIR) to the directory the Camofox server uses as its "
-                    f"CAMOFOX_UPLOADS_DIR.", success=False)
-            raise
-        return json.dumps({"success": bool(data.get("ok", True)),
-                           "attached": [Path(p).name for p in server_paths],
-                           "via": data.get("via", ""),
-                           "note": "Refs changed; take a fresh snapshot, then save and read back the result."})
-    return _with_tab(task_id, "upload a file", run)
+    """Attach Python-host files through the Camofox inline upload contract."""
+    from tools.browser_camofox_files import upload
+    return upload(paths, ref, selector, task_id)
 
 
-_UPLOAD_ROOT_MISMATCH_CODES = frozenset({"file_not_found", "upload_path_outside_root", "uploads_dir_not_found"})
-
-
-def _upload_root_mismatch(exc: requests.HTTPError) -> bool:
-    """True when Camofox's 400 says the staged path is not in (or there is no) server uploads root."""
-    response = getattr(exc, "response", None)
-    if response is None or response.status_code != 400:
-        return False
-    try:
-        payload = response.json()
-    except ValueError:
-        return False
-    return isinstance(payload, dict) and payload.get("code") in _UPLOAD_ROOT_MISMATCH_CODES
+def camofox_downloads(download_id: Optional[str] = None, task_id: Optional[str] = None) -> str:
+    """List captured files, or save one on the Python host without exposing its bytes."""
+    from tools.browser_camofox_files import downloads
+    return downloads(download_id, task_id)
 
 
 def camofox_back(task_id: Optional[str] = None) -> str:

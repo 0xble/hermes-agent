@@ -42,6 +42,15 @@ approval:
     second_one: "{count} segundo"
     second_other: "{count} segundos"
 gateway:
+  attend:
+    usage: "Uso: /attend, /attend off o /attend status."
+    disabled: "El enrutamiento durante el uso activo no está configurado. Configura primero model.attended."
+    pinned: "Se ha fijado el modelo para uso activo ({model}). Usa /attend off para liberarlo. Las selecciones explícitas con /model siguen teniendo prioridad."
+    released: "Se ha liberado el modelo para uso activo. El temporizador de inactividad de {minutes} minutos empieza ahora."
+    status_pinned: "Uso activo: modelo fijado. Ruta actual: {model}."
+    status_unpinned: "Uso activo: modelo no fijado. Ruta actual: {model}."
+    session_changed: "La sesión ha cambiado. Ejecuta /attend de nuevo."
+    configured_model: "ruta configurada"
   approval_expired: "⚠️ La aprobación ha caducado (el agente ya no está esperando). Pida al agente que lo intente de nuevo."
   draining: "⏳ Esperando a que terminen {count} agente(s) activo(s) antes de reiniciar..."
   goal_cleared: "✓ Objetivo eliminado."
@@ -1487,6 +1496,8 @@ platform:
     prompt_other: "✏️ Otra (escribir respuesta)"
     prompt_expired: ⌛ Esa solicitud ya no espera respuesta. Envía tu respuesta como un mensaje normal.
 slash:
+  attend:
+    description: "Fijar el modelo para uso activo hasta liberarlo"
   approve:
     description: "Aprobar un comando peligroso pendiente"
   bg:

@@ -42,6 +42,15 @@ approval:
     second_one: "{count} 秒"
     second_other: "{count} 秒"
 gateway:
+  attend:
+    usage: "使い方: /attend、/attend off、または /attend status。"
+    disabled: "操作中のモデルルーティングが未設定です。先に model.attended を設定してください。"
+    pinned: "操作中のモデル（{model}）に固定しました。/attend off で解除します。明示的な /model 選択が引き続き優先されます。"
+    released: "操作中のモデルの固定を解除しました。{minutes} 分のアイドルタイマーを今から開始します。"
+    status_pinned: "操作中のモデル: 固定中。現在のルート: {model}。"
+    status_unpinned: "操作中のモデル: 固定なし。現在のルート: {model}。"
+    session_changed: "セッションが変更されました。/attend を再実行してください。"
+    configured_model: "設定済みルート"
   approval_expired: "⚠️ 承認の有効期限が切れました（エージェントはもう待機していません）。エージェントに再試行を依頼してください。"
   draining: "⏳ 再起動前に {count} 個のアクティブエージェントの終了を待っています..."
   goal_cleared: "✓ 目標をクリアしました。"
@@ -1487,6 +1496,8 @@ platform:
     prompt_other: "✏️ その他（回答を入力）"
     prompt_expired: ⌛ このプロンプトはもう回答を待っていません。通常のメッセージとして返信を送ってください。
 slash:
+  attend:
+    description: "解除するまで操作中のモデルに固定"
   approve:
     description: "保留中の危険なコマンドを承認"
   bg:

@@ -17,6 +17,7 @@ from hermes_loop_guard import LoopGuardedLock
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
 from gateway.session_identity import transport_profile_of
+from gateway.session_attended import SessionAttendedMixin
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pin
 from gateway.session_recovery import SessionRecoveryMixin
@@ -590,6 +591,7 @@ class SessionEntry:
     # Process memory loses the attended decision on restart; this keeps the idle switch-back card.
     attended_route_active: Optional[bool] = None
     model_role: Optional[str] = None
+    attended_pinned: bool = False
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -637,6 +639,8 @@ class SessionEntry:
             result["attended_route_active"] = self.attended_route_active
         if self.model_role:
             result["model_role"] = self.model_role
+        if self.attended_pinned:
+            result["attended_pinned"] = True
         if self.active_turn_token and self.active_turn_owner_pid and self.active_turn_owner_slot:
             result["active_turn_owner_pid"] = self.active_turn_owner_pid
             result["active_turn_owner_slot"] = self.active_turn_owner_slot
@@ -735,6 +739,7 @@ class SessionEntry:
             attended_route_active=data.get("attended_route_active")
             if isinstance(data.get("attended_route_active"), bool) else None,
             model_role=str(data.get("model_role")).strip().lower() if data.get("model_role") else None,
+            attended_pinned=data.get("attended_pinned") is True,
             model_override_scope=data.get("model_override_scope", "session")
             if data.get("model_override_scope") in ("session", "temporary", "once") else "session",
             reasoning_override_scope=data.get("reasoning_override_scope", "session")
@@ -899,7 +904,7 @@ class AsyncSessionStore:
 
 class SessionStore(
     SessionPersistenceMixin, SessionRecoveryMixin, SessionLifecycleMixin, SessionTranscriptMixin,
-    SessionPromptPinMixin,
+    SessionPromptPinMixin, SessionAttendedMixin,
 ):
     """Session routing index + transcripts: SQLite (SessionDB), legacy JSONL fallback."""
 
@@ -1369,6 +1374,8 @@ class SessionStore(
                      or durable.last_user_activity_at.timestamp() > entry.last_user_activity_at.timestamp())
             ):
                 entry.last_user_activity_at = durable.last_user_activity_at
+            if entry is not None and durable is not None and durable.session_id == entry.session_id:
+                entry.attended_pinned = durable.attended_pinned
             return getattr(entry, "last_user_activity_at", None) if entry else None
 
     def mark_user_activity(self, session_key: str, when: Optional[datetime] = None) -> bool:
@@ -1538,7 +1545,7 @@ class SessionStore(
     # restart-resume freshness gate (#85709).
     def switch_session(
         self, session_key: str, target_session_id: str, *, expected_session_id: Optional[str] = None,
-        preserve_prompt_pin: bool = True,
+        preserve_prompt_pin: bool = True, preserve_attended_pin: bool = True,
     ) -> Optional[SessionEntry]:
         """Point a session key at an existing session ID (``/resume``): ends the current row and
         reopens the target so resume matches the CLI.
@@ -1547,7 +1554,8 @@ class SessionStore(
         the key no longer points at that session, so a caller that resolved against a snapshot
         across an await (async-delegation re-pin) cannot overwrite a concurrent /new or /resume.
         Prompt pins follow non-boundary repoints by default; /resume opts out explicitly because it
-        starts a different conversation on the same routing key.
+        starts a different conversation on the same routing key. Attended pins also follow
+        non-boundary repoints; /resume and /branch explicitly drop them.
         """
         with self._lock:
             old_entry = self._entry_locked(session_key)
@@ -1569,6 +1577,7 @@ class SessionStore(
                 # The user's activity belongs to the route, not the session row it points at.
                 last_user_activity_at=old_entry.last_user_activity_at,
                 attended_route_active=old_entry.attended_route_active,
+                attended_pinned=old_entry.attended_pinned if preserve_attended_pin else False,
                 model_role=old_entry.model_role,
                 prompt_pin=(
                     dict(old_entry.prompt_pin)

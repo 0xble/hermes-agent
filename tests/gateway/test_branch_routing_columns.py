@@ -101,7 +101,7 @@ class TestBranchRoutingColumns:
         captured_new_session_id = {}
         real_switch_session = store.switch_session
 
-        def _crash_before_switch(session_key, target_session_id):
+        def _crash_before_switch(session_key, target_session_id, **kwargs):
             # Simulate the process dying right here — before routing gets
             # backfilled — by capturing the id and raising instead of
             # forwarding to the real switch_session().

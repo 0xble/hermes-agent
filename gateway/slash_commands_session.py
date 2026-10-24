@@ -1182,7 +1182,7 @@ class GatewaySessionCommandsMixin:
         self._release_running_agent_state(session_key)
         async with self._session_model_override_lock(session_key):
             new_entry = await self.async_session_store.switch_session(
-                session_key, target_id, preserve_prompt_pin=False,
+                session_key, target_id, preserve_prompt_pin=False, preserve_attended_pin=False,
             )
             if not new_entry:
                 return t("gateway.resume.switch_failed")
@@ -1364,7 +1364,9 @@ class GatewaySessionCommandsMixin:
             # Materialize the thread's own entry, then point IT at the clone; ``session_key`` (this
             # chat) is never touched, so the original conversation stays live here.
             await self.async_session_store.get_or_create_session(dest_source)
-        new_entry = await self.async_session_store.switch_session(dest_key, new_session_id)
+        new_entry = await self.async_session_store.switch_session(
+            dest_key, new_session_id, preserve_attended_pin=False,
+        )
         if not new_entry:
             return t("gateway.branch.switch_failed")
         self._clear_session_boundary_security_state(dest_key)
