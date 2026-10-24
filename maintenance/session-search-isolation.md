@@ -8,6 +8,8 @@ Patch identity: `session-search-isolation`.
 
 Ordinary state reads retain upstream's writer fallback. Recall does not: one reader-only scope covers MATCH, metadata, lineage resolution, and hydration. Admission reuses the existing per-file and process descriptor budgets, with at most 64 waiting searches per file and a 5-second reader-admission budget. Known background sources yield to interactive or unknown callers, FIFO within each class. Saturation and opening errors are explicit failures. An admitted statement has no search timeout, progress-handler cancellation, or added result cap.
 
+Session rows read inside recall skip token-count draining. Metadata token totals may be slightly stale until queued deltas commit. Outside recall, `get_session` still drains deltas for exact accounting. The tool paths for discovery, title lookup, compression ancestors and tips, recent browse, transcript hydration, scrolling, and rebuild status all use the scoped reader without the writer lock or a token flush. Admission priority reads only the caller's bound session source and is rechecked after connection opening, before handing out the reader. Queryless tool browse also skips the SQL deadline. Ordinary recent-session UI browse retains its existing deadline through the shared runtime helper.
+
 Only recognized FTS5 parser diagnostics may become misses or language-route fallbacks. Busy, interruption, failed context SQL, and corruption propagate to the tool's error response. Search no longer detaches corrupt indexes, because that recovery acquires the writer lock. Existing writer, reopen, and maintenance recovery remains responsible. An index already marked stale still uses the existing canonical LIKE route.
 
 The slow log retains the served profile's existing threshold. Timings use a monotonic clock: `reader_queue_ms` includes admission and connection opening, `sql_ms` measures read-statement execution/fetch, `hydration_ms` measures context preparation and tool shaping exclusive of SQL, and `total_ms` includes the entire recall scope. Nested calls reuse the scope and do not produce duplicate logs. The line identifies caller, filters, sort, route, and raw hit count.
@@ -16,7 +18,9 @@ The slow log retains the served profile's existing threshold. Timings use a mono
 
 The independent starting hypothesis was reader-pool exhaustion reaching the locked-writer fallback, not slow FTS computation. It follows the production convoy evidence and was tested before widening execution architecture.
 
-Guidance and source were inspected at upstream `5894e750c3dba980d43b25aa29e3958149ba2c61`. Its `_read_ctx` retains the locked-writer fallback. Related sources read during the design preflight:
+Guidance and source were inspected at upstream `5894e750c3dba980d43b25aa29e3958149ba2c61`, with root and tool guidance rechecked at `bac34e9e9946c9c6a9ce7ce64efadd47f8fa375b` for the token-flush correction. The existing recall scope remains the narrow owner for skipping token drains, rather than changing accounting reads globally. Related sources read during the design preflight:
+
+- [Issue #141966](https://github.com/NousResearch/hermes-agent/issues/141966): the same 5-second `get_session` token-writer wait in gateway handlers. Skipping drains in recall addresses that dependency without changing those handlers' accounting contract.
 
 - [Issue #110610](https://github.com/NousResearch/hermes-agent/issues/110610): transcript writer starvation is related, not a reader-isolation implementation.
 - [Issue #139959](https://github.com/NousResearch/hermes-agent/issues/139959): lease failures under SQLite write contention. Its proposed separate lease writer does not isolate recall.
@@ -34,7 +38,7 @@ Observed on macOS/Python 3.14 with 10,000 messages and 64 simultaneous search th
 
 ## Verification and Retirement
 
-`tests/hermes_state/test_search_isolation.py` exercises error classification, saturated admission with the writer held, language and LIKE routes, hydration errors, read-only handles, non-WAL selection, bounded admission, interactive FIFO priority, unbounded admitted SQL, stage logs, exact pagination through ties, and corruption without writer repair. Existing state, pool, search-tool, CJK, fallback, registry, web search, and FTS-recovery suites remain the neighboring proof surfaces.
+`tests/hermes_state/test_search_isolation.py` exercises error classification, saturated admission with the writer held, language and LIKE routes, hydration errors, read-only handles, non-WAL selection, bounded admission, interactive FIFO priority, unbounded admitted SQL, stage logs, exact pagination through ties, and corruption without writer repair. `tests/hermes_state/test_search_isolation_review.py` holds the writer lock with busy, pending token deltas across every tool shape and a 3-ancestor walk. It also covers priority races during checkout, unbound process-environment contamination, partial-result supplement errors, and unavailable-store/read error responses. Existing state, pool, search-tool, CJK, fallback, registry, web search, and FTS-recovery suites remain the neighboring proof surfaces.
 
 `python scripts/benchmark_session_search.py --messages 10000 --workers 64` creates and deletes only its own temporary store. Rerun it through the source checkout's normal PM activation. Compare the returned plans and completion counts, not only average latency.
 

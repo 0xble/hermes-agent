@@ -46,7 +46,14 @@ class _ReaderQueue:
                     # still be able to expire or enqueue with higher priority.
                     conn = db._checkout_read_conn(independent=True)
                     if conn is not None:
-                        return conn
+                        with self.condition:
+                            if ticket == min(self.waiters):
+                                return conn
+                        # A higher-priority caller arrived during the open. Give
+                        # back its permit before rejoining admission, not the SQL.
+                        db._return_read_conn(conn)
+                        with self.condition:
+                            self.condition.notify_all()
                 with self.condition:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -67,9 +74,11 @@ def _queue_for(db):
 def _priority():
     # Gateway context is thread-local. Unknown/library callers use FIFO with
     # interactive calls. Only known automation yields, never a guessed UI list.
-    from gateway.session_context import get_session_env
+    from gateway.session_context import _SESSION_SOURCE
 
-    source = get_session_env("HERMES_SESSION_SOURCE", "")
+    # No process-environment fallback, even before the first bound gateway turn.
+    # The unbound sentinel matches no background source and gets default priority.
+    source = _SESSION_SOURCE.get()
     return int(source in {"cron", "subagent", "batch", "kanban", "oneshot", "tool", "a2a"})
 
 
@@ -132,6 +141,33 @@ def search_operation(db, *, caller="other", query="", sort=None, filters=None):
                 operation.reader_queue_ms, operation.sql_ms, operation.hydration_ms,
                 total_ms, operation.rows, operation.query[:200],
             )
+
+
+@contextmanager
+def browse_deadline(db, conn, timeout_seconds):
+    """Keep ordinary recent browsing bounded, but never interrupt admitted recall."""
+    if current_search(db) is not None:
+        yield
+        return
+    deadline = time.monotonic() + timeout_seconds
+    interrupted_by_deadline = False
+
+    def progress():
+        nonlocal interrupted_by_deadline
+        if time.monotonic() >= deadline:
+            interrupted_by_deadline = True
+            return 1
+        return 0
+
+    conn.set_progress_handler(progress, 1000)
+    try:
+        yield
+    except sqlite3.OperationalError as exc:
+        if interrupted_by_deadline and "interrupt" in str(exc).lower():
+            raise TimeoutError(f"recent-session browse exceeded {timeout_seconds:g}s deadline") from exc
+        raise
+    finally:
+        conn.set_progress_handler(None, 0)
 
 
 def hydration_stage(fn):
