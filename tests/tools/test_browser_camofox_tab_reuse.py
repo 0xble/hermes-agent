@@ -8,6 +8,7 @@ compression handoff against a stub Camofox HTTP server, with a temporary ``HERME
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,10 @@ class _Camofox:
         self.created = 0
         self.gone: set[str] = set()
         self.open_tab_ids: list[str] = []
+        self.identities_status = 200
+        self.identity_barrier = None
+        self.identities = [{"alias": alias, "userId": "hermes_camofox_" + hashlib.sha256(alias.encode()).hexdigest()[:24]}
+                           for alias in ("brianle", "lpg", "meridian", "mgf")]
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -48,6 +53,13 @@ class _Camofox:
                 parsed = urlsplit(self.path)
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 stub.calls.append(("GET", parsed.path, query))
+                if parsed.path == "/browser/identities":
+                    barrier = stub.identity_barrier
+                    stub.identity_barrier = None
+                    if barrier is not None:
+                        barrier[0].set()
+                        assert barrier[1].wait(15), "registry response was not released"
+                    return self._send({"identities": stub.identities}, stub.identities_status)
                 if parsed.path == "/tabs":
                     return self._send({"running": True, "tabs": stub.tabs.get(query.get("userId"), [])})
                 tab_id = parsed.path.split("/")[2] if parsed.path.startswith("/tabs/") else ""
@@ -159,6 +171,73 @@ def _dispatch(name, args, task_id):
     from tools.registry import registry
     raw = registry.dispatch(name, args, task_id=task_id)
     return json.loads(raw) if isinstance(raw, str) else raw
+
+
+def test_named_accounts_reuse_existing_profiles_across_hosts(camofox, tmp_path, monkeypatch, request):
+    """The server registry, not the client's absolute home, selects each persistent profile."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    c = camofox
+    aliases = ("brianle", "lpg", "meridian", "mgf")
+    mac_home = tmp_path / "mac" / ".hermes"
+    canonical = {alias: "hermes_camofox_" + hashlib.sha256(
+        f"camofox-account:{mac_home / 'browser_auth' / 'camofox'}:{alias}".encode()
+    ).hexdigest()[:24] for alias in aliases}
+    c.server.identities = [{"alias": alias, "userId": user_id} for alias, user_id in canonical.items()]
+    for alias, user_id in canonical.items():
+        c.server.seed(user_id, {"tabId": f"existing-{alias}", "url": "https://example.com",
+                                "listItemId": SHARED})
+    for host, home in (("mac", mac_home), ("linux", tmp_path / "linux" / "home" / "hermes" / ".hermes")):
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            "browser:\n  cloud_provider: camofox\n  camofox:\n    accounts: [brianle, lpg, meridian, mgf]\n",
+            encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        token = set_hermes_home_override(home)
+        request.addfinalizer(lambda token=token: reset_hermes_home_override(token))
+        for alias in aliases:
+            task = f"{host}-{alias}"
+            result = _dispatch("browser_navigate", {"url": "https://example.com", "account": alias}, task)
+            assert result["success"], result
+            assert c.cf._sessions[task]["user_id"] == canonical[alias]
+            assert c.cf._sessions[task]["tab_id"] == f"existing-{alias}"
+            assert canonical[alias] not in json.dumps(result)
+            c.cf.release_task_bindings([task])
+    assert not c.server.tab_posts(), "Selecting an existing account must not create a replacement profile/tab"
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("metadata,status", [
+    ([], 200),
+    (None, 200),
+    ({}, 200),
+    ([{"alias": "brianle", "userId": "ephemeral"}], 200),
+    ([{"alias": "brianle", "userId": None}], 200),
+    ([{"alias": "brianle", "userId": "hermes_camofox_" + "a" * 24}] * 2, 200),
+    ([{"alias": "brianle", "userId": "hermes_camofox_" + "b" * 24}], 503),
+])
+def test_named_accounts_fail_closed_without_persistent_mapping(camofox, metadata, status, bound):
+    c = camofox
+    tasks = ("unmapped-browser_navigate", "unmapped-browser_handoff")
+    if bound:
+        for task in tasks:
+            assert _dispatch("browser_navigate", {"url": "https://example.com", "account": "brianle"}, task)["success"]
+        c.server.calls.clear()
+    c.server.identities = metadata
+    c.server.identities_status = status
+    for tool, args in (("browser_navigate", {"url": "https://example.com", "account": "brianle"}),
+                       ("browser_handoff", {"account": "brianle"})):
+        result = _dispatch(tool, args, f"unmapped-{tool}")
+        assert result["success"] is False
+        assert "persistent" in result["error"].lower()
+        assert "brianle" in result["error"]
+    if bound:
+        result = _dispatch("browser_snapshot", {}, tasks[0])
+        assert result["success"] is False
+        assert "persistent" in result["error"].lower()
+    assert c.server.calls
+    assert all(method == "GET" and path == "/browser/identities" for method, path, _ in c.server.calls)
+    assert bool(c.cf._sessions) == bound
 
 
 def _end_turn(task_id, *, headed=False):
@@ -1037,6 +1116,110 @@ def test_agent_close_cleans_actual_tool_task_not_shared_session_id(camofox):
     with patch("run_agent.cleanup_vm"):
         owner._close_task_resources("different-session-id")
     assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_slow_identity_registry_does_not_block_existing_task_or_cleanup(camofox, bound):
+    from agent.memory_provider import spawn_context_thread
+
+    cf = camofox.cf
+    for task in ("sibling", "cleanup"):
+        assert _dispatch("browser_navigate", {"url": "https://example.test/"}, task)["success"]
+    if bound:
+        assert _dispatch("browser_navigate", {"url": "https://example.test/", "account": "brianle"}, "slow")["success"]
+    started, finish = threading.Event(), threading.Event()
+    sibling_done, cleanup_done = threading.Event(), threading.Event()
+    camofox.server.identity_barrier = (started, finish)
+    results = {}
+
+    def named_tool():
+        results["named"] = _dispatch("browser_navigate", {"url": "https://slow.test/", "account": "brianle"}, "slow")
+
+    def sibling_tool():
+        results["sibling"] = _dispatch("browser_snapshot", {}, "sibling")
+        sibling_done.set()
+
+    def cleanup():
+        cf.release_task_bindings({"cleanup"}, close_created_tabs=True)
+        cleanup_done.set()
+
+    named = spawn_context_thread(named_tool, name="slow-registry")
+    sibling = spawn_context_thread(sibling_tool, name="sibling-browser")
+    closer = spawn_context_thread(cleanup, name="browser-cleanup")
+    named.start()
+    try:
+        assert started.wait(2)
+        sibling.start()
+        closer.start()
+        # Both must finish before the registry responds, not merely after its timeout.
+        sibling_ready = sibling_done.wait(2)
+        cleanup_ready = cleanup_done.wait(2)
+        assert sibling_ready, "existing task blocked on the identity registry"
+        assert cleanup_ready, "cleanup blocked on the identity registry"
+        assert results["sibling"]["success"]
+        assert "cleanup" not in cf._sessions
+    finally:
+        finish.set()
+        for thread in (named, sibling, closer):
+            if thread.ident is not None:
+                thread.join(5)
+    assert not any(thread.is_alive() for thread in (named, sibling, closer))
+    assert results["named"]["success"]
+
+
+@pytest.mark.parametrize("change", ["initial-bind", "replacement", "drop", "account", "user-id"])
+def test_identity_lookup_refuses_a_concurrently_changed_binding(camofox, change):
+    from agent.memory_provider import spawn_context_thread
+
+    cf = camofox.cf
+    old = None
+    if change != "initial-bind":
+        assert _dispatch("browser_navigate", {"url": "https://old.test/", "account": "brianle"}, "target")["success"]
+        old = cf._sessions["target"]
+        cf.quarantine_current_protected_tab("target")
+    started, finish, changed = threading.Event(), threading.Event(), threading.Event()
+    camofox.server.identity_barrier = (started, finish)
+    results = []
+
+    def named_tool():
+        results.append(_dispatch("browser_navigate", {"url": "https://stale.test/", "account": "brianle"}, "target"))
+
+    def change_binding():
+        if change in {"replacement", "drop"}:
+            cf.release_task_bindings({"target"})
+        if change in {"initial-bind", "replacement"}:
+            cf._get_session("target", "lpg" if change == "initial-bind" else "brianle")
+        elif change in {"account", "user-id"}:
+            assert old is not None
+            with cf._sessions_lock:
+                field, value = (("account", "lpg") if change == "account"
+                                else ("user_id", "hermes_camofox_" + "f" * 24))
+                old[field] = value
+        changed.set()
+
+    named = spawn_context_thread(named_tool, name="delayed-identity")
+    changer = spawn_context_thread(change_binding, name="change-browser-binding")
+    named.start()
+    try:
+        assert started.wait(2)
+        changer.start()
+        assert changed.wait(2), "binding change blocked on the identity registry"
+        current = cf._sessions.get("target")
+        current_state = dict(current) if current is not None else None
+        before = list(camofox.server.calls)
+    finally:
+        finish.set()
+        for thread in (named, changer):
+            if thread.ident is not None:
+                thread.join(5)
+    assert not named.is_alive() and not changer.is_alive()
+    assert results[0]["success"] is False
+    assert "binding changed" in results[0]["error"]
+    assert cf._sessions.get("target") is current
+    assert current == current_state
+    assert camofox.server.calls == before, "stale lookup must not navigate or create a replacement"
+    if old is not None:
+        assert old["tab_id"] in cf._protected_tabs_on_disk()
 
 
 def test_slow_owned_tab_delete_does_not_block_sibling_tool(camofox):

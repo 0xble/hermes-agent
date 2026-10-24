@@ -42,7 +42,9 @@ def test_managed_tab_cannot_be_adopted_after_protected_task_cleanup(tmp_path):
     session = {"task_id": "journey", "tab_id": "protected-tab", "user_id": "account", "session_key": "account"}
     browser_camofox._sessions["journey"] = session
     try:
-        with patch.object(browser_camofox, "_protected_tabs_path", return_value=tmp_path / "quarantine"):
+        with patch.object(browser_camofox, "_protected_tabs_path", return_value=tmp_path / "quarantine"), \
+             patch.object(browser_camofox, "get_camofox_account_identity", return_value={
+                 "user_id": "hermes_camofox_" + "a" * 24, "session_key": "brianle_task"}):
             browser_camofox._drop_session("journey")
             assert "protected-tab" in browser_camofox._protected_tab_ids
             assert "protected-tab" in browser_camofox._protected_tabs_on_disk()
