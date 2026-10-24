@@ -504,6 +504,7 @@ def test_publication_busy_retries_the_same_generated_summary(published, tmp_path
 
     agent = _Agent(_compressor())
     agent.compression_in_place = in_place
+    agent._session_init_model_config = {}
     db = SessionDB(tmp_path / "publish.db")
     agent._session_db = db
     db.create_session(agent.session_id, "cli")
@@ -527,6 +528,37 @@ def test_publication_busy_retries_the_same_generated_summary(published, tmp_path
         assert any("SANITIZED SUMMARY" in str(m.get("content")) for m in db.get_messages(agent.session_id))
         [(_sid, name, payload)] = published
         assert name == "compaction" and payload["outcome"] == "committed"
+    finally:
+        db.close()
+
+
+def test_publication_failure_does_not_select_another_summary_model(published, tmp_path):
+    import sqlite3
+    from hermes_state import SessionDB
+    from agent.conversation_compression import run_compress_context_with_progress_timeout
+
+    agent = _Agent(_compressor())
+    agent.compression_in_place = True
+    db = SessionDB(tmp_path / "exhausted.db")
+    agent._session_db = db
+    db.create_session(agent.session_id, "cli")
+    messages = _messages()
+
+    def worker(fence):
+        return compress_context(agent, messages, "system prompt", approx_tokens=80_000, commit_fence=fence)
+
+    try:
+        with patch.object(db, "archive_and_compact", side_effect=sqlite3.OperationalError("database is locked")) as publish, \
+                patch.object(agent.context_compressor, "_generate_summary", return_value="SANITIZED SUMMARY") as generate, \
+                patch("agent.conversation_compression._attempt_stall_fallback") as fallback:
+            compressed, _ = run_compress_context_with_progress_timeout(
+                worker=worker, messages=messages, system_prompt_fallback="system prompt", telemetry_agent=agent,
+                idle_timeout_seconds=30, total_ceiling_seconds=60,
+            )
+        assert compressed == _messages()
+        assert generate.call_count == 1 and publish.call_count == 3
+        fallback.assert_not_called()
+        assert db.get_messages(agent.session_id) == []
     finally:
         db.close()
 

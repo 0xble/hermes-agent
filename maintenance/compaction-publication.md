@@ -1,6 +1,6 @@
 # Compaction Publication
 
-Fork-Patch: compaction-publication
+Fork patch identity: `compaction-publication`
 
 ## Contract
 
