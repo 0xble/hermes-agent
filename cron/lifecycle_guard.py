@@ -697,25 +697,25 @@ def _executable_name(token: str) -> str:
     return Path(token).name or token
 
 
-def _installed_heavy_slot_path(token: str) -> bool:
+def _installed_semaphore_path(token: str) -> bool:
     """Whether *token* is an explicit path resolving to this profile's installed helper."""
     try:
         path = Path(token)
         if not path.is_absolute() or _on_cloud_path(path):
             return False
-        installed = Path.home() / ".local" / "bin" / "heavy-slot"
+        installed = Path.home() / ".local" / "bin" / "semaphore"
         return path.resolve(strict=True) == installed.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return False
 
 
-def _heavy_slot_command_index(segment: list[str], index: int) -> Optional[int]:
+def _semaphore_command_index(segment: list[str], index: int) -> Optional[int]:
     """Peel only an explicit absolute path to the installed helper and its exact grammar.
 
     Bare names never earn this exception: modelling shell PATH mutations is unnecessary for the
     LPG caller, which uses the installed absolute path. Other scripts keep the strict walk.
     """
-    if not _installed_heavy_slot_path(segment[index]):
+    if not _installed_semaphore_path(segment[index]):
         return None
     position = index + 1
     while position < len(segment):
@@ -736,16 +736,16 @@ def _heavy_slot_command_index(segment: list[str], index: int) -> Optional[int]:
     return None
 
 
-def _heavy_slot_fallback_command_index(
+def _semaphore_fallback_command_index(
     segment: list[str], index: int,
 ) -> tuple[Optional[int], Optional[str]]:
-    """Find the command tail when heavy-slot's transparent grammar cannot be peeled.
+    """Find the command tail when semaphore's transparent grammar cannot be peeled.
 
     The helper remains a strict source reference on this path. Consume only exact known options
     up to the command boundary: argparse accepts abbreviations, so skipping to a later delimiter
     could hide a command already started by an abbreviated option. Refuse ambiguity by name.
     """
-    if _executable_name(segment[index]) != "heavy-slot" and not _installed_heavy_slot_path(segment[index]):
+    if _executable_name(segment[index]) != "semaphore" and not _installed_semaphore_path(segment[index]):
         return None, None
     arguments = segment[index + 1:]
     if not arguments or arguments in (["--help"], ["-h"]):
@@ -755,32 +755,32 @@ def _heavy_slot_fallback_command_index(
         option = segment[position]
         if option == "--":
             if position + 1 >= len(segment):
-                return None, "heavy-slot wrapper has `--` but no wrapped command"
+                return None, "semaphore wrapper has `--` but no wrapped command"
             return position + 1, None
         name, equals, value = option.partition("=")
         if name in {"--label", "--gate-fd"}:
             if not equals:
                 position += 1
                 if position >= len(segment) or segment[position].startswith("-"):
-                    return None, f"heavy-slot wrapper has an incomplete option `{name}`"
+                    return None, f"semaphore wrapper has an incomplete option `{name}`"
                 value = segment[position]
             if name == "--gate-fd" and re.fullmatch(r"[0-9]+", value) is None:
-                return None, f"heavy-slot wrapper has an invalid option `{option}`"
+                return None, f"semaphore wrapper has an invalid option `{option}`"
             position += 1
             continue
         if option in {"-h", "--help"}:
             return None, None
         if option.startswith("-"):
-            return None, f"heavy-slot wrapper has an unknown option `{option}`"
+            return None, f"semaphore wrapper has an unknown option `{option}`"
         # The delimiter may belong to the wrapped command itself. Once a command operand
         # starts, scan from here rather than skipping ahead to a later `--` in its argv.
         return position, None
 
-    return None, "heavy-slot wrapper has options but no wrapped command"
+    return None, "semaphore wrapper has options but no wrapped command"
 
 
 def _prefix_positions(
-    segment: list[str], index: int, *, allow_heavy_slot: bool = True,
+    segment: list[str], index: int, *, allow_semaphore: bool = True,
 ) -> tuple[list[int], bool, list[bool]]:
     """Return peeled positions, budget completion, and proven wrapper boundaries.
 
@@ -793,13 +793,13 @@ def _prefix_positions(
     for _ in range(_MAX_PREFIX_PEELS):
         if index >= len(segment):
             return positions, False, boundaries
-        heavy_target = _heavy_slot_command_index(segment, index) if allow_heavy_slot else None
+        heavy_target = _semaphore_command_index(segment, index) if allow_semaphore else None
         if heavy_target is not None:
             index = heavy_target
             positions.append(index)
             boundaries.append(True)
             continue
-        fallback_target, _ = _heavy_slot_fallback_command_index(segment, index)
+        fallback_target, _ = _semaphore_fallback_command_index(segment, index)
         if fallback_target is not None:
             index = fallback_target
             positions.append(index)
@@ -1269,7 +1269,7 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
 
     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
     # hits the filesystem root and fails the regular-file check, hard-blocking innocent .py scripts.
-    if executable == "heavy-slot":
+    if executable == "semaphore":
         # A bare name does NOT earn the exception. Resolve it only to keep the fallback strict,
         # including a different script on PATH; use the existing passive resolver, never execute it.
         from hermes_platform.resolver import locate_command
@@ -1282,13 +1282,13 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
         yield from _resolved_or_nothing(executable, cwd)
 
 
-def _iter_heavy_slot_fallback_refusals(command: str) -> Iterator[str]:
-    """Yield named refusals for heavy-slot invocations with an ambiguous command boundary."""
+def _iter_semaphore_fallback_refusals(command: str) -> Iterator[str]:
+    """Yield named refusals for semaphore invocations with an ambiguous command boundary."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
             continue
-        positions, complete, _ = _prefix_positions(segment, index, allow_heavy_slot=False)
+        positions, complete, _ = _prefix_positions(segment, index, allow_semaphore=False)
         if not complete and positions[-1] < len(segment):
             # Identify helpers even beyond the scan limit, without changing ordinary wrapper
             # behavior. Each chunk advances strictly through the segment's finite token list.
@@ -1296,30 +1296,30 @@ def _iter_heavy_slot_fallback_refusals(command: str) -> Iterator[str]:
             while True:
                 if any(
                     position < len(segment)
-                    and (_executable_name(segment[position]) == "heavy-slot"
-                         or _installed_heavy_slot_path(segment[position]))
+                    and (_executable_name(segment[position]) == "semaphore"
+                         or _installed_semaphore_path(segment[position]))
                     for position in chain
                 ):
-                    yield "the heavy-slot command wrapper chain exceeds the prefix scan budget"
+                    yield "the semaphore command wrapper chain exceeds the prefix scan budget"
                     break
                 if complete or chain[-1] >= len(segment):
                     break
-                chain, complete, _ = _prefix_positions(segment, chain[-1], allow_heavy_slot=False)
+                chain, complete, _ = _prefix_positions(segment, chain[-1], allow_semaphore=False)
         for position in positions:
             if position >= len(segment):
                 continue
-            if (_executable_name(segment[position]) != "heavy-slot"
-                    and not _installed_heavy_slot_path(segment[position])):
+            if (_executable_name(segment[position]) != "semaphore"
+                    and not _installed_semaphore_path(segment[position])):
                 continue
-            _, reason = _heavy_slot_fallback_command_index(segment, position)
+            _, reason = _semaphore_fallback_command_index(segment, position)
             if reason:
                 yield reason
 
 
 def _iter_referenced_shell_scripts(
-    command: str, *, cwd: Optional[str] = None, allow_heavy_slot: bool = True,
+    command: str, *, cwd: Optional[str] = None, allow_semaphore: bool = True,
 ) -> Iterator[Path]:
-    """Scan every wrapper reference, except the identity-trusted, exact-grammar heavy-slot helper.
+    """Scan every wrapper reference, except the identity-trusted, exact-grammar semaphore helper.
 
     Remote callbacks cannot attest the installed local helper's identity, so keep them strict.
     """
@@ -1328,12 +1328,12 @@ def _iter_referenced_shell_scripts(
         if index is None:
             continue
         positions, complete, boundaries = _prefix_positions(
-            segment, index, allow_heavy_slot=allow_heavy_slot,
+            segment, index, allow_semaphore=allow_semaphore,
         )
-        if allow_heavy_slot and not complete:
-            # An exhausted chain gets exactly the pre-heavy-slot walk: the helper is a normal
+        if allow_semaphore and not complete:
+            # An exhausted chain gets exactly the pre-semaphore walk: the helper is a normal
             # executable, so its source stays in the strict scan set and earns no peel benefit.
-            positions, _, boundaries = _prefix_positions(segment, index, allow_heavy_slot=False)
+            positions, _, boundaries = _prefix_positions(segment, index, allow_semaphore=False)
         # Positions after an unrecognized wrapper option are all possible command starts.
         positions = positions + [
             position for position in _ambiguous_positions(segment, positions, boundaries)
@@ -1342,7 +1342,7 @@ def _iter_referenced_shell_scripts(
         for position in positions:
             if position >= len(segment):
                 continue
-            if allow_heavy_slot and complete and _heavy_slot_command_index(segment, position) is not None:
+            if allow_semaphore and complete and _semaphore_command_index(segment, position) is not None:
                 continue
             yield from _references_at(segment, position, cwd)
 
@@ -1573,7 +1573,7 @@ def _contains_unsafe_gateway_action(
 
     walk_command = strip_inert_heredoc_bodies(command)
 
-    wrapper_refusal = next(_iter_heavy_slot_fallback_refusals(walk_command), None) if executed else None
+    wrapper_refusal = next(_iter_semaphore_fallback_refusals(walk_command), None) if executed else None
 
     for payload in _iter_shell_command_payloads(walk_command):
         if recurse(payload, cwd, executed):
@@ -1583,13 +1583,13 @@ def _contains_unsafe_gateway_action(
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
-    allow_heavy_slot = read_remote_script is None
+    allow_semaphore = read_remote_script is None
     candidates = [(path, executed) for path in _iter_referenced_shell_scripts(
-        walk_command, cwd=cwd, allow_heavy_slot=allow_heavy_slot,
+        walk_command, cwd=cwd, allow_semaphore=allow_semaphore,
     )]
     if walk_command != command:
         candidates += [(path, False) for path in _iter_referenced_shell_scripts(
-            command, cwd=cwd, allow_heavy_slot=allow_heavy_slot,
+            command, cwd=cwd, allow_semaphore=allow_semaphore,
         )]
 
     for script_path, candidate_executed in candidates:
