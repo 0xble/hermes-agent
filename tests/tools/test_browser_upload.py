@@ -1,5 +1,6 @@
-"""browser_upload: Camofox file-chooser attach, staging into the uploads root, and path safety."""
+"""browser_upload: Camofox file-chooser attach, cross-host byte transport, and path safety."""
 
+import base64
 import json
 from unittest.mock import MagicMock, patch
 
@@ -23,7 +24,7 @@ def _open_tab(mock_post, task_id):
 
 
 @patch("tools.browser_camofox.requests.post")
-def test_stages_outside_file_into_uploads_root_and_posts_ref(mock_post, monkeypatch, tmp_path):
+def test_sends_outside_file_inline_and_posts_ref(mock_post, monkeypatch, tmp_path):
     monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
     root = tmp_path / "uploads"
     root.mkdir()
@@ -45,12 +46,11 @@ def test_stages_outside_file_into_uploads_root_and_posts_ref(mock_post, monkeypa
     body = mock_post.call_args.kwargs["json"]
     assert url.endswith("/tabs/tab-up1/upload")
     assert body["ref"] == "e7" and "selector" not in body
-    (staged,) = body["path"]
-    assert staged.startswith(str(root.resolve()))
-    # The page sees the staged file's basename as File.name, so it must be the original name.
-    assert staged.rsplit("/", 1)[-1] == "logo.png"
-    with open(staged, "rb") as fh:
-        assert fh.read() == src.read_bytes()
+    assert "path" not in body
+    assert body["files"] == [{"name": "logo.png", "mimeType": "image/png",
+                              "dataBase64": base64.b64encode(src.read_bytes()).decode("ascii")}]
+    assert not list(root.iterdir())
+
 
 
 @patch("tools.browser_camofox.requests.post")
@@ -69,7 +69,8 @@ def test_file_already_in_root_is_not_copied(mock_post, monkeypatch, tmp_path):
     assert result["success"] is True
 
     body = mock_post.call_args.kwargs["json"]
-    assert body["path"] == [str(inside.resolve())]
+    assert "path" not in body
+    assert body["files"] == [{"name": "a.pdf", "mimeType": "application/pdf", "dataBase64": "JVBERg=="}]
     assert body["selector"].startswith("iframe")
     assert not (root / "hermes").exists()
 
@@ -182,7 +183,7 @@ def test_upload_without_trigger_does_not_require_count(mock_post, monkeypatch, t
 
 
 @patch("tools.browser_camofox.requests.post")
-def test_server_root_mismatch_names_staging_dir_and_setting(mock_post, monkeypatch, tmp_path):
+def test_old_server_rejection_never_replays_and_names_server_first_order(mock_post, monkeypatch, tmp_path):
     import requests
 
     monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
@@ -200,8 +201,10 @@ def test_server_root_mismatch_names_staging_dir_and_setting(mock_post, monkeypat
     result = json.loads(camofox_upload([str(src)], task_id="up6"))
 
     assert result.get("success") is False
-    assert str(root) in result["error"]
-    assert "browser.camofox.uploads_dir" in result["error"]
+    assert "installed before this client" in result["error"]
+    assert "inspect" in result["error"]
+    assert not root.exists()
+    assert len([c for c in mock_post.call_args_list if c.args[0].endswith("/upload")]) == 1
 
 
 @patch("tools.browser_camofox.requests.post")
@@ -219,37 +222,6 @@ def test_nt_namespace_path_rejected_before_resolve(mock_post, monkeypatch, tmp_p
 
     assert result.get("success") is False
     assert mock_post.call_count == calls
-
-
-def test_failed_staging_copy_leaves_nothing_reusable(monkeypatch, tmp_path):
-    import shutil
-    from tools import browser_camofox
-
-    root = tmp_path / "uploads"
-    root.mkdir()
-    src = tmp_path / "logo.png"
-    src.write_bytes(b"complete-bytes" * 100)
-    real_copy = shutil.copyfile
-
-    def partial_then_fail(a, b, *args, **kwargs):
-        with open(b, "wb") as fh:
-            fh.write(b"partial")
-        raise OSError("disk full")
-
-    monkeypatch.setattr(shutil, "copyfile", partial_then_fail)
-    try:
-        browser_camofox._stage_upload_file(str(src), str(root))
-    except OSError:
-        pass
-    else:
-        raise AssertionError("expected the failed copy to raise")
-    assert [p for p in (root / "hermes").rglob("*") if p.is_file()] == []
-
-    monkeypatch.setattr(shutil, "copyfile", real_copy)
-    staged = browser_camofox._stage_upload_file(str(src), str(root))
-    with open(staged, "rb") as fh:
-        assert fh.read() == src.read_bytes()
-    assert staged.rsplit("/", 1)[-1] == "logo.png"
 
 
 def test_registered_only_for_camofox_and_in_browser_toolset(monkeypatch):

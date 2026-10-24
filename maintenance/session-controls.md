@@ -99,11 +99,15 @@ back absence before removing the existing topic binding and routing index entry.
 The session and transcript remain. The user CLI's exact `topic list --id` probe
 is preferred when installed. Its DM peer is the bot's dialog, not the Bot API
 user chat ID. The strict Bot API missing-thread probe serves other installations.
-An unresolved delete is quiescent, not retried by housekeeping. `/retire` or
-`/retire cancel` first probes the exact topic under the executor lock. Confirmed
-absence only cleans up its binding. Confirmed existence permits cancellation or
-a fresh generation that inventories again and requires a new closing receipt.
-An unknown result leaves the previous dispatch unresolved and never repeats it.
+Housekeeping never retries an unresolved destructive request or sends a probe.
+When the user CLI is available, it may passively reconcile exact-topic absence
+under the executor lock and the saved generation-matching closing receipt, then
+finish unbinding. Existing, unknown or incomplete lookup results, disconnected
+transports and invalid receipts leave the record quiet and unchanged. `/retire`
+or `/retire cancel` explicitly probes the exact topic under the same lock.
+Confirmed absence only cleans up its binding. Confirmed existence permits
+cancellation or a fresh generation that inventories again and requires a new
+closing receipt. An unknown result never repeats the previous dispatch.
 
 Proof surfaces: `tests/gateway/test_telegram_retire.py` and
 `test_telegram_retire_work.py`, plus the existing topic-tool, topic-mode,
