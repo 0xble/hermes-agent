@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from hermes_constants import get_hermes_home
-from tools.interrupt import consume_yield, is_interrupted, is_thread_interrupted
+from tools.interrupt import acting_for_tid, consume_yield, is_interrupted, is_thread_interrupted
 from tools.environments.base_output import (
     ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
 )
@@ -96,6 +96,15 @@ def _quiet_kill(kill: Callable, proc) -> None:
         kill(proc)
     except Exception:
         logger.debug("exit-time kill of a foreground command failed", exc_info=True)
+
+
+def foreground_cleanup_in_progress() -> bool:
+    """Non-blocking teardown hint for local kill paths, including late spawn callbacks.
+
+    The admission fence is already owned by cleanup; do not acquire a lock the exiting
+    thread might hold just to decide whether to avoid a host-wide descendant scan.
+    """
+    return _exit_fenced or _cleanup_fences > 0
 
 
 def kill_live_foreground_processes(*, now: bool = False) -> int:
@@ -693,12 +702,16 @@ class BaseEnvironment(ABC):
                 self._force_kill_process(spawned)
             output = _new_output_collector(spawned, bounded_capture)
             output_holder.append(output)
+            # The wait watches parent_tid, and its kill path must resolve that same
+            # thread's shutdown cause rather than treating it as ordinary /stop.
+            interrupt_token = acting_for_tid.set(parent_tid)
             try:
                 return self._wait_for_process(
                     spawned, timeout=effective_timeout, bounded_capture=bounded_capture,
                     watch_interrupt_tid=parent_tid, output=output,
                     **({"yield_handler": yield_handler} if yield_handler is not None else {}))
             finally:
+                acting_for_tid.reset(interrupt_token)
                 with _live_foreground_cond:
                     _live_foreground.pop(id(spawned), None)
 
