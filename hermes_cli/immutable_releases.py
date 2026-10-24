@@ -106,7 +106,8 @@ def prune_carry_forward_refs(source: Path, paths: ReleasePaths) -> None:
     from hermes_cli.update_custody import run_git
 
     def run(args):
-        return run_git(["git"], args, cwd=source, check=True, capture_output=True, text=True)
+        return run_git(["git"], args, cwd=source, check=True, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
 
     keep = {release.name for pointer in (paths.current, paths.previous)
             if (release := read_pointer(pointer)) is not None}
