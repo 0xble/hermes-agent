@@ -265,7 +265,7 @@ def test_timed_pin_resolution_uses_deadline_or_newer_user_activity(stamp):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("duration,seconds", [("30m", 1800), ("2h", 7200), ("1h30m", 5400), ("1d", 86400)])
+@pytest.mark.parametrize("duration,seconds", [("10s", 10), ("30m", 1800), ("2h", 7200), ("1h30m", 5400), ("1d", 86400)])
 async def test_timed_busy_pin_replaces_deadline_and_round_trips(attended, monkeypatch, tmp_path, duration, seconds):
     from zoneinfo import ZoneInfo
 
@@ -297,6 +297,8 @@ async def test_timed_busy_pin_replaces_deadline_and_round_trips(attended, monkey
         await asyncio.to_thread(reader.close_all_db_handles)
     status = await dispatch(" status")
     assert "more" in status and local_release in status
+    if seconds < 60:
+        assert "<1m" in status
     clock += 10
     await dispatch(" 1h30m")
     assert entry.attended_pin_until == clock + 5400
