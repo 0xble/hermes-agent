@@ -1868,12 +1868,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
-                # A rejected message, not a completed turn: return before the /goal judge so it
-                # cannot consume the resend notice and enqueue a synthetic continuation loop.
+                # The bounded wait expired or its durable spool failed. No turn ran,
+                # so refund the wake tick and bypass the /goal judge for the resend notice.
                 logger.error(
-                    "Rejecting turn for routing key %s on session %s after "
-                    "turn-lease timeout; transcript load was not started and "
-                    "the user must resend",
+                    "Cannot run queued turn for routing key %s on session %s: "
+                    "turn-lease wait expired or input could not be preserved; "
+                    "transcript load was not started and the user must resend",
                     _quick_key, exc.session_id,
                 )
                 await self._release_unsettled_loop_tick(event, ran=False)
@@ -1899,7 +1899,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             if getattr(event, "_gateway_lease_wait_spool", None) is not None:
                 from gateway.run_turn_lease_wait import retire_lease_wait
                 with suppress(Exception):
-                    await asyncio.to_thread(retire_lease_wait, self, event)
+                    await asyncio.to_thread(retire_lease_wait, self, event, discard=not self._draining)
             if not getattr(event, "_turn_marker_handoff", False):
                 await self._clear_durable_active_turn(event)
             # Release only this turn's generation. Eviction may immediately admit a replacement

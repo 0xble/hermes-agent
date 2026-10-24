@@ -21,9 +21,11 @@ logger = logging.getLogger(__name__)
 # distinct sessions may transiently exceed the cap rather than break serialization.
 DEFAULT_MAX_LEASES = 512
 # Fallback wait (seconds) when the caller passes no positive timeout (bridged via
-# HERMES_TURN_LEASE_TIMEOUT — lease contention is not agent inactivity). Fail-closed but short:
-# never pin a sequential platform updater for minutes.
+# HERMES_TURN_LEASE_TIMEOUT — lease contention is not agent inactivity). Callers without
+# a durable waiting owner fail closed here, while queued inputs get the larger total bound.
 DEFAULT_LEASE_WAIT = 5.0
+DEFAULT_LEASE_NOTICE_DELAY = 30.0
+DEFAULT_MAX_LEASE_WAIT = 1800.0
 
 
 def _holder_desc(holder: "Optional[TurnLeaseToken]") -> tuple:
@@ -99,11 +101,14 @@ class SessionTurnLeaseRegistry:
     async def acquire(
         self, session_id: str, *, owner_key: str, generation: int, timeout: Optional[float] = None,
         on_timeout: Callable[[], Awaitable[None]] | None = None,
+        max_wait: float = DEFAULT_MAX_LEASE_WAIT,
+        on_wait: Callable[[], Awaitable[None]] | None = None,
     ) -> Optional[TurnLeaseToken]:
         """Acquire the lease for ``session_id``; None for a falsy id.
 
-        At the deadline, fail closed unless ``on_timeout`` durably takes ownership
-        of the waiting input. That owner can extend the original FIFO wait until release.
+        At the initial deadline, fail closed unless ``on_timeout`` durably takes
+        ownership of the waiting input. Extend the original FIFO wait until release
+        or ``max_wait``, with a one-time ``on_wait`` notice after 30 seconds.
         """
         if not session_id:
             return None
@@ -127,16 +132,18 @@ class SessionTurnLeaseRegistry:
         # may schedule them before the lock coroutine runs) so eviction cannot orphan the old
         # lock and create a second lock for the same session.
         lease.pending_acquires += 1
+        started = time.monotonic()
         try:
-            await self._wait_for_lock(lease.lock, wait, on_timeout)
+            await self._wait_for_lock(lease.lock, wait, on_timeout, max_wait, on_wait)
         except TimeoutError:
+            elapsed = time.monotonic() - started
             logger.error(
                 "turn lease wait timed out after %.0fs on session %s (waiter: routing key %s gen "
                 "%s; holder: routing key %s gen %s) — failing closed: refusing to run this turn "
                 "UNSERIALIZED against the still-held lease",
-                wait, session_id, owner_key, generation, *_holder_desc(lease.holder))
+                elapsed, session_id, owner_key, generation, *_holder_desc(lease.holder))
             raise TurnLeaseTimeoutError(
-                session_id, owner_key=owner_key, generation=generation, wait_seconds=wait) from None
+                session_id, owner_key=owner_key, generation=generation, wait_seconds=elapsed) from None
         finally:
             lease.pending_acquires -= 1
         # Lock held and no await before holder publication, so the lease cannot become
@@ -146,19 +153,26 @@ class SessionTurnLeaseRegistry:
         return token
 
     @staticmethod
-    async def _wait_for_lock(lock, timeout, on_timeout):
+    async def _wait_for_lock(lock, timeout, on_timeout, max_wait, on_wait):
         # Keep the SAME asyncio.Lock waiter after the deadline, preserving FIFO order.
         # Cancellation must drain it too: otherwise a detached acquire can steal the lease.
         waiter = asyncio.create_task(lock.acquire())
         acquired = False
+        notice_at = asyncio.get_running_loop().time() + DEFAULT_LEASE_NOTICE_DELAY
         try:
-            done, _ = await asyncio.wait({waiter}, timeout=timeout)
-            if not done:
-                if on_timeout is None:
-                    raise TimeoutError
-                await on_timeout()  # preserve durably off-loop before extending its wait
-            await waiter
-            acquired = True
+            async with asyncio.timeout(max_wait):
+                done, _ = await asyncio.wait({waiter}, timeout=timeout)
+                if not done:
+                    if on_timeout is None:
+                        raise TimeoutError
+                    await on_timeout()  # preserve durably off-loop before extending its wait
+                    if on_wait is not None:
+                        remaining = max(0, notice_at - asyncio.get_running_loop().time())
+                        done, _ = await asyncio.wait({waiter}, timeout=remaining)
+                        if not done:
+                            await on_wait()
+                await waiter
+                acquired = True
         finally:
             if not acquired:
                 waiter.cancel()

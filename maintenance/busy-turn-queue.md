@@ -26,9 +26,18 @@ Cancellation must cancel and drain the lock acquire. A completed acquire racing
 cancellation must release the lock if no turn token was published. A failed
 spool write fails visibly and closed, never authorizing an unserialized turn.
 
-Retire a waiting event's spool only when the exact platform or recovery identity
-is present in the transcript. Otherwise leave it for the existing startup
-follow-up recovery path. Reuse its authorization, profile routing, media,
+The total wait is bounded by the owning profile's
+`gateway.turn_lease_max_wait_seconds` (default 1800 seconds). After 30 seconds,
+use the existing busy-ack channel for 1 queued notice, unless the event was
+already acknowledged. Expiry and spool failures use the existing visible resend
+reply and refund unrun loop ticks.
+
+Retire a waiting event's spool after a durable user row, on deliberate input
+rejection, or on user cancellation (`/stop`, `/new`, `/reset`). Retain undurable
+input only for process shutdown or a crash. Settle an in-flight spool writer
+before cancellation finalizes replay ownership. Recovered waiters reuse their
+existing spool, and reconnect scans skip still-running routing keys. Startup
+follow-up recovery retains its authorization, profile routing, media,
 identity-based duplicate handling, and visible stale-input decisions.
 
 Contention logs distinguish same-key generation overlap from different routing
@@ -39,8 +48,9 @@ in `agent/turn_facade_lease.py` are unchanged.
 ## Proof And Retirement
 
 `tests/gateway/test_turn_lease_queue.py` covers same-key and aliased-key dispatch,
-FIFO across the deadline, cancellation, capacity pressure, failed spool writes,
-media and id-less recovery, and spool retirement only after a durable input.
+FIFO across the deadline, user cancellation versus shutdown, capacity pressure,
+failed spool writes, bounded waits, busy-ack deduplication, media and id-less
+recovery, recovery-spool reuse, reconnects, and spool retirement on deliberate drops.
 `tests/gateway/test_turn_lease.py` covers the real preparation/dispatch boundary,
 including no transcript access or goal judgment while waiting.
 

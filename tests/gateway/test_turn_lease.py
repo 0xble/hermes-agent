@@ -172,6 +172,9 @@ async def test_lease_wait_preserves_input_without_loading_transcript_or_goal_hoo
         assert not task.done()
         runner.session_store.load_transcript.assert_not_called()
     finally:
+        # This probe models process shutdown. User cancellation deliberately retires
+        # the spool instead, exercised by the inbound exit-intent coverage.
+        runner._draining = True
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         assert runner._turn_leases.release(holder)

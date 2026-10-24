@@ -1320,7 +1320,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         finally, granted per (routing key, run generation) so a stale unwind can't
         release a newer turn's."""
         from gateway.run import _float_env
-        from gateway.run_turn_lease_wait import preserve_lease_wait
+        from gateway.run_turn_lease_wait import lease_wait_max_seconds, lease_wait_notice, preserve_lease_wait_async
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is None:
             return
@@ -1328,8 +1328,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             _lease_token = await _lease_registry.acquire(
                 session_entry.session_id, owner_key=_quick_key, generation=run_generation,
                 timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
-                on_timeout=(lambda: asyncio.to_thread(
-                    preserve_lease_wait, self, _quick_key, session_entry.session_id, event,
+                max_wait=lease_wait_max_seconds(),
+                on_wait=(lambda: lease_wait_notice(self, _quick_key, event)) if event is not None else None,
+                on_timeout=(lambda: preserve_lease_wait_async(
+                    self, _quick_key, session_entry.session_id, event,
                 )) if event is not None else None,
             )
         except BaseException:
