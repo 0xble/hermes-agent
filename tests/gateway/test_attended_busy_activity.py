@@ -72,7 +72,7 @@ def busy_activity(monkeypatch):
 async def _receive(fixture, path, mode, monkeypatch):
     runner, event, key, state = fixture
     runner._busy_input_mode = mode
-    if path == "adapter_fallthrough":
+    if path == "adapter_text_queue":
         runner._busy_text_mode = "queue"
     if path == "grace":
         state.turn.started_ts = time.time()
@@ -86,8 +86,16 @@ async def _receive(fixture, path, mode, monkeypatch):
         await zero_cut_busy.queue_foreign_owner(runner, event, key)
     elif path.startswith("adapter"):
         result = await runner._handle_active_session_busy_message(event, key)
-        if path == "adapter_fallthrough":
-            assert result is False
+        if path == "adapter_text_queue":
+            if event.internal and event.allow_gateway_control:
+                assert result is True
+                runner._queue_or_replace_pending_event.assert_called_once_with(key, event)
+                assert getattr(event, "_gateway_accepted", False) is True
+                runner._steer_running_agent.assert_not_called()
+                runner._hm_busy_interrupt.assert_not_awaited()
+            else:
+                assert result is False
+                runner._queue_or_replace_pending_event.assert_not_called()
     elif path == "command":
         runner._hm_admit_event = AsyncMock(return_value=(event, event.source, event.internal))
         runner._quick_command_alias_text = lambda _event: None
@@ -102,7 +110,7 @@ async def _receive(fixture, path, mode, monkeypatch):
 
 
 BUSY_PATHS = [(path, mode) for path in ("adapter", "runner") for mode in ("queue", "steer", "interrupt")]
-BUSY_PATHS += [("grace", "interrupt"), ("adapter_fallthrough", "queue"),
+BUSY_PATHS += [("grace", "interrupt"), ("adapter_text_queue", "queue"),
                ("foreign_accept", "queue"), ("foreign_reject", "queue"), ("command", "queue")]
 
 
