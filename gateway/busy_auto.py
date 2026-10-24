@@ -26,7 +26,8 @@ def _restore_arrival_order(runner, session_key, adapter) -> None:
     slot = adapter._pending_messages
     overflow = runner._overflow_queue(session_key)
     events = [slot[session_key], *(overflow or [])]
-    events.sort(key=stamp_busy_arrival)
+    # Untagged recovered entries predate this turn. Never stamp them at deferral time.
+    events.sort(key=lambda event: getattr(event, "_busy_arrival_order", -1))
     slot[session_key] = events[0]
     if overflow is not None:
         overflow[:] = events[1:]

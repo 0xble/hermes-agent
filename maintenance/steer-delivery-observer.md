@@ -41,6 +41,15 @@ handoffs are idempotent. Input accepted after the last model request returns to
 the original host queue at finalization. Slash commands, media, explicit
 `/queue`, internal events, interrupt, and `/stop` retain their existing paths.
 
+Arrival order is assigned on input admission, including explicit queue and media
+admissions, never at a delayed handoff. The gateway retains its event stamp.
+The TUI keeps an arrival sequence on the existing queue envelopes and merges
+only adjacent queued text, not across an intervening auto input. The CLI extends
+its native `Queue`, retaining arrival metadata internally while consumers still
+receive the original string, image tuple, or voice sentinel. Queue edits retain
+that metadata. A successful insertion commits the handoff, so a later display
+failure cannot reopen its receipt or enqueue the original input again.
+
 The Ask Tracking consumer update must be qualified with the compatible core
 before enabling auto mode. Optional `manual_text` and `auto_messages` are
 host-owned input boundaries. The consumer observes successful deferrals through
@@ -66,8 +75,9 @@ Use the canonical `scripts/run_tests.sh` runner for
 `tests/agent/test_steer_deferral.py`,
 `tests/agent/test_steer_delivered_hook.py`,
 `tests/agent/test_compression_last_assistant_anchor.py`,
-`tests/gateway/test_busy_auto.py`, and
-`tests/tui_gateway/test_auto_steer.py`, plus the existing steer, busy-policy,
+`tests/gateway/test_busy_auto.py`,
+`tests/tui_gateway/test_auto_steer.py`, and
+`tests/hermes_cli/test_auto_steer.py`, plus the existing steer, busy-policy,
 queue, lock-fallback, and plugin suites for the affected surfaces.
 
 The consumer's native probe checks real plugin dispatch and durable capture with
