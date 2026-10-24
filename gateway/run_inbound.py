@@ -1687,10 +1687,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             if entry is None:
                 return False
             state = self._session_state(session_key)
-            if attended_cfg.start_new_sessions and (
-                getattr(entry, "created_at", None) == getattr(entry, "updated_at", None)
-                or getattr(entry, "is_fresh_reset", False)
-                or getattr(state.conversation, "attended_new_session", False)
+            from gateway.session_state import session_opening_pending
+            if attended_cfg.start_new_sessions and session_opening_pending(
+                entry, attended_new_session=state.conversation.attended_new_session,
             ):
                 # Preserve the creation boundary before mark_user_activity updates updated_at.
                 state.conversation.attended_new_session = True
@@ -1855,6 +1854,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
+        _preserve_lease_wait_on_shutdown = False
         try:
             # Mark genuine user activity inside the claimed turn, before resolving the model. This
             # preserves the attended route's same-turn semantics without delaying the sentinel claim.
@@ -1869,12 +1869,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
-                # A rejected message, not a completed turn: return before the /goal judge so it
-                # cannot consume the resend notice and enqueue a synthetic continuation loop.
+                # The bounded wait expired or its durable spool failed. No turn ran,
+                # so refund the wake tick and bypass the /goal judge for the resend notice.
                 logger.error(
-                    "Rejecting turn for routing key %s on session %s after "
-                    "turn-lease timeout; transcript load was not started and "
-                    "the user must resend",
+                    "Cannot run queued turn for routing key %s on session %s: "
+                    "turn-lease wait expired or input could not be preserved; "
+                    "transcript load was not started and the user must resend",
                     _quick_key, exc.session_id,
                 )
                 await self._release_unsettled_loop_tick(event, ran=False)
@@ -1887,6 +1887,13 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
+        except asyncio.CancelledError:
+            # Shutdown may replay an unfinished turn, but a stop/reset invalidates
+            # its generation even when the gateway is already draining.
+            _preserve_lease_wait_on_shutdown = (
+                self._draining and self._is_session_run_current(_quick_key, _run_generation)
+            )
+            raise
         finally:
             with suppress(Exception):
                 self._session_state(_quick_key).conversation.attended_new_session = False
@@ -1897,6 +1904,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
             # clears it only once the reply is in the delivery ledger (else a kill in between
             # left neither marker nor ledger row and the persisted reply was never sent).
+            if getattr(event, "_gateway_lease_wait_spool", None) is not None:
+                from gateway.run_turn_lease_wait import retire_lease_wait
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        retire_lease_wait, self, event, discard=not _preserve_lease_wait_on_shutdown,
+                    )
             if not getattr(event, "_turn_marker_handoff", False):
                 await self._clear_durable_active_turn(event)
             # Release only this turn's generation. Eviction may immediately admit a replacement

@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_state_common import (
     _BOUNDARY_END_REASONS, _COMPRESSION_LOCK_ROW_SQL as _LOCK_ROW_SQL, _ENDED_ROW_SQL, _ended_by_compression,
     _RESET_CHILD_SQL, _sql_json_extract, _sql_session_last_active, is_automatic_end_reason)
+from hermes_state_transactions import execute_transcript_write
 
 # Log-record parity with the origin module (caplog tests pin "hermes_state").
 logger = logging.getLogger("hermes_state")
@@ -363,7 +364,7 @@ class SessionCompressionMixin:
                 # A live continuation under an idle-sweep archive re-activates the chat; after the
                 # closure above the child is linked into the lineage walk (#117713).
                 self._unarchive_auto_archived_lineage(conn, child_session_id)
-        self._execute_transcript_write(_do, messages)
+        execute_transcript_write(self, _do, messages, session_id=child_session_id)
 
     def _write_sql_logged(self, op: str, session_id: str, sql: str, params) -> None:
         """``_write_sql`` that logs (never raises) on ``sqlite3.Error``."""

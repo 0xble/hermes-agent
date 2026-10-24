@@ -79,6 +79,7 @@ from hermes_state_maintenance import SessionMaintenanceMixin
 from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
+from hermes_state_transactions import settle_write_transaction
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -1044,13 +1045,15 @@ class SessionDB(
 
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+        *, session_id: Optional[str] = None, input_rows: Optional[int] = None,
     ) -> T:
         """Run *fn(conn)* in a write transaction; see :meth:`_execute_write_marked`."""
         with _storage_write_in_progress():
-            return self._execute_write_marked(fn, patience_s)
+            return self._execute_write_marked(fn, patience_s, session_id=session_id, input_rows=input_rows)
 
     def _execute_write_marked(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+        *, session_id: Optional[str] = None, input_rows: Optional[int] = None,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
@@ -1084,6 +1087,7 @@ class SessionDB(
             generation_clean = self._db_generation_probe_clean()
             fn_started = False
             try:
+                acquisition_started = time.monotonic()
                 with self._lock:
                     if generation_clean:
                         self._raise_if_db_generation_flagged()
@@ -1091,25 +1095,12 @@ class SessionDB(
                         self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    transaction_started = time.monotonic()
-                    try:
-                        fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
-                        try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
-                    finally:
-                        held_s = time.monotonic() - transaction_started
-                        if held_s >= self._WRITE_LOCK_WARN_S:
-                            callback_name = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
-                            logger.warning(
-                                "state.db write transaction held the write lock for %.1fs: callback=%s pid=%d",
-                                held_s, callback_name, os.getpid())
+                    conn = cast(sqlite3.Connection, self._conn)  # reopen succeeded under the writer guard
+                    conn.execute("BEGIN IMMEDIATE")
+                    fn_started = True
+                    result = settle_write_transaction(conn, fn, clock=time, logger=logger,
+                        warn_s=self._WRITE_LOCK_WARN_S, acquire_s=time.monotonic() - acquisition_started,
+                        session_id=session_id, input_rows=input_rows)
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:

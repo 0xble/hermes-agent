@@ -1248,13 +1248,13 @@ def test_locked_distribution_upgrade_survives_optional_restore(tmp_path, monkeyp
     assert result.stdout.strip() == "2.0 1.0"
 
 
-@pytest.mark.parametrize("manager", ["linux", "win32"])
-def test_immutable_opt_in_rejects_non_launchd_before_staging(tmp_path, monkeypatch, manager):
-    from hermes_cli import update_cmd
+@pytest.mark.platforms("linux", "windows")
+def test_immutable_opt_in_rejects_non_launchd_before_staging(tmp_path, monkeypatch):
+    from hermes_cli import main, update_cmd
     home = tmp_path / "profile"
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
-    monkeypatch.setattr(update_cmd.sys, "platform", manager)
     monkeypatch.setattr(releases, "stage_release", lambda *args, **kw: pytest.fail("staged"))
     with pytest.raises(RuntimeError, match="macOS launchd"):
         update_cmd._cmd_update_impl(object(), gateway_mode=False)
