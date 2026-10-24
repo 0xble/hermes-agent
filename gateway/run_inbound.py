@@ -28,10 +28,10 @@ from gateway.cron_review import is_review_event
 from gateway.platforms.base import OUTBOUND_FINAL, EphemeralReply, as_command_reply, outbound_class
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
-from gateway.run_common import _UNSET
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_inbound_hooks import GatewayInboundHooksMixin
 from gateway.run_loop_wake import GatewayLoopWakeMixin, _CommandDispatch, _CommandHandled
+from gateway.run_inbound_transcription import GatewayInboundTranscriptionMixin
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
 from gateway.run_inbound_unauthorized import (
     UnauthorizedOwnerNotifier, pairing_code_reply, pairing_profile_arg, pairing_rate_limited_reply,
@@ -120,7 +120,7 @@ async def _admit_outbox_event(runner, event, source):
         bind_turn(home, turn_id)
 
 
-class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
+class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
     async def _hm_stop_owner_turn(self, _quick_key: str) -> None:
@@ -252,10 +252,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         if getattr(_config, "multiplex_profiles", False):
             self._canonicalize(source)
         if getattr(source, "profile_route_rejected", False) is True:
-            logger.warning(
-                "Dropping inbound message because its explicit profile route "
-                "targets an unserved profile"
-            )
+            from gateway.parked_route_refusal import drop_rejected_route
+            _intake = None
+            with suppress(Exception):
+                _intake = self._intake_adapter_for(source)
+            drop_rejected_route(_intake, source)  # a parked target is also refused to the sender
             return None
 
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
@@ -309,6 +310,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         if is_internal:
             await _admit_outbox_event(self, event, source)
             return event, source, True
+        if getattr(event, "_fifo_only", False):  # a slash command's queued turn: its command passed ingress
+            return event, source, False
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
@@ -861,13 +864,26 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         authority = active_authority(self)
         sid = authority.logical_owner(self.session_store.peek_session_id(_quick_key)) if authority else None
         if not sid or sid not in authority.sessions:
+            if authority is not None:
+                # The chat's first input, and a command's turn, not committed yet never commit.
+                authority.fence_route(_quick_key)
             return
         from gateway.session_contract import Principal, SessionRef
         from hermes_state_runtime import RuntimeStoreError, list_session_admissions
         ref = SessionRef(authority.profile_id, sid)
         actor = Principal('messaging-control', authority.profile_id,
                           frozenset({'session:submit', 'session:control'}), 'busy-command')
-        for row in await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid):
+        rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid)
+        # A FIFO paused on a lost (``unknown``) turn is the operator's to resume: its pause notice
+        # promised the queued followers stay saved, so a /new from the chat leaves them queued.
+        paused = any(row['status'] == 'unknown' for row in rows)
+        if not paused:
+            # Input (and a command's turn) that arrived before this and is not committed yet never
+            # commits after it; one that committed before the fence is in the second listing and
+            # cancelled below. A paused FIFO keeps both, like its queued followers.
+            authority.fence_route(_quick_key)
+            rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid)
+        for row in [] if paused else rows:
             if row['status'] == 'queued' and row['principal_id'].startswith('messaging:'):
                 # Claimed meanwhile (stale_generation): it runs as main's post-claim race does.
                 with suppress(RuntimeStoreError):
@@ -963,6 +979,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             self._preserve_drain_event(_quick_key, event)
             return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
+        if not _handled:
+            _handled, _result = await self._busy_skill_turn(event, source, _quick_key)
         if _handled:
             return _result
 
@@ -1556,9 +1574,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         self, event: MessageEvent, source: SessionSource, _quick_key: str
     ) -> Optional[str]:
         """Replies owned by in-flight work: pending /update prompt, clarify, slash-confirm.
-        Only events that may control the gateway (``allow_gateway_control``) can answer them, and
-        never a gateway-authored synthetic event (``internal``): a wake is not a human answer."""
-        if not event.allow_gateway_control or getattr(event, "internal", False):
+        Only gateway-control human events may answer prompts, never internal wakes or an
+        already admitted turn whose prompt was offered before commit."""
+        from gateway.session_ingress import executing_admission
+        if (not event.allow_gateway_control or getattr(event, "internal", False)
+                or getattr(event, "_fifo_only", False) or executing_admission.get()):
             return None
         _reply = self._hm_update_prompt_reply(event, _quick_key)
         if _reply is None:
@@ -1571,6 +1591,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         self, event: MessageEvent, source: SessionSource, _quick_key: str
     ) -> tuple[bool, Optional[str]]:
         """Idle path: resolve + dispatch slash commands; rewriting commands fall through to the agent."""
+        stop_epoch = self._route_stop_epoch(_quick_key)
         async def _loop_command_current() -> bool:
             if await self._prepare_loop_wake_execution(event, source):
                 return True
@@ -1611,6 +1632,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             _result = await self._run_in_executor_with_context(
                 self._hm_skill_slash_rewrite, event, source, _quick_key, command)
             _handled = _result is not None
+        if not _handled and command:
+            _handled, _result = await self._admit_command_turn(event, source, _quick_key, stop_epoch)
         if not _handled:
             return await _loop_command_fallthrough()
         if _handled is _CommandDispatch.SUPPRESSED:
@@ -1785,13 +1808,18 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
                 # its whole request timeout.
                 # A bare "yes"/"no" to a blocking dangerous-command approval answers it (#46866):
                 # never an interrupt (read as deny) nor a queued turn (auto-deny deadlock).
-                if self._is_session_running(_quick_key) and (
+                # A turn a slash command produced (``/queue yes``) is never live typing.
+                if self._is_session_running(_quick_key) and not getattr(event, "_fifo_only", False) and (
                         await self._route_plaintext_approval_while_busy(event, _quick_key)
                         or await self._hm_busy_preempt(event, source, _quick_key)):
                     return True, None
                 _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
                 if _consumed:
                     return True, _consumer_reply
+                if getattr(event, "_fifo_only", False) and event._stop_epoch != self._route_stop_epoch(_quick_key):
+                    return True, None  # a /stop or /new came after its command, as it clears the slot
+                # A failed admit stays the authority's answer (refusal notice or turn error), never a
+                # pending legacy turn: that would run unadmitted, outside the FIFO's order.
                 return True, await admit_message(authority, event)
         if (authority is None and not is_internal and not event.get_command()
                 and getattr(self, 'session_authority', None) is not None):
@@ -2470,7 +2498,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
         Description *and* local cache path are injected so the model understands the image without
         a tool call and can re-examine it with vision_analyze."""
         from tools.vision_tools import vision_analyze_tool
-        from agent.memory_manager import sanitize_context
+        from agent.memory_context import sanitize_context
 
         analysis_prompt = (
             "Concisely describe this image in English using 2-4 sentences "

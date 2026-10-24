@@ -454,7 +454,6 @@ def test_prepare_agent_startup_installs_server_filter(monkeypatch, _reset_mcp_se
         types.SimpleNamespace(discover_plugins=lambda *a, **k: None),
     )
     monkeypatch.setattr(main_mod, "_should_background_mcp_startup", lambda args: False)
-    monkeypatch.setattr(main_mod, "_command_has_dedicated_mcp_startup", lambda args: True)
     main_mod._prepare_agent_startup(_agent_args(toolsets="terminal,code-mcp"))
     assert mcp_startup.get_mcp_server_filter() == ["terminal", "code-mcp"]
 

@@ -65,9 +65,9 @@ def describe_active_work_unit(unit: dict, home: Optional[Path] = None) -> str:
         detail = ", ".join(p for p in (f"model {model}" if model else "", f"tool {tool}" if tool else "") if p)
         return f"chat turn {session}{pid_part}{elapsed_part}" + (f" [{detail}]" if detail else "")
     if kind == "delegation":
-        delegation_id = str(unit.get("delegation_id") or "?")
-        elapsed_text = f" ({_fmt_elapsed(elapsed)})" if elapsed is not None else ""
-        return f"delegation {delegation_id}{elapsed_text}"
+        goal = str(unit.get("goal") or "").strip()
+        return (f"background delegation {unit.get('delegation_id') or '?'}{pid_part}{elapsed_part}"
+                + (f" [{goal}]" if goal else ""))
     return f"{kind} run{pid_part}{elapsed_part}"
 
 

@@ -151,8 +151,7 @@ class TestSkips:
         listed them (and the next opener may recreate them before the re-check); a
         vanished sidecar is not read-only (CI flake in
         test_concurrent_openers_zero_byte_startup_serialization). Outside the home
-        tree, so the chmod repair cannot mask a false verdict.
-        """
+        tree, so the chmod repair cannot mask a false verdict."""
         outside = tmp_path / "elsewhere"
         outside.mkdir()
         db = outside / "state.db"
@@ -193,6 +192,17 @@ class TestSkips:
 
 
 class TestSessionDBIntegration:
+    def test_sessiondb_repairs_readonly_dir_before_fresh_db_lock(self, hermes_home):
+        sub = hermes_home / "profiles" / "p1"
+        sub.mkdir(parents=True)
+        os.chmod(sub, 0o555)
+        try:
+            db = SessionDB(sub / "state.db")  # absent DB: the quarantine lock lives in this dir
+            db.close()
+            assert os.access(sub, os.W_OK)
+        finally:
+            os.chmod(sub, 0o755)
+
     def test_sessiondb_selfheals_readonly_db_in_home(self, hermes_home):
         db_path = hermes_home / "state.db"
         first = SessionDB(db_path)

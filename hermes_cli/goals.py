@@ -2813,6 +2813,10 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
             self._state = None
             self._unreadable = exc
 
+    def refresh(self) -> None:
+        """Re-read state from the DB (another writer, e.g. a tool, moved it)."""
+        self._state = load_goal(self.session_id)
+
     # --- introspection ------------------------------------------------
 
     @property

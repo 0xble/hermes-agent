@@ -19,7 +19,8 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
-from urllib.parse import urlsplit
+from hermes_dir_acl import make_user_dir, unusable_dir_remedy
+from gateway.platforms.base_log_safety import safe_url_for_log
 
 from utils import normalize_proxy_url
 from agent.i18n import t
@@ -491,28 +492,7 @@ def unauthorized_action_notice(platform: Any) -> str:
     return t("gateway.unauthorized.action_notice", platform=str(name or "<platform>"))
 
 
-def safe_url_for_log(url: str, max_len: int = 80) -> str:
-    """Return a URL string safe for logs (no query/fragment/userinfo)."""
-    raw = str(url) if max_len > 0 and url is not None else ""
-    if not raw:
-        return ""
-    try:
-        parsed = urlsplit(raw)
-    except Exception:
-        return raw[:max_len]
-    safe = raw
-    if parsed.scheme and parsed.netloc:
-        # Strip potential embedded credentials (user:pass@host).
-        path = parsed.path or ""
-        basename = path.rsplit("/", 1)[-1]
-        tail = "" if path in ("", "/") else f"/.../{basename}" if basename else "/..."
-        safe = f"{parsed.scheme}://{parsed.netloc.rsplit('@', 1)[-1]}{tail}"
-    if len(safe) <= max_len:
-        return safe
-    return "." * max_len if max_len <= 3 else f"{safe[:max_len - 3]}..."
-
-
-async def _ssrf_redirect_guard(response):
+async def ssrf_redirect_guard(response):
     """Re-validate each redirect target (a public URL 302-ing to http://169.254.169.254/ would
     bypass the pre-flight is_safe_url()). Async because httpx awaits response event hooks."""
     from tools.url_safety import is_safe_url, redirect_target_from_response
@@ -634,7 +614,7 @@ def _secure_media_cache_dir(cache_dir: Path) -> None:
         if managed:
             cache_dir.mkdir(parents=True, exist_ok=True)
             return
-        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        make_user_dir(cache_dir, parents=True, exist_ok=True, mode=0o700)
         try:
             from hermes_cli.config import _secure_dir
 
@@ -691,7 +671,7 @@ async def _cache_media_from_url(url: str, ext: str, retries: int, *, media_type:
         raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
     headers = {"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)", "Accept": accept}
     async with create_ssrf_safe_async_client(
-        timeout=30.0, follow_redirects=True, event_hooks={"response": [_ssrf_redirect_guard]},
+        timeout=30.0, follow_redirects=True, event_hooks={"response": [ssrf_redirect_guard]},
     ) as client:
         for attempt in range(retries + 1):
             try:
@@ -2455,11 +2435,26 @@ class BasePlatformAdapter(ABC):
         """Acquire a scoped lock for this adapter; True on success. A live cross-HERMES_HOME
         holder is replaced only when the runner armed this adapter for its initial
         ``--replace`` connect (the status module validates ownership and terminates)."""
-        from gateway.status import (
-            acquire_scoped_lock, scoped_lock_owner_label, take_over_scoped_lock_holder)
+        from gateway.status import acquire_scoped_lock, scoped_lock_owner_label, take_over_scoped_lock_holder
+        from gateway.status_lock_dir import ScopedLockDirUnusable
         self._platform_lock_scope, self._platform_lock_identity, self._platform_lock_nonce = scope, identity, uuid.uuid4().hex
-        lock_meta = {"platform": self.platform.value, "nonce": self._platform_lock_nonce}  # nonce: per-acquire owner
-        acquired, existing = acquire_scoped_lock(scope, identity, metadata=lock_meta)
+        lock_meta = {"platform": self.platform.value, "nonce": self._platform_lock_nonce}
+        try:
+            acquired, existing = acquire_scoped_lock(scope, identity, metadata=lock_meta)
+        except ScopedLockDirUnusable as exc:
+            # An ACL an elevated install left on the lock dir (#134889 W2): name the repair. Stay
+            # RETRYABLE: the dir is shared by every token-locked adapter, so a non-retryable park
+            # on a gateway that runs only those exits 78 and takes cron and the Desktop attach
+            # endpoint down with it. The status module logs the WARNING once per dir (DEBUG after),
+            # so the watcher's backoff retries quietly and picks the repair up without a restart.
+            self._platform_lock_identity = None
+            self._set_fatal_error(
+                "lock_dir_unusable",
+                f"{resource_desc} lock cannot be taken: the gateway lock directory {exc.filename} is not "
+                f"usable by this user (likely created by an elevated Hermes). To repair, "
+                f"{unusable_dir_remedy(exc.filename)}; the gateway retries on its own.",
+                retryable=True)
+            return False
         if acquired:
             return True
         if (self._platform_lock_takeover_allowed and not self._platform_lock_takeover_attempted
@@ -2494,7 +2489,7 @@ class BasePlatformAdapter(ABC):
         identity = getattr(self, '_platform_lock_identity', None)
         if not identity:
             return
-        from gateway.status import release_scoped_lock
+        from gateway.status_scoped_locks import release_scoped_lock
         release_scoped_lock(self._platform_lock_scope, identity)
         self._platform_lock_identity = None
 
@@ -2684,9 +2679,8 @@ class BasePlatformAdapter(ABC):
             return False
         if getattr(source, "profile_route_rejected", False) is not True:
             return False
-        logger.warning(
-            "[%s] Dropping inbound event for %s: explicit profile route targets an unserved profile",
-            self.name, getattr(source, "chat_id", "?"))
+        from gateway.parked_route_refusal import drop_rejected_route
+        drop_rejected_route(self, source)  # one WARNING; a parked target is also refused to the sender
         return True
 
     def _session_key_profile(self, source: Optional[Any] = None) -> Optional[str]:
@@ -3172,9 +3166,8 @@ class BasePlatformAdapter(ABC):
         if choices:
             # Multi-select flag lives on the pending entry (signature stays adapter-compatible).
             try:
-                from tools import clarify_gateway as _cg
-                with _cg._lock:
-                    _is_multi = bool(getattr(_cg._entries.get(clarify_id), "multi_select", False))
+                from tools.clarify_gateway import get_pending
+                _is_multi = bool(getattr(get_pending(clarify_id), "multi_select", False))
             except Exception:
                 _is_multi = False
             hint = t("gateway.clarify.hint_multi") if _is_multi else t("gateway.clarify.hint_single")
@@ -3832,31 +3825,9 @@ class BasePlatformAdapter(ABC):
         if emoji:
             await add(chat_id, message_id, emoji)
 
-    def _shared_runtime_owns_input(self, event: MessageEvent) -> bool:
-        """True when a non-command input belongs to the shared runtime's session authority."""
-        runner = getattr(self._message_handler, '__self__', None)
-        return getattr(runner, 'session_authority', None) is not None and not event.get_command()
-
     def _shared_burst_pending(self, event: MessageEvent, session_key: str) -> bool:
         from gateway.session_ingress_burst import holds_busy_burst
         return self._shared_runtime_owns_input(event) and holds_busy_burst(self, session_key)
-
-    def _pending_recovery_owners(self, event: MessageEvent, session_key: str) -> list:
-        """Adapters whose pending slot may hold *event* after busy admission: this one, plus the
-        runner's current delivery adapter for its source when that replacement has no live guard."""
-        owners = [self]
-        runner = getattr(self, "gateway_runner", None)
-        if runner is not None:
-            try:
-                delivery_adapter = runner._delivery_adapter_for(event.source)
-            except Exception:
-                delivery_adapter = None
-                logger.debug("[%s] Delivery-adapter lookup failed during pending recovery",
-                             self.name, exc_info=True)
-            if (delivery_adapter is not None and delivery_adapter is not self
-                    and session_key not in delivery_adapter._active_sessions):
-                owners.append(delivery_adapter)
-        return owners
 
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
@@ -4530,16 +4501,40 @@ class BasePlatformAdapter(ABC):
                     from gateway.telegram_retire import advance
                     await advance(runner, event.source)
                     return
+        from gateway.session_ingress_burst import burst_gate
+        behind_burst = await burst_gate(self, event, session_key)  # a serial reader's command waits too
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
-        if session_key in self._active_sessions or self._shared_burst_pending(event, session_key):
+        if session_key in self._active_sessions or behind_burst:
             await self._handle_message_while_active(event, session_key)
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         # Entering session processing is the handoff: a failure after this point must not replay.
         self._on_session_handoff(event)
         event._gateway_accepted = self._start_session_processing(event, session_key)
+
+    def _shared_runtime_owns_input(self, event: MessageEvent) -> bool:
+        """True when a non-command input belongs to the shared runtime's session authority."""
+        runner = getattr(self._message_handler, '__self__', None)
+        return getattr(runner, 'session_authority', None) is not None and not event.get_command()
+
+    def _pending_recovery_owners(self, event: MessageEvent, session_key: str) -> list:
+        """Adapters whose pending slot may hold *event* after busy admission: this one, plus the
+        runner's current delivery adapter for its source when that replacement has no live guard."""
+        owners = [self]
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None:
+            try:
+                delivery_adapter = runner._delivery_adapter_for(event.source)
+            except Exception:
+                delivery_adapter = None
+                logger.debug("[%s] Delivery-adapter lookup failed during pending recovery",
+                             self.name, exc_info=True)
+            if (delivery_adapter is not None and delivery_adapter is not self
+                    and session_key not in delivery_adapter._active_sessions):
+                owners.append(delivery_adapter)
+        return owners
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
@@ -5655,14 +5650,14 @@ class BasePlatformAdapter(ABC):
         # Profile from configured routes, else the owning profile of a dedicated secondary bot (so no
         # later ``source.profile``-less fallback can re-route the message through the default bot's routes).
         owner_profile = getattr(self, "_owner_profile", None)
-        profile, profile_route_rejected = owner_profile, False
+        profile, profile_route_rejected, rejected_profile = owner_profile, False, None
         if self.gateway_runner is not None:
             from gateway.profile_routing import ProfileRouteRejected
             try:
                 profile = self.gateway_runner._profile_name_for_source(
                     SessionSource(**fields), adapter_profile=owner_profile) or owner_profile
-            except ProfileRouteRejected:
-                profile_route_rejected = True
+            except ProfileRouteRejected as exc:
+                profile_route_rejected, rejected_profile = True, exc.profile
             except Exception:
                 logger.warning("Profile resolution failed for %s/%s, defaulting to active profile",
                                self.platform, chat_id, exc_info=True)
@@ -5672,7 +5667,7 @@ class BasePlatformAdapter(ABC):
         # Transport-only, kept out of to_dict(): the receiving adapter is authoritative this turn
         # even if profile_routes picks another runtime; the reject flag is consumed before auth.
         source._transport_adapter_ref = weakref.ref(self)
-        source.profile_route_rejected = profile_route_rejected
+        source.profile_route_rejected, source._rejected_route_profile = profile_route_rejected, rejected_profile
         return source
 
     @abstractmethod

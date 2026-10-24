@@ -95,7 +95,7 @@ export function savePendingInput(item: QueueItem): void {
   const path = join(dir, `${item.submissionId}.json`)
   const temporary = `${path}.${process.pid}.tmp`
   const ownerDestination = pendingInputOwner(item.ownerDestination ?? item.destination)
-  const { submissionId, display, text, preparedText, attachments, controlMethod, executionGeneration, inFlight, failed, createdAt, queued, legacyAttempted } = item
+  const { submissionId, display, text, moaToken, preparedText, attachments, controlMethod, executionGeneration, inFlight, failed, createdAt, queued, legacyAttempted } = item
   const destination = inFlight || failed ? item.destination : ownerDestination
   writeFileSync(
     temporary,
@@ -106,6 +106,7 @@ export function savePendingInput(item: QueueItem): void {
       display,
       text,
       preparedText,
+      moaToken,
       attachments,
       controlMethod,
       executionGeneration,

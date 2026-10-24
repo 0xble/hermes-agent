@@ -384,6 +384,7 @@ _SLACK_RESERVED_COMMANDS = frozenset({
 _SLACK_VIA_HERMES_ONLY = frozenset({
     "topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat",
     "refine", "review", "pause", "whoami", "platform", "insights", "login", "retire",
+    "discard",
     # One-time answer to the low-disk prompt; `/hermes autoprune on` reaches it.
     "autoprune"})
 

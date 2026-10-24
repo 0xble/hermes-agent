@@ -776,7 +776,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         for label, hook, hook_kwargs in hooks:
             try:
                 await hook(
-                    session_entry=session_entry, source=source, final_response=final_text,
+                    session_entry=session_entry, source=source, final_response=final_text if successful else "",
                     **hook_kwargs,
                 )
             except Exception as exc:
@@ -791,6 +791,15 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         from gateway.session_authorities import active_authority
         from gateway.session_control_actions import publish
         publish(active_authority(self), source.chat_id, only_if_present=only_if_present)
+
+    @staticmethod
+    def _turn_failed() -> bool:
+        """Whether the owner recorded this turn's result as failed (``session_ingress`` captures it
+        around ``_handle_message``; turns outside an owner capture nothing)."""
+        from gateway.session_results import execution_result
+        captured = execution_result.get() or {}
+        result = captured.get('terminal_result', captured.get('result'))
+        return isinstance(result, dict) and bool(result.get('failed'))
 
     @staticmethod
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:

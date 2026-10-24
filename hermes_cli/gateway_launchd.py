@@ -259,7 +259,13 @@ def _launchd_unsupported_marker_exists() -> bool:
 
 def _gateway_run_command(*, interpreter: str | None = None) -> list[str]:
     from hermes_cli._launchers import runtime_command
-    return runtime_command(_gw().PROJECT_ROOT, [*shlex.split(_gw()._profile_arg()), "gateway", "run", "--replace"],
+    from hermes_constants import get_default_hermes_root
+    # Every caller spawns an UNSUPERVISED child, which follows the sticky active_profile unless a
+    # selector pins it (main._apply_profile_override): the root's replacement booted that profile.
+    selector = shlex.split(_gw()._profile_arg())
+    if not selector and _gw().get_hermes_home().resolve() == get_default_hermes_root().resolve():
+        selector = ["--profile", "default"]
+    return runtime_command(_gw().PROJECT_ROOT, [*selector, "gateway", "run", "--replace"],
                            python=interpreter or _gw().get_python_path())
 
 
@@ -799,6 +805,7 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
 
 
 def launchd_uninstall():
+    gateway_service_owner.refuse_foreign_launchd_plist("uninstall")
     from hermes_cli.gateway_guardian import set_intent
     set_intent(_gw().get_hermes_home(), stopped=True)
     plist_path = _gw().get_launchd_plist_path()
@@ -813,6 +820,7 @@ def launchd_uninstall():
 
 
 def launchd_start():
+    gateway_service_owner.refuse_foreign_launchd_plist("start")
     from hermes_cli.gateway_guardian import set_intent
     set_intent(_gw().get_hermes_home(), stopped=False)
     plist_path = _gw().get_launchd_plist_path()
@@ -866,6 +874,7 @@ def _launchd_ok(message: str) -> None:
 
 
 def launchd_stop():
+    gateway_service_owner.refuse_foreign_launchd_plist("stop")
     from hermes_cli.gateway_guardian import set_intent
     set_intent(_gw().get_hermes_home(), stopped=True)
     target = f"{_launchd_domain()}/{get_launchd_label()}"
@@ -906,6 +915,7 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    gateway_service_owner.refuse_foreign_launchd_plist("restart")
     from hermes_cli.gateway_guardian import set_intent
     set_intent(_gw().get_hermes_home(), stopped=False)
     label = _gw().get_launchd_label()

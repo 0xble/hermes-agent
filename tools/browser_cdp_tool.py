@@ -45,8 +45,13 @@ _CDP_FLAGGED_BINARY_PATHS: dict[str, tuple] = {
 }
 
 
-def _redact_cdp_output(value: Any, *, always_paths: tuple = (), flagged_paths: tuple = (),
-                       field_context: bool = False, vault_tab: str = "default", vault_origin: str = "") -> Any:
+def _redact_cdp_output(
+    value: Any,
+    *,
+    always_paths: tuple = (),
+    flagged_paths: tuple = (),
+    field_context: bool = False, vault_tab: str = "default", vault_origin: str = "",
+    _depth: int = 0) -> Any:
     """Redact browser-originated CDP result text; opaque bytes stay byte-identical.
 
     Exemptions come ONLY from the calling method's spec as exact result paths. Path
@@ -54,15 +59,25 @@ def _redact_cdp_output(value: Any, *, always_paths: tuple = (), flagged_paths: t
     solely as a sibling on the trusted carrier object — never as ambient trust a
     ``Runtime.evaluate`` by-value object could spoof.
 
+    ``_depth`` stops a page-controlled tree from raising RecursionError. The
+    unread remainder is replaced, not returned raw.
+
     See #94138, #94142.
     """
-    from agent.redact import redact_sensitive_text
+    from agent.redact import (
+        REDACT_WALK_DEPTH_MARKER,
+        REDACT_WALK_MAX_DEPTH,
+        redact_sensitive_text,
+    )
+    if _depth >= REDACT_WALK_MAX_DEPTH:
+        return REDACT_WALK_DEPTH_MARKER
     if isinstance(value, str):
         return redact_sensitive_text(value, force=True,
                                      vault_tab=vault_tab, vault_origin=vault_origin)
     if isinstance(value, (list, tuple)):
-        return type(value)(_redact_cdp_output(item, field_context=field_context,
-                                              vault_tab=vault_tab, vault_origin=vault_origin) for item in value)
+        return type(value)(
+            _redact_cdp_output(item, field_context=field_context, vault_tab=vault_tab, vault_origin=vault_origin, _depth=_depth + 1) for item in value
+        )
     if not isinstance(value, dict):
         from agent.redact import redact_registered_vault_number
         return redact_registered_vault_number(value, tab=vault_tab, origin=vault_origin)
@@ -77,8 +92,14 @@ def _redact_cdp_output(value: Any, *, always_paths: tuple = (), flagged_paths: t
         out_key = redact_sensitive_text(key, force=True,
                                         vault_tab=vault_tab, vault_origin=vault_origin) if isinstance(key, str) else key
         redacted[out_key] = item if isinstance(item, str) and opaque else _redact_cdp_output(
-            item, always_paths=descend(always_paths, key), flagged_paths=descend(flagged_paths, key),
-            field_context=field_context, vault_tab=vault_tab, vault_origin=vault_origin)
+            item,
+            always_paths=descend(always_paths, key),
+            flagged_paths=descend(flagged_paths, key),
+            field_context=field_context,
+        vault_tab=vault_tab,
+        vault_origin=vault_origin,
+            _depth=_depth + 1,
+        )
     return redacted
 
 

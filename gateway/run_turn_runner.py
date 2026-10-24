@@ -54,15 +54,6 @@ _CARD_DESTINATION_REFUSALS = {
 }
 
 
-def _finite_viewer_turn() -> bool:
-    from gateway.session_finite import finite_turn_required
-    return finite_turn_required() is True
-
-
-class _NoStreamConsumer(RuntimeError):
-    """Raised when a delta has no live consumer, so it was not delivered."""
-
-
 def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, str, bool]:
     """Return chat text, failure reason and retryability for pre-turn resolution failures."""
     from agent.error_classifier import FailoverReason
@@ -98,21 +89,6 @@ _LEDGER_PASSTHROUGH_KEYS = (
 )
 
 
-def _persisted_turn(agent, agent_history, result, compressions) -> dict | None:
-    """Build the persisted-turn receipt used by TUI completion notifications."""
-    from agent.persisted_turn_receipt import persisted_turn_receipt
-    if not isinstance(result, dict):
-        return None
-    status = ("interrupted" if result.get("interrupted")
-              else "error" if result.get("failed") or result.get("error") else "complete")
-    return persisted_turn_receipt(
-        result.get("messages"), getattr(agent, "_persist_user_message_idx", None), agent_history,
-        result.get("final_response"), status,
-        compression_unchanged=type(compressions) is int and compressions == getattr(
-            getattr(agent, "context_compressor", None), "compression_count", None),
-        prefix_row_matches=lambda before, after: before is after)
-
-
 def _settle_api_runtime_lock(agent, result, captured):
     """Settle a confirmed API runtime lock against the runtime that served the turn."""
     from gateway.session_api_turn import api_runtime_locked
@@ -142,6 +118,46 @@ def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
 # Slack click handler shows on a dead entry).
 def _clarify_expired_notice() -> str:
     return t("gateway.clarify.expired")
+
+
+# run_conversation result keys the gateway projection carries verbatim so a finite viewer's
+# `-z --usage-file` ledger (hermes_cli/oneshot._USAGE_KEYS) reads what the in-process path did.
+_LEDGER_PASSTHROUGH_KEYS = (
+    "estimated_cost_usd", "cost_status", "cost_source", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "total_tokens", "provider", "turn_exit_reason", "service_tier",
+)
+# Beside ``failure_reason`` and ``error``: what ``agent.error_surface.build_error_surface_from_result`` reads,
+# so the authority's ``message.complete`` carries the same error card the TUI path builds;
+# ``usage_window_message`` also marks a window-plan refusal for the chat rewording.
+_FAILURE_DESCRIPTOR_KEYS = ("free_tier", "failure_retryable", "failure_resets_at", "usage_window_message")
+
+
+def _finite_viewer_turn() -> bool:
+    from gateway.session_finite import finite_turn_required
+    return finite_turn_required() is True
+
+
+def _persisted_turn(agent, agent_history, result, compressions) -> dict | None:
+    """``message.complete.persisted_turn`` for this turn, the receipt the TUI gateway's own turns
+    publish: clients bind the streamed reply to its stored row instead of comparing words. The
+    agent copies ``conversation_history`` into its message list, so an untouched pre-turn prefix
+    is the same dicts (transcript rows here carry no ``_row_id`` to compare)."""
+    from agent.persisted_turn_receipt import persisted_turn_receipt
+    if not isinstance(result, dict):
+        return None
+    status = ("interrupted" if result.get("interrupted")
+              else "error" if result.get("failed") or result.get("error") else "complete")
+    return persisted_turn_receipt(
+        result.get("messages"), getattr(agent, "_persist_user_message_idx", None), agent_history,
+        result.get("final_response"), status,
+        compression_unchanged=type(compressions) is int and compressions == getattr(
+            getattr(agent, "context_compressor", None), "compression_count", None),
+        prefix_row_matches=lambda before, after: before is after)
+
+
+class _NoStreamConsumer(RuntimeError):
+    """Raised by the delta callback when nothing consumed the text; ``_call_quietly`` turns it into
+    'not delivered' so the agent's partial-delivery accounting matches what the user saw."""
 
 
 class _ExecApprovalDeclined(RuntimeError):
@@ -1150,10 +1166,20 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.warning_notifications import is_diagnostic_notice, render_notification
         if self._ctx.mute_notification_reply or not self._status_live():
             return
+        # A usage-window limit line repeats the turn's own reply, which carries the sentence and the
+        # switch button (a chat message cannot be cleared, so it would only pile up). The 90% heads-up
+        # is a desktop / terminal nudge; in a chat it is noise (/usage has the numbers).
+        key = str(getattr(notice, "key", "") or "")
+        if key == "credits.window_limit" or key.startswith("credits.window."):
+            return
         diagnostic = is_diagnostic_notice(notice)
         def present():
             try:
                 line = render_notice_line(notice)
+                if key.startswith("credits."):
+                    # Window plans (e.g. a paused plan's line): a chat's /topup has no credits settings.
+                    from agent.plan_limits import portal_wording
+                    line = portal_wording(line)
             except Exception:
                 logger.debug("render_notice_line failed", exc_info=True)
                 return
@@ -1560,7 +1586,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             return finite_clarify_reply()
         from gateway.session_cli_turn import clarify_batch_turn
         if clarify_batch_turn(self):
-            # Main's classic CLI shows every question at once in its batch panel: one request.
+            # Main's batch panel (classic CLI, Ink TUI) shows every question at once: one request.
             from gateway.session_clarify_batch import ask_clarify_batch
             return ask_clarify_batch(self, questions)
         answers: dict[str, Any] = {}
@@ -1801,6 +1827,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         if api is not None and api['history'] is not None:
             from gateway.run import _collect_history_media_paths
             history = api['history']
+            tail = history[-1] if history else None
+            if api.get('resume_unanswered') and isinstance(tail, dict) and tail.get('role') == 'user':
+                # The door's re-run continues the row its failed attempt persisted (#115325). Only a
+                # bare user tail: a tool suffix is completed work the re-run must still see.
+                from agent.session_persistence import adopt_unanswered_turn
+                history = list(history)
+                adopt_unanswered_turn(history, api['content'], agent)
             return history, None, _collect_history_media_paths(history)
         # Transcript rows ({role, content, timestamp}) lose timestamps; interrupt-path agent messages
         # (tool_calls/tool_call_id/reasoning) pass through intact so the API sees valid assistant→tool
@@ -1982,6 +2015,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 kwargs["persist_user_display_metadata"] = ctx.persist_user_display_metadata
             if ctx.moa_config is not None:
                 kwargs["moa_config"] = ctx.moa_config
+            from gateway.session_onboarding import arm_onboarding_turn
+            prelude = arm_onboarding_turn(agent, self._approval_owner, agent_history)
+            if prelude is not None and _accepts_keyword(agent.run_conversation, "prelude"):
+                kwargs["prelude"] = prelude
             if persist_user_timestamp_override is not None:
                 kwargs["persist_user_timestamp"] = persist_user_timestamp_override
             # The raw inbound id (not event_message_id, the reply anchor) rides the persisted user
@@ -2174,12 +2211,23 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         return final_response + "\n" + "\n".join(unique_tags)
 
     def run_sync(self):
-        from gateway.session_policy import policy_for_source, policy_scope
+        from contextlib import ExitStack
+        from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, workspace_unavailable_result
         from gateway.session_api_turn import api_policy_scope
         from gateway.session_authorities import active_authority
-        with policy_scope(policy_for_source(self._runner, self._ctx.source),
-                          authority=active_authority(self._runner)), api_policy_scope():
-            result = self._run_sync_scoped()
+        from hermes_state_runtime import RuntimeStoreError
+        policy = policy_for_source(self._runner, self._ctx.source)
+        with ExitStack() as scope:
+            try:
+                scope.enter_context(policy_scope(policy, authority=active_authority(self._runner)))
+            except RuntimeStoreError as exc:
+                if exc.reason != 'workspace_unavailable':
+                    raise
+                result = workspace_unavailable_result(policy)
+            else:
+                scope.enter_context(api_policy_scope())
+                bind_turn_workspace(policy, self._ctx.session_id)
+                result = self._run_sync_scoped()
             from gateway.session_results import execution_result
             captured = execution_result.get()
             if captured is not None:
@@ -2273,6 +2321,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             runner._resolve_session_reasoning_config(
                 source=ctx.source, session_key=ctx.session_key, model=model, user_config=ctx.user_config,
                 assignment=getattr(self, "_model_assignment", None)))
+        from gateway.session_cli_turn import one_turn_reasoning
+        reasoning_config = one_turn_reasoning(self, reasoning_config)
         runner._service_tier = (policy.current_service_tier(runner, ctx.session_key) if policy else
             runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key))
         from gateway.session_api_turn import api_execution
@@ -2350,6 +2400,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             "input_tokens": getattr(agent, "session_prompt_tokens", 0) if has_comp else 0,
             "output_tokens": getattr(agent, "session_completion_tokens", 0) if has_comp else 0,
             "model": getattr(agent, "model", None) if agent else None,
+            # Most failed results name no provider; the error card's sign-in / update-key action needs it.
+            "provider": getattr(agent, "provider", None) if agent else None,
             "context_length": (getattr(comp, "context_length", 0) or 0) if has_comp else 0,
             **{key: result.get(key) for key in _LEDGER_PASSTHROUGH_KEYS if key in result},
         }
@@ -2358,9 +2410,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             "_model_final_response": model_response,
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
+            # Usage-window limit (agent/plan_limits.py): the gateway offers the plan's model as a button.
+            "usage_limit": result.get("usage_limit"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
+            **{key: result[key] for key in _FAILURE_DESCRIPTOR_KEYS if key in result},
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "recovered_reply": result.get("recovered_reply", False),
