@@ -50,19 +50,44 @@ Upstream: `semaphore` is a host-local tool, so this has no upstream equivalent a
 
 This source rename must not activate against a retiring-protocol-only helper.
 The unchanged helper-absent fail-open behavior is not a deployment fallback.
-Follow the dotfiles [Semaphore Cutover contract](https://github.com/0xble/dotfiles/blob/refactor/semaphore-rename/automation/launchd/candidates.md#semaphore-cutover)
-before switching this runtime: install and verify the actual new helper, prove
-the default state bridge shares the existing queue, then update and resolve
-`terminal.shell_init_files` to the installed `semaphore.sh` before deleting the
-retiring init file. Keep the old executable only for draining existing consumers,
-not as a permanent alias. Do not add retired environment reads or hint matching.
+Follow the exact dotfiles [Semaphore Cutover contract](https://github.com/0xble/dotfiles/blob/0a2852fb8b42ade14f2f7fe7b013c4e8f0d7e9b0/automation/launchd/candidates.md#semaphore-cutover)
+before switching this runtime:
 
-Hermes update/restart remains gated on the Sunday go/no-go or Brian's explicit
-approval. The unrelated dotfiles candidate pin is not this change's to release.
-A source merge, private-fixture proof or existing shared-inode bridge is not
-permission to activate. The cutover owner must read back the installed helper
-hash, configured and resolved init paths, fresh-shell wrappers and real wrapped
-command before marking activation complete.
+1. Prepare additive source selecting the actual helper, new shell init and
+   changed rendered `.zsh/.zshenv`, while retaining the old sources and reviewed
+   ENFILE-fixed helper. The unrelated candidate pin remains with its owner.
+2. Before installing or enabling any new-protocol path lookup, positively prove
+   that no new-protocol consumer can look up the prospective state path. Then
+   promote the existing physical queue to `semaphore` using the contract's
+   preactivation symlink preparation and Darwin exchange. Old-path clients keep
+   using the original directory through the resulting old-name symlink. Verify
+   device/inode and held-lock continuity. If the no-new-lookup precondition is
+   unproved, retain the existing bridge and block activation. Never exchange
+   paths after new-protocol consumers are enabled.
+3. Use supported additive candidate copy installation for exactly the helper,
+   init and rendered zshenv targets. Verify the actual new helper's hash and
+   protocol. Separately prove every affected Hermes `terminal.shell_init_files`
+   through the real loader and a fresh Bash canary, and the actual regular
+   rendered `~/.zsh/.zshenv` through a fresh Zsh canary using its normal entry
+   point. Both must define the CI/test wrappers and invoke the new helper.
+4. Deploy callers/runtime only under separate authorization. Refresh or
+   naturally retire all cached and long-lived old shell environments before
+   removing the old executable or init source. Old wrappers deliberately run
+   directly if their executable disappears. Fresh-shell proof alone does not
+   drain those consumers. Existing holders and waiters must finish naturally.
+5. After every old-path consumer drains, unlink only the positively verified old
+   state symlink, never the canonical directory or individual locks/tickets.
+   Only then may deleting dotfiles source land and permanent `main` advance.
+   Its maintained `.chezmoiremove` entries retire the installed old executable
+   and init file, never either state path. Verify the original queue and real
+   enqueue/acquire/release before declaring completion.
+
+Hermes update/restart remains gated on an affirmative Sunday go/no-go or Brian's
+explicit approval. Preserve every existing job/ticket and 1 machine-wide queue.
+No admission bypass, permanent alias, retired environment reads or hint matching
+is a fallback. No job kill, cancel, requeue, protected-service stop, reboot or OS
+update is authorized. A source merge or private-fixture proof is not permission
+to activate or proof of the live-consumer inventory.
 
 ## Verification and retirement
 
