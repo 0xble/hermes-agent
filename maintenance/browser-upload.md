@@ -26,6 +26,8 @@ Load this unit when changing `browser_upload`, `browser_downloads`, Camofox tab 
 
 Use the repository runner for `tests/tools/test_browser_file_transfer.py`, `tests/tools/test_browser_upload.py`, the directly relevant Camofox ownership/account/timeout suites and browser registry/toolset tests. The transfer fixture runs a real loopback HTTP peer on an ephemeral port with an isolated Hermes home and synthetic persistent identity. It verifies the actual registered tool path and wire payload without using an authenticated browser profile. The server's separately owned real-engine suite verifies browser attachment bytes and cross-origin chooser behavior.
 
+When tool registrations change, also run `tests/ci/test_prompt_surface.py` and `tests/hermes_cli/test_shared_metrics_efficiency.py`. Regenerate the committed prompt-surface snapshot with `scripts/ci/prompt_surface.py render` and keep the current shared-metrics tool-name vocabularies aligned with the built-in registry. Preserve existing schema bounds and prompt text unrelated to the tool change.
+
 ## Rollout And Rollback
 
 Install and activate the matching server first, then the Python client. Source publication does not authorize either installation or activation. A server lacking the inline contract must fail visibly, never trigger a legacy-path retry. Revert or deactivate the client before removing inline server support. Existing server-side path callers remain compatible. Captured local artifacts remain ordinary profile-local files.
