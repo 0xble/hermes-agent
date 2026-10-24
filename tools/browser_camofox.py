@@ -623,6 +623,18 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
     task_id = task_id or "default"
     account = _resolve_account(account)
     with _sessions_lock:
+        prior = _sessions.get(task_id)
+        bound_account = prior.get("account") if prior is not None else None
+        bound_user_id = prior.get("user_id") if prior is not None else None
+    # Registry HTTP must not serialize unrelated tasks or their cleanup. Resolve before
+    # dropping even a carried binding so a registry failure leaves it intact.
+    identity_account = account if account is not None else bound_account
+    identity = get_camofox_account_identity(identity_account, task_id) if identity_account is not None else None
+    with _sessions_lock:
+        if (_sessions.get(task_id) is not prior
+                or (prior is not None and (prior.get("account") != bound_account
+                                           or prior.get("user_id") != bound_user_id))):
+            raise ValueError("Camofox task binding changed while resolving its identity; retry the browser operation")
         if task_id in _sessions:
             session = _sessions[task_id]
             bound_account = session.get("account")
@@ -639,16 +651,13 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
                 else:
                     _sessions.pop(task_id, None)
             else:
-                if bound_account is not None:
-                    identity = get_camofox_account_identity(bound_account, task_id)
-                    if identity["user_id"] != session["user_id"]:
-                        raise ValueError(f"Camofox account {bound_account!r} persistent mapping changed; start a new task")
+                if identity is not None and identity["user_id"] != session["user_id"]:
+                    raise ValueError(f"Camofox account {bound_account!r} persistent mapping changed; start a new task")
                 session.pop("carried", None)
                 session.pop("carried_from", None)  # in use now: its own agent releases it
                 _release_protected_tab_binding(task_id, session)
                 return session
         camofox_cfg = _get_camofox_config()
-        identity = get_camofox_account_identity(account, task_id) if account is not None else None
         managed, adopt, adopt_any = True, True, False  # Hermes-derived identities own their tabs
         if identity is None:
             identity = _camofox_identity_override(task_id, camofox_cfg)

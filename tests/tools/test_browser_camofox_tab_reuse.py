@@ -32,6 +32,7 @@ class _Camofox:
         self.gone: set[str] = set()
         self.open_tab_ids: list[str] = []
         self.identities_status = 200
+        self.identity_barrier = None
         self.identities = [{"alias": alias, "userId": "hermes_camofox_" + hashlib.sha256(alias.encode()).hexdigest()[:24]}
                            for alias in ("brianle", "lpg", "meridian", "mgf")]
         stub = self
@@ -53,6 +54,11 @@ class _Camofox:
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 stub.calls.append(("GET", parsed.path, query))
                 if parsed.path == "/browser/identities":
+                    barrier = stub.identity_barrier
+                    stub.identity_barrier = None
+                    if barrier is not None:
+                        barrier[0].set()
+                        assert barrier[1].wait(15), "registry response was not released"
                     return self._send({"identities": stub.identities}, stub.identities_status)
                 if parsed.path == "/tabs":
                     return self._send({"running": True, "tabs": stub.tabs.get(query.get("userId"), [])})
@@ -1110,6 +1116,110 @@ def test_agent_close_cleans_actual_tool_task_not_shared_session_id(camofox):
     with patch("run_agent.cleanup_vm"):
         owner._close_task_resources("different-session-id")
     assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_slow_identity_registry_does_not_block_existing_task_or_cleanup(camofox, bound):
+    from agent.memory_provider import spawn_context_thread
+
+    cf = camofox.cf
+    for task in ("sibling", "cleanup"):
+        assert _dispatch("browser_navigate", {"url": "https://example.test/"}, task)["success"]
+    if bound:
+        assert _dispatch("browser_navigate", {"url": "https://example.test/", "account": "brianle"}, "slow")["success"]
+    started, finish = threading.Event(), threading.Event()
+    sibling_done, cleanup_done = threading.Event(), threading.Event()
+    camofox.server.identity_barrier = (started, finish)
+    results = {}
+
+    def named_tool():
+        results["named"] = _dispatch("browser_navigate", {"url": "https://slow.test/", "account": "brianle"}, "slow")
+
+    def sibling_tool():
+        results["sibling"] = _dispatch("browser_snapshot", {}, "sibling")
+        sibling_done.set()
+
+    def cleanup():
+        cf.release_task_bindings({"cleanup"}, close_created_tabs=True)
+        cleanup_done.set()
+
+    named = spawn_context_thread(named_tool, name="slow-registry")
+    sibling = spawn_context_thread(sibling_tool, name="sibling-browser")
+    closer = spawn_context_thread(cleanup, name="browser-cleanup")
+    named.start()
+    try:
+        assert started.wait(2)
+        sibling.start()
+        closer.start()
+        # Both must finish before the registry responds, not merely after its timeout.
+        sibling_ready = sibling_done.wait(2)
+        cleanup_ready = cleanup_done.wait(2)
+        assert sibling_ready, "existing task blocked on the identity registry"
+        assert cleanup_ready, "cleanup blocked on the identity registry"
+        assert results["sibling"]["success"]
+        assert "cleanup" not in cf._sessions
+    finally:
+        finish.set()
+        for thread in (named, sibling, closer):
+            if thread.ident is not None:
+                thread.join(5)
+    assert not any(thread.is_alive() for thread in (named, sibling, closer))
+    assert results["named"]["success"]
+
+
+@pytest.mark.parametrize("change", ["initial-bind", "replacement", "drop", "account", "user-id"])
+def test_identity_lookup_refuses_a_concurrently_changed_binding(camofox, change):
+    from agent.memory_provider import spawn_context_thread
+
+    cf = camofox.cf
+    old = None
+    if change != "initial-bind":
+        assert _dispatch("browser_navigate", {"url": "https://old.test/", "account": "brianle"}, "target")["success"]
+        old = cf._sessions["target"]
+        cf.quarantine_current_protected_tab("target")
+    started, finish, changed = threading.Event(), threading.Event(), threading.Event()
+    camofox.server.identity_barrier = (started, finish)
+    results = []
+
+    def named_tool():
+        results.append(_dispatch("browser_navigate", {"url": "https://stale.test/", "account": "brianle"}, "target"))
+
+    def change_binding():
+        if change in {"replacement", "drop"}:
+            cf.release_task_bindings({"target"})
+        if change in {"initial-bind", "replacement"}:
+            cf._get_session("target", "lpg" if change == "initial-bind" else "brianle")
+        elif change in {"account", "user-id"}:
+            assert old is not None
+            with cf._sessions_lock:
+                field, value = (("account", "lpg") if change == "account"
+                                else ("user_id", "hermes_camofox_" + "f" * 24))
+                old[field] = value
+        changed.set()
+
+    named = spawn_context_thread(named_tool, name="delayed-identity")
+    changer = spawn_context_thread(change_binding, name="change-browser-binding")
+    named.start()
+    try:
+        assert started.wait(2)
+        changer.start()
+        assert changed.wait(2), "binding change blocked on the identity registry"
+        current = cf._sessions.get("target")
+        current_state = dict(current) if current is not None else None
+        before = list(camofox.server.calls)
+    finally:
+        finish.set()
+        for thread in (named, changer):
+            if thread.ident is not None:
+                thread.join(5)
+    assert not named.is_alive() and not changer.is_alive()
+    assert results[0]["success"] is False
+    assert "binding changed" in results[0]["error"]
+    assert cf._sessions.get("target") is current
+    assert current == current_state
+    assert camofox.server.calls == before, "stale lookup must not navigate or create a replacement"
+    if old is not None:
+        assert old["tab_id"] in cf._protected_tabs_on_disk()
 
 
 def test_slow_owned_tab_delete_does_not_block_sibling_tool(camofox):
