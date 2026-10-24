@@ -43,6 +43,24 @@ def test_worker_labels_keep_rank_and_reject_late_generations(tmp_path):
         db.close()
 
 
+def test_worker_auto_title_rejects_equivalent_collision_in_the_owner_write(tmp_path):
+    """The worker store must carry ``reject_collision`` to the owner's write transaction."""
+    db, store, scope = setup_store(tmp_path)
+    try:
+        db.set_session_title('foreign', 'Straße Plans #2')
+        assert not store.set_auto_title('owned', 'STRASSE PLANS', source='llm', reject_collision=True)
+        assert db.get_session('owned')['title'] is None
+        assert store.set_auto_title('owned', 'Distinct Subject', source='llm', reject_collision=True)
+        assert db.get_session('owned')['title'] == 'Distinct Subject'
+        for payload in [{'title': 'x', 'source': 'llm', 'reject_collision': False},
+                        {'title': 'x', 'source': 'user', 'reject_collision': True}]:
+            with pytest.raises(RuntimeStoreError, match='invalid_params'):
+                mutate_worker_execution(db, **scope, sequence=store.journal['next_sequence'],
+                                        operation='session.title', payload=payload)
+    finally:
+        store.close()
+        db.close()
+
 def test_worker_route_and_api_content_preserve_exact_usage_and_target_fences(tmp_path):
     db, store, scope = setup_store(tmp_path)
     try:

@@ -60,12 +60,17 @@ def worker_lifecycle(db, conn, session_id, payload):
 
 
 def worker_title(db, conn, session_id, payload):
-    if (set(payload) != {'title', 'source'} or payload['source'] not in ('user', 'derived', 'llm')
-            or not (payload['title'] is None or isinstance(payload['title'], str))):
+    # ``reject_collision`` is sent only as True, and only for automatic sources.
+    if (set(payload) - {'reject_collision'} != {'title', 'source'}
+            or payload['source'] not in ('user', 'derived', 'llm')
+            or not (payload['title'] is None or isinstance(payload['title'], str))
+            or ('reject_collision' in payload
+                and (payload['reject_collision'] is not True or payload['source'] == 'user'))):
         raise RuntimeStoreError('invalid_params')
     try:
         value = bool(db._set_session_title_in_transaction(
-            conn, session_id, payload['title'], source=payload['source']))
+            conn, session_id, payload['title'], source=payload['source'],
+            reject_auto_collision=payload.get('reject_collision', False)))
     except ValueError:
         # Expected validation/conflict outcomes must not poison the retry journal.
         # Keep candidate authority in the receipt, not an in-memory worker claim.

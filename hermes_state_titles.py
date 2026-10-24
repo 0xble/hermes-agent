@@ -25,6 +25,17 @@ def _auto_title_matches(stored: str, candidate: str) -> bool:
     return stored.casefold() == candidate or _NUMBERED_TITLE_RE.sub(r'\1', stored).casefold() == candidate
 
 
+def _auto_title_collides(conn, title: str, exclude_session_id: str) -> bool:
+    """True when another session holds *title* under the automatic-title equivalence rule."""
+    # SQLite's lower()/NOCASE do not implement Unicode casefolding.
+    conn.create_function("auto_title_matches", 2, _auto_title_matches, deterministic=True)
+    return conn.execute(
+        "SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL "
+        "AND auto_title_matches(title, ?) LIMIT 1",
+        (exclude_session_id or "", title.casefold()),
+    ).fetchone() is not None
+
+
 def next_title_in_lineage(conn, base_title: str) -> str:
     """Next title in a lineage ("my session" -> "my session #2") as seen by *conn*: strip any
     " #N" suffix, then increment the highest existing number."""
@@ -85,18 +96,24 @@ class SessionTitlesMixin:
             SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
             """, (descendant_id, ancestor_id, descendant_id)).fetchone() is not None
 
-    def _set_session_title(self, session_id: str, title: str, *, source: str) -> bool:
+    def _set_session_title(self, session_id: str, title: str, *, source: str,
+                           reject_auto_collision: bool = False) -> bool:
         """Write a title, enforcing provenance precedence. A ``user`` write always lands;
         ``derived``/``llm`` land only when the row is untitled or holds strictly lower
         authority (derived upgrades to llm exactly once, nothing overwrites a user name,
         re-running the titler on an llm row is a no-op). No writer may move a hidden
         canonical Bot Chat off its title. Read and write are one compare-and-swap
-        transaction, so a manual ``/title`` racing an in-flight generation is not clobbered."""
+        transaction, so a manual ``/title`` racing an in-flight generation is not clobbered.
+        ``reject_auto_collision`` refuses an automatic title equivalent to another session's
+        inside that same write transaction, so concurrent workers cannot both pass a check."""
         return bool(self._execute_write(
-            lambda conn: self._set_session_title_in_transaction(conn, session_id, title, source=source)
+            lambda conn: self._set_session_title_in_transaction(
+                conn, session_id, title, source=source, reject_auto_collision=reject_auto_collision,
+            )
         ))
 
-    def _set_session_title_in_transaction(self, conn, session_id: str, title: str, *, source: str):
+    def _set_session_title_in_transaction(self, conn, session_id: str, title: str, *, source: str,
+                                          reject_auto_collision: bool = False):
         """Reuse title rules within an authority-owned transaction; never commit here."""
         title = self.sanitize_title(title)
         is_user = source == self.TITLE_SOURCE_USER
@@ -120,6 +137,8 @@ class SessionTitlesMixin:
                                  "To start fresh, create a new bot instead.")
             return []
         if not is_user and current["title"] is not None and self._title_rank(current["title_source"]) >= new_rank:
+            return []
+        if reject_auto_collision and not is_user and title and _auto_title_collides(conn, title, session_id):
             return []
         if title:
             cleared = self._resolve_title_conflict(conn, session_id, title)
@@ -207,11 +226,12 @@ class SessionTitlesMixin:
         ValueError on conflict or validation failure."""
         return self._set_session_title(session_id, title, source=self.TITLE_SOURCE_USER)
 
-    def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
-        """Set an automatic title; False (untouched) when a higher-authority title holds the row."""
+    def set_auto_title(self, session_id: str, title: str, *, source: str, reject_collision: bool = False) -> bool:
+        """Set an automatic title; False (untouched) when a higher-authority title holds the row,
+        or, with ``reject_collision``, when another session holds an equivalent title."""
         if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
             raise ValueError(f"invalid automatic title source: {source!r}")
-        return self._set_session_title(session_id, title, source=source)
+        return self._set_session_title(session_id, title, source=source, reject_auto_collision=reject_collision)
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -223,13 +243,7 @@ class SessionTitlesMixin:
         if not title:
             return False
         with self._read_ctx() as conn:
-            # SQLite's lower()/NOCASE do not implement Unicode casefolding.
-            conn.create_function("auto_title_matches", 2, _auto_title_matches, deterministic=True)
-            return conn.execute(
-                "SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL "
-                "AND auto_title_matches(title, ?) LIMIT 1",
-                (exclude_session_id or "", title.casefold()),
-            ).fetchone() is not None
+            return _auto_title_collides(conn, title, exclude_session_id or "")
 
     def list_recent_session_titles(self, exclude_session_id: Optional[str] = None, limit: int = 20):
         """Return non-empty titles, newest first, excluding the active session."""

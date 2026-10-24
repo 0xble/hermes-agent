@@ -71,15 +71,22 @@ its optional icon, and the durable alias can be observed through one Telegram to
   a reply can supply a subject even when the opener was only a greeting. If both attempts
   are greetings, the placeholder stays provisional. Each failed attempt is logged, but
   the turn's failure callback reports only the first failure, including a retry-only
-  failure. Gateway callbacks remain debug-only, not user-visible. Later turns retain
-  the existing turn-3 cap. A manual `/title` still wins, and a stored `llm` or `user`
+  failure. Gateway callbacks remain debug-only, not user-visible. A provisional title
+  gets model attempts through turn 3. At turn 3 a rejected name falls back to a title
+  derived from the current user message. Only a substantive, non-colliding final
+  candidate gets `llm` authority and replaces the instant `derived` placeholder once.
+  A rejected fallback stays provisional. Later user turns may recover from their
+  literal subject without more model calls or link fetches. An entirely untitled
+  session retains its existing model retry eligibility. A manual `/title` still wins, and a stored `llm` or `user`
   title is never replaced. `auxiliary.title_generation.hold_until_reply: false` restores
   the previous opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
   multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. The opening
-  turn's subject-less opener is the exception: `auxiliary.title_generation.hold_until_reply`
-  (default true) waits for that turn's reply before the first model title. Other openers
-  start immediately and receive the bounded completion retry described above.
+  turn's empty or attachment-only opener is the exception: `auxiliary.title_generation.hold_until_reply`
+  (default true) waits for that turn's reply before the first model title. Link and prose
+  openers start immediately and receive the bounded completion retry described above.
+  Links fetch metadata only in the background attempt. A readable page can yield a title
+  before the reply, while an unreadable link can abstain and recover from the reply.
   Upstream #117296 defers the title until the turn settles whenever both share a self-hosted base URL,
   which delays a new topic's name and icon by the whole first turn on a routing proxy. The
   declaration is keyed by endpoint URL, never by route name, and an undeclared or `false`
