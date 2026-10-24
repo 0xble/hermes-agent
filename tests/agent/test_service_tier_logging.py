@@ -93,7 +93,10 @@ def test_chat_relay_keeps_tier_on_choiceless_usage_frame():
 
 
 # Reuse the real conversation/stream harness, not a fabricated completed response.
-from tests.agent.test_first_chunk_at_hook import agent as agent, _make_stream_chunk, _run_with_hooks
+from tests.agent import test_first_chunk_at_hook
+from tests.agent.test_first_chunk_at_hook import _make_stream_chunk, _run_with_hooks
+
+agent = test_first_chunk_at_hook.agent
 
 
 def test_streamed_chat_tier_reaches_the_conversation_log(agent, caplog):

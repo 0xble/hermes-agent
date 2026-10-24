@@ -28,7 +28,16 @@ CLIProxyAPI's Codex-to-Responses translator returns the terminal `response` obje
 
 The inspected proxy source matches the installed revision `09e3ea1005c46b124117a41191e3369622e7ad14` (`v8.0.36`). At that revision, request translation preserves `priority` and `ultrafast` (request translator, lines 31–48), streaming preserves terminal event bytes (response translator, lines 15–39), and non-streaming returns `responseResult.Raw` (lines 75–97). The usage extractor separately reads `response.service_tier` and `service_tier` in `internal/runtime/executor/helps/usage_helpers.go`.
 
-The bounded live spike did not produce a completed response: both requested tiers returned HTTP 400, `invalid_request_error`, with no response ID, usage, or served-tier echo. The proxy has `request-log: false`, and its available logs contain no service-tier fields. Account-level served tiers remain unverified. The spike used a hand-written Responses request rather than Hermes' transport builder and discarded `error.message` and the raw error body. The retained evidence cannot distinguish a request-shape failure from route/account rejection. Do not interpret these failed requests, or the source passthrough evidence, as successful Ultrafast service.
+The earlier hand-written spike returned HTTP 400, `invalid_request_error`, for both tiers and discarded `error.message` and the raw error body. That attempt cannot distinguish a request-shape failure from route/account rejection.
+
+A separately authorized retry used the live Hermes `ResponsesApiTransport.build_kwargs` and `preflight_kwargs` shape: explicit instructions, typed message input, `store=false`, low reasoning effort, encrypted-reasoning include, and the selected tier. Both requests completed with HTTP 200 and returned `service_tier: default`:
+
+| Requested | Served | Response ID |
+| --- | --- | --- |
+| `priority` | `default` | `resp_098e2eb909ab0804016adcf815d93c87d0a902dbabedf496a8` |
+| `ultrafast` | `default` | `resp_0dbc69458e7e3abe016adcf8175f1887d086c6b39b3e097c45` |
+
+The Ultrafast request was sent only after `ultrafast_offered` accepted `gpt-6.1-sol` on `custom:codex-proxy` at the configured proxy URL. Neither response contained an error. This verifies passthrough and the `default` served-tier echoes for these 2 requests, not that all accounts always receive Default, or that paid acceleration was delivered. The original 400's precise field-level cause remains unknown.
 
 ## Verification And Retirement
 
