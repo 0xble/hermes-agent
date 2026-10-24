@@ -22,9 +22,9 @@ def runtime(tmp_path, monkeypatch):
     meta = AsyncSessionDB(db)
     adapter = SimpleNamespace(send=AsyncMock(return_value=SendResult(success=True, message_id="19",
                                                                     raw_response={"requested_thread_id": "17"})))
-    runner = SimpleNamespace(_session_db=meta, _session_key_for_source=lambda _: "old-key",
+    runner = SimpleNamespace(_session_db=meta, _session_key_for_source=lambda s: "old-key" if s.thread_id == "17" else "next-key",
                              _delivery_adapter_for=lambda _: adapter,
-                             session_store=SimpleNamespace(peek_session_id=lambda _: "old"))
+                             session_store=SimpleNamespace(peek_session_id=lambda key: "old" if key == "old-key" else "next"))
     state = {"generation": "gen", "phase": "pending", "session_id": "old", "session_key": "old-key",
              "target": "", "handoffs": {}}
     monkeypatch.setattr(work, "locate_command", lambda _: SimpleNamespace(command=()))
@@ -262,30 +262,153 @@ async def test_cron_moves_origin_delivery_failure_and_attach_with_exact_readback
 ])
 async def test_receipt_requires_transcript_readback_before_moving(runtime, monkeypatch, status, target, receipt_id):
     r = runtime
-    # tasks handoff returns relay.id, not receipt.receipt_id. relay status
-    # reconciles that same receipt against its exact target transcript.
+    assignment = {"id": "a2", "assigned_to": "hermes:default/next",
+                  "assigned_by": "hermes:default/parent", "report_to": "hermes:default/parent"}
+    # relay status must reconcile that same receipt against its exact transcript.
     monkeypatch.setattr(work, "cli", AsyncMock(side_effect=[
-        {"relay": {"id": "r1"}}, {"id": receipt_id, "target": target, "status": status}]))
+        [assignment], {"id": "r1"}, {"id": receipt_id, "target": target, "status": status}]))
     with pytest.raises(RuntimeError, match="not confirmed"):
         await work.receipt(r.runner, r.source, r.state,
-                           {"id": "goal", "kind": "goal", "title": "Service Operations"},
-                           {"session_id": "next"})
+                           {"id": "task:t1", "kind": "task", "record": {
+                               "id": "t1", "assignment_id": "a1", "assigned_by": "hermes:default/parent",
+                               "report_to": "hermes:default/parent"}},
+                           {"session_id": "next", "session_key": "next-key", "thread_id": "18"})
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["goal", "task"])
-async def test_receipt_accepts_actual_handoff_and_direct_relay_shapes(runtime, monkeypatch, kind):
+async def test_receipt_accepts_actual_direct_relay_shape(runtime, monkeypatch):
     r = runtime
     target = "hermes:default/next"
     delivered = {"id": "r1", "target": target, "status": "delivered"}
-    responses = ([{}, [{"id": "t1"}], delivered, delivered] if kind == "task"
-                 else [{"relay": delivered}, delivered])
-    command = AsyncMock(side_effect=responses)
+    assignment = {"id": "a2", "assigned_to": target,
+                  "assigned_by": "hermes:default/parent", "report_to": "hermes:default/parent"}
+    command = AsyncMock(side_effect=[[assignment], delivered, delivered])
     monkeypatch.setattr(work, "cli", command)
     result = await work.receipt(r.runner, r.source, r.state,
-                                {"id": kind, "kind": kind, "record": {"id": "t1"}}, {"session_id": "next"})
+                                {"id": "task:t1", "kind": "task", "record": {
+                                    "id": "t1", "assignment_id": "a1", "assigned_by": "hermes:default/parent",
+                                    "report_to": "hermes:default/parent"}},
+                                {"session_id": "next", "session_key": "next-key", "thread_id": "18"})
     assert result["receipt_id"] == "r1" and result["address"] == target
     assert command.await_args.args[-2:] == ("status", "r1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("original", ["hermes:default/parent", "codex:parent", "claude:parent", "brian:interactive", "hermes:default/old"])
+async def test_task_handoff_preserves_reportback_and_reconciles_assignment(runtime, monkeypatch, original):
+    import re
+
+    r = runtime
+    origin, target = "hermes:default/old", "hermes:default/next"
+    record = {"id": "t1", "assignment_id": "a1", "assigned_by": original, "report_to": original}
+    item = {"id": "task:t1", "kind": "task", "record": record}
+    assignments = [{"id": "a1", "assigned_to": origin, "assigned_by": original,
+                    "report_to": original, "accepted_at": None}]
+    delivered = {"id": "r1", "target": target, "status": "delivered"}
+    writes, keys = [], []
+
+    async def command(_runner, source, *args):
+        if "assignments" in args:
+            return [dict(a) for a in assignments]
+        if "accept" in args:
+            assignments[-1]["accepted_at"] = "accepted"
+            return dict(assignments[-1])
+        if "assign" in args:
+            assert assignments[-1]["accepted_at"]
+            actor = args[args.index("--agent-id") + 1]
+            session = args[args.index("--session-id") + 1]
+            by = actor + "/" + session if actor.startswith("hermes:") else actor + ":" + session
+            report = args[args.index("--report-to") + 1]
+            assert by == report == (target if original == origin else original)
+            assignments.append({"id": "a2", "assigned_to": target, "assigned_by": by,
+                                "report_to": report, "accepted_at": None})
+            writes.append(tuple(args))
+            return dict(assignments[-1])
+        if "send" in args:
+            key = args[args.index("--key") + 1]
+            assert len(key) <= 200 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", key)
+            keys.append(key)
+            return delivered
+        if "status" in args:
+            return delivered
+        raise AssertionError(args)
+
+    monkeypatch.setattr(work, "cli", command)
+    dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
+    assert (await work.receipt(r.runner, r.source, r.state, item, dest))["receipt_id"] == "r1"
+    assert (await work.receipt(r.runner, r.source, r.state, item, dest))["receipt_id"] == "r1"
+    assert len(writes) == 1 and len(keys) == 2 and keys[0] == keys[1]
+    # This is the tasks ledger's reporting predicate, not just a target inbox lookup.
+    assert assignments[-1]["assigned_by"] == assignments[-1]["report_to"]
+
+
+@pytest.mark.asyncio
+async def test_native_handoff_is_created_under_destination_not_reassigned_on_retry(runtime, monkeypatch):
+    r = runtime
+    delivered = {"id": "r1", "target": "hermes:default/next", "status": "delivered"}
+    keys = []
+    saved, assignments, sends = {}, [], []
+
+    async def command(runner, source, *args):
+        if "add" in args:
+            sid = runner.session_store.peek_session_id(runner._session_key_for_source(source))
+            assert work.address(source, sid) == "hermes:default/next"
+            keys.append(args[args.index("--dedupe-key") + 1])
+            saved.update(id="t1", title=args[3], context=args[args.index("--context") + 1])
+            return dict(saved)
+        if "show" in args:
+            return dict(saved)
+        if "assignments" in args:
+            return list(assignments)
+        if "assign" in args:
+            by = args[args.index("--agent-id") + 1] + "/" + args[args.index("--session-id") + 1]
+            assert by == args[args.index("--report-to") + 1] == "hermes:default/next"
+            assignments.append({"id": "a1", "assigned_to": "hermes:default/next", "assigned_by": by, "report_to": by})
+            return assignments[-1]
+        if "send" in args:
+            assert work.address(source, runner.session_store.peek_session_id(runner._session_key_for_source(source))) != args[3]
+            sends.append(tuple(args))
+            return delivered
+        assert args[:3] == ("relay", "--json", "status")
+        return delivered
+
+    monkeypatch.setattr(work, "cli", command)
+    item = {"id": "goal", "kind": "goal", "record": {}}
+    dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
+    for _ in range(2):
+        assert (await work.receipt(r.runner, r.source, r.state, item, dest))["receipt_id"] == "r1"
+    assert len(keys) == 2 and keys[0] == keys[1]
+    assert len(assignments) == 1 and len(sends) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["reassigned", "report_to", "missing_history", "wrong_readback"])
+async def test_task_transfer_stops_on_changed_or_unreportable_assignment(runtime, monkeypatch, change):
+    r = runtime
+    record = {"id": "t1", "assignment_id": "a1", "assigned_by": "hermes:default/parent", "report_to": "hermes:default/parent"}
+    current = {"id": "a1", "assigned_to": "hermes:default/old", "assigned_by": record["assigned_by"],
+               "report_to": record["report_to"], "accepted_at": "accepted"}
+    if change == "reassigned":
+        current["id"] = "different"
+    if change == "report_to":
+        record["report_to"] = "hermes:default/other"
+    command = AsyncMock(side_effect=([[]] if change == "missing_history" else [[current], {}, [current]]))
+    monkeypatch.setattr(work, "cli", command)
+    with pytest.raises(RuntimeError, match="assignment"):
+        await work.assign_task(r.runner, r.source, r.state, "t1", "hermes:default/next", record)
+    if change != "wrong_readback":
+        assert all("assign" not in call.args for call in command.await_args_list)
+
+
+def test_handoff_key_is_bounded_stable_and_keeps_distinct_original_bindings():
+    import re
+
+    state = {"generation": "new", "handoff_generation": "original"}
+    item = {"id": "task:" + "a/b:é" * 100}
+    key = work.handoff_key(state, item)
+    assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", key)
+    assert key == work.handoff_key({**state, "generation": "retry"}, item)
+    assert key != work.handoff_key(state, {"id": item["id"] + ":different"})
 
 
 def test_live_process_transfer_updates_watcher_and_checkpoint(monkeypatch):

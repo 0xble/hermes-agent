@@ -245,3 +245,75 @@ async def test_exact_mtproto_probe_uses_bot_dialog_not_user_chat(runtime, monkey
     assert await retire._probe_deleted(runtime.bot, runtime.source, runner=runtime)
     assert command.await_args.args[-3:] == ("@HermesBot", "--id", "42")
     runtime.bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_unresolved_delete_can_recover_without_housekeeping_spam(runtime, monkeypatch, cancel):
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def scope(_source):
+        yield
+
+    runtime._async_profile_scope_for_source = scope
+    runtime.bot.delete_forum_topic.side_effect = RuntimeError("not enough rights")
+    runtime.bot.send_message.side_effect = None  # exact topic still exists
+    runtime.bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot"))
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", AsyncMock(side_effect=RuntimeError("CLI unavailable")))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    failed = await retire.load(runtime, runtime.source)
+    assert failed["phase"] == "delete_unresolved"
+    assert "/retire cancel" in runtime.adapter.send.await_args.args[1]
+    counts = (runtime.bot.send_message.await_count, runtime.adapter.send.await_count)
+    await retire.resume_all(runtime)
+    await retire.advance(runtime, runtime.source)
+    assert (runtime.bot.send_message.await_count, runtime.adapter.send.await_count) == counts
+
+    # A new command first reconciles the previous dispatch, never blindly repeats it.
+    await retire.request(runtime, runtime.source, cancel=cancel)
+    recovered = await retire.load(runtime, runtime.source)
+    assert recovered["generation"] != failed["generation"]
+    if cancel:
+        assert recovered["phase"] == "cancelled"
+        assert await retire.intercept(runtime, MessageEvent(text="new work", source=runtime.source)) is None
+        await retire.advance(runtime, runtime.source)
+        assert runtime.bot.delete_forum_topic.await_count == 1
+    else:
+        assert recovered["phase"] == "pending" and not recovered.get("closing_receipt")
+        runtime.bot.delete_forum_topic.side_effect = None
+        runtime.bot.send_message.side_effect = RuntimeError("message thread not found")
+        await retire.advance(runtime, runtime.source)
+        assert (await retire.load(runtime, runtime.source))["phase"] == "done"
+        assert runtime.bot.delete_forum_topic.await_count == 2
+        assert [c.args[1] for c in runtime.adapter.send.await_args_list].count(retire.CLOSING) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_unresolved_delete_already_gone_only_unbinds(runtime, cancel):
+    await retire.request(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    state.update(phase="delete_unresolved", closing_receipt={"generation": state["generation"],
+                 "message_id": "10", "chat_id": "100", "thread_id": "42"})
+    await retire.save(runtime, runtime.source, state)
+    result = await retire.request(runtime, runtime.source, cancel=cancel)
+    assert result["status"] == "done"
+    runtime.bot.delete_forum_topic.assert_not_awaited()
+    runtime.adapter.send.assert_not_awaited()
+    assert (await retire.load(runtime, runtime.source))["phase"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_unresolved_delete_unknown_probe_never_retries_or_cancels(runtime):
+    await retire.request(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    state["phase"] = "delete_unresolved"
+    await retire.save(runtime, runtime.source, state)
+    runtime.bot.send_message.side_effect = TimeoutError("unknown topic state")
+    for cancel in (False, True):
+        with pytest.raises(Exception, match="unknown topic state"):
+            await retire.request(runtime, runtime.source, cancel=cancel)
+    assert await retire.load(runtime, runtime.source) == state
+    runtime.bot.delete_forum_topic.assert_not_awaited()

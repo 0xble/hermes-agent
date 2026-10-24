@@ -77,6 +77,12 @@ Retirement waits until the active turn settles before discovering obligations.
 routes, background processes and watchers, durable delegations and pending
 results, and the task ledger's exact-session assignment inbox. Active task claim
 tokens cannot be moved by assignment, so they hold retirement until settlement.
+Existing tasks retain their original assigner and report recipient. Self-owned
+work reports in the destination topic. Task creation and assignment use the
+ledger APIs, with exact task/context and typed-assignment readbacks before a
+source-origin relay. This avoids both an unreportable `assigned_by != report_to`
+row and relay's self-send refusal. Stable, bounded plain-token relay keys and
+assignment reconciliation prevent duplicate offers during recovery.
 A changed session binding holds retirement for an explicit cancel/retry instead
 of guessing which session owns a compacted turn's work. The existing live
 exact-title matcher selects unambiguous subject owners. Other owners require
@@ -93,6 +99,11 @@ back absence before removing the existing topic binding and routing index entry.
 The session and transcript remain. The user CLI's exact `topic list --id` probe
 is preferred when installed. Its DM peer is the bot's dialog, not the Bot API
 user chat ID. The strict Bot API missing-thread probe serves other installations.
+An unresolved delete is quiescent, not retried by housekeeping. `/retire` or
+`/retire cancel` first probes the exact topic under the executor lock. Confirmed
+absence only cleans up its binding. Confirmed existence permits cancellation or
+a fresh generation that inventories again and requires a new closing receipt.
+An unknown result leaves the previous dispatch unresolved and never repeats it.
 
 Proof surfaces: `tests/gateway/test_telegram_retire.py` and
 `test_telegram_retire_work.py`, plus the existing topic-tool, topic-mode,

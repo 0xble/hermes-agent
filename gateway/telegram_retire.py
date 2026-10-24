@@ -58,6 +58,30 @@ async def request(runner, source, *, target="", now=False, cancel=False):
     if runner._session_db is None:
         raise TopicRequestError("Session storage is unavailable. The topic was not changed.")
     existing = await load(runner, source)
+    if existing and existing["phase"] == "delete_unresolved":
+        # Only an explicit command retries recovery after a failed dispatch.
+        # Serialize the existence check against an executor already in flight.
+        locks = getattr(runner, "_telegram_retire_locks", None)
+        if locks is None:
+            locks = runner._telegram_retire_locks = {}
+        lock = locks.setdefault(state_key(source), asyncio.Lock())
+        if lock.locked():
+            raise TopicRequestError("Topic deletion is still being reconciled. Retry the command after it settles.")
+        async with lock:
+            current = await load(runner, source)
+            if not current or current["generation"] != existing["generation"] or current["phase"] != "delete_unresolved":
+                raise TopicRequestError("Retirement changed during recovery. Retry the command.")
+            bot = getattr(runner._delivery_adapter_for(source), "_bot", None)
+            if bot is None:
+                raise TopicRequestError("Telegram bot is disconnected. The previous deletion is unresolved.")
+            if await _probe_deleted(bot, source, runner=runner):
+                await _unbind(runner, source, existing)
+                return {"action": "cancel_retire" if cancel else "retire", "status": "done",
+                        "thread_id": str(source.thread_id)}
+            # Exact-topic existence makes cancellation safe. A retry instead
+            # starts a new generation, re-inventories work and closes again.
+            existing["phase"] = "failed"
+            await save(runner, source, existing)
     if cancel:
         if existing and existing["phase"] in {"deleting", "delete_unresolved"}:
             raise TopicRequestError("Topic deletion has already been dispatched and cannot be cancelled.")
@@ -190,7 +214,7 @@ async def _unbind(runner, source, state):
 async def advance(runner, source):
     """Resume persisted retirement only after the active turn relinquishes its lane."""
     state = await load(runner, source)
-    if not state or state["phase"] in {"cancelled", "done", "failed"}:
+    if not state or state["phase"] in {"cancelled", "done", "failed", "delete_unresolved"}:
         return
     key = state["session_key"]
     adapter = runner._delivery_adapter_for(source)
@@ -208,7 +232,7 @@ async def advance(runner, source):
         return
     async with lock:
         state = await _current(runner, source, state["generation"])
-        if not state:
+        if not state or state["phase"] in {"failed", "delete_unresolved"}:
             return
         generation = state["generation"]
         bot = getattr(adapter, "_bot", None)
@@ -226,7 +250,7 @@ async def advance(runner, source):
                 if await _probe_deleted(bot, source, runner=runner):
                     await _unbind(runner, source, state)
                     return
-                raise RuntimeError("The previous delete was not confirmed. Use /retire to retry.")
+                raise RuntimeError("The previous delete was not confirmed. Use /retire to retry or /retire cancel to keep this topic.")
             from gateway.telegram_retire_work import prepare
             # Inventory happens here, after the turn, not when /retire was typed.
             if runner.session_store.peek_session_id(key) != state["session_id"]:
@@ -281,7 +305,8 @@ async def advance(runner, source):
                 current["phase"] = "delete_unresolved" if current["phase"] in {"deleting", "delete_unresolved"} else "failed"
                 current["error"] = str(exc)
                 await save(runner, source, current)
-                await adapter.send(str(source.chat_id), f"Topic retirement failed: {exc}",
+                recovery = " Use /retire to retry or /retire cancel to keep this topic." if current["phase"] == "delete_unresolved" else ""
+                await adapter.send(str(source.chat_id), f"Topic retirement failed: {exc}{recovery}",
                                    metadata={"thread_id": str(source.thread_id)})
 
 
@@ -291,7 +316,7 @@ async def resume_all(runner):
     for _, raw in await runner._session_db.list_meta_prefix(PREFIX):
         try:
             state = json.loads(raw)
-            if state["phase"] not in {"cancelled", "done", "failed"}:
+            if state["phase"] not in {"cancelled", "done", "failed", "delete_unresolved"}:
                 source = SessionSource(**{**state["source"], "platform": Platform.TELEGRAM})
                 async with runner._async_profile_scope_for_source(source):
                     await advance(runner, source)

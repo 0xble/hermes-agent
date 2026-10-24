@@ -6,8 +6,10 @@ scheduler callback or process owner, and must never be treated as one.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+from dataclasses import replace
 from hermes_platform.resolver import locate_command
 
 from gateway.telegram_retire import save
@@ -107,7 +109,6 @@ async def destination(runner, source, selector):
     candidate = candidates[0]
     # The existing live matcher validates archive/profile/session state. Reject
     # another retirement too, so simultaneous retirements cannot hand off in a loop.
-    from dataclasses import replace
     from gateway.telegram_retire import load
     owner_source = replace(source, thread_id=str(candidate["thread_id"]))
     pending = await load(runner, owner_source)
@@ -141,51 +142,105 @@ async def resolve_answers(runner, source, state, text):
     return True
 
 
+def handoff_key(state, item):
+    # Relay accepts a <=200-character plain token, not task/route addresses.
+    binding = json.dumps([state.get("handoff_generation", state["generation"]), item["id"]])
+    return "retire-" + hashlib.sha256(binding.encode("utf-8")).hexdigest()
+
+
+def task_actor_args(actor):
+    """Use the ledger's original native attribution, not the retiring session."""
+    if actor.startswith("hermes:"):
+        agent, separator, session = actor.partition("/")
+    else:
+        agent, separator, session = actor.partition(":")
+    if not separator or not session:
+        raise RuntimeError("Task assignment has no native reporting identity")
+    return ("--agent-id", agent, "--session-id", session)
+
+
+async def assign_task(runner, source, state, task_id, target, record=None):
+    actor = record.get("assigned_by") if record else target
+    if not actor or (record and actor != record.get("report_to")):
+        raise RuntimeError(f"Task {task_id} has no reportable original assignment")
+    # External requesters keep their reporting route. A self-assigned task's
+    # topic-local result belongs in the replacement topic, not the deleted one.
+    origin = address(source, state["session_id"])
+    if actor == origin:
+        actor = target
+    expected = {"assigned_to": target, "assigned_by": actor, "report_to": actor}
+
+    async def latest():
+        rows = await cli(runner, source, "tasks", "--json", "assignments", task_id)
+        if not isinstance(rows, list) or (record and not rows):
+            raise RuntimeError(f"Task {task_id} has no readable assignment history")
+        return rows[-1] if rows else {}
+
+    current = await latest()
+    if all(current.get(key) == value for key, value in expected.items()):
+        return
+    if current and (not record or not record.get("assignment_id")
+            or current.get("id") != record["assignment_id"]
+            or current.get("assigned_to") != origin
+            or current.get("assigned_by") != record["assigned_by"]
+            or current.get("report_to") != record["report_to"]):
+        raise RuntimeError(f"Task {task_id} assignment changed before transfer")
+    # The ledger allows only 1 pending offer. Acceptance is not execution and
+    # releases that offer without claiming or settling the original task.
+    if current and not current.get("accepted_at"):
+        await cli(runner, source, "tasks", "--json", "accept", task_id)
+    await cli(runner, source, "tasks", "--json", *task_actor_args(actor), "assign", task_id,
+              "--to", target, "--report-to", actor)
+    assigned = await latest()
+    if not all(assigned.get(key) == value for key, value in expected.items()):
+        raise RuntimeError(f"Task {task_id} reporting assignment was not read back")
+
+
 async def receipt(runner, source, state, item, dest):
     """Task-linked relay with stable keys, then exact receipt reconciliation."""
     target = address(source, dest["session_id"])
     if item["kind"] == "task":
         task_id = str(item["record"]["id"])
-        await cli(runner, source, "tasks", "--json", "assign", task_id, "--to", target, "--report-to", target)
-        assigned = await cli(runner, source, "tasks", "--json", "inbox", "--session", target)
-        if not any(str(task.get("id")) == task_id for task in assigned):
-            raise RuntimeError(f"Task {task_id} assignment was not read back")
-        # Existing task's resumption context is already in the canonical ledger.
-        body = f"📦 Topic handoff\nContinue task {task_id} from the retiring topic. Read its current ledger context before acting."
-        from pathlib import Path
-        from tempfile import NamedTemporaryFile
-        from hermes_constants import get_hermes_home
-        scratch = get_hermes_home() / "cache" / "scratch"
-        scratch.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=scratch, suffix=".txt", delete=False) as payload:
-            payload.write(body)
-            path = Path(payload.name)
-        try:
-            sent = await cli(runner, source, "relay", "--json", "send", target, "--task", task_id,
-                             "--key", f"retire:{state.get('handoff_generation', state['generation'])}:{item['id']}", "--body-file", str(path))
-        finally:
-            path.unlink(missing_ok=True)
     else:
-        sent = await cli(runner, source, "tasks", "--json", "handoff", target,
-                         "--title", f"Retired topic: {item['kind']}",
-                         "--brief", "Own the transferred work from the retiring topic. Preserve its original limits and report to this topic.",
-                         "--context", json.dumps(item, ensure_ascii=False),
-                         "--dedupe-key", f"retire:{state.get('handoff_generation', state['generation'])}:{item['id']}")
-    relay = sent.get("relay", sent)
-    receipt_id = relay.get("id")
+        # tasks handoff reports to its sender, and relay refuses a self-send.
+        # Create/assign under the destination, then relay from the source.
+        owner_source = replace(source, thread_id=str(dest["thread_id"]))
+        owner_key = runner._session_key_for_source(owner_source)
+        if (owner_key != dest["session_key"]
+                or runner.session_store.peek_session_id(owner_key) != dest["session_id"]):
+            raise RuntimeError("Handoff destination binding changed")
+        title = f"Retired topic: {item['kind']}"
+        context = "Own the transferred work. Preserve its original limits and report to this topic.\n" + json.dumps(item, ensure_ascii=False)
+        created = await cli(runner, owner_source, "tasks", "--json", "add", title,
+                            "--context", context, "--dedupe-key", handoff_key(state, item))
+        task_id = str(created["id"])
+        saved = await cli(runner, source, "tasks", "--json", "show", task_id)
+        if saved.get("id") != task_id or saved.get("title") != title or saved.get("context") != context:
+            raise RuntimeError(f"Task {task_id} handoff context was not read back")
+    await assign_task(runner, source, state, task_id, target,
+                      item["record"] if item["kind"] == "task" else None)
+    # The full resumption context is already in the canonical ledger.
+    body = f"📦 Topic handoff\nContinue task {task_id} from the retiring topic. Read its current ledger context before acting."
+    from pathlib import Path
+    from tempfile import NamedTemporaryFile
+    from hermes_constants import get_hermes_home
+    scratch = get_hermes_home() / "cache" / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=scratch, suffix=".txt", delete=False) as payload:
+        payload.write(body)
+        path = Path(payload.name)
+    try:
+        sent = await cli(runner, source, "relay", "--json", "send", target, "--task", task_id,
+                         "--key", handoff_key(state, item), "--body-file", str(path))
+    finally:
+        path.unlink(missing_ok=True)
+    receipt_id = sent.get("id")
     if not receipt_id:
         raise RuntimeError("Handoff did not return a relay receipt")
     readback = await cli(runner, source, "relay", "--json", "status", str(receipt_id))
     if (readback.get("id") != receipt_id or readback.get("target") != target
             or readback.get("status") not in {"delivered", "replied"} or readback.get("error")):
         raise RuntimeError(f"Handoff receipt {receipt_id} is not confirmed at {target}: {readback.get('status')}")
-    handoff_task = sent.get("task")
-    handoff_task_id = handoff_task.get("id") if isinstance(handoff_task, dict) else sent.get("task_id")
-    if item["kind"] != "task" and handoff_task_id:
-        # The handoff's default result recipient is the retiring source. Move
-        # that assignment's reporting route too, without generating another brief.
-        await cli(runner, source, "tasks", "--json", "assign", str(handoff_task_id),
-                  "--to", target, "--report-to", target)
     return {"receipt_id": receipt_id, "address": target, "destination": dest}
 
 
