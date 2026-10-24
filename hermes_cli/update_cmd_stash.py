@@ -261,6 +261,7 @@ def _record_stash_disposition(outcome: str, stash_ref: str, detail: str = "", *,
         "local_changes_stash",
         outcome != "parked",
         f"{outcome}: {stash_ref}" + (f" ({detail})" if detail else ""),
+        replace=True,
     )
 
 

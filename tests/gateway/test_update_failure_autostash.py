@@ -154,6 +154,44 @@ def test_pre_pull_failure_notice_names_parked_autostash(update_tree, tmp_path, m
     assert f"git stash apply {stash}" in detail
 
 
+@pytest.mark.parametrize("disposition", ["restored", "parked", "discarded"])
+def test_settled_stash_replaces_pending_failure_step(update_tree, tmp_path, monkeypatch, disposition):
+    from hermes_cli import main, update_cmd, update_cmd_stash, update_receipt
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_receipt, "_receipt_dir", lambda: home / "logs/update_receipts")
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ())
+    local = update_tree.clone / "content.txt"
+    local.write_text("local edits\n")
+    update_receipt.begin_update_receipt()
+    try:
+        stash = main._stash_local_changes_if_needed(["git"], update_tree.clone)
+        if disposition == "restored":
+            assert main._restore_stashed_changes(["git"], update_tree.clone, stash)
+            assert local.read_text() == "local edits\n"
+        elif disposition == "discarded":
+            assert main._discard_stashed_changes(["git"], update_tree.clone, stash)
+        else:
+            update_cmd_stash._record_stash_disposition("parked", stash, "keep-stash", chosen=True)
+    finally:
+        path = update_receipt.finalize_update_receipt("partial")
+        update_cmd_stash._clear_pending_autostash()
+    receipt = json.loads(path.read_text())
+    steps = receipt["steps"]
+    assert len([step for step in steps if step["name"] == "local_changes_stash"]) == 1
+    # These are the existing fork checker and Desktop failure-detail readings.
+    failed_steps = [step["name"] for step in steps if not step.get("ok", True)]
+    first_failed = next((step for step in steps if step.get("ok") is False), None)
+    if disposition == "parked":
+        assert failed_steps == ["local_changes_stash"]
+        assert "keep-stash" in first_failed["detail"]
+    else:
+        assert failed_steps == []
+        assert first_failed is None
+
+
 @pytest.mark.parametrize("evidence", ["user_action", "parked", "restored", "discarded"])
 def test_failure_notice_honors_recorded_local_work_disposition(tmp_path, monkeypatch, evidence):
     from tests.gateway.update_fixtures import finalize_update

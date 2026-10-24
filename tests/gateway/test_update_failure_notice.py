@@ -9,7 +9,10 @@ import pytest
 
 from gateway.config import Platform
 from gateway.update_notifications import _failure_cause, final_outcome
-from tests.gateway.update_fixtures import RELEASE, SOURCE, _make_runner, _release, finalize_update, pending
+from tests.gateway.update_fixtures import (
+    RELEASE, SOURCE, _make_runner, _release, fail_immutable_update, finalize_update, pending,
+)
+from tests.hermes_cli.test_update_target_identity import update_tree  # fixture
 
 
 @pytest.fixture(autouse=True)
@@ -41,15 +44,16 @@ async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
     data = pending(tmp_path, reason=False)
     data["updating_notified"] = True
     (tmp_path / ".update_pending.json").write_text(json.dumps(data))
-    finalize_update(tmp_path, outcome="failed", noop=True)
-    path = tmp_path / "logs" / "update_receipts" / "latest.json"
-    receipt = json.loads(path.read_text())
-    receipt.update(stop_reason=stop_reason, stop_class="syntax_rollback",
-                   pre_update={"sha": SOURCE}, post_update={"sha": SOURCE})
-    path.write_text(json.dumps(receipt))
-    (tmp_path / ".update_process_exit_code").write_text(str(exit_code))
     if immutable:
         _release(tmp_path)
+        fail_immutable_update(tmp_path)
+    else:
+        finalize_update(tmp_path, outcome="failed", noop=True)
+    path = tmp_path / "logs" / "update_receipts" / "latest.json"
+    receipt = json.loads(path.read_text())
+    receipt.update(stop_reason=stop_reason, stop_class="syntax_rollback")
+    path.write_text(json.dumps(receipt))
+    (tmp_path / ".update_process_exit_code").write_text(str(exit_code))
     adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
     runner = _make_runner()
     runner.adapters = {Platform.TELEGRAM: adapter}
@@ -69,6 +73,37 @@ async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
         assert "Cause: The downloaded update contains a syntax error." in text
         assert "sys.exit" not in text
     assert not (tmp_path / ".update_pending.json").exists()
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_immutable_build_failure_has_untouched_source_proof(update_tree, tmp_path, monkeypatch, dirty):
+    from tests.hermes_cli.test_update_target_identity import git
+
+    home = tmp_path / "home"
+    home.mkdir()
+    release = _release(home)
+    source = update_tree.clone
+    if dirty:
+        (source / "content.txt").write_text("local edits\n")
+    before = git(source, "status", "--porcelain")
+    request = pending(home, reason=False)
+    monkeypatch.setattr("gateway.update_notifications.__file__", str(release / "gateway/update_notifications.py"))
+    path = fail_immutable_update(home, source)
+    receipt = json.loads(path.read_text())
+    assert not any(step["name"] == "local_changes_stash" for step in receipt["steps"])
+    assert git(source, "status", "--porcelain") == before
+    assert git(source, "rev-parse", "HEAD") == update_tree.base
+    assert final_outcome(home, request) == (
+        False, f"Nothing changed. Still on {RELEASE[:12]}. Cause: candidate build failed",
+    )
+    receipt["steps"].append({"name": "immutable_source_untouched", "ok": False})
+    latest = home / "logs/update_receipts/latest.json"
+    latest.write_text(json.dumps(receipt))
+    assert "Runtime state is unverified" in final_outcome(home, request)[1]
+    # The pointer and equal source SHAs alone must never create this assurance.
+    receipt["steps"] = []
+    latest.write_text(json.dumps(receipt))
+    assert "Runtime state is unverified" in final_outcome(home, request)[1]
 
 
 @pytest.mark.parametrize("case", [
@@ -206,8 +241,7 @@ def test_immutable_notice_checks_recovery_in_journal_bound_source(
     # The updater runs from the source, while the gateway imports its release copy.
     monkeypatch.setattr(obligation, "__file__", str(source / "hermes_cli" / "update_host_obligation.py"))
     data = pending(tmp_path, reason=False)
-    finalize_update(tmp_path, outcome="failed", noop=True)
-    (tmp_path / ".update_process_exit_code").write_text("1")
+    fail_immutable_update(tmp_path, source)
     markers = {
         "interrupted_pull": interrupted_pull_marker(source),
         "completion": completion_pending_path(source),
@@ -234,5 +268,5 @@ def test_immutable_notice_checks_recovery_in_journal_bound_source(
 
     owed.unlink()
     assert final_outcome(tmp_path, data) == (
-        False, f"Nothing changed. Still on {RELEASE[:12]}. Cause: The updater exited with code 1.",
+        False, f"Nothing changed. Still on {RELEASE[:12]}. Cause: candidate build failed",
     )
