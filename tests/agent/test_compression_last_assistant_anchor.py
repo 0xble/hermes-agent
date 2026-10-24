@@ -263,3 +263,23 @@ class TestEngineDropsReplyEndToEnd:
         # precedes the last "ok" that followed it).
         assert _count_reply(live) == 0
         assert live_contents.index("noted") < len(live_contents) - 1 == live_contents.index("ok")
+
+
+def test_auto_steer_receipt_and_deferral_survive_native_compression_commit(tmp_path):
+    from agent.steer_deferral import defer_message, register_steer
+
+    fold = [{"role": "user", "content": SUMMARY}, {"role": "user", "content": FOLLOWER}]
+    db, session_id, messages, agent = _seed(tmp_path, [], fold, FOLLOWER)
+    agent._current_turn_id = "auto-turn"
+    queued = []
+    pending, _ = register_steer(agent, "unrelated original", lambda: queued.append("original") or True)
+    deferred, _ = register_steer(agent, "already queued", lambda: queued.append("queued") or True)
+    assert defer_message(agent, {"message_id": deferred})["accepted"]
+
+    compressed = _compress(agent, messages)
+    for view in (compressed, db.get_messages_as_conversation(agent.session_id)):
+        text = str(view)
+        assert pending in text and deferred in text and 'deferred' in text
+    assert defer_message(agent, {"message_id": pending})["accepted"]
+    assert defer_message(agent, {"message_id": deferred})["accepted"]
+    assert queued == ["queued", "original"]

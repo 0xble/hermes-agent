@@ -357,7 +357,7 @@ def _word_setters() -> dict:
     """key -> (normaliser, accepted words, error template, apply(word)); the reported value is the
     accepted word. Built per call: the specs reference server.py globals (rebound at install)."""
     return {
-        "busy": (_word, {"queue", "steer", "interrupt"}, "unknown busy mode: {value}",
+        "busy": (_word, {"queue", "steer", "interrupt", "auto"}, "unknown busy mode: {value}",
                  lambda w: _write_config_key("display.busy_input_mode", w)),
         "approvals.mode": (_word, _APPROVAL_MODES, "unknown approval mode: {value}; pick one of manual|smart|off",
                            lambda w: (_write_config_key("approvals.mode", w), _emit_all_session_info())),

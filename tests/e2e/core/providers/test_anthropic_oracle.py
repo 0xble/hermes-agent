@@ -43,6 +43,27 @@ def test_conformant_body_has_no_schema_errors(beta: bool) -> None:
 
 
 @pytest.mark.parametrize("beta", [False, True], ids=["ga", "beta"])
+def test_tool_input_schema_retains_json_schema_keywords(beta: bool) -> None:
+    body = _body()
+    body["tools"][0]["input_schema"].update({
+        "properties": {"path": {"$ref": "#/$defs/path"}},
+        "required": ["path"],
+        "additionalProperties": False,
+        "$defs": {"path": {"type": "string", "minLength": 1}},
+        "description": "Read a path.",
+        "allOf": [{"type": "object"}],
+    })
+    assert validate_request(body, beta=beta) == []
+
+
+@pytest.mark.parametrize("beta", [False, True], ids=["ga", "beta"])
+def test_unknown_tool_envelope_key_is_reported(beta: bool) -> None:
+    body = _body()
+    body["tools"][0]["e2e_bogus_field"] = 1
+    assert "unknown key $.tools[0].e2e_bogus_field" in validate_request(body, beta=beta)
+
+
+@pytest.mark.parametrize("beta", [False, True], ids=["ga", "beta"])
 @pytest.mark.parametrize("where", [
     ("messages", 1, 0),  # assistant thinking (what _replay_thinking builds)
     ("messages", 1, 1),  # assistant text

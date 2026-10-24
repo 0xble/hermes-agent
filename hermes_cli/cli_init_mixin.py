@@ -11,6 +11,7 @@ import queue
 import threading
 from datetime import datetime
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.pending_input import PendingInputQueue
 from hermes_state_ids import new_session_id
 from pathlib import Path
 from rich.console import Console
@@ -55,7 +56,7 @@ class CLIInitMixin:
         )
         # busy_input_mode: "interrupt" (redirect the run) | "queue" (next turn) | "steer" (inject mid-run).
         _bim = str(display.get("busy_input_mode", "interrupt")).strip().lower()
-        self.busy_input_mode = _bim if _bim in ("queue", "steer") else "interrupt"
+        self.busy_input_mode = _bim if _bim in ("queue", "steer", "auto") else "interrupt"
 
         # verbose ONLY controls global DEBUG logging; tool_progress="verbose" is independent
         # (coupling them spewed every module's DEBUG logs to the console).
@@ -378,7 +379,7 @@ class CLIInitMixin:
     def _init_ui_state(self):
         """Per-run mutable UI state; must exist before any chat() call since -q never goes through run()."""
         from cli import CLI_CONFIG, _status_bar_visible_from_display_config
-        self._pending_input = queue.Queue()
+        self._pending_input = PendingInputQueue()
         self._interrupt_queue = queue.Queue()
         self._agent_running = self._should_exit = False
         self._last_turn_interrupted = False  # /goal never auto-queues on a Ctrl+C'd turn

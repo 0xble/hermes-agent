@@ -7,6 +7,80 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
+def test_secure_state_db_files_handles_disappearance_at_chmod(tmp_path, monkeypatch, suffix):
+    import os
+    import stat
+
+    import hermes_state as hs
+
+    db = tmp_path / "state.db"
+    paths = [tmp_path / (db.name + ending) for ending in ("", "-wal", "-shm")]
+    for path in paths:
+        path.write_bytes(path.name.encode())
+        path.chmod(0o644)
+    identities = {path: (path.stat().st_dev, path.stat().st_ino) for path in paths}
+    vanished = tmp_path / (db.name + suffix)
+    real_chmod = os.chmod
+    visited = []
+
+    def disappear_before_chmod(path, mode):
+        visited.append(path)
+        if path == vanished:
+            path.unlink()
+        return real_chmod(path, mode)
+
+    def no_open(*args, **kwargs):
+        pytest.fail("hardening must not open/close existing SQLite inodes")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hs.os, "chmod", disappear_before_chmod)
+        patch.setattr(hs.os, "open", no_open)
+        patch.setattr(hs.os, "close", no_open)
+        if suffix:
+            hs._secure_state_db_files(db)
+        else:
+            # Losing the main database is not the normal SQLite sidecar race.
+            with pytest.raises(FileNotFoundError):
+                hs._secure_state_db_files(db)
+
+    assert vanished in visited
+    assert not vanished.exists()
+    if suffix:
+        assert visited == paths
+        for path in paths:
+            if path != vanished:
+                st = path.stat()
+                assert stat.S_IMODE(st.st_mode) == 0o600
+                assert (st.st_dev, st.st_ino) == identities[path]
+                assert path.read_bytes() == path.name.encode()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
+def test_secure_state_db_files_propagates_permission_failure(tmp_path, monkeypatch, suffix):
+    import hermes_state as hs
+
+    db = tmp_path / "state.db"
+    denied = tmp_path / (db.name + suffix)
+    for ending in ("", "-wal", "-shm"):
+        (tmp_path / (db.name + ending)).write_bytes(b"existing")
+    real_chmod = hs.os.chmod
+    error = PermissionError("mode change denied")
+
+    def deny_chmod(path, mode):
+        if path == denied:
+            raise error
+        return real_chmod(path, mode)
+
+    monkeypatch.setattr(hs.os, "chmod", deny_chmod)
+    with pytest.raises(PermissionError) as raised:
+        hs._secure_state_db_files(db)
+    assert raised.value is error
+    assert denied.read_bytes() == b"existing"
+
+
 def test_is_zeroed_state_db_and_quarantine(tmp_path):
     import hermes_state as hs
 

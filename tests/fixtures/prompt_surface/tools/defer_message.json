@@ -1,0 +1,17 @@
+{
+  "description": "Hand an unrelated auto-steered user message back to the host queue for its own next turn. Use only the exact message_id supplied in its auto-steer wrapper. On success, do not act on or answer that message in the current turn. Unavailable without an auto-steered message in the current turn.",
+  "name": "defer_message",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "message_id": {
+        "description": "Exact immutable ID from the auto-steer wrapper.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "message_id"
+    ],
+    "type": "object"
+  }
+}

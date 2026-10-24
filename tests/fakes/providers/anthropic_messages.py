@@ -31,6 +31,7 @@ carries ``bearer`` / ``x_api_key`` so a responder can branch on the credential.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import typing
@@ -159,6 +160,10 @@ _BETA_BLOCKS = _param_adapters(BetaMessageParam)
 
 
 def _unknown_keys(sent: Any, known: Any, path: str = "$") -> list[str]:
+    # Tool input_schema is JSON Schema data, not an API envelope. The beta SDK's
+    # TypedDict drops valid schema keywords that the GA SDK preserves as extras.
+    if re.fullmatch(r"\$\.tools\[\d+\]\.input_schema", path):
+        return []
     # A block the union resolved to a (permissive) response BaseModel stops this walk; content
     # blocks are checked key-for-key against their *Param TypedDict by _block_problems instead.
     if isinstance(sent, dict) and isinstance(known, dict):

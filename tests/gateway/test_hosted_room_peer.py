@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import stat
@@ -277,8 +278,12 @@ def test_room_grant_fails_closed_for_tamper_expiry_and_permission():
             permission="status",
             now=100 + 30 * 24 * 60 * 60,
         )
+    payload, signature = token.rsplit(".", 1)
+    changed = bytearray(base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4)))
+    changed[0] ^= 1
+    tampered = payload + "." + base64.urlsafe_b64encode(changed).decode("ascii").rstrip("=")
     with pytest.raises(HostedRoomGrantError, match="signature"):
-        verify_room_grant(SECRET, token[:-1] + "A", dispatch, now=105)
+        verify_room_grant(SECRET, tampered, dispatch, now=105)
 
 
 def test_local_catalog_is_honest_for_app_managed_process(monkeypatch):

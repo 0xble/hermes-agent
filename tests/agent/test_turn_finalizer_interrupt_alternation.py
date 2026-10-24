@@ -144,6 +144,34 @@ def _finalize(agent, messages, *, interrupted, final_response=None):
     )
 
 
+def test_auto_input_after_final_drain_falls_back_to_host_queue():
+    from agent.interrupt_control import InterruptControlMixin
+    from agent.steer_deferral import offer_auto_steer
+    from unittest.mock import Mock
+
+    agent = _StubAgent()
+    native = InterruptControlMixin()
+    agent.__dict__.update(_current_turn_id="turn-1",
+                          _drain_pending_steer=native._drain_pending_steer,
+                          steer=native.steer)
+    queued = Mock(return_value=True)
+    accepted = []
+
+    # The host still sees a busy turn while finalization synchronizes memory.
+    # There is no model request or steer drain after this callback.
+    def arrive(**kwargs):
+        accepted.append(offer_auto_steer(agent, "late follow-up", queued))
+        if not accepted[-1]:
+            queued()
+
+    agent._sync_external_memory_for_turn = arrive
+    _finalize(agent, [{"role": "user", "content": "task"}],
+              interrupted=False, final_response="settled")
+    assert accepted == [False]
+    queued.assert_called_once_with()
+    assert agent._drain_pending_steer() is None
+
+
 def _assert_no_tool_then_user(messages):
     for i in range(len(messages) - 1):
         if messages[i].get("role") == "tool":
