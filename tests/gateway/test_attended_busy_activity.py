@@ -635,7 +635,7 @@ async def test_drain_arrival_records_receipt_before_spool_and_preserves_it_on_re
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule", [False, True], ids=["turn-start", "busy-admission"])
-@pytest.mark.parametrize("reason", ["shutdown_follow_up", "drain_deferred"])
+@pytest.mark.parametrize("reason", ["shutdown_follow_up", "drain_deferred", "turn_lease_wait"])
 @pytest.mark.parametrize("recorded_receipt", [True, False], ids=["original-receipt", "legacy-spool"])
 @pytest.mark.parametrize("persisted_receipt", [True, False], ids=["arrival-written", "arrival-not-written"])
 async def test_replayed_followup_never_counts_as_new_activity(
@@ -664,7 +664,11 @@ async def test_replayed_followup_never_counts_as_new_activity(
     try:
         if persisted_receipt:
             assert await runner._mark_attended_user_activity(original, original.source, key)
-        assert flush_pending_to_file({key: original}, reason=reason) == 1
+        if reason == "turn_lease_wait":
+            from gateway.run_turn_lease_wait import preserve_lease_wait
+            preserve_lease_wait(runner, key, entry.session_id, original)
+        else:
+            assert flush_pending_to_file({key: original}, reason=reason) == 1
         path, = (tmp_path / "pending_messages").glob("*.json")
         if not recorded_receipt:
             payload = json.loads(path.read_text())
