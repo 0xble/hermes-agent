@@ -37,11 +37,13 @@ def test_writer_patience_bounds_local_mutex_wait(tmp_path):
         db.close()
 
 
-def test_lease_refresh_ttl_starts_after_writer_wait(tmp_path):
+@pytest.mark.parametrize("operation", ["acquire", "refresh"])
+def test_lease_ttl_starts_after_writer_wait(tmp_path, operation):
     db = SessionDB(tmp_path / "lease.db")
     try:
         db.create_session("s", "test")
-        assert db.try_acquire_compression_lock("s", "holder", ttl_seconds=10)
+        if operation == "refresh":
+            assert db.try_acquire_compression_lock("s", "holder", ttl_seconds=10)
         execute = db._execute_write
         clock = [100.0]
 
@@ -51,7 +53,8 @@ def test_lease_refresh_ttl_starts_after_writer_wait(tmp_path):
 
         with patch("hermes_state_compression.time.time", side_effect=lambda: clock[0]), \
                 patch.object(db, "_execute_write", side_effect=delayed_write):
-            assert db.refresh_compression_lock("s", "holder", ttl_seconds=10)
+            operation_fn = db.refresh_compression_lock if operation == "refresh" else db.try_acquire_compression_lock
+            assert operation_fn("s", "holder", ttl_seconds=10)
         row = db._read_one("SELECT expires_at FROM compression_locks WHERE session_id='s'")
         assert row[0] == 210.0
     finally:

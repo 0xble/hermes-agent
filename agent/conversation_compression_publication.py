@@ -35,15 +35,14 @@ def retry_publication(fn, *args, **kwargs):
     Keep the same candidate and holder. Lease loss, corruption and ambiguous I/O
     settlement propagate, never regenerate a summary or publish a stale snapshot.
     """
-    record_publication_attempt()
-    try:
-        return fn(*args, **kwargs)
-    except sqlite3.OperationalError as exc:
-        if not is_sqlite_lock_error(exc):
-            raise
-        logger.info("Compaction publication busy, retrying the generated candidate once")
-    record_publication_attempt()
-    return fn(*args, **kwargs)
+    for attempt in range(3):
+        record_publication_attempt()
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if attempt == 2 or not is_sqlite_lock_error(exc):
+                raise
+            logger.info("Compaction publication busy, retrying the generated candidate (%s/3)", attempt + 2)
 
 
 @contextlib.contextmanager
