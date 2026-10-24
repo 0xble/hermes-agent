@@ -382,6 +382,45 @@ async def test_stuck_predecessor_has_bounded_visible_failure(monkeypatch, tmp_pa
         runner._turn_leases.release(holder)
 
 
+@pytest.mark.parametrize("config", [
+    {"gateway": None},
+    {"gateway": "not-a-mapping"},
+    {"gateway": {"turn_lease_max_wait_seconds": None}},
+    {},
+])
+def test_lease_wait_max_seconds_tolerates_empty_or_malformed_gateway_config(monkeypatch, config):
+    # The shipped template leaves ``gateway:`` with only commented children, which loads as None.
+    from gateway.run_turn_lease_wait import lease_wait_max_seconds
+    from gateway.turn_lease import DEFAULT_MAX_LEASE_WAIT
+
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: config)
+    assert lease_wait_max_seconds() == DEFAULT_MAX_LEASE_WAIT
+
+
+def test_lease_wait_max_seconds_survives_config_load_failure(monkeypatch):
+    from gateway.run_turn_lease_wait import lease_wait_max_seconds
+    from gateway.turn_lease import DEFAULT_MAX_LEASE_WAIT
+
+    def boom():
+        raise OSError("config unreadable")
+
+    monkeypatch.setattr("gateway.run._load_gateway_config", boom)
+    assert lease_wait_max_seconds() == DEFAULT_MAX_LEASE_WAIT
+
+
+@pytest.mark.asyncio
+async def test_uncontended_turn_runs_with_null_gateway_config(monkeypatch, tmp_path):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    event = _event()
+    key = runner._session_key_for_source(event.source)
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"gateway": None})
+    await runner._hmwa_acquire_turn_lease(
+        key, 1, runner.session_store.get_or_create_session(event.source), None, event,
+    )
+    token = runner._session_state(key).turn.lease_tokens.pop(1)
+    runner._turn_leases.release(token)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prior_ack", [False, True])
 async def test_long_lease_wait_sends_one_busy_ack(monkeypatch, tmp_path, prior_ack):

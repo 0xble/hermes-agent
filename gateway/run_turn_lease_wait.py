@@ -14,10 +14,25 @@ logger = logging.getLogger("gateway.run")
 
 
 def lease_wait_max_seconds() -> float:
-    """Behavior configuration belongs to the owning profile's YAML, not secrets."""
+    """Behavior configuration belongs to the owning profile's YAML, not secrets.
+
+    Never raises: the value only matters after a contended deadline, so a missing, null or
+    malformed ``gateway`` block (the shipped template leaves it null) must not fail the turn.
+    """
     from gateway.run import _load_gateway_config
 
-    value = _load_gateway_config().get("gateway", {}).get("turn_lease_max_wait_seconds", DEFAULT_MAX_LEASE_WAIT)
+    try:
+        gateway_cfg = _load_gateway_config().get("gateway")
+    except Exception:
+        logger.warning("Could not read gateway config, using %s seconds lease wait", DEFAULT_MAX_LEASE_WAIT,
+                       exc_info=True)
+        return DEFAULT_MAX_LEASE_WAIT
+    if gateway_cfg is None:
+        return DEFAULT_MAX_LEASE_WAIT
+    if not isinstance(gateway_cfg, dict):
+        logger.warning("Invalid gateway config section, using %s seconds lease wait", DEFAULT_MAX_LEASE_WAIT)
+        return DEFAULT_MAX_LEASE_WAIT
+    value = gateway_cfg.get("turn_lease_max_wait_seconds", DEFAULT_MAX_LEASE_WAIT)
     try:
         seconds = float(value)
         if not isinstance(value, bool) and math.isfinite(seconds) and seconds > 0:
