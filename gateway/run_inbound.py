@@ -1687,10 +1687,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             if entry is None:
                 return False
             state = self._session_state(session_key)
-            if attended_cfg.start_new_sessions and (
-                getattr(entry, "created_at", None) == getattr(entry, "updated_at", None)
-                or getattr(entry, "is_fresh_reset", False)
-                or getattr(state.conversation, "attended_new_session", False)
+            from gateway.session_state import session_opening_pending
+            if attended_cfg.start_new_sessions and session_opening_pending(
+                entry, attended_new_session=state.conversation.attended_new_session,
             ):
                 # Preserve the creation boundary before mark_user_activity updates updated_at.
                 state.conversation.attended_new_session = True
