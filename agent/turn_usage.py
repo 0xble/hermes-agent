@@ -71,6 +71,30 @@ def _fold_moa_usage(agent, canonical_usage):
     return _moa_client, canonical_usage, _moa_ref_cost
 
 
+def log_response_service_tier(agent: Any, response: Any, api_kwargs: dict[str, Any]) -> None:
+    """Audit the negotiated wire tier, not the session's preferred Fast mode.
+
+    Missing echoes are unknown, never proof that the requested tier was served.
+    Runs before validation/accounting so usage-less and retried responses count too.
+    """
+    if getattr(agent, "api_mode", None) not in {"codex_responses", "chat_completions"}:
+        return
+    extra = api_kwargs.get("extra_body")
+    requested = (extra.get("service_tier", api_kwargs.get("service_tier"))
+                 if isinstance(extra, dict) else api_kwargs.get("service_tier"))
+    requested = requested.strip().lower() if isinstance(requested, str) else ""
+    usage = with_served_service_tier(normalize_usage(None), response)
+    served = (usage.raw_usage or {}).get("service_tier")
+    if requested or served:
+        logger.info(
+            "speed tier: session=%s model=%s provider=%s route=%s requested=%s served=%s",
+            getattr(agent, "session_id", None) or "unknown",
+            api_kwargs.get("model") or getattr(agent, "model", "unknown"),
+            getattr(agent, "provider", None) or "unknown", agent.api_mode,
+            requested or "none", served or "unreported",
+        )
+
+
 def record_response_usage(
     agent: Any, response: Any, *, messages: list[dict[str, Any]], api_call_count: int,
     api_duration: float, compression_attempts: int, max_compression_attempts: int,
