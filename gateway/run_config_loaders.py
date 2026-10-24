@@ -184,16 +184,17 @@ class GatewayConfigLoadersMixin:
         empty uses ``model.default``.
         """
         resolved_session_key = self._resolve_session_key_or_none(source, session_key)
+        _r_state = None
         if resolved_session_key:
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
-            if _r_state is not None and _r_state.conversation.live_alias_reasoning is not None:
-                return _r_state.conversation.live_alias_reasoning[0]
         from gateway.session_setting_commands import local_policy
         if (policy := local_policy(self, source)) is not None:
             # A local session runs its frozen (or followed) level, not the profile's.
             return policy.current_reasoning_config(self, resolved_session_key)
+        if resolved_session_key and _r_state is not None and _r_state.conversation.live_alias_reasoning is not None:
+            return _r_state.conversation.live_alias_reasoning[0]
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:

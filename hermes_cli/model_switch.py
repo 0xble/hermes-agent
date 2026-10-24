@@ -1787,6 +1787,7 @@ def switch_model(
                 is_global=is_global, live_alias=live.reference,
                 alias_endpoint_applied=bool(live.base_url))
         except Exception as exc:
+            logger.warning("Live alias selection failed", exc_info=True)
             return ModelSwitchResult(success=False, error_message=str(exc))
     st = _Switch(
         raw_input=raw_input, current_provider=current_provider, current_model=current_model,
