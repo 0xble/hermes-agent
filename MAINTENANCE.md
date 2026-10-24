@@ -60,6 +60,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
 | Browser vault alias authorization | Retain alias refusals independently of prompt preferences and revalidate aliases before resolution and injection | Alias consent, vault fill, or OTP authorization changes | [Browser vault alias authorization](maintenance/browser-vault-alias-authorization.md) |
+| Busy turn queue | Preserve admitted user input across same-key generation overlap and session-lease contention | Gateway lease waits, generation cleanup or pending-input recovery changes | [Busy turn queue](maintenance/busy-turn-queue.md) |
 | Delivered steer observer | Give native mid-turn insertions a stable plugin delivery identity | Steer insertion, turn identity or plugin lifecycle changes | [Steer delivery observer](maintenance/steer-delivery-observer.md) |
 | Turn-origin provenance | Give plugins and session context a default-deny per-turn provenance value | Gateway turn identity, plugin hook context, or session environment changes | [Turn-origin provenance](maintenance/turn-origin-provenance.md) |
 | Fork CI | Reproducible patch proof surfaces, hermetic Git fixtures, and complete-suite access on bounded runners | CI, test harness, Git fixture, or proof-surface changes | [Fork CI](maintenance/fork-ci.md) |
@@ -203,10 +204,10 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 ## Active patch record: state.db prune lock batching
 
 - **Patch identity:** `state-prune-lock-batching`.
-- **Behavior:** Automatic session retention pruning enforces the configured deletion window inside the maintenance function and at its long-lived callers, so stale or alternate Hermes entrypoints cannot trigger a daytime prune. Inside the window, it deletes sessions and their FTS-triggered messages in short idempotent transactions with guard-safe compression lineage handling, and reports long write-lock holds with callback and pid. Non-Linux lock diagnostics no longer claim a holder released just before the deadline when `/proc/locks` is unavailable.
-- **Source surfaces:** `gateway/run.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_lockowners.py`, and focused state/gateway/CLI tests.
+- **Behavior:** Automatic session retention pruning enforces the configured deletion window inside the maintenance function and at its long-lived callers, so stale or alternate Hermes entrypoints cannot trigger a daytime prune. Inside the window, it deletes sessions and their FTS-triggered messages in short idempotent transactions with guard-safe compression lineage handling, and reports long write-lock holds with callback and pid. Long compaction write holds also report per-phase timings and row counts. Non-Linux lock diagnostics no longer claim a holder released just before the deadline when `/proc/locks` is unavailable.
+- **Source surfaces:** `gateway/run.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_lockowners.py`, `hermes_state_messages.py`, `hermes_state_message_archive.py`, `hermes_state_write_metrics.py`, and focused state/gateway/CLI tests.
 - **Upstream status:** No equivalent upstream fix for the combined daytime gate, bounded prune transactions, and macOS diagnostic correction.
-- **Focused regression:** `uv run --with pytest --with pytest-asyncio pytest -q tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py`.
+- **Focused regression:** `uv run --with pytest --with pytest-asyncio pytest -q tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py`.
 - **Retirement:** Remove when upstream provides equivalent deletion-window gating, bounded guard-safe pruning, and cross-platform long-lock diagnostics.
 - **Rollback:** Revert the commit carrying `Fork-Patch: state-prune-lock-batching`.
 
@@ -526,6 +527,8 @@ Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the d
 
 Fork patch identity: `session-controls`. One session can pause, resume, clear or replace another session's goal, and pause, resume or stop another session's loop, authorized by a fresh verbatim user quote or a Telegram Approve/Deny press. See [the maintenance unit](maintenance/session-controls.md).
 
-## TUI prompt test isolation
+## TUI Prompt Test Isolation
 
-Fork patch identity: `test-isolation`. TUI prompt-submit row-id resolution tests stub `_run_after_agent_ready` so successful requests do not leave deferred prompt workers running after the request; production behavior is unchanged.
+Fork patch identity: `test-isolation`. Fake-agent prompt-submit rewind tests share a containment fixture that stubs real build/turn/deferred execution and joins the submit dispatcher before their mocks and session mapping are removed. A prior deferred-run-only stub left an earlier dispatcher able to enter a real prompt after monkeypatch teardown and contaminate a later poller test. Preserve every rewind assertion, real-conversation rewind coverage and the poller's owner-session assertion. Production behavior is unchanged.
+
+Verify the complete `tests/tui_gateway/test_tui_gateway_server.py` through `scripts/run_tests.sh` with file retries disabled. Retire this test-only adaptation when the accepted upstream tests contain their dispatchers across teardown and retain equivalent rewind and notification-ownership coverage.

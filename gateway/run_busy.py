@@ -916,6 +916,7 @@ class GatewayBusySessionMixin:
     async def _send_busy_ack_reply(self, event: MessageEvent, adapter, message: str) -> None:
         try:
             await self._send_busy_reply(event, adapter, message)
+            event._gateway_busy_ack_sent = True
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
@@ -1075,7 +1076,7 @@ class GatewayBusySessionMixin:
         "status", "context", "restart", "approve", "deny", "pause", "agents", "bg", "btw",
         "kanban", "subgoal", "heartbeat", "busy", "yolo", "verbose", "footer", "help",
         "commands", "profile", "login", "update", "version",
-        "title", "fast", "reasoning", "usage", "whoami",
+        "title", "retire", "fast", "reasoning", "usage", "whoami",
     )
     # Dispatched only on the idle path (busy dispatch has its own allowlist).
     _IDLE_COMMANDS = (

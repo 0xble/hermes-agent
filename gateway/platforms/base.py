@@ -4506,6 +4506,20 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
+        # Retirement admission precedes busy/debounce queues. The runner repeats
+        # this check when draining prompts queued before retirement was requested.
+        runner = self.gateway_runner
+        if runner is not None and self.platform == Platform.TELEGRAM:
+            from gateway.telegram_retire import intercept
+            if self._is_sender_authorized(event.source.user_id, event.source.chat_type,
+                                          event.source.chat_id, thread_id=event.source.thread_id) is True:
+                notice = await intercept(runner, event)
+                if notice is not None:
+                    await self.send(str(event.source.chat_id), notice, metadata=_thread_metadata_for_event(event))
+                    event._gateway_accepted = True
+                    from gateway.telegram_retire import advance
+                    await advance(runner, event.source)
+                    return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
@@ -5465,6 +5479,9 @@ class BasePlatformAdapter(ABC):
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+            if self.gateway_runner is not None and self.platform == Platform.TELEGRAM:
+                from gateway.telegram_retire import advance
+                await advance(self.gateway_runner, event.source)
 
     _REQUEUE_BACKOFF_INITIAL_SECONDS = 0.25
     # Kept at 1s: nothing wakes the back-off sleep, so a genuine message merged into the slot

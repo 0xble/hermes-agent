@@ -106,6 +106,32 @@ async def _seed_caller(runner, home, thread_id="297206", title="Calling Topic", 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("immediate", [False, True])
+async def test_retire_tool_preserves_immediate_mode(monkeypatch, immediate):
+    import gateway.telegram_retire as retirement
+    import tools.send_message_tool as send_tool
+    import tools.telegram_topic_tool as topic_tool
+
+    runner, source = object(), _source(thread_id="297206")
+    request = AsyncMock(return_value={"status": "queued"})
+    monkeypatch.setattr(retirement, "request", request)
+    monkeypatch.setattr(topic_tool, "_live_runner", lambda: runner)
+    monkeypatch.setattr(topic_tool, "_calling_source", lambda _: source)
+
+    async def dispatch(_runner, make_coro, _error):
+        return await make_coro()
+
+    monkeypatch.setattr(send_tool, "_dispatch_on_gateway_loop", dispatch)
+    result = json.loads(await topic_tool.telegram_topic_tool(
+        {"action": "retire", "target": "Owner", "now": immediate},
+    ))
+
+    assert result["status"] == "queued"
+    request.assert_awaited_once_with(runner, source, target="Owner", now=immediate, cancel=False)
+    assert topic_tool.TELEGRAM_TOPIC_SCHEMA["parameters"]["properties"]["now"]["type"] == "boolean"
+
+
+@pytest.mark.asyncio
 async def test_named_role_create_and_edit_use_gateway_loader_not_runner(home, monkeypatch):
     import gateway.run as gateway_run
 

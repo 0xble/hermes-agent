@@ -58,6 +58,7 @@ from hermes_state_schema import SessionSchemaMixin
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import log_write_lock_holders
+from hermes_state_write_metrics import WriteMetrics, current_write_metrics, write_phase
 from hermes_loop_guard import LoopGuardedLock, check as check_loop_thread
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
@@ -1098,25 +1099,32 @@ class SessionDB(
                         self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    conn = cast(sqlite3.Connection, self._conn)
+                    conn.execute("BEGIN IMMEDIATE")
                     transaction_started = time.monotonic()
+                    metrics = WriteMetrics()
+                    metrics_token = current_write_metrics.set(metrics)
                     try:
                         fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
+                        with write_phase("callback_total"):
+                            result = fn(conn)
+                        with write_phase("commit"):
+                            conn.commit()
                     except BaseException:
                         try:
-                            self._conn.rollback()
+                            with write_phase("rollback"):
+                                conn.rollback()
                         except Exception:
                             pass
                         raise
                     finally:
+                        current_write_metrics.reset(metrics_token)
                         held_s = time.monotonic() - transaction_started
                         if held_s >= self._WRITE_LOCK_WARN_S:
                             callback_name = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
                             logger.warning(
-                                "state.db write transaction held the write lock for %.1fs: callback=%s pid=%d",
-                                held_s, callback_name, os.getpid())
+                                "state.db write transaction held the write lock for %.1fs: callback=%s pid=%d %s",
+                                held_s, callback_name, os.getpid(), metrics.format())
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
