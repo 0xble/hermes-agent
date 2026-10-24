@@ -105,6 +105,17 @@ class TestReceiptLifecycle:
         # rebrand an unverified relaunch as supervisor-backed success.
         assert "succeeded" not in persisted
 
+    def test_finalize_survives_pending_stash_recording_failure(self, receipt_home, monkeypatch):
+        def fail():
+            raise ImportError("partially swapped updater")
+
+        monkeypatch.setattr("hermes_cli.update_cmd_stash._record_pending_autostash", fail)
+        ur.begin_update_receipt()
+        path = _finalize("failed")
+        assert path is not None
+        assert json.loads(path.read_text())["outcome"] == "failed"
+        assert _finalize("failed") is None
+
     def test_latest_pointer_written_and_readable(self, receipt_home):
         ur.begin_update_receipt()
         ur.record_step("git_pull", True)

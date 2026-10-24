@@ -209,7 +209,8 @@ def _local_changes_evidence(receipt: dict) -> tuple[bool, str]:
         if detail.startswith("discarded: "):
             return False, "Local changes were discarded."
         return False, "Local changes were not confirmed restored; see the update output."
-    return False, ""
+    return next((step.get("ok") is True for step in reversed(receipt.get("steps") or [])
+                 if step.get("name") == "immutable_source_untouched"), False), ""
 
 
 def _failed_update_detail(home: Path, receipt: dict | None, exit_code: int) -> str:

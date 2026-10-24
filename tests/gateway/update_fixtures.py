@@ -1,7 +1,10 @@
 """Native updater receipt fixtures built through its real persistence boundary."""
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import pytest
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
@@ -55,6 +58,39 @@ def _release(home, sha=RELEASE):
     return path
 
 
+def fail_immutable_update(home, source=None):
+    """Fail at the build boundary, retaining the real immutable apply's receipt facts."""
+    from hermes_cli import main, update_cmd, update_receipt
+    from tests.hermes_cli.test_update_target_identity import git
+
+    if source is None:
+        source = home / "immutable-source"
+        source.mkdir()
+        git(source, "init", "-q", "-b", "main")
+        git(source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "source")
+    git(source, "fetch", "--no-tags", ".", "HEAD")
+    (home / "release-layout.json").write_text(json.dumps({"source": str(source)}))
+    with patch.dict("os.environ", {"HERMES_HOME": str(home)}), \
+         patch.object(main, "PROJECT_ROOT", source), \
+         patch.object(update_receipt, "_receipt_dir", return_value=home / "logs" / "update_receipts"), \
+         patch.object(update_receipt, "_code_identity", side_effect=lambda **_: {"sha": git(source, "rev-parse", "HEAD")}), \
+         patch("hermes_cli.immutable_releases.stage_release", side_effect=RuntimeError("candidate build failed")):
+        update_receipt.begin_update_receipt()
+        try:
+            with pytest.raises(RuntimeError, match="candidate build failed"):
+                update_cmd._apply_fetched_immutable_update(
+                    ["git"], "main", SimpleNamespace(no_gateway_restart=True), None,
+                    gateway_mode=True, had_desktop_app_before_update=False,
+                    pre_update_snapshot_id=None, _pre_update_plan=None, _windows_gateway_resume=None,
+                )
+        finally:
+            path = update_receipt.finalize_update_receipt("failed", stop_reason="candidate build failed")
+    (home / ".update_process_exit_code").write_text("1")
+    assert path is not None
+    return path
+
+
 def finalize_update(home, *, outcome="success", fleet_state="current", noop=False):
     """``noop`` mirrors "Already up to date": same revision, no restart, empty fleet."""
     from hermes_cli import update_receipt
@@ -62,7 +98,8 @@ def finalize_update(home, *, outcome="success", fleet_state="current", noop=Fals
     with patch.object(update_receipt, "_receipt_dir", return_value=home / "logs" / "update_receipts"), \
          patch.object(update_receipt, "_code_identity", return_value={"sha": sha}):
         update_receipt.begin_update_receipt()
-        update_receipt.record_step("local_changes_stash", True, "not_needed: clean working tree, no autostash taken")
+        if not (home / "current").is_symlink():
+            update_receipt.record_step("local_changes_stash", True, "not_needed: clean working tree, no autostash taken")
         if not noop:
             update_receipt.record_gateway_restart(restarted_services=["gateway"])
         path = update_receipt.finalize_update_receipt(outcome, fleet=[] if noop else [{
