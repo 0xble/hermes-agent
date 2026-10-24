@@ -292,20 +292,13 @@ class SessionUsageMixin:
         for the row-existence guard; callers that don't know it leave the placeholder. ``task`` names a
         per-turn route (``voice_chat``): its calls count in the session totals and land in
         ``session_model_usage`` under that task, but never become the session's recorded route."""
-        usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
-        billed_delta = (estimated_cost_usd if (cost_status == "actual" and actual_cost_usd is None
-                                               and not absolute) else None)
-        if billed_delta is not None:
-            usage["actual_cost_usd"] = billed_delta
         values = dict(locals())
         values.pop('self')
         values.pop('session_id')
         values.pop('source')
-        values.pop('usage')
-        values.pop('billed_delta')
         self._insert_session_row(session_id, source or "unknown", model=model)
         self._execute_write(lambda conn: self._update_token_counts_in_transaction(
-            conn, session_id, billed_delta=billed_delta, **values))
+            conn, session_id, **values))
 
     def _update_token_counts_in_transaction(
         self, conn, session_id: str, input_tokens: int=0, output_tokens: int=0, model: str | None=None,
@@ -314,9 +307,11 @@ class SessionUsageMixin:
         cost_status: Optional[str]=None, cost_source: Optional[str]=None,
         pricing_version: Optional[str]=None, billing_provider: Optional[str]=None,
         billing_base_url: Optional[str]=None, billing_mode: Optional[str]=None,
-        api_call_count: int=0, absolute: bool=False, task: str="", billed_delta: Optional[float]=None,
+        api_call_count: int=0, absolute: bool=False, task: str="",
     ) -> None:
         """Apply usage counters and attribution inside the caller's write transaction."""
+        billed_delta = (estimated_cost_usd if (cost_status == "actual" and actual_cost_usd is None
+                                               and not absolute) else None)
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
         if billed_delta is not None:
             usage["actual_cost_usd"] = billed_delta

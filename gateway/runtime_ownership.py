@@ -7,7 +7,7 @@ still names the inode it locked.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
@@ -138,8 +138,9 @@ def _still_names(path: Path, fd: int) -> bool:
 
 
 class ProfileOwnership:
-    def __init__(self):
-        self._handles: dict[Path, object] = {}
+    def __init__(self, *, all_slots: bool = False):
+        self._all_slots = all_slots
+        self._handles: dict[Path, ExitStack] = {}
         self._writers: list[threading.Thread] = []
         self._mutex = threading.RLock()
 
@@ -149,11 +150,11 @@ class ProfileOwnership:
             return tuple(self._handles)
 
     def reserve(self, homes) -> None:
-        from gateway.gateway_slot import effective_gateway_slot, slot_filename
-        from gateway.status import _try_acquire_file_lock, _build_pid_record
-        # Zero-cut handover: a slot-b gateway reserves ``gateway.b.lock`` beside slot a's
-        # ``gateway.lock``; this process's own slot, never the probed serving slot.
-        lock_name = slot_filename('gateway.lock', effective_gateway_slot())
+        from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY, effective_gateway_slot, slot_filename
+        from gateway.status import _try_acquire_file_lock, _release_file_lock, _build_pid_record
+        # Runtime startup owns its own slot. Shared-state maintenance must exclude both.
+        slots = (SLOT_ACTIVE, SLOT_STANDBY) if self._all_slots else (effective_gateway_slot(),)
+        lock_names = tuple(slot_filename('gateway.lock', slot) for slot in slots)
         with self._mutex:
             added = []
             try:
@@ -161,22 +162,21 @@ class ProfileOwnership:
                     if home in self._handles:
                         continue
                     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    path = home / lock_name
-                    fd = _open_lock(path)
-                    handle = os.fdopen(fd, 'r+', encoding='utf-8')  # windows-footgun: ok — write-only
-                    try:
-                        if not _try_acquire_file_lock(handle) or not _still_names(path, handle.fileno()):
-                            raise OwnershipConflict(f'Gateway runtime already owns profile {home}')
-                        record = {**_build_pid_record(), 'hermes_home': str(home)}
-                        handle.seek(0)
-                        handle.truncate()
-                        json.dump(record, handle)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    except BaseException:
-                        handle.close()
-                        raise
-                    self._handles[home] = handle
+                    with ExitStack() as locks:
+                        for lock_name in lock_names:
+                            path = home / lock_name
+                            fd = _open_lock(path)
+                            handle = locks.enter_context(os.fdopen(fd, 'r+', encoding='utf-8'))  # windows-footgun: ok — write-only
+                            if not _try_acquire_file_lock(handle) or not _still_names(path, handle.fileno()):
+                                raise OwnershipConflict(f'Gateway runtime already owns profile {home}')
+                            locks.callback(_release_file_lock, handle)
+                            record = {**_build_pid_record(), 'hermes_home': str(home)}
+                            handle.seek(0)
+                            handle.truncate()
+                            json.dump(record, handle)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        self._handles[home] = locks.pop_all()
                     added.append(home)
             except BaseException:
                 for home in reversed(added):
@@ -188,12 +188,10 @@ class ProfileOwnership:
             return canonical_home(home) in self._handles
 
     def release(self, home: Path) -> None:
-        from gateway.status import _release_file_lock
         with self._mutex:
-            handle = self._handles.pop(canonical_home(home), None)
-            if handle is not None:
-                _release_file_lock(handle)
-                handle.close()
+            locks = self._handles.pop(canonical_home(home), None)
+            if locks is not None:
+                locks.close()
 
     def start_writer(self, thread: threading.Thread) -> None:
         """Register before starting so partial startup cannot forget a live writer."""
@@ -218,7 +216,7 @@ _maintenance = threading.local()
 
 @contextmanager
 def exclusive_maintenance(homes):
-    """Reserve the authority's exact lock before touching managed state.
+    """Reserve every runtime slot before touching a home's managed state.
 
     This is not an owner-presence check: the reservation remains held through
     publication, excluding startup even before its PID/control socket exists.
@@ -228,7 +226,7 @@ def exclusive_maintenance(homes):
     """
     state = getattr(_maintenance, 'state', None)
     outermost = state is None or state[0] != os.getpid()
-    owner = state[1] if state is not None and not outermost else ProfileOwnership()
+    owner = state[1] if state is not None and not outermost else ProfileOwnership(all_slots=True)
     previous = set(owner.homes)
     try:
         owner.reserve(homes)

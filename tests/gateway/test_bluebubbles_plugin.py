@@ -11,7 +11,7 @@ from gateway.platforms.base import BasePlatformAdapter
 
 
 def _make_adapter(monkeypatch, **extra):
-    monkeypatch.setenv("BLUEBUBBLES_SERVER_URL", "http://localhost:1234")
+    monkeypatch.setenv("BLUEBUBBLES_SERVER_URL", extra.get("server_url", "http://localhost:1234"))
     monkeypatch.setenv("BLUEBUBBLES_PASSWORD", "secret")
     from plugins.platforms.bluebubbles.adapter import BlueBubblesAdapter
 
@@ -24,6 +24,100 @@ def _make_adapter(monkeypatch, **extra):
         },
     )
     return BlueBubblesAdapter(cfg)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('operation', ['connect', 'text', 'attachment', 'download', 'register', 'unregister'])
+async def test_authenticated_http_failures_scrub_adapter_diagnostics(monkeypatch, tmp_path, caplog, operation):
+    import logging
+    from urllib.parse import quote, quote_plus
+    import plugins.platforms.bluebubbles.adapter as bb
+
+    password = 'fixture secret+&/value'
+    adapter = _make_adapter(monkeypatch, server_url='https://bluebubbles.invalid', password=password)
+    caplog.set_level(logging.DEBUG, logger=bb.logger.name)
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if operation == 'register' and request.method == 'POST':
+            raise httpx.ConnectError(f'Cannot connect to {request.url}', request=request)
+        return httpx.Response(503, json={'message': 'Service unavailable'}, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    adapter.client = client
+    try:
+        if operation == 'connect':
+            monkeypatch.setattr(bb, 'check_bluebubbles_requirements', lambda: True)
+            monkeypatch.setattr(bb.httpx, 'AsyncClient', lambda **kwargs: client)
+            assert await adapter.connect() is False
+            diagnostic = ''
+        elif operation == 'text':
+            result = await adapter.send('iMessage;-;fixture', 'fixture message')
+            assert result.success is False
+            diagnostic = result.error
+        elif operation == 'attachment':
+            attachment = tmp_path / 'fixture.txt'
+            attachment.write_text('fixture attachment')
+            result = await adapter.send_document('iMessage;-;fixture', str(attachment))
+            assert result.success is False
+            diagnostic = result.error
+        elif operation == 'download':
+            assert await adapter._download_attachment('fixture-attachment', {}) is None
+            diagnostic = ''
+        elif operation == 'register':
+            assert await adapter._register_webhook() is False
+            diagnostic = ''
+        else:
+            adapter._find_registered_webhooks = AsyncMock(return_value=[{'id': 'fixture-hook'}])
+            assert await adapter._unregister_webhook() is False
+            diagnostic = ''
+    finally:
+        await client.aclose()
+
+    assert requests
+    assert all(request.url.params['password'] == password for request in requests)
+    diagnostic += '\n'.join(record.getMessage() for record in caplog.records if record.name == bb.logger.name)
+    assert password not in diagnostic
+    assert quote_plus(password) not in diagnostic
+    assert quote(password, safe='') not in diagnostic
+    assert 'bluebubbles.invalid/api/v1/' in diagnostic
+    assert '503' in diagnostic if operation != 'register' else 'Cannot connect' in diagnostic
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['result', 'exception'])
+async def test_standalone_send_scrubs_error_results_and_traceback_diagnostics(monkeypatch, caplog, failure):
+    import logging
+    from urllib.parse import quote, quote_plus
+    import plugins.platforms.bluebubbles.adapter as bb
+    from gateway.platforms.base import SendResult
+
+    password = 'fixture secret+&/value'
+    adapter = _make_adapter(monkeypatch, server_url='https://bluebubbles.invalid', password=password)
+    request = httpx.Request('POST', adapter._api_url('/api/v1/message/text'))
+    response = httpx.Response(503, request=request)
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        response.raise_for_status()
+    error = raised.value
+    monkeypatch.setattr(bb, 'check_bluebubbles_requirements', lambda: True)
+    monkeypatch.setattr(bb.BlueBubblesAdapter, 'connect', AsyncMock(return_value=True))
+    monkeypatch.setattr(bb.BlueBubblesAdapter, 'disconnect', AsyncMock())
+    send = AsyncMock(side_effect=error) if failure == 'exception' else AsyncMock(
+        return_value=SendResult(success=False, error=str(error)))
+    monkeypatch.setattr(bb.BlueBubblesAdapter, 'send', send)
+    caplog.set_level(logging.DEBUG, logger=bb.logger.name)
+
+    result = await bb._standalone_send(adapter.config, 'iMessage;-;fixture', 'fixture message')
+    assert result['error'].startswith('BlueBubbles send failed: ')
+    diagnostic = json.dumps(result) + '\n'.join(
+        record.getMessage() for record in caplog.records if record.name == bb.logger.name)
+    assert password not in diagnostic
+    assert quote_plus(password) not in diagnostic
+    assert quote(password, safe='') not in diagnostic
+    assert '503' in diagnostic
+    assert 'bluebubbles.invalid/api/v1/message/text' in diagnostic
+    assert all(record.exc_info is None for record in caplog.records if record.name == bb.logger.name)
 
 
 class TestBlueBubblesConfigLoading:

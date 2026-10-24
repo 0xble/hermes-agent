@@ -132,3 +132,64 @@ def test_post_selection_scan_failure_keeps_entry_with_honest_audit(
     # A later prune that can scan the entry reclaims it: fail-closed, not fail-forever.
     assert scratch.prune_idle_entries(root, 24, frozenset(), log_file) == 1
     assert not entry.exists()
+
+
+@pytest.mark.parametrize('kind,error', [
+    ('malformed', ValueError), ('shape', ValueError),
+    ('permission', PermissionError), ('overflow', OverflowError),
+])
+def test_process_registry_uncertainty_is_not_reported_as_no_owners(tmp_path, monkeypatch, kind, error):
+    import json
+    from pathlib import Path
+    from hermes_constants import get_default_hermes_root
+    home = tmp_path / '.hermes'
+    home.mkdir()
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    root = get_default_hermes_root(home=home)
+    assert root.is_relative_to(tmp_path)
+    root.mkdir(parents=True, exist_ok=True)
+    registry = root / 'spawn-ledger.json'
+    contents = {
+        'malformed': '{', 'shape': '{}', 'permission': '[]',
+        'overflow': json.dumps([{'pid': os.getpid(), 'create_time': 10 ** 400}]),
+    }
+    registry.write_text(contents[kind], encoding='utf-8')
+    original = Path.read_text
+    with monkeypatch.context() as fault:
+        if kind == 'permission':
+            def unreadable(path, *args, **kwargs):
+                if path == registry:
+                    raise PermissionError('registry unavailable')
+                return original(path, *args, **kwargs)
+            fault.setattr(Path, 'read_text', unreadable)
+        with pytest.raises(error):
+            scratch._registered_live_pids(home)
+    registry.write_text('[]', encoding='utf-8')
+    assert scratch._registered_live_pids(home) == set()
+
+
+@pytest.mark.parametrize('error', [PermissionError, OverflowError])
+def test_process_inspection_failure_defers_deletion_until_retry(tmp_path, monkeypatch, error):
+    root = tmp_path / 'scratch'
+    entry = root / 'lane'
+    entry.mkdir(parents=True)
+    payload = entry / 'result.txt'
+    payload.write_text('keep', encoding='utf-8')
+    old = time.time() - 48 * 3600
+    for path in (payload, entry):
+        os.utime(path, (old, old))
+    log = tmp_path / 'logs' / 'scratch-prune.log'
+    with monkeypatch.context() as fault:
+        def unavailable(*_args, **_kwargs):
+            raise error('owner inspection unavailable')
+        fault.setattr(scratch, 'reap_processes_rooted_in', unavailable)
+        assert scratch.prune_idle_entries(root, 24, frozenset(), log) == 0
+        assert payload.read_text(encoding='utf-8') == 'keep'
+        assert payload.stat().st_mtime == old
+    audit = log.read_text(encoding='utf-8-sig')
+    assert 'cleanup deferred, process inspection/reaping failed' in audit
+    assert 'scratch prune: removed' not in audit
+    monkeypatch.setattr(scratch, 'reap_processes_rooted_in', lambda *_args, **_kwargs: 0)
+    assert scratch.prune_idle_entries(root, 24, frozenset(), log) == 1
+    assert not entry.exists()

@@ -419,7 +419,9 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           }
 
           if (dispatch.type === 'alias') {
-            await runSlash(`/${dispatch.target}${arg ? ` ${arg}` : ''}`, sessionId, false)
+            if ((await runSlash(`/${dispatch.target}${arg ? ` ${arg}` : ''}`, sessionId, false)) === false) {
+              submitted = false
+            }
 
             return
           }
@@ -483,8 +485,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           const queued = options?.fromQueue
             ? 'idle'
             : queueKickoffIfSessionBusy({
-            ...(dispatch.type === 'send' && dispatch.moaToken ? { moaToken: dispatch.moaToken } : {}),
-            displayText,
+                ...(dispatch.type === 'send' && dispatch.moaToken ? { moaToken: dispatch.moaToken } : {}),
+                displayText,
                 foregroundBusy: busyRef.current,
                 id: submissionId,
                 sessionId,
@@ -633,7 +635,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
       // One handler per `action` command. Adding a desktop-native command is a
       // registry row in desktop-slash-commands.ts plus an entry here — never a
       // new branch in a dispatch ladder.
-      const actionHandlers: Record<DesktopActionId, (ctx: SlashActionCtx) => Promise<void>> = {
+      const actionHandlers: Record<DesktopActionId, (ctx: SlashActionCtx) => Promise<boolean | void>> = {
         ...sessionCommandHandlers<SlashActionCtx>({
           activeSessionIdRef,
           busyRef,
@@ -1461,7 +1463,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
       // The whole dispatcher: resolve the command's desktop surface, then act on
       // its kind. No per-command ladder — behavior lives in the registry.
-      async function runSlash(commandText: string, sessionHint?: string, recordInput = true): Promise<void> {
+      async function runSlash(commandText: string, sessionHint?: string, recordInput = true): Promise<boolean | void> {
         const command = commandText.trim()
         const { name, arg } = parseSlashCommand(command)
 
@@ -1522,9 +1524,9 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         }
       }
 
-      await runSlash(rawCommand, options?.sessionId ?? undefined, options?.recordInput ?? true)
+      const result = await runSlash(rawCommand, options?.sessionId ?? undefined, options?.recordInput ?? true)
 
-      return submitted
+      return result === false ? false : submitted
     },
     [
       activeSessionIdRef,

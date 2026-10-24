@@ -16,7 +16,6 @@ from hermes_state_runtime import admit_session_input, claim_session_input, get_s
 @pytest.mark.parametrize('late_result', [False, True])
 async def test_timeout_diagnostic_keeps_failed_receipt_after_string_projection(owner, platform, late_result):
     from gateway.run import GatewayRunner
-    from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
     from gateway.session_ingress import execute_admission
     from gateway.session_results import execution_result, finish_result, admission_result
     from gateway.turn_context import TurnContext
@@ -31,7 +30,7 @@ async def test_timeout_diagnostic_keeps_failed_receipt_after_string_projection(o
     async def handle(event):
         raw = GatewayRunner._run_agent_timeout_result(owner.runner,
             SimpleNamespace(agent_timeout=1800), TurnContext(session_key='route'))
-        response, _, _ = await GatewayTurnPersistenceMixin._hmwa_shape_agent_response(
+        response, _, _ = await GatewayRunner._hmwa_shape_agent_response(
             owner.runner, raw, source, [], SimpleNamespace(session_id='s'), None,
             None, 1, 's', platform.value, time.time())
         diagnostic.append(response)

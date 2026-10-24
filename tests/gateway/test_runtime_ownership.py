@@ -1,10 +1,88 @@
 """Real process exclusion before writable gateway construction."""
+from contextlib import ExitStack, contextmanager
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 
 import pytest
+
+
+@contextmanager
+def _runtime_slot_owner(home, slot):
+    code = '''
+import sys
+from pathlib import Path
+from gateway.gateway_slot import pin_gateway_slot
+from gateway.runtime_ownership import OwnershipConflict, ProfileOwnership
+pin_gateway_slot({'gateway': {'zero_cut_handover': {'enabled': True}}})
+owner = ProfileOwnership()
+try:
+    try:
+        owner.reserve([Path(sys.argv[1])])
+    except OwnershipConflict:
+        print('blocked', flush=True)
+    else:
+        print('held', flush=True)
+        sys.stdin.read()
+finally:
+    owner.close()
+'''
+    child = subprocess.Popen(
+        [sys.executable, '-u', '-c', code, str(home)],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**os.environ, 'HERMES_HOME': str(home), 'HERMES_GATEWAY_SLOT': slot},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout is not None
+        assert select.select([child.stdout], [], [], 20)[0], 'slot owner did not report readiness'
+        outcome = child.stdout.readline().strip()
+        assert outcome in {'held', 'blocked'}, outcome
+        yield outcome == 'held'
+    finally:
+        try:
+            _stdout, stderr = child.communicate('', timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate(timeout=10)
+            raise
+        assert child.returncode == 0, stderr
+
+
+@pytest.mark.platforms('linux', 'macos')
+@pytest.mark.parametrize('held_slots', [(), ('a',), ('b',), ('a', 'b')],
+                         ids=['unowned', 'slot-a', 'slot-b', 'both-slots'])
+def test_whole_home_maintenance_holds_every_slot_and_unwinds_partial_reservations(tmp_path, held_slots):
+    from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
+
+    home, earlier_home = tmp_path / 'z-owned', tmp_path / 'a-free'
+    home.mkdir(mode=0o700)
+    with ExitStack() as holders:
+        for slot in held_slots:
+            assert holders.enter_context(_runtime_slot_owner(home, slot))
+        if held_slots:
+            with pytest.raises(OwnershipConflict):
+                with exclusive_maintenance([earlier_home, home]):
+                    pytest.fail('maintenance entered while a runtime slot was owned')
+            for slot in held_slots:
+                with _runtime_slot_owner(home, slot) as acquired:
+                    assert not acquired, 'failed maintenance released another runtime owner'
+        else:
+            with exclusive_maintenance([home]):
+                with exclusive_maintenance([home]):
+                    pass
+                for slot in ('a', 'b'):
+                    with _runtime_slot_owner(home, slot) as acquired:
+                        assert not acquired, 'maintenance did not retain the complete home reservation'
+        # A failed multi-home reservation must unwind both slots in every earlier home.
+        with ExitStack() as free:
+            for slot in ('a', 'b'):
+                assert free.enter_context(_runtime_slot_owner(earlier_home, slot))
+    # Runtime a and b must still coexist independently once maintenance/holders are gone.
+    with ExitStack() as free:
+        for slot in ('a', 'b'):
+            assert free.enter_context(_runtime_slot_owner(home, slot))
 
 
 @pytest.mark.platforms("linux")

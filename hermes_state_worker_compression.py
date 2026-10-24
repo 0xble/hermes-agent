@@ -195,19 +195,20 @@ def worker_history(db, conn, sid, payload):
         rows = db._dedupe_display_generations(rows)
     return {'messages': db._rows_to_conversation(rows, session_id=target,
         include_ancestors=payload['include_ancestors'], repair_alternation=payload['repair_alternation'],
-        include_row_ids=payload['include_row_ids'])}
+        include_row_ids=payload['include_row_ids'],
+        include_summary_markers=payload['repair_alternation'])}
 
 
 
 
 
-def archive_on_connection(db, conn, session_id: str, compacted_messages: list[dict[str, Any]], model_config_patch: Optional[dict[str, Any]]=None, watermark: Optional[int]=None, lock_holder: Optional[str]=None, tail_count: int=0, carried_messages: Optional[list[dict[str, Any]]]=None, covered_ids: Optional[list[int]]=None, unresolved_held: Optional[list[dict[str, Any]]]=None):
+def archive_on_connection(db, conn, session_id: str, compacted_messages: list[dict[str, Any]], model_config_patch: Optional[dict[str, Any]]=None, watermark: Optional[int]=None, lock_holder: Optional[str]=None, tail_count: int=0, carried_messages: Optional[list[dict[str, Any]]]=None, covered_ids: Optional[list[int]]=None, unresolved_held: Optional[list[dict[str, Any]]]=None, held_messages: Optional[list[dict[str, Any]]]=None):
     # The owner's in-place compaction body, on this receipt's connection: one implementation, so
     # main's coverage/merge/timestamp/display-order fixes reach worker and mutation verbs too.
     return db._archive_and_compact_on_conn(conn, session_id, compacted_messages,
         model_config_patch=model_config_patch, watermark=watermark, lock_holder=lock_holder,
         tail_count=tail_count, carried_messages=carried_messages, covered_ids=covered_ids,
-        unresolved_held=unresolved_held)
+        unresolved_held=unresolved_held, held_messages=held_messages)
 
 def publish_on_connection(db, conn, *, parent_session_id: str, child_session_id: str, source: str, messages: list[dict[str, Any]], model: str | None=None, model_config: dict[str, Any] | None=None, system_prompt: str | None=None, cwd: str | None=None, profile_name: str | None=None, compression_lock_holder: str | None=None, require_compression_lease: bool=True, require_lease_refresh: bool=False, lease_ttl_seconds: float=300.0, watermark: Optional[int]=None, watermark_ceiling: Optional[int]=None):
     # The owner's rotation body (lease, closure, child row, timestamps, tail clone, local target,
@@ -247,8 +248,11 @@ def _watermarks(payload):
 def worker_archive(db, conn, sid, payload):
     from hermes_state_worker_context import SIDECAR_KEYS
     _fields(payload, ('messages', 'model_config_patch', 'watermark', 'lock_holder', 'tail_count'),
-            optional=('carried_messages', 'covered_ids', 'unresolved_held'))
+            optional=('carried_messages', 'covered_ids', 'unresolved_held', 'held_messages'))
     _handoff_messages(conn, sid, payload['messages'])
+    held = payload.get('held_messages')
+    if held is not None:
+        _handoff_messages(conn, sid, held)
     carried = payload.get('carried_messages') or []
     if not isinstance(carried, list) or any(not isinstance(m, dict) for m in carried):
         raise RuntimeStoreError('invalid_params')
@@ -269,9 +273,14 @@ def worker_archive(db, conn, sid, payload):
         raise RuntimeStoreError('invalid_params')
     if type(payload['tail_count']) is not int or payload['tail_count'] < 0:
         raise RuntimeStoreError('invalid_params')
-    value = archive_on_connection(db, conn, sid, payload['messages'], model_config_patch=patch,
-        watermark=payload['watermark'], lock_holder=payload['lock_holder'], tail_count=payload['tail_count'],
-        carried_messages=carried, covered_ids=covered, unresolved_held=unresolved)
+    from agent.context_compressor import StaleHeldHistory
+    try:
+        value = archive_on_connection(db, conn, sid, payload['messages'], model_config_patch=patch,
+            watermark=payload['watermark'], lock_holder=payload['lock_holder'], tail_count=payload['tail_count'],
+            carried_messages=carried, covered_ids=covered, unresolved_held=unresolved,
+            held_messages=held)
+    except StaleHeldHistory as exc:
+        return {'stale_held_history': str(exc)}
     from hermes_state_runtime import row_annotations
     return {'value': value, 'annotations': row_annotations(payload['messages'])}
 

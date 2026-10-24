@@ -1,3 +1,4 @@
+import { JsonRpcGatewayError } from '@hermes/shared'
 import type { MutableRefObject } from 'react'
 
 import type { ClientSessionState, SessionRedirectResponse } from '@/app/types'
@@ -252,7 +253,13 @@ export function sessionCommandHandlers<C extends { arg: string }>(env: SessionCo
           return out.render(copy().retryNothing)
         }
 
-        await submitPromptText(text, { destination, sessionId: out.sessionId, storedSessionId: out.storedSessionId })
+        const result = await submitPromptText(text, {
+          destination,
+          sessionId: out.sessionId,
+          storedSessionId: out.storedSessionId
+        })
+
+        return result === false ? false : undefined
       } catch (err) {
         out.render(errorText(err))
       }
@@ -272,10 +279,11 @@ export function sessionCommandHandlers<C extends { arg: string }>(env: SessionCo
 
       // No running turn: queue the words as the next turn so they are not lost (Ink, gateway).
       if (!isTargetSessionBusy($sessionStates.get(), out.sessionId, busyRef.current)) {
-        return out.render((await enqueue(out, text)) ? copy().steerNoActiveTurn(previewOf(text)) : copy().queueFailed)
-      }
+        const queued = await enqueue(out, text)
+        out.render(queued ? copy().steerNoActiveTurn(previewOf(text)) : copy().queueFailed)
 
-      let accepted = false
+        return queued
+      }
 
       try {
         const result = await requestGateway<SessionRedirectResponse>('session.steer', {
@@ -283,17 +291,33 @@ export function sessionCommandHandlers<C extends { arg: string }>(env: SessionCo
           text
         })
 
-        accepted = result?.status === 'queued'
-      } catch {
-        accepted = false
+        if (result?.status === 'queued') {
+          return out.render(copy().steerQueued(previewOf(text)))
+        }
+
+        if (result?.status !== 'rejected') {
+          out.render(copy().queueFailed)
+
+          return false
+        }
+      } catch (err) {
+        // A missing reply may follow a delivered steer. Only a typed refusal
+        // proving there is no execution permits a second, queued submission.
+        if (!(
+          err instanceof JsonRpcGatewayError &&
+          err.code === 4000 &&
+          ['execution_not_ready', 'no_active_execution'].includes(err.message)
+        )) {
+          out.render(errorText(err))
+
+          return false
+        }
       }
 
-      if (accepted) {
-        return out.render(copy().steerQueued(previewOf(text)))
-      }
+      const queued = await enqueue(out, text)
+      out.render(queued ? copy().steerRejected : copy().queueFailed)
 
-      // The turn ended before the steer landed (#64578): keep the words as the next turn.
-      out.render((await enqueue(out, text)) ? copy().steerRejected : copy().queueFailed)
+      return queued
     },
     queue: async (ctx: C) => {
       const out = await env.withSlashOutput(ctx)
@@ -310,7 +334,10 @@ export function sessionCommandHandlers<C extends { arg: string }>(env: SessionCo
         return out.render(count === 1 ? copy().countOne('1') : copy().countOther(String(count)))
       }
 
-      out.render((await enqueue(out, text)) ? copy().queued(previewOf(text)) : copy().queueFailed)
+      const queued = await enqueue(out, text)
+      out.render(queued ? copy().queued(previewOf(text)) : copy().queueFailed)
+
+      return queued
     }
   }
 }

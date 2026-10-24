@@ -86,17 +86,17 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         self._editor_mcp = {}
         self._permissions = {}
         self._admissions = {}
-        self._submitting = set()
-        # Session -> (content fingerprint, input_id, staged (text, attachments)) of a submit whose ack
-        # never arrived. The editor's retry (that session's next prompt, same content) reuses it, so the authority
-        # returns the same admission.
+        self._submitting = {}  # canonical session -> this prompt's existing input_id
+        # Session -> (editor fingerprint, input_id, final text/attachments, readiness) after a lost ACK.
+        # The next identical editor prompt replays the same prepared payload and admission without
+        # repeating media staging or slash mutations.
         self._unacked = {}
         # Admissions whose terminal reply one path (the pump's message.complete or a retry's
         # terminal receipt) is delivering right now; the other path yields to the claim.
         self._settling = set()
         # Admissions a terminal receipt already delivered: their late message.complete adds nothing.
         self._receipted = {}
-        self._pending_cancels = set()
+        self._pending_cancels = {}  # canonical session -> input_id stopped before admission
         # (session, tool_call_id) -> (tool name, args, admission) of a call still open on the editor.
         self._tool_args = {}
         # Session -> AssistantMessageIdAllocator: the ``messageId`` of the assistant message being streamed.
@@ -412,8 +412,9 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             raise GatewayClientError("not_found")
         admission_id = self._admissions.get(session_id)
         if admission_id is None:
-            if session_id in self._submitting:
-                self._pending_cancels.add(session_id)
+            input_id = self._submitting.get(session_id)
+            if input_id is not None:
+                self._pending_cancels[session_id] = input_id
             return
         await self._cancel_admission(session_id, admission_id)
 
@@ -568,37 +569,56 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             raise GatewayClientError("not_found")
         if self._has_unknown(session_id):
             raise GatewayClientError(self._unknown_recovery(session_id, submitted=False))
-        prepared = await self._prepare_submit(session_id, prompt)
-        if prepared is None:
-            return PromptResponse(stop_reason='cancelled')
-        retry_key, input_id, staged = prepared
-        text, attachments = staged
-        answered, text = await self._run_slash(held_id, session_id, text) if not attachments else (False, text)
-        if answered:
-            return PromptResponse(stop_reason='end_turn')
-        # ... and every prepared control's (a slash keeps its own key: apply retires the rest).
+        prepared = self._prepare_submit(session_id, prompt)
+        input_id = prepared[1]
+        self._submitting[session_id] = input_id
+        try:
+            return await self._prompt_turn(held_id, session_id, prepared)
+        finally:
+            # An older coroutine must not remove a successor prompt's lifecycle state.
+            if self._submitting.get(session_id) == input_id:
+                self._submitting.pop(session_id, None)
+            if self._pending_cancels.get(session_id) == input_id:
+                self._pending_cancels.pop(session_id, None)
+
+    async def _prompt_turn(self, held_id, session_id, prepared):
+        retry_key, input_id, staged, ready, content = prepared
+        replaying_submit = ready
+        if not ready:
+            from acp_adapter.gateway_media import stage_user_content
+            staged = await stage_user_content(content, self._home)
+            if self._pending_cancels.get(session_id) == input_id:
+                return PromptResponse(stop_reason='cancelled')
+            text, attachments = staged
+            answered, text = await self._run_slash(held_id, session_id, text) if not attachments else (False, text)
+            if self._pending_cancels.get(session_id) == input_id:
+                # A committed slash mutation remains committed. Stop suppresses its follow-on work.
+                return PromptResponse(stop_reason='cancelled')
+            if answered:
+                return PromptResponse(stop_reason='end_turn')
+            staged = (text, attachments)
+            ready = True
+        # Slash mutation receipts keep their existing ambiguity handling until preparation succeeds.
         self._mutations.retire(session_id)
+        text, attachments = staged
         submit = {'text': text}
         if attachments:
             submit['attachments'] = attachments
-        self._submitting.add(session_id)
         try:
-            # Inside the try: a failed reconnect is as ambiguous for a retained identity as a lost ack.
             client = await self._client()
             link = self._link
+            if self._pending_cancels.get(session_id) == input_id and not replaying_submit:
+                return PromptResponse(stop_reason='cancelled')
+            # A retained submit may already exist. Reconcile its exact input_id, then cancel
+            # the returned exact admission instead of assuming Stop undid the earlier submit.
             receipt = await client.rpc("prompt.submit", session_id=session_id, input_id=input_id, **submit)
         except BaseException as exc:
             from hermes_cli.gateway_client import GatewayRPCError
             if not isinstance(exc, GatewayRPCError):
-                # Transport loss, timeout or cancel before the ack: the owner may hold this admission.
-                # Keep its identity for the editor's retry of the same prompt (latest 64 sessions).
-                self._unacked[session_id] = (retry_key, input_id, staged)
+                self._unacked[session_id] = (retry_key, input_id, staged, ready)
                 while len(self._unacked) > 64:
                     self._unacked.pop(next(iter(self._unacked)))
-            self._pending_cancels.discard(session_id)
             raise
-        finally:
-            self._submitting.discard(session_id)
         admission_id = receipt["admission_id"]
         self._admissions[session_id] = admission_id
         if receipt.get("status") == "terminal":
@@ -609,8 +629,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             self._admissions.pop(session_id, None)
             raise GatewayClientError(self._unknown_recovery(session_id, admission_id))
         try:
-            if session_id in self._pending_cancels:
-                self._pending_cancels.discard(session_id)
+            if self._pending_cancels.get(session_id) == input_id:
+                self._pending_cancels.pop(session_id, None)
                 await self._cancel_admission(session_id, admission_id)
             async with self._changed:
                 await self._changed.wait_for(lambda: admission_id in self._terminals or self._failure is not None
@@ -660,31 +680,17 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             await self._conn.session_update(session_id=held_id, update=acp.update_agent_message_text(reply + '\n'))
         return True, None
 
-    async def _prepare_submit(self, session_id, prompt):
-        """``(retry_key, input_id, (text, attachments))`` for one ACP prompt, or None when the editor's Stop
-        arrived while it was staged."""
+    def _prepare_submit(self, session_id, prompt):
+        """Select an input identity without yielding; ready payloads bypass preparation."""
         from acp_adapter.content import _content_blocks_to_openai_user_content
-        from acp_adapter.gateway_media import stage_user_content, submit_fingerprint
+        from acp_adapter.gateway_media import submit_fingerprint
         content = _content_blocks_to_openai_user_content(prompt)
         retry_key = submit_fingerprint(session_id, content)
-        # Only this session's very next prompt may be the editor's retry of an un-acked submit; any
-        # prompt (slash work included) retires the retained identity, so a later repeat is new work.
+        # Only the next identical request may replay this session's unacknowledged input.
         retained = self._unacked.pop(session_id, None)
         if retained is not None and retained[0] == retry_key:
-            # The retry resends what the owner may already hold: the staged content and input_id are
-            # reused, never prepared (a remote image fetched) a second time.
-            return retained
-        # The editor's Stop during staging (a remote image download) is held like one during the
-        # submit itself, and the prompt then ends without being sent.
-        self._submitting.add(session_id)
-        try:
-            staged = await stage_user_content(content, self._home)
-        finally:
-            self._submitting.discard(session_id)
-        if session_id in self._pending_cancels:
-            self._pending_cancels.discard(session_id)
-            return None
-        return retry_key, uuid.uuid4().hex, staged
+            return (*retained, content)
+        return retry_key, uuid.uuid4().hex, None, False, content
 
     async def _settled_receipt(self, client, held_id, session_id, receipt):
         admission_id = receipt["admission_id"]

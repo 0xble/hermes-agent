@@ -76,7 +76,11 @@ class RuntimeSessionCompressionMixin:
         result = self._apply('compression.archive', dict(messages=_handoff_rows(compacted_messages),
             model_config_patch=model_config_patch, watermark=watermark, lock_holder=lock_holder,
             tail_count=tail_count, carried_messages=carried, covered_ids=covered_ids,
-            unresolved_held=unresolved))
+            unresolved_held=unresolved,
+            held_messages=None if held_messages is None else _handoff_rows(held_messages)))
+        if 'stale_held_history' in result:
+            from agent.context_compressor import StaleHeldHistory
+            raise StaleHeldHistory(result['stale_held_history'])
         from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(compacted_messages, result['annotations'])
         return result['value']

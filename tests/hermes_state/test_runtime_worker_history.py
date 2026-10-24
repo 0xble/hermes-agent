@@ -98,3 +98,22 @@ def test_terminal_worker_keeps_no_full_history_receipt(tmp_path):
                                        payload={}) == {'status': 'terminal'}
     finally:
         db.close()
+
+
+@pytest.mark.parametrize('repair', [False, True])
+@pytest.mark.parametrize('row_ids', [False, True])
+def test_worker_history_keeps_summary_markers_like_direct(worker, repair, row_ids):
+    from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
+    db, store = worker
+    db.append_messages_batch('owned', [{'role': 'user', 'content': 'before'}])
+    db.archive_and_compact('owned', [{
+        'role': 'assistant', 'content': 'summary',
+        COMPRESSED_SUMMARY_METADATA_KEY: True,
+        '_compressed_summary_has_user_turn': True,
+    }])
+    options = dict(repair_alternation=repair, include_row_ids=row_ids)
+    expected = db.get_messages_as_conversation('owned', **options)
+    actual = store.get_messages_as_conversation('owned', **options)
+    assert actual == expected
+    assert any(message.get(COMPRESSED_SUMMARY_METADATA_KEY) for message in actual) is repair
+    assert store.failure is None and store.journal['pending'] == []

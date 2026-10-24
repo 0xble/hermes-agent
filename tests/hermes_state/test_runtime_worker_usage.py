@@ -54,3 +54,32 @@ def test_worker_voice_turn_usage_counts_but_never_rewrites_the_session_route(tmp
         assert db.auxiliary_usage_by_task('s')['voice_chat']['input_tokens'] == 10
     finally:
         db.close()
+
+
+@pytest.mark.parametrize('actual,absolute', [(None, False), (0.0, False), (None, True)])
+def test_worker_billed_usage_matches_direct_cost_buckets(worker, actual, absolute):
+    db, store = worker
+    db.create_session('direct', 'cli')
+    usage = dict(input_tokens=13, output_tokens=7, api_call_count=1,
+                 model='model-a', billing_provider='provider', estimated_cost_usd=0.25,
+                 actual_cost_usd=actual, cost_status='actual', cost_source='provider_cost_api',
+                 absolute=absolute)
+    for _ in range(2):
+        db.update_token_counts('direct', **usage)
+        store.queue_token_counts('owned', **usage)
+    fields = 'input_tokens, output_tokens, api_call_count, estimated_cost_usd, actual_cost_usd, cost_status'
+    direct = dict(db._read_one(f'SELECT {fields} FROM sessions WHERE id=?', ('direct',)))
+    managed = dict(db._read_one(f'SELECT {fields} FROM sessions WHERE id=?', ('owned',)))
+    assert managed == direct
+    fields = 'input_tokens, output_tokens, api_call_count, estimated_cost_usd, actual_cost_usd, cost_status, cost_source'
+    direct_routes = [dict(row) for row in db._read_all(
+        f'SELECT {fields} FROM session_model_usage WHERE session_id=?', ('direct',))]
+    managed_routes = [dict(row) for row in db._read_all(
+        f'SELECT {fields} FROM session_model_usage WHERE session_id=?', ('owned',))]
+    assert managed_routes == direct_routes
+    assert len(managed_routes) == (0 if absolute else 1)
+    if actual is None and not absolute:
+        assert managed_routes[0]['actual_cost_usd'] == pytest.approx(0.5)
+    if actual == 0.0:
+        assert managed_routes[0]['actual_cost_usd'] == 0.0
+    assert store.failure is None and store.journal['pending'] == []

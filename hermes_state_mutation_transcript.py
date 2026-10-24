@@ -16,6 +16,8 @@ def rewind_in_transaction(self, conn, session_id, target_message_id, *,
     if row is None:
         raise ValueError(f"message {target_message_id} not found in session {session_id}")
     target_row = dict(row)
+    if not target_row.get("active"):
+        raise ValueError("rewind target is not active")
     if target_row.get("role") != "user":
         raise ValueError(
             f"rewind target must be a 'user' message (got role={target_row.get('role')!r}, id={target_message_id})")

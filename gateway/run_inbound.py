@@ -1330,26 +1330,6 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin,
             return result if started else (_CommandDispatch.SUPPRESSED, None)
         return False, None
 
-    async def _hm_run_exec_quick_command(self, command: str, exec_cmd: str, cwd: Optional[str] = None) -> str:
-        """Run a quick command with the local session cwd when supplied."""
-        proc = None
-        try:
-            from tools.environments.local import build_subprocess_env
-            proc = await asyncio.create_subprocess_shell(
-                exec_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=build_subprocess_env(), cwd=cwd, start_new_session=True,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            output = (stdout or stderr).decode().strip()
-            if output:
-                from agent.redact import redact_sensitive_text
-                output = redact_sensitive_text(output)
-            return output or t("gateway.quick_command.no_output")
-        except TimeoutError:
-            return t("gateway.quick_command.timed_out")
-        except Exception as e:
-            return t("gateway.quick_command.error", error=e)
-
     @staticmethod
     def _hm_is_registered_command(event: MessageEvent) -> bool:
         command = event.get_command()

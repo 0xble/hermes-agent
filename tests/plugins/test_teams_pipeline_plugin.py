@@ -92,6 +92,7 @@ async def test_bind_gateway_runtime_attaches_scheduler(monkeypatch, tmp_path):
         def __init__(self) -> None:
             self.notifications = []
             self.release = asyncio.Event()
+            self.store = TeamsPipelineStore(tmp_path / "runtime-store.json")
 
         def create_job_from_notification(self, notification):
             return SimpleNamespace(job_id=f"job-{notification['id']}", status="received")

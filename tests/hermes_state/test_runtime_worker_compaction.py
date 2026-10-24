@@ -98,3 +98,63 @@ def test_micro_compaction_live_dicts_persist_through_the_worker_like_direct(work
         durable[sid] = [r['content'] for r in db.get_messages_as_conversation(sid)]
     assert store.failure is None and store.journal['pending'] == []
     assert durable['owned'] == durable['direct'] == ['u1', 'micro summary', 'u2', 'after']
+
+
+@pytest.mark.parametrize('durable_identity', [False, True])
+def test_worker_stale_compaction_is_acknowledged_without_mutation_or_sticky_failure(worker, durable_identity):
+    from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY, StaleHeldHistory
+    db, store = worker
+    store.append_messages_batch('owned', [{'role': 'user', 'content': 'before'}])
+    held = store.get_messages_as_conversation('owned', include_row_ids=durable_identity)
+    db.archive_and_compact('owned', [{
+        'role': 'assistant', 'content': 'winning summary',
+        COMPRESSED_SUMMARY_METADATA_KEY: True,
+    }])
+    rows = [dict(row) for row in db._read_all('SELECT * FROM messages ORDER BY id')]
+    config = db.get_session('owned')['model_config']
+    sequence = store.journal['next_sequence']
+    with pytest.raises(StaleHeldHistory):
+        store.archive_and_compact('owned', [{'role': 'assistant', 'content': 'stale rewrite'}],
+                                  held_messages=held, model_config_patch={'_proactive_prune_rearm_tokens': 42})
+    assert [dict(row) for row in db._read_all('SELECT * FROM messages ORDER BY id')] == rows
+    assert db.get_session('owned')['model_config'] == config
+    assert store.failure is None and store.journal['pending'] == []
+    assert store.journal['next_sequence'] == sequence + 1
+    assert store.retry_pending() == []
+    store.append_messages_batch('owned', [{'role': 'user', 'content': 'after refusal'}])
+    assert [row['content'] for row in store.get_messages_as_conversation('owned')] == [
+        'winning summary', 'after refusal']
+
+
+def test_worker_held_compaction_preserves_tail_and_receipt_rollback(worker):
+    import sqlite3
+    db, store = worker
+    store.append_messages_batch('owned', [{'role': 'user', 'content': 'before'}])
+    held = store.get_messages_as_conversation('owned', include_row_ids=True)
+    watermark = store.get_active_message_watermark('owned')
+    db.append_messages_batch('owned', [{'role': 'user', 'content': 'concurrent tail',
+        'api_content': ' EXACT TAIL ', 'platform_message_id': 'delivery-tail',
+        'display_metadata': {'_accepted_input_id': 'tail-input'}}])
+    rows = [dict(row) for row in db._read_all('SELECT * FROM messages ORDER BY id')]
+    sequence = store.journal['next_sequence']
+    db._execute_write(lambda conn: conn.execute(
+        "CREATE TRIGGER deny_receipt BEFORE INSERT ON worker_receipts "
+        "BEGIN SELECT RAISE(ABORT, 'deny receipt'); END"))
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match='deny receipt'):
+            store.archive_and_compact('owned', [{'role': 'assistant', 'content': 'summary'}],
+                                      held_messages=held, watermark=watermark)
+        assert [dict(row) for row in db._read_all('SELECT * FROM messages ORDER BY id')] == rows
+        assert db._read_one('SELECT last_sequence FROM worker_executions')[0] == sequence - 1
+    finally:
+        db._execute_write(lambda conn: conn.execute('DROP TRIGGER deny_receipt'))
+    store.retry_pending()
+    assert store.failure is None and store.journal['pending'] == []
+    active = store.get_messages_as_conversation('owned', include_row_ids=True)
+    assert [row['content'] for row in active] == ['summary', 'concurrent tail']
+    assert active[-1]['api_content'] == ' EXACT TAIL '
+    assert active[-1]['message_id'] == 'delivery-tail'
+    assert db._read_one('SELECT platform_message_id FROM messages WHERE session_id=? AND id=? AND active=1',
+                        ('owned', active[-1]['_row_id']))[0] == 'delivery-tail'
+    assert active[-1]['display_metadata'] == {'_accepted_input_id': 'tail-input'}
+    assert all(isinstance(row['_row_id'], int) for row in active)

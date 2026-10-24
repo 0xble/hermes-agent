@@ -529,7 +529,9 @@ for line in sys.stdin:
 
 
 @pytest.mark.platforms("posix")
-def test_restart_cleanup_never_deletes_a_gateway_that_claimed_the_lock_mid_cleanup(host_dir, monkeypatch):
+@pytest.mark.parametrize('owner_exited', [False, True], ids=['live-looking-owner', 'confirmed-dead-owner'])
+def test_restart_cleanup_never_deletes_a_gateway_that_claimed_the_lock_mid_cleanup(
+        host_dir, monkeypatch, owner_exited):
     """A free-lock probe released before the unlink let a new gateway publish in the gap.
 
     The restart's record cleanup then deleted the NEW owner's record and token while it held
@@ -560,11 +562,16 @@ def test_restart_cleanup_never_deletes_a_gateway_that_claimed_the_lock_mid_clean
         )
         hr.ensure_host_state_dir()
         hr.record_path(hr.ROLE_GATEWAY).write_text(json.dumps(record.to_json()), encoding="utf-8")
+        if owner_exited:
+            sleeper.kill()
+            sleeper.wait(timeout=10)
+            assert hr._record_incarnation_matches(record) is False
 
         won_in_gap = []
         real_unlink = Path.unlink
 
         def unlink_after_a_racing_claim(self, *args, **kwargs):
+            assert not hr.owns_host_lock(hr.ROLE_GATEWAY), "cleanup must not register its private guard"
             if not won_in_gap:
                 won_in_gap.append(claim())
             return real_unlink(self, *args, **kwargs)
@@ -578,9 +585,55 @@ def test_restart_cleanup_never_deletes_a_gateway_that_claimed_the_lock_mid_clean
             assert claim() is True, "the cleanup must release the host lock it took"
         current = hr.read_record(hr.ROLE_GATEWAY, include_stale=True)
         assert current is not None and current.pid == claimer.pid
-        assert hr.token_path(hr.ROLE_GATEWAY).exists()
+        assert hr.token_path(hr.ROLE_GATEWAY).read_text(encoding='utf-8') == 'new-owner-token'
+        assert not hr.owns_host_lock(hr.ROLE_GATEWAY)
     finally:
         claimer.kill()
         sleeper.kill()
         claimer.wait(timeout=10)
         sleeper.wait(timeout=10)
+
+
+@pytest.mark.platforms('posix')
+def test_restart_cleanup_preserves_a_successor_that_exited_before_the_private_guard(host_dir, monkeypatch):
+    tree = _tree()
+    real_read = hr.read_record
+
+    def publish_and_exit():
+        child = subprocess.Popen(
+            [sys.executable, '-u', '-c', _CLAIMER_CHILD.format(tree=tree)], cwd=tree,
+            env={**os.environ, 'HERMES_GATEWAY_LOCK_DIR': str(host_dir / 'locks')},
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, stderr = child.communicate('claim\n', timeout=20)
+            assert child.returncode == 0, stderr
+            assert stdout.splitlines() == ['ready', 'true'], stdout + stderr
+            return child.pid
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+
+    old_pid = publish_and_exit()
+    old_record = real_read(hr.ROLE_GATEWAY, include_stale=True)
+    assert old_record is not None and old_record.pid == old_pid
+    assert hr._record_incarnation_matches(old_record) is False
+    successor_pids = []
+
+    def read_then_publish_successor(role, *, include_stale=False):
+        observed = real_read(role, include_stale=include_stale)
+        if not successor_pids:
+            successor_pids.append(publish_and_exit())
+        return observed
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hr, 'read_record', read_then_publish_successor)
+        removed = hr.discard_dead_record(hr.ROLE_GATEWAY)
+
+    assert removed is False
+    current = real_read(hr.ROLE_GATEWAY, include_stale=True)
+    assert current is not None and current.pid == successor_pids[0] and current != old_record
+    assert hr._record_incarnation_matches(current) is False
+    assert hr.token_path(hr.ROLE_GATEWAY).read_text(encoding='utf-8') == 'new-owner-token'
+    assert not hr.owns_host_lock(hr.ROLE_GATEWAY)
+    assert hr.host_lock_is_held(hr.ROLE_GATEWAY) is False

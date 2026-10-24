@@ -7,7 +7,7 @@ import logging
 from typing import Any
 
 from gateway.config import Platform
-from plugins.teams_pipeline.pipeline import TeamsMeetingPipeline
+from plugins.teams_pipeline.pipeline import ACTIVE_PIPELINE_STATES, TeamsMeetingPipeline
 from plugins.teams_pipeline.store import TeamsPipelineStore, resolve_teams_pipeline_store_path
 from plugins.teams_pipeline.subscriptions import build_graph_client
 
@@ -70,6 +70,10 @@ def bind_gateway_runtime(gateway: Any) -> bool:
     adapter = gateway.adapters.get(Platform.MSGRAPH_WEBHOOK)
     if adapter is None:
         return False
+    from gateway.zero_cut_standby import is_standby
+
+    if is_standby():
+        return False
     if getattr(gateway, "_teams_pipeline_runtime", None) is not None:
         return True
     try:
@@ -88,23 +92,36 @@ def bind_gateway_runtime(gateway: Any) -> bool:
         adapter.set_notification_scheduler(_drop)
         return False
 
-    # Graph wants a prompt 202 once the work is durable: accept (persist the job) inside the request,
-    # run the fetch/transcript/summary pipeline detached. An accept failure still fails the request.
-    background = getattr(adapter, "_background_tasks", set())
-    # Claim a job before scheduling its external effects: a no-id duplicate in one Graph batch
-    # returns the same still-"received" job (run_job persists progress only once it runs).
+    # Persist acceptance inside the request. Processing stays detached from Graph's ACK.
+    background = adapter._background_tasks
     scheduled: set[str] = set()
+
+    def _queue(job_id: str, status: str) -> None:
+        if status not in ACTIVE_PIPELINE_STATES or job_id in scheduled:
+            return
+        # Startup and immediate duplicate redelivery must share the same pre-spawn claim.
+        scheduled.add(job_id)
+        task = asyncio.create_task(runtime.run_job(job_id))
+        background.add(task)
+
+        def _finished(done: asyncio.Task) -> None:
+            background.discard(done)
+            scheduled.discard(job_id)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                logger.error(
+                    "Teams job %s stopped: %s", job_id, error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(_finished)
 
     async def _schedule(notification: dict[str, Any], event: Any) -> None:
         job = runtime.create_job_from_notification(notification)
-        if job.status != "received" or job.job_id in scheduled:  # duplicate of a running or finished job
-            return
-        scheduled.add(job.job_id)
-        task = asyncio.create_task(runtime.run_job(job.job_id))
-        background.add(task)
-        task.add_done_callback(background.discard)
-        task.add_done_callback(lambda _task: scheduled.discard(job.job_id))
+        _queue(job.job_id, job.status)
+
     adapter.set_notification_scheduler(_schedule)
     gateway._teams_pipeline_runtime = runtime
     gateway._teams_pipeline_runtime_error = None
+    for job_id, record in runtime.store.list_jobs().items():
+        _queue(job_id, record.get("status", ""))
     return True

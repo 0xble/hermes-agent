@@ -1,10 +1,18 @@
-import { cleanup } from '@testing-library/react'
+import { JsonRpcGatewayError } from '@hermes/shared'
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { useComposerSubmit } from '@/app/chat/composer/hooks/use-composer-submit'
 import { en } from '@/i18n/en'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { resolveDesktopCommand } from '@/lib/desktop-slash-commands'
-import { $composerDraft, setComposerDraft } from '@/store/composer'
+import {
+  $composerDraft,
+  clearSessionDraft,
+  setComposerDraft,
+  stashSessionDraft,
+  takeSessionDraft
+} from '@/store/composer'
 import { $queuedPromptsBySession } from '@/store/composer-queue'
 import { $connection } from '@/store/session'
 import { dropSessionState, publishSessionState } from '@/store/session-states'
@@ -72,12 +80,63 @@ const queuedTexts = () =>
     .flat()
     .map(entry => entry.text)
 
+function composer(text: string, onSubmit: HarnessHandle['submitTextRaw']) {
+  const draftRef = { current: text }
+  const editor = window.document.createElement('div')
+  editor.dataset.slot = 'composer-rich-input'
+  editor.textContent = text
+
+  const loadIntoComposer = vi.fn((value: string) => {
+    draftRef.current = value
+    editor.textContent = value
+    setComposerDraft(value)
+  })
+
+  setComposerDraft(text)
+
+  const hook = renderHook(() =>
+    useComposerSubmit({
+      activeQueueSessionKey: RUNTIME_SESSION_ID,
+      activeQueueSessionKeyRef: { current: RUNTIME_SESSION_ID },
+      attachments: [],
+      busy: false,
+      clearDraft: () => {
+        draftRef.current = ''
+        editor.textContent = ''
+        setComposerDraft('')
+      },
+      disabled: false,
+      draftScopeRef: { current: RUNTIME_SESSION_ID },
+      draftRef,
+      drainNextQueued: async () => false,
+      editorRef: { current: editor },
+      exitQueuedEdit: () => false,
+      focusInput: () => undefined,
+      inputDisabled: false,
+      loadIntoComposer,
+      onCancel: () => undefined,
+      onSteer: undefined,
+      onSteerHidden: undefined,
+      onSubmit,
+      queueCurrentDraft: () => false,
+      queueEdit: null,
+      queuedPrompts: [],
+      sessionId: RUNTIME_SESSION_ID,
+      setComposerText: () => undefined,
+      stashAt: (scope, value = draftRef.current, files = []) => stashSessionDraft(scope, value, files)
+    })
+  )
+
+  return { hook, draftRef, loadIntoComposer }
+}
+
 const canonical = () => $connection.set({ mode: 'local', wsUrl: 'ws://localhost/api/ws?native_dial=unminted' } as never)
 
 beforeEach(() => {
   clearSingleFlightSessionResumeState()
   window.localStorage.removeItem('hermes.desktop.composerQueue.v1')
   $queuedPromptsBySession.set({})
+  clearSessionDraft(RUNTIME_SESSION_ID)
   setComposerDraft('')
 })
 
@@ -238,6 +297,80 @@ describe('/steer', () => {
     expect(callsOf(requestGateway, 'session.steer')).toEqual([])
     expect(queuedTexts()).toEqual(['next thing'])
     expect(renderedText(handle)).toContain(copy.steerNoActiveTurn('next thing'))
+  })
+})
+
+describe('slash admission ownership', () => {
+  it.each([
+    ['/queue keep these exact words', false],
+    ['/q keep these exact words', false],
+    ['/steer keep these exact words', false],
+    ['/s keep these exact words', true]
+  ] as const)('restores %s through the actual composer when its queue admission is refused', async (command, busy) => {
+    canonical()
+    publishSessionState(RUNTIME_SESSION_ID, { ...createClientSessionState(RUNTIME_SESSION_ID), busy })
+
+    const requestGateway = gateway(method => {
+      if (method === 'session.steer') {
+        return { status: 'rejected' }
+      }
+
+      if (method === 'prompt.submit') {
+        throw new JsonRpcGatewayError('invalid_params', { code: 4000 })
+      }
+    })
+
+    const handle = await mount(requestGateway)
+    let outcome: Awaited<ReturnType<HarnessHandle['submitTextRaw']>> | undefined
+
+    const onSubmit: HarnessHandle['submitTextRaw'] = async (text, options) => {
+      const result = await handle.submitTextRaw(text, options)
+      outcome = result
+
+      return result
+    }
+
+    const current = composer(command, onSubmit)
+    await act(async () => {
+      current.hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(outcome).toBe(false))
+    expect(callsOf(requestGateway, 'prompt.submit')).toHaveLength(1)
+    expect(current.draftRef.current).toBe(command)
+    expect(current.loadIntoComposer).toHaveBeenCalledWith(command, [])
+    expect($composerDraft.get()).toBe(command)
+    expect(takeSessionDraft(RUNTIME_SESSION_ID)).toEqual(expect.objectContaining({ text: command, attachments: [] }))
+  })
+
+  it.each([
+    ['timeout', () => new Error('request timed out: session.steer'), false],
+    ['detached transport', () => new Error('connection closed'), false],
+    ['untyped no-execution lookalike', () => new Error('execution_not_ready'), false],
+    ['unrelated typed refusal', () => new JsonRpcGatewayError('admission_conflict', { code: 4000 }), false],
+    ['typed no execution', () => new JsonRpcGatewayError('execution_not_ready', { code: 4000 }), true],
+    ['typed ended execution', () => new JsonRpcGatewayError('no_active_execution', { code: 4000 }), true]
+  ] as const)('queues after %s only when the owner definitively refused the steer', async (_label, error, fallback) => {
+    canonical()
+    publishSessionState(RUNTIME_SESSION_ID, { ...createClientSessionState(RUNTIME_SESSION_ID), busy: true })
+
+    const requestGateway = gateway(method => {
+      if (method === 'session.steer') {
+        throw error()
+      }
+    })
+
+    const handle = await mount(requestGateway)
+    let outcome: Awaited<ReturnType<HarnessHandle['submitTextRaw']>> | undefined
+    await act(async () => {
+      outcome = await handle.submitTextRaw('/steer use staging')
+    })
+
+    expect(outcome).toBe(fallback)
+    expect(callsOf(requestGateway, 'session.steer')).toHaveLength(1)
+    expect(callsOf(requestGateway, 'prompt.submit')).toHaveLength(fallback ? 1 : 0)
+    expect(queuedTexts()).toEqual([])
+    expect(callsOf(requestGateway, 'slash.exec')).toEqual([])
   })
 })
 

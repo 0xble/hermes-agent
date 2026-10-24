@@ -180,9 +180,11 @@ def _registered_live_pids(home: Path) -> set[int]:
     for path, stamp_key in sources:
         try:
             entries = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
             continue
-        for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entries, list):
+            raise ValueError(f"process ownership registry is not a list: {path}")
+        for entry in entries:
             pid, stamp = (entry.get("pid"), entry.get(stamp_key)) if isinstance(entry, dict) else (None, None)
             if not isinstance(pid, int) or pid <= 0 or entry.get("pid_scope", "host") != "host":
                 continue
@@ -368,8 +370,9 @@ def _prune_idle_entries(
     # (or by hand) are found by the deleted-cwd rule, not by membership in ``doomed``.
     try:
         reap_processes_rooted_in(root, doomed, audit)
-    except Exception as exc:  # psutil missing or restricted host: the deletion still proceeds
-        logger.debug("scratch prune: process reap skipped: %s", exc, exc_info=True)
+    except Exception as exc:
+        audit.warning("scratch prune: cleanup deferred, process inspection/reaping failed: %s", exc)
+        return 0
     if not doomed:
         return 0
     repos: set[str] = set()

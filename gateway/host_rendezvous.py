@@ -659,16 +659,14 @@ def discard_dead_record(role: str) -> bool:
     if record is None:
         return False
     guard = None
-    if record.pid != os.getpid() and _record_incarnation_matches(record) is not False:
-        # A recycled pid can still look like the same incarnation. The publisher holds the
-        # host lock for its life, so winning it proves the recorded owner is gone. Hold it
-        # across the re-read and unlink: a free-lock probe released first let a new gateway
-        # claim and publish in the gap, and we deleted ITS record and token. A private handle,
-        # not claim_host_lock: cleanup must not enter this process's own claim/release ledger.
+    if record.pid != os.getpid():
+        # Hold the private guard across reread and unlink even for a confirmed-dead owner.
+        # A successor can publish after the initial read, so dead-PID proof alone is insufficient.
+        # Do not enter this process's host ownership ledger for temporary cleanup.
         if owns_host_lock(role) or (guard := _hold_lock_briefly(role)) is None:
             return False
     try:
-        if guard is not None and read_record(role, include_stale=True) is None:
+        if guard is not None and read_record(role, include_stale=True) != record:
             return False
         for path in (record_path(role), token_path(role)):
             with contextlib.suppress(OSError):

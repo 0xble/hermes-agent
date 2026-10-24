@@ -14,8 +14,9 @@ OWNER_RELEASE_WAIT_SECONDS = 60.0
 
 
 def wait_profile_unowned(profile_dir: Path, *, timeout: float | None = None) -> bool:
-    """True once no gateway runtime holds ``profile_dir``'s ``gateway.lock`` (taken and released
-    through ``exclusive_maintenance``); False when it is still held after ``timeout`` seconds."""
+    """True once every runtime slot is unowned, reserved through ``exclusive_maintenance``;
+    False when ownership remains held or unknown after ``timeout`` seconds."""
+    from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY, slot_filename
     from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
     deadline = time.monotonic() + (OWNER_RELEASE_WAIT_SECONDS if timeout is None else timeout)
     while True:
@@ -25,8 +26,9 @@ def wait_profile_unowned(profile_dir: Path, *, timeout: float | None = None) -> 
         except OwnershipConflict:
             pass
         except OSError:
-            # A read-only copy (0555 home, 0444 lock) cannot host a reservation: probe it instead.
-            if _lock_unheld_read_only(profile_dir / 'gateway.lock'):
+            # Read-only, unowned copies remain removable, but every sibling slot must be free.
+            if all(_lock_unheld_read_only(profile_dir / slot_filename('gateway.lock', slot))
+                   for slot in (SLOT_ACTIVE, SLOT_STANDBY)):
                 return True
         if time.monotonic() >= deadline:
             return False
@@ -42,6 +44,8 @@ def _lock_unheld_read_only(path: Path) -> bool:
         fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | os.O_NONBLOCK)
     except FileNotFoundError:
         return True
+    except OSError:
+        return False
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
