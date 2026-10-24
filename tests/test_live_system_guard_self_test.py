@@ -139,6 +139,17 @@ def _record_signal_delivery(request, *, deliver=False):
                 next(guard)
 
 
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("primitive", ["kill", "killpg"])
+def test_signal_guard_preserves_zero_as_own_group(request, primitive):
+    # Recording sinks prove pass-through without signalling pytest's own group.
+    with _record_signal_delivery(request) as (kill, killpg):
+        getattr(os, primitive)(0, signal.SIGTERM)
+        sink = kill if primitive == "kill" else killpg
+        assert sink is not None
+        sink.assert_called_once_with(0, signal.SIGTERM)
+
+
 def _missing_signal_target(state, primitive, pid, target, lookup, monkeypatch):
     import psutil
 
@@ -148,9 +159,9 @@ def _missing_signal_target(state, primitive, pid, target, lookup, monkeypatch):
         lookup.side_effect = psutil.NoSuchProcess(pid)
     if not state.startswith("missing_leader_"):
         return ProcessLookupError
-    # A group outlives its leader whether its remaining member is owned or
-    # foreign. Neither case permits delivery based on the absent leader.
+    # A missing leader is not proof of either group ownership or absence.
     member = Mock(pid=pid + 1)
+    member.create_time.return_value = 11.0
     member.parents.return_value = (
         [types.SimpleNamespace(pid=os.getpid())]
         if state == "missing_leader_owned_member" else []
@@ -172,6 +183,8 @@ def _missing_signal_target(state, primitive, pid, target, lookup, monkeypatch):
         getpgid.side_effect = PermissionError()
     elif state == "missing_leader_unverifiable_scan":
         pids.side_effect = psutil.AccessDenied(member.pid)
+    if primitive == "killpg" and state == "missing_leader_owned_member":
+        return None
     return (
         RuntimeError if primitive == "killpg" and state != "missing_leader_reaped_member"
         else ProcessLookupError
@@ -198,12 +211,14 @@ def test_signal_guard_only_delivers_to_verified_owned_targets(request, monkeypat
     pid = 987654321
     target = Mock(pid=pid)
     target.create_time.return_value = 10.0
+    target.children.return_value = []
     target.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
     owner = Mock()
     owner.children.return_value = [target] if state.startswith("initial_") else []
     lookup = Mock(side_effect=lambda value: owner if value == os.getpid() else target)
     monkeypatch.setattr(psutil, "Process", lookup)
-    monkeypatch.setattr(psutil, "pids", Mock(return_value=[]))
+    monkeypatch.setattr(psutil, "pids", Mock(return_value=[pid]))
+    monkeypatch.setattr(os, "getpgid", Mock(return_value=pid), raising=False)
 
     with _record_signal_delivery(request) as (kill, killpg):
         sink = kill if primitive == "kill" else killpg
@@ -302,6 +317,92 @@ def test_signal_guard_handles_owned_child_exit_interleavings(request, monkeypatc
             if child.poll() is None:
                 assert original_process(child.pid).create_time() == identity
                 reap()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("primitive", ["kill", "killpg"])
+def test_signal_guard_keeps_owned_orphan_identity(request, primitive):
+    """A verified helper remains owned after TERM reaps its group leader."""
+    import psutil
+
+    script = (
+        "import os,signal,sys\n"
+        "if os.fork() == 0:\n"
+        " signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        " print(os.getpid(), flush=True)\n"
+        "sys.stdin.buffer.read()\n"
+    )
+    with _record_signal_delivery(request, deliver=True), subprocess.Popen(
+        [sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        start_new_session=True, text=True,
+    ) as leader:
+        assert leader.stdin is not None and leader.stdout is not None
+        helper = psutil.Process(int(leader.stdout.readline()))
+        identity = helper.create_time()
+        try:
+            os.kill(leader.pid, signal.SIGTERM)
+            assert leader.wait(timeout=5) == -signal.SIGTERM
+            assert all(parent.pid != os.getpid() for parent in helper.parents())
+            assert helper.create_time() == identity
+            getattr(os, primitive)(helper.pid if primitive == "kill" else leader.pid, signal.SIGKILL)
+            assert leader.stdout.read() == ""  # EOF proves the surviving helper released its pipe.
+        finally:
+            leader.stdin.close()  # Also releases the helper if an assertion failed.
+            leader.stdout.close()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("state", ["owned", "recycled", "unverifiable", "foreign", "mixed"])
+@pytest.mark.parametrize("leader_exited", [False, True])
+def test_signal_guard_rechecks_group_members(request, monkeypatch, state, leader_exited):
+    """Saved ownership never authorizes a replacement or a foreign group member."""
+    import psutil
+
+    leader_pid = 987654321
+    member = Mock(pid=leader_pid + 1)
+    member.create_time.return_value = 10.0
+    member.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
+    foreign = Mock(pid=leader_pid + 2)
+    foreign.create_time.return_value = 20.0
+    foreign.parents.return_value = []
+    leader = Mock(pid=leader_pid)
+    leader.create_time.return_value = 9.0
+    leader.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
+    leader.children.return_value = [member]
+    owner = Mock()
+    owner.children.return_value = []
+    processes = {os.getpid(): owner, leader_pid: leader, member.pid: member}
+
+    def lookup(pid):
+        if pid not in processes:
+            raise psutil.NoSuchProcess(pid)
+        return processes[pid]
+
+    monkeypatch.setattr(psutil, "Process", lookup)
+    monkeypatch.setattr(psutil, "pids", lambda: [pid for pid in processes if pid != os.getpid()])
+    monkeypatch.setattr(os, "getpgid", lambda pid: leader_pid)
+    with _record_signal_delivery(request) as (kill, killpg):
+        os.kill(leader_pid, signal.SIGTERM)
+        kill.assert_called_once_with(leader_pid, signal.SIGTERM)
+        if leader_exited:
+            del processes[leader_pid]
+        member.parents.return_value = []
+        if state == "recycled":
+            member.create_time.return_value = 30.0
+        elif state == "unverifiable":
+            member.create_time.side_effect = psutil.AccessDenied(member.pid)
+        elif state in {"foreign", "mixed"}:
+            processes[foreign.pid] = foreign
+            if state == "foreign":
+                del processes[member.pid]
+        assert killpg is not None
+        if state == "owned":
+            os.killpg(leader_pid, signal.SIGKILL)
+            killpg.assert_called_once_with(leader_pid, signal.SIGKILL)
+        else:
+            with pytest.raises(RuntimeError, match="live-system guard"):
+                os.killpg(leader_pid, signal.SIGKILL)
+            killpg.assert_not_called()
 
 
 # ──────────────────── subprocess regex bypasses ────────────────

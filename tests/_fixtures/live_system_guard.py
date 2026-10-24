@@ -81,13 +81,13 @@ def _live_system_guard(request, monkeypatch):
 
     test_pid = _os.getpid()
     lookalike_ok = request.node.get_closest_marker(_GATEWAY_LOOKALIKE_MARK) is not None
-    # Keep identities, not bare PIDs: an initial child can be reparented,
-    # but its PID must never allowlist a later, unrelated process.
+    # Keep verified identities across reparenting, never a bare-PID allowlist.
+    # Later signals also snapshot descendants before their parent can die.
     try:
         import psutil as _psutil
     except ImportError:
         _psutil = None
-    _initial_children = {}
+    _owned_processes = {}
     if _psutil is not None:
         try:
             children = _psutil.Process(test_pid).children(recursive=True)
@@ -95,7 +95,7 @@ def _live_system_guard(request, monkeypatch):
             children = []
         for child in children:
             try:
-                _initial_children[child.pid] = child.create_time()
+                _owned_processes[child.pid] = child.create_time()
             except _psutil.Error:
                 continue  # Unverifiable children still need a live ancestry check.
 
@@ -112,13 +112,16 @@ def _live_system_guard(request, monkeypatch):
         try:
             walker = _psutil.Process(pid)
             identity = walker.create_time()
-            if pid in _initial_children:
-                owned = identity == _initial_children[pid]
+            if pid in _owned_processes:
+                owned = identity == _owned_processes[pid]
             else:
                 owned = any(parent.pid == test_pid for parent in walker.parents())
-            # Ancestry and initial-child membership apply only to the same
-            # process that is still present after inspection.
-            return owned and _psutil.Process(pid).create_time() == identity
+            # Ancestry and saved ownership apply only to the same process
+            # that is still present after inspection.
+            if not owned or _psutil.Process(pid).create_time() != identity:
+                return False
+            _owned_processes[pid] = identity
+            return True
         except _psutil.NoSuchProcess as exc:
             if exc.pid != pid:
                 return False  # A missing ancestor is not proof the target is gone.
@@ -127,20 +130,42 @@ def _live_system_guard(request, monkeypatch):
         except _psutil.Error:
             return False  # AccessDenied and other unverifiable identities fail closed.
 
-    def _group_is_gone(pgid: int) -> bool:
-        # A group can outlive its leader. Inspect membership without even a
-        # signal-0 call; an incomplete scan cannot establish a missing group.
+    def _remember_descendants(pid: int) -> None:
+        # Save helpers before signalling their parent can reparent them. Each
+        # identity is verified independently, not trusted from a children() list.
+        if _psutil is None:
+            return
+        try:
+            children = _psutil.Process(pid or test_pid).children(recursive=True)
+        except _psutil.Error:
+            return
+        for child in children:
+            try:
+                _is_own_subtree(child.pid)
+            except ProcessLookupError:
+                continue
+
+    def _group_is_owned(pgid: int) -> bool:
+        # Neither an owned leader nor an absent leader proves group ownership.
+        # Every surviving member needs its own verified process identity.
         if _psutil is None:
             return False
+        found = False
         try:
             for pid in _psutil.pids():
                 try:
-                    if _os.getpgid(pid) == pgid:
+                    if _os.getpgid(pid) != pgid:
+                        continue
+                    if not _is_own_subtree(pid):
                         return False
+                    found = True
                 except ProcessLookupError:
                     continue
         except (OSError, _psutil.Error):
             return False
+        if not found:
+            import errno
+            raise ProcessLookupError(errno.ESRCH, "signal target group vanished", pgid)
         return True
 
     real_kill = _os.kill
@@ -154,6 +179,7 @@ def _live_system_guard(request, monkeypatch):
         if int(sig) == 0:
             return real_kill(pid, sig, *args, **kwargs)
         if _is_own_subtree(int(pid)):
+            _remember_descendants(int(pid))
             return real_kill(pid, sig, *args, **kwargs)
         raise RuntimeError(
             f"tests/conftest.py live-system guard: blocked os.kill("
@@ -171,8 +197,8 @@ def _live_system_guard(request, monkeypatch):
     # ``os.killpg`` is the same risk class — sends a signal to every
     # process in a group. The gateway is a session leader (its own
     # PGID == its PID), so killpg(gateway_pid, SIGTERM) is a one-shot
-    # kill of the live process. Allow it only when the target PGID is
-    # the test process's own group.
+    # kill of the live process. Other groups require verified ownership of
+    # every surviving member, including after their leader exits.
     if hasattr(_os, "killpg"):
         real_killpg = _os.killpg
         own_pgid = _os.getpgrp()
@@ -181,14 +207,16 @@ def _live_system_guard(request, monkeypatch):
             # Signal 0 is a pure liveness probe — never destructive.
             if int(sig) == 0:
                 return real_killpg(pgid, sig, *args, **kwargs)
-            owned = int(pgid) == own_pgid
+            owned = int(pgid) in (0, own_pgid)
             if not owned:
                 try:
-                    owned = _is_own_subtree(int(pgid))
+                    leader_owned = _is_own_subtree(int(pgid))
                 except ProcessLookupError:
-                    if _group_is_gone(int(pgid)):
-                        raise
-                    # A leaderless or uninspectable group is not allowlisted.
+                    leader_owned = None  # Surviving members must prove ownership.
+                if leader_owned:
+                    _remember_descendants(int(pgid))
+                if leader_owned is not False:
+                    owned = _group_is_owned(int(pgid))
             if owned:
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(
