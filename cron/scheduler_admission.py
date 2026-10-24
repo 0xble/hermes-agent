@@ -88,7 +88,8 @@ def submit_reserved(job: dict, process_job):
             _reserved_pools[key] = pool
         _reserved_claims[key] = (job["id"], token)
     try:
-        future = scheduler._submit_with_guard(job, pool, process_job, registration_owner=token)
+        future = scheduler._submit_with_guard(
+            job, pool, process_job, registration_owner=token, dispatch_lane="reserved")
     except BaseException:
         _release_unsubmitted(key, token)
         raise
