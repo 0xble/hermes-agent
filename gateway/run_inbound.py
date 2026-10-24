@@ -290,7 +290,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             and not getattr(event, "_hermes_startup_restore_replay", False)
             and not _is_restore_control_event(event)
         ):
-            self._schedule_attended_user_activity(event, source, reconnect_key)
+            # Persist only after the normal user and bot admission checks on drain.
             self._queue_startup_restore_event(event, session_key=reconnect_key)
             return None
 

@@ -117,7 +117,7 @@ BUSY_PATHS += [("grace", "interrupt"), ("adapter_text_queue", "queue"),
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path,mode", BUSY_PATHS)
-@pytest.mark.parametrize("kind", ["human", "relay", "goal", "process", "attend_invalid", "attend_status", "attend_off", "attend_attachment"])
+@pytest.mark.parametrize("kind", ["human", "relay", "goal", "process", "bot", "attend_invalid", "attend_status", "attend_off", "attend_attachment"])
 async def test_only_human_receipts_refresh_once_without_blocking(busy_activity, monkeypatch, path, mode, kind):
     runner, event, key, state = busy_activity
     if path == "command":
@@ -134,6 +134,8 @@ async def test_only_human_receipts_refresh_once_without_blocking(busy_activity, 
         event.internal = True
     elif kind == "process":
         event.metadata = {"kind": "process_notification"}
+    elif kind == "bot":
+        event.source.is_bot = True
     release = asyncio.Event()
 
     async def lookup(_key):
@@ -603,12 +605,12 @@ async def test_drain_arrival_records_receipt_before_spool_and_preserves_it_on_re
         receipt = getattr(original, "_attended_activity_received_at", None)
         assert receipt is not None and before <= receipt <= received
         task = getattr(original, "_attended_activity_task", None)
-        if path in {"compression", "orphan"}:
-            assert task is None  # These paths park input before turn-start bookkeeping.
+        if path in {"startup", "reconnect", "compression", "orphan"}:
+            assert task is None  # Buffers preserve metadata, not pre-admission writes.
             persist.assert_not_awaited()
         else:
             assert task is not None
-            # A normal restore drain must join the arrival task, not stamp again.
+            # Repeated scheduling must join the arrival task, not stamp again.
             monkeypatch.setattr("gateway.run_inbound.time.time", lambda: received + 600)
             runner._schedule_attended_user_activity(original, source, key)
             assert original._attended_activity_task is task
@@ -654,10 +656,100 @@ async def test_drain_arrival_records_receipt_before_spool_and_preserves_it_on_re
         assert runner._session_state(key).conversation.last_user_activity_at == receipt
         restored = reader.get_last_user_activity_at(key, refresh=True)
         assert restored is not None and restored.timestamp() == pytest.approx(receipt, rel=0, abs=1e-6)
-        assert persist.await_count == (1 if path in {"compression", "orphan"} else 2)
+        assert persist.await_count == (1 if path in {"startup", "reconnect", "compression", "orphan"} else 2)
         persist.assert_awaited_with(key, when=datetime.fromtimestamp(receipt))
     finally:
         await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
+        for session_store in (store, reader):
+            session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["startup", "reconnect", "compression", "orphan"])
+@pytest.mark.parametrize("sender", ["unauthorized", "rejected-bot", "admitted-bot", "human"])
+async def test_admission_buffers_only_publish_authorized_human_receipts(
+    tmp_path, monkeypatch, path, sender,
+):
+    from gateway.session import AsyncSessionStore
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: CONFIG)
+    runner, adapter = make_restart_runner()
+    owner = make_restart_source(chat_type="group", thread_id="topic")
+    key = runner._session_key_for_source(owner)
+    store = SessionStore(tmp_path / "sessions", runner.config)
+    reader = SessionStore(tmp_path / "sessions", runner.config)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    persist = AsyncMock(wraps=runner.async_session_store.mark_user_activity)
+    runner.async_session_store.mark_user_activity = persist
+    store.get_or_create_session(owner)
+    previous = time.time() - 600
+    assert store.mark_user_activity(key, datetime.fromtimestamp(previous))
+    runner._session_state(key).conversation.last_user_activity_at = previous
+    source = make_restart_source(chat_type="group", thread_id="topic")
+    source.user_id = "stranger" if sender == "unauthorized" else owner.user_id
+    source.is_bot = sender in {"rejected-bot", "admitted-bot"}
+    assert runner._session_key_for_source(source) == key
+    runner._is_user_authorized_for_source = Mock(side_effect=lambda source: source.user_id == owner.user_id)
+    runner._admit_bot_message_for_source = Mock(return_value=sender != "rejected-bot")
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, _source: event)
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._intake_adapter_for = lambda _source: adapter
+    runner._startup_restore_in_progress = path == "startup"
+    runner._reconnect_restore_keys = {key: 1} if path == "reconnect" else {}
+    event = MessageEvent(text="shared-topic input", source=source, user_id=source.user_id)
+
+    async def handle(replayed):
+        await runner._handle_admitted_message(replayed)
+        replayed._gateway_accepted = adapter._pending_messages.get(key) is replayed
+
+    adapter.handle_message = AsyncMock(side_effect=handle)
+    try:
+        admitted = await runner._hm_admit_event(event)
+        receipt = getattr(event, "_attended_activity_received_at", None)
+        if path in {"startup", "reconnect"}:
+            assert admitted is None
+            assert runner._startup_restore_queue == [event]
+        elif admitted is not None:
+            if path == "compression":
+                runner._session_has_compression_in_flight = AsyncMock(return_value=True)
+                runner._start_compression_deferred_drain = Mock()
+                assert await runner._defer_compression_locked_event(key, event)
+            else:
+                older = MessageEvent(text="older input", source=owner)
+                runner._rescue_orphaned_overflow = lambda *_args: older
+                assert runner._hm_rescue_orphaned_fifo(event, source, False, key)[0] is older
+        await asyncio.gather(*list(runner._background_tasks))
+        monkeypatch.setattr("gateway.run_inbound.time.time", lambda: previous + 1200)
+        runner._draining = True
+        runner._startup_restore_in_progress = False
+        runner._reconnect_restore_keys = {}
+        if path in {"startup", "reconnect"}:
+            assert await runner._drain_startup_restore_queue() == (sender in {"human", "admitted-bot"})
+            adapter.handle_message.assert_awaited_once_with(event)
+            assert runner._startup_restore_queue == []
+        elif admitted is not None:
+            await runner._handle_admitted_message(event)
+        await asyncio.gather(*list(runner._background_tasks))
+        expected = receipt if sender == "human" else previous
+        restored = reader.get_last_user_activity_at(key, refresh=True)
+        assert restored is not None and restored.timestamp() == pytest.approx(expected, rel=0, abs=1e-6)
+        assert runner._session_state(key).conversation.last_user_activity_at == expected
+        if sender == "human":
+            persist.assert_awaited_once_with(key, when=datetime.fromtimestamp(receipt))
+        else:
+            persist.assert_not_awaited()
+        if sender == "unauthorized":
+            runner._admit_bot_message_for_source.assert_not_called()
+        assert adapter.sent == []
+    finally:
+        await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
+        scheduler = getattr(runner, "_replay_scheduler", None)
+        if scheduler is not None:
+            await scheduler.close()
         for session_store in (store, reader):
             session_store.close_all_db_handles()
 
