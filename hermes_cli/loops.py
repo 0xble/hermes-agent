@@ -1381,19 +1381,15 @@ def wake_loop_for_external_event(session_id: str) -> bool:
 
 
 def _active_goal_loop_warning(session_id: Optional[str]) -> str:
-    """Return the non-blocking loop/goal overlap warning, if a goal owns this session."""
-    if not session_id:
+    """Warn only when the scheduler's goal predicate currently blocks loop ticks."""
+    if not session_id or not goal_blocks_loop_tick(session_id):
         return ""
-    try:
-        from hermes_cli.goals import GoalManager
-        if GoalManager(session_id=session_id).is_active():
-            return (
-                "⚠ An active goal already owns this session: loop ticks defer while the goal is active; "
-                "keep this as a separate recurring duty only if that deferral is intended."
-            )
-    except Exception:
-        pass
-    return ""
+    return (
+        "⚠ An active goal is driving this session: loop ticks defer now, "
+        "only while the goal is actively taking turns. "
+        "A goal that is parked/waiting, paused, or done does not block loop ticks. "
+        "Keep this as a separate recurring duty only if that deferral is intended."
+    )
 
 
 def goal_blocks_loop_tick(session_id: str) -> bool:
