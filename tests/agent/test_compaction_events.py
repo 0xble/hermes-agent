@@ -550,7 +550,7 @@ def test_publication_failure_does_not_select_another_summary_model(published, tm
     try:
         with patch.object(db, "archive_and_compact", side_effect=sqlite3.OperationalError("database is locked")) as publish, \
                 patch.object(agent.context_compressor, "_generate_summary", return_value="SANITIZED SUMMARY") as generate, \
-                patch("agent.conversation_compression._attempt_stall_fallback") as fallback:
+                patch("agent.conversation_compression._retry_compression_on_fallback_chain") as fallback:
             compressed, _ = run_compress_context_with_progress_timeout(
                 worker=worker, messages=messages, system_prompt_fallback="system prompt", telemetry_agent=agent,
                 idle_timeout_seconds=30, total_ceiling_seconds=60,

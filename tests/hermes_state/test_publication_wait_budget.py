@@ -64,7 +64,7 @@ def test_lost_compaction_lease_is_not_retried(tmp_path):
     db = SessionDB(tmp_path / "lost.db")
     try:
         db.create_session("s", "test")
-        with patch("hermes_state.time.sleep") as sleep:
+        with patch.object(db, "_WRITE_PATIENCE_S", 0.02), patch("hermes_state.time.sleep") as sleep:
             with pytest.raises(SessionCompressionInProgressError):
                 db.archive_and_compact("s", [{"role": "user", "content": "summary"}],
                                        lock_holder="lost")
