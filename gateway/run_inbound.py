@@ -1896,6 +1896,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
             # clears it only once the reply is in the delivery ledger (else a kill in between
             # left neither marker nor ledger row and the persisted reply was never sent).
+            if getattr(event, "_gateway_lease_wait_spool", None) is not None:
+                from gateway.run_turn_lease_wait import retire_lease_wait
+                with suppress(Exception):
+                    await asyncio.to_thread(retire_lease_wait, self, event)
             if not getattr(event, "_turn_marker_handoff", False):
                 await self._clear_durable_active_turn(event)
             # Release only this turn's generation. Eviction may immediately admit a replacement
