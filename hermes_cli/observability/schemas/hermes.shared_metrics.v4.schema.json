@@ -4608,6 +4608,7 @@
                 "browser_click",
                 "browser_console",
                 "browser_dialog",
+                "browser_downloads",
                 "browser_exec",
                 "browser_get_images",
                 "browser_handoff",
