@@ -767,8 +767,6 @@ class CLIModelSwitchMixin:
                     "cli.model.switch_failed", model=snapshot.get("model", ""), error=restored, old_model=agent.model)
                 _cprint(f"  {notice}")
                 return
-            if "reasoning_config" in snapshot:
-                restore_reasoning(snapshot["reasoning_config"])
 
     @staticmethod
     def _filter_model_picker_entries(entries: list, query: str) -> list:

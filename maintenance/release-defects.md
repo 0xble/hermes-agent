@@ -718,6 +718,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - When a release payload had shipped optional dependencies but PM had no facts or frozen feature inventory yet, the first on-demand extra sync selected only the requested extra and replaced the payload environment. Infer concrete shipped extras from the payload's site-packages before creating the first PM generation, while excluding umbrella aliases that share anchors with their member extras.
 - Guard: `tests/pm/test_environment_build.py` (`test_first_on_demand_extra_preserves_payload_extras`).
 
+## v0.22.5 merge integration
+
+- Fork patch identity: `v0225-merge-integration`.
+- Merging upstream `v0.22.5`, current fork main and the installed display-fold fix (#765) left five bindings that Git merged cleanly but that no longer resolved. Exact-head CI caught them on the first hosted run.
+  - `gateway/run_inbound.py` kept the fork's `metadata=_UNSET` default on `_transcribe_and_echo_pending_voice` but lost the `from gateway.run_common import _UNSET` import that upstream's side never had. Every `gateway.run` import raised `NameError`, which accounted for most failures in the first run.
+  - `hermes_state_messages.py` raised `CompressionLeaseLostError` from the compaction lease check without importing it.
+  - `hermes_state_messages.py` `_with_removed_identities` received a copy of an `ORDER BY {...}` f-string expression as a plain literal, sending `{` to SQLite on every display read that includes removed rows. The removed-row query orders by plain `id` as on upstream.
+  - `hermes_cli/cli_model_switch_mixin.py` kept upstream's trailing `restore_reasoning(...)` call after the fork had replaced that local with `_restore_reasoning()`, which already reapplies the snapshot after `switch_model`.
+  - The desktop slash-session test imported in an order `perfectionist/sort-imports` rejects.
+- Guard: `uvx pyflakes` over the merged tree reports no undefined name that is absent on both parents, plus exact-head hosted CI for `gateway.run` import and the display-read suites.
+- Retire once the next release sync no longer carries these merge points.
+
 ## v0.21.6 merge integration
 
 - Fork patch identity: `v0216-merge-integration`.

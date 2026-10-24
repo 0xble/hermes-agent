@@ -896,6 +896,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         fold_plan: Optional[_FoldPlan] = None) -> int:
         """Run compaction on the caller's write transaction without committing it."""
         from hermes_state import SessionCompressionInProgressError
+        from hermes_state_errors import CompressionLeaseLostError
         if lock_holder is not None:
             lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
             if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
@@ -1737,7 +1738,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             "message_uid, absorbed_message_uids, display_identity, active, compacted, "
             "CASE WHEN display_identity IS NULL THEN content END AS content "
             f"FROM messages WHERE session_id IN ({_placeholders(session_ids)}) AND active = 0 AND compacted = 0 "
-            "ORDER BY {'+id' if active_clause == ' AND active = 1' and not with_compacted else 'id'}", tuple(session_ids))
+            "ORDER BY id", tuple(session_ids))
         return sorted([*rows, *removed], key=lambda row: row["id"]) if removed else list(rows)
 
     def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = False,
