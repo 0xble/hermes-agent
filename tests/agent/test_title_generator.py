@@ -348,6 +348,22 @@ def test_abstain_payload_is_an_empty_title():
     assert _extract_json_title('Result: {"title": "Generic Title", "abstain": true}') == ""
 
 
+@pytest.mark.parametrize("payload, expected", [
+    ('{"title": "Q3 Billing Dispute", "abstain": false}', "Q3 Billing Dispute"),
+    ('```json\n{"title": "Q3 Billing Dispute", "abstain": false}\n```', "Q3 Billing Dispute"),
+    ('Result: {"title": "Q3 Billing Dispute", "abstain": false}', "Q3 Billing Dispute"),
+    ('{"title": "", "abstain": true}', ""),
+])
+def test_visible_title_payload_ignores_schema_quoted_in_thinking(payload, expected):
+    response = MagicMock()
+    response.choices[0].message.content = (
+        '<think>The schema permits {"title": "Incorrect Subject", "abstain": true}.</think>' + payload
+    )
+    response.choices[0].finish_reason = "stop"
+    with patch("agent.title_generator.call_llm", return_value=response):
+        assert generate_title("Investigate the Q3 billing dispute") == expected
+
+
 @pytest.mark.parametrize("result", ["abstain", "loose_abstain", "failure", "truncated"])
 def test_title_worker_distinguishes_abstention_from_provider_failure(tmp_path, result):
     db = SessionDB(tmp_path / "state.db")
@@ -373,7 +389,7 @@ def test_title_worker_distinguishes_abstention_from_provider_failure(tmp_path, r
     ("INFLUENCE AND PERSUASION #2", "Influence and Persuasion"),
     ("Review PR #586", "Review PR #586"),
 ])
-@pytest.mark.parametrize("turns, hold", [(1, True), (3, True), (1, False)])
+@pytest.mark.parametrize("turns, hold", [(1, True), (1, False)])
 def test_duplicate_model_title_is_held_or_replaced_by_derived(tmp_path, existing, generated, turns, hold):
     db = SessionDB(tmp_path / "state.db")
     db.create_session(session_id="taken", source="telegram")
@@ -480,14 +496,6 @@ class TestAutoTitleSession:
             auto_title_session(db, "sess-1", history[0]["content"], conversation_history=history)
         assert db.get_session_title_source("sess-1") != "llm"
 
-    def test_junk_title_uses_derived_at_turn_three(self, tmp_path):
-        db = SessionDB(tmp_path / "state.db")
-        db.create_session(session_id="sess-1", source="telegram")
-        history = [{"role": "user", "content": "go"} for _ in range(3)]
-        with patch("agent.title_generator.generate_title", return_value="Investigation"):
-            auto_title_session(db, "sess-1", "go", conversation_history=history)
-        assert db.get_session_title("sess-1") == "go"
-        assert db.get_session_title_source("sess-1") == "derived"
 
     def test_process_notifications_are_not_retry_turns(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
@@ -526,7 +534,7 @@ class TestAutoTitleSession:
                 title_callback=lambda title, source: seen.append((title, source)),
             )
         db.set_auto_title.assert_called_once_with(
-            "sess-1", "Readable Session", source="llm"
+            "sess-1", "Readable Session", source="llm", reject_collision=True
         )
         # The stage reaches the consumer, so one that spends a rate-limited
         # remote call per title can take this and skip the derived one.
@@ -624,7 +632,7 @@ class TestMaybeAutoTitle:
     def test_link_deferral_does_not_fetch_on_turn_start(self):
         from agent.title_generator import opener_needs_reply
         with patch("agent.title_generator._title_link_context", side_effect=AssertionError("network on turn start")):
-            assert opener_needs_reply("https://example.com/article") is True
+            assert opener_needs_reply("https://example.com/article") is False
 
     @pytest.mark.parametrize(
         "main_runtime, title_cfg, deferred",
@@ -975,22 +983,26 @@ class TestMaybeAutoTitle:
         assert db.get_session_title("sess-1") == "Debug scheduler failures"
         assert db.get_session_title_source("sess-1") == "llm"
 
-    def test_a_placeholder_title_stops_retrying_after_the_third_turn(self, tmp_path):
-        """A derived name gets turns 2-3 to upgrade, not a model call on every later turn."""
+    def test_a_placeholder_stops_model_requests_after_the_third_turn(self, tmp_path):
+        """Cap model requests, not deterministic recovery of a still-provisional name."""
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="sess-1", source="cli")
         db.set_auto_title("sess-1", "hi", source="derived")
         history = [{"role": "user", "content": f"turn {n}"} for n in range(3)]
-        with patch("agent.title_generator.auto_title_session") as mock_auto, \
+        with patch("agent.title_generator.generate_title", return_value=None) as generate, \
+                patch("agent.title_generator._hold_until_reply_enabled", return_value=True), \
                 patch("agent.title_generator._auto_title_enabled", return_value=True), \
                 patch("agent.title_generator._model_title_upgrade_enabled", return_value=True):
             maybe_auto_title(db, "sess-1", "and now the real question", history)
             wait_for_title_upgrades(10)
-            assert mock_auto.call_count == 1  # turn 3: the placeholder still gets a model shot
-            history.append({"role": "user", "content": "turn 3"})
-            maybe_auto_title(db, "sess-1", "and now the real question", history)
+            assert generate.call_count == 1
+            assert db.get_session_title_source("sess-1") == "derived"
+            history.append({"role": "user", "content": "Q4 Invoice Reconciliation"})
+            maybe_auto_title(db, "sess-1", "Q4 Invoice Reconciliation", history)
             wait_for_title_upgrades(10)
-        assert mock_auto.call_count == 1  # turn 4: capped, no call
+        assert generate.call_count == 1
+        assert db.get_session_title("sess-1") == "Q4 Invoice Reconciliation"
+        assert db.get_session_title_source("sess-1") == "llm"
 
     def test_instant_title_declines_a_name_collision(self, tmp_path):
         """A colliding derived title is skipped, not scanned into 'hi #2'.

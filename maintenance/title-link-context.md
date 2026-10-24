@@ -2,7 +2,7 @@
 
 ## Required behavior
 
-When the opening message contains a link, the background title upgrade reads the first `http(s)` link's page metadata and gives it to the auxiliary title model as labeled, untrusted input. The instant derived title and the main turn are unchanged. The page text never reaches the main agent, the system prompt, or conversation history.
+When the opening message contains a link, the background title upgrade starts immediately unless the shared self-hosted endpoint requires deferral. It reads the first `http(s)` link's page metadata and gives it to the auxiliary title model as labeled, untrusted input. The turn-start predicate never fetches metadata. If the model cannot support a title, the opening turn retries once after its reply with a bounded reply excerpt. The instant derived title and the main turn are unchanged. The page text never reaches the main agent, the system prompt, or conversation history.
 
 - **First link only:** the first URL in text order, after control wrappers, the gateway `[Replying to: "..."]` pointer, and the @-reference attached-context footer are removed. Trailing prose punctuation and unbalanced brackets are trimmed. A Desktop paste preview takes precedence and suppresses the fetch.
 - **What is read:** `og:title`, `twitter:title` or `<title>`, plus `og:description`, `description` or `twitter:description`, or the first meaningful line of `text/plain`. Parsing streams and stops at `</head>` or `<body>`. The result is capped at 500 characters.
