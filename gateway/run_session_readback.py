@@ -9,12 +9,13 @@ from dataclasses import replace
 from gateway.attended_model import is_active, parse_attended_config, resolve_attended_model
 from gateway.model_pick import model_pick_deadline
 from gateway.session import sanitize_reasoning_override
+from gateway.session_attended import session_attended_pinned
 from gateway.session_state import ConversationState, session_opening_pending
 
 
 def resolve_attended_snapshot(
     runner, *, source, user_config, override, model_role, model_scope, stamp, new_session,
-    reasoning_value, reasoning_scope, default_reasoning=None, attended_reasoning=None,
+    reasoning_value, reasoning_scope, default_reasoning=None, attended_reasoning=None, attended_pinned=False,
 ):
     """Project detached inputs into the existing pure precedence resolver, without a commit."""
     from gateway.run import _get_channel_override, _resolve_gateway_model
@@ -62,6 +63,7 @@ def resolve_attended_snapshot(
             "channel_model": channel_model,
             "channel_provider": channel_provider,
             "last_user_activity_at": stamp,
+            "attended_pinned": attended_pinned,
             "new_session": new_session,
             "model_role": model_role,
             "default_reasoning": default_reasoning,
@@ -118,7 +120,8 @@ def _load_session_settings(runner, *, source, session_key, user_config, conversa
         stamp = runner._load_attended_activity_stamp(session_key)
     cfg = parse_attended_config(user_config or {})
     now = time.time()
-    active = is_active(stamp, now=now, idle_revert_minutes=cfg.idle_revert_minutes)
+    pinned = session_attended_pinned(store, session_key)
+    active = is_active(stamp, now=now, idle_revert_minutes=cfg.idle_revert_minutes, pinned=pinned)
     deadline = model_pick_deadline(conversation.model_override)
     expired = bool(deadline and now >= deadline)
     if conversation.model_override_scope == "temporary" and (
@@ -136,7 +139,7 @@ def _load_session_settings(runner, *, source, session_key, user_config, conversa
         runner, source=source, user_config=user_config, override=conversation.model_override,
         model_role=conversation.model_role, model_scope=conversation.model_override_scope,
         stamp=stamp, new_session=new_session, reasoning_value=conversation.reasoning_override,
-        reasoning_scope=conversation.reasoning_override_scope,
+        reasoning_scope=conversation.reasoning_override_scope, attended_pinned=pinned,
     )
     # Like turn setup, inspection cannot switch back before a quiet API boundary.
     if decision is not None and attended_switch_back_pending(
