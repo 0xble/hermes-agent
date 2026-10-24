@@ -1246,7 +1246,9 @@ class SessionSearchMixin:
                 seen_ids = {m["id"] for m in matches}
                 matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
             except sqlite3.OperationalError as exc:
-                logger.debug("Unindexed-gap supplement skipped: %s", exc)
+                if not is_fts_query_syntax_error(exc):
+                    raise
+                logger.debug("Unindexed-gap supplement skipped for invalid FTS query: %s", exc)
 
         # unicode61 puts no boundary between Latin and adjacent CJK ("修改youer服务端" is
         # one token, so MATCH "youer" misses). On a zero-result Latin miss retry the

@@ -14,7 +14,7 @@ import sqlite3
 import re
 import time
 from datetime import datetime, timezone, UTC
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from hermes_state_common import _BOUNDARY_END_REASONS
 from hermes_time import safe_strftime
@@ -73,6 +73,8 @@ def _loud(fn, log_msg, error_prefix, *log_args):
     calls whose failure the model must see."""
     try:
         return fn(), None
+    except sqlite3.Error:
+        raise
     except Exception as e:
         logging.error(log_msg, *log_args, e, exc_info=True)
         return None, tool_error(f"{error_prefix}: {e}", success=False)
@@ -630,7 +632,7 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
                 exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids))
 
 
-def _shape_session_links(raw_result: str, platform: str = None) -> str:
+def _shape_session_links(raw_result: str, platform: str | None = None) -> str:
     """Only Desktop can render the internal references in session-search results."""
     surface = str(getattr(platform, "value", platform) or "").strip().lower()
     if not surface or surface == "desktop":
@@ -650,11 +652,12 @@ def _shape_session_links(raw_result: str, platform: str = None) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=None,
-                   current_session_id: str = None, session_id: str = None, around_message_id: int = None,
-                   window: int = 5, sort: str = None, profile: str = None, detail: str = "adaptive",
-                   after: str = None, before: str = None, exclude_session_ids: Optional[List[str]] = None,
-                   platform: str = None) -> str:
+def session_search(query: str = "", role_filter: str | None = None, limit: int = 3, db=None,
+                   current_session_id: str | None = None, session_id: str | None = None,
+                   around_message_id: int | None = None, window: int = 5, sort: str | None = None,
+                   profile: str | None = None, detail: str = "adaptive", after: str | None = None,
+                   before: str | None = None, exclude_session_ids: list[str] | None = None,
+                   platform: str | None = None) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
     from hermes_state import format_session_db_unavailable
@@ -662,7 +665,10 @@ def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=
     owned_dbs: list[Any] = []
     try:
         if db is None:
-            db = _quiet(acquire, None, "SessionDB unavailable for session_search")
+            try:
+                db = _quiet(acquire, None, "SessionDB unavailable for session_search")
+            except sqlite3.Error:
+                return tool_error(format_session_db_unavailable(), success=False)
             if db is None:
                 return tool_error(format_session_db_unavailable(), success=False)
             owned_dbs.append(db)

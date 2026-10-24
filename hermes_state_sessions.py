@@ -914,8 +914,13 @@ class SessionSessionsMixin:
         return bool(_parse_model_config((session_meta or {}).get("model_config")).get("yolo_mode"))
 
     def get_session(self, session_id: str) -> Optional[dict[str, Any]]:
-        """Get a session by ID (drains queued token deltas first so cost readers see exact totals)."""
-        self.flush_token_counts()
+        """Get a session by ID, with exact token totals except inside reader-only recall."""
+        from hermes_state_search_runtime import current_search
+
+        # Recall metadata can lag queued usage. Draining it would wait on the writer
+        # once per ancestor and defeat the reader-only scope before any SELECT runs.
+        if current_search(self) is None:
+            self.flush_token_counts()
         row = self._read_one(
             "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
             "COALESCE(tp.prompt, s.tool_names) AS _tool_names_resolved "
@@ -1355,29 +1360,9 @@ class SessionSessionsMixin:
             lineage_limit,
             limit,
         ]
-        deadline = time.monotonic() + timeout_seconds
-        interrupted_by_deadline = False
-
-        def _deadline_progress_handler() -> int:
-            nonlocal interrupted_by_deadline
-            if time.monotonic() >= deadline:
-                interrupted_by_deadline = True
-                return 1
-            return 0
-
-        try:
-            with self._read_ctx() as conn:
-                conn.set_progress_handler(_deadline_progress_handler, 1000)
-                try:
-                    rows = conn.execute(query, params).fetchall()
-                finally:
-                    conn.set_progress_handler(None, 0)
-        except sqlite3.OperationalError as exc:
-            if interrupted_by_deadline and "interrupt" in str(exc).lower():
-                raise TimeoutError(
-                    f"recent-session browse exceeded {timeout_seconds:g}s deadline"
-                ) from exc
-            raise
+        from hermes_state_search_runtime import browse_deadline
+        with self._read_ctx() as conn, browse_deadline(self, conn, timeout_seconds):
+            rows = conn.execute(query, params).fetchall()
 
         sessions = []
         for row in rows:
