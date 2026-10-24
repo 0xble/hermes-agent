@@ -10,6 +10,7 @@ reaction from those hooks (Slack 👀, Discord, Telegram, Feishu, Matrix,
 Signal, ...) silently skips the acknowledgement for mid-turn messages.
 """
 
+import asyncio
 import importlib
 import sys
 import types
@@ -335,3 +336,96 @@ async def test_complete_only_adapter_is_left_alone(monkeypatch, tmp_path):
 
     assert result["final_response"] == "done-2"
     assert adapter.completed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_response,result_state,outcome", [
+    ("NO_REPLY", {}, "resumed"),
+    ("[SILENT]", {}, "resumed"),
+    ("follow-up answer", {}, "resumed"),
+    ("NO_REPLY", {"failed": True}, "skipped:turn-failed"),
+    ("NO_REPLY", {"interrupted": True}, "skipped:turn-failed"),
+])
+@pytest.mark.parametrize("merged", [False, True])
+async def test_recovered_in_band_followup_reports_outcome(
+    monkeypatch, tmp_path, caplog, final_response, result_state, outcome, merged,
+):
+    """Real busy admission and recursive execution must settle the recovered input."""
+    from functools import partial
+    from unittest.mock import AsyncMock, Mock
+
+    from gateway.config import GatewayConfig
+    from gateway.platforms.base import merge_pending_message_event
+    from gateway.run_pending_recovery import _defer_followup
+    from gateway.session import SessionStore
+    from gateway.shutdown_flush import flush_pending_to_file, recover_pending_to_db
+
+    class RecoveryAgent(_TwoTurnAgent):
+        calls = []
+
+        def run_conversation(self, *args, **kwargs):
+            result = super().run_conversation(*args, **kwargs)
+            result["final_response"] = final_response
+            if len(self.calls) > 1:
+                result.update(result_state)
+            return result
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
+    _install_fake_agent(monkeypatch, tmp_path, RecoveryAgent)
+    adapter = HookRecordingAdapter()
+    adapter.send = AsyncMock(wraps=adapter.send)
+    runner = _make_runner(adapter)
+    runner.session_store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    entry = runner.session_store.get_or_create_session(_source())
+    runner._startup_restore_queue = []
+    runner._background_tasks = set()
+    runner._is_user_authorized_for_source = lambda source: True
+    runner._restored_source = lambda entry: entry.origin
+    runner._intake_adapter_for = lambda source: adapter
+    event = MessageEvent(text="saved follow-up", source=_source(), internal=True, reply_expected=False)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    assert recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None),
+    ) == 1
+    recovered = runner._startup_restore_queue.pop()
+    spool = recovered._hermes_recovery_spool
+    adapter.set_message_handler(AsyncMock())
+    adapter._active_sessions[entry.session_key] = asyncio.Event()
+    predecessor = MessageEvent(text="predecessor", source=_source(), internal=True, reply_expected=False)
+    async def run_predecessor():
+        from gateway.platforms.event import turn_origin_for_event
+        from gateway.session_context import set_turn_origin
+
+        set_turn_origin(turn_origin_for_event(predecessor))
+        return await runner._run_agent(
+            message=predecessor.text, context_prompt="", history=[], source=_source(),
+            session_id=entry.session_id, session_key=entry.session_key, reply_expected=False,
+        )
+
+    task = asyncio.create_task(run_predecessor())
+    task._hermes_event = predecessor
+    adapter._session_tasks[entry.session_key] = task
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert await runner._dispatch_startup_restore_event(recovered, entry.session_key)
+        assert adapter._pending_messages[entry.session_key] is recovered
+        if merged:
+            consumed = MessageEvent(text="earlier follow-up", source=_source(), internal=True, reply_expected=False)
+            adapter._pending_messages[entry.session_key] = consumed
+            merge_pending_message_event(
+                adapter._pending_messages, entry.session_key, recovered, merge_text=True,
+            )
+        await task
+        await asyncio.gather(*list(runner._background_tasks))
+
+    assert RecoveryAgent.calls == [
+        "predecessor", "earlier follow-up\nsaved follow-up" if merged else "saved follow-up",
+    ]
+    outcomes = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Restart recovery outcome:")]
+    assert outcomes == [f"Restart recovery outcome: session={entry.session_key} outcome={outcome}"]
+    assert not spool.exists()
+    sent_text = [call.kwargs["content"] if "content" in call.kwargs else call.args[1]
+                 for call in adapter.send.call_args_list]
+    assert all("still preserved" not in text for text in sent_text)
