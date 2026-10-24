@@ -243,6 +243,7 @@ class LocalSessionPolicy:
             provider, key = direct_alias_runtime_request(
                 DirectAlias(alias.model, alias.provider, alias.base_url, alias.api_key))
             config["model"] = {"default": alias.model, "provider": provider, "base_url": alias.base_url}
+            config["_live_alias_reference"] = alias.reference
             if secrets and key:
                 config["model"]["api_key"] = key
             if not session_pinned(config, "reasoning", "reasoning" in json.loads(self.request_json)):
@@ -990,6 +991,8 @@ def route_launch_key(authority, policy, config):
     """The launch key a turn on *config* (the route it runs, a followed profile's included) sends.
     A launch key authenticates the frozen route it was bound with: once the followed profile
     supersedes that pick and moves to another endpoint, the key stays behind with its route."""
+    if config.get("_live_alias_reference"):
+        return (config.get("model") or {}).get("api_key") or None
     bound = present_sections(json.loads(policy.config_json))  # the route the key was bound with
     if not bound_route_holds(bound.get('model'), bound, config.get('model'), config):
         return None

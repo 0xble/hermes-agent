@@ -239,7 +239,7 @@ def test_by_parent_invalid_maps_fail_loudly(config_file, routes, message):
 
 def test_startup_and_frozen_policy_keep_reference_live(config_file):
     from gateway.session_local_route import resolve_launch_route
-    from gateway.session_policy import build_policy
+    from gateway.session_policy import build_policy, route_launch_key
     from gateway.session_worker_construct import route_runtime
     from hermes_cli.model_switch import resolve_startup_model_route
     _home, config, save = config_file
@@ -249,12 +249,13 @@ def test_startup_and_frozen_policy_keep_reference_live(config_file):
     policy = build_policy(launch, config, profile_terminal=False, private_secrets={})
     stored = policy.config_json
     frozen, model = policy.effective()
-    runtime, fallback = route_runtime(policy, frozen, model, None)
+    runtime, fallback = route_runtime(policy, frozen, model, route_launch_key(None, policy, frozen))
     assert (model, runtime["provider"], fallback) == ("gpt-test-old", "openrouter", None)
     _edit(config, save)
     frozen, model = policy.effective()
-    runtime, _fallback = route_runtime(policy, frozen, model, None)
+    runtime, _fallback = route_runtime(policy, frozen, model, route_launch_key(None, policy, frozen))
     assert (model, runtime["provider"]) == ("claude-test-new", "anthropic")
+    assert runtime["api_key"] == "test-new"
     assert frozen["_live_alias_reasoning"] == parse_reasoning_effort("high")
     assert policy.config_json == stored and policy.model == "alias:work"
     assert "api_key" not in policy.effective(secrets=False)[0]["model"]
