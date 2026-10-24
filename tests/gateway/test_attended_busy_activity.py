@@ -116,12 +116,17 @@ BUSY_PATHS += [("grace", "interrupt"), ("adapter_text_queue", "queue"),
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path,mode", BUSY_PATHS)
-@pytest.mark.parametrize("kind", ["human", "relay", "goal", "process"])
+@pytest.mark.parametrize("kind", ["human", "relay", "goal", "process", "attend_invalid", "attend_status", "attend_off", "attend_attachment"])
 async def test_only_human_receipts_refresh_once_without_blocking(busy_activity, monkeypatch, path, mode, kind):
     runner, event, key, state = busy_activity
     if path == "command":
         event.text = "/status"
-    if kind == "relay":
+    if kind.startswith("attend_"):
+        action = {"attend_invalid": "0m", "attend_status": "status", "attend_off": "off", "attend_attachment": "0m"}[kind]
+        event.text = "/attend@HermesBot " + action
+        if kind == "attend_attachment":
+            event.text = "@image:/path/photo.png\n\n" + event.text
+    elif kind == "relay":
         event.text = "[relay from=hermes:default/other]\nFYI"
         event.metadata = {"notification_origin": "relay_delivery"}
     elif kind == "goal":
