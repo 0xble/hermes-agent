@@ -14,7 +14,7 @@ from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_errors import is_malformed_db_error, is_sqlite_lock_error, is_fts_query_syntax_error
-from hermes_state_search_runtime import search_operation, hydration_stage
+from hermes_state_search_runtime import search_operation, hydration_stage, search_stage
 from hermes_state_common import (
     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
@@ -829,7 +829,7 @@ class SessionSearchMixin:
         if bookend > 0:
             role_clause = "" if keep_roles is None else f" AND role IN ({','.join('?' for _ in keep_roles)})"
             role_params = [] if keep_roles is None else list(keep_roles)
-            with self._read_ctx() as conn:
+            with self._read_ctx() as conn, search_stage(self, "sql_ms"):
                 def _bookend(op: str, boundary_id: int, order: str):
                     return conn.execute(
                         f"SELECT * FROM messages "

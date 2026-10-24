@@ -1360,8 +1360,8 @@ class SessionSessionsMixin:
             lineage_limit,
             limit,
         ]
-        from hermes_state_search_runtime import browse_deadline
-        with self._read_ctx() as conn, browse_deadline(self, conn, timeout_seconds):
+        from hermes_state_search_runtime import browse_deadline, search_stage
+        with self._read_ctx() as conn, browse_deadline(self, conn, timeout_seconds), search_stage(self, "sql_ms"):
             rows = conn.execute(query, params).fetchall()
 
         sessions = []

@@ -684,10 +684,14 @@ def test_read_only_handles_do_not_count_toward_the_duplicate_writer_warning(db, 
             d.close()
 
 
-def test_handle_diagnostics_do_not_retain_the_creators_frame(tmp_path):
+def test_handle_diagnostics_do_not_retain_the_creators_frame(tmp_path, monkeypatch):
     """Remembering where a handle opened must not retain its caller's locals."""
     import gc
     import weakref
+
+    # This checks call-site metadata, not host-wide FD scans. A cached native
+    # scan error retains its re-raised traceback, including the opening frames.
+    monkeypatch.setattr("hermes_state_dbfile._deleted_sidecar_holders_for_open", lambda _path: [])
 
     class Context:
         pass
