@@ -43,11 +43,13 @@ approval:
     second_other: "{count} Sekunden"
 gateway:
   attend:
-    usage: "Verwendung: /attend, /attend off oder /attend status."
+    usage: "Verwendung: /attend [duration], /attend off oder /attend status. Die Dauer muss positiv sein, z. B. 30m, 2h, 1h30m oder 1d. Ohne Dauer gilt die Bindung dauerhaft."
     disabled: "Das Routing bei aktiver Nutzung ist nicht konfiguriert. Zuerst model.attended festlegen."
-    pinned: "Auf das Modell für aktive Nutzung ({model}) festgelegt. Mit /attend off aufheben. Explizite /model-Auswahlen haben weiterhin Vorrang."
+    pinned: "Dauerhaft auf das Modell für aktive Nutzung ({model}) festgelegt. Mit /attend off aufheben. Explizite /model-Auswahlen haben weiterhin Vorrang."
+    pinned_timed: "Für {duration} auf das Modell für aktive Nutzung ({model}) festgelegt, bis {until}. Mit /attend off aufheben. Explizite /model-Auswahlen haben weiterhin Vorrang."
     released: "Modellbindung für aktive Nutzung aufgehoben. Der Inaktivitätstimer von {minutes} Minuten beginnt jetzt."
-    status_pinned: "Aktive Nutzung: Modell festgelegt. Aktuelle Route: {model}."
+    status_pinned: "Aktive Nutzung: Modell dauerhaft festgelegt. Aktuelle Route: {model}."
+    status_timed: "Aktive Nutzung: Modell noch für {remaining} festgelegt, bis {until}. Aktuelle Route: {model}."
     status_unpinned: "Aktive Nutzung: kein Modell festgelegt. Aktuelle Route: {model}."
     session_changed: "Die Sitzung hat sich geändert. /attend erneut ausführen."
     configured_model: "konfigurierte Route"
@@ -1485,7 +1487,7 @@ platform:
     prompt_expired: ⌛ Diese Abfrage wartet nicht mehr auf eine Antwort. Senden Sie Ihre Antwort als normale Nachricht.
 slash:
   attend:
-    description: "Modell für aktive Nutzung bis zur Freigabe festlegen"
+    description: "Modell für aktive Nutzung dauerhaft oder für eine Dauer festlegen"
   approve:
     description: "Einen ausstehenden gefährlichen Befehl genehmigen"
   bg:
