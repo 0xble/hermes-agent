@@ -11,8 +11,11 @@ import sqlite3
 import threading
 from pathlib import Path
 
+import pytest
+
 import hermes_state as hs
 import hermes_state_repair
+import hermes_state_dbfile as dbfile
 import hermes_state_repair as repair
 
 
@@ -169,3 +172,82 @@ def test_preflight_settles_absent_then_recreated_replacement(tmp_path, monkeypat
         assert conn.execute("SELECT id FROM sessions ORDER BY id").fetchall() == [
             ("opener-0",), ("opener-1",)
         ]
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses file permission checks",
+)
+def test_permission_repair_keeps_concurrent_sessions_in_canonical_db(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    db = home / "state.db"
+    db.write_bytes(bytes(4096))
+    db.chmod(0o200)
+    assert not os.access(db, os.R_OK)
+
+    replacement_created = threading.Event()
+    stale_probe = threading.Event()
+    first_finished = threading.Event()
+    real_secure = hs._secure_state_db_files
+    real_lock = hs.quarantine_cross_process_lock
+    real_invalid = dbfile.has_invalid_sqlite_header_preopen
+    errors: list[BaseException | None] = [None, None]
+
+    def is_late():
+        return threading.current_thread().name == "permission-late-opener"
+
+    def secure_then_schedule(path, **kwargs):
+        result = real_secure(path, **kwargs)
+        if not is_late() and kwargs.get("create_main") and not replacement_created.is_set():
+            replacement_created.set()
+            # Choose the vulnerable interleaving only if startup is unlocked.
+            # With serialization, the late opener must wait for initialization.
+            with real_lock(path, timeout=0) as acquired:
+                startup_unlocked = acquired
+            late.start()
+            if startup_unlocked:
+                assert stale_probe.wait(10), "late opener never inspected the empty replacement"
+        return result
+
+    def probe_then_allow_first_commit(path, *args, **kwargs):
+        result = real_invalid(path, *args, **kwargs)
+        if is_late() and result:
+            stale_probe.set()
+            assert first_finished.wait(10), "first opener never committed its session"
+        return result
+
+    def worker(idx):
+        try:
+            sdb = hs.SessionDB(db_path=db)
+            try:
+                sdb.create_session(session_id=f"permission-opener-{idx}", source="test")
+            finally:
+                sdb.close()
+        except BaseException as exc:
+            errors[idx] = exc
+        finally:
+            if idx == 0:
+                first_finished.set()
+
+    late = threading.Thread(target=worker, args=(1,), name="permission-late-opener")
+    monkeypatch.setattr(hs, "_secure_state_db_files", secure_then_schedule)
+    monkeypatch.setattr(dbfile, "has_invalid_sqlite_header_preopen", probe_then_allow_first_commit)
+
+    first = threading.Thread(target=worker, args=(0,), name="permission-first-opener")
+    first.start()
+    first.join(30)
+    if late.ident is not None:
+        late.join(30)
+    assert not first.is_alive() and not late.is_alive()
+    assert replacement_created.is_set(), "first opener never created the replacement"
+    assert errors == [None, None], f"permission-repair startup raised: {errors}"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT id FROM sessions ORDER BY id").fetchall() == [
+            ("permission-opener-0",), ("permission-opener-1",)
+        ]
+    backups = list(home.glob("state.db.*.bak"))
+    assert len(backups) == 1 and backups[0].read_bytes() == bytes(4096)
