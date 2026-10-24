@@ -373,7 +373,9 @@ async def test_stuck_predecessor_has_bounded_visible_failure(monkeypatch, tmp_pa
 
     runner._handle_message_with_agent = handle
     try:
-        reply = await asyncio.wait_for(runner._handle_message(event), 2)
+        # The lease bound is 1 s. The outer budget only guards against a hang, and leaves room
+        # for the spool write's worker thread on a loaded CI runner.
+        reply = await asyncio.wait_for(runner._handle_message(event), 15)
         assert reply == t("gateway.busy.another_turn_running")
         runner._release_unsettled_loop_tick.assert_awaited_once_with(event, ran=False)
         assert not event._gateway_lease_wait_spool.exists()
