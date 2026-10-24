@@ -580,6 +580,17 @@ BROWSER_TOOL_SCHEMAS = [
         },
     },
     {
+        "name": "browser_downloads",
+        "description": "List captured downloads for the current Camofox tab. With download_id from the listing, save that file on the Python host and return its local output_path, never its contents. Files are limited to 20 MiB and responses to 28 MiB. Requires browser_navigate or browser_handoff first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "download_id": {"type": "string", "description": "ID from the listing to save locally. Omit to list metadata only."}
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "browser_press",
         "description": "Press a keyboard key. Useful for submitting forms (Enter), navigating (Tab), or keyboard shortcuts. Requires browser_navigate to be called first.",
         "parameters": {
@@ -786,6 +797,13 @@ def browser_upload(paths: list, ref: Optional[str] = None, selector: Optional[st
     if not _is_camofox_mode():
         return _dumps(_err("browser_upload requires the Camofox browser backend"))
     return _camofox("camofox_upload", paths, ref, selector, task_id)
+
+
+def browser_downloads(download_id: Optional[str] = None, task_id: Optional[str] = None) -> str:
+    """List or locally import captured files for the current Camofox tab."""
+    if not _is_camofox_mode():
+        return _dumps(_err("browser_downloads requires the Camofox browser backend"))
+    return _camofox("camofox_downloads", download_id, task_id)
 
 
 def browser_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
@@ -1473,6 +1491,10 @@ registry.register(name="browser_upload", toolset="browser", schema=_BROWSER_SCHE
                       [str(p) for p in (args.get("paths") or []) if p], ref=args.get("ref") or None,
                       selector=args.get("selector") or None, task_id=kw.get("task_id")),
                   check_fn=_is_camofox_mode, emoji="📎")
+
+registry.register(name="browser_downloads", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_downloads"],
+                  handler=lambda args, **kw: browser_downloads(args.get("download_id"), task_id=kw.get("task_id")),
+                  check_fn=_is_camofox_mode)
 
 for _name, _emoji, _check_fn, _defaults, *_extra in _BROWSER_TOOL_TABLE:
     if _check_fn is None:  # also binds the legacy check_browser_<x>_requirements globals (tests + callers)
