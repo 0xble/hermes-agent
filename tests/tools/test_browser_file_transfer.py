@@ -19,7 +19,7 @@ def peer(monkeypatch, tmp_path):
     import tools.browser_tool  # noqa: F401
     from tools.registry import registry
 
-    state = SimpleNamespace(calls=[], downloads=[], status=200, count=0, tab="transfer-tab")
+    state = SimpleNamespace(calls=[], downloads=[], status=200, error=None, count=0, tab="transfer-tab")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -46,6 +46,8 @@ def peer(monkeypatch, tmp_path):
             if parsed.path.endswith("/snapshot"):
                 return self.send({"snapshot": "- button Upload [e7]", "refsCount": 1})
             if parsed.path.endswith("/downloads"):
+                if state.error is not None:
+                    return self.send(state.error, state.status)
                 records = state.downloads
                 if query.get("includeData") != "true":
                     records = [{k: v for k, v in row.items() if k != "dataBase64"} for row in records]
@@ -180,6 +182,34 @@ def test_download_imports_validated_bytes_without_overwrite_or_content_output(pe
         assert gets[-1][2]["includeData"] == "true"
     else:
         assert not root.exists() or not list(root.rglob("*"))
+
+
+@pytest.mark.parametrize("arguments", [{}, {"download_id": "lost"}], ids=["list", "import"])
+def test_download_missing_tab_invalidates_binding_without_replay(peer, arguments):
+    peer.status = 404
+    peer.error = {"error": "Tab not found"}
+
+    result = peer.dispatch("browser_downloads", arguments)
+
+    assert result["success"] is False
+    assert "tab is gone" in result["error"] and "browser_navigate" in result["error"]
+    assert peer.dispatch("browser_snapshot", {})["success"] is False
+    assert len([call for call in peer.calls if call[1].endswith("/downloads")]) == 1
+    assert not any(call[1] == "/tabs" or call[1].endswith("/snapshot") for call in peer.calls)
+
+
+def test_download_error_body_obeys_transport_limit(peer, monkeypatch):
+    from tools import browser_camofox_files
+
+    monkeypatch.setattr(browser_camofox_files, "MAX_RESPONSE_BYTES", 512)
+    peer.status = 404
+    peer.error = {"error": "Tab not found", "padding": "x" * 2048}
+
+    result = peer.dispatch("browser_downloads", {})
+
+    assert result["success"] is False and "transport limit" in result["error"]
+    assert peer.dispatch("browser_snapshot", {})["success"] is True
+    assert len([call for call in peer.calls if call[1].endswith("/downloads")]) == 1
 
 
 def test_download_stream_limit_does_not_return_partial_file(peer, monkeypatch):

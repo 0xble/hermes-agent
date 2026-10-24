@@ -115,6 +115,15 @@ def upload(paths: list, ref=None, selector=None, task_id=None) -> str:
     return browser._with_tab(task_id, "attach files", body)
 
 
+def _bounded_response_content(response: requests.Response) -> bytes:
+    content = bytearray()
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if len(content) + len(chunk) > MAX_RESPONSE_BYTES:
+            raise ValueError("Camofox download response exceeds the 28 MiB transport limit")
+        content.extend(chunk)
+    return bytes(content)
+
+
 def _download_response(session: dict, include_data: bool) -> list[dict]:
     from tools import browser_camofox as browser
 
@@ -125,16 +134,19 @@ def _download_response(session: dict, include_data: bool) -> list[dict]:
                                     allow_redirects=False)
     except requests.HTTPError as exc:
         if exc.response is not None:
-            exc.response.close()
+            content = b""
+            try:
+                content = _bounded_response_content(exc.response)
+            finally:
+                # Keep only bounded bytes readable by stale-tab recovery after cleanup.
+                exc.response._content = content
+                browser._clear_stale_tab(session, exc)
+                exc.response.close()
         raise
     try:
         if response.status_code != 200:
             raise ValueError("Camofox did not return downloads")
-        content = bytearray()
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            if len(content) + len(chunk) > MAX_RESPONSE_BYTES:
-                raise ValueError("Camofox download response exceeds the 28 MiB transport limit")
-            content.extend(chunk)
+        content = _bounded_response_content(response)
         try:
             data = json.loads(content)
         except (ValueError, UnicodeError):
