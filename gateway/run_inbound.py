@@ -266,6 +266,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
             return None
 
+        # Capture before any admission buffer can park input for shutdown spooling,
+        # including restore gates, compression deferral, and orphan FIFO rescue.
+        if is_genuine_user_message(event) and getattr(event, "_attended_activity_received_at", None) is None:
+            setattr(event, "_attended_activity_received_at", time.time())
+
         reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
         startup_restore_keys = getattr(self, "_startup_restore_keys", None)
         # Session-key normalization precedes the turn's key derivation. The
@@ -285,6 +290,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             and not getattr(event, "_hermes_startup_restore_replay", False)
             and not _is_restore_control_event(event)
         ):
+            self._schedule_attended_user_activity(event, source, reconnect_key)
             self._queue_startup_restore_event(event, session_key=reconnect_key)
             return None
 

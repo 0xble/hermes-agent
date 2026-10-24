@@ -544,14 +544,14 @@ async def test_drain_retries_failed_receipt_with_original_arrival_time(busy_acti
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["idle", "busy"])
+@pytest.mark.parametrize("path", ["idle", "busy", "startup", "reconnect", "compression", "orphan"])
 async def test_drain_arrival_records_receipt_before_spool_and_preserves_it_on_replay(
     tmp_path, monkeypatch, path,
 ):
     from gateway.attended_model import is_genuine_user_message
     from gateway.run_pending_recovery import _claim_recovered_followup
     from gateway.session import AsyncSessionStore
-    from gateway.shutdown_flush import flush_pending_to_file, recover_pending_spool
+    from gateway.shutdown_flush import recover_pending_spool
     from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -569,7 +569,7 @@ async def test_drain_arrival_records_receipt_before_spool_and_preserves_it_on_re
     previous = time.time() - 600
     assert store.mark_user_activity(key, datetime.fromtimestamp(previous))
     runner._session_state(key).conversation.last_user_activity_at = previous
-    runner._draining = True
+    runner._draining = path in {"idle", "busy"}
     runner._is_user_authorized_for_source = lambda _source: True
     runner._admit_bot_message_for_source = lambda _source: True
     runner._scale_to_zero_note_real_inbound = lambda: None
@@ -581,24 +581,53 @@ async def test_drain_arrival_records_receipt_before_spool_and_preserves_it_on_re
         if path == "idle":
             assert not runner._is_session_running(key)
             assert await runner._handle_admitted_message(original) is None
-        else:
+        elif path == "busy":
             runner._session_state(key).turn.agent = Mock()
             assert await runner._handle_active_session_busy_message(original, key) is True
+        elif path in {"startup", "reconnect"}:
+            runner._startup_restore_in_progress = path == "startup"
+            runner._reconnect_restore_keys = {key: 1} if path == "reconnect" else {}
+            assert await runner._hm_admit_event(original) is None
+            assert runner._startup_restore_queue == [original]
+        else:
+            assert await runner._hm_admit_event(original) == (original, source, False)
+            if path == "compression":
+                runner._session_has_compression_in_flight = AsyncMock(return_value=True)
+                runner._start_compression_deferred_drain = Mock()
+                assert await runner._defer_compression_locked_event(key, original)
+            else:
+                older = MessageEvent(text="older queued input", source=source)
+                runner._rescue_orphaned_overflow = lambda *_args: older
+                assert runner._hm_rescue_orphaned_fifo(original, source, False, key)[0] is older
         received = time.time()
         receipt = getattr(original, "_attended_activity_received_at", None)
         assert receipt is not None and before <= receipt <= received
-        task = original._attended_activity_task
-        runner._schedule_attended_user_activity(original, source, key)
-        assert original._attended_activity_task is task
-        await task
-        restored = reader.get_last_user_activity_at(key, refresh=True)
-        assert restored is not None and restored.timestamp() == pytest.approx(receipt, rel=0, abs=1e-6)
-        persist.assert_awaited_once_with(key, when=datetime.fromtimestamp(receipt))
+        task = getattr(original, "_attended_activity_task", None)
+        if path in {"compression", "orphan"}:
+            assert task is None  # These paths park input before turn-start bookkeeping.
+            persist.assert_not_awaited()
+        else:
+            assert task is not None
+            # A normal restore drain must join the arrival task, not stamp again.
+            monkeypatch.setattr("gateway.run_inbound.time.time", lambda: received + 600)
+            runner._schedule_attended_user_activity(original, source, key)
+            assert original._attended_activity_task is task
+            await task
+            restored = reader.get_last_user_activity_at(key, refresh=True)
+            assert restored is not None and restored.timestamp() == pytest.approx(receipt, rel=0, abs=1e-6)
+            persist.assert_awaited_once_with(key, when=datetime.fromtimestamp(receipt))
         assert adapter.sent == []
-        assert adapter._pending_messages[key] is original and original._drain_deferred
-        assert flush_pending_to_file(dict(adapter._pending_messages), reason="drain_deferred") == 1
+        if path in {"startup", "reconnect"}:
+            assert runner._persist_shutdown_pending_messages() == 1
+            assert runner._startup_restore_queue == []
+        else:
+            assert adapter._pending_messages[key] is original
+            assert runner._persist_shutdown_pending_messages() == 1
         spool, = (tmp_path / "pending_messages").glob("*.json")
-        assert json.loads(spool.read_text())["data"]["_attended_activity_received_at"] == receipt
+        payload = json.loads(spool.read_text())
+        assert payload["data"]["_attended_activity_received_at"] == receipt
+        if path in {"startup", "reconnect"}:
+            assert payload["reason"] == "restore_shutdown"
 
         def claim(recovered_key, session_id, data, spool):
             return _claim_recovered_followup(
@@ -625,12 +654,29 @@ async def test_drain_arrival_records_receipt_before_spool_and_preserves_it_on_re
         assert runner._session_state(key).conversation.last_user_activity_at == receipt
         restored = reader.get_last_user_activity_at(key, refresh=True)
         assert restored is not None and restored.timestamp() == pytest.approx(receipt, rel=0, abs=1e-6)
-        assert persist.await_count == 2
+        assert persist.await_count == (1 if path in {"compression", "orphan"} else 2)
         persist.assert_awaited_with(key, when=datetime.fromtimestamp(receipt))
     finally:
         await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
         for session_store in (store, reader):
             session_store.close_all_db_handles()
+
+
+@pytest.mark.parametrize("receipt", [None, True, False, "123", {}, [], float("nan"), float("inf"), -float("inf"), 123, 123.5])
+def test_recovered_receipt_requires_a_finite_number(receipt):
+    from gateway.attended_model import is_genuine_user_message
+    from gateway.run_pending_recovery import _claim_recovered_followup
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source()
+    queued = []
+    data = {"text": "human input", "_attended_activity_received_at": receipt}
+    assert _claim_recovered_followup(runner, "key", "session", data, None, source, source.user_id, queued)
+    replay, = queued
+    valid = type(receipt) in (int, float) and receipt in (123, 123.5)
+    assert getattr(replay, "_attended_activity_received_at", None) == (receipt if valid else None)
+    assert is_genuine_user_message(replay) is valid
 
 
 @pytest.mark.asyncio

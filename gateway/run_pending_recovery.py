@@ -1,6 +1,7 @@
 """Replay shutdown spools under each owning gateway profile at startup."""
 
 import logging
+import math
 from pathlib import Path
 from functools import partial
 
@@ -245,7 +246,11 @@ def _recovered_followup_event(data, source, author_id):
         metadata=data.get("metadata") or {},
         reply_expected=data["reply_expected"] if isinstance(data.get("reply_expected"), bool) else None,
     )
-    setattr(event, "_attended_activity_received_at", data.get("_attended_activity_received_at"))
+    receipt = data.get("_attended_activity_received_at")
+    if (not isinstance(receipt, (int, float)) or isinstance(receipt, bool)
+            or (isinstance(receipt, float) and not math.isfinite(receipt))):
+        receipt = None
+    setattr(event, "_attended_activity_received_at", receipt)
     if recovery_id is not None:
         setattr(event, "_hermes_recovery_id", recovery_id)
     return event
