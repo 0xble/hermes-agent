@@ -219,7 +219,8 @@ def test_a_session_backend_switch_routes_that_session_only_and_global_persists(t
         )
         from tools.delegate_tool import delegate_task
 
-        assert [(b.name, b.available) for b in list_backends()] == [("default", True), ("probe-options", True)]
+        assert [(b.name, b.available) for b in list_backends()] == [
+            ("default", True), ("by_parent", True), ("probe-options", True)]
         set_session_backend("chat-a", "default")
         for sid in ("chat-a", "chat-b"):
             delegate_task(tasks=[{"goal": "route me plainly"}, {"goal": "route me on fast", "option": "fast"}],
