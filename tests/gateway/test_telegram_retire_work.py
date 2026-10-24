@@ -1,4 +1,5 @@
 """Retirement discovers every native owner and moves authoritative routes, not just briefs."""
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -290,7 +291,32 @@ async def test_receipt_accepts_actual_direct_relay_shape(runtime, monkeypatch):
                                     "report_to": "hermes:default/parent"}},
                                 {"session_id": "next", "session_key": "next-key", "thread_id": "18"})
     assert result["receipt_id"] == "r1" and result["address"] == target
-    assert command.await_args.args[-2:] == ("status", "r1")
+    # A Hermes receipt is `posted` until the target stores it. Relay reconciles
+    # for a bounded time and the subprocess deadline outlasts that wait.
+    assert command.await_args.args[-4:] == ("status", "--wait", f"{work.RELAY_CONFIRM_WAIT}s", "r1")
+    assert command.await_args.kwargs["timeout"] > work.RELAY_CONFIRM_WAIT
+
+
+@pytest.mark.asyncio
+async def test_cli_honors_a_longer_deadline_for_waiting_reads(runtime, monkeypatch, tmp_path):
+    from tools.environments import local
+    r = runtime
+    r.runner._resolve_profile_home_for_source = lambda _: tmp_path
+    monkeypatch.setattr(local, "served_profile_child_env", lambda **_: {})
+    monkeypatch.setattr(work, "locate_command", lambda _: SimpleNamespace(command=("/fake/relay",)))
+    process = SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b'{"id":"r1"}', b"")))
+    monkeypatch.setattr(work.asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    deadlines = []
+    real_wait_for = asyncio.wait_for
+
+    async def wait_for(awaitable, timeout):
+        deadlines.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(work.asyncio, "wait_for", wait_for)
+    await work.cli(r.runner, r.source, "relay", "--json", "status", "r1")
+    await work.cli(r.runner, r.source, "relay", "--json", "status", "r1", timeout=90)
+    assert deadlines == [30, 90]
 
 
 @pytest.mark.asyncio
@@ -307,7 +333,7 @@ async def test_task_handoff_preserves_reportback_and_reconciles_assignment(runti
     delivered = {"id": "r1", "target": target, "status": "delivered"}
     writes, keys = [], []
 
-    async def command(_runner, source, *args):
+    async def command(_runner, source, *args, **_):
         if "assignments" in args:
             return [dict(a) for a in assignments]
         if "accept" in args:
@@ -349,7 +375,7 @@ async def test_native_handoff_is_created_under_destination_not_reassigned_on_ret
     keys = []
     saved, assignments, sends = {}, [], []
 
-    async def command(runner, source, *args):
+    async def command(runner, source, *args, **_):
         if "add" in args:
             sid = runner.session_store.peek_session_id(runner._session_key_for_source(source))
             assert work.address(source, sid) == "hermes:default/next"
