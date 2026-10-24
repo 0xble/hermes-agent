@@ -26,7 +26,7 @@ from gateway.response_filters import (
 )
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import canonical_whatsapp_identifier
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -432,6 +432,12 @@ class GatewayBusySessionMixin:
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
             return False
+        # A debounce burst predates any new FIFO arrival. Transfer it without an
+        # await so neither its timer nor the new arrival can overtake it.
+        debounce = getattr(adapter, "_text_debounce", None)
+        if isinstance(debounce, dict) and (buffer := debounce.pop(session_key, None)) is not None:
+            buffer.cancel_timer()
+            self._enqueue_fifo(session_key, buffer.event, adapter)
         # FIFO so each follow-up gets its own turn in arrival order (the single pending slot used to
         # be silently OVERWRITTEN). Photo bursts still merge into the head slot (album semantics).
         pending_slot = getattr(adapter, "_pending_messages", None)
@@ -460,6 +466,8 @@ class GatewayBusySessionMixin:
         }
         if (
             same_security_context
+            and not any(getattr(candidate, "_gateway_compression_deferred", False)
+                        for candidate in (existing, event))
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
         ):
@@ -936,7 +944,7 @@ class GatewayBusySessionMixin:
             return True
         if event.internal and event.allow_gateway_control:
             adapter = self._delivery_adapter_for(event.source)
-            if adapter and session_key in getattr(adapter, "_pending_messages", {}):
+            if adapter:
                 event._gateway_accepted = self._queue_or_replace_pending_event(session_key, event)
                 return True
             return False  # base adapter queues silently behind the active turn
@@ -1008,12 +1016,12 @@ class GatewayBusySessionMixin:
         ):
             # A retained head cannot absorb a debounce buffer. Keep every arrival
             # in the existing FIFO, including the lock-release/backoff boundary.
-            adapter = cast("GatewayRunner", self)._delivery_adapter_for(event.source)
             pending = getattr(adapter, "_pending_messages", {}).get(session_key)
             if (
                 getattr(pending, "_gateway_compression_deferred", False)
                 or await self._session_has_compression_in_flight(session_key)
             ):
+                setattr(event, "_gateway_compression_deferred", True)
                 self._queue_or_replace_pending_event(session_key, event)
                 return True
             return False

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.bot_loop_guard import BotLoopGuard, BotLoopGuardSettings
-from gateway.platforms.base import ProcessingOutcome
+from gateway.platforms.base import MessageType, ProcessingOutcome
 from hermes_state import SessionDB
 from tests.gateway.test_session_hygiene import _make_cooldown_runner
 from tests.waiting import async_wait_until
@@ -154,26 +154,29 @@ async def test_retry_has_one_pending_adapter_lifecycle(locked_lane):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["queue", "interrupt"])
-async def test_deferred_wake_cannot_absorb_same_sender_text(locked_lane, mode):
+@pytest.mark.parametrize("head_kind", ["wake", "photo"])
+async def test_deferred_head_cannot_absorb_same_sender_text(locked_lane, mode, head_kind):
     runner, adapter, event, key, db, sid = locked_lane
     adapter._active_sessions[key] = asyncio.Event()
     adapter._busy_text_mode = mode
     runner._busy_input_mode = "queue"
     runner._effective_busy_text_mode = lambda *_: mode
     adapter._busy_session_handler = runner._handle_active_session_busy_message
-    wake = replace(event, internal=True, text="process finished", message_id="wake",
+    head = replace(event, internal=True, text="process finished", message_id="wake",
                    metadata={"notification_category": "process"})
+    if head_kind == "photo":
+        head = replace(event, message_type=MessageType.PHOTO, text="photo caption", message_id="photo")
+    head_text, head_metadata = head.text, dict(head.metadata)
     human = replace(event, text="human instruction", message_id="human")
     try:
-        assert await runner._handle_message(wake) is None
-        assert adapter._pending_messages[key] is wake
+        assert await runner._handle_message(head) is None
+        assert adapter._pending_messages[key] is head
         # The lock can commit before the retained head's retry backoff expires.
         db.release_compression_lock(sid, "worker")
         await adapter._handle_message_while_active(human, key)
         await adapter._flush_text_debounce_now(key)
-        assert adapter._pending_messages[key] is wake
-        assert wake.text == "process finished"
-        assert wake.metadata == {"notification_category": "process"}
+        assert adapter._pending_messages[key] is head
+        assert head.text == head_text and head.metadata == head_metadata
         assert human.text == "human instruction" and not human.internal
         assert runner._overflow_queue(key) == [human]
         assert key not in adapter._text_debounce_store()
@@ -182,9 +185,11 @@ async def test_deferred_wake_cannot_absorb_same_sender_text(locked_lane, mode):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["queue", "interrupt"])
+@pytest.mark.parametrize("mode,lock_boundary", [
+    ("queue", "retained"), ("interrupt", "retained"), ("queue", "buffered"),
+])
 @pytest.mark.parametrize("third_kind", ["human", "relay", "internal"])
-async def test_later_inputs_follow_retained_retry(locked_lane, mode, third_kind):
+async def test_later_inputs_follow_retained_retry(locked_lane, mode, lock_boundary, third_kind):
     runner, adapter, event, key, db, sid = locked_lane
     adapter._busy_text_mode = mode
     runner._busy_input_mode = "queue"
@@ -192,11 +197,15 @@ async def test_later_inputs_follow_retained_retry(locked_lane, mode, third_kind)
     adapter._busy_session_handler = runner._handle_active_session_busy_message
     adapter.on_processing_start = AsyncMock()
     executed = []
+    model_started, model_release = asyncio.Event(), asyncio.Event()
 
     from gateway.turn_context import TurnContext
 
     async def model_turn(*, message, source, session_id, session_key, run_generation,
                          _interrupt_depth=0, **_kwargs):
+        if lock_boundary == "buffered" and message == event.text:
+            model_started.set()
+            await model_release.wait()
         executed.append(message)
         result = {"final_response": message, "messages": []}
         context = TurnContext(
@@ -227,8 +236,13 @@ async def test_later_inputs_follow_retained_retry(locked_lane, mode, third_kind)
     runner._handle_message_with_agent.side_effect = execute
     adapter.set_message_handler(runner._handle_message)
     try:
+        if lock_boundary == "buffered":
+            db.release_compression_lock(sid, "worker")
         await adapter.handle_message(event)
-        await async_wait_until(lambda: adapter._requeue_counts.get(key, 0) >= 2, timeout=10)
+        if lock_boundary == "buffered":
+            await async_wait_until(model_started.is_set, timeout=10)
+        else:
+            await async_wait_until(lambda: adapter._requeue_counts.get(key, 0) >= 2, timeout=10)
         owner = adapter._session_tasks[key]
         second = replace(event, text="second", message_id="2")
         third = replace(event, text="third", message_id="3")
@@ -239,14 +253,23 @@ async def test_later_inputs_follow_retained_retry(locked_lane, mode, third_kind)
             third.metadata = {"notification_category": "process"}
         expected = [event.text, second.text, third.text]
         await adapter.handle_message(second)
+        if lock_boundary == "buffered":
+            assert adapter._text_debounce_store()[key].event is second
+            assert db.try_acquire_compression_lock(sid, "worker")
         await adapter.handle_message(third)
         await adapter._flush_text_debounce_now(key)
-        assert adapter._pending_messages[key] is event
+        if lock_boundary == "buffered":
+            assert adapter._pending_messages[key] is second
+            assert runner._overflow_queue(key) == [third]
+            assert key not in adapter._text_debounce_store()
+        else:
+            assert adapter._pending_messages[key] is event
         assert event.text == "hello" and event.message_id == "1"
         assert adapter._session_tasks[key] is owner and not owner.done()
         adapter.on_processing_start.assert_awaited_once_with(event)
         assert adapter.sent == []
         db.release_compression_lock(sid, "worker")
+        model_release.set()
         await async_wait_until(lambda: len(executed) == len(expected), timeout=10)
         assert executed == expected
         await async_wait_until(lambda: key not in adapter._active_sessions, timeout=10)
