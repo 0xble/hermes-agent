@@ -10,7 +10,7 @@ import time
 from typing import Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from agent.conversation_compression import _CompressionLease, _Attempt, _CommitOutcome
+    from agent.conversation_compression import _CompressionLease, _Attempt, _CommitOutcome, CompressionCommitFence
 
 from hermes_state_errors import is_sqlite_lock_error
 from hermes_state_publication import publication_metrics, record_publication_attempt, raise_if_nonretryable_contention
@@ -188,6 +188,7 @@ def _commit_compaction(
     new_system_prompt: str, system_message: str, compressed_user_turn_outcome: str,
     messages_before_compression: Optional[list], made_progress: bool, attempt: _Attempt,
     verbatim_tail: Optional[list] = None, carried_messages: Optional[list] = None,
+    commit_fence: Optional[CompressionCommitFence] = None,
 ) -> _CommitOutcome:
     """Persist the compacted transcript: anti-growth guard, memory extraction, then the
     in-place archive or the parent->child rotation.
@@ -291,6 +292,8 @@ def _commit_compaction(
                 agent, messages, compressed, in_place=in_place, old_session_id=old_session_id,
                 split_status=split_status, messages_before_compression=messages_before_compression,
                 made_progress=made_progress, attempt=attempt, e=e)
+            if commit_fence is not None:
+                commit_fence.mark_publication_failed()
     return _CommitOutcome(
         compressed=compressed, commit_started_at=commit_started_at, old_session_id=old_session_id,
         split_status=split_status, session_commit_succeeded=session_commit_succeeded,

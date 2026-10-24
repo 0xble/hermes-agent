@@ -4223,9 +4223,8 @@ def compress_context(
             # of archiving it compacted=1 next to a fresh twin (display would show it twice). The
             # todo fold / user-anchor rows above keep their own class and are not carried.
             carried_messages=[reinserted_reply] if reinserted_reply is not None else None,
+            commit_fence=commit_fence,
         )
-        if commit_fence is not None and commit.split_status in {"failed_not_indexed", "aborted"}:
-            commit_fence.mark_publication_failed()
         if commit.refused_prompt is not None:
             _restore_messages_snapshot(messages, messages_before_compression)
             return messages, commit.refused_prompt
