@@ -64,6 +64,55 @@ and the existing 24-hour outcome expiry bounds retries.
 
 ## Proof surface
 
+### Telegram Topic Retirement
+
+**Fork patch identity:** `telegram-topic-retire`. `/retire [topic|now|cancel]`
+and `telegram_topic`'s `retire`/`cancel_retire` actions share the profile-local
+`state_meta` record and executor in `gateway/telegram_retire.py`. Pending
+retirement gates new user work, but accepts cancellation, owner answers and
+already-owned internal completions. `now` requests interruption first.
+Retirement waits until the active turn settles before discovering obligations.
+
+`gateway/telegram_retire_work.py` discovers goals, loops, active and paused cron
+routes, background processes and watchers, durable delegations and pending
+results, and the task ledger's exact-session assignment inbox. Active task claim
+tokens cannot be moved by assignment, so they hold retirement until settlement.
+Existing tasks retain their original assigner and report recipient. Self-owned
+work reports in the destination topic. Task creation and assignment use the
+ledger APIs, with exact task/context and typed-assignment readbacks before a
+source-origin relay. This avoids both an unreportable `assigned_by != report_to`
+row and relay's self-send refusal. Stable, bounded plain-token relay keys and
+assignment reconciliation prevent duplicate offers during recovery.
+A changed session binding holds retirement for an explicit cancel/retry instead
+of guessing which session owns a compacted turn's work. The existing live
+exact-title matcher selects unambiguous subject owners. Other owners require
+1 numbered question or an explicit target topic. Receipt IDs, transfer intentions
+and verified moves persist independently of discovery, so a restart cannot
+forget an item that has already left the source inventory.
+
+Deletion requires the same generation's complete successful closing SendResult,
+including a message ID and the original thread. Partial, deferred, held,
+thread-fallback, failed or cancelled sends never authorize it. Callback execution
+alone is not evidence. A saved uncertain closing attempt is not replayed. Remote
+delete uncertainty probes the exact thread before any CLI fallback, and reads
+back absence before removing the existing topic binding and routing index entry.
+The session and transcript remain. The user CLI's exact `topic list --id` probe
+is preferred when installed. Its DM peer is the bot's dialog, not the Bot API
+user chat ID. The strict Bot API missing-thread probe serves other installations.
+An unresolved delete is quiescent, not retried by housekeeping. `/retire` or
+`/retire cancel` first probes the exact topic under the executor lock. Confirmed
+absence only cleans up its binding. Confirmed existence permits cancellation or
+a fresh generation that inventories again and requires a new closing receipt.
+An unknown result leaves the previous dispatch unresolved and never repeats it.
+
+Proof surfaces: `tests/gateway/test_telegram_retire.py` and
+`test_telegram_retire_work.py`, plus the existing topic-tool, topic-mode,
+process-registry, async-delegation and completion-delivery regression suites.
+Live validation must use disposable topics and preserve their session histories.
+Roll back the gateway/tool hooks and retirement modules together. The additive
+metadata may remain ignored by older versions. Retire this fork patch only after
+upstream provides equivalent durable handoff and delivery-before-delete behavior.
+
 Core regression tests cover quote freshness, relay rejection, target resolution, immediate controls, pending approval, atomic resolution/expiry, goal replacement, revision isolation, and loop actions. Gateway tests cover the non-blocking watcher/outbox behavior, Telegram-topic metadata, route skipping, continuation cleanup, and goal-resume admission. Telegram tests cover callback authorization, callback rendering that preserves the request text, and no-op second presses.
 
 ## Upstream disposition

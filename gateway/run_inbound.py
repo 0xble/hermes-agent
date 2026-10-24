@@ -1756,6 +1756,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if _paused_notice is not None:
             return _paused_notice
 
+        from gateway.telegram_retire import intercept
+        _retire_reply = await intercept(self, event)
+        if _retire_reply is not None:
+            return _retire_reply
         _quick_key = self._session_key_for_source(source)
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
