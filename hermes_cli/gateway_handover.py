@@ -40,6 +40,7 @@ class HandoverEffects:
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     write_plist: Callable[[Path, str], None] | None = None
+    supervised_pid: Callable[[str], int | None] | None = None
 
 
 def _launchctl_runner(args: list[str]) -> None:
@@ -64,11 +65,13 @@ def _default_write_plist(path: Path, contents: str) -> None:
 def _effects(effects: HandoverEffects | None) -> HandoverEffects:
     if effects is not None:
         return effects
+    from hermes_cli.gateway_launchd import _launchctl_supervised_pid
     return HandoverEffects(
         process_exists=_pid_exists,
         bootstrap=_default_bootstrap,
         bootout=_default_bootout,
         write_plist=_default_write_plist,
+        supervised_pid=_launchctl_supervised_pid,
     )
 
 
@@ -103,7 +106,7 @@ def _slot_plist_path(label: str) -> Path:
     return get_launchd_plist_path().with_name(f"{label}.plist")
 
 
-def _failure(effects: HandoverEffects, idle_label: str, message: str, *, cleanup: bool = True) -> int:
+def _failure(effects: HandoverEffects, idle_label: str, message: str, *, cleanup: bool = False) -> int:
     if cleanup:
         try:
             assert effects.bootout is not None
@@ -116,7 +119,8 @@ def _failure(effects: HandoverEffects, idle_label: str, message: str, *, cleanup
 
 
 def run_handover(*, home: Path | None = None, enabled: bool | None = None,
-                 timeout: float, effects: HandoverEffects | None = None) -> int:
+                 timeout: float, effects: HandoverEffects | None = None, release_target: Path | None = None,
+                 wait_for_exit: bool = True) -> int:
     """Perform one A→B handover and return a CLI exit code."""
     home = Path(home or get_hermes_home()).expanduser().resolve()
     fx = _effects(effects)
@@ -125,11 +129,18 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
         return 2
 
     from hermes_cli.gateway_launchd import generate_launchd_plist, get_launchd_slot_labels
+    # Every entry point selects the same immutable tree, including explicit
+    # CLI handover. A source install has no selection and keeps its normal
+    # launcher without claiming immutable pinning.
+    if release_target is None:
+        from hermes_cli.immutable_releases import ReleasePaths, read_pointer
+        release_target = read_pointer(ReleasePaths.for_home(home).current)
     labels = get_launchd_slot_labels()
     label_by_slot = {SLOT_ACTIVE: labels[0], SLOT_STANDBY: labels[1]}
     snapshots = {slot: _slot_snapshot(fx, home, slot) for slot in (SLOT_ACTIVE, SLOT_STANDBY)}
     active_slots = [slot for slot, (identity, _status) in snapshots.items()
-                    if identity is not None and identity.get("standby") is False]
+                    if identity is not None and identity.get("standby") is False
+                    and not identity.get("handover_accepted")]
     if len(active_slots) != 1:
         return _failure(fx, labels[1], f"refusing handover: expected exactly one active slot, found {len(active_slots)}", cleanup=False)
     active_slot = active_slots[0]
@@ -141,20 +152,30 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
     idle_snapshot = idle_identity or idle_status
     if idle_snapshot is not None and idle_snapshot.get("standby") is not True:
         return _failure(fx, idle_label, "refusing handover: idle slot is active", cleanup=False)
+    from gateway.gateway_slot import slot_lock_held
+    if idle_snapshot is None and slot_lock_held(home, idle_slot):
+        return _failure(fx, idle_label, "idle slot is live but unanswered", cleanup=False)
     reused = idle_identity is not None or idle_status is not None
+    if reused and release_target is not None and (idle_identity or {}).get("code_sha") != release_target.name:
+        return _failure(fx, idle_label, "standby is pinned to another release", cleanup=False)
     if reused and not bool((idle_status or idle_identity or {}).get("ready")):
         return _failure(fx, idle_label, "refusing handover: standby slot is running but not ready")
 
     if not reused:
         assert fx.bootstrap is not None and fx.write_plist is not None
         plist_path = _slot_plist_path(idle_label)
-        fx.write_plist(plist_path, generate_launchd_plist(slot=idle_slot))
+        fx.write_plist(plist_path, generate_launchd_plist(slot=idle_slot, release_target=release_target))
         try:
             fx.bootstrap(idle_label, plist_path)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             # A slot that exited cleanly stays loaded (KeepAlive restarts only failures), and bootstrap
             # of a loaded label fails with EIO. Nothing answers on that slot (reused is False), so
             # booting the stale label out and bootstrapping once more is safe (found in a real drill).
+            # Bootstrap failure and socket silence do not prove death. Only unload a stale label
+            # after both the slot owner lock and native supervisor say no process is running.
+            if (slot_lock_held(home, idle_slot) or fx.supervised_pid is None or
+                    fx.supervised_pid(idle_label) is not None):
+                return _failure(fx, idle_label, f"standby bootstrap uncertain: {exc}")
             try:
                 assert fx.bootout is not None
                 fx.bootout(idle_label)
@@ -169,6 +190,12 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
         (_query(fx, home, "status", idle_slot) or {}).get("standby") is True)):
         return _failure(fx, idle_label, "standby did not become ready before the handover budget expired")
 
+    old_identity, old_status = snapshots[active_slot]
+    old_pid = ((old_identity or {}).get("pid") or (old_status or {}).get("pid"))
+    armed = fx.query(home, "arm-handover", slot=idle_slot, params={
+        "predecessor_slot": active_slot, "predecessor_pid": old_pid})
+    if not armed or not armed.get("armed"):
+        return _failure(fx, idle_label, "successor could not own promotion", cleanup=False)
     accepted = _query(fx, home, "handover", active_slot)
     if not accepted or accepted.get("accepted") is not True:
         # A lost answer may still have been accepted, and an accepted handover is not cancellable: the
@@ -176,7 +203,7 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
         # proves it did not accept; otherwise carry on as accepted.
         status = _query(fx, home, "handover-status", active_slot)
         if not (status or {}).get("accepted"):
-            return _failure(fx, idle_label, f"active gateway refused handover: {accepted or 'no response'}")
+            return _failure(fx, idle_label, f"active handover not confirmed: {accepted or 'no response'}", cleanup=False)
 
     old_identity, old_status = snapshots[active_slot]
     old_pid = ((old_identity or {}).get("pid") or (old_status or {}).get("pid"))
@@ -213,6 +240,9 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
         (_query(fx, home, "status", idle_slot) or {}).get("standby") is False)):
         print(f"⚠ {idle_label} accepted promotion but has not reported active status yet; leaving it running")
 
+    if not wait_for_exit:
+        # The updater may itself be an old-owned command. Waiting for it would deadlock retirement.
+        return 0
     # The old slot finishes its own in-flight turns with no drain budget (zero-cut), then exits 0.
     print(f"… {idle_label} is serving; waiting for {active_label} to finish its in-flight turns and exit")
     _poll(fx, float("inf"), lambda: _old_active_exited(fx, home, old_pid, active_slot))
@@ -235,11 +265,10 @@ def _handover_released(fx: HandoverEffects, home: Path, holder: list[Any], slot:
     holder[0] = state
     if state and (state.get("failed") or state.get("status") == "failed"):
         return True
-    if state and state.get("token_lock_released") is True:
+    if state and state.get("updates_settled") is True and state.get("token_lock_released") is True:
         return True
-    identity = _query(fx, home, "identify", slot)
-    dead = identity is None
-    if not dead and old_pid is not None:
+    dead = False
+    if old_pid is not None:
         try:
             dead = not fx.process_exists(int(old_pid))
         except (TypeError, ValueError, OSError):
@@ -253,13 +282,19 @@ def _handover_released(fx: HandoverEffects, home: Path, holder: list[Any], slot:
 
 
 def _old_active_exited(fx: HandoverEffects, home: Path, pid: Any, slot: str) -> bool:
-    identity = _query(fx, home, "identify", slot)
-    if identity is None:
-        return True
     try:
         return pid is not None and not fx.process_exists(int(pid))
     except (TypeError, ValueError, OSError):
         return False
+
+
+def planned_handover() -> bool | None:
+    """Shared opt-in boundary. None alone permits the legacy restart path."""
+    from hermes_cli.config import load_config_readonly
+    if not is_zero_cut_handover_enabled(load_config_readonly()):
+        return None
+    return run_handover(home=get_hermes_home(), timeout=STANDBY_READY_BUDGET_S,
+                        wait_for_exit=False) == 0
 
 
 def cmd_handover(args) -> int:

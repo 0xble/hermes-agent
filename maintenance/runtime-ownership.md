@@ -64,6 +64,17 @@ not establish runtime health. Manually promote reviewed fork `main` through
 then check the native receipt, live identity, and a real model round trip.
 Company updates continue through their signed release owners, not these personal jobs.
 
+For an opted-in [zero-cut handover](zero-cut-handover.md), normal update and
+planned restart transfer polling without retiring the original work owner.
+Read both fixed slots: the serving label may be `.b`, and `current` can already
+name the successor while the predecessor still imports from its pinned release.
+Retain that release and environment until its live owner exits. Verify the
+transaction acknowledgement against the serving slot's supervised process and
+code identity, not the primary label or pointer alone. A completed transfer does
+not prove predecessor retirement. If both slots remain occupied, refuse another
+transfer without a destructive fallback. Native mixed-work and exact-candidate
+qualification remain activation gates, not consequences of a source test pass.
+
 ### Progress and failure handling
 
 - Resume the existing candidate and inspect prior receipts, live process handles,

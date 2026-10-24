@@ -20,9 +20,9 @@ class FakeGateway:
         self.standby_ready = False
         self.booted = False
         self.handover_states = iter([{"accepted": True, "token_lock_released": False},
-                                     {"accepted": True, "token_lock_released": True}])
+                                     {"accepted": True, "updates_settled": True, "token_lock_released": True}])
 
-    def query(self, home, verb, *, slot, timeout=2.0):
+    def query(self, home, verb, *, slot, timeout=2.0, params=None):
         self.calls.append((verb, slot))
         if slot == "a":
             if verb == "identify":
@@ -33,6 +33,8 @@ class FakeGateway:
                 return {"accepted": True}
             if verb == "handover-status":
                 return next(self.handover_states)
+        if verb == "arm-handover":
+            return {"armed": True}
         if slot == "b":
             if verb == "identify":
                 return ({"slot": "b", "standby": True, "ready": self.standby_ready}
@@ -60,6 +62,7 @@ def _effects(fake, events):
         monotonic=lambda: 0.0,
         sleep=lambda _: setattr(fake, "standby_ready", True),
         write_plist=lambda path, text: events.append(("plist", path.name, "b" in text)),
+        supervised_pid=lambda label: None,
     )
 
 
@@ -79,7 +82,7 @@ def test_standby_never_ready_leaves_active_untouched(tmp_path):
     effects = HandoverEffects(**{**effects.__dict__, "monotonic": lambda: next(clock),
                                  "sleep": lambda _: None})
     assert run_handover(home=tmp_path, timeout=1, effects=effects) == 1
-    assert any(event[0] == "bootout" and event[1].endswith(".b") for event in events)
+    assert not any(event[0] == "bootout" for event in events)
     assert not any(verb == "handover" for verb, _slot in fake.calls)
 
 
@@ -88,11 +91,11 @@ def test_handover_failed_does_not_promote(tmp_path):
     fake.handover_states = iter([{"failed": "telegram lock failure"}])
     assert run_handover(home=tmp_path, timeout=5, effects=_effects(fake, events)) == 1
     assert not any(verb == "promote" for verb, _slot in fake.calls)
-    assert any(event[0] == "bootout" for event in events)
+    assert not any(event[0] == "bootout" for event in events)
 
 
 def test_active_role_errors_and_reverse_handover_is_supported(tmp_path):
-    def query(home, verb, *, slot, timeout=2):
+    def query(home, verb, *, slot, timeout=2, params=None):
         if verb == "identify":
             return {"standby": False, "slot": slot}
         return {"standby": False, "ready": True}
@@ -106,10 +109,12 @@ def test_active_role_errors_and_reverse_handover_is_supported(tmp_path):
             self.booted = False
             self.old_alive = True
             self.handover_states = iter([{"accepted": True, "token_lock_released": False},
-                                         {"accepted": True, "token_lock_released": True}])
+                                         {"accepted": True, "updates_settled": True, "token_lock_released": True}])
 
-        def query(self, home, verb, *, slot, timeout=2.0):
+        def query(self, home, verb, *, slot, timeout=2.0, params=None):
             self.calls.append((verb, slot))
+            if verb == "arm-handover":
+                return {"armed": True}
             if slot == "b":
                 if verb == "identify":
                     return {"slot": "b", "standby": False, "pid": 202}
@@ -148,8 +153,10 @@ def test_active_dies_before_release_still_promotes_idle_and_only_boots_out_activ
             super().__init__()
             self.crashed = False
 
-        def query(self, home, verb, *, slot, timeout=2.0):
+        def query(self, home, verb, *, slot, timeout=2.0, params=None):
             self.calls.append((verb, slot))
+            if verb == "arm-handover":
+                return {"armed": True}
             if slot == "a":
                 if verb == "identify":
                     return {"slot": "a", "standby": False, "pid": 101} if not self.crashed else None
@@ -177,7 +184,7 @@ def test_active_dies_before_release_still_promotes_idle_and_only_boots_out_activ
         query=fake.query,
         bootstrap=lambda label, path: (events.append(("bootstrap", label)), setattr(fake, "booted", True)),
         bootout=lambda label: events.append(("bootout", label)),
-        process_exists=lambda pid: fake.old_alive,
+        process_exists=lambda pid: not fake.crashed,
         monotonic=lambda: 0.0,
         sleep=lambda _: setattr(fake, "standby_ready", True),
         write_plist=lambda path, text: events.append(("plist", path.name, "b" in text)),
@@ -195,7 +202,7 @@ def test_old_active_drains_past_the_budget_and_promoted_standby_is_never_booted_
     fake, events = FakeGateway(), []
     ticks = {"n": 0}
 
-    def promote_keeps_old_alive(home, verb, *, slot, timeout=2.0):
+    def promote_keeps_old_alive(home, verb, *, slot, timeout=2.0, params=None):
         result = FakeGateway.query(fake, home, verb, slot=slot, timeout=timeout)
         if verb == "promote":
             fake.old_alive = True  # A still finishing an in-flight turn
@@ -216,7 +223,7 @@ def test_old_active_drains_past_the_budget_and_promoted_standby_is_never_booted_
         query=promote_keeps_old_alive,
         bootstrap=lambda label, path: (events.append(("bootstrap", label)), setattr(fake, "booted", True)),
         bootout=lambda label: events.append(("bootout", label)),
-        process_exists=lambda pid: True,
+        process_exists=lambda pid: clock["t"] < 22,
         monotonic=lambda: clock["t"],
         sleep=sleep,
         write_plist=lambda path, text: None,
@@ -275,7 +282,7 @@ def test_lost_promote_answer_never_boots_out_the_standby(tmp_path):
     real_query = fake.query
     timeouts = []
 
-    def slow_promote(home, verb, *, slot, timeout=2.0):
+    def slow_promote(home, verb, *, slot, timeout=2.0, params=None):
         if verb == "promote":
             timeouts.append(timeout)
             real_query(home, verb, slot=slot, timeout=timeout)  # takes effect...
@@ -292,7 +299,7 @@ def test_refused_promotion_after_release_leaves_standby_running(tmp_path):
     fake, events = FakeGateway(), []
     real_query = fake.query
 
-    def refuse(home, verb, *, slot, timeout=2.0):
+    def refuse(home, verb, *, slot, timeout=2.0, params=None):
         if verb == "promote":
             return {"promoted": False, "refused": "not_ready"}
         return real_query(home, verb, slot=slot, timeout=timeout)
@@ -327,7 +334,7 @@ def test_slow_release_after_acceptance_never_boots_out_the_standby(tmp_path):
     fake, events = FakeGateway(), []
     clock = [0.0]
     states = iter([{"accepted": True, "token_lock_released": False}] * 50 +
-                  [{"accepted": True, "token_lock_released": True}])
+                  [{"accepted": True, "updates_settled": True, "token_lock_released": True}])
     fake.handover_states = states
     base = _effects(fake, events)
 
@@ -344,21 +351,21 @@ def test_lost_handover_answer_that_was_accepted_carries_on(tmp_path):
     fake, events = FakeGateway(), []
     real_query = fake.query
 
-    def lossy(home, verb, *, slot, timeout=2.0):
+    def lossy(home, verb, *, slot, timeout=2.0, params=None):
         answer = real_query(home, verb, slot=slot, timeout=timeout)
         return None if verb == "handover" else answer  # accepted, but the answer never arrives
 
-    fake.handover_states = iter([{"accepted": True, "token_lock_released": True}] * 5)
+    fake.handover_states = iter([{"accepted": True, "updates_settled": True, "token_lock_released": True}] * 5)
     effects = dataclasses.replace(_effects(fake, events), query=lossy)
     assert run_handover(home=tmp_path, timeout=5, effects=effects) == 0
     assert not any(kind == "bootout" and label.endswith(".b") for kind, label, *_ in events)
 
 
-def test_handover_that_was_never_accepted_boots_out_the_standby(tmp_path):
+def test_handover_that_was_never_accepted_preserves_both_slots(tmp_path):
     fake, events = FakeGateway(), []
     real_query = fake.query
 
-    def refused(home, verb, *, slot, timeout=2.0):
+    def refused(home, verb, *, slot, timeout=2.0, params=None):
         if verb == "handover":
             return {"accepted": False, "refused": "disabled"}
         if verb == "handover-status":
@@ -367,4 +374,29 @@ def test_handover_that_was_never_accepted_boots_out_the_standby(tmp_path):
 
     effects = dataclasses.replace(_effects(fake, events), query=refused)
     assert run_handover(home=tmp_path, timeout=5, effects=effects) == 1
-    assert any(kind == "bootout" and label.endswith(".b") for kind, label, *_ in events)
+    assert not any(kind == "bootout" for kind, *_ in events)
+
+
+def test_common_handover_boundary_resolves_omitted_immutable_selection(tmp_path, monkeypatch):
+    from hermes_cli import gateway_launchd
+    target = tmp_path / "releases/selected"
+    target.mkdir(parents=True)
+    (tmp_path / "current").symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    selected = []
+    monkeypatch.setattr(gateway_launchd, "generate_launchd_plist", lambda **kw: selected.append(kw.get("release_target")) or "plist")
+    fake, events = FakeGateway(), []
+    assert run_handover(home=tmp_path, timeout=5, effects=_effects(fake, events)) == 0
+    assert selected == [target]
+
+
+def test_common_handover_boundary_preserves_explicit_target_and_source_install(tmp_path, monkeypatch):
+    from hermes_cli import gateway_launchd
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    selected = []
+    monkeypatch.setattr(gateway_launchd, "generate_launchd_plist", lambda **kw: selected.append(kw.get("release_target")) or "plist")
+    explicit = tmp_path / "releases/explicit"
+    for target in (explicit, None):
+        fake, events = FakeGateway(), []
+        assert run_handover(home=tmp_path, timeout=5, release_target=target, effects=_effects(fake, events)) == 0
+    assert selected == [explicit, None]

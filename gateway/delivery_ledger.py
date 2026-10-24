@@ -403,6 +403,17 @@ def recorded_contents_since(session_key: str, since: float) -> Dict[str, int]:
     return counts
 
 
+def owned_pending_count() -> int:
+    """Unsettled final deliveries of this process, including delayed retry obligations."""
+    if not _db_path().exists():
+        return 0
+    pid, started = _owner_stamp()
+    with _transaction() as conn:
+        return conn.execute("""SELECT COUNT(*) FROM delivery_obligations
+            WHERE owner_pid=? AND owner_started_at IS ? AND state IN ('pending','attempting','failed')""",
+                            (pid, started)).fetchone()[0]
+
+
 def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 

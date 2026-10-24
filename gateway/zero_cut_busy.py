@@ -117,14 +117,34 @@ async def queue_foreign_owner(runner: Any, event: Any, session_key: str) -> bool
     if not _enabled(runner):
         return False
     waiting = session_key in (getattr(runner, "_zero_cut_busy_keys", None) or ())
+    text = str(getattr(event, "text", "") or "")
+    verb = text.split()[0].split("@")[0].lower() if text.split() else ""
+    control = verb in {"/approve", "/deny", "/stop"}
     marker = None
-    if not (waiting and _pending_for(runner, session_key)[1] is not None):
+    # Normal follow-ups preserve FIFO even after the marker clears. Controls must
+    # refresh ownership instead of joining a queue the original turn is blocking.
+    if control or not (waiting and _pending_for(runner, session_key)[1] is not None):
         marker = await asyncio.to_thread(_marker, runner.async_session_store, session_key)
         if marker is None or marker["pid"] == os.getpid() or not _owner_live(marker["pid"]):
             return False
     schedule_activity = getattr(runner, "_schedule_attended_user_activity", None)
     if callable(schedule_activity):
         schedule_activity(event, event.source, session_key)
+    # Approval/control replies cannot sit behind the very turn they must unblock.
+    if marker and control:
+        from gateway.control_socket import query_gateway_control
+        from gateway.status import _get_process_hermes_home
+        response = await asyncio.to_thread(
+            query_gateway_control, _get_process_hermes_home(), "handover-control", slot=marker["slot"],
+            params={"source": event.source.to_dict(), "text": text})
+        # Never requeue/replay a submitted control if its acknowledgement was lost.
+        if response is None or response.get("owned"):
+            if response and response.get("response"):
+                adapter = runner._delivery_adapter_for(event.source)
+                if adapter is not None:
+                    await adapter.send(str(event.source.chat_id), response["response"],
+                                       thread_id=event.source.thread_id)
+            return True
     accepted = runner._queue_or_replace_pending_event(session_key, event)
     if accepted:
         keys = getattr(runner, "_zero_cut_busy_keys", None)

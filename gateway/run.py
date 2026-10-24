@@ -5876,7 +5876,12 @@ async def _start_gateway_start_control_socket(runner):
 
         from gateway.cron_review import CronReviewControl
         from gateway import zero_cut_standby as zcs
+        from gateway.zero_cut_controls import resolve_callback, resolve_text_control
         from gateway.zero_cut_handover_drain import request_handover, status as handover_status
+        zcs.bind_runner(runner)
+        async def _arm_handover(owner, params):
+            return zcs.arm_handover(owner, params)
+
         _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
@@ -5890,6 +5895,12 @@ async def _start_gateway_start_control_socket(runner):
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "purge-profile-identity": purge_profile_identity_verb(runner),
                            "reload-plugins": reload_plugins_verb(runner, _main_loop),
+                           "handover-callback": lambda params: asyncio.run_coroutine_threadsafe(
+                               resolve_callback(runner, params), _main_loop).result(),
+                           "handover-control": lambda params: asyncio.run_coroutine_threadsafe(
+                               resolve_text_control(runner, params), _main_loop).result(),
+                           "arm-handover": lambda params: asyncio.run_coroutine_threadsafe(
+                               _arm_handover(runner, params), _main_loop).result(),
                            "promote": lambda: asyncio.run_coroutine_threadsafe(zcs.promote(runner), _main_loop).result(),
                            "handover": lambda: request_handover(runner, _main_loop),
                            "handover-status": lambda: handover_status(runner)})
