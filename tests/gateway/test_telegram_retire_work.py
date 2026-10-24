@@ -306,6 +306,76 @@ def test_live_process_transfer_updates_watcher_and_checkpoint(monkeypatch):
     checkpoint.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_process_watcher_delivers_only_to_transferred_topic(monkeypatch):
+    from contextlib import nullcontext
+    from tests.gateway.restart_test_helpers import make_restart_runner
+    import tools.process_registry as registry_module
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc-route", command="build", task_id="task", owner_task_id="old",
+        session_key="old-key", parent_session_id="old",
+        watcher_platform="telegram", watcher_chat_id="101", watcher_thread_id="17")
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    monkeypatch.setattr(registry, "_write_checkpoint", MagicMock())
+    destination = SessionSource(platform=Platform.TELEGRAM, chat_id="101", thread_id="18", chat_type="dm")
+    moved = registry.transfer_ownership(
+        session.id, from_owner="old", to_owner="next", to_task_id="task",
+        to_session_key="next-key", to_source=destination)
+    assert moved is session
+    session.mark_exited(0)
+    runner, _adapter = make_restart_runner()
+    monkeypatch.setattr(runner, "_completion_event_scope", lambda _: nullcontext())
+    monkeypatch.setattr(runner, "_load_background_notifications_mode", lambda: "concise")
+    send = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_send_watcher_message", send)
+    monkeypatch.setattr("gateway.run_notifications.asyncio.sleep", AsyncMock())
+    monkeypatch.setattr("tools.process_registry_notifications.should_surface_notification", lambda _: True)
+    await runner._run_process_watcher({
+        "session_id": session.id, "session_key": "old-key", "check_interval": 1,
+        "platform": "telegram", "chat_id": "101", "thread_id": "17"})
+    send.assert_awaited_once()
+    assert send.await_args is not None
+    assert send.await_args.args[:3] == ("telegram", "101", "18")
+
+
+@pytest.mark.asyncio
+async def test_queued_batch_regroups_transferred_sibling_and_retries_only_new_route(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from tests.gateway.restart_test_helpers import make_restart_runner
+    from tools import async_delegation as delegation
+
+    old_key = "agent:main:telegram:dm:101:17"
+    new_key = "agent:main:telegram:dm:101:18"
+    monkeypatch.setattr(delegation, "_db_path", lambda: tmp_path / "state.db")
+    with delegation._transaction() as conn:
+        conn.executemany("""INSERT INTO async_delegations
+            (delegation_id, origin_session, parent_session_id, state, dispatched_at, updated_at,
+             delivery_state, task_json) VALUES (?, ?, ?, 'running', 1, 1, 'pending', '{}')""",
+            [("stay", old_key, "old"), ("move", old_key, "old")])
+    delegation.transfer_retirement_owner("move", old_key, "old", new_key, "next")
+    group = [{"type": "async_delegation", "delegation_id": name, "session_key": old_key,
+              "parent_session_id": "old", "platform": "telegram", "chat_id": "101", "thread_id": "17"}
+             for name in ("stay", "move")]
+    runner, _adapter = make_restart_runner()
+    monkeypatch.setattr(runner, "_completion_event_scope", lambda _: nullcontext())
+    deliver = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(runner, "_deliver_async_delegation_group_scoped", deliver)
+    assert await runner._deliver_async_delegation_group(group) is False
+    calls = deliver.await_args_list
+    assert [call.args[0][0]["thread_id"] for call in calls] == ["17", "18"]
+    assert [call.args[0][0]["parent_session_id"] for call in calls] == ["old", "next"]
+    assert len(group) == 1 and group[0]["delegation_id"] == "move"
+    deliver = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_deliver_async_delegation_group_scoped", deliver)
+    assert await runner._deliver_async_delegation_group(group) is True
+    assert deliver.await_args is not None
+    assert deliver.await_args.args[0][0]["thread_id"] == "18"
+
+
 def test_durable_delegation_handoff_and_queued_snapshot_refresh(tmp_path, monkeypatch):
     from tools import async_delegation as delegation
     monkeypatch.setattr(delegation, "_db_path", lambda: tmp_path / "state.db")
