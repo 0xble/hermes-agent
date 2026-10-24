@@ -1741,7 +1741,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             # here would send it a second time.
             return None
         if self._draining and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(self._session_key_for_source(source), event)
+            session_key = self._session_key_for_source(source)
+            self._schedule_attended_user_activity(event, source, session_key)
+            self._preserve_drain_event(session_key, event)
             return None
         # Expand alias quick commands before the running-session split (fork patch: the idle
         # path re-expands harmlessly since the target is then a resolvable built-in).
