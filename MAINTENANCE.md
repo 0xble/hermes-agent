@@ -59,6 +59,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
+| Compaction display-fold writer cost | Reuse snapshot identities without historical metadata rereads, preserve live presentation and stale-row invalidation | Display-fold planning, reconciliation or timing changes | [Compaction display fold](maintenance/compaction-write-amplification.md) |
 | Browser vault alias authorization | Retain alias refusals independently of prompt preferences and revalidate aliases before resolution and injection | Alias consent, vault fill, or OTP authorization changes | [Browser vault alias authorization](maintenance/browser-vault-alias-authorization.md) |
 | Busy turn queue | Preserve admitted user input across same-key generation overlap and session-lease contention | Gateway lease waits, generation cleanup or pending-input recovery changes | [Busy turn queue](maintenance/busy-turn-queue.md) |
 | Delivered steer observer | Give native mid-turn insertions a stable plugin delivery identity | Steer insertion, turn identity or plugin lifecycle changes | [Steer delivery observer](maintenance/steer-delivery-observer.md) |
