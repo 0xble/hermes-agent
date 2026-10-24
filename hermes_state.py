@@ -22,6 +22,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import contextmanager, suppress
+from hermes_state_publication import state_lock, record_publication_write, measure_write, raise_if_nonretryable_contention
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, mkdir_under_hermes_home
@@ -474,9 +475,9 @@ def _storage_write_in_progress():
         thread._hermes_storage_write_ended_at = time.time()
 
 
-def storage_write_activity(thread_id: Optional[int]) -> Tuple[bool, Optional[float]]:
+def storage_write_activity(thread_id: Optional[int]) -> tuple[bool, Optional[float]]:
     """``(in_progress, last_ended_at)`` of SessionDB writes on thread *thread_id*."""
-    thread = threading._active.get(thread_id) if thread_id is not None else None  # noqa: SLF001
+    thread = threading._active.get(thread_id) if thread_id is not None else None
     if thread is None:
         return False, None
     return (getattr(thread, "_hermes_storage_write_depth", 0) > 0,
@@ -993,7 +994,7 @@ class SessionDB(
                     # permits == maxsize, load-bearing if they drift): surplus.
                     self._close_read_conn(conn)
             return
-        with self._lock:
+        with state_lock(self._lock, db_path=self.db_path):
             if self._conn is None:  # close() raced a still-unwinding reader
                 self._reopen_after_close_locked(context="read")
             conn = cast(sqlite3.Connection, self._conn)
@@ -1047,7 +1048,7 @@ class SessionDB(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
     ) -> T:
         """Run *fn(conn)* in a write transaction; see :meth:`_execute_write_marked`."""
-        with _storage_write_in_progress():
+        with _storage_write_in_progress(), measure_write():
             return self._execute_write_marked(fn, patience_s)
 
     def _execute_write_marked(
@@ -1085,7 +1086,7 @@ class SessionDB(
             generation_clean = self._db_generation_probe_clean()
             fn_started = False
             try:
-                with self._lock:
+                with state_lock(self._lock, db_path=self.db_path, deadline=deadline):
                     if generation_clean:
                         self._raise_if_db_generation_flagged()
                     else:
@@ -1095,6 +1096,7 @@ class SessionDB(
                     conn = cast(sqlite3.Connection, self._conn)
                     conn.execute("BEGIN IMMEDIATE")
                     transaction_started = time.monotonic()
+                    changes_before = conn.total_changes
                     metrics = WriteMetrics()
                     metrics_token = current_write_metrics.set(metrics)
                     try:
@@ -1113,6 +1115,7 @@ class SessionDB(
                     finally:
                         current_write_metrics.reset(metrics_token)
                         held_s = time.monotonic() - transaction_started
+                        record_publication_write(hold_s=held_s, rows_written=conn.total_changes - changes_before)
                         if held_s >= self._WRITE_LOCK_WARN_S:
                             callback_name = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
                             logger.warning(
@@ -1125,7 +1128,8 @@ class SessionDB(
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
-            except SessionCompressionInProgressError:
+            except SessionCompressionInProgressError as exc:
+                raise_if_nonretryable_contention(exc)
                 # Transient (see _COMPRESSION_BUSY_WAIT_S): a steer landing mid-compression must not abort.
                 # A live foreign compression lock is transient: the compressor publishes in a couple of
                 # seconds. Without any wait, a steer that lands mid-compression aborts the user's turn as
@@ -1142,6 +1146,7 @@ class SessionDB(
                     continue
                 raise
             except sqlite3.Error as exc:
+                raise_if_nonretryable_contention(exc)
                 # 'no more rows' is a transient engine error on contended WAL appends (some builds
                 # raise it as InterfaceError, a sibling of DatabaseError): retry like locked/busy.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
