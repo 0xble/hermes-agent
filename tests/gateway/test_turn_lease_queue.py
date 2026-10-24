@@ -14,6 +14,10 @@ from gateway.run_turn_lease_wait import preserve_lease_wait, retire_lease_wait
 from gateway.turn_lease import SessionTurnLeaseRegistry
 from tests.gateway.test_duplicate_user_message import _bootstrap, _event
 
+# Outer wait_for bounds only catch hangs. The behavior under test is bounded by lease timeouts
+# of 1 s or less, but spool writes run on a worker thread that a loaded CI runner can starve.
+HANG_GUARD_SECONDS = 30
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("holder_key", ["same-key", "other-key"])
@@ -50,7 +54,7 @@ async def test_admitted_successor_waits_past_lease_deadline(monkeypatch, tmp_pat
     runner._handle_message_with_agent = handle
     task = asyncio.create_task(runner._handle_message(event))
     try:
-        await asyncio.wait_for(spooled.wait(), 3)
+        await asyncio.wait_for(spooled.wait(), HANG_GUARD_SECONDS)
         assert not task.done(), "the admitted message was rejected at the lease deadline"
         assert not executed
         payload = json.loads(event._gateway_lease_wait_spool.read_text())
@@ -61,7 +65,7 @@ async def test_admitted_successor_waits_past_lease_deadline(monkeypatch, tmp_pat
         if holder_key == "same-key":
             assert "two routing keys" not in caplog.text
         runner._turn_leases.release(holder)
-        assert await asyncio.wait_for(task, 3) == "processed once"
+        assert await asyncio.wait_for(task, HANG_GUARD_SECONDS) == "processed once"
         assert executed == [event.message_id]
         assert not event._gateway_lease_wait_spool.exists()
     finally:
@@ -93,7 +97,7 @@ async def test_extended_lease_wait_preserves_fifo_without_detached_acquires(canc
     try:
         for index in range(3):
             tasks.append(asyncio.create_task(successor(index)))
-            await asyncio.wait_for(queued[index].wait(), 2)
+            await asyncio.wait_for(queued[index].wait(), HANG_GUARD_SECONDS)
         assert not order
         # Capacity pressure must not evict a held lease with queued waiters.
         independent = await registry.acquire("unrelated", owner_key="other", generation=1)
@@ -102,7 +106,7 @@ async def test_extended_lease_wait_preserves_fifo_without_detached_acquires(canc
             tasks[1].cancel()
             await asyncio.gather(tasks[1], return_exceptions=True)
         registry.release(holder)
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 2)
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), HANG_GUARD_SECONDS)
         assert order == ([0, 2] if cancel_middle else [0, 1, 2])
         next_turn = await registry.acquire("session", owner_key="topic", generation=12, timeout=0.02)
         assert registry.release(next_turn)
@@ -139,7 +143,7 @@ async def test_cancelled_waiter_has_replayable_identity_and_media(monkeypatch, t
     entry = runner.session_store.get_or_create_session(event.source)
     task = asyncio.create_task(runner._hmwa_acquire_turn_lease(key, 9, entry, None, event))
     try:
-        await asyncio.wait_for(spooled.wait(), 2)
+        await asyncio.wait_for(spooled.wait(), HANG_GUARD_SECONDS)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     finally:
@@ -255,7 +259,7 @@ async def test_wait_spool_follows_inbound_exit_intent(monkeypatch, tmp_path, exi
     adapter._session_tasks[key] = task
     adapter._active_sessions[key] = asyncio.Event()
     try:
-        await asyncio.wait_for(spooled.wait(), 3)
+        await asyncio.wait_for(spooled.wait(), HANG_GUARD_SECONDS)
         path = event._gateway_lease_wait_spool
         runner._draining = exit_kind.endswith("during-shutdown")
         if exit_kind.startswith("stop"):
@@ -373,9 +377,7 @@ async def test_stuck_predecessor_has_bounded_visible_failure(monkeypatch, tmp_pa
 
     runner._handle_message_with_agent = handle
     try:
-        # The lease bound is 1 s. The outer budget only guards against a hang, and leaves room
-        # for the spool write's worker thread on a loaded CI runner.
-        reply = await asyncio.wait_for(runner._handle_message(event), 15)
+        reply = await asyncio.wait_for(runner._handle_message(event), HANG_GUARD_SECONDS)
         assert reply == t("gateway.busy.another_turn_running")
         runner._release_unsettled_loop_tick.assert_awaited_once_with(event, ran=False)
         assert not event._gateway_lease_wait_spool.exists()
@@ -458,13 +460,13 @@ async def test_long_lease_wait_sends_one_busy_ack(monkeypatch, tmp_path, prior_a
     runner._handle_message_with_agent = handle
     task = asyncio.create_task(runner._handle_message(event))
     try:
-        await asyncio.wait_for(noticed.wait(), 3)
+        await asyncio.wait_for(noticed.wait(), HANG_GUARD_SECONDS)
         assert not task.done()
         await lease_wait_notice(runner, key, event)
         assert len(adapter.sent) == 1
         assert adapter.sent[0] == ("Already queued" if prior_ack else "Queued behind the previous turn.")
         runner._turn_leases.release(holder)
-        await asyncio.wait_for(task, 3)
+        await asyncio.wait_for(task, HANG_GUARD_SECONDS)
     finally:
         runner._turn_leases.release(holder)
         task.cancel()
@@ -500,12 +502,12 @@ async def test_cancel_during_spool_write_settles_before_retirement(monkeypatch, 
     runner._handle_message_with_agent = handle
     task = asyncio.create_task(runner._handle_message(event))
     try:
-        await asyncio.wait_for(started.wait(), 2)
+        await asyncio.wait_for(started.wait(), HANG_GUARD_SECONDS)
         runner._draining = draining
         task.cancel()
         await asyncio.wait({task}, timeout=0.05)
         unblock.set()
-        await asyncio.wait_for(spooled.wait(), 2)
+        await asyncio.wait_for(spooled.wait(), HANG_GUARD_SECONDS)
         await asyncio.gather(task, return_exceptions=True)
         assert event._gateway_lease_wait_spool.exists() is draining
     finally:
