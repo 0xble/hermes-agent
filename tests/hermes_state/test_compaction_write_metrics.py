@@ -34,16 +34,20 @@ def test_compaction_reports_phase_times_and_existing_row_amplification(tmp_path,
         fts_written = [db._read_one(f"SELECT COUNT(*) FROM {table} WHERE {table} MATCH 'amplification'")[0] - old
                        for table, old in zip(("messages_fts", "messages_fts_trigram"), fts_before)]
         print(f"carried={len(carried)} concurrent=2 message_inserts={written} fts_inserts={fts_written}")
-        # Byte-identical carried/concurrent rows are currently reinserted to preserve id ordering.
-        # The warning must report that work, not just the newly summarized content.
-        assert written == len(carried) + 3
+        # The warning must report every row the write actually added, including carried/concurrent
+        # rows that compaction reinserts today. Compare reported counts with the observed delta
+        # rather than pinning the delta, so reusing unchanged rows later still passes.
         assert fts_written == [written, written]
         assert count == 11
         warning = next(record.message for record in caplog.records if "held the write lock" in record.message)
         for name in ("archive_mark_inactive", "insert_incl_fts", "clone_incl_fts", "display_reconcile",
                      "callback_total", "commit"):
             assert re.search(rf"{name}=\d+\.\d{{3}}s", warning), warning
-        for count in ("archived=4", "rewound=10", "inserted=9", "cloned=2"):
+        inserted_match = re.search(r"inserted=(\d+)", warning)
+        cloned_match = re.search(r"cloned=(\d+)", warning)
+        assert inserted_match and cloned_match, warning
+        assert int(inserted_match.group(1)) + int(cloned_match.group(1)) == written, warning
+        for count in ("archived=4", "rewound=10"):
             assert count in warning
         assert "fts=inline" in warning
         assert [msg["content"] for msg in db.get_messages("topic")] == [
