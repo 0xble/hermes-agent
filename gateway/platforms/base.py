@@ -134,6 +134,8 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     if platform == "slack" and thread_id is None:
         thread_id = reply_to_message_id
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    if platform == "slack" and reply_to_message_id:
+        metadata["message_id"] = reply_to_message_id
     # Slack workspace identity is routing state: carry it so a multi-workspace Socket Mode
     # gateway never falls back to its primary WebClient.
     scope_id = getattr(source, "scope_id", None) if platform == "slack" else None
