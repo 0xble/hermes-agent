@@ -165,6 +165,7 @@ def _rows(formatter: str):
 
 def test_registry_covers_every_current_goal_formatter_constant():
     current = {
+        "autonomy": goals.AUTONOMY_CONTINUATION_TEMPLATE,
         "plain": goals.CONTINUATION_PROMPT_TEMPLATE,
         "contract": goals.CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
         "subgoals": goals.CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE,
@@ -175,7 +176,7 @@ def test_registry_covers_every_current_goal_formatter_constant():
     current_names = {
         name for name, value in vars(goals).items()
         if name.startswith("CONTINUATION_") and name.endswith("_TEMPLATE") and isinstance(value, str)
-    } | {"GOAL_WAIT_LIFTED_NOTE_OPEN"}
+    } | {"GOAL_WAIT_LIFTED_NOTE_OPEN", "AUTONOMY_CONTINUATION_TEMPLATE"}
     assert current_names == {name for _, name in CURRENT_GOAL_FORMATTER_NAMES}
     assert set(current) == {kind for kind, _ in CURRENT_GOAL_FORMATTER_NAMES}
     assert all((kind, template) in registered for kind, template in current.items())
@@ -220,7 +221,7 @@ def test_generator_adds_new_uncommitted_wording_without_losing_the_old_snapshot(
 
 @pytest.mark.parametrize(
     "row",
-    [row for row in GOAL_PROMPT_REGISTRY if row["formatter"] in {"plain", "contract", "subgoals", "gate_failed"}],
+    [row for row in GOAL_PROMPT_REGISTRY if row["formatter"] in {"autonomy", "plain", "contract", "subgoals", "gate_failed"}],
     ids=lambda row: f"{row['formatter']}-{row['source_commits'][0][:8]}",
 )
 def test_every_historical_continuation_wording_is_synthetic_and_keeps_a_real_suffix(row):

@@ -160,10 +160,12 @@ async def test_failed_pin_save_leaves_session_unchanged_and_reset_unpins(attende
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transition", ["repin", "handoff", "resume", "branch", "reset"])
-async def test_attended_pin_follows_repins_but_not_conversation_boundaries(attended, tmp_path, transition):
+@pytest.mark.parametrize("duration", ["", " 2h"])
+async def test_attended_pin_follows_repins_but_not_conversation_boundaries(attended, tmp_path, transition, duration):
     runner, source, entry = attended
     key = entry.session_key
-    await runner._handle_attend_command(MessageEvent(text="/attend", source=source))
+    await runner._handle_attend_command(MessageEvent(text="/attend" + duration, source=source))
+    deadline = entry.attended_pin_until
     if transition == "reset":
         switched = await asyncio.to_thread(runner.session_store.reset_session, key)
     else:
@@ -175,11 +177,13 @@ async def test_attended_pin_follows_repins_but_not_conversation_boundaries(atten
         switched = await runner.async_session_store.switch_session(key, "retargeted", **kwargs)
     expected = transition in {"repin", "handoff"}
     assert switched is not None and switched.attended_pinned is expected
+    assert switched.attended_pin_until == (deadline if expected else None)
     assert await asyncio.to_thread(runner.session_store.get_attended_pinned, key) is expected
     reader = SessionStore(tmp_path / "sessions", runner.config)
     try:
         restored = await asyncio.to_thread(reader.lookup_by_session_key, key)
         assert restored.attended_pinned is expected
+        assert restored.attended_pin_until == (deadline if expected else None)
     finally:
         await asyncio.to_thread(reader.close_all_db_handles)
 
@@ -241,3 +245,160 @@ def test_old_session_payload_defaults_unpinned_and_disabled_config_is_inert():
     assert not SessionEntry.from_dict(entry.to_dict()).attended_pinned
     decision = resolve_attended_model({"attended_pinned": True, "default_model": "default"}, 9999, {})
     assert decision.reason == "default"
+
+
+@pytest.mark.parametrize("stamp", [None, 1, 2400])
+def test_timed_pin_resolution_uses_deadline_or_newer_user_activity(stamp):
+    from gateway.attended_model import expiry_time
+
+    state = {"attended_pinned": True, "attended_pin_until": 1800,
+             "last_user_activity_at": stamp, "default_model": "default"}
+    deadline = max(stamp or 0, 1800) + 1800
+    assert expiry_time(stamp, 30, pinned=True, pin_until=1800) == deadline
+    for clock in (1799, max(1800, stamp or 0), deadline - 1):
+        decision = resolve_attended_model(state, clock, CONFIG)
+        assert decision.reason == "attended"
+        assert bool(decision.idle_model) is (clock >= 1800)
+    assert resolve_attended_model(state, deadline, CONFIG).reason == "default"
+    state["model_override"] = "explicit"
+    assert resolve_attended_model(state, deadline, CONFIG).model == "explicit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duration,seconds", [("10s", 10), ("30m", 1800), ("2h", 7200), ("1h30m", 5400), ("1d", 86400)])
+async def test_timed_busy_pin_replaces_deadline_and_round_trips(attended, monkeypatch, tmp_path, duration, seconds):
+    from zoneinfo import ZoneInfo
+
+    runner, source, entry = attended
+    clock = 1_800_000_000.0
+    monkeypatch.setattr("gateway.slash_commands_attend.time.time", lambda: clock)
+    monkeypatch.setattr("gateway.slash_commands_attend.get_timezone", lambda: ZoneInfo("America/Los_Angeles"))
+    cmd = resolve_command("attend")
+
+    async def dispatch(args):
+        return await runner._dispatch_busy_slash_command(
+            MessageEvent(text="/attend" + args, source=source), cmd, entry.session_key, source,
+        )
+
+    reply = await dispatch(" " + duration)
+    deadline = clock + seconds
+    assert "Pinned" in reply and duration in reply
+    local_release = datetime.fromtimestamp(deadline, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %I:%M %p %Z")
+    assert local_release in reply
+    assert entry.attended_pinned and entry.attended_pin_until == deadline
+    assert SessionEntry.from_dict(entry.to_dict()).attended_pin_until == deadline
+    reader = SessionStore(tmp_path / "sessions", runner.config)
+    try:
+        restored = await asyncio.to_thread(reader.lookup_by_session_key, entry.session_key)
+        assert restored.attended_pin_until == deadline
+        route = resolve_attended_model({**restored.to_dict(), "default_model": "default"}, deadline - 1, CONFIG)
+        assert route.reason == "attended" and not route.idle_model
+    finally:
+        await asyncio.to_thread(reader.close_all_db_handles)
+    status = await dispatch(" status")
+    assert "more" in status and local_release in status
+    if seconds < 60:
+        assert "<1m" in status
+    clock += 10
+    await dispatch(" 1h30m")
+    assert entry.attended_pin_until == clock + 5400
+    await dispatch("")
+    assert entry.attended_pinned and entry.attended_pin_until is None
+    assert "permanent" in await dispatch(" status")
+    await dispatch(" 30m")
+    await dispatch(" off")
+    assert not entry.attended_pinned and entry.attended_pin_until is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duration", ["0m", "0h0m", "-2h", "2", "1h-30m", "1h30", "30m junk", "nan", "infh", "1e5h", "9" * 400 + "d"])
+async def test_invalid_duration_does_not_change_existing_pin(attended, duration):
+    runner, source, entry = attended
+    await runner._handle_attend_command(MessageEvent(text="/attend 2h", source=source))
+    before = entry.to_dict()
+    reply = await runner._handle_attend_command(MessageEvent(text="/attend " + duration, source=source))
+    assert "Usage:" in reply
+    assert entry.to_dict() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_activity", [False, True])
+async def test_timed_pin_expires_lazily_at_api_boundary_after_full_idle_window(attended, monkeypatch, has_activity):
+    runner, source, entry = attended
+    key = entry.session_key
+    clock = 1_800_000_000.0
+    monkeypatch.setattr("gateway.slash_commands_attend.time.time", lambda: clock)
+    if has_activity:
+        await runner.async_session_store.mark_user_activity(key, when=datetime.fromtimestamp(1))
+    await runner._handle_attend_command(MessageEvent(text="/attend 30m", source=source))
+    deadline = entry.attended_pin_until
+    state = runner._session_state(key)
+    state.conversation.last_user_activity_at = 1.0 if has_activity else None
+    state.conversation.last_api_call_at = 1.0
+    turn = TurnRunner.__new__(TurnRunner)
+    turn._runner = runner
+    turn._ctx = SimpleNamespace(session_key=key, source=source, user_config=CONFIG)
+    turn._emit_persistent_attended_notice = Mock()
+    switch = Mock()
+    monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", switch)
+    agent = SimpleNamespace(model="opus", provider="anthropic", api_mode="anthropic_messages")
+
+    # Initialize the existing request-route key, which may apply attended reasoning.
+    await asyncio.to_thread(turn._apply_attended_before_api_call, agent)
+    assert agent._gateway_attended_decision.reason == "attended"
+    switch.reset_mock()
+    turn._emit_persistent_attended_notice.reset_mock()
+    for clock in (deadline - 1, deadline, deadline + 1799):
+        await asyncio.to_thread(turn._apply_attended_before_api_call, agent)
+        assert agent._gateway_attended_decision.reason == "attended"
+        model, _runtime = await runner._resolve_session_agent_runtime_async(source=source, session_key=key, user_config=CONFIG)
+        assert model == "opus"
+        status = await runner._handle_attend_command(MessageEvent(text="/attend status", source=source))
+        if clock >= deadline:
+            assert "not pinned" in status
+    switch.assert_not_called()
+    # Inspection must not restart the idle window or persist expiry at observation time.
+    assert entry.attended_pin_until == deadline
+    clock = deadline + 1800
+    # A quiet request boundary remains required, independently of the timed pin.
+    state.conversation.last_api_call_at = 1.0
+    await asyncio.to_thread(turn._apply_attended_before_api_call, agent)
+    assert agent._gateway_attended_decision.reason == "default"
+    assert agent._gateway_attended_decision.switched_back
+    assert switch.call_count == 1
+    assert turn._emit_persistent_attended_notice.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_expiry", [False, True])
+async def test_timed_pin_keeps_temporary_model_and_reasoning_until_deadline_plus_idle(attended, monkeypatch, async_expiry):
+    runner, source, entry = attended
+    key = entry.session_key
+    clock = 1_800_000_000.0
+    monkeypatch.setattr("gateway.slash_commands_attend.time.time", lambda: clock)
+    await runner._handle_attend_command(MessageEvent(text="/attend 30m", source=source))
+    deadline = entry.attended_pin_until
+    state = runner._session_state(key)
+    state.conversation.last_user_activity_at = 1.0
+    state.conversation.model_override = {"model": "picked", "provider": "nous"}
+    state.conversation.model_override_scope = "temporary"
+    state.conversation.reasoning_override = {"enabled": True, "effort": "low"}
+    state.conversation.reasoning_override_scope = "temporary"
+    await runner.async_session_store.set_model_override(key, state.conversation.model_override, scope="temporary")
+
+    async def expire():
+        if async_expiry:
+            await runner._expire_attended_temporary_picks_async(key, CONFIG)
+        else:
+            await asyncio.to_thread(runner._expire_attended_temporary_picks, key, CONFIG)
+
+    clock = deadline + 1799
+    await expire()
+    assert state.conversation.model_override["model"] == "picked"
+    assert state.conversation.reasoning_override["effort"] == "low"
+    model, _, _ = await run_session_readback.read_session_settings(runner, source=source, session_key=key, user_config=CONFIG)
+    assert model == "picked"
+    clock = deadline + 1800
+    await expire()
+    assert state.conversation.model_override is None
+    assert state.conversation.reasoning_override is None

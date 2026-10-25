@@ -43,11 +43,13 @@ approval:
     second_other: "{count} ثوانٍ"
 gateway:
   attend:
-    usage: "الاستخدام: /attend أو /attend off أو /attend status."
+    usage: "الاستخدام: /attend [duration] أو /attend off أو /attend status. يجب أن تكون المدة موجبة، مثل 30m أو 2h أو 1h30m أو 1d. بدون مدة يكون التثبيت دائمًا."
     disabled: "لم يُضبط توجيه النموذج أثناء الاستخدام النشط. اضبط model.attended أولًا."
-    pinned: "تم تثبيت النموذج للاستخدام النشط ({model}). استخدم /attend off لإلغاء التثبيت. تظل اختيارات /model الصريحة ذات أولوية."
+    pinned: "تم تثبيت النموذج للاستخدام النشط بشكل دائم ({model}). استخدم /attend off لإلغاء التثبيت. تظل اختيارات /model الصريحة ذات أولوية."
+    pinned_timed: "تم تثبيت النموذج للاستخدام النشط ({model}) لمدة {duration} حتى {until}. استخدم /attend off لإلغاء التثبيت. تظل اختيارات /model الصريحة ذات أولوية."
     released: "أُلغي تثبيت النموذج للاستخدام النشط. يبدأ الآن مؤقت الخمول لمدة {minutes} دقيقة."
-    status_pinned: "الاستخدام النشط: النموذج مثبت. المسار الحالي: {model}."
+    status_pinned: "الاستخدام النشط: النموذج مثبت بشكل دائم. المسار الحالي: {model}."
+    status_timed: "الاستخدام النشط: النموذج مثبت لمدة {remaining} أخرى حتى {until}. المسار الحالي: {model}."
     status_unpinned: "الاستخدام النشط: النموذج غير مثبت. المسار الحالي: {model}."
     session_changed: "تغيرت الجلسة. شغّل /attend مرة أخرى."
     configured_model: "المسار المضبوط"
@@ -1485,7 +1487,7 @@ platform:
     prompt_expired: ⌛ لم يعد هذا الطلب ينتظر إجابة. أرسل ردك كرسالة عادية.
 slash:
   attend:
-    description: "تثبيت نموذج الاستخدام النشط حتى إلغاء التثبيت"
+    description: "تثبيت نموذج الاستخدام النشط بشكل دائم أو لمدة محددة"
   approve:
     description: "الموافقة على أمر خطير قيد الانتظار"
   bg:
