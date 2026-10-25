@@ -79,6 +79,22 @@ async def test_lazy_dependency_binding_keeps_shared_admission(transport, monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("base_url", ["http://127.0.0.1:8765/api/", "https://slack-compatible.example/api/"])
+async def test_alternate_api_does_not_consume_or_inherit_slack_budget(transport, base_url):
+    app = client()
+    alternate = budget.BudgetedAsyncWebClient(token=app.token, base_url=base_url)
+    await app.chat_postMessage(channel="C1", text="Slack reply")
+    await alternate.chat_postMessage(channel="C1", text="alternate reply")
+    await alternate.assistant_threads_setStatus(channel_id="C1", thread_ts="1", status="Working")
+    transport.responses.append({"data": {"ok": False, "error": "ratelimited"},
+                                "headers": {"Retry-After": "3600"}, "status_code": 429})
+    with pytest.raises(SlackApiError):
+        await alternate.chat_postMessage(channel="C1", text="alternate failure")
+    await app.chat_postMessage(channel="C2", text="Slack reply after alternate failure")
+    assert [entry[0] for entry in transport.sent] == [1000, 1000, 1000, 1000, 1004]
+
+
+@pytest.mark.asyncio
 async def test_independent_channels_workspaces_and_reads(transport):
     app, other = client(), client("other-workspace-token")
     await app.chat_postMessage(channel="C1", text="reply")

@@ -97,7 +97,9 @@ class BudgetedAsyncWebClient(AsyncWebClient):
         self._outbound_budget = budget
 
     async def api_call(self, api_method: str, **kwargs) -> AsyncSlackResponse:
-        if not _is_write(api_method):
+        # Slack's published limits do not describe alternate API endpoints, such
+        # as a stand-in server. Do not delay, shed, or share their cooldowns.
+        if self.base_url != "https://slack.com/api/" or not _is_write(api_method):
             return await super().api_call(api_method, **kwargs)
         channels = _channels(kwargs)
         while delay := self._outbound_budget.delay(api_method, channels):
