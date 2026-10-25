@@ -151,7 +151,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Attended model switching | Route genuine user activity to the configured attended model while preserving the default route when unset | Attended model configuration, activity clocks, model routing, or attended turn transitions | [Attended model switching](maintenance/attended-model-switching.md) |
 | Model presets | Shared flat preset authoring, route/reasoning readers and concrete-selection persistence | Preset/config loaders, model selection writers, or new model config consumers | [Model presets](maintenance/model-presets.md) |
 | Session reasoning persistence | Persist session `/reasoning` picks in the routing entry so a gateway restart keeps them, like `/model` pins | Session reasoning override storage, rehydration, or conversation-boundary clears | [Session reasoning persistence](maintenance/session-reasoning-persistence.md) |
-| Session-scoped Fast expiry | Switch session `/fast fast` and `/fast ultrafast` overrides to explicit normal after a configurable wall-clock deadline | `agent.fast_expiry_seconds`, session tier resolution, cached-agent request overrides, or Fast status/notice changes | [Session-scoped Fast expiry](maintenance/session-fast-expiry.md) |
+| Session-scoped Fast expiry | Switch session `/fast fast` and `/fast ultrafast` overrides to explicit normal after independently configurable wall-clock deadlines (Fast 30m, Ultrafast 5m by default) | `agent.fast_expiry_seconds`, `agent.ultrafast_expiry_seconds`, session tier resolution, cached-agent request overrides, or Fast status/notice changes | [Session-scoped Fast expiry](maintenance/session-fast-expiry.md) |
 | Native Telegram topic tool | Let an agent create or edit a Telegram DM topic and bind its settings, opening brief, and relay address to a native Hermes session | `telegram_topic`, Telegram DM topic creation/editing, topic bindings, or opening-brief delivery | [Native Telegram topic tool](maintenance/telegram-topic-tool.md) |
 | Typed session-state inspection | Expose bounded, profile-scoped, read-only Hermes topic, session, and delivery state without generic SQL or transcript leakage | `session_state`, durable session-state readers, toolset registration, or state inspection regressions | [Typed session-state inspection](maintenance/session-state-inspection.md) |
 | Queued voice transcription | Transcribe and echo queued voice immediately with bounded concurrency, reuse it at drain | Busy queueing, pending-event STT cache, transcript echo, or drain changes | [Queued voice STT](maintenance/queued-voice-stt.md) |
@@ -221,6 +221,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/gateway/test_response_filters.py tests/gateway/test_gateway_silence_tokens.py tests/gateway/test_busy_relay_silence.py tests/gateway/test_busy_redirect_anchor.py`.
 - **Retirement:** Remove this patch when upstream supports equivalent agent-origin silence behavior across normal, queued, and recovery paths.
 - **Rollback:** Revert the relay-silence fix commit.
+
+## Active Patch Record: Requested And Served Speed Tiers
+
+- **Patch identity:** `speed-tier-audit`.
+- **Behavior:** One `speed tier:` INFO record per completed Codex Responses or Chat Completions response, including when neither side reports a tier. Logs negotiated request kwargs and the response echo, with missing echoes labeled `unreported`. An Ultrafast parent passes the tier only to an eligible child route, using the child's credential. Explicit delegation overrides win and unsupported children get no inherited paid tier.
+- **Source surfaces:** `agent/turn_api_call.py`, `agent/turn_usage.py`, chat streaming accumulators, `tools/delegate_tool_config.py`, `tools/delegate_tool.py`, and [Requested And Served Speed Tiers](maintenance/speed-tier-audit.md).
+- **Upstream status:** The upstream explicit-backend-route work in `ed11601539`, `572ecbe43d`, `5d7fea742c` and `0214eb4fdc` does not fix the fork's inherited-mode path. Reuses its existing route/account gates rather than importing the larger route API change.
+- **Focused regression:** `scripts/run_tests.sh tests/agent/test_service_tier_logging.py tests/tools/test_delegate_ultrafast.py`.
+- **Retirement:** Remove when upstream covers inherited Ultrafast and equivalent per-response requested/served auditing, without silent paid fallback or losing explicit-override precedence.
+- **Rollback:** Revert the commit carrying `Fork-Patch: speed-tier-audit`.
 
 ## Active patch record: resumable delegation retention
 

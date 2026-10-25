@@ -84,7 +84,9 @@ _SLACK_LINK_RE = re.compile(
     r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^>|]+)(?:\|([^>]+))?>"
 )
 _BOLD_RE = re.compile(r"(?:\*\*|__)(.+?)(?:\*\*|__)")
-_ITALIC_RE = re.compile(r"(?<![\*_])(?:\*|_)(?![\*_\s])(.+?)(?<![\*_\s])(?:\*|_)(?![\*_])")
+# Delimiters must not touch a word character outside the span, so snake_case, file_names and
+# 2*3 arithmetic stay literal (CommonMark's rule for ``_``; agents rarely use intraword ``*``).
+_ITALIC_RE = re.compile(r"(?<![\w*_])(?:\*|_)(?![\*_\s])(.+?)(?<![\*_\s])(?:\*|_)(?![\w*_])")
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
 
 

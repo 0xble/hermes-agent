@@ -279,3 +279,15 @@ class TestEmphasisAroundInlineCode:
     def test_code_stays_opaque_to_emphasis(self):
         (item,) = self._list_items("- `a*b*c` and `__init__`")
         assert [el["text"] for el in item if el.get("style", {}).get("code")] == ["a*b*c", "__init__"]
+
+    def test_snake_case_and_arithmetic_around_code_stay_literal(self):
+        """Review of the code-placeholder change: italics must not span a code span or a word."""
+        (item,) = self._list_items("- Set max_tokens via `config` in my_file")
+        assert [el.get("style") for el in item] == [None, {"code": True}, None]
+        assert item[0]["text"] == "Set max_tokens via " and item[2]["text"] == " in my_file"
+        (item,) = self._list_items("- 2*3 is `x` and 4*5")
+        assert not any(el.get("style", {}).get("italic") for el in item)
+
+    def test_real_italics_still_render(self):
+        (item,) = self._list_items("- _real italic_ and *also*")
+        assert [el["text"] for el in item if el.get("style", {}).get("italic")] == ["real italic", "also"]
