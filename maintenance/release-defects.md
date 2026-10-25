@@ -771,6 +771,11 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   the fixture is proving that maintenance uses an isolated worktree. The real subprocess and
   maintenance assertions remain unchanged. Guard: `test_worktree_maintenance_isolation.py`
   passed in the canonical runner (`r5-fixtures.log`, 1 passed).
+- Keep MCP serve in the agent-command registry and restore inline discovery for commands
+  without a dedicated startup owner, while preserving gateway-owned discovery for chat.
+  Release-hold isolation explicitly permits dropping the synthetic main branch so the
+  independent runtime-format downgrade refusal is the path under test. Guards: bounded MCP
+  startup and release-channel holds (26 passed).
 - Batched pruning retains upstream on-session-delete hooks after each committed batch,
   before filesystem cleanup. Rewind fixtures assert the structured API error field/detail
   separately from storage exceptions, and routing-diff fixtures use serialized JSON objects.

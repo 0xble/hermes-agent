@@ -2870,6 +2870,7 @@ _AGENT_COMMANDS = {None, "chat", "acp", "rl"}
 _AGENT_SUBCOMMANDS = {
     "cron": ("cron_command", {"run", "tick"}),
     "gateway": ("gateway_command", {"run"}),
+    "mcp": ("mcp_action", {"serve"}),
 }
 
 
@@ -2895,6 +2896,13 @@ def _agent_subcommand_selected(args) -> bool:
     """True for ``cron run/tick``, ``gateway run`` (see _AGENT_SUBCOMMANDS)."""
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
     return bool(_sub_attr and getattr(args, _sub_attr, None) in _sub_set)
+
+
+def _command_has_dedicated_mcp_startup(args) -> bool:
+    """acp / gateway run / cron run|tick own their MCP startup on the runtime path."""
+    return args.command == "acp" or (
+        args.command != "mcp" and _agent_subcommand_selected(args)
+    )
 
 
 def _should_background_mcp_startup(args) -> bool:
@@ -2956,12 +2964,16 @@ def _prepare_agent_startup(args) -> None:
     except Exception:
         logger.debug("MCP server filter setup failed", exc_info=True)
 
-    # TUI launches background MCP discovery with a bounded join; acp/gateway/cron do their own.
-    if _chat_runs_at_gateway(args):  # chat turns run in the gateway: it owns MCP, hooks, webhooks
-        if _accept_hooks:  # rides session.create (env_launch_flags) and the classic CLI's consent check
+    if _chat_runs_at_gateway(args):  # the gateway owns MCP, hooks and webhooks for chat
+        if _accept_hooks:
             os.environ["HERMES_ACCEPT_HOOKS"] = "1"
         return
-    if _should_background_mcp_startup(args):
+    # TUI launches hand off to a startup path that backgrounds MCP discovery
+    # with a bounded join; acp/gateway/cron do their own on the runtime path.
+    _run_inline_mcp_discovery = not (
+        _is_tui_chat_launch(args) or _command_has_dedicated_mcp_startup(args)
+    )
+    if _run_inline_mcp_discovery and _should_background_mcp_startup(args):
         try:
             from hermes_cli.mcp_startup import start_background_mcp_discovery
 
@@ -2972,6 +2984,22 @@ def _prepare_agent_startup(args) -> None:
         except Exception:
             logger.debug(
                 "Background MCP tool discovery failed at CLI startup",
+                exc_info=True,
+            )
+        _run_inline_mcp_discovery = False
+    if _run_inline_mcp_discovery:
+        try:  # synchronous for entrypoints without a later bounded startup path
+            from hermes_cli.mcp_startup import get_mcp_server_filter
+            from tools.mcp_tool_discovery import discover_mcp_tools
+
+            _mcp_filter = get_mcp_server_filter()
+            if _mcp_filter is None:
+                discover_mcp_tools()
+            else:
+                discover_mcp_tools(allowed_mcp_names=_mcp_filter)
+        except Exception:
+            logger.debug(
+                "MCP tool discovery failed at CLI startup",
                 exc_info=True,
             )
     try:

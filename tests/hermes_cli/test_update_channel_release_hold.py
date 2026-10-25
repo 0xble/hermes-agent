@@ -133,7 +133,7 @@ def test_an_explicit_branch_to_a_pre_runtime_commit_is_still_refused(source, mon
     _ledgered(source.home)
 
     with pytest.raises(SystemExit) as stopped:
-        update_cmd._cmd_update_impl(source.parser.parse_args(["update", "--branch", "release", "--yes"]), False)
+        update_cmd._cmd_update_impl(source.parser.parse_args(["update", "--branch", "release", "--yes", "--allow-drop-main"]), False)
 
     out = capsys.readouterr().out
     assert stopped.value.code == 1 and git(source.root, "rev-parse", "HEAD") == source.installed
