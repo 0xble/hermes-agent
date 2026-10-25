@@ -4,6 +4,8 @@ Safe printing, quiet-mode gating, deduped context-overflow warnings, and the buf
 chatter that is shown only when every retry/fallback is exhausted.
 Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO unchanged.
 """
+
+from gateway.notice_style import ContextNotice
 import logging
 import sys
 
@@ -92,13 +94,19 @@ class StatusOutputMixin:
             # A presentation preference must never turn a recoverable notice into a failed turn.
             return True
 
-    def _emit_diagnostic_status(self, message: str) -> None:
+    def _emit_diagnostic_status(self, message: str, *, context: bool = False) -> None:
         """A diagnostic on the lifecycle rail, without changing legacy formatting."""
         from gateway.warning_notifications import DiagnosticText
-        self._emit_status(DiagnosticText(message))
+        text = DiagnosticText(message)
+        if context or getattr(message, "notice_style", None) == "context":
+            text.notice_style = "context"
+        self._emit_status(text)
 
-    def _emit_status(self, message: str) -> None:
+    def _emit_status(self, message: str, *, context: bool = False) -> None:
         """Emit a lifecycle status message (CLI + gateway ``status_callback``)."""
+        if context:
+            from gateway.notice_style import ContextNotice
+            message = ContextNotice(message)
         self._emit_status_kind("lifecycle", message, origin="_emit_status")
 
     def _emit_warning(self, message: str) -> None:
@@ -111,6 +119,7 @@ class StatusOutputMixin:
         Desktop renders notices but no warn-kind ``status.update``, and the messaging gateway wires
         its callbacks per turn, after init, so a notice raised before then waits for
         :meth:`_replay_startup_warnings` on the first turn."""
+        notice_style = getattr(message, "notice_style", None)
         message = message.strip()
         if (getattr(self, "platform", None) or "cli") == "cli":
             self._emit_warning(message)
@@ -121,7 +130,7 @@ class StatusOutputMixin:
 
         key = f"startup-warning.{zlib.crc32(message.encode()):08x}"
         level = "success" if message.startswith("✓") else "warn"  # a recovered provider is good news
-        notice = AgentNotice(text=message, level=level, kind="sticky", key=key, id=key)
+        notice = AgentNotice(text=message, level=level, kind="sticky", key=key, id=key, notice_style=notice_style)
         if getattr(self, "notice_callback", None):
             self._emit_notice(notice)
         else:
@@ -227,7 +236,7 @@ class StatusOutputMixin:
         self._pending_fallback_notice = None
         for item in notice if isinstance(notice, list) else [notice]:
             try:
-                self._emit_diagnostic_status(item)
+                self._emit_diagnostic_status(ContextNotice(item))
             except Exception:
                 # One surface failure must not hide later switches from the same chain.
                 continue

@@ -9,6 +9,7 @@ class DiagnosticText(str):
     String behavior and event kind stay unchanged for existing plugin renderers.
     Durable carriers must serialize their own category, not this in-memory marker.
     """
+    notice_style = None
 
 
 def is_warning_status(event_type: str, message: str) -> bool:

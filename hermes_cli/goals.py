@@ -8,6 +8,8 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import asyncio
 import hashlib
 import json
@@ -2748,6 +2750,8 @@ def _judge_outage_notice(*, failed: bool) -> str:
 
 
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
+    if verdict == "done":
+        message = ContextNotice(message)
     return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
             "verdict": verdict, "reason": reason, "message": message}
 

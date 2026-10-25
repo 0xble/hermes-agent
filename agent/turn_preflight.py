@@ -9,6 +9,8 @@ overflow warnings. Nothing here imports ``agent.conversation_loop`` at module le
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -155,7 +157,7 @@ def run_preflight_compression(
             max_attempts=max_compression_attempts,
         )
         if _pre_api_status:
-            agent._emit_status(_pre_api_status)
+            agent._emit_status(ContextNotice(_pre_api_status))
         v._last_preflight_pressure = request_pressure_tokens
         _pre_api_input = v.messages
         v.messages, v.active_system_prompt = agent._compress_context(

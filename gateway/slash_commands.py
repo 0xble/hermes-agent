@@ -5,6 +5,8 @@ the one-off commands.  run.py helpers are imported lazily."""
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import asyncio
 import contextlib
 import dataclasses
@@ -926,7 +928,7 @@ class GatewaySlashCommandsMixin(
             event_message_id=reply_anchor,
             # Forward image/audio attachments so the background agent can see them.
             media_urls=list(event.media_urls or []), media_types=list(event.media_types or [])))
-        return t("gateway.background.started", preview=_preview(prompt), task_id=task_id)
+        return ContextNotice(t("gateway.background.started", preview=_preview(prompt), task_id=task_id))
 
     async def _handle_btw_command(self, event: MessageEvent) -> str:
         """Handle /btw <question> — one-shot auxiliary LLM call on a transcript snapshot; live history

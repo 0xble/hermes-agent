@@ -5,6 +5,8 @@ Each function takes the parent ``AIAgent`` as ``agent`` except the stateless mes
 """
 
 from __future__ import annotations
+
+from gateway.notice_style import ContextNotice
 import contextlib
 import copy
 import json
@@ -1537,9 +1539,8 @@ def restore_primary_runtime(agent) -> bool:
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
                 agent._emit_diagnostic_status(
-                    f"✅ Primary model restored: {agent.model} via {agent.provider}; "
-                    f"fallback {previous_model} via {previous_provider} is no longer active."
-                )
+                    ContextNotice(f"✅ Primary model restored: {agent.model} via {agent.provider}; "
+                    f"fallback {previous_model} via {previous_provider} is no longer active."))
         return True
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
