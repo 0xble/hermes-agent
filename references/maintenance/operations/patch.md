@@ -20,6 +20,18 @@
 - **Outbound budget:** Retry gaps 2,4,8,16,30 seconds give attempts at 0,2,6,14,30,60. At most 5 logical attempts in a half-open 60-second window, or 10 HTTP append attempts with the SDK connection retry, versus appendStream Tier 3 floor 50/min (20%). Later retries are at most 4 HTTP attempts/min (8%). Positive start rejection uses Retry-After, startStream has no SDK retry. Existing successful native progress, reply and typing paths lack shared admission, so aggregate per-conversation budget compliance is not established. Keep draft pending qualification.
 - **Rollback and retirement:** Revert this patch and matching presentation assertions. No schema, dependency or config change. Retire when upstream preserves the same retry, ambiguity and clean-fallback contract.
 
+## attended-switch-notice-transition
+
+- **Status:** Candidate.
+- **Contract:** Announce an attended-model switch only when the session transitions to that route. Queued follow-ups and repeated API-boundary resolution on an already-selected attended model do not announce another switch. Preserve genuine idle-to-attended transitions, first-session silence, fallback ownership and idle return behavior.
+- **Source surfaces:** `gateway/run_turn.py`, `gateway/run_turn_runner.py`, `tests/gateway/test_attended_turn_runner.py`.
+- **Independent hypothesis (2026-10-25):** Turn-start resolution can compare a stale `last_resolved_model` snapshot even though the durable committed attended-route marker is already true. API-boundary resolution also announces a changed desired key without requiring a changed live route. Reuse the committed marker during turn-start staging and require a real model/provider/API-mode transition at the boundary. An intervening idle API call before the duplicate notice would falsify this incident explanation. The incident logs instead show the queued follow-up stayed on the attended model.
+- **Upstream findings:** Local-only attended-routing overlay. No upstream implementation to backport, so the upstream discussion-search exception applies.
+- **Verification:** `HERMES_PYTHON="$PWD/.venv/bin/python" bash scripts/run_tests.sh tests/gateway/test_attended_turn_runner.py tests/gateway/test_attended_model.py tests/gateway/test_attended_busy_activity.py tests/gateway/test_attended_session_opening.py tests/gateway/test_attend_command.py` passes: 287 tests, 0 failures. The new cases cover stale-model queued staging with committed active/inactive routes and no-op API-boundary resolutions with absent/stale decision keys.
+- **Outbound budget:** Removes redundant uses of the existing persistent notice rail. Adds no API calls, retries, timers, limiters or platform-specific send path. Existing shared egress budgeting is unchanged and worst-case notice traffic cannot increase.
+- **Rollback:** Revert the committed-route guard in turn-start resolution and the route-equality guard in API-boundary emission, plus their matching tests. No configuration, schema, dependency or state migration.
+- **Retirement:** Remove when the shared routing owner derives switch announcements solely from committed route transitions and equivalent regressions pass upstream.
+
 ## mcp-verbatim-tool-labels
 
 - **Status:** Candidate.
