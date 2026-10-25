@@ -2664,7 +2664,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission
                 if await asyncio.to_thread(completion_admission, self, evt) is not None:
-                    outcome = await self._deliver_completion_notification(synth_text, evt)
+                    outcome = await deliver_one(synth_text, evt)
                     acknowledged = outcome is True or acknowledged
                     retry_needed = outcome is False or retry_needed
                     continue
@@ -2718,12 +2718,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             "response. If a result does not change the current conclusion, absorb it silently.]"
         )
         consolidated = "\n\n".join([header, *blocks])
+        admission_evt = primary_evt
         if getattr(self, 'session_authority', None) is not None:
             from gateway.session_automation import producer_identity
-            primary_evt = dict(primary_evt, _automation_identities=[
+            admission_evt = dict(primary_evt, _automation_identities=[
                 producer_identity(self, event) for event in [primary_evt, *(e for e, _ in siblings)]])
         delivered = await self._deliver_completion_notification(
-            consolidated, primary_evt, sibling_claims=siblings,
+            consolidated, admission_evt, sibling_claims=siblings,
         )
         if delivered is not False:
             forget(primary_evt)

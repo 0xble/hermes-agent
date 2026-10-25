@@ -720,6 +720,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- Completion-batch retry narrowing removes the original primary event, not the
+  authority-only metadata copy. Already-admitted siblings are removed after their
+  lost-ACK settlement too, so successful batches do not falsely request a retry.
+  Guards: automation retry, completion admission and completion delivery suites,
+  78 passing tests on Linux Python 3.14.9.
+
 - Service identity fixtures use account-native home naming. Detached restart mocks only
   the gateway launch, leaving process scans real. The vanished-file race probes preflight
   directly before reopening because upstream serializes startup preflight and quarantine.
