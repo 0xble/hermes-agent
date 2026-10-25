@@ -1305,6 +1305,8 @@ goals:
 
 `auto_notices` (fork setting) controls whether a goal the agent sets or extends through the `goal_set` tool is announced with its committed text and completion contract. `/goal` replies and judge verdicts are always shown regardless.
 
+`goals.notices` defaults to `true`. Set it to `false` to hide automatic goal cards and lifecycle notices on shared gateways. Explicit `/goal status` output remains available.
+
 `goals.autonomy` defaults to `false`, preserving the judge and approval behavior above. When `true`, the supporting `goal_set` plugin can set, revise, replace, pause, resume and complete goals without approval. Clear remains user-only. Completion requires a mapping from every verification criterion to recorded proof, passing quality gates and no recorded hard-limit breach. Refusals leave the goal active and name the gap in history and `/goal status`.
 
 Autonomous revisions and replacements retain constraints, hard limits and unmet criteria. Removing an item requires the user's current verbatim removal instruction naming it. A blocked route calls for another route or a timed sleep with an automatic wake. Existing blocked/input states migrate on load. A finite `max_turns` becomes a paced checkpoint that records consumed turns, sleeps and starts another continuation span, allowing ongoing model spend. Explicit contract limits still bind, and an explicit pause remains paused.
