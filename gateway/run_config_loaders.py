@@ -274,6 +274,9 @@ class GatewayConfigLoadersMixin:
         if _r_state is not None and _r_state.conversation.reasoning_override is not None:
             return _r_state.conversation.reasoning_override
         loaded = await asyncio.to_thread(self._load_persisted_reasoning_override, session_key)
+        _r_state = self._peek_session_state(session_key)
+        if _r_state is not None and _r_state.conversation.reasoning_override is not None:
+            return _r_state.conversation.reasoning_override  # a pick landed during the read: it wins
         return self._publish_persisted_reasoning_override(session_key, loaded)
 
     def _load_persisted_reasoning_override(self, session_key: str) -> Optional[tuple[dict, Optional[str]]]:
@@ -297,13 +300,10 @@ class GatewayConfigLoadersMixin:
     def _publish_persisted_reasoning_override(
         self, session_key: str, loaded: Optional[tuple[dict, Optional[str]]],
     ) -> dict | None:
-        conversation = self._session_state(session_key).conversation
-        if conversation.reasoning_override is not None:
-            # A /reasoning pick landed while the persisted copy was being read: the live pick wins.
-            return conversation.reasoning_override
         if loaded is None:
             return None
         persisted, scope = loaded
+        conversation = self._session_state(session_key).conversation
         conversation.reasoning_override = dict(persisted)
         if scope is not None:
             conversation.reasoning_override_scope = scope
