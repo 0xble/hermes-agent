@@ -57,11 +57,13 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 try:  # sibling modules; support both package and flat plugin-dir import
     from .attachment_errors import describe_download_exception
     from .block_kit import render_blocks, sanitize_blocks
+    from .task_cards import finish_task_card
     from .adapter_slash_lane import SlashHandoffLanes
     from .adapter_slash_payload import slash_command_text, slash_thread_id
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from task_cards import finish_task_card  # type: ignore
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
 
@@ -2154,8 +2156,7 @@ class SlackAdapter(BasePlatformAdapter):
                 return
             stream.stopped = True
             try:
-                if self._app and stream.stream_ts:
-                    from .task_cards import finish_task_card
+                if self._app and (stream.stream_ts or stream.message_timestamps):
                     extra = self.config.extra if isinstance(self.config.extra, dict) else {}
                     ephemeral = extra.get("native_task_cards_ephemeral", True)
                     await finish_task_card(

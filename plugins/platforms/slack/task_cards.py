@@ -9,11 +9,12 @@ logger = logging.getLogger(__name__)
 
 async def finish_task_card(client, stream, *, delete: bool) -> None:
     """Seal first so a failed deletion cannot leave Slack's live indicator armed."""
-    try:
-        await client.api_call("chat.stopStream", json={"channel": stream.channel, "ts": stream.stream_ts})
-    except Exception as exc:
-        # Slack may already have sealed an expired stream. Still try deletion.
-        logger.debug("[Slack] Native task-card stopStream failed: %s", exc)
+    if stream.stream_ts:
+        try:
+            await client.api_call("chat.stopStream", json={"channel": stream.channel, "ts": stream.stream_ts})
+        except Exception as exc:
+            # Slack may already have sealed an expired stream. Still try deletion.
+            logger.debug("[Slack] Native task-card stopStream failed: %s", exc)
     if not delete:
         return
     for ts in stream.message_timestamps:

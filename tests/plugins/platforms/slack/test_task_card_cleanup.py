@@ -112,6 +112,30 @@ async def test_delete_failure_clears_turn_state_and_does_not_mask_reply(slack, e
 
 
 @pytest.mark.asyncio
+async def test_failed_reopen_still_removes_the_expired_card(slack):
+    adapter, client = slack
+    await adapter.send_native_task_card_progress("C1", TASKS, metadata=METADATA)
+    original = client.api_call.side_effect
+
+    async def api_call(method, *, json):
+        if method == "chat.appendStream":
+            raise SlackApiError("expired", {"ok": False, "error": "message_not_in_streaming_state"})
+        if method == "chat.startStream":
+            raise ConnectionError("reopen failed")
+        return await original(method, json=json)
+
+    client.api_call.side_effect = api_call
+    result = await adapter.send_native_task_card_progress("C1", TASKS, metadata=METADATA)
+    assert not result.success
+    client.api_call.reset_mock()
+    await adapter.stop_native_task_card_progress("C1", metadata=METADATA)
+    assert [(call.args[0], call.kwargs["json"]) for call in client.api_call.await_args_list] == [
+        ("chat.delete", {"channel": "C1", "ts": "card-1"}),
+    ]
+    assert not adapter._native_task_card_streams
+
+
+@pytest.mark.asyncio
 async def test_retention_opt_out_preserves_completed_card(slack):
     adapter, client = slack
     adapter.config.extra["native_task_cards_ephemeral"] = False
