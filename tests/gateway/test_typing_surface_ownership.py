@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import _thread_metadata_for_event
+from gateway.platforms.typing_state import typing_metadata_for_event
 from gateway.platforms.typing_state import call_typing_with_metadata
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
@@ -64,7 +64,7 @@ def test_normal_scope_metadata_agrees(platform, chat_type, thread_id):
     runner._delivery_adapter_for = lambda source: a
     source = SessionSource(platform=platform, chat_id="123", chat_type=chat_type, thread_id=thread_id)
     event = MessageEvent(text="test", source=source, message_id="171.1")
-    initial = _thread_metadata_for_event(event)
+    initial = typing_metadata_for_event(event)
     _, _, status = runner._run_agent_progress_threading(source, event.message_id, False)
     assert a._typing_scope_key(source.chat_id, initial) == a._typing_scope_key(source.chat_id, status)
 
@@ -78,7 +78,7 @@ def test_slack_status_keeps_turn_scoped_recipient_identity():
     assert status["user_id"] == "U1"
     assert status["scope_id"] == status["slack_team_id"] == "T1"
     event = MessageEvent(text="test", source=source, message_id="171.2")
-    assert a._typing_scope_key("C123", status) == a._typing_scope_key("C123", _thread_metadata_for_event(event))
+    assert a._typing_scope_key("C123", status) == a._typing_scope_key("C123", typing_metadata_for_event(event))
 
 
 @pytest.mark.asyncio
@@ -94,7 +94,7 @@ async def test_top_level_slack_without_thread_sessions_uses_same_scope(reply_in_
     event = MessageEvent(text="test", source=source, message_id=root_ts)
     runner = object.__new__(GatewayRunner)
     runner._delivery_adapter_for = lambda source: a
-    initial = _thread_metadata_for_event(event)
+    initial = typing_metadata_for_event(event)
     _, _, status = runner._run_agent_progress_threading(source, root_ts, False)
     assert initial == status
     await a.send_typing(source.chat_id, metadata=initial)
@@ -151,7 +151,7 @@ async def test_late_interim_reassert_cannot_restore_status_after_final(monkeypat
         # Final delivery owns exactly this surface and has completed all normal typing cleanup.
         await a._stop_typing_refresh("D123", owner, metadata=md)
         assert ui_status[0] == ""
-        assert not a._typing_tasks
+        assert not a._typing_refresh_owners
         release_reassert.set()
         assert (await interim).success
         assert ui_status[0] == "", "the interim request restored a stuck idle status"
