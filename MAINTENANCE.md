@@ -100,3 +100,8 @@ leg assertions and the separate refusal tests. Guards: `tests/conformance/test_v
 The inherited `fallback.min_switch_reset_seconds` setting also needs its
 `fallback` category folded into the existing agent tab through `_CATEGORY_MERGE`.
 The existing `test_no_single_field_categories` contract remains unchanged.
+
+The concurrent cron/profile isolation fixture must accept `compute_next_run`'s
+existing third timezone argument. Only the stub signature changes. Its concurrent
+write ordering and both profile-store isolation assertions remain unchanged.
+Guard: `tests/hermes_cli/test_web_server_cron_profiles.py`.
