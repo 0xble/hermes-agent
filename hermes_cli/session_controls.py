@@ -1112,9 +1112,21 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     if autonomous_goal:
         # No route/approval requirement: goal writes use the same transaction and wake receipt.
         # Replacement is an agent edit, so every existing requirement still binds.
+        def apply_autonomous(conn):
+            authority = {"via": "autonomy", "session_id": str(requester_sid), "quote": user_quote}
+            if action == "pause" and user_quote:
+                # Only a still-current user instruction may suspend automatic waking.
+                checked = check_user_quote(requester_sid, user_quote, cursor=conn)
+                if not isinstance(checked, str) and _quote_matches_control(
+                    kind, action, target_sid, requester_sid,
+                    _governing_sentence(*checked), payload, cursor=conn,
+                ):
+                    quote, message = checked
+                    authority = {"via": "quote", "quote": quote, "message": message}
+            return commit(conn, authority, "session_control_autonomy")
+
         try:
-            return _db()._execute_write(lambda conn: commit(
-                conn, {"via": "autonomy", "session_id": str(requester_sid), "quote": user_quote}, "session_control_autonomy"))
+            return _db()._execute_write(apply_autonomous)
         except Exception as exc:
             logger.warning("autonomous goal control failed", exc_info=True)
             return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
@@ -1367,8 +1379,20 @@ def mark_outbox(request_id: str, flag: str, value: Any = True) -> Optional[Dict[
     return db._execute_write(_mark)
 
 
+def _pause_goal(sid, reason, payload, authority, cursor=None):
+    from hermes_cli.goals import GoalManager
+
+    manager = GoalManager(sid, cursor=cursor)
+    if authority.get("via") == "autonomy":
+        if not manager.is_active():
+            return None
+        return manager.wait_for_seconds(manager._autonomy_wait_seconds(),
+                                        reason=reason or "session-control")
+    return manager.pause(reason=reason or "session-control")
+
+
 CONTROLS = {
-    ("goal", "pause"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).pause(reason=reason or "session-control"),
+    ("goal", "pause"): _pause_goal,
     ("goal", "resume"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).resume(),
     ("goal", "clear"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).clear(),
     ("loop", "pause"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid, cursor=cursor).pause(reason=reason or "session-control"),

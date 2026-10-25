@@ -65,6 +65,13 @@ remain paused. Legacy blocked/input/approval states and automatic pauses migrate
 to active timed waits on load. Idle scans include those rows so migration is not
 dependent on a new user message. Stale resume_pending takeover continues through
 the existing generation-fenced gateway path.
+Agent-requested pauses use the same native retry interval as other timed holds.
+A reason string or unverified quote is not user authority. A current explicit
+user pause quote is revalidated under the session-control write lock and keeps
+the goal paused. Native user pauses and default-off controls remain unchanged.
+The CLI idle hook refreshes its cached goal snapshot before deciding whether a
+tool-authored wait is due. Reload adopts durable state and retains the existing
+snapshot/CAS fences.
 Cleared and completed rows remain terminal even if legacy wait fields survive.
 Load and idle-store scans cannot reactivate those rows.
 

@@ -5,6 +5,10 @@ import time
 
 import pytest
 
+# User-message persistence reaches the runtime bootstrap. Load it before the
+# per-test real-home guard, as the application entry point does.
+import hermes_bootstrap  # noqa: F401
+
 from hermes_cli import goals, session_controls
 from hermes_cli.goal_command import dispatch_goal_command
 
@@ -17,7 +21,8 @@ def home(tmp_path, monkeypatch):
     (tmp_path / "config.yaml").write_text("goals:\n  autonomy: true\n", encoding="utf-8")
     goals._DB_CACHE.clear()
     db = goals._get_session_db()
-    db.ensure_session("autonomy", source="telegram")
+    db.create_session("autonomy", "telegram", profile_name="default", chat_id="autonomy",
+                      chat_type="private", session_key="agent:main:telegram:dm:autonomy")
     yield tmp_path, db
     goals._DB_CACHE.clear()
 
@@ -140,6 +145,76 @@ def test_model_controls_never_request_approval_or_clear(home, action):
         assert goals.load_goal("autonomy").status == "active"
     else:
         assert result["ok"], result
+
+
+@pytest.mark.parametrize("entry", ["apply", "request"])
+@pytest.mark.parametrize("reason,user_quote", [
+    ("temporary dependency wait", ""),
+    ("user-paused", ""),
+    ("session-control", "Pause the goal."),
+    ("next step", "Continue the goal."),
+])
+def test_model_pause_has_a_timed_native_wake(home, monkeypatch, entry, reason, user_quote):
+    _, db = home
+    mgr = manager()
+    mgr.add_subgoal("delivery confirmed")
+    db.append_message("autonomy", "user", "Continue the goal.")
+    before = goals.load_goal("autonomy")
+    control = session_controls.apply_control if entry == "apply" else session_controls.request_control
+    kwargs = {"user_quote": user_quote} if entry == "apply" else {}
+    result = control("goal", "pause", "autonomy", requester_sid="autonomy", reason=reason, **kwargs)
+    assert result["ok"] and result["status"] == "applied", result
+    state = goals.load_goal("autonomy")
+    assert state.status == "active"
+    assert state.waiting_until > time.time()
+    assert not state.waiting_on_user_message and state.paused_reason is None
+    assert state.contract == before.contract and state.subgoals == before.subgoals
+    assert (state.turns_used, state.max_turns, state.created_at) == (
+        before.turns_used, before.max_turns, before.created_at)
+    assert goals.store_has_parked_goal(db)
+    assert any(sid == "autonomy" for sid, _ in goals.list_parked_goals())
+    wake = goals.GoalManager("autonomy")
+    assert wake.lifted_barrier_prompt() is None
+    monkeypatch.setattr(goals.time, "time", lambda: state.waiting_until + 1)
+    assert wake.lifted_barrier_prompt() is not None
+    assert wake.clear_lifted_wait(state.waiting_since)
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "next route", False, None, False))
+    decision = wake.evaluate_after_turn("try the next route", user_initiated=False)
+    assert decision["status"] == "active" and wake.state.turns_used == before.turns_used + 1
+
+
+@pytest.mark.parametrize("entry", ["slash", "quote", "stale_quote", "default_off"])
+def test_user_pause_authority_stays_explicit(home, monkeypatch, entry):
+    root, db = home
+    mgr = manager()
+    quote = "Pause the goal."
+    db.append_message("autonomy", "user", quote)
+    if entry == "slash":
+        dispatch_goal_command(mgr, "pause", authorize_gate=lambda: None)
+    else:
+        if entry == "default_off":
+            root.joinpath("config.yaml").write_text("goals:\n  autonomy: false\n", encoding="utf-8")
+        if entry == "stale_quote":
+            check = session_controls.check_user_quote
+
+            def supersede(sid, text, *, cursor=None):
+                checked = check(sid, text, cursor=cursor)
+                if cursor is None:
+                    db.append_message("autonomy", "user", "Continue the goal.")
+                return checked
+
+            monkeypatch.setattr(session_controls, "check_user_quote", supersede)
+        result = session_controls.apply_control("goal", "pause", "autonomy",
+            requester_sid="autonomy", reason="temporary dependency wait", user_quote=quote)
+        assert result["ok"] and result["status"] == "applied", result
+    state = goals.load_goal("autonomy")
+    if entry == "stale_quote":
+        assert state.status == "active" and state.waiting_until > time.time()
+    else:
+        assert state.status == "paused" and not state.waiting_until
+        assert not goals.store_has_parked_goal(db)
+        assert goals.list_parked_goals() == []
+        assert goals.GoalManager("autonomy").lifted_barrier_prompt() is None
 
 
 def test_legacy_blocks_and_user_waits_migrate_but_default_off_does_not(home):
