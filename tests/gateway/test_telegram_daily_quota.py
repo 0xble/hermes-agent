@@ -603,3 +603,20 @@ def test_shorter_penalty_inside_a_longer_one_keeps_the_later_end(tmp_path):
     wall.t = _utc("2026-10-26 10:07:00")  # within 24h of the long ban's end
     assert quota.call_ceiling(CHAT) == 50
     assert DailyQuota(call_soft_ceiling=100, profile_dir=tmp_path, wall=wall).call_ceiling(CHAT) == 50
+
+
+@pytest.mark.asyncio
+async def test_typed_turn_at_the_call_ceiling_drops_typing_but_keeps_its_final_edit(tmp_path):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(adapter._daily_quota(), 10)
+    token = bind_trigger(SimpleNamespace(text="what changed?"))
+    try:
+        await adapter.send_typing(CHAT)
+        adapter._bot.send_chat_action.assert_not_awaited()
+        assert (await adapter.edit_message(CHAT, "5", "the answer", finalize=True)).success
+        adapter._bot.edit_message_text.assert_awaited()
+    finally:
+        reset_trigger(token)
