@@ -142,8 +142,11 @@ def finish_text_response(
         and not assistant_message.tool_calls
         and (_content is None or (isinstance(_content, str) and not _content.strip()))
     )
+    from gateway.session_context import current_message_reaction_acknowledged
+    _reaction_stop = _contentless_stop and not truncated_response_parts and current_message_reaction_acknowledged()
     if (
         _contentless_stop
+        and not _reaction_stop
         and not _responses_reasoning_summary
         and not any(
             isinstance(d, dict) and (
@@ -184,7 +187,7 @@ def finish_text_response(
     agent._mute_post_response = False
 
     # Think-block-only / empty content: recovery path.
-    if not agent._has_content_after_think_block(final_response):
+    if not agent._has_content_after_think_block(final_response) and not _reaction_stop:
         _ev = recover_empty_response(
             agent, assistant_message, response, finish_reason, final_response=final_response,
             messages=messages, api_messages=api_messages, conversation_history=conversation_history,
@@ -251,6 +254,7 @@ def finish_text_response(
         and _ack_mode != "off"
         and codex_ack_continuations < 2
         and _tool_rows > 0
+        and not _reaction_stop
         and looks_like_degenerate_final(_stall_text, user_message=user_message)
     )
     # Precedence: an announced next action outranks the fragment shape; the codex ack is last.
@@ -259,7 +263,8 @@ def finish_text_response(
     elif _degenerate_final:
         _continuation_kind = "degenerate"
     elif (
-        _ack_mode != "off"
+        not _reaction_stop
+        and _ack_mode != "off"
         and agent.valid_tool_names
         and codex_ack_continuations < 2
         and agent._looks_like_codex_intermediate_ack(

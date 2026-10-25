@@ -2990,6 +2990,15 @@ class BasePlatformAdapter(ABC):
         when content is unchanged."""
         return SendResult(success=False, error="Not supported")
 
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        """Add an explicit reaction, returning False if unsupported or delivery fails.
+
+        ``routing`` carries platform context such as team_id, thread_id and user_id
+        (the target author on Signal). Explicit reactions are independent of the
+        automatic processing-status reaction setting and do not mark a turn answered.
+        """
+        return False
+
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a sent message; True on success (platforms without a deletion API return False and
         callers leave it). Used by the stream consumer's fresh-final cleanup to remove stale
