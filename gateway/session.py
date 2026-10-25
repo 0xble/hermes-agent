@@ -590,6 +590,7 @@ class SessionEntry:
     attended_route_active: Optional[bool] = None
     model_role: Optional[str] = None
     attended_pinned: bool = False
+    attended_pin_until: Optional[float] = None
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -637,6 +638,8 @@ class SessionEntry:
             result["model_role"] = self.model_role
         if self.attended_pinned:
             result["attended_pinned"] = True
+            if self.attended_pin_until is not None:
+                result["attended_pin_until"] = self.attended_pin_until
         if self.active_turn_token and self.active_turn_owner_pid and self.active_turn_owner_slot:
             result["active_turn_owner_pid"] = self.active_turn_owner_pid
             result["active_turn_owner_slot"] = self.active_turn_owner_slot
@@ -731,6 +734,7 @@ class SessionEntry:
             if isinstance(data.get("attended_route_active"), bool) else None,
             model_role=str(data.get("model_role")).strip().lower() if data.get("model_role") else None,
             attended_pinned=data.get("attended_pinned") is True,
+            attended_pin_until=data.get("attended_pin_until"),
             model_override_scope=data.get("model_override_scope", "session")
             if data.get("model_override_scope") in ("session", "temporary", "once") else "session",
             reasoning_override_scope=data.get("reasoning_override_scope", "session")
@@ -1372,6 +1376,7 @@ class SessionStore(
                 entry.last_user_activity_at = durable.last_user_activity_at
             if entry is not None and durable is not None and durable.session_id == entry.session_id:
                 entry.attended_pinned = durable.attended_pinned
+                entry.attended_pin_until = durable.attended_pin_until
             return getattr(entry, "last_user_activity_at", None) if entry else None
 
     def mark_user_activity(self, session_key: str, when: Optional[datetime] = None) -> bool:
@@ -1571,6 +1576,7 @@ class SessionStore(
                 last_user_activity_at=old_entry.last_user_activity_at,
                 attended_route_active=old_entry.attended_route_active,
                 attended_pinned=old_entry.attended_pinned if preserve_attended_pin else False,
+                attended_pin_until=old_entry.attended_pin_until if preserve_attended_pin else None,
                 model_role=old_entry.model_role,
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
