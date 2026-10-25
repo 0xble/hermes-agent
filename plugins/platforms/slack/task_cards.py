@@ -69,7 +69,7 @@ class TaskCardCleanup:
 
     def _read(self) -> list[dict]:
         try:
-            entries = json.loads(self.path.read_text(encoding="utf-8"))
+            entries = json.loads(self.path.read_text(encoding="utf-8-sig"))
             if not isinstance(entries, list):
                 raise ValueError("expected a list")
             return entries

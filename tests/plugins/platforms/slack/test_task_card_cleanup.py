@@ -46,7 +46,7 @@ async def test_turn_cleanup_stops_then_deletes_only_its_card(slack, include_team
     result = await adapter.send_native_task_card_progress("C1", TASKS, metadata=metadata)
     assert result.success
     ledger = get_hermes_home() / "state" / "slack_task_cards.json"
-    entries = json.loads(ledger.read_text())
+    entries = json.loads(ledger.read_text(encoding="utf-8-sig"))
     assert [(entry["team_id"], entry["channel"], entry["ts"]) for entry in entries] == [("T1", "C1", "card-1")]
     assert entries[0]["created_at"] > 0
     client.api_call.reset_mock()
@@ -60,7 +60,7 @@ async def test_turn_cleanup_stops_then_deletes_only_its_card(slack, include_team
         ("chat.delete", {"channel": "C1", "ts": "card-1"}),
     ]
     assert not adapter._native_task_card_streams
-    assert json.loads(ledger.read_text()) == []
+    assert json.loads(ledger.read_text(encoding="utf-8-sig")) == []
     # The thread can be reused without inheriting stopped state.
     result = await adapter.send_native_task_card_progress("C1", TASKS, metadata=metadata)
     assert result.success and result.message_id == "card-2"
@@ -118,7 +118,7 @@ async def test_delete_failure_clears_turn_state_and_does_not_mask_reply(slack, e
     client.api_call.side_effect = api_call
     await adapter.stop_native_task_card_progress("C1", metadata=METADATA)
     assert not adapter._native_task_card_streams
-    entries = json.loads((get_hermes_home() / "state" / "slack_task_cards.json").read_text())
+    entries = json.loads((get_hermes_home() / "state" / "slack_task_cards.json").read_text(encoding="utf-8-sig"))
     assert [entry["ts"] for entry in entries] == ([] if error == "message_not_found" else ["card-1"])
     await adapter._task_card_cleanup.close()
     if error != "message_not_found":
@@ -200,12 +200,12 @@ async def test_cancelled_cleanup_reclaims_its_card_without_waiting_for_retry_del
             await stopping
         await asyncio.wait_for(deleted.wait(), timeout=2)
         await asyncio.wait_for(adapter._task_card_cleanup.task, timeout=2)
-        assert json.loads(adapter._task_card_cleanup.path.read_text()) == []
+        assert json.loads(adapter._task_card_cleanup.path.read_text(encoding="utf-8-sig")) == []
         assert not adapter._native_task_card_streams
         # Recovery must not carry the stopped turn's state into the next turn.
         result = await adapter.send_native_task_card_progress("C1", TASKS, metadata=METADATA)
         assert result.success and result.message_id == "card-2"
-        assert [entry["ts"] for entry in json.loads(adapter._task_card_cleanup.path.read_text())] == ["card-2"]
+        assert [entry["ts"] for entry in json.loads(adapter._task_card_cleanup.path.read_text(encoding="utf-8-sig"))] == ["card-2"]
     finally:
         stopping.cancel()
         await adapter._task_card_cleanup.close()
@@ -244,7 +244,7 @@ async def test_new_cleanup_wakes_an_existing_retry_worker(slack, monkeypatch):
         await adapter.stop_native_task_card_progress("C1", metadata=METADATA)
         await asyncio.wait_for(old_deleted.wait(), timeout=2)
         await asyncio.wait_for(adapter._task_card_cleanup.task, timeout=2)
-        assert json.loads(adapter._task_card_cleanup.path.read_text()) == []
+        assert json.loads(adapter._task_card_cleanup.path.read_text(encoding="utf-8-sig")) == []
         assert old_attempts == 3
     finally:
         await adapter._task_card_cleanup.close()
@@ -270,27 +270,30 @@ async def test_failed_delete_is_retried_until_confirmed_even_after_24h(slack, mo
     client.api_call.side_effect = api_call
     await adapter.stop_native_task_card_progress("C1", metadata=METADATA)
     ledger = adapter._task_card_cleanup.path
-    entries = json.loads(ledger.read_text())
+    entries = json.loads(ledger.read_text(encoding="utf-8-sig"))
     assert [entry["ts"] for entry in entries] == ["card-1"]
     entries[0]["created_at"] = 0
-    ledger.write_text(json.dumps(entries))
+    ledger.write_text(json.dumps(entries), encoding="utf-8")
     assert adapter._task_card_cleanup.task is not None
     try:
         await asyncio.wait_for(adapter._task_card_cleanup.task, timeout=5)
         assert attempts == 3
-        assert json.loads(ledger.read_text()) == []
+        assert json.loads(ledger.read_text(encoding="utf-8-sig")) == []
     finally:
         await adapter._task_card_cleanup.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ephemeral", [True, False])
+@pytest.mark.parametrize("bom", [False, True])
 async def test_connect_sweeps_only_ledger_cards_and_preserves_live_streams(
-    slack, monkeypatch, ephemeral,
+    slack, monkeypatch, ephemeral, bom,
 ):
     previous, client = slack
     await previous.send_native_task_card_progress("C1", TASKS, metadata=METADATA)
     ledger = previous._task_card_cleanup.path
+    if bom:
+        ledger.write_bytes(b"\xef\xbb\xbf" + ledger.read_bytes())
     # A fresh adapter has no memory of the first process's in-flight stream.
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake", extra={
         "native_task_cards": True, "native_task_cards_ephemeral": ephemeral}))
@@ -298,7 +301,7 @@ async def test_connect_sweeps_only_ledger_cards_and_preserves_live_streams(
     adapter._team_clients["T1"] = client
     await adapter.send_native_task_card_progress(
         "C1", TASKS, metadata={**METADATA, "thread_id": "live-thread"})
-    before = ledger.read_text()
+    before = ledger.read_bytes()
     client.api_call.reset_mock()
     swept = asyncio.Event()
     sweep = adapter._task_card_cleanup.sweep
@@ -334,12 +337,12 @@ async def test_connect_sweeps_only_ledger_cards_and_preserves_live_streams(
         assert await adapter.connect()
         if ephemeral:
             await asyncio.wait_for(swept.wait(), timeout=5)
-            assert [entry["ts"] for entry in json.loads(ledger.read_text())] == ["card-2"]
+            assert [entry["ts"] for entry in json.loads(ledger.read_text(encoding="utf-8-sig"))] == ["card-2"]
             assert [(call.args[0], call.kwargs["json"]["ts"])
                     for call in client.api_call.await_args_list] == [
                         ("chat.stopStream", "card-1"), ("chat.delete", "card-1")]
         else:
-            assert ledger.read_text() == before
+            assert ledger.read_bytes() == before
             assert adapter._task_card_cleanup.task is None
             client.api_call.assert_not_awaited()
     finally:
