@@ -559,3 +559,54 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   trailer, while retaining a legacy fallback for old logs.
 - Guard: `tests/hermes_cli/test_kanban_worker_exit_trailer.py`
   (`test_logged_exit_code_matches_worker_pid_across_appended_retries`).
+
+## Catalog Entry Hides Plugin Credentials
+
+- Fork patch identity: `meridian-provider-credentials`.
+- Deploy-base repair for [PR #791](https://github.com/0xble/hermes-agent/pull/791).
+  Once models.dev listed CommandCode, `get_provider` returned its `CMD_API_KEY`
+  catalog entry before consulting the registered plugin's `COMMANDCODE_API_KEY`.
+  Model switches therefore stopped recognizing the credential Hermes setup uses.
+- Merge credential names from the catalog, registered profile and overlay without
+  treating URL variables as credentials or changing endpoint/transport precedence.
+- Guard: `tests/hermes_cli/test_provider_catalog_credentials.py` exercises real
+  plugin discovery against absent and alternate catalog credentials. The existing
+  `tests/plugins/model_providers/test_commandcode_profile.py` assertion stays intact.
+- Retire when upstream provider resolution preserves the same credential union.
+
+## Telegram Flood Delay Test Clock
+
+- Fork patch identity: `meridian-qualification-fixtures`.
+- The delay-preservation test used an arbitrary real event-loop epoch, so
+  `(now + 30) - now` could return `30.000000000000057`. Bind the test clock
+  to an exactly representable epoch while preserving both exact error-string
+  and numeric delay assertions. Runtime cooldown behavior is unchanged.
+- Guard: `tests/gateway/test_telegram_final_delivery.py`.
+
+## Deploy-Base Qualification Probes
+
+Fork patch identity: `meridian-qualification-probes`.
+
+The cron fork-race probe must wait up to 2 seconds for asynchronous SIGKILL
+delivery before asserting every recorded descendant is gone or a zombie. A
+survivor still fails the same assertion. No additional kill occurs before it.
+Guard: `tests/agent/test_deadline_fork_race.py`.
+
+The Kanban E2E harness strips launch-profile settings, but must explicitly
+retain the suite's lazy-install disablement and pytest recovery guard. Otherwise
+real workers can repair or install into the test interpreter while sibling files
+import it. The observed reviewer crash was `prompt_toolkit.utils` missing during
+import. All worker, tick, outcome, and billing assertions remain unchanged.
+Guard: `tests/e2e/core/kanban/test_kanban_rate_limit_review.py`.
+
+The immutable-release real-worker retention fixture scopes its process inventory
+to its owned worker, retaining real psutil identity reads and the exact pruning
+assertions. Unrelated unreadable processes intentionally keep every release,
+covered separately by `test_unreadable_process_identity_scopes_retention`.
+
+The cron replica contention harness checks peer liveness while waiting for both
+claims and includes the peer's stderr on failure. The peer records its stack
+before the unchanged barrier deadline if stalled. A hosted first-round timeout
+was not reproduced by isolated or full-file Linux execution, so its triggering
+cause remains unproven. These diagnostics strengthen failure evidence without
+changing deadlines, claims, scheduling, or any delivery assertions.

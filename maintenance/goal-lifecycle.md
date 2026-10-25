@@ -13,6 +13,13 @@ Failed or interrupted model turns do not run completion judging.
 
 - Fork patch identity: `slice-3-goal-lifecycle`. The original goal lifecycle slice: `goal_set`
   honors the profile budget and surfaces agent `goal_set` receipts as notices.
+- Fork patch identity: `goal-notice-visibility`. Own fork patch, no upstream PR yet.
+  `goals.notices` (default true) gates automatic goal chat output: judge verdict and
+  status notices, `goal_set` receipts, and the `/goal set` and `/goal draft` confirmation.
+  Explicit `/goal status` and `/goal show` replies, errors, and session-control approval
+  cards stay visible. Goal persistence, judging and continuations are unchanged.
+  Shared company agents (LPG/Io, Meridian) set it false. Regression:
+  `tests/gateway/test_goal_notices_config.py`. Rollback removes the switch and its reads.
 - Fork patch identity: `goal-criteria-completeness`. Own upstream contribution:
   [PR #118343](https://github.com/NousResearch/hermes-agent/pull/118343),
   tracked by [issue #118334](https://github.com/NousResearch/hermes-agent/issues/118334).
@@ -141,3 +148,9 @@ Landing is not runtime promotion or activation.
 The v2026.9.21 integration preserves trusted user-turn admission across upstream
 prompt metadata and compute-host changes. Title previews remain presentation data,
 and hidden or relayed turns do not acquire user authority.
+
+The notice policy also gates CLI/TUI judge, automatic resume, and lifted-wait
+output. Judging and queued follow-ups remain active. Explicit controls and
+compression-failure recovery warnings remain visible. Guards:
+`tests/hermes_cli/test_goal_notice_surfaces.py` and
+`tests/tui_gateway/test_goal_notice_surfaces.py`.
