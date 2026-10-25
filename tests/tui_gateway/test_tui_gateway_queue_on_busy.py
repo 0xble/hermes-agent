@@ -649,13 +649,18 @@ def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
         server, "_run_prompt_submit",
         lambda rid, sid, session, text, **kwargs: fired.update(rid=rid, sid=sid, text=text),
     )
-    session = _session(queued_prompt={"text": "go", "transport": "ws-9"})
+    class Transport:
+        def write(self, obj):
+            return True
+
+    transport = Transport()
+    session = _session(queued_prompt={"text": "go", "transport": transport})
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
     assert fired == {"rid": "r1", "sid": "sid", "text": "go"}
     assert session["running"] is True
     assert session["queued_prompt"] is None
-    assert session["transport"] == "ws-9"
+    assert server._session_transport_contains(session, transport)
 
 
 def test_drain_compute_host_forwards_queued_image_paths(monkeypatch):
