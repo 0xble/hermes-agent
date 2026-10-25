@@ -56,10 +56,12 @@ try:  # sibling module; support both package and flat plugin-dir import
     from .attachment_errors import describe_download_exception
     from .block_kit import render_blocks, sanitize_blocks
     from .task_card_stream import start_native_task_card_stream
+    from .task_cards import finish_task_card
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
     from task_card_stream import start_native_task_card_stream  # type: ignore
+    from task_cards import finish_task_card  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -338,6 +340,7 @@ class _NativeTaskCardStream:
     channel: str
     thread_ts: str
     stream_ts: str = ""
+    message_timestamps: list[str] = field(default_factory=list)
     stopped: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -2140,11 +2143,14 @@ class SlackAdapter(BasePlatformAdapter):
                 return
             stream.stopped = True
             try:
-                if self._app and stream.stream_ts:
-                    await self._get_client(stream.channel, team_id=stream.team_id).api_call(
-                        "chat.stopStream", json={"channel": stream.channel, "ts": stream.stream_ts})
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.debug("[Slack] Native task-card stopStream failed: %s", exc)
+                if self._app and (stream.stream_ts or stream.message_timestamps):
+                    extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+                    ephemeral = extra.get("native_task_cards_ephemeral", True)
+                    await finish_task_card(
+                        self._get_client(stream.channel, team_id=stream.team_id), stream,
+                        delete=self._truthy_config(ephemeral))
+            except Exception as exc:  # Never let progress cleanup block the real reply.
+                logger.warning("[Slack] Native task-card cleanup failed: %s", exc)
             finally:
                 if self._native_task_card_streams.get(key) is stream:
                     self._native_task_card_streams.pop(key, None)
@@ -2152,7 +2158,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None) -> None:
-        """Finalize an active Slack-native progress stream exactly once."""
+        """Seal and remove transient progress, including on interrupted turns."""
         key = self._native_task_card_key(chat_id, reply_to, metadata)
         if key is None:
             return
