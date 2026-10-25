@@ -330,9 +330,17 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # counting internal/system events would keep a genuinely idle gateway awake.
         if not getattr(event, "_gateway_compression_deferred", False):
             self._scale_to_zero_note_real_inbound()
+            original_event = event
             event = await self._hm_pre_gateway_dispatch_hook(event, source)
             if event is None:
                 return None
+            if event is not original_event:
+                # The native adapter retains this exact object for compression retries.
+                # Keep the rewrite and callback proof on that owner, not a throwaway copy.
+                from gateway.session_ingress_context import carry_callback
+                original_event.text = event.text
+                carry_callback(event, original_event)
+                event = original_event
         from gateway.response_filters import apply_agent_origin_reply_expectation
         event = apply_agent_origin_reply_expectation(event)
         source = event.source

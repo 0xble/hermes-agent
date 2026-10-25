@@ -2448,8 +2448,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             display_response = _sanitize_gateway_final_response(ctx.source.platform, display_response)
             if not display_response:
                 display_response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
-            # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
-            # defaults agent_persisted differently when the key is absent.
+            # Empty local-viewer turns still carry reasoning on the completion frame.
+            # Omit agent_persisted: the caller defaults it differently when absent.
+            if local_sinks is not None:
+                common["last_reasoning"] = result.get("last_reasoning")
             return {"final_response": final_response or "", "delivery_text": display_response, **common, **viewer_meta,
                     "response_previewed": previewed,
                     "response_transformed": bool(result.get("response_transformed"))}

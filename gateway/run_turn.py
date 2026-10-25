@@ -2557,44 +2557,32 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             )
         return agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure
 
-    async def _hmwa_compression_exhaustion_reset(
-        self, agent_result, response, session_entry, session_key, source,
-    ):
-        """Auto-reset a permanently oversized session so the next message starts fresh instead of
-        replaying the oversized context forever. Never on a lock-contended defer — that is the
-        OPPOSITE case (a concurrent path holds the lock and is shrinking it). Returns
-        ``(response, session_entry)``."""
-        # When compression is exhausted, the session is permanently too large to process. (#9893) Never wipe
-        # the session for that — retry-next-message semantics apply (#69870 lock-skip consumer; salvaged
-        # from #49874).
-        if agent_result.get("compression_deferred"):
-            logger.info(
-                "Compression deferred for session %s — the compression "
-                "lock is held by a concurrent compressor. Keeping the "
-                "session intact; the next message retries normally.",
-                session_entry.session_id if session_entry else "?",
-            )
-        elif agent_result.get("compression_exhausted") and session_entry and session_key:
-            logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
-            from gateway.session_automation import move_route_wakes, reset_and_rehome_messages
-            async with self._session_model_override_lock(session_key):
-                new_entry, release_fresh = await reset_and_rehome_messages(self, session_key, session_entry.session_id)
-                try:
-                    await move_route_wakes(self, session_key, session_entry.session_id)
-                    self._evict_cached_agent(session_key)
-                    queued = list(self._overflow_queue(session_key) or ())
-                    await self._clear_conversation_scope_locked_async(session_key, reason="compression_exhausted_reset")
-                    if queued:
-                        self._session_state(session_key).conversation.queued_events.extend(queued)
-                    if new_entry is not None:
-                        session_entry = new_entry
-                        await asyncio.to_thread(
-                            self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
-                        )
-                finally:
-                    release_fresh()
-            response = (response or "") + t("gateway.session.auto_reset_context_exhausted")
-        return response, session_entry
+    async def _hmwa_compression_exhaustion_reset(self, agent_result, response, session_entry, session_key, source):
+        from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
+        return await GatewayTurnPersistenceMixin._hmwa_compression_exhaustion_reset(
+            self, agent_result, response, session_entry, session_key, source)
+
+    async def _hmwa_rotate_exhausted_session(self, session_entry, session_key, source):
+        """Keep fork async scope cleanup behind the shared API and active-admission gates."""
+        logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
+        from gateway.session_automation import move_route_wakes, reset_and_rehome_messages
+        async with self._session_model_override_lock(session_key):
+            new_entry, release_fresh = await reset_and_rehome_messages(self, session_key, session_entry.session_id)
+            try:
+                await move_route_wakes(self, session_key, session_entry.session_id)
+                self._evict_cached_agent(session_key)
+                queued = list(self._overflow_queue(session_key) or ())
+                await self._clear_conversation_scope_locked_async(session_key, reason="compression_exhausted_reset")
+                if queued:
+                    self._session_state(session_key).conversation.queued_events.extend(queued)
+                if new_entry is not None:
+                    session_entry = new_entry
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
+                    )
+            finally:
+                release_fresh()
+        return session_entry
 
     @staticmethod
     def _hmwa_user_transcript_entry(event, prepared, ts):
