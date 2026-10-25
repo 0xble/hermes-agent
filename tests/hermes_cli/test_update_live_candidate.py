@@ -352,14 +352,13 @@ def test_uncertain_landing_evidence_is_unknown(installed, monkeypatch, case):
     if case != "no-origin":
         origin = "https://example.com/example/hermes-agent.git" if case == "non-github" else "https://github.com/example/hermes-agent.git"
         git(installed.source, "remote", "add", "origin", origin)
-    if case == "closed":
-        pr["state"] = "closed"
-    elif case == "moved-head":
-        pr["head"]["sha"] = installed.target
-    elif case == "other-base":
-        pr["base"]["ref"] = "unrelated"
-    elif case == "other-repo":
-        pr["base"]["repo"]["full_name"] = "other/hermes-agent"
+    mutate = {
+        "closed": lambda: pr.update(state="closed"),
+        "moved-head": lambda: pr["head"].update(sha=installed.target),
+        "other-base": lambda: pr["base"].update(ref="unrelated"),
+        "other-repo": lambda: pr["base"]["repo"].update(full_name="other/hermes-agent"),
+    }
+    mutate.get(case, lambda: None)()
 
     def request(url):
         if case == "offline":

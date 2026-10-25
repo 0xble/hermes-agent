@@ -189,3 +189,11 @@ def select_update_candidate(source: Path, home: Path, target: str,
         _record_stop(stop)
         print(message)
         raise SystemExit(2) from exc
+
+
+def select_update_target(source: Path, home: Path, live: Path | None, fetched: str, branch: str,
+                         args) -> tuple[str, str | None]:
+    """Return the revision to stage and the source branch its release stamp records."""
+    selected = select_update_candidate(
+        source, home, fetched, getattr(args, "replace_candidate", None), target_branch=branch)
+    return selected, branch if selected == fetched else candidate_branch(home, live, source=source)
