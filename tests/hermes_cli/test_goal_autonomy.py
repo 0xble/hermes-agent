@@ -329,3 +329,12 @@ def test_completion_rejects_negated_recorded_proof(home):
         "tests pass": "12 passed", "release readback matches": "12 passed"})
     assert not result["ok"] and "negated" in result["error"]
     assert goals.load_goal("autonomy").status == "active"
+
+
+def test_no_prefixed_evidence_keeps_the_default_off_admission_contract(home):
+    root, db = home
+    mgr = manager()
+    db.append_message("autonomy", "tool", "No 12 passed result was observed", tool_name="terminal")
+    assert mgr._recorded_evidence_error("12 passed", mgr.state)["error_code"] == "evidence_negated"
+    root.joinpath("config.yaml").write_text("goals:\n  autonomy: false\n", encoding="utf-8")
+    assert mgr._recorded_evidence_error("12 passed", mgr.state) is None

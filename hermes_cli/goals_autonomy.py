@@ -43,7 +43,7 @@ def record_hard_limit_breach(state, reason: str) -> None:
         r"(?i)\b(?:constraints?|hard[- ]limits?)\s+(?:(?:was|were|has been|have been)\s+)?"
         r"(?:violated|breached|violation|breach)\b|"
         r"\b(?:violated|breached)\b[^.;]{0,40}\b(?:constraints?|hard[- ]limits?)\b", reason or "")
-    if breached and _evidence_is_negated(reason, breached.group(0)):
+    if breached and _evidence_is_negated(reason, breached.group(0), include_no=True):
         return
     if breached and not any(
             row.get("kind") == "hard_limit_breach" and row.get("reason") == reason

@@ -29,6 +29,7 @@ class GoalContractCommandsMixin:
         """
         from hermes_cli.goals import (
             _bounded_evidence_match, _evidence_is_negated, _evidence_tool_excluded, _get_session_db,
+            goal_autonomy_enabled,
         )
 
         db = _get_session_db()
@@ -54,7 +55,7 @@ class GoalContractCommandsMixin:
                         continue
                     content = str(row.get("content") or "")
                     if _bounded_evidence_match(raw_evidence, content):
-                        if _evidence_is_negated(content, raw_evidence):
+                        if _evidence_is_negated(content, raw_evidence, include_no=goal_autonomy_enabled()):
                             found_negated = True
                             continue
                         return None
