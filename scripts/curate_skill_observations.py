@@ -40,7 +40,7 @@ def _norm(text: str) -> str:
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args], check=check, capture_output=True, text=True)
+    return subprocess.run(["git", "-C", str(repo), *args], check=check, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 def read_observations(obs_dir: Path) -> dict[str, list[str]]:
@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     staged = [str(stage(dotfiles, skill, blocks, today).relative_to(dotfiles)) for skill, blocks in accepted.items()]
     result["staged_files"] = staged
 
-    check = subprocess.run([sys.executable, str(dotfiles / args.check)], cwd=str(dotfiles), capture_output=True, text=True, timeout=1800)
+    check = subprocess.run([sys.executable, str(dotfiles / args.check)], cwd=str(dotfiles), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1800)
     result["check"] = {"exit": check.returncode, "tail": (check.stdout + check.stderr).strip()[-600:]}
     if check.returncode != 0:
         restore(dotfiles, staged)
@@ -189,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _existing_pr(dotfiles: Path, branch: str) -> str:
     run = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url"],
-                         cwd=str(dotfiles), capture_output=True, text=True, env={**os.environ, "GH_REPO": ""})
+                         cwd=str(dotfiles), capture_output=True, text=True, encoding="utf-8", errors="replace", env={**os.environ, "GH_REPO": ""})
     return run.stdout.strip() if run.returncode == 0 else ""
 
 
@@ -198,7 +198,7 @@ def _create_pr(dotfiles: Path, branch: str, base: str, skills: list[str], body: 
     run = subprocess.run(["gh", "pr", "create", "--base", base, "--head", branch, "--title",
                           f"skills: curate observations ({', '.join(skills)})", "--body",
                           body or f"Staged skill observations for reviewed incorporation ({', '.join(skills)})."],
-                         cwd=str(dotfiles), capture_output=True, text=True, env={**os.environ, "GH_REPO": ""})
+                         cwd=str(dotfiles), capture_output=True, text=True, encoding="utf-8", errors="replace", env={**os.environ, "GH_REPO": ""})
     if run.returncode != 0:
         return ""
     url = run.stdout.strip().splitlines()[-1].strip() if run.stdout.strip() else ""
