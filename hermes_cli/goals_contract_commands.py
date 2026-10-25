@@ -4,7 +4,9 @@ Facade dependencies are late-bound so evaluator and command test seams remain sh
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from hermes_cli.lifecycle_snapshot import snapshot_control
@@ -15,6 +17,21 @@ if TYPE_CHECKING:
     from hermes_cli.goals import GoalContract, GoalGate, GoalState
 
 
+def _recorded_result_text(content: str) -> str:
+    """Decode one JSON envelope without joining fields or dropping negative context."""
+    try:
+        json.loads(content)
+    except (json.JSONDecodeError, RecursionError):
+        return content
+    # Preserve field separators and all metadata. Only undo serialization escaping,
+    # once, so literal backslashes and excerpts spanning distinct fields stay distinct.
+    return re.sub(
+        r'"(?:[^"\\]|\\.)*"',
+        lambda match: '"' + json.loads(match.group(0)) + '"',
+        content,
+    )
+
+
 class GoalContractCommandsMixin:
     # --- revisions ------------------------------------------------------
     # Public revise()/replace() live on GoalRevisionsMixin (snapshot/CAS boundary); this mixin
@@ -23,7 +40,7 @@ class GoalContractCommandsMixin:
     def _recorded_evidence_error(self, evidence: str, state: GoalState) -> Optional[Dict[str, str]]:
         """Require evidence-backed revisions to cite an eligible recorded tool result.
 
-        Matching uses word-bounded raw or identically whitespace-normalized token sequences.
+        Matching uses word-bounded decoded or identically whitespace-normalized token sequences.
         This accepts a multiline excerpt copied from a result without accepting partial tokens or prose
         fabricated by the agent: every candidate still comes from a recorded tool row in this session.
         """
@@ -53,9 +70,12 @@ class GoalContractCommandsMixin:
                 for row in rows:
                     if _evidence_tool_excluded(str(row.get("tool_name") or "")):
                         continue
-                    content = str(row.get("content") or "")
+                    raw_content = str(row.get("content") or "")
+                    content = _recorded_result_text(raw_content)
                     if _bounded_evidence_match(raw_evidence, content):
-                        if _evidence_is_negated(content, raw_evidence, include_no=goal_autonomy_enabled()):
+                        # Decoded punctuation must not remove an existing envelope veto.
+                        if any(_evidence_is_negated(candidate, raw_evidence, include_no=goal_autonomy_enabled())
+                               for candidate in (raw_content, content)):
                             found_negated = True
                             continue
                         return None
