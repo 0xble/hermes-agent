@@ -98,7 +98,9 @@ def _completion_event(*, started_at, session_id="proc_reused"):
 def _stop_after_sleeps(monkeypatch, runner, count, *, minutes_apart=False):
     """``minutes_apart``: each watcher tick is a minute later, so a refused retry's backoff is due."""
     sleep_calls = 0
-    clock = install_module_clock(monkeypatch, run_notifications) if minutes_apart else None
+    clock = install_module_clock(
+        monkeypatch, run_notifications, now=run_notifications.time.monotonic(),
+    ) if minutes_apart else None
 
     async def _bounded_sleep(_delay):
         nonlocal sleep_calls
@@ -1643,7 +1645,7 @@ async def test_terminal_drop_sql_failure_retries_exact_event(monkeypatch, isolat
     if route == "closed-parent":
         runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value=None))
     isolated_registry.completion_queue.put(evt)
-    _stop_after_sleeps(monkeypatch, runner, count=2)
+    _stop_after_sleeps(monkeypatch, runner, count=2, minutes_apart=True)
     await runner._async_delegation_watcher(interval=0)
     with ad._DB_LOCK, ad._transaction() as conn:
         state = conn.execute(f"SELECT delivery_state, delivery_attempts, delivery_claim FROM {table} WHERE {key}=?", (identity,)).fetchone()
@@ -1653,7 +1655,7 @@ async def test_terminal_drop_sql_failure_retries_exact_event(monkeypatch, isolat
     adapter.handle_message.assert_not_awaited()
 
     runner._running = True
-    _stop_after_sleeps(monkeypatch, runner, count=2)
+    _stop_after_sleeps(monkeypatch, runner, count=2, minutes_apart=True)
     await runner._async_delegation_watcher(interval=0)
     assert isolated_registry.completion_queue.empty()
     with ad._DB_LOCK, ad._transaction() as conn:

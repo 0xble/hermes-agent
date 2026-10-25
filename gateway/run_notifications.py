@@ -1843,7 +1843,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             _prime = getattr(adapter, "prime_routing_cache", None)
             if callable(_prime):
                 _prime(synth_event)
-            if getattr(self, "_draining", False):
+            from gateway.session_authorities import active_authority
+            authority = active_authority(self)
+            if getattr(self, "_draining", False) and authority is None:
                 # Heartbeats have their durable producer queue as the retry owner. Do not move a
                 # refused replacement into the adapter pending slot during teardown.
                 if evt.get("type") == "heartbeat":
@@ -1857,8 +1859,6 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         raise WakeNotAccepted("gateway draining; delegation result stays pending")
                     return False
                 return self._preserve_drain_event(self._session_key_for_source(source), synth_event)
-            from gateway.session_authorities import active_authority
-            authority = active_authority(self)
             if authority is not None:
                 from gateway.session_automation import admit_process_notice
                 from hermes_state_runtime import RuntimeStoreError

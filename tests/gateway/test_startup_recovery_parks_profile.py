@@ -101,6 +101,7 @@ def test_a_secondary_whose_retirement_times_out_keeps_its_lock_but_is_never_star
         monkeypatch.setenv("HERMES_HOME", str(launch))
         started, published = [], {}
         host = object.__new__(GatewayRunner)
+        runner.config._runtime_profile_homes = (("default", launch), *runner.config._runtime_profile_homes)
         host.config, host.adapters, host._profile_adapters = runner.config, {}, {}
         host.pairing_store, host.pairing_stores, host._served_profile_signatures = None, {}, {}
         host._primary_profile_name = "default"

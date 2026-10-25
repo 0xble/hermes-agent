@@ -22,6 +22,7 @@ async def _gateway(monkeypatch):
 
     monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
     runner = GatewayRunner(GatewayConfig())
+    runner._completion_notification_batch_window = 0
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
     adapter.gateway_runner = runner
     runner.adapters = {Platform.DISCORD: adapter}

@@ -28,7 +28,7 @@ def _run(args, cwd):
 
 
 @pytest.fixture
-def repo_with_bare_origin(tmp_path):
+def repo_with_bare_origin(tmp_path, monkeypatch):
     """A working clone whose origin is a real local bare repo.
 
     Mirrors the managed-install fetch config: single-branch refspec for main
@@ -36,6 +36,9 @@ def repo_with_bare_origin(tmp_path):
     entries — the exact condition that made the old pruner misread pushed PR
     lanes as 'unpushed'.
     """
+    # The synthetic repo has no live host processes. Keep process discovery isolated
+    # while exercising the real Git eligibility and removal paths.
+    monkeypatch.setattr("hermes_cli.worktree_sweep.live_process_pids", lambda roots, **kwargs: {})
     bare = tmp_path / "origin.git"
     bare.mkdir()
     _run(["git", "init", "--bare", "--initial-branch=main"], bare)
@@ -247,8 +250,11 @@ class TestCronWorktreeMaintenance:
     @pytest.fixture(autouse=True)
     def _inside_deletion_window(self, monkeypatch):
         import hermes_time
+        import cron.scheduler as sched
 
         monkeypatch.setattr(hermes_time, "now", lambda: datetime(2026, 10, 12, 3, 0).astimezone())
+        monkeypatch.setattr(sched, "_worktree_maintenance_boot_started",
+                            time.monotonic() - sched._WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS - 1)
 
     def test_outside_deletion_window_leaves_the_throttle_unspent(self, monkeypatch):
         import cron.scheduler as sched
@@ -289,9 +295,8 @@ class TestCronWorktreeMaintenance:
 
         calls = []
         boot = time.monotonic()
-        monkeypatch.setattr(sched, "_last_worktree_maintenance_at",
-                            boot - sched._WORKTREE_MAINTENANCE_INTERVAL_SECONDS
-                            + sched._WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS)
+        monkeypatch.setattr(sched, "_last_worktree_maintenance_at", None)
+        monkeypatch.setattr(sched, "_worktree_maintenance_boot_started", boot)
         monkeypatch.setattr(
             sched.threading, "Thread",
             lambda *a, **k: type("T", (), {"start": lambda self: calls.append(k.get("name"))})(),
@@ -299,8 +304,8 @@ class TestCronWorktreeMaintenance:
         sched._maybe_run_worktree_maintenance()
         assert calls == []
         # Once the boot delay has elapsed, the first pass runs.
-        monkeypatch.setattr(sched, "_last_worktree_maintenance_at",
-                            boot - sched._WORKTREE_MAINTENANCE_INTERVAL_SECONDS - 1)
+        monkeypatch.setattr(sched, "_worktree_maintenance_boot_started",
+                            boot - sched._WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS - 1)
         sched._maybe_run_worktree_maintenance()
         assert calls == ["cron-worktree-prune"]
 

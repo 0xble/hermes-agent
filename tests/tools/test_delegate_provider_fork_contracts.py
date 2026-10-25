@@ -37,7 +37,7 @@ def _spawn(parent, **options):
 
     with (
         patch("run_agent.AIAgent", side_effect=construct),
-        patch.object(delegate, "_run_batch", return_value={"results": [], "summary": "done"}),
+        patch.object(delegate, "_run_batch", return_value=json.dumps({"results": [], "summary": "done"})),
     ):
         result = json.loads(delegate.delegate_task(
             tasks=[{"goal": "Inspect the resolved child runtime"}],
@@ -49,6 +49,9 @@ def _spawn(parent, **options):
 
 
 def test_default_backend_selects_by_parent_before_native_provider_and_real_builder(config_file):
+    raw = _authored()
+    raw["delegation"]["max_iterations"] = 19
+    config_file(raw)
     parent = _parent()
     with (
         patch.object(routes, "_active_provider", wraps=routes._active_provider) as provider,
@@ -61,7 +64,7 @@ def test_default_backend_selects_by_parent_before_native_provider_and_real_build
     selected = route.call_args.args[4]
     assert "provider" not in selected and "model" not in selected
     assert selected["max_iterations"] == 19
-    assert runtime.call_args.kwargs["reasoning_cfg"] == selected
+    assert runtime.call_args.args[1] == selected
     assert (built["model"], built["provider"], built["base_url"]) == (
         VENICE, parent.provider, parent.base_url,
     )
@@ -77,7 +80,7 @@ def test_internal_review_bypasses_provider_but_uses_same_real_builder(config_fil
         built, _ = _spawn(_parent(), credentials_cfg=credentials_cfg)
     provider.assert_not_called()
     assert runtime.call_count == 1
-    assert runtime.call_args.kwargs["reasoning_cfg"] is None
+    assert runtime.call_args.args[1] == delegate._load_config()
     assert built["reasoning_config"] == HIGH
 
 
@@ -106,7 +109,9 @@ def test_fast_mode_reaches_real_pinned_child_without_parent_wire_leak(config_fil
     }
     built, _ = _spawn(parent)
     assert built["service_tier"] == mode
-    assert built["request_overrides"] is None
+    assert built["request_overrides"] == raw["delegation"]["request_overrides"]
+    assert "service_tier" not in built["request_overrides"]
+    assert "speed" not in built["request_overrides"]
     assert built["model"] == SOL
 
 
@@ -133,7 +138,7 @@ def test_provider_spawn_keeps_depth_derived_live_model_role(config_file, depth, 
     _, child = _spawn(parent)
     assert child._delegate_depth == depth + 1
     assert child._delegate_role == expected
-    assert child._max_spawn_depth == 3
+    assert delegate._get_max_spawn_depth() == 3
 
 
 def test_provider_child_keeps_its_own_handle_on_parent_profile_database(config_file, tmp_path):
