@@ -30,6 +30,7 @@ from hermes_state_transactions import execute_transcript_write
 from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_phase
 from hermes_state_message_archive import archive_message_rows, archive_named_rows
 from hermes_state_display_fold import DisplayFoldMixin
+from hermes_state_search_runtime import search_stage
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
@@ -1543,10 +1544,9 @@ class SessionMessagesMixin(DisplayFoldMixin):
                 chunk)]
 
     def get_messages_around(self, session_id: str, around_message_id: int, window: int = 5) -> dict[str, Any]:
-        """Up to *window* messages either side of an anchor id (ascending). ``messages_before``/``_after`` count
-        strictly around the anchor (fewer than *window* = session boundary). Empty for a foreign anchor."""
+        """Anchor window in ID order, with strict before/after counts. Foreign anchors return an empty window."""
         window = max(window, 0)
-        with self._read_ctx() as conn:
+        with self._read_ctx() as conn, search_stage(self, "sql_ms"):
             if not conn.execute("SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
                                 (around_message_id, session_id)).fetchone():
                 return {"window": [], "messages_before": 0, "messages_after": 0}
