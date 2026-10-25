@@ -46,11 +46,18 @@ def test_summary_carrier_does_not_show_its_message_twice(tmp_path, monkeypatch, 
         model, resumed = db.get_resume_conversations("s")
         assert any(m.get("content") == carried["content"] and m.get("_compressed_summary") for m in model)
         assert any(m.get("content") == carried["content"] for m in db.get_messages("s"))
-        for read in (shown, listed, exported, resumed):
-            assert sum(str(m.get("content")).count("REPLY-ONE") for m in read) == 1, read
+        # SQL inspection and export retain the physical carrier. Only conversation display
+        # unwraps it, so model context remains inspectable without duplicating the reply.
+        for read in (listed, exported):
+            reply = next(m for m in read if "REPLY-ONE" in str(m.get("content")))
+            assert reply["content"] == carried["content"]
+            assert reply["_compressed_summary"]
+        for read in (shown, resumed):
             reply = next(m for m in read if "REPLY-ONE" in str(m.get("content")))
             assert reply["content"] == "REPLY-ONE words"
             assert not reply.get("_compressed_summary")
+        for read in (shown, listed, exported, resumed):
+            assert sum(str(m.get("content")).count("REPLY-ONE") for m in read) == 1, read
             # The other messages are untouched: each still shows exactly once.
             for text in ("turn one", "turn two", "REPLY-TWO"):
                 assert sum(str(m.get("content")).count(text) for m in read) == 1, (text, read)

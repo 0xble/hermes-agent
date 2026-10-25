@@ -1535,8 +1535,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             rows = self._read_all(sql, params)
             if latest:
                 rows.reverse()
-        messages = [self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True) for row in rows]
-        return [_display_summary_carrier(message) for message in messages] if include_compacted else messages
+        return [self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True) for row in rows]
 
     @staticmethod
     def _tool_exclusion_sql(exclude_tools: Sequence[str], exclude_prefixes: Sequence[str]) -> tuple[str, list]:

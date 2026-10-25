@@ -786,8 +786,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
     its stale-row fallback now use the same carrier identity and retained-slot rule as the full fold.
     After folding, display reads unwrap an assistant's composite carrier back to its original reply,
     while model reads retain the summary verbatim. Otherwise the selected carrier hides the reply
-    as synthetic context even though the original row remains durably archived. SQL message reads,
-    conversation display, export and atomic resume share this projection. Linux guards cover the
+    as synthetic context even though the original row remains durably archived. Conversation
+    display and atomic resume share this projection. Physical SQL message reads and exports
+    retain the original carrier, and web history supplies its unwrapped reply via
+    `display_content` without rewriting inspection/export `content`. Linux guards cover the
     complete transcript ledger (10 passed), manual compression (29), planned/full carrier folding
     (2), compacted reads (47), off-writer folding (26) and stale held-generation fences (7).
   - The fork turn mixin lost the upstream persistence mixin base, hiding usage-window wording and
@@ -862,6 +864,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   like a failed idle wait. Native and forced-split variants retain the fd, output, timeout
   and EMFILE fallback assertions. Guard: `test_drain_high_fd.py` passes 3 tests on Linux, and
   the forced split reproduces the original pending-CRLF failure with the old boundary.
+- The merge resurrected upstream's `tests/ci/test_cache_report_collection.py` without its
+  `scripts/ci/timings_report.py` dependency. Fork main had already retired both with its cache-report
+  CI tooling (`d77a654d8605` and retirement), so the orphan test is removed consistently with main.
+  No remaining successor source imports `timings_report`.
 - Retire once the next release sync no longer carries these merge points.
 
 ## v0.21.6 merge integration
