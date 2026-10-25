@@ -264,6 +264,16 @@ Step 1, Option A) that declares every command in
 as a slash command. In Socket Mode, Slack routes the command event
 through the WebSocket regardless of the manifest's `url` field.
 
+### Native Stop control
+
+Slack shows a Stop button while an agent session is processing. Hermes routes
+`agent_session_stopped` through the same session-scoped `/stop` command as a typed
+stop, then clears the processing status. Existing Assistant and Agent apps must add
+`agent_session_stopped` under **Event Subscriptions → Subscribe to bot events**.
+The generated manifest includes it, and the event requires the existing
+`chat:write` scope. Slack does not emit a corresponding native resume event. Send
+a new message to continue after stopping.
+
 ### Agent messaging experience
 
 New Slack apps use Slack's **Agent** messaging experience. Existing Hermes
@@ -276,7 +286,8 @@ hermes slack manifest --agent-view --write
 Update the manifest in **Features → App Manifest**, then reinstall the app if
 Slack asks. Agent view cannot be reverted to Assistant view, and users may need
 to hard-refresh Slack after the switch. The generated Agent manifest subscribes
-to `message.im`, `app_home_opened`, and `app_context_changed`, so Hermes can
+to `message.im`, `app_home_opened`, `app_context_changed`, and
+`agent_session_stopped`, so Hermes can
 identify a Messages-tab DM and receive the user's active Slack context with a
 turn. Hermes only supplies that context as a label; it does not read the viewed
 channel's history.
