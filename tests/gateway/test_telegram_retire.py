@@ -168,22 +168,24 @@ async def test_now_interrupts_first_preserves_pending_obligations(setup_retire):
 
 
 @pytest.mark.asyncio
-async def test_prompt_and_commands_admitted_unrelated_work_rejected(setup_retire, monkeypatch):
+async def test_owner_question_replies_do_not_bypass_retirement_and_preparation_is_fenced(setup_retire):
     runner, source, _adapter, _ = setup_retire
     await retire.request(runner, source)
     state = await retire.load(runner, source)
     state["questions"] = [{"id": "goal", "suggestion": "Work"}]
     await retire.save(runner, source, state)
-    resolve = AsyncMock(return_value=True)
-    monkeypatch.setattr("gateway.telegram_retire_work.resolve_answers", resolve)
     event = SimpleNamespace(source=source, allow_gateway_control=True, internal=False,
                             get_command=lambda: None, text="1 Work")
-    assert await retire.intercept(runner, event) == "Retirement owners recorded."
-    resolve.return_value = False
+    assert await retire.intercept(runner, event) == retire.NOTICE
     event.text = "start a new project"
     assert await retire.intercept(runner, event) == retire.NOTICE
     event.get_command = lambda: "retire"
     assert await retire.intercept(runner, event) is None
+    wake = MessageEvent(text="prepare", source=source, internal=True,
+                        metadata={"retirement_generation": state["generation"]})
+    assert await retire.intercept(runner, wake) is None
+    await retire.request(runner, source, cancel=True)
+    assert await retire.intercept(runner, wake) == ""
 
 
 @pytest.mark.asyncio
@@ -196,7 +198,7 @@ async def test_complete_split_receipt_authorizes_delete(runtime):
 
 
 @pytest.mark.asyncio
-async def test_pending_owner_question_never_sends_closing_or_deletes(runtime, monkeypatch):
+async def test_pending_preparation_never_sends_closing_or_deletes(runtime, monkeypatch):
     monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(return_value=False))
     await retire.request(runtime, runtime.source)
     await retire.advance(runtime, runtime.source)
@@ -289,7 +291,8 @@ async def test_unresolved_delete_can_recover_without_housekeeping_spam(runtime, 
         await retire.advance(runtime, runtime.source)
         assert (await retire.load(runtime, runtime.source))["phase"] == "done"
         assert runtime.bot.delete_forum_topic.await_count == 2
-        assert [c.args[1] for c in runtime.adapter.send.await_args_list].count(retire.CLOSING) == 2
+        from gateway.telegram_retire_prepare import closing_note
+        assert [c.args[1] for c in runtime.adapter.send.await_args_list].count(closing_note(recovered)) == 2
 
 
 @pytest.mark.asyncio
