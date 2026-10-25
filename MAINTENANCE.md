@@ -105,3 +105,7 @@ The concurrent cron/profile isolation fixture must accept `compute_next_run`'s
 existing third timezone argument. Only the stub signature changes. Its concurrent
 write ordering and both profile-store isolation assertions remain unchanged.
 Guard: `tests/hermes_cli/test_web_server_cron_profiles.py`.
+
+JS/TS and bootstrap-installer checks also use standard hosted runners. Their
+large-runner labels inherited from upstream are unavailable to this fork. All
+existing commands and acceptance checks remain in both jobs.
