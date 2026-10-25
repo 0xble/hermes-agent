@@ -39,6 +39,16 @@ _spill_prune_last: dict[str, float] = {}
 _spill_prune_thread: threading.Thread | None = None
 
 
+def _reset_spill_prune_gate() -> None:
+    """A fork while another thread holds the gate would leave it held forever in the child."""
+    global _spill_prune_gate
+    _spill_prune_gate = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):  # POSIX only
+    os.register_at_fork(after_in_child=_reset_spill_prune_gate)
+
+
 def _prune_spill_dir(spill_dir: Path) -> None:
     """Delete ``out-*.log`` spills older than ``_SPILL_MAX_AGE_S``."""
     try:
