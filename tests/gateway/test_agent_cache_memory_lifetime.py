@@ -12,6 +12,7 @@ from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
 from gateway.run import GatewayRunner
 from gateway.run_turn_runner import TurnRunner
+from gateway.turn_context import TurnContext
 from plugins.memory.hindsight import HindsightMemoryProvider
 from run_agent import AIAgent
 
@@ -67,8 +68,8 @@ def test_eviction_drains_memory_once_and_refetches_fresh_manager(route, monkeypa
     )
     turn = TurnRunner.__new__(TurnRunner)
     turn._runner = runner
-    turn._ctx = SimpleNamespace(session_key=key, session_id="sid", source=SimpleNamespace(),
-                                user_config={}, enabled_toolsets=[], _interrupt_depth=0)
+    turn._ctx = TurnContext(session_key=key, session_id="sid", source=SimpleNamespace(),
+                            user_config={}, enabled_toolsets=[], _interrupt_depth=0)
     turn._build_fresh_agent = lambda *a: SimpleNamespace(_memory_manager=MemoryManager())
     runner._agent_cache[key] = (agent, "old-signature", 0, "sid")
     signature = runner._agent_config_signature("m", {}, [], "", cache_keys=runner._extract_cache_busting_config({}))
