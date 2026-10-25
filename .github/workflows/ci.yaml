@@ -274,7 +274,7 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          failed = [name for name, info in needs.items() if info['result'] not in ('success', 'skipped')]
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
@@ -284,6 +284,17 @@ jobs:
               sys.exit(1)
           print('All checks passed (or were skipped)')
           "
+
+  qualification:
+    name: qualification
+    needs: [all-checks-pass]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the complete existing CI aggregate
+        env:
+          RESULT: ${{ needs.all-checks-pass.result }}
+        run: test "$RESULT" = success
 
   # ─────────────────────────────────────────────────────────────────────
   # CI timing report: collect per-job/step durations from the GitHub API,

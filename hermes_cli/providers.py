@@ -191,6 +191,14 @@ def _overlay_pdef(canonical, ov: HermesOverlay, name, env_vars, base_url, doc, s
                        source=source)
 
 
+def _registered_provider_profile(name: str):
+    try:
+        from providers import get_provider_profile
+        return get_provider_profile(name)
+    except Exception:
+        return None
+
+
 def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderDef]:
     """Look up a built-in provider by id or alias: models.dev catalog merged with the Hermes overlay;
     Hermes-only overlay (nous, openai-codex, …); plugin provider profiles with a concrete endpoint."""
@@ -200,7 +208,11 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     if mdev_info is not None:
         ov = overlay or HermesOverlay()
         env_vars = list(mdev_info.env)
-        for ev in ov.extra_env_vars:
+        # A catalog entry must preserve credentials declared by its plugin.
+        profile = _registered_provider_profile(canonical)
+        plugin_keys = tuple(v for v in (profile.env_vars or ())
+                            if not v.endswith(("_BASE_URL", "_URL"))) if profile is not None else ()
+        for ev in (*plugin_keys, *ov.extra_env_vars):
             if ev not in env_vars:
                 env_vars.append(ev)
         return _overlay_pdef(canonical, ov, mdev_info.name, tuple(env_vars), ov.base_url_override or mdev_info.api,
@@ -214,17 +226,13 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     # placeholder profiles like ``custom`` (aliases ollama/local/vllm) ship an empty base_url and
     # are completed by config.yaml custom_providers — resolving them would preempt
     # resolve_provider_full's custom step and collapse keyed ``custom:<name>`` ids to bare custom.
-    try:
-        from providers import get_provider_profile as _profile
-        _prof = _profile(canonical)
-        if _prof is not None and (_prof.base_url or "").strip():
-            _api_mode_to_transport = {v: k for k, v in TRANSPORT_TO_API_MODE.items()}
-            return ProviderDef(id=canonical, name=_prof.display_name or _prof.name or canonical,
-                               transport=_api_mode_to_transport.get(_prof.api_mode, "openai_chat"),
-                               api_key_env_vars=tuple(_prof.env_vars or ()), base_url=_prof.base_url or "",
-                               auth_type=_prof.auth_type or "api_key", source="plugin-profile")
-    except Exception:
-        pass
+    _prof = _registered_provider_profile(canonical)
+    if _prof is not None and (_prof.base_url or "").strip():
+        _api_mode_to_transport = {v: k for k, v in TRANSPORT_TO_API_MODE.items()}
+        return ProviderDef(id=canonical, name=_prof.display_name or _prof.name or canonical,
+                           transport=_api_mode_to_transport.get(_prof.api_mode, "openai_chat"),
+                           api_key_env_vars=tuple(_prof.env_vars or ()), base_url=_prof.base_url or "",
+                           auth_type=_prof.auth_type or "api_key", source="plugin-profile")
     return None
 
 

@@ -279,6 +279,8 @@ def _goal_followup_after_turn(
     """/goal continuation (mirrors gateway/run._post_turn_goal_continuation): the prompt to
     chain once ``running`` is released, or None.  Compression failures are never judge
     input: the error text is not work toward the goal, and judging it spends a turn."""
+    from hermes_cli.goal_notices import goal_notices_enabled
+
     goal_followup = None
     compression_exhausted = bool(isinstance(result, dict) and result.get("compression_exhausted"))
     try:
@@ -304,7 +306,7 @@ def _goal_followup_after_turn(
                 _bg_procs = None
             decision = goal_mgr.evaluate_after_turn(
                 raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
-            if verdict_msg := decision.get("message") or "":
+            if (verdict_msg := decision.get("message") or "") and goal_notices_enabled():
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
             if decision.get("should_continue") and (
                 cont_prompt := decision.get("continuation_prompt") or ""):
