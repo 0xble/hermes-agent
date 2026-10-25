@@ -106,8 +106,14 @@ def file_digest(path: Path) -> str | None:
     return hashlib.sha256(data).hexdigest() if data is not None else None
 
 
+#: Bumped by every PM durable write (facts, stamps, selections) so this process's cached PATH
+#: composition (``pm.install._store_path_dirs``) never outlives a change it made itself.
+write_generation = 0
+
+
 def durable_write_bytes(path: Path, data: bytes) -> None:
     """Replace ``path`` atomically and fsync file and directory so a crash keeps old or new bytes."""
+    global write_generation
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".publish-")
     try:
@@ -124,6 +130,7 @@ def durable_write_bytes(path: Path, data: bytes) -> None:
                 os.close(directory)
     finally:
         Path(temporary).unlink(missing_ok=True)
+        write_generation += 1
 
 
 #: A handle still open inside the tree. Windows reports antivirus and indexer scans of freshly

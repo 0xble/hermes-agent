@@ -137,9 +137,9 @@ def user_facing_path(path: str) -> str:
     Hermes's Python stops just before the app-alias dir that holds the Store stub, so a
     machine without Python still runs a real one.
     """
-    from pm.install import _store_path_dirs
+    from pm.install import cached_store_path_dirs
 
-    store = _store_path_dirs()
+    store = cached_store_path_dirs()
     if not store:
         return path
     ours = copies(store)
