@@ -86,6 +86,37 @@ def test_published_backfill_covers_only_the_reviewed_patch_content(tmp_path, mon
     assert len(failures) == 1 and "unreviewed without trailer" in failures[0]
 
 
+def test_backfill_ownership_ignores_the_callers_diff_algorithm(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    (tmp_path / "fix").write_text("\n".join("aaccbbaaaaaaaccbbbad") + "\n", encoding="utf-8")
+    git("add", "fix")
+    git("commit", "-qm", "baseline content")
+    base = git("rev-parse", "HEAD")
+    (tmp_path / "fix").write_text("\n".join("aacaabbcaaeeeecbbbad") + "\n", encoding="utf-8")
+    git("add", "fix")
+    git("commit", "-qm", "published without trailer")
+
+    def patch_id(algorithm):
+        return subprocess.run(
+            ["git", "patch-id", "--stable"],
+            input=git("-c", f"diff.algorithm={algorithm}", "show", "--pretty=format:", "HEAD"),
+            capture_output=True, text=True, check=True,
+        ).stdout.split()[0]
+
+    canonical = patch_id("myers")
+    assert canonical != patch_id("histogram")  # this content needs different hunks
+    _units(tmp_path, "fixture", prose=f"Fork-Patch-Backfill: {canonical}; fixture\n")
+    checker = _checker(tmp_path, monkeypatch)
+    for algorithm in ("myers", "histogram", "patience", "minimal"):
+        git("config", "diff.algorithm", algorithm)
+        assert checker.check_trailers(base) == []
+    (tmp_path / "fix").write_text("unreviewed content\n", encoding="utf-8")
+    git("add", "fix")
+    git("commit", "-qm", "unreviewed without trailer")
+    failures = checker.check_trailers(base)
+    assert len(failures) == 1 and "unreviewed without trailer" in failures[0]
+
+
 def test_every_trailer_on_a_multi_trailer_commit_is_checked(tmp_path, monkeypatch):
     git = _repo(tmp_path)
     base = git("rev-parse", "HEAD")

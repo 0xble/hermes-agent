@@ -9,8 +9,11 @@ Fork patch identities: `lpg-runtime-preservation`, `loop-cap-final-answer`,
 
 The preserved deployment lineage includes already-published commits without
 trailers. Their stable patch IDs below bind ownership to exact content, using
-check_fork_patches.py's existing backfill route. Do not advance the trailer
-floor, exempt the branch, or rewrite the legacy deployment history.
+check_fork_patches.py's existing backfill route with an explicit Myers diff.
+A stable patch ID ignores whitespace and hunk offsets, but not an algorithm's
+choice of hunks. Both generation and validation must select Myers rather than
+inherit a user's `diff.algorithm`. Do not advance the trailer floor, exempt the
+branch, or rewrite the legacy deployment history.
 
 Fork-Patch-Backfill: 89d3491a7e20cbb676c7801aa7a0e89a043f3b56; lpg-runtime-preservation
 Fork-Patch-Backfill: de5f7267a4cdab486fd2c213495529c80c130e5c; lpg-runtime-preservation
@@ -18,7 +21,7 @@ Fork-Patch-Backfill: 3873652a825a538695e148abfaa0b6350465354f; lpg-runtime-prese
 Fork-Patch-Backfill: 2dbbcea7fcb6afa15af3127fd105523107647a4e; lpg-runtime-preservation
 Fork-Patch-Backfill: a244eb31eb443f53a9d13d92d3d5098c875d15c6; lpg-runtime-preservation
 Fork-Patch-Backfill: 1c3635717538aebc81a0c8c6d9ef74b6000a55ee; lpg-runtime-preservation
-Fork-Patch-Backfill: c4f0c97b0aa39804b4e80273e2852b20035671a0; lpg-runtime-preservation
+Fork-Patch-Backfill: 62ec021aa76959f60d1e5b0020f707062d8676f1; lpg-runtime-preservation
 Fork-Patch-Backfill: eac7c06a0ed1cea3812c16859a1e11e7ad1f1366; lpg-runtime-preservation
 
 These cover the legacy Slack status API, optional documents extra, quiet
