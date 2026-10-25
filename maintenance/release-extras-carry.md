@@ -20,8 +20,11 @@ and the next update dropped it again. The new release's own `.venv` now contains
 the carried extras, so the carry also holds for a release whose gateway never
 committed a PM generation.
 
-`_active_locked_extras` returns early when the candidate declares no extras, so
-fake releases without optional dependencies never spawn their interpreter.
+`_active_locked_extras` returns early when the candidate declares no extras or
+has no `pyproject.toml`, so fake releases never spawn their interpreter. The
+non-git staging path (`source=None`) now reaches inference through the previous
+release, which `test_sigkill_stage_and_flip_converge_with_complete_current`
+exercises.
 
 Proof: `tests/hermes_cli/test_immutable_releases.py::test_prepare_venv_carries_extras_from_previous_release_environment`
 records `slack` only in the previous release's committed generation and fails on
