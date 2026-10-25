@@ -29,14 +29,14 @@ def _english(key, default, **values):
 
 
 def _status(mgr, arg, render):
-    details = mgr.render_removable_items()
+    details = "\n".join(filter(None, (mgr.render_removable_items(), mgr.render_completion_history())))
     status = mgr.status_line()
     output = status + (f"\n{details}" if details else "")
     return GoalCommandResult(ContextNotice(output) if getattr(status, "notice_style", None) == "context" else output)
 
 
 def _show(mgr, arg, render):
-    details = mgr.render_removable_items()
+    details = "\n".join(filter(None, (mgr.render_removable_items(), mgr.render_completion_history())))
     return GoalCommandResult(f"{mgr.status_line()}\n{mgr.render_contract()}" + (f"\n{details}" if details else ""))
 
 

@@ -924,6 +924,8 @@ stt_enabled: true
 
 When `true` (the default), incoming audio messages are automatically transcribed using the configured STT provider before being processed by the agent.
 
+With `stt.echo_transcripts` enabled (the default), native Slack echoes use a small microphone context line with speaker labels supplied by the transcript and Slack as the source. If no speaker is identified, the context identifies the uploader as “Shared by”, not as the speaker. The body preserves the transcript as literal text, without the old outer quotes. Multiple speaker labels remain in the body. Long transcripts continue across bounded cards in the same thread, and each card includes an accessible text fallback. This does not require `rich_blocks` or `markdown_blocks`. Relay-backed Slack keeps its existing text fallback.
+
 ### Full Example
 
 ```yaml

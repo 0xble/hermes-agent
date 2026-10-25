@@ -67,12 +67,12 @@ _MUTATOR_CONFIG = ("-c", "core.fsmonitor=false", "-c", "credential.helper=", "-c
 # tidy's merge, whose output the update moves into the object store.
 LOCAL_MUTATORS = frozenset({
     "add", "am", "apply", "checkout", "checkout-index", "cherry-pick", "clean", "commit", "gc",
-    "merge", "mv", "pack-objects", "read-tree", "rebase", "reset", "restore", "revert", "rm", "stash",
+    "merge", "merge-tree", "commit-tree", "mv", "pack-objects", "read-tree", "rebase", "reset", "restore", "revert", "rm", "stash",
     "switch", "update-index", "update-ref", "symbolic-ref", "tag", "branch", "worktree",
 })
 # Mutators that move the checkout to another commit: what they read from a promisor remote is
 # fetched first, without the fd (_prefetch_for_move).
-_MOVES = frozenset({"checkout", "merge", "read-tree", "reset", "switch"})
+_MOVES = frozenset({"checkout", "merge", "merge-tree", "read-tree", "reset", "switch"})
 
 # Global options before the subcommand that take a separate value argument.
 _GLOBAL_WITH_VALUE = frozenset({"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path",

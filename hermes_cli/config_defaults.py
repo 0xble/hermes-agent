@@ -1455,8 +1455,8 @@ DEFAULT_CONFIG = {
     # goal is satisfied, else a continuation prompt re-enters the session until done, budget
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
-        # Max continuation turns before auto-pause (/goal resume) — guards against judge false
-        # negatives and unbounded spend.
+        "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
+        # Max turns before pausing, or a paced counter checkpoint when autonomy is enabled.
         "max_turns": 20,
         # Minimum seconds between autonomous continuation turns (continuation after continuation,
         # /loop or heartbeat wakes). A user message or a process/delegation result continues at
