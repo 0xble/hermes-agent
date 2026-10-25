@@ -4,6 +4,8 @@
 
 Slack DM and Assistant threads keep their instant first-message placeholder, then receive at most one best-effort generated upgrade per cached thread. The existing shared session-title worker performs generation off the turn path, preserving endpoint serialization, link context, held-title retries, profile context, and user-title authority. Slack opts into verb-first, sentence-case task titles. Telegram, Discord, and ordinary sessions retain the unchanged noun prompt and echo guard.
 
+Patch identity: `slack-generated-thread-titles`.
+
 `slack.assistant_thread_titles` remains the opt-out for both Slack renames. No new configuration is required. Global `auxiliary.title_generation.enabled` and `model_upgrade_enabled` continue controlling the shared worker.
 
 ## Preserve

@@ -899,7 +899,9 @@ def generate_title(
         if len(title.split()) > max_title_words:
             logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), max_title_words)
             return None
-        if title_style == "verb_first" and len(title) > 80:
+        # _clean_title strips trailing punctuation before truncating, so a trailing "..." can only
+        # come from its 80-character cut. A clipped task title is the defect this style replaces.
+        if title_style == "verb_first" and title.endswith("..."):
             logger.debug("Rejecting oversized task title")
             return None
         if _is_prompt_example_echo(title, title_style):
