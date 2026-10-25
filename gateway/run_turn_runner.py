@@ -1543,6 +1543,9 @@ class TurnRunner:
                 decision.reason == "attended"
                 and not decision.new_session
                 and not unavailable_emitted
+                # Turn-start resolution may already have selected and announced this route.
+                # A changed desired key alone does not mean the live model switched.
+                and destination_route != current_route
                 and not (previous_key and previous_key[-1])
             ):
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
