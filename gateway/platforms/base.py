@@ -462,7 +462,9 @@ from gateway.platforms.base_exec_approval import (
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
 from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
-from gateway.platforms.typing_state import TypingStateMixin, call_typing_with_metadata, typing_metadata_for_event
+from gateway.platforms.typing_state import (
+    TypingStateMixin, call_typing_with_metadata, forget_typing_prompt_surface, typing_metadata_for_event,
+)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
@@ -3701,6 +3703,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             if tasks.get(scope) is asyncio.current_task():
                 tasks.pop(scope, None)
             getattr(self, "_status_text", {}).pop(scope, None)
+            forget_typing_prompt_surface(self, chat_id, metadata)
 
     async def _stop_typing_refresh(
         self, chat_id: str, typing_task: asyncio.Task | None = None, *, metadata=None,
@@ -3723,6 +3726,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 await self._stop_typing_quietly(chat_id, metadata)
         finally:
             call_typing_with_metadata(self.resume_typing_for_chat, chat_id, metadata=metadata)
+            forget_typing_prompt_surface(self, chat_id, metadata)
 
     async def _stop_typing_quietly(self, chat_id: str, metadata=None) -> None:
         """Best-effort platform stop_typing; adapter errors are swallowed."""

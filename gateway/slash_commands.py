@@ -23,7 +23,7 @@ from agent.i18n import t
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent
-from gateway.platforms.typing_state import call_typing_with_metadata
+from gateway.platforms.typing_state import resume_typing_after_prompt
 from gateway.session import AsyncSessionStore, SessionSource
 from gateway.session_transcript import TranscriptReadError
 from gateway.slash_commands_attend import GatewayAttendCommandsMixin
@@ -310,7 +310,8 @@ class GatewaySlashCommandsMixin(
         source = event.source
         adapter = self._delivery_adapter_for(source)  # the receiving bot, not the default profile's
         if adapter:
-            call_typing_with_metadata(adapter.resume_typing_for_chat, source.chat_id, metadata=self._event_thread_metadata(event, source))  # agent is about to continue
+            resume_typing_after_prompt(adapter, self._session_key_for_source(source), source.chat_id,
+                                       self._event_thread_metadata(event, source))
         if getattr(adapter, "SUPPORTS_NATIVE_STREAMING", False) is not True:
             return confirmation_text
         if adapter:

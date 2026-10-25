@@ -28,7 +28,10 @@ from gateway.attended_model import (
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.platforms.typing_state import call_typing_with_metadata
+from gateway.platforms.typing_state import (
+    call_typing_with_metadata, pause_typing_for_prompt, resume_typing_after_prompt,
+    typing_metadata_for_source,
+)
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext, silence_retry_prompt
@@ -282,10 +285,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
                 from agent.display import build_status_phrase
-                call_typing_with_metadata(adapter.set_status_text, ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None), metadata=ctx._status_thread_metadata)
+                call_typing_with_metadata(adapter.set_status_text, ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None), metadata=typing_metadata_for_source(ctx.source, ctx.event_message_id))
             elif event_type == "tool.completed":
                 # Between tools the model is genuinely "thinking" again — revert to the static default.
-                call_typing_with_metadata(adapter.set_status_text, ctx.source.chat_id, None, metadata=ctx._status_thread_metadata)
+                call_typing_with_metadata(adapter.set_status_text, ctx.source.chat_id, None, metadata=typing_metadata_for_source(ctx.source, ctx.event_message_id))
         except Exception as err:
             logger.debug("live status update failed: %s", err)
 
@@ -1646,7 +1649,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Pause typing: a "thinking..." status must not obscure the prompt or block an "Other" reply
         # on platforms that disable input while typing (Slack Assistant).
         with suppress(Exception):
-            call_typing_with_metadata(ctx._status_adapter.pause_typing_for_chat, ctx._status_chat_id, metadata=ctx._status_thread_metadata)
+            pause_typing_for_prompt(
+                ctx._status_adapter, ctx.session_key, ctx._status_chat_id,
+                typing_metadata_for_source(ctx.source, ctx.event_message_id))
         # Ordering barrier: flush buffered assistant prose BEFORE the poll, which goes out on a
         # separate agent-thread-blocking path and would otherwise render ABOVE its own explanation.
         # Best-effort + short timeout so the agent thread never hangs if the consumer isn't running.
@@ -1688,7 +1693,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 except Exception:
                     logger.debug("request_reopen_seed after clarify answer failed", exc_info=True)
             try:
-                call_typing_with_metadata(ctx._status_adapter.resume_typing_for_chat, ctx._status_chat_id, metadata=ctx._status_thread_metadata)
+                resume_typing_after_prompt(
+                    ctx._status_adapter, ctx.session_key, ctx._status_chat_id,
+                    typing_metadata_for_source(ctx.source, ctx.event_message_id))
             except Exception:
                 logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
         return response, answered
@@ -1717,7 +1724,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
-        call_typing_with_metadata(adapter.pause_typing_for_chat, ctx._status_chat_id, metadata=ctx._status_thread_metadata)
+        pause_typing_for_prompt(
+            adapter, ctx.session_key, ctx._status_chat_id,
+            typing_metadata_for_source(ctx.source, ctx.event_message_id))
         self._close_native_stream_boundary("Approval")
         # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
