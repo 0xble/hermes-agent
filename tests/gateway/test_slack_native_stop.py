@@ -75,7 +75,7 @@ async def test_native_stop_respects_channel_gate():
 
 
 @pytest.mark.asyncio
-async def test_native_stop_interrupts_real_gateway_turn(monkeypatch):
+async def test_native_stop_interrupts_real_gateway_turn(monkeypatch, caplog):
     from unittest.mock import Mock
 
     from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -104,9 +104,13 @@ async def test_native_stop_interrupts_real_gateway_turn(monkeypatch):
     runner._running_agents[key] = agent
     adapter._active_sessions[key] = asyncio.Event()
 
+    caplog.set_level("INFO", logger="plugins.platforms.slack.adapter_native_stop")
     await handle_agent_session_stopped(adapter, {**_EVENT, "channel": "D1"}, {"team_id": "T1"})
 
     agent.interrupt.assert_called_once()
     assert key not in runner._running_agents
     assert key not in adapter._pending_messages
     assert runner._peek_session_state(key).conversation.stop_latched
+    assert (
+        "[Slack] agent_session_stopped channel=D1 thread=1700.0001 team=T1 outcome=stop_dispatched"
+    ) in caplog.messages
