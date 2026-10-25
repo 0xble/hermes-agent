@@ -483,18 +483,6 @@ _BLOCKED_PAUSE_PREFIX = "judge blocked: "
 _LEGACY_BLOCKED_PAUSE_PREFIX = "judged unachievable: "
 
 
-def _paused_by_contract_verdict(state) -> bool:
-    """Whether the judge paused this goal over its contract (a BLOCKED verdict).
-
-    A user-authorized replacement supersedes that contract, so it may lift such a pause. User and
-    interrupt pauses, an exhausted budget, and judge-infrastructure or barrier pauses are not about
-    the contract and stay until ``/goal resume``."""
-    reason = state.paused_reason or ""
-    if state.status != "paused":
-        return False
-    return state.last_verdict == "blocked" and reason.startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX))
-
-
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
 # on concrete evidence instead of a vibe check.
@@ -563,7 +551,7 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     + "Continue working toward the outcome above. Take the next concrete step. "
     "Stay within the stated boundaries and do not violate the constraints. "
     "Your method may change in the plan without changing the contract. goal_set "
-    "action=revise is additive only. If an enrolled criterion is contradictory, "
+    "action=revise can only add requirements. If an enrolled criterion is contradictory, "
     "obsolete, or already falsified by history, name the conflict and propose "
     "prospective verification through goal_set action=replace, preserving all "
     "unrelated requirements and hard limits. Use the latest real user instruction "
