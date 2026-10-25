@@ -908,7 +908,7 @@ class GatewayTopicThreadsMixin:
         from gateway.telegram_topic_sessions import TopicRequestError
         args = (event.get_command_args() or "").strip()
         try:
-            result = await request(self, event.source, target="" if args in {"now", "cancel"} else args,
+            result = await request(self, event.source, target=None if args in {"", "now", "cancel"} else args,
                                    now=args == "now", cancel=args == "cancel")
         except TopicRequestError as exc:
             return str(exc)

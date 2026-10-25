@@ -3158,19 +3158,16 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                 chat_id=chat_id_str, owner_key=owner_key, profile_name=profile_name)
             if existing:
                 status = str(existing.get("status") or "")
+                if str(existing.get("topic_name") or "") != name:
+                    raise RuntimeError(f"Telegram topic owner {owner_key} title changed; refusing reroute")
                 if status != "active" or not existing.get("thread_id"):
                     if status == "active" and existing.get("canonical_owner_key"):
-                        canonical = db.get_telegram_topic_owner(
+                        canonical = db.resolve_telegram_topic_owner(
                             chat_id=chat_id_str,
-                            owner_key=str(existing["canonical_owner_key"]),
+                            owner_key=owner_key,
                             profile_name=profile_name,
                         )
-                        if (
-                            canonical
-                            and canonical.get("status") == "active"
-                            and canonical.get("thread_id")
-                            and str(canonical.get("topic_name") or "") == name
-                        ):
+                        if canonical:
                             existing = canonical
                         else:
                             raise RuntimeError(
@@ -3178,8 +3175,6 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                     else:
                         raise RuntimeError(
                             f"Telegram topic owner {owner_key} is {status or 'unresolved'}; refusing duplicate fallback")
-                if str(existing.get("topic_name") or "") != name:
-                    raise RuntimeError(f"Telegram topic owner {owner_key} title changed; refusing reroute")
                 thread_id = str(existing["thread_id"])
                 binding = db.get_telegram_topic_binding(
                     chat_id=chat_id_str, thread_id=thread_id, profile_name=profile_name)
