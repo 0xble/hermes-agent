@@ -149,4 +149,3 @@ def test_standalone_disabled_rich_mode_stays_text(monkeypatch, _standalone_send)
     result = asyncio.run(_standalone_send(pconfig, "D1", "![Photo](https://example.com/p.png)"))
     assert result["success"]
     assert "blocks" not in fake.calls[0][1]
-
