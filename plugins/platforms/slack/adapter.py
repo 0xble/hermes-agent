@@ -2229,7 +2229,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # stay stuck on "is thinking..." (#24117).
                 return SendResult(success=True)
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
-            last_result = await self._post_chunks(chat_id, team_id, content, formatted, thread_ts)
+            from .message_delivery import post_chunks
+            last_result = await post_chunks(self, chat_id, team_id, content, formatted, thread_ts, metadata)
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
                 await self.stop_typing(chat_id, metadata=metadata)
@@ -2255,32 +2256,6 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False, error=str(e), retryable=_retryable,
                 retry_after=self._retry_after_from_exc(e) if _retryable else None)
-
-    async def _post_chunks(
-        self, chat_id: str, team_id: str, content: str, formatted: str, thread_ts: Optional[str]
-    ) -> Any:
-        """``chat.postMessage`` each ``MAX_MESSAGE_LENGTH`` chunk; returns the last response.
-        Block Kit only for single-chunk messages (a >39k response is pathological for the 50-block /
-        3000-char limits); ``text`` stays the notification/accessibility fallback. With
-        ``reply_broadcast`` only the first chunk is also posted to the main channel."""
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-        broadcast = self.config.extra.get("reply_broadcast", False)
-        blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
-        last_result = None
-        for i, chunk in enumerate(chunks):
-            kwargs = {
-                "channel": chat_id, "text": chunk,
-                "mrkdwn": True, **_slack_unfurl_kwargs(self.config.extra)}
-            if blocks and i == 0:
-                kwargs["blocks"] = blocks
-            if thread_ts:
-                kwargs["thread_ts"] = thread_ts
-                if broadcast and i == 0:
-                    kwargs["reply_broadcast"] = True
-            client_fn = lambda: self._get_client(chat_id, team_id=team_id)
-            last_result = await self._call_with_block_fallback(
-                client_fn, "chat_postMessage", kwargs, "send")
-        return last_result
 
     @staticmethod
     def _retry_after_from_exc(e: BaseException) -> Optional[float]:
