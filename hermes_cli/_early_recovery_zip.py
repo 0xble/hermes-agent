@@ -239,7 +239,7 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
     """
     root = _project_root() if project_root is None else Path(project_root)
     journal = root / ZIP_SWAP_JOURNAL
-    if not journal.is_file() or _pytest_owns_live_checkout(root):
+    if _pytest_owns_live_checkout(root) or not journal.is_file():
         return False
     with zip_swap_owner_lock(root) as owned:
         if not owned and owned.reason != "busy":

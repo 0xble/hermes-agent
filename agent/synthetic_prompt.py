@@ -118,7 +118,7 @@ class _TemplateMatcher:
 _GOAL_PROMPT_PATTERNS = tuple(
     ("goal", str(row["template"]), _TemplateMatcher(str(row["template"])))
     for row in GOAL_PROMPT_REGISTRY
-    if row["formatter"] in {"plain", "contract", "subgoals", "gate_failed"}
+    if row["formatter"] in {"autonomy", "plain", "contract", "subgoals", "gate_failed"}
 )
 _INJECTED_TURN_PATTERNS = (
     *_GOAL_PROMPT_PATTERNS,
