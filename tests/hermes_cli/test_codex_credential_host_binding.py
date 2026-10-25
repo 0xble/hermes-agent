@@ -225,11 +225,13 @@ def test_full_picker_discovers_codex_models_with_pinned_canonical_url(monkeypatc
         })
 
     monkeypatch.setattr(httpx, "get", catalog_get)
-    # Unrelated metadata sources stay offline; config, auth, discovery, cache and picker are real.
+    # Unrelated metadata stays offline, including usage workers that can outlive this test.
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", dict)
     monkeypatch.setattr("hermes_cli.models.get_curated_nous_model_ids", list)
     monkeypatch.setattr("hermes_cli.models.fetch_ollama_cloud_models", lambda **kw: [])
     monkeypatch.setattr("hermes_cli.models_pricing.get_pricing_for_provider", lambda *a, **kw: {})
+    monkeypatch.setattr("agent.account_usage_cache.refresh_account_usage_async", lambda *a: [])
+    monkeypatch.setattr("agent.account_usage_cache.refresh_account_usage_entries_async", lambda *a: [])
 
     payload = build_model_options_payload(load_picker_context(), refresh=True)
     row = next(p for p in payload["providers"] if p["slug"] == "openai-codex")
