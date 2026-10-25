@@ -25,6 +25,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.typing_state import call_typing_with_metadata
 from agent.i18n import t
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.egress import (
@@ -2164,7 +2165,7 @@ class RelayAdapter(BasePlatformAdapter):
         # connector's prompt message can't be edited cross-platform yet).
         self._send_lifecycle_ack(chat_id, label, ack_meta)
         if count:
-            self.resume_typing_for_chat(chat_id, metadata=ack_meta)
+            call_typing_with_metadata(self.resume_typing_for_chat, chat_id, metadata=ack_meta)
 
     async def _resolve_slash_confirm(self, state, option_id, chat_id, ack_meta) -> None:
         from tools import slash_confirm as slash_confirm_mod

@@ -25,6 +25,13 @@ fail before the change, this hypothesis must be revised. UI animation caused by
 repeated identical API updates is a separate possibility, not established by
 source inspection alone.
 
+## Provenance
+
+- Patch identity: `thread-status-continuity`.
+- Source surfaces: `gateway/platforms/typing_state.py`, `gateway/platforms/base.py`, typing/status callers in `gateway/`, and the Slack and Telegram adapters.
+- Regression: `tests/gateway/test_slack.py`, `tests/gateway/test_typing_refresh_interval.py`, `tests/gateway/test_telegram_typing_retrigger.py`, and legacy clarify/approval adapter tests.
+- Metadata is forwarded only when an adapter override accepts it, preserving legacy pause, resume and status signatures.
+
 ## Verification and Retirement
 
 Regression commands and results are recorded with the delivery commit. Preserve

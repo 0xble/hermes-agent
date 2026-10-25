@@ -122,6 +122,8 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     ``direct_messages_topic_id`` when supported."""
     thread_id = getattr(source, "thread_id", None)
     platform = _platform_name(getattr(source, "platform", None))
+    if platform == "slack" and thread_id is None:
+        thread_id = reply_to_message_id
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
     # Slack workspace identity is routing state: carry it so a multi-workspace Socket Mode
     # gateway never falls back to its primary WebClient.
@@ -439,7 +441,7 @@ from gateway.platforms.helpers import consume_detached_handler_exception, fence_
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
-from gateway.platforms.typing_state import TypingStateMixin
+from gateway.platforms.typing_state import TypingStateMixin, call_typing_with_metadata
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
@@ -3714,7 +3716,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if cancel_retrigger is not None:
             with contextlib.suppress(Exception):
                 cancel_retrigger(chat_id, metadata)
-        self.pause_typing_for_chat(chat_id, metadata=metadata)
+        call_typing_with_metadata(self.pause_typing_for_chat, chat_id, metadata=metadata)
         try:
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
@@ -3726,7 +3728,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                     await asyncio.sleep(0)
                 await self._stop_typing_quietly(chat_id, metadata)
         finally:
-            self.resume_typing_for_chat(chat_id, metadata=metadata)
+            call_typing_with_metadata(self.resume_typing_for_chat, chat_id, metadata=metadata)
 
     async def _stop_typing_quietly(self, chat_id: str, metadata=None) -> None:
         """Best-effort platform stop_typing; adapter errors are swallowed."""
@@ -5389,7 +5391,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 # measured to have no effect).
                 if text_content or extracted.copy_blocks or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
-                    self.pause_typing_for_chat(event.source.chat_id, metadata=_thread_metadata)
+                    call_typing_with_metadata(self.pause_typing_for_chat, event.source.chat_id, metadata=_thread_metadata)
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
