@@ -205,6 +205,68 @@ def test_carried_candidate_landing_returns_to_published_target(installed, landin
     assert git(installed.source, "status", "--porcelain") == ""
 
 
+@pytest.mark.parametrize("commits,landing", [(1, "squash"), (2, "squash"), (2, "cherry-pick")])
+@pytest.mark.parametrize("followup", ["revert", "delete", "edit"])
+def test_squash_landed_candidate_respects_later_main_changes(installed, commits, landing, followup, capsys):
+    if commits == 2:
+        git(installed.source, "switch", "candidate")
+        live = commit_file(installed.source, "candidate.txt", "reviewed candidate content\n")
+        change_live(installed, live)
+        git(installed.source, "switch", "main")
+    # Leave the named candidate branch pointing at the installed commit, as on
+    # repositories that retain branches after a squash merge.
+    if landing == "squash":
+        git(installed.source, "merge", "--squash", "candidate")
+        git(installed.source, "commit", "-m", "squash candidate")
+        landed = [git(installed.source, "rev-parse", "HEAD")]
+    else:
+        candidate_commits = git(installed.source, "rev-list", "--reverse", f"{installed.base}..candidate").split()
+        landed = []
+        for sha in candidate_commits:
+            git(installed.source, "cherry-pick", sha)
+            landed.append(git(installed.source, "rev-parse", "HEAD"))
+    if followup == "revert":
+        git(installed.source, "revert", "--no-edit", *reversed(landed))
+    elif followup == "delete":
+        git(installed.source, "rm", "candidate.txt")
+        git(installed.source, "commit", "-m", "remove landed candidate")
+    else:
+        commit_file(installed.source, "candidate.txt", "main supersedes candidate\n")
+    target = git(installed.source, "rev-parse", "HEAD")
+    git(installed.source, "update-ref", "refs/remotes/origin/main", target)
+    git(installed.source, "fetch", ".", "main")
+    active = apply(installed)
+    assert active.name == target
+    if followup == "edit":
+        assert (active / "candidate.txt").read_text() == "main supersedes candidate\n"
+    else:
+        assert not (active / "candidate.txt").exists()
+    assert "CARRYING FORWARD" not in capsys.readouterr().out
+    assert "carried_candidates" not in update_receipt._current.get().data
+    assert git(installed.source, "rev-parse", "HEAD") == target
+    assert git(installed.source, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("commits", [1, 2])
+def test_unlanded_candidate_is_not_mistaken_for_target_history(installed, commits):
+    if commits == 2:
+        git(installed.source, "switch", "candidate")
+        live = commit_file(installed.source, "candidate.txt", "reviewed candidate content\n")
+        change_live(installed, live)
+        git(installed.source, "switch", "main")
+    # Similar text in an unrelated path must not count as a landed patch.
+    commit_file(installed.source, "other.txt", "installed optimistic change\n")
+    target = git(installed.source, "rev-parse", "HEAD")
+    git(installed.source, "update-ref", "refs/remotes/origin/main", target)
+    git(installed.source, "fetch", ".", "main")
+    active = apply(installed)
+    assert active.name != target
+    expected = "reviewed candidate content\n" if commits == 2 else "installed optimistic change\n"
+    assert (active / "candidate.txt").read_text() == expected
+    assert (active / "other.txt").read_text() == "installed optimistic change\n"
+    assert git(installed.source, "rev-parse", f"{active.name}^2") == installed.live
+
+
 def test_uppercase_replacement_names_the_same_commit(installed):
     assert apply(installed, "--replace-candidate", installed.live.upper()).name == installed.target
     assert update_receipt._current.get().data["replaced_candidate"] == installed.live

@@ -73,6 +73,39 @@ def candidate_branch(home: Path, release: Path | None, *, source: Path) -> str |
     return next(iter(branches)) if len(branches) == 1 else None
 
 
+def candidate_is_unlanded(source: Path, candidate: str, target: str) -> bool:
+    """Require unmatched individual and combined patches, not current tree equality."""
+    from hermes_cli.update_cmd import _git_run
+    from hermes_cli.update_custody import run_git
+
+    def run(args):
+        return _git_run(["git"], args, cwd=source, check=True).stdout
+
+    def patch_ids(args):
+        # Patch equivalence must not decode or transform arbitrary file bytes.
+        patch = run_git(["git"], args, cwd=source, capture_output=True, check=True).stdout
+        result = run_git(["git"], ["patch-id", "--stable"], cwd=source,
+                         input=patch, capture_output=True, check=True)
+        return {line.split()[0] for line in result.stdout.splitlines()}
+
+    base = run(["merge-base", candidate, target]).strip()
+    cherry = run(["cherry", target, candidate, base]).splitlines()
+    if any(line.startswith("- ") for line in cherry):
+        return False
+    if not cherry or any(re.fullmatch(r"\+ [0-9a-f]{40}", line) is None for line in cherry):
+        raise RuntimeError(f"cannot prove candidate {candidate} has unlanded commits against {target}")
+    # A multi-commit squash has no per-commit cherry equivalent. Compare its
+    # complete delta with historical patches before considering a merge. Later
+    # reverts, deletions and edits do not erase the earlier landing evidence.
+    options = ["--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "--binary", "--full-index"]
+    combined = patch_ids(["diff", *options, base, candidate])
+    if not combined:
+        return False
+    history = patch_ids(["log", "-p", "--diff-merges=first-parent", *options,
+                         f"{base}..{target}"])
+    return combined.isdisjoint(history)
+
+
 def select_update_candidate(source: Path, home: Path, target: str,
                             replace_candidate: str | None = None) -> str:
     """Only objects and local refs may change, never HEAD or the index."""
@@ -104,12 +137,15 @@ def select_update_candidate(source: Path, home: Path, target: str,
         if ancestor(candidate, target):
             return target
         main = run(["rev-parse", "--verify", "origin/main^{commit}"], check=False)
-        if main.returncode == 0 and ancestor(candidate, main.stdout.strip()):
+        if main.returncode == 0 and (ancestor(candidate, main.stdout.strip())
+                                     or not candidate_is_unlanded(source, candidate, main.stdout.strip())):
+            return target
+        if not candidate_is_unlanded(source, candidate, target):
             return target
         stop = "merge_conflict"
         tree = releases.merge_release_tree(source, target, candidate)
         if tree == run(["rev-parse", f"{target}^{{tree}}"]).stdout.strip():
-            return target  # Squash-equivalent content has landed, not a carry.
+            return target  # The candidate adds no content to this target.
         stop = "target_unresolved"
         # Never reintroduce a reviewed-away revision, even when it would merge
         # cleanly. Refresh the named source rather than trusting a tracking ref.
