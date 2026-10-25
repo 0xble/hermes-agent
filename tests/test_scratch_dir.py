@@ -922,3 +922,40 @@ def test_prune_log_escapes_control_characters_in_unreadable_declarations(tmp_pat
     log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
     assert not any(line.startswith("scratch prune: removed") for line in log.splitlines())
     assert "kept all 1 idle entries, unreadable retention declaration" in log
+
+
+def test_prune_matches_declared_paths_to_entries_by_filesystem_identity(tmp_path):
+    """On a case-insensitive volume a declaration may spell an entry, or the scratch root, with
+    different case. The declared path still names the pinned data, so the entry must survive."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, data, control = (scratch / n for n in ("owner", "CaseSensitiveInput", "control"))
+    for d in (owner, data, control):
+        d.mkdir()
+    (data / "f").write_text("x", encoding="utf-8")
+    declared = Path(str(scratch).swapcase()) / "casesensitiveinput" / "f"
+    if not declared.exists():
+        pytest.skip("case-sensitive filesystem: differently cased paths name nothing")
+    _pin(owner, declared)
+    for d in (owner, data, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert declared.exists() and owner.exists() and not control.exists()
+
+
+def test_prune_keeps_the_entry_a_linked_declaration_file_points_into(tmp_path):
+    """A symlinked ``input-pins.json`` keeps the entry holding its target, so the retained
+    declaration does not dangle and freeze every later pass."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, manifests, data, control = (
+        scratch / n for n in ("owner", "manifests", "data", "control"))
+    for d in (owner, manifests, data, control):
+        d.mkdir()
+    (data / "f").write_text("x", encoding="utf-8")
+    _pin(manifests, data / "f")
+    (manifests / "input-pins.json").rename(manifests / "pins.json")
+    (owner / "input-pins.json").symlink_to(manifests / "pins.json")
+    for d in (owner, manifests, data, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert (owner / "input-pins.json").exists() and (data / "f").exists()
+    assert not control.exists()

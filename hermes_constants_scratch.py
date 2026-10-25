@@ -232,14 +232,42 @@ def _declared_inputs(entry: Path) -> list[str] | None:
 _SYMLINK_HOPS = 40
 
 
-def _entries_on_path(path: str, roots: tuple[str, ...]) -> set[str]:
+def _identity(path: str) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of *path* itself (links not followed), or None when it is gone."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _prefixes(path: str) -> list[str]:
+    """Every ancestor-or-self prefix of an already-resolved absolute *path*."""
+    parts = Path(path).parts
+    out, cur = [], parts[0]
+    for part in parts[1:]:
+        cur = os.path.join(cur, part)
+        out.append(cur)
+    return out
+
+
+def _entries_on_path(path: str, by_identity: dict[tuple[int, int], set[str]]) -> set[str]:
     """Top-level scratch entry names a declared *path* passes through on its way to the data,
-    including every symlink hop, not only its canonical target: a scratch-local alias on the
-    path must survive or the declared path stops resolving."""
+    including every symlink hop and the entry holding its realpath. Components are matched to
+    entries by filesystem identity, not spelling: on a case-insensitive volume a declaration may
+    name ``Input`` as ``input``, or spell the scratch root differently, and a string comparison
+    would let the pinned entry be pruned."""
     tops: set[str] = set()
+
+    def note(component: str) -> None:
+        ident = _identity(component)
+        if ident is not None:
+            tops.update(by_identity.get(ident, ()))
+
     # Join, never normpath: ``alias/../f`` must traverse ``alias`` before ``..`` applies, and
     # ``abspath`` would drop it.
-    pending = [path if os.path.isabs(path) else os.path.join(os.getcwd(), path)]
+    start = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+    pending = [start]
     seen: set[str] = set()
     while pending and len(seen) < _SYMLINK_HOPS:
         candidate = pending.pop()
@@ -254,9 +282,7 @@ def _entries_on_path(path: str, roots: tuple[str, ...]) -> set[str]:
             # Every earlier component is a real directory (a symlink ends this walk), so ``..``
             # here is the physical parent.
             cur = os.path.dirname(cur) if part == ".." else os.path.join(cur, part)
-            for root in roots:
-                if cur != root and _under(cur, root):
-                    tops.add(os.path.relpath(cur, root).split(os.sep, 1)[0])
+            note(cur)
             if os.path.islink(cur):
                 try:
                     target = os.readlink(cur)
@@ -264,15 +290,18 @@ def _entries_on_path(path: str, roots: tuple[str, ...]) -> set[str]:
                     break
                 pending.append(os.path.join(os.path.dirname(cur), target, *parts[i + 1:]))
                 break
+    for component in _prefixes(os.path.realpath(start)):
+        note(component)
     return tops
 
 
 def retained_entries(root: Path, entries: list[Path], candidates: list[Path]) -> set[str]:
     """Names of *candidates* that a retention declaration holds. A candidate is held when it has a
     ``.keep``, declares input pins itself, or contains an input declared by any entry of *root*,
-    followed transitively through that dependency's own declaration. Each declared path holds
-    every top-level entry it passes through, symlink hops included, and the entry holding its
-    realpath, so aliases and directory pins keep both the link and the data.
+    followed transitively through that dependency's own declaration. Each declared path, and the
+    declaration file's own path, holds every top-level entry it passes through, symlink hops
+    included, and the entry holding its realpath, so aliases, directory pins and a linked
+    ``input-pins.json`` keep both the link and what it points at.
 
     *entries* is every top-level entry (declarations anywhere protect a candidate); only
     *candidates* pay for the ``.keep`` walk, since a marker protects only its own entry.
@@ -280,14 +309,16 @@ def retained_entries(root: Path, entries: list[Path], candidates: list[Path]) ->
     Raises :class:`UnreadableRetention` when any declaration cannot be read: its dependencies are
     unknown, so no candidate can be shown to be free of them.
     """
-    real_root = os.path.realpath(str(root))
-    roots = tuple(dict.fromkeys((real_root, os.path.abspath(str(root)))))
-    by_name = {e.name: e for e in entries}
+    by_identity: dict[tuple[int, int], set[str]] = {}
+    for entry in entries:
+        ident = _identity(str(entry))
+        if ident is not None:
+            by_identity.setdefault(ident, set()).add(entry.name)
     declared: dict[str, list[str]] = {}
     for entry in entries:
         paths = _declared_inputs(entry)
         if paths is not None:
-            declared[entry.name] = paths
+            declared[entry.name] = [str(entry / _INPUT_PINS), *paths]
     reached: set[str] = set()
     pending = list(declared)
     while pending:
@@ -296,11 +327,7 @@ def retained_entries(root: Path, entries: list[Path], candidates: list[Path]) ->
             continue
         reached.add(name)
         for path in declared.get(name, ()):
-            tops = _entries_on_path(path, roots)
-            real = os.path.realpath(path)
-            if real != real_root and _under(real, real_root):
-                tops.add(os.path.relpath(real, real_root).split(os.sep, 1)[0])
-            pending.extend(top for top in tops if top in by_name and top not in reached)
+            pending.extend(top for top in _entries_on_path(path, by_identity) if top not in reached)
     return {c.name for c in candidates if c.name in reached or _has_keep_marker(c)}
 
 
