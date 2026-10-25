@@ -4183,29 +4183,8 @@ class SlackAdapter(BasePlatformAdapter):
         return True
 
     def _normalize_changed_message(self, event: dict) -> Optional[dict]:
-        """Turn a ``message_changed`` envelope into a plain message event.
-        None if malformed or the original was already routed to the agent. The edit's own ts rides
-        along as ``_slack_changed_event_ts`` for dedup."""
-        updated_message = event.get("message")
-        if not isinstance(updated_message, dict):
-            return None
-        original_message_ts = str(updated_message.get("ts") or "")
-        if original_message_ts and original_message_ts in self._processed_message_ts:
-            return None
-        edited = updated_message.get("edited")
-        edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
-        outer_event_ts = str(event.get("ts") or "")
-        changed_event_ts = (
-            str(event.get("event_ts") or edited_ts or "")
-            or (outer_event_ts if outer_event_ts != original_message_ts else "")
-            or (f"{original_message_ts}:changed" if original_message_ts else ""))
-        normalized_event = dict(updated_message)
-        for key in ("channel", "channel_type", "team", "team_id"):
-            if not normalized_event.get(key) and event.get(key):
-                normalized_event[key] = event.get(key)
-        if changed_event_ts:
-            normalized_event["_slack_changed_event_ts"] = changed_event_ts
-        return normalized_event
+        from .message_changes import normalize_changed_message
+        return normalize_changed_message(self, event)
 
     @staticmethod
     def _append_link_unfurls(text: str, slack_attachments: list) -> str:
@@ -4434,20 +4413,8 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: dict, payload: Optional[dict]) -> Optional[tuple[dict, str, str]]:
         """Normalize edits, then drop replays / ignored channels / bot posts / deletions.
         Returns ``(event, team_id, channel_id)`` for messages the handler should consider."""
-        # Entry log BEFORE any filtering so operators can tell "dropped here"
-        # from "never subscribed in the manifest". Metadata only, never text.
-        # DEBUG entry log — fires BEFORE any filtering so users debugging bot-to-bot interop, allow_bots
-        # config, or SLACK_ALLOWED_USERS drops can confirm whether the event actually arrived from Slack
-        # (vs. being silently filtered upstream by the app's event subscriptions — Socket Mode will not
-        # deliver events the app manifest hasn't subscribed to). See #30091.
-        if logger.isEnabledFor(logging.DEBUG):
-            _bot_profile = event.get("bot_profile") or {}
-            logger.debug(
-                "[Slack] event received type=%s subtype=%s user=%s bot_id=%s bot_name=%s "
-                "channel=%s ts=%s thread_ts=%s", event.get("type"), event.get("subtype"),
-                event.get("user", "") or "", event.get("bot_id", "") or "",
-                (_bot_profile.get("name") if isinstance(_bot_profile, dict) else "") or "",
-                event.get("channel", ""), event.get("ts", ""), event.get("thread_ts", ""))
+        from .message_changes import log_message_ingress
+        log_message_ingress(event, payload)
         if event.get("subtype") == "message_changed":
             event = self._normalize_changed_message(event)
             if event is None:
