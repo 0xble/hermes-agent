@@ -8,6 +8,8 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import asyncio
 import hashlib
 import json
@@ -2746,6 +2748,8 @@ def _judge_outage_notice(*, failed: bool) -> str:
 
 
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
+    if verdict == "done":
+        message = ContextNotice(message)
     return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
             "verdict": verdict, "reason": reason, "message": message}
 
@@ -2850,21 +2854,21 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
         meta = f"{turns}{sub}{con}{gat}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
-                return f"⏳ Goal (parked on {s.waiting_reason or f'session {s.waiting_on_session}'}, {meta}): {s.goal}"
+                return ContextNotice(f"⏳ Goal (parked on {s.waiting_reason or f'session {s.waiting_on_session}'}, {meta}): {s.goal}")
             if s.waiting_on_pid and _pid_alive(s.waiting_on_pid):
-                return f"⏳ Goal (parked on {s.waiting_reason or f'pid {s.waiting_on_pid}'}, {meta}): {s.goal}"
+                return ContextNotice(f"⏳ Goal (parked on {s.waiting_reason or f'pid {s.waiting_on_pid}'}, {meta}): {s.goal}")
             if s.waiting_until and time.time() < s.waiting_until:
                 remaining = int(s.waiting_until - time.time())
                 wr = s.waiting_reason or f"{remaining}s"
-                return f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}"
+                return ContextNotice(f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}")
             if s.waiting_on_user_message:
                 return f"⏳ Goal (waiting for your message — {meta}): {s.goal}"
-            return f"⊙ Goal (active, {meta}): {s.goal}"
+            return ContextNotice(f"⊙ Goal (active, {meta}): {s.goal}")
         if s.status == "paused":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
             return f"⏸ Goal (paused, {meta}{extra}): {s.goal}"
         if s.status == "done":
-            return f"✓ Goal done ({meta}): {s.goal}"
+            return ContextNotice(f"✓ Goal done ({meta}): {s.goal}")
         return f"Goal ({s.status}, {meta}): {s.goal}"
 
     # --- mutation -----------------------------------------------------

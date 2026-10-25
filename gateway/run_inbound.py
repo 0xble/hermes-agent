@@ -1415,7 +1415,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                                     pending_result.close()
                         if not started:
                             return _CommandDispatch.SUPPRESSED, None, command
-                    return True, str(result) if result else None, command
+                    # Preserve explicit presentation attributes on string-like plugin replies.
+                    return True, (result if isinstance(result, str) else str(result)) if result else None, command
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
         return False, None, command

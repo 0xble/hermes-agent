@@ -3729,9 +3729,10 @@ class _StreamingCall(StreamingWaitMonitor):
             # Durable channel, not _buffer_status: this recovery is expected to SUCCEED, and
             # buffered retry chatter is dropped on successful recovery. Fires at most once per
             # session (streaming is off from here on).
-            self.agent._emit_warning(
+            from gateway.notice_style import ContextNotice
+            self.agent._emit_warning(ContextNotice(
                 "⚠️ Provider stream returned an empty keepalive frame — retrying this turn "
-                "without streaming (streaming stays off for this session).")
+                "without streaming (streaming stays off for this session)."))
             return
         from agent.anthropic_adapter import _is_stream_unavailable_error
         if not _is_stream_unavailable_error(e):
