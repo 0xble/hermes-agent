@@ -79,6 +79,12 @@ classification runs in `tests/agent/test_synthetic_prompt_legacy_goals.py`.
 The companion plugin tests drive the registered goal_set handler through the
 native managers and durable readbacks.
 
+Default-install worktrees can place their shared Git metadata inside the real
+Hermes home. Startup recovery must apply its existing pytest checkout exclusion
+before resolving or probing recovery markers. Both Git and ZIP paths leave the
+running checkout unprobed, while temporary copied installations remain eligible
+for recovery tests. The real-home I/O guard is unchanged.
+
 No Hermes gateway or agent.service may be restarted, updated or reloaded by this
 change's implementation task. Source merge does not establish live adoption.
 Runtime installation and config enablement, real platform probes on each host,

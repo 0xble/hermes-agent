@@ -223,6 +223,7 @@ def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=No
         rows = db.messages_by_role(requester_session_id, "user", since=0.0, limit=500, cursor=cursor,
                                    current_only=True)
     except Exception:
+        logger.debug("current user quote lookup failed", exc_info=True)
         return "user_quote_not_found"
     latest = next((row for row in rows if _is_user_typed(row)), None)
     if latest is None:
@@ -235,6 +236,7 @@ def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=No
     except ValueError:
         raise
     except Exception:
+        logger.debug("current user quote provenance unavailable", exc_info=True)
         return "user_quote_not_found"
     # The gateway reply pointer repeats the assistant's words; only the user's own text authorizes.
     # Its end is ambiguous when the quoted words themselves contain the closing marker, and then
