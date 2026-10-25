@@ -349,24 +349,29 @@ class SessionGatewayMixin:
         are removed); other scopes untouched.
 
         Writes only the difference: every session update full-saves the index, and rewriting all
-        rows (thousands per scope) on each one multiplied WAL traffic under the shared writer lock."""
+        rows (thousands per scope) on each one multiplied WAL traffic under the shared writer lock.
+
+        The diff runs inside SQLite as two statements over one JSON parameter. Each row fetched
+        into Python (or each executemany row) releases and re-takes the GIL; with ~120 busy agent
+        threads every re-take waits a switch interval, which stretched a 10 ms diff of 2,753 rows
+        into 3-17 s writer-lock holds on the live gateway (callback CPU ~0.4 s)."""
         now = time.time()
-        wanted = {k: v for k, v in entries.items() if k and v}
+        # ensure_ascii=False keeps an unpaired surrogate a bind-time UnicodeEncodeError (the caller's
+        # sessions.json fallback) instead of invalid UTF-8 that json_each would store.
+        payload = json.dumps({k: v for k, v in entries.items() if k and v}, ensure_ascii=False)
         def _do(conn):
-            current = dict(conn.execute(
-                "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (scope,)).fetchall())
-            stale = [(scope, k) for k in current if k not in wanted]
-            if stale:
-                conn.executemany("DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?", stale)
-            changed = [(scope, k, v, now) for k, v in wanted.items() if current.get(k) != v]
-            if changed:
-                conn.executemany(
-                    """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
-                       VALUES (?, ?, ?, ?)
-                       ON CONFLICT(scope, session_key) DO UPDATE SET
-                           entry_json = excluded.entry_json,
-                           updated_at = excluded.updated_at""",
-                    changed)
+            conn.execute(
+                "DELETE FROM gateway_routing WHERE scope = ? "
+                "AND session_key NOT IN (SELECT key FROM json_each(?))",
+                (scope, payload))
+            conn.execute(
+                """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                   SELECT ?, key, value, ? FROM json_each(?) WHERE true
+                   ON CONFLICT(scope, session_key) DO UPDATE SET
+                       entry_json = excluded.entry_json,
+                       updated_at = excluded.updated_at
+                   WHERE gateway_routing.entry_json IS NOT excluded.entry_json""",
+                (scope, now, payload))
         self._execute_write(_do)
 
     def load_gateway_routing_entries(self, *, scope: str = "") -> dict[str, str]:

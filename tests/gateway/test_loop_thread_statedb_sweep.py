@@ -212,9 +212,125 @@ async def test_delivery_validates_automation_topic_owner_off_the_loop(tmp_path):
     router = DeliveryRouter(GatewayConfig(sessions_dir=tmp_path), adapters={Platform.TELEGRAM: adapter})
     target = DeliveryTarget(platform=Platform.TELEGRAM, chat_id="2027045491", thread_id="150")
     loop_thread = _arm()
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="telegram_reply_to_message_id"):
         # The numeric private-topic send then refuses for want of a reply anchor; the owner
         # check before it is the step under test.
         await router._deliver_to_platform(target, "body", metadata={"job_id": "j1"})
     assert owner.off_loop(loop_thread)
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_role_hold_without_attended_routing_reads_route_state_off_the_loop(lane, monkeypatch):
+    cfg = {"model": {"default": "base", "provider": "baseline"},
+           "model_presets": {"fast": {"model": "first", "provider": "provider-a"}}}
+    (lane.runner._resolve_profile_home_for_source(lane.source) / "config.yaml").write_text(yaml.safe_dump(cfg))
+    await lane.runner._set_session_model_role(lane.key, "fast")
+    route_active = _Probe(True)
+    monkeypatch.setattr(lane.runner.session_store, "get_attended_route_active", route_active)
+    loop_thread = _arm()
+    await lane.runner._resolve_session_agent_runtime_async(
+        source=lane.source, session_key=lane.key, user_config=cfg)
+    assert route_active.off_loop(loop_thread)
+
+
+@pytest.mark.asyncio
+async def test_turn_dispatch_passes_the_off_loop_reasoning_pick_to_assembly(lane, monkeypatch):
+    runner, pick = lane.runner, {"enabled": True, "effort": "high"}
+    runner.session_store.set_reasoning_override(lane.key, pick)
+    reads = _Probe(pick)
+    monkeypatch.setattr(runner.session_store, "get_reasoning_override", reads)
+    captured = {}
+
+    class _Assembled(Exception):
+        pass
+
+    def build(_disp, _agent_cls, **kwargs):
+        captured.update(kwargs)
+        raise _Assembled
+
+    monkeypatch.setattr(runner, "_get_proxy_url", lambda: None)
+    monkeypatch.setattr(runner, "_run_agent_display_settings",
+                        lambda _source: SimpleNamespace(user_config=copy.deepcopy(lane.cfg)))
+    monkeypatch.setattr(runner, "_run_agent_build_turn_context", build)
+    loop_thread = _arm()
+    with pytest.raises(_Assembled):
+        await runner._run_agent_inner("hi", "", [], lane.source, "sid", session_key=lane.key)
+    assert captured["reasoning_override"] == pick
+    assert reads.off_loop(loop_thread)
+
+
+def _racing_read(runner, key, during):
+    """Persisted ``high`` read off the loop, with ``during`` landing on the loop mid-read."""
+    loop = asyncio.get_running_loop()
+
+    def read(_key):
+        asyncio.run_coroutine_threadsafe(during(), loop).result(timeout=5)
+        return {"enabled": True, "effort": "high"}
+
+    runner.session_store.get_reasoning_override = read
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_state", [True, False])
+async def test_reasoning_reset_during_rehydration_is_not_undone(lane, existing_state):
+    runner = lane.runner
+    if existing_state:
+        runner._session_state(lane.key)
+    else:
+        runner._sessions.pop(lane.key, None)
+
+    async def reset():
+        runner._session_state(lane.key).conversation.reasoning_override = None
+
+    _racing_read(runner, lane.key, reset)
+    assert await runner._session_reasoning_override_async(lane.key) is None
+    assert runner._session_state(lane.key).conversation.reasoning_override is None
+
+
+@pytest.mark.asyncio
+async def test_reasoning_pick_set_during_rehydration_wins(lane):
+    runner = lane.runner
+    runner._session_state(lane.key)
+    low = {"enabled": True, "effort": "low"}
+
+    async def pick():
+        runner._session_state(lane.key).conversation.reasoning_override = dict(low)
+
+    _racing_read(runner, lane.key, pick)
+    assert await runner._session_reasoning_override_async(lane.key) == low
+    assert runner._session_state(lane.key).conversation.reasoning_override == low
+
+
+@pytest.mark.asyncio
+async def test_hygiene_gate_waits_for_a_cooldown_scheduled_by_an_unwinding_attempt(lane):
+    runner = lane.runner
+    started, release, written = threading.Event(), threading.Event(), []
+
+    def write():
+        started.set()
+        release.wait(5)
+        written.append(True)
+
+    runner._hmwa_hygiene_schedule_cooldown("sid", write, failure_label="test")
+    await asyncio.to_thread(started.wait, 5)
+    threading.Timer(0.2, release.set).start()
+    await runner._hmwa_hygiene_await_pending_cooldown("sid")
+    assert written == [True]
+    await asyncio.sleep(0)
+    assert "sid" not in runner._hygiene_pending_cooldowns
+
+
+def test_failure_streak_does_not_resurrect_an_evicted_session(tmp_path):
+    from gateway.run import _hygiene_cooldown_for_failure
+    from hermes_state import SessionDB
+
+    runner = object.__new__(GatewayRunner)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        runner._session_db = db
+        assert _hygiene_cooldown_for_failure(runner, "agent:main:telegram:dm:9", 300.0) == 300.0
+        assert runner._peek_session_state("agent:main:telegram:dm:9") is None
+        assert _hygiene_cooldown_for_failure(runner, "agent:main:telegram:dm:9", 300.0) == 900.0
+    finally:
+        db.close()

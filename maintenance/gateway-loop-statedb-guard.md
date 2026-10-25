@@ -35,7 +35,14 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   and topic-session binding peeks, and Slack thread hydration (active-session check, watermark
   read and write) run through `asyncio.to_thread`. Concurrent Slack replies in one thread may
   now persist watermarks out of order; a regressed watermark only re-injects already-seen replies
-  after a restart. The Slack DM seed (`_seed_dm_session`, and the `_adopt_legacy_slack_entry`
+  after a restart. The off-loop `/reasoning` rehydration publishes the stored pick only while
+  `ConversationState.reasoning_override_epoch` is unchanged (every write of the field and every
+  conversation `clear()` bumps it), so a set, reset or boundary during the read wins. Cooldown
+  writes scheduled from the done-callback and unwind paths are tracked per session id, and the
+  hygiene gate waits for a pending one (bounded by `_HYGIENE_PENDING_COOLDOWN_WAIT_S`, 10 s)
+  before reading the durable cooldown. With SQLite available, the failure-streak bump refreshes
+  only a live session's in-memory view, never get-or-creates one from a worker thread. A role hold
+  with attended routing off takes the same off-loop resolution snapshot. The Slack DM seed (`_seed_dm_session`, and the `_adopt_legacy_slack_entry`
   and compression-tip reads under it) belongs to PR #814 (`slack-seed-off-loop`).
 - The pre-open deleted-WAL holder scan (host-wide libproc on macOS, already bounded at 5 s
   fail-open by upstream `233434b41447`; a cold scan took 77 s on the loaded host) reuses a
@@ -75,6 +82,11 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   (#105567's close race stays inside). 11:52: the lock holder sat in a kernel-stalled stat().
 - A full routing-index save (`replace_gateway_routing_entries`) writes only the difference,
   with unchanged full-replace semantics; it used to rewrite every row of the scope per update.
+  The diff runs inside SQLite (two statements over one `json_each` parameter), never as rows
+  fetched into Python under the writer lock: each row round trip re-takes the GIL, and with
+  ~120 busy agent threads that turned a 10 ms diff of 2,753 rows into 3-17 s holds
+  (2026-10-25: 58 holds, 365 s in 2 h; callback CPU ~0.4 s). Keep new writer callbacks
+  O(1) in Python round trips where the row count grows with history or sessions.
 - The turn-liveness watchdog does not count time the turn's execution thread spends inside a
   SessionDB write (writer-lock queue, busy retries, commit) as no progress; a finished write
   counts as activity. Nothing else (lease refresh included) feeds the activity clock.

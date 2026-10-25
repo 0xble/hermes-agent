@@ -34,6 +34,9 @@ def test_compaction_reports_phase_times_and_existing_row_amplification(tmp_path,
             return indexed
 
         monkeypatch.setattr(db, "_visible_display_index", observe_index)
+        # Keep the full-index fallback diagnostics covered. Eligible incremental
+        # enumeration and its fixed work bound are exercised by the closure suite.
+        monkeypatch.setattr(db, "_begin_display_fold", lambda conn, plan: plan)
         for i in range(12):
             db.append_message("topic", "user" if i % 2 == 0 else "assistant", f"amplification original {i}")
         history = db.get_messages_as_conversation("topic", include_row_ids=True)

@@ -25,7 +25,7 @@ from agent.i18n import t
 from gateway.config import Platform
 from gateway.cron_review import is_review_event
 from gateway.platforms.base import EphemeralReply, as_command_reply
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, turn_origin_for_event
 from gateway.platforms.typing_state import resume_typing_after_prompt
 from gateway.run_busy import approval_input_words
 from gateway.run_common import _UNSET
@@ -919,6 +919,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         schedule_activity: Any = getattr(self, "_schedule_attended_user_activity", None)
         if callable(schedule_activity):
             schedule_activity(event, source, _quick_key)
+        if turn_origin_for_event(event) == "user":  # a queued restart resume's preclaim may hold this slot
+            self._promote_background_admission(_quick_key)
         from gateway.cron_review import fail_busy_review
         if fail_busy_review(event):
             # The runner slot can still be live when the adapter guard is not (reconnect,
@@ -1826,7 +1828,6 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if self._is_session_running(_quick_key):
             # The durable lock lookup yielded; another turn may now own the slot.
             return await self._hm_handle_running_session_message(event, source, _quick_key)
-
 
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
