@@ -13,7 +13,21 @@ class GoalPromptEntry(TypedDict):
     source_commits: tuple[str, ...]
 
 
-GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'plain',
+GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'autonomy',
+  'template': '[Continuing toward your standing goal] Goal: {goal}\n'
+              '\n'
+              'Completion contract:\n'
+              '{contract_block}\n'
+              '{subgoals_block}\n'
+              '\n'
+              'Manage this goal autonomously. Choose the next concrete authorized step. If a route fails, try a new '
+              'route. For an external dependency use a timed wait with an automatic wake, rather than stopping for '
+              'input or approval. Preserve every constraint, hard limit and verification criterion when revising or '
+              'replacing. Never use complete or replace to escape constraints, failing checks or unsolved work. Use '
+              'goal_set complete only with an evidence mapping from EVERY verification criterion to concrete recorded '
+              'tool output. Never clear a goal. If nothing material changed, reply exactly [SILENT].',
+  'source_commits': ('02752d9f92e53b210af963bede45be9d52fbc00b',)},
+ {'formatter': 'plain',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
               '\n'
@@ -86,6 +100,30 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'plain
               'state so explicitly, cite the proof (exact identifiers or output lines from tool results, in '
               'backticks), and stop. If you are blocked and need input from the user, say so clearly and stop.',
   'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '5dc1a7f693d97c02e73e6f291d222c693ff60515')},
+ {'formatter': 'plain',
+  'template': '[Continuing toward your standing goal]\n'
+              'Goal: {goal}\n'
+              '\n'
+              'Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. If since your last '
+              "visible update nothing new and material happened and nothing needs the user's action (for example, you "
+              'are still waiting on an external party, a scheduled check, or a background process), reply with exactly '
+              '[SILENT] and nothing else. Never post status like "no change", "still waiting", plain acknowledgements, '
+              '"next check at", or what you did not do.\n'
+              'When something changed, report only the new fact or needed action briefly, in one or two short lines. '
+              'The FIRST time you claim the goal is done, include an Evidence section with exact proof and make that '
+              'claim visible above it. Evidence may be a collapsed <details><summary>Evidence</summary>...</details> '
+              'block where the platform renders toggles; keep exact identifiers and output lines verbatim in '
+              'backticks. Make a done claim visible again only when its substance changed because new evidence, new '
+              'state, or a changed blocker appeared. If you already reported done and nothing material changed since '
+              'that report, reply with exactly [SILENT] and nothing else; the runtime will still re-check completion. '
+              'A restart, update, or new release by itself is not news, and re-running a check that returns the same '
+              'result as your last visible report counts as unchanged; reply with exactly [SILENT] and nothing else. '
+              'The FIRST time you are blocked or need user input, say so visibly. While the same blocker or input need '
+              'is unchanged, reply with exactly [SILENT] and nothing else.\n'
+              'Continue working toward this goal. Take the next concrete step. If you believe the goal is complete, '
+              'state so explicitly, cite the proof (exact identifiers or output lines from tool results, in '
+              'backticks), and stop. If you are blocked and need input from the user, say so clearly and stop.',
+  'source_commits': ('511d3b72b438b4a9005c8b9d171fd6b5d649175e',)},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -303,6 +341,39 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'plain
               'backticks. Make a done claim visible again only when its substance changed because new evidence, new '
               'state, or a changed blocker appeared. If you already reported done and nothing material changed since '
               'that report, reply with exactly [SILENT] and nothing else; the runtime will still re-check completion. '
+              'A restart, update, or new release by itself is not news, and re-running a check that returns the same '
+              'result as your last visible report counts as unchanged; reply with exactly [SILENT] and nothing else. '
+              'The FIRST time you are blocked or need user input, say so visibly. While the same blocker or input need '
+              'is unchanged, reply with exactly [SILENT] and nothing else.\n'
+              'Continue working toward the outcome above. Take the next concrete step. Stay within the stated '
+              'boundaries and do not violate the constraints. Your method may change as you learn; the end state may '
+              'not. If a criterion has become obsolete or wrong, say so. goal_set action=revise can only add '
+              'requirements (cite concrete recorded evidence for verification changes); retiring or replacing an '
+              'existing item requires a user-typed /goal remove <kind> <N> or /goal replace command. Before claiming '
+              'the goal is done, audit each Verification item against current state and end with an Evidence section '
+              'that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, '
+              'URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or are '
+              'otherwise blocked and need user input, say so clearly and stop.',
+  'source_commits': ('511d3b72b438b4a9005c8b9d171fd6b5d649175e',)},
+ {'formatter': 'contract',
+  'template': '[Continuing toward your standing goal]\n'
+              'Goal: {goal}\n'
+              '\n'
+              'Completion contract:\n'
+              '{contract_block}\n'
+              '\n'
+              'Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. If since your last '
+              "visible update nothing new and material happened and nothing needs the user's action (for example, you "
+              'are still waiting on an external party, a scheduled check, or a background process), reply with exactly '
+              '[SILENT] and nothing else. Never post status like "no change", "still waiting", plain acknowledgements, '
+              '"next check at", or what you did not do.\n'
+              'When something changed, report only the new fact or needed action briefly, in one or two short lines. '
+              'The FIRST time you claim the goal is done, include an Evidence section with exact proof and make that '
+              'claim visible above it. Evidence may be a collapsed <details><summary>Evidence</summary>...</details> '
+              'block where the platform renders toggles; keep exact identifiers and output lines verbatim in '
+              'backticks. Make a done claim visible again only when its substance changed because new evidence, new '
+              'state, or a changed blocker appeared. If you already reported done and nothing material changed since '
+              'that report, reply with exactly [SILENT] and nothing else; the runtime will still re-check completion. '
               'The FIRST time you are blocked or need user input, say so visibly. While the same blocker or input need '
               'is unchanged, reply with exactly [SILENT] and nothing else.\n'
               'Continue working toward the outcome above. Take the next concrete step. Stay within the stated '
@@ -396,64 +467,6 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'plain
               'believe the goal and every additional criterion are complete, state so explicitly and stop. If you are '
               'blocked and need input from the user, say so clearly and stop.',
   'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '5dc1a7f693d97c02e73e6f291d222c693ff60515')},
-
- {'formatter': 'plain',
-  'template': '[Continuing toward your standing goal]\n'
-              'Goal: {goal}\n'
-              '\n'
-              'Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. If since your last '
-              "visible update nothing new and material happened and nothing needs the user's action (for example, you "
-              'are still waiting on an external party, a scheduled check, or a background process), reply with exactly '
-              '[SILENT] and nothing else. Never post status like "no change", "still waiting", plain acknowledgements, '
-              '"next check at", or what you did not do.\n'
-              'When something changed, report only the new fact or needed action briefly, in one or two short lines. '
-              'The FIRST time you claim the goal is done, include an Evidence section with exact proof and make that '
-              'claim visible above it. Evidence may be a collapsed <details><summary>Evidence</summary>...</details> '
-              'block where the platform renders toggles; keep exact identifiers and output lines verbatim in '
-              'backticks. Make a done claim visible again only when its substance changed because new evidence, new '
-              'state, or a changed blocker appeared. If you already reported done and nothing material changed since '
-              'that report, reply with exactly [SILENT] and nothing else; the runtime will still re-check completion. '
-              'A restart, update, or new release by itself is not news, and re-running a check that returns the same '
-              'result as your last visible report counts as unchanged; reply with exactly [SILENT] and nothing else. '
-              'The FIRST time you are blocked or need user input, say so visibly. While the same blocker or input need '
-              'is unchanged, reply with exactly [SILENT] and nothing else.\n'
-              'Continue working toward this goal. Take the next concrete step. If you believe the goal is complete, '
-              'state so explicitly, cite the proof (exact identifiers or output lines from tool results, in '
-              'backticks), and stop. If you are blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('511d3b72b438b4a9005c8b9d171fd6b5d649175e',)},
- {'formatter': 'contract',
-  'template': '[Continuing toward your standing goal]\n'
-              'Goal: {goal}\n'
-              '\n'
-              'Completion contract:\n'
-              '{contract_block}\n'
-              '\n'
-              'Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. If since your last '
-              "visible update nothing new and material happened and nothing needs the user's action (for example, you "
-              'are still waiting on an external party, a scheduled check, or a background process), reply with exactly '
-              '[SILENT] and nothing else. Never post status like "no change", "still waiting", plain acknowledgements, '
-              '"next check at", or what you did not do.\n'
-              'When something changed, report only the new fact or needed action briefly, in one or two short lines. '
-              'The FIRST time you claim the goal is done, include an Evidence section with exact proof and make that '
-              'claim visible above it. Evidence may be a collapsed <details><summary>Evidence</summary>...</details> '
-              'block where the platform renders toggles; keep exact identifiers and output lines verbatim in '
-              'backticks. Make a done claim visible again only when its substance changed because new evidence, new '
-              'state, or a changed blocker appeared. If you already reported done and nothing material changed since '
-              'that report, reply with exactly [SILENT] and nothing else; the runtime will still re-check completion. '
-              'A restart, update, or new release by itself is not news, and re-running a check that returns the same '
-              'result as your last visible report counts as unchanged; reply with exactly [SILENT] and nothing else. '
-              'The FIRST time you are blocked or need user input, say so visibly. While the same blocker or input need '
-              'is unchanged, reply with exactly [SILENT] and nothing else.\n'
-              'Continue working toward the outcome above. Take the next concrete step. Stay within the stated '
-              'boundaries and do not violate the constraints. Your method may change as you learn; the end state may '
-              'not. If a criterion has become obsolete or wrong, say so. goal_set action=revise can only add '
-              'requirements (cite concrete recorded evidence for verification changes); retiring or replacing an '
-              'existing item requires a user-typed /goal remove <kind> <N> or /goal replace command. Before claiming '
-              'the goal is done, audit each Verification item against current state and end with an Evidence section '
-              'that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, '
-              'URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or are '
-              'otherwise blocked and need user input, say so clearly and stop.',
-  'source_commits': ('511d3b72b438b4a9005c8b9d171fd6b5d649175e',)},
  {'formatter': 'subgoals',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -574,6 +587,13 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'plain
   'template': '[Goal wait lifted: pid {note_field_0} has exited. Verify its result before continuing.]',
   'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
  {'formatter': 'barrier_lift_note',
+  'template': '[Goal wait lifted: pid {note_field_0} is still running after Check its progress before waiting again.]',
+  'source_commits': ('working-tree',)},
+ {'formatter': 'barrier_lift_note',
+  'template': '[Goal wait lifted: background process {note_field_0} is still running after Check its progress before '
+              'waiting again.]',
+  'source_commits': ('working-tree',)},
+ {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: pid {note_field_0} is still running after {note_field_1} minutes. Check its progress '
               'before waiting again.]',
   'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
@@ -581,13 +601,6 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'plain
   'template': '[Goal wait lifted: background process {note_field_0} is still running after {note_field_1} minutes. '
               'Check its progress before waiting again.]',
   'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
- {'formatter': 'barrier_lift_note',
-  'template': '[Goal wait lifted: pid {note_field_0} is still running after Check its progress before waiting again.]',
-  'source_commits': ('working-tree',)},
- {'formatter': 'barrier_lift_note',
-  'template': '[Goal wait lifted: background process {note_field_0} is still running after Check its progress before '
-              'waiting again.]',
-  'source_commits': ('working-tree',)},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} finished ({note_field_1}, exit {note_field_2}). '
               'Read its output with the process tool before continuing.]',
@@ -615,6 +628,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'plain
 # Current formatter names are the guard-test contract: a wording change must first be added to
 # the generated history snapshot before the classifier can be considered complete.
 CURRENT_GOAL_FORMATTER_NAMES: Final[tuple[tuple[str, str], ...]] = (
+    ("autonomy", "AUTONOMY_CONTINUATION_TEMPLATE"),
     ("plain", "CONTINUATION_PROMPT_TEMPLATE"),
     ("contract", "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE"),
     ("subgoals", "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE"),
@@ -622,7 +636,7 @@ CURRENT_GOAL_FORMATTER_NAMES: Final[tuple[tuple[str, str], ...]] = (
     ("barrier_lift", "GOAL_WAIT_LIFTED_NOTE_OPEN"),
 )
 
-GOAL_PROMPT_REGISTRY_COUNTS: Final[dict[str, int]] = {'plain': 6, 'contract': 10, 'subgoals': 5, 'gate_failed': 1, 'revisions': 6, 'barrier_lift': 1, 'barrier_lift_note': 10}
+GOAL_PROMPT_REGISTRY_COUNTS: Final[dict[str, int]] = {'autonomy': 1, 'plain': 6, 'contract': 10, 'subgoals': 5, 'gate_failed': 1, 'revisions': 6, 'barrier_lift': 1, 'barrier_lift_note': 10}
 
 # All historical goal formatter versions contributing to the frozen registry. Individual rows
 # name their newest and oldest source commits instead of repeating this complete list per row.
@@ -1446,4 +1460,6 @@ SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('915777a8321b4186faad8e87
  '20132435c07cd1cee9f896ba9cd504698c09589c',
  '5ad030d19d71523bb4c901991bc0fac47cdd1ebf',
  '0159f25fd024c76a5a1f66fdbca39a828e4e2a61',
- '265bd59c1d9f8dea658f243b257d4fae3685af53')
+ '265bd59c1d9f8dea658f243b257d4fae3685af53',
+ '02752d9f92e53b210af963bede45be9d52fbc00b',
+ '511d3b72b438b4a9005c8b9d171fd6b5d649175e')

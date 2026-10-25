@@ -81,43 +81,123 @@ def _live_system_guard(request, monkeypatch):
 
     test_pid = _os.getpid()
     lookalike_ok = request.node.get_closest_marker(_GATEWAY_LOOKALIKE_MARK) is not None
-    # Capture the test process's existing children at fixture start —
-    # any *new* children spawned by the test are also allowlisted via
-    # the live psutil walk below. Static set keeps the fast path cheap.
+    # Keep verified identities across reparenting, never a bare-PID allowlist.
+    # Later signals also snapshot descendants before their parent can die.
     try:
         import psutil as _psutil
-        _initial_children = {
-            c.pid for c in _psutil.Process(test_pid).children(recursive=True)
-        }
-    except Exception:
+    except ImportError:
         _psutil = None
-        _initial_children = set()
+    _owned_processes = {}
+    if _psutil is not None:
+        try:
+            children = _psutil.Process(test_pid).children(recursive=True)
+        except _psutil.Error:
+            children = []
+        for child in children:
+            try:
+                _owned_processes[child.pid] = child.create_time()
+            except _psutil.Error:
+                continue  # Unverifiable children still need a live ancestry check.
 
     def _is_own_subtree(pid: int) -> bool:
-        # PID 0 means "our own process group"; -1 means "every process we
-        # can signal". Both are dangerous when paired with SIGTERM/SIGKILL,
-        # but pid 0 is technically scoped to our group so allow it; pid -1
-        # is treated as foreign (refuse).
+        # PID 0 means our group; -1 means every signalable process.
         if pid == 0:
             return True
         if pid < 0:
             return False
-        if pid == test_pid or pid in _initial_children:
+        if pid == test_pid:
             return True
         if _psutil is None:
             return False
         try:
             walker = _psutil.Process(pid)
-        except Exception:
-            # Stale PID — kill would be a no-op anyway, allow it.
+            identity = walker.create_time()
+            if pid in _owned_processes:
+                owned = identity == _owned_processes[pid]
+            else:
+                owned = any(parent.pid == test_pid for parent in walker.parents())
+            # Ancestry and saved ownership apply only to the same process
+            # that is still present after inspection.
+            if not owned or _psutil.Process(pid).create_time() != identity:
+                return False
+            _owned_processes[pid] = identity
             return True
+        except _psutil.NoSuchProcess as exc:
+            if exc.pid != pid:
+                return False  # A missing ancestor is not proof the target is gone.
+            import errno
+            raise ProcessLookupError(errno.ESRCH, "signal target vanished", pid) from exc
+        except _psutil.Error:
+            return False  # AccessDenied and other unverifiable identities fail closed.
+
+    def _remember_descendants(pid: int) -> None:
+        # Save helpers before signalling their parent can reparent them. Each
+        # identity is verified independently, not trusted from a children() list.
+        if _psutil is None:
+            return
         try:
-            for parent in walker.parents():
-                if parent.pid == test_pid:
-                    return True
-        except Exception:
+            children = _psutil.Process(pid or test_pid).children(recursive=True)
+        except _psutil.Error:
+            return
+        for child in children:
+            try:
+                _is_own_subtree(child.pid)
+            except ProcessLookupError:
+                continue
+
+    def _is_owned_session_member(pid: int, pgid: int) -> bool:
+        # An orphan may lose its Python ancestry before our first signal. A
+        # process cannot join an existing POSIX session, so a still-live owned
+        # session leader also proves the origin of its younger session members.
+        # Never override a rejected cached identity with this alternate proof.
+        if _psutil is None or pid in _owned_processes:
             return False
-        return False
+        try:
+            member = _psutil.Process(pid)
+            identity = member.create_time()
+            if _os.getsid(pid) != pgid or _os.getsid(pgid) != pgid:
+                return False
+            if not _is_own_subtree(pgid):
+                return False
+            leader_identity = _owned_processes[pgid]
+            if identity < leader_identity:
+                return False
+            # Use fresh psutil handles, since create_time caches per instance.
+            # A stale/recycled leader or a moving member cannot confer ownership.
+            if (_psutil.Process(pgid).create_time() != leader_identity
+                    or _psutil.Process(pid).create_time() != identity
+                    or _os.getsid(pgid) != pgid
+                    or _os.getsid(pid) != pgid
+                    or _os.getpgid(pid) != pgid):
+                return False
+            _owned_processes[pid] = identity
+            return True
+        except (OSError, _psutil.Error):
+            return False
+
+    def _group_is_owned(pgid: int) -> bool:
+        # Neither an owned leader nor an absent leader proves group ownership.
+        # Every surviving member needs its own verified process identity.
+        if _psutil is None:
+            return False
+        found = False
+        try:
+            for pid in _psutil.pids():
+                try:
+                    if _os.getpgid(pid) != pgid:
+                        continue
+                    if not (_is_own_subtree(pid)
+                            or _is_owned_session_member(pid, pgid)):
+                        return False
+                    found = True
+                except ProcessLookupError:
+                    continue
+        except (OSError, _psutil.Error):
+            return False
+        if not found:
+            import errno
+            raise ProcessLookupError(errno.ESRCH, "signal target group vanished", pgid)
+        return True
 
     real_kill = _os.kill
 
@@ -130,6 +210,7 @@ def _live_system_guard(request, monkeypatch):
         if int(sig) == 0:
             return real_kill(pid, sig, *args, **kwargs)
         if _is_own_subtree(int(pid)):
+            _remember_descendants(int(pid))
             return real_kill(pid, sig, *args, **kwargs)
         raise RuntimeError(
             f"tests/conftest.py live-system guard: blocked os.kill("
@@ -147,8 +228,8 @@ def _live_system_guard(request, monkeypatch):
     # ``os.killpg`` is the same risk class — sends a signal to every
     # process in a group. The gateway is a session leader (its own
     # PGID == its PID), so killpg(gateway_pid, SIGTERM) is a one-shot
-    # kill of the live process. Allow it only when the target PGID is
-    # the test process's own group.
+    # kill of the live process. Other groups require verified ownership of
+    # every surviving member, including after their leader exits.
     if hasattr(_os, "killpg"):
         real_killpg = _os.killpg
         own_pgid = _os.getpgrp()
@@ -157,7 +238,17 @@ def _live_system_guard(request, monkeypatch):
             # Signal 0 is a pure liveness probe — never destructive.
             if int(sig) == 0:
                 return real_killpg(pgid, sig, *args, **kwargs)
-            if int(pgid) == own_pgid or _is_own_subtree(int(pgid)):
+            owned = int(pgid) in (0, own_pgid)
+            if not owned:
+                try:
+                    leader_owned = _is_own_subtree(int(pgid))
+                except ProcessLookupError:
+                    leader_owned = None  # Surviving members must prove ownership.
+                if leader_owned:
+                    _remember_descendants(int(pgid))
+                if leader_owned is not False:
+                    owned = _group_is_owned(int(pgid))
+            if owned:
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "

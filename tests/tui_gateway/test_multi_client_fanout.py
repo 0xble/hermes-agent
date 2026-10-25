@@ -226,7 +226,9 @@ def test_membership_preserves_terminal_delivery_and_revokes_departed_peers(monke
         assert not server._attach_session_transport(session, server._stdio_transport)
         assert server._close_sessions_for_transport(b) == (0, 0)
         assert server._close_sessions_for_transport(a) == (0, 1)
-        assert session["transport"] is server._detached_ws_transport
+        assert isinstance(session["transport"], FanoutTransport)
+        assert not session["transport"].transports()
+        assert server._ws_session_is_detached(session)
 
 
 @pytest.mark.platforms("linux")

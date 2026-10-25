@@ -12,31 +12,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.event import MessageEvent
-from gateway.session import SessionSource
-
-
-def _make_event(text="/update", platform=Platform.TELEGRAM,
-                user_id="12345", chat_id="67890", thread_id=None):
-    """Build a MessageEvent for testing."""
-    source = SessionSource(
-        platform=platform,
-        user_id=user_id,
-        chat_id=chat_id,
-        user_name="testuser",
-        thread_id=thread_id,
-    )
-    return MessageEvent(text=text, source=source)
-
-
-def _make_runner():
-    """Create a bare GatewayRunner without calling __init__."""
-    from gateway.run import GatewayRunner
-    runner = object.__new__(GatewayRunner)
-    runner.adapters = {}
-    runner._voice_mode = {}
-    runner._update_prompt_pending = {}
-    return runner
+from tests.gateway.update_fixtures import _make_event, _make_runner
 
 
 # ---------------------------------------------------------------------------
