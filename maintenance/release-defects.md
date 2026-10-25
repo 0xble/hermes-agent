@@ -737,6 +737,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   burst batching, bounded overflow resume notices and physical flush unchanged.
   Guards: unchanged session-event-publication, multi-client fanout, fanout burst
   batching and gateway session-events-overflow suites.
+- Immutable release retention probes the executable and cwd of real processes.
+  Its source and tests are unchanged from fork main `39358bac528d`, where the
+  same 3 retention tests fail on macOS when a live process uses a release under
+  the real Hermes home. The home I/O guard correctly rejects that metadata
+  resolution. Treat this as parent-inherited host contamination, not fanout or
+  extras-carry merge fallout. Keep the guard and tests intact and qualify the
+  release-retention suite in disposable Linux without live-home mounts.
+- The hosted-room and secondary-route scope suites import `aiohttp` at
+  collection. An isolated core/dev/test environment without a messaging or
+  slack extra cannot collect them. Use a disposable PM-built declared-extra
+  environment to exercise these contracts, not a production dependency install
+  or a test skip.
 
 - The classic gateway goal proxy reuses the completion-history renderer added by
   autonomous goals. `/goal`, `/goal status` and `/goal show` remain local reads of
