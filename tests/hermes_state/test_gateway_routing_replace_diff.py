@@ -18,21 +18,21 @@ def _rows(db, scope):
 def test_replace_writes_only_the_difference_and_keeps_replace_semantics(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
-        db.replace_gateway_routing_entries({"a": "1", "b": "2", "c": "3"}, scope="s")
-        db.replace_gateway_routing_entries({"z": "other"}, scope="other-scope")
+        db.replace_gateway_routing_entries({"a": '{"session_id":"1"}', "b": '{"session_id":"2"}', "c": '{"session_id":"3"}'}, scope="s")
+        db.replace_gateway_routing_entries({"z": '{"session_id":"other"}'}, scope="other-scope")
         before = _rows(db, "s")
         with db._lock:
             changes_before = db._conn.total_changes
 
-        db.replace_gateway_routing_entries({"a": "1", "b": "2-new", "d": "4"}, scope="s")
+        db.replace_gateway_routing_entries({"a": '{"session_id":"1"}', "b": '{"session_id":"2-new"}', "d": '{"session_id":"4"}'}, scope="s")
 
         with db._lock:
             changed_rows = db._conn.total_changes - changes_before
         after = _rows(db, "s")
-        assert {k: v[0] for k, v in after.items()} == {"a": "1", "b": "2-new", "d": "4"}
+        assert {k: v[0] for k, v in after.items()} == {"a": '{"session_id":"1"}', "b": '{"session_id":"2-new"}', "d": '{"session_id":"4"}'}
         assert after["a"] == before["a"], "an unchanged row must not be rewritten"
         assert changed_rows == 3  # delete c, update b, insert d
-        assert _rows(db, "other-scope")["z"][0] == "other"
+        assert _rows(db, "other-scope")["z"][0] == '{"session_id":"other"}'
 
         db.replace_gateway_routing_entries({}, scope="s")
         assert _rows(db, "s") == {}

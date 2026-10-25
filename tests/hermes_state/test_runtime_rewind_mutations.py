@@ -66,14 +66,17 @@ def test_rewind_refuses_invalid_targets_without_changing_later_work(tmp_path, en
         assert current is not None
         before = _rewind_state(db)
         reason = 'not active' if target_kind == 'archived_user' else "must be a 'user'"
-        with pytest.raises(ValueError, match=reason):
-            if entrypoint == 'storage':
+        if entrypoint == 'storage':
+            with pytest.raises(ValueError, match=reason):
                 db.rewind_to_message('s', target)
-            else:
+        else:
+            with pytest.raises(rt.RuntimeStoreError, match='invalid_params') as refused:
                 rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='s',
                     request_id='fresh-rewind', expected_revision=current['runtime_revision'],
                     expected_generation=current['runtime_generation'], operation='rewind',
                     payload={'target_message_id': target})
+            assert refused.value.field == 'target_message_id'
+            assert refused.value.detail == "target user message is no longer in session history"
         assert _rewind_state(db) == before
         assert [m['content'] for m in db.get_messages('s')] == [
             'first ask', 'first reply', 'later ask', 'later reply',

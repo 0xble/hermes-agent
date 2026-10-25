@@ -771,6 +771,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   the fixture is proving that maintenance uses an isolated worktree. The real subprocess and
   maintenance assertions remain unchanged. Guard: `test_worktree_maintenance_isolation.py`
   passed in the canonical runner (`r5-fixtures.log`, 1 passed).
+- Batched pruning retains upstream on-session-delete hooks after each committed batch,
+  before filesystem cleanup. Rewind fixtures assert the structured API error field/detail
+  separately from storage exceptions, and routing-diff fixtures use serialized JSON objects.
+  Guards: session-delete hooks, runtime rewind and routing replace-diff (15 passed).
 - Retry parking retains the atomic process-notification owner hold until routing or shutdown
   requeue, including duplicate replacement. Keep wait-policy observations isolated per synthetic
   registry and preserve the bounded wait requirement when automatic notification is unavailable.
