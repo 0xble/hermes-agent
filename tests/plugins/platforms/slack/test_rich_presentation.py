@@ -30,10 +30,9 @@ def test_images_thumbnails_context_and_cards_in_reading_order():
     assert [e["type"] for e in blocks[2]["elements"]] == ["image", "mrkdwn"]
     assert blocks[2]["elements"][1]["text"] == "Updated today"
     cards = blocks[3]["elements"]
-    assert [c["title"]["text"] for c in cards] == ["First", "Second"]
+    assert [c["title"]["text"] for c in cards] == ["[First](https://example.com/details)", "Second"]
     assert cards[0]["hero_image"]["image_url"] == URL
-    assert cards[0]["actions"][0]["url"] == "https://example.com/details"
-    assert "actions" not in cards[1]
+    assert all("actions" not in card for card in cards)
 
 
 @pytest.mark.parametrize("body", ["not: a list", "- title: First\n  unknown: Lost", "- title: First\n  image: http://example.com/x.png"])
@@ -58,19 +57,24 @@ def test_table_alignment_survives_rich_media():
 
 def test_new_payload_limits_are_sanitized_without_mutating_input():
     long = "x" * 4000
-    card = {"type": "card", "title": {"type": "mrkdwn", "text": long}, "body": {"type": "mrkdwn", "text": long}}
+    card = {"type": "card", "title": {"type": "mrkdwn", "text": long}, "body": {"type": "mrkdwn", "text": long},
+            "actions": [{"type": "button", "url": "https://example.com/details",
+                         "text": {"type": "plain_text", "text": "Details"}}]}
     source = [
         {"type": "image", "image_url": URL, "alt_text": long, "title": {"type": "plain_text", "text": long}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": long}] * 12},
         {"type": "carousel", "elements": [card] * 11},
     ]
     blocks = sanitize_blocks(source)
+    assert blocks is not None
     assert len(blocks[0]["alt_text"]) == 2000
     assert len(blocks[0]["title"]["text"]) == 2000
     assert len(blocks[1]["elements"]) == 10
     assert len(blocks[2]["elements"]) == 10
     assert len(blocks[2]["elements"][0]["title"]["text"]) == 150
     assert len(blocks[2]["elements"][0]["body"]["text"]) == 200
+    assert all("actions" not in card for card in blocks[2]["elements"])
+    assert "actions" in source[2]["elements"][0]
     assert source[0]["alt_text"] == long
 
 

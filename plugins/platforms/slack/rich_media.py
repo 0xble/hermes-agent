@@ -1,7 +1,7 @@
 """Images, subtext and peer cards for the opt-in markdown renderer.
 
 Cards use a fenced ``cards`` YAML list with title, subtitle, body, image and url
-keys. Only link buttons are emitted, never callback-only interactivity.
+keys. URLs are ordinary title links because the sender has no button handler.
 """
 
 from __future__ import annotations
@@ -122,24 +122,23 @@ def _card(record, fmt) -> dict | None:
         return None
     if not isinstance(record.get("title"), str) or not record["title"].strip():
         return None
+    for key in ("image", "url"):
+        if key in record and not https_url(record[key]):
+            return None
     card = {"type": "card"}
     for key, limit in (("title", 150), ("subtitle", 150), ("body", 200)):
         value = record.get(key, "")
         if not isinstance(value, str):
             return None
         if value:
+            if key == "title" and "url" in record:
+                value = f"[{value}]({record['url']})"
             rendered = fmt(value)
             if len(rendered) > limit:
                 return None
             card[key] = {"type": "mrkdwn", "text": rendered}
-    for key in ("image", "url"):
-        if key in record and not https_url(record[key]):
-            return None
     if "image" in record:
         card["hero_image"] = image_element(record["image"], record["title"])
-    if "url" in record:
-        card["actions"] = [{"type": "button", "text": {"type": "plain_text", "text": "Details"},
-                            "url": record["url"]}]
     return card
 
 
@@ -189,16 +188,7 @@ def sanitize_card(card) -> dict | None:
         image = sanitize_image(card.get(key))
         if image:
             result[key] = image
-    actions = []
-    for action in (card.get("actions") or [])[:3]:
-        if not isinstance(action, dict) or action.get("type") != "button" or not https_url(action.get("url")):
-            continue
-        label = _text(action.get("text"), 75)
-        if label and label["type"] == "plain_text":
-            actions.append({"type": "button", "text": label, "url": action["url"]})
-    if actions:
-        result["actions"] = actions
-    return result if any(k in result for k in ("hero_image", "title", "actions", "body")) else None
+    return result if any(k in result for k in ("hero_image", "title", "body")) else None
 
 
 def sanitize_carousel(block: dict) -> dict | None:
