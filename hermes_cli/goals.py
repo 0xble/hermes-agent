@@ -1354,11 +1354,11 @@ def _parse_goal_row(session_id: str, raw: str) -> GoalState:
         ) from exc
 
 
-def load_goal(session_id: str, *, cursor=None) -> Optional[GoalState]:
+def load_goal(session_id: str, *, cursor=None, db=None) -> Optional[GoalState]:
     """Load the goal, atomically upgrading legacy history-backed requirements once."""
     if not session_id:
         return None
-    db = _get_session_db()
+    db = _get_session_db() if db is None else db
     if db is None:
         return None
     try:

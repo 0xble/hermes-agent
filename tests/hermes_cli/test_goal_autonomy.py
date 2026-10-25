@@ -274,3 +274,22 @@ def test_replacement_advances_the_instance_and_requires_fresh_readbacks(home):
     assert mgr.state.created_at > old_instance
     assert not mgr.complete(reason="old proof", evidence=evidence)["ok"]
     assert mgr.complete(reason="fresh proof", evidence=proof(db))["ok"]
+
+
+def test_failed_migration_reports_persistence_failure_without_a_blocked_state(home, monkeypatch):
+    _, db = home
+    mgr = manager()
+    mgr.state.status = "blocked"
+    mgr.state.last_verdict = "blocked"
+    goals.save_goal("autonomy", mgr.state)
+
+    def unavailable(*args, **kwargs):
+        raise OSError("store unavailable")
+
+    monkeypatch.setattr(db, "_execute_write", unavailable)
+    loaded = goals.GoalManager("autonomy")
+    assert loaded.state.status == "active"
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "retry", False, None, False))
+    result = loaded.evaluate_after_turn("continue")
+    assert result["status"] == "active" and not result["should_continue"]
+    assert result["verdict"] == "persistence_failed"

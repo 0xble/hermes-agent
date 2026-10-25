@@ -24,9 +24,11 @@ class GoalEvaluationPersistenceError(Exception):
 
 
 def _read_goal(session_id: str, db: SessionDB) -> GoalState | None:
-    from hermes_cli.goals import GoalState, _meta_key
+    from hermes_cli.goals import GoalState, _meta_key, goal_autonomy_enabled, load_goal
 
     try:
+        if goal_autonomy_enabled():
+            return load_goal(session_id, db=db)
         raw = db.get_meta(_meta_key(session_id))
         return GoalState.from_json(raw) if raw else None
     except Exception as exc:
@@ -72,11 +74,14 @@ def commit_goal_snapshot(session_id: str, expected: str, state: GoalState, db: S
 
 
 def evaluate_goal_snapshot(manager: GoalManager, last_response: str, **kwargs: Any) -> dict[str, Any]:
-    from hermes_cli.goals import GoalState, _decision, _get_session_db
+    from hermes_cli.goals import GoalState, _decision, _get_session_db, goal_autonomy_enabled
 
     state = manager.state
     if state is None or state.status != "active":
         return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+    if goal_autonomy_enabled() and getattr(state, "_legacy_migration_pending", False):
+        return _decision("active", False, None, "persistence_failed", "goal migration was not saved",
+                         "Goal migration could not be saved. The next load will retry it.")
     if not manager.session_id:
         return manager._evaluate_after_turn(last_response, **kwargs)
     expected = state.to_json()
