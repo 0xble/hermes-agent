@@ -2019,7 +2019,13 @@ class SlackAdapter(BasePlatformAdapter):
         just guarantees it runs without letting a cleanup error mask the caller's SendResult.
         """
         try:
-            await self.stop_typing(chat_id, metadata=metadata)
+            md = metadata or {}
+            # Slack clears status when a bot posts. An intermediate post must restore the
+            # running surface immediately, not leave it blank until the next 2s refresh.
+            if self._typing_is_active(chat_id, metadata) and not md.get("notify"):
+                await self.send_typing(chat_id, metadata=metadata)
+            elif not (md.get("_interim_send") or md.get("expect_edits")):
+                await self.stop_typing(chat_id, metadata=metadata)
         except Exception as e:  # pragma: no cover - defensive cleanup
             logger.debug("[Slack] status cleanup failed: %s", e)
 
@@ -2234,9 +2240,8 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             from .message_delivery import post_chunks
             last_result = await post_chunks(self, chat_id, team_id, content, formatted, thread_ts, metadata)
-            # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
-                await self.stop_typing(chat_id, metadata=metadata)
+                await self._clear_thread_status_quietly(chat_id, metadata)
             # Track sent ts (and the thread root) so thread replies get answered
             # without an @mention.
             sent_ts = last_result.get("ts") if last_result else None
@@ -2532,6 +2537,8 @@ class SlackAdapter(BasePlatformAdapter):
             "ts": str(ts), "draft_id": draft_id, "sent": text, "started": time.time(),
             "base": base}
         self._bot_message_ts.add(str(ts))
+        if self._typing_is_active(chat_id, metadata):
+            await self.send_typing(chat_id, metadata=metadata)
         return SendResult(success=True, message_id=str(ts))
 
     # A turn that ends without a matching final (crash, interrupt, rewritten final) leaves its
@@ -2717,7 +2724,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._evict_oldest_by_ts(
                 self._active_status_threads, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
         # May lack assistant:write scope or assistant context; reactions still work.
-        _status = getattr(self, "_status_text", {}).get(str(chat_id)) or getattr(
+        _status = self.get_status_text(chat_id, metadata) or getattr(
             self.config, "typing_status_text", None)
         _status = _status or self._default_status_text(_status_started)
         await self._set_thread_status(chat_id, team_id, thread_ts, _status, "failed")

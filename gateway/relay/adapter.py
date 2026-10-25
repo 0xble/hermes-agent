@@ -2059,7 +2059,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         # connector's prompt message can't be edited cross-platform yet).
         self._send_lifecycle_ack(chat_id, label, ack_meta)
         if count:
-            self.resume_typing_for_chat(chat_id)
+            self.resume_typing_for_chat(chat_id, metadata=ack_meta)
 
     async def _resolve_slash_confirm(self, state, option_id, chat_id, ack_meta) -> None:
         from tools import slash_confirm as slash_confirm_mod

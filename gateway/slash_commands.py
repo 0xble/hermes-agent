@@ -309,7 +309,7 @@ class GatewaySlashCommandsMixin(
         source = event.source
         adapter = self._delivery_adapter_for(source)  # the receiving bot, not the default profile's
         if adapter:
-            adapter.resume_typing_for_chat(source.chat_id)  # agent is about to continue
+            adapter.resume_typing_for_chat(source.chat_id, metadata=self._event_thread_metadata(event, source))  # agent is about to continue
         if getattr(adapter, "SUPPORTS_NATIVE_STREAMING", False) is not True:
             return confirmation_text
         if adapter:

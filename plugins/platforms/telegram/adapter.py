@@ -4646,9 +4646,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
     def _typing_retrigger_key(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> tuple[str, Optional[str]]:
         return str(chat_id), self._metadata_thread_id(metadata)
 
-    def _typing_retrigger_paused(self, chat_id: str) -> bool:
-        paused = getattr(self, "_typing_paused", None) or ()
-        return chat_id in paused or str(chat_id) in paused
+    def _typing_retrigger_paused(self, chat_id: str, metadata=None) -> bool:
+        return self._typing_is_paused(chat_id, metadata)
 
     def _cancel_typing_retrigger(self, chat_id: str, metadata: Any = _ALL_TOPICS) -> None:
         """Cancel re-arms for one topic (``metadata`` given, ``None`` = the chat's non-topic lane), or for
@@ -4686,12 +4685,14 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 for key in [key for key in tuple(sent_at) if _matches(key)]:
                     sent_at.pop(key, None)
 
-    def pause_typing_for_chat(self, chat_id: str) -> None:
-        """Pause typing and drop pending post-send re-arms for every topic in this chat.
-        The pause API is chat-level, so it lacks metadata and intentionally cancels all topic keys."""
-        super().pause_typing_for_chat(chat_id)
+    def pause_typing_for_chat(self, chat_id: str, metadata=None) -> None:
+        """Pause one topic, or all topics for a metadata-free chat-wide pause."""
+        super().pause_typing_for_chat(chat_id, metadata=metadata)
         with contextlib.suppress(Exception):
-            self._cancel_typing_retrigger(chat_id)
+            if metadata is None:
+                self._cancel_typing_retrigger(chat_id)
+            else:
+                self._cancel_typing_retrigger(chat_id, metadata)
 
     async def _retrigger_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> None:
         """Re-arm typing after an intermediate send (Telegram clears it when a message lands). Skipped on
@@ -4712,7 +4713,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             return
         # Paused chats (approval/clarify waits, or the stream consumer's pre-finalize pause) get no
         # re-arm, matching _keep_typing, which skips them on every tick.
-        if self._typing_retrigger_paused(chat_id):
+        if self._typing_retrigger_paused(chat_id, metadata):
             self._cancel_typing_retrigger(chat_id, metadata)
             return
         tasks, trailing_tasks = self._typing_retrigger_task_maps()
@@ -4753,7 +4754,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     if active_task is not None and not active_task.done():
                         await active_task
                     # A pause can land while this waited (e.g. before an edit-only final reply).
-                    if self._typing_retrigger_paused(chat_id):
+                    if self._typing_retrigger_paused(chat_id, metadata):
                         return
                     current = asyncio.current_task()
                     if current is not None and trailing_tasks.get(key) is current:

@@ -281,10 +281,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
                 from agent.display import build_status_phrase
-                adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
+                adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None), metadata=ctx._status_thread_metadata)
             elif event_type == "tool.completed":
                 # Between tools the model is genuinely "thinking" again — revert to the static default.
-                adapter.set_status_text(ctx.source.chat_id, None)
+                adapter.set_status_text(ctx.source.chat_id, None, metadata=ctx._status_thread_metadata)
         except Exception as err:
             logger.debug("live status update failed: %s", err)
 
@@ -1645,7 +1645,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Pause typing: a "thinking..." status must not obscure the prompt or block an "Other" reply
         # on platforms that disable input while typing (Slack Assistant).
         with suppress(Exception):
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id, metadata=ctx._status_thread_metadata)
         # Ordering barrier: flush buffered assistant prose BEFORE the poll, which goes out on a
         # separate agent-thread-blocking path and would otherwise render ABOVE its own explanation.
         # Best-effort + short timeout so the agent thread never hangs if the consumer isn't running.
@@ -1687,7 +1687,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 except Exception:
                     logger.debug("request_reopen_seed after clarify answer failed", exc_info=True)
             try:
-                ctx._status_adapter.resume_typing_for_chat(ctx._status_chat_id)
+                ctx._status_adapter.resume_typing_for_chat(ctx._status_chat_id, metadata=ctx._status_thread_metadata)
             except Exception:
                 logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
         return response, answered
@@ -1716,7 +1716,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
-        adapter.pause_typing_for_chat(ctx._status_chat_id)
+        adapter.pause_typing_for_chat(ctx._status_chat_id, metadata=ctx._status_thread_metadata)
         self._close_native_stream_boundary("Approval")
         # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
