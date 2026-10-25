@@ -3,7 +3,6 @@ replayed-user dedupe. Mixin bound via the MRO, built on SessionDB's _read_ctx/_e
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -24,7 +23,8 @@ from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
     _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 from hermes_state_identity import (
-    _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json)
+    _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json,
+    display_identity)
 from hermes_state_transactions import execute_transcript_write
 
 from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_phase
@@ -1194,7 +1194,7 @@ class SessionMessagesMixin(DisplayFoldMixin):
     @staticmethod
     def _display_identity(key: tuple[Any, ...]) -> bytes:
         """Fixed-width durable identity for indexed display-generation lookup."""
-        return hashlib.sha256(repr(key).encode("utf-8", "surrogatepass")).digest()
+        return display_identity(key)
 
     def _dedupe_display_generations(self, rows):
         """Collapse compaction generations so each logical message appears once (the protected tail is copied
