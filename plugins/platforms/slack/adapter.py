@@ -2126,7 +2126,7 @@ class SlackAdapter(BasePlatformAdapter):
                         "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
                         "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts)
                     stream.stream_ts = ""
-                    await start_native_task_card_stream(client, stream, metadata)
+                    await self._start_native_task_card_stream(client, stream, metadata)
                     await client.api_call(
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
                 return SendResult(success=True, message_id=stream.stream_ts)
@@ -2147,7 +2147,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def _start_native_task_card_stream(
         self, client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
     ) -> None:
-        """Start without ambiguous retries, then restore only active typing."""
+        """Start through the transport helper, then restore only active typing."""
         await start_native_task_card_stream(client, stream, metadata)
         if self._typing_is_active(stream.channel, metadata):
             await self.send_typing(stream.channel, metadata=metadata)
@@ -2752,10 +2752,12 @@ class SlackAdapter(BasePlatformAdapter):
         _status = self.get_status_text(chat_id, metadata) or getattr(
             self.config, "typing_status_text", None)
         _status = _status or self._default_status_text(_status_started)
-        owner = getattr(self, "_typing_tasks", {}).get(self._typing_scope_key(chat_id, metadata))
+        owner = getattr(self, "_typing_refresh_owners", {}).get(self._typing_scope_key(chat_id, metadata))
         await self._set_thread_status(chat_id, team_id, thread_ts, _status, "failed")
-        # An interim reassertion can finish after final cleanup has removed its owner.
-        if owner is not None and not self._typing_is_active(chat_id, metadata):
+        # Final cleanup removes the tracked surface even when no base owner exists
+        # (or its cancellation times out). A late set must not leave idle status behind.
+        if ((status_key and status_key not in self._active_status_threads)
+                or (owner is not None and not self._typing_is_active(chat_id, metadata))):
             await self.stop_typing(chat_id, metadata=metadata)
 
     async def _set_thread_status(
