@@ -216,3 +216,47 @@ def test_prompt_generation_retains_unreachable_shipped_wordings(home, monkeypatc
     monkeypatch.setattr(generator, "SOURCE_FILES", ())
     monkeypatch.setattr(generator, "_commits", lambda: [])
     assert generator._snapshot()["plain"][shipped["template"]] == ["retired"]
+
+
+@pytest.mark.parametrize("reason", ["Need approval to avoid violating a constraint", "No constraint violation occurred"])
+def test_a_prevented_breach_does_not_invalidate_later_completion(home, monkeypatch, reason):
+    _, db = home
+    mgr = manager()
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("blocked", reason, False, None, False))
+    mgr.evaluate_after_turn("try another route")
+    assert mgr.complete(reason="verified without a breach", evidence=proof(db))["ok"]
+
+
+def test_completion_cannot_overwrite_a_new_requirement(home, monkeypatch):
+    _, db = home
+    mgr = manager()
+    evidence = proof(db)
+    original = mgr._recorded_evidence_error
+
+    def interleave(excerpt, state):
+        goals.GoalManager("autonomy").add_subgoal("New delivery readback")
+        return original(excerpt, state)
+
+    monkeypatch.setattr(mgr, "_recorded_evidence_error", interleave)
+    result = mgr.complete(reason="all done", evidence=evidence)
+    assert result["error_code"] == "state_changed"
+    live = goals.load_goal("autonomy")
+    assert live.status == "active" and "New delivery readback" in live.subgoals
+
+
+def test_removal_quote_must_still_be_current_at_commit(home, monkeypatch):
+    _, db = home
+    mgr = manager()
+    quote = "Remove 'Never restart the gateway'."
+    db.append_message("autonomy", "user", quote)
+    execute = db._execute_write
+
+    def interleave(commit, *args, **kwargs):
+        monkeypatch.setattr(db, "_execute_write", execute)
+        db.append_message("autonomy", "user", "Keep that limit after all")
+        return execute(commit, *args, **kwargs)
+
+    monkeypatch.setattr(db, "_execute_write", interleave)
+    result = mgr.revise(reason="remove limit", contract={"constraints": ""}, user_quote=quote)
+    assert result["error_code"] == "state_changed"
+    assert goals.load_goal("autonomy").contract.constraints == "Never restart the gateway"

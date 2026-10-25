@@ -37,8 +37,14 @@ def completion_criteria(state) -> list[str]:
 
 
 def record_hard_limit_breach(state, reason: str) -> None:
-    breached = re.search(r"(?i)(?:constraint|hard.limit).{0,40}(?:breach|violat)|"
-                         r"(?:breach|violat).{0,40}(?:constraint|hard.limit)", reason or "")
+    from hermes_cli.goals_authority import _evidence_is_negated
+
+    breached = re.search(
+        r"(?i)\b(?:constraints?|hard[- ]limits?)\s+(?:(?:was|were|has been|have been)\s+)?"
+        r"(?:violated|breached|violation|breach)\b|"
+        r"\b(?:violated|breached)\b[^.;]{0,40}\b(?:constraints?|hard[- ]limits?)\b", reason or "")
+    if breached and _evidence_is_negated(reason, breached.group(0)):
+        return
     if breached and not any(
             row.get("kind") == "hard_limit_breach" and row.get("reason") == reason
             for row in state.revisions):
@@ -221,6 +227,7 @@ class GoalAutonomyMixin:
             return {"ok": False, "error_code": "completion_unproven", "error": gap}
         state.clear_wait()
         state.status = "done"
+        state.paused_reason = None
         state.last_verdict = "done"
         state.last_reason = reason
         state.revisions.append({"at": time.time(), "kind": "complete", "reason": reason,
