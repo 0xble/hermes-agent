@@ -2222,11 +2222,14 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
         # Never leave the session untitled.
         # Try the next free title in the lineage, then a bare id-stamped title. See #50535.
-        for _fallback in (
-            getattr(_session_db, "get_next_title_in_lineage", lambda b: b)(f"cron {job_id}"),
-            f"cron {job_id} {_final_cron_session_id[-6:]}"):
+        # Resolve each fallback inside the guard: after a cleanup timeout the bounded proxy fails
+        # every call, and an escape here would skip end/release and mask the run's own result.
+        _fallbacks = (
+            lambda: getattr(_session_db, "get_next_title_in_lineage", lambda b: b)(f"cron {job_id}"),
+            lambda: f"cron {job_id} {_final_cron_session_id[-6:]}")
+        for _fallback in _fallbacks:
             try:
-                if _set_cron_session_title(_session_db, _final_cron_session_id, _fallback):
+                if _set_cron_session_title(_session_db, _final_cron_session_id, _fallback()):
                     break
             except (Exception, KeyboardInterrupt):
                 continue
@@ -2733,8 +2736,13 @@ def run_job(
                     lambda: release_or_close(_session_db), job_id=job_id,
                     label="unused session store release")
             else:
-                _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
-                                       workdir=scope.workdir)
+                # Finalization is best-effort bookkeeping: it must never replace the run's
+                # result or skip the agent teardown below.
+                try:
+                    _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
+                                           workdir=scope.workdir)
+                except (Exception, KeyboardInterrupt) as e:
+                    logger.warning("Job '%s': cron session finalization failed: %s", job_id, e)
         # Tear down the ephemeral agent or the gateway leaks fds per tick (EMFILE). With deferred
         # teardown, hand the live agent back: delivery needs a live async client.
         # Release subprocesses, terminal sandboxes, browser daemons, and the main OpenAI/httpx client held
