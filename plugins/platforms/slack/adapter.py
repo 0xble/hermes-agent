@@ -57,13 +57,13 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 try:  # sibling modules; support both package and flat plugin-dir import
     from .attachment_errors import describe_download_exception
     from .block_kit import render_blocks, sanitize_blocks
-    from .task_cards import finish_task_card
+    from .task_cards import TaskCardCleanup, finish_task_card
     from .adapter_slash_lane import SlashHandoffLanes
     from .adapter_slash_payload import slash_command_text, slash_thread_id
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
-    from task_cards import finish_task_card  # type: ignore
+    from task_cards import TaskCardCleanup, finish_task_card  # type: ignore
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
 
@@ -1120,6 +1120,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Native progress streams; each owns a lock so concurrent start/append/stop
         # can't create duplicates or append after finalization.
         self._native_task_card_streams: dict[tuple[str, str, str], _NativeTaskCardStream] = {}
+        self._task_card_cleanup = TaskCardCleanup(self)
         # Guard: set the Slack AI thread title once per DM thread, not per reply.
         self._titled_assistant_threads: set = set()
         # Slash-command contexts so send() can route the first reply ephemerally. Keyed
@@ -1792,6 +1793,7 @@ class SlackAdapter(BasePlatformAdapter):
             await self._cancel_socket_watchdog("[Slack] Prior watchdog task failed while stopping")
             # A zombie Socket Mode handler would double-respond to every event.
             await self._stop_socket_mode_handler()
+            await self._task_card_cleanup.close()
             await self._close_workspace_clients()
             # Close any previous handler before creating a new one so that calling connect() a second time
             # (e.g. during a gateway restart or in-process reconnect attempt) does not leave a zombie Socket
@@ -1810,6 +1812,7 @@ class SlackAdapter(BasePlatformAdapter):
             _apply_slack_proxy(self._app.client, proxy_url)
             for token in bot_tokens:
                 await self._authenticate_workspace(token, proxy_url)
+            self._task_card_cleanup.start(immediate=True)
             self._register_bolt_handlers()
             # _running=True only once the handler is alive (watchdog needs the live
             # task); on failure keep it False so ``finally`` releases the lock.
@@ -1832,6 +1835,7 @@ class SlackAdapter(BasePlatformAdapter):
             return False
         finally:
             if lock_acquired and not self._running:
+                await self._task_card_cleanup.close()
                 self._release_platform_lock()
 
     def _fatal_missing_env(self, env_name: str) -> None:
@@ -1901,6 +1905,7 @@ class SlackAdapter(BasePlatformAdapter):
         # shutdown safety net for cancellation/reconnect races.
         for key, stream in list(self._native_task_card_streams.items()):
             await self._stop_native_task_card_stream(key, stream)
+        await self._task_card_cleanup.close()
         await self._stop_socket_mode_handler()
         await self._close_workspace_clients()
         self._app = self._app_token = self._proxy_url = self._bot_user_id = None
@@ -2116,28 +2121,10 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
                 return SendResult(success=False, error=str(exc), retryable=True)
 
-    @staticmethod
     async def _start_native_task_card_stream(
-        client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
+        self, client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
     ) -> None:
-        """chat.startStream a plan-mode card in ``stream``'s thread; sets ``stream.stream_ts``."""
-        start_payload: dict[str, Any] = {
-            "channel": stream.channel, "thread_ts": stream.thread_ts,
-            "task_display_mode": "plan"}
-        md = metadata or {}
-        recipients = (
-            ("recipient_team_id", ("recipient_team_id", "team_id", "slack_team_id")),
-            ("recipient_user_id", ("recipient_user_id", "user_id")))
-        for key, sources in recipients:
-            value = _first_truthy(md, sources)
-            if value:
-                start_payload[key] = value
-        result = await client.api_call("chat.startStream", json=start_payload)
-        if hasattr(result, "get"):
-            stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
-        if not stream.stream_ts:
-            raise RuntimeError("Slack startStream returned no stream timestamp")
-        stream.message_timestamps.append(stream.stream_ts)
+        await self._task_card_cleanup.start_stream(client, stream, metadata)
 
     @staticmethod
     def _task_update_chunk(task: dict[str, str]) -> dict[str, Any]:
@@ -2161,12 +2148,13 @@ class SlackAdapter(BasePlatformAdapter):
                     ephemeral = extra.get("native_task_cards_ephemeral", True)
                     await finish_task_card(
                         self._get_client(stream.channel, team_id=stream.team_id), stream,
-                        delete=self._truthy_config(ephemeral))
+                        delete=self._truthy_config(ephemeral), cleanup=self._task_card_cleanup)
             except Exception as exc:  # Never let progress cleanup block the real reply.
                 logger.warning("[Slack] Native task-card cleanup failed: %s", exc)
             finally:
                 if self._native_task_card_streams.get(key) is stream:
                     self._native_task_card_streams.pop(key, None)
+                self._task_card_cleanup.start()
 
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
