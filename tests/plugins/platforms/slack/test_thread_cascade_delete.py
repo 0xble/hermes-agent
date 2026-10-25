@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
+from slack_sdk.errors import SlackApiError
 
 from gateway.config import HomeChannel, Platform, PlatformConfig
 from plugins.platforms.slack import adapter as slack
@@ -112,49 +113,51 @@ async def test_cascade_scope_and_single_failure_notice(monkeypatch, case):
         "delete_error", "delete_exception", "foreign_reply", "missing_token",
         "wrong_token_team", "wrong_token_user", "fetch_error",
     }
-    if case == "channel":
-        event.update(channel="C_PUBLIC", channel_type="channel")
-    elif case == "non_owner_dm":
-        event["channel"] = "D_OTHER"
-    elif case == "non_owner_peer":
-        bot.conversations_info.return_value["channel"]["user"] = "U_OTHER"
-    elif case == "wrong_team":
-        event["team"] = "T_OTHER"
-    elif case == "no_home_owner":
-        adapter.config.home_channel.user_id = None
-    elif case == "reply_not_root":
-        event["message"]["thread_ts"] = "122.000001"
-    elif case == "live_parent":
-        bot.conversations_replies.return_value["messages"][0] = {"ts": ROOT, "user": OWNER}
-    elif case == "ordinary_edit":
-        adapter._processed_message_ts.clear()
-        event["message"] = {
-            "ts": ROOT, "user": OWNER, "text": "Edited text", "client_msg_id": "edited-human-message",
-        }
-        accepted = await adapter._prefilter_inbound(event, None)
-        assert accepted is not None
-        assert accepted[0]["text"] == "Edited text"
-        bot.conversations_replies.assert_not_awaited()
-        bot.chat_delete.assert_not_awaited()
-        user.chat_delete.assert_not_awaited()
-        return
-    elif case == "delete_error":
-        user.chat_delete.return_value = {"ok": False, "error": "cant_delete_message"}
-        bot.chat_delete.return_value = {"ok": False, "error": "restricted_action"}
-    elif case == "delete_exception":
-        error = RuntimeError("DO NOT DISCLOSE RAW EXCEPTION")
-        error.response = {"ok": False, "error": "cant_delete_message"}
-        user.chat_delete.side_effect = error
-    elif case == "foreign_reply":
-        bot.conversations_replies.return_value["messages"][2]["user"] = "U_OTHER"
-    elif case == "missing_token":
-        monkeypatch.setattr(slack, "_get_scoped_secret", lambda key: None)
-    elif case == "wrong_token_team":
-        user.auth_test.return_value["team_id"] = "T_OTHER"
-    elif case == "wrong_token_user":
-        user.auth_test.return_value["user_id"] = "U_OTHER"
-    elif case == "fetch_error":
-        bot.conversations_replies.return_value = {"ok": False, "error": "missing_scope"}
+    match case:
+        case "channel":
+            event.update(channel="C_PUBLIC", channel_type="channel")
+        case "non_owner_dm":
+            event["channel"] = "D_OTHER"
+        case "non_owner_peer":
+            bot.conversations_info.return_value["channel"]["user"] = "U_OTHER"
+        case "wrong_team":
+            event["team"] = "T_OTHER"
+        case "no_home_owner":
+            adapter.config.home_channel.user_id = None
+        case "reply_not_root":
+            event["message"]["thread_ts"] = "122.000001"
+        case "live_parent":
+            bot.conversations_replies.return_value["messages"][0] = {"ts": ROOT, "user": OWNER}
+        case "ordinary_edit":
+            adapter._processed_message_ts.clear()
+            event["message"] = {
+                "ts": ROOT, "user": OWNER, "text": "Edited text", "client_msg_id": "edited-human-message",
+            }
+            accepted = await adapter._prefilter_inbound(event, None)
+            assert accepted is not None
+            assert accepted[0]["text"] == "Edited text"
+            bot.conversations_replies.assert_not_awaited()
+            bot.chat_delete.assert_not_awaited()
+            user.chat_delete.assert_not_awaited()
+            return
+        case "delete_error":
+            user.chat_delete.return_value = {"ok": False, "error": "cant_delete_message"}
+            bot.chat_delete.return_value = {"ok": False, "error": "restricted_action"}
+        case "delete_exception":
+            error = SlackApiError(
+                "DO NOT DISCLOSE RAW EXCEPTION", {"ok": False, "error": "cant_delete_message"},
+            )
+            user.chat_delete.side_effect = error
+        case "foreign_reply":
+            bot.conversations_replies.return_value["messages"][2]["user"] = "U_OTHER"
+        case "missing_token":
+            monkeypatch.setattr(slack, "_get_scoped_secret", lambda key: None)
+        case "wrong_token_team":
+            user.auth_test.return_value["team_id"] = "T_OTHER"
+        case "wrong_token_user":
+            user.auth_test.return_value["user_id"] = "U_OTHER"
+        case "fetch_error":
+            bot.conversations_replies.return_value = {"ok": False, "error": "missing_scope"}
 
     await adapter._handle_slack_message(event)
     await adapter._handle_slack_message({**event, "ts": "125.000001"})
