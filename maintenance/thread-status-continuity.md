@@ -1,0 +1,37 @@
+# Thread Status Continuity
+
+## Contract and Independent Hypothesis
+
+The native Slack assistant status belongs to a thread, not its DM channel.
+Typing refresh, pause, phrase updates and cleanup must use the same scope. A
+sibling thread finishing or waiting for input must not alter another thread.
+Intermediate delivery must retain the running thread's status. Final delivery,
+interruption and failure must still clear it.
+
+Source inspection on 2026-10-24 found chat-only `_typing_paused` and `_status_text`
+state in the shared adapter despite thread-scoped Slack status tracking. Final
+delivery pauses the whole chat, and tool callbacks overwrite the whole chat's
+phrase. Slack `send()` also clears status after every post, including interim
+posts, while `_keep_typing` sets it again on its next 2-second tick. These are
+separate, reproducible defects. The claim that Telegram's cadence hook changed
+Slack cadence is falsified by the existing base cadence regression: the base
+hook still returns False and the base interval remains 2 seconds.
+
+The repair belongs in shared typing scope resolution and its existing consumers,
+with Slack's persistent-status delivery behavior kept in its adapter. Tests must
+exercise 2 threads sharing a DM, a paused/finalizing sibling, distinct phrases,
+and intermediate delivery followed by another refresh. If those probes do not
+fail before the change, this hypothesis must be revised. UI animation caused by
+repeated identical API updates is a separate possibility, not established by
+source inspection alone.
+
+## Verification and Retirement
+
+Regression commands and results are recorded with the delivery commit. Preserve
+Telegram's topic re-arm isolation, its 4.5-second cadence and retry budget, Slack's
+legacy free-text API, elapsed heartbeat and explicit untracked-status cleanup.
+No configuration, dependency, schema or gateway activation change is needed.
+
+Remove the fork delta when released upstream provides equivalent per-thread
+ownership and intermediate-post continuity. Roll back by reverting this focused
+commit, without changing the separate Telegram cadence or Slack API patches.
