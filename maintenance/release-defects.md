@@ -720,6 +720,20 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- The classic gateway goal proxy reuses the completion-history renderer added by
+  autonomous goals. `/goal`, `/goal status` and `/goal show` remain local reads of
+  mirrored gateway state, with no judge call or state write. Without the binding,
+  status dispatch raised `AttributeError` before emitting any output while goal
+  continuations kept running. Regression coverage exercises all 3 read spellings
+  and verifies completion-refusal history, unchanged state and no gateway call.
+  The existing Linux/tmux goal-status expectation and timeout remain unchanged.
+  Linux Python 3.14.9 with the selected test environment and tmux required:
+  old proxy reproduces the live timeout and 3 new read-command failures, then
+  gateway automation, classic live chat, autonomy and goal dispatch pass 146 tests.
+  Upstream preflight: guidance at `930e5ed557ed` and related goal-status issues
+  preserve visible status reads. This is a fork #800 adapter omission, not a
+  routing or pacing change, so the existing proxy read path remains the owner.
+
 - The serve maintenance test waits for the completed consolidation-off summary,
   not the early run-count checkpoint plus a fixed delay. Linux reproduction
   delayed report writing after the checkpoint and observed the final summary in

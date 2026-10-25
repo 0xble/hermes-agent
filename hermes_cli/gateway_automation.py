@@ -103,6 +103,7 @@ class GatewayGoalManager(_Remote):
     next_continuation_prompt = _Local.next_continuation_prompt
     is_parked = _Local.is_parked
     render_removable_items = _Local.render_removable_items
+    render_completion_history = _Local.render_completion_history
     del _Local
 
     def resume_for_user_input(self):

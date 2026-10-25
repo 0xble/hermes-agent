@@ -51,6 +51,28 @@ def test_goal_manager_is_the_gateways(cli):
     assert cli.cli._get_goal_manager() is mgr  # cached per session id, like main
 
 
+@pytest.mark.parametrize('command', ['', 'status', 'show'])
+def test_goal_status_renders_gateway_completion_history_without_mutation(cli, command):
+    from hermes_cli.gateway_automation import dispatch_goal_command
+    from hermes_cli.goals import GoalState
+
+    state = GoalState(goal='ship the cache', status='active', revisions=[{
+        'kind': 'complete_refused', 'reason': 'missing passing cache tests',
+    }])
+    cli.db.set_meta('goal:sid-1', state.to_json())
+    mgr = cli.cli._get_goal_manager()
+    before = cli.db.get_meta('goal:sid-1')
+    calls = list(cli.conn.calls)
+
+    result = dispatch_goal_command(mgr, command, authorize_gate=lambda: None)
+
+    assert 'Goal (active,' in result.output
+    assert 'Completion refused: missing passing cache tests' in result.output
+    assert result.prompt is None and not result.error
+    assert cli.conn.calls == calls
+    assert cli.db.get_meta('goal:sid-1') == before
+
+
 def test_no_manager_before_the_gateway_session_is_open(cli):
     cli.cli._gateway_session_open = False
     assert cli.cli._get_goal_manager() is None and cli.conn.calls == []
