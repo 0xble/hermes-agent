@@ -1,7 +1,7 @@
 """Failed updates explain the cause without claiming unproved runtime changes."""
 import json
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -138,6 +138,58 @@ def test_fetch_failure_proves_unchanged_only_before_source_cleanup(
     else:
         assert git(source, "diff") == before
         assert detail == f"Nothing changed. Still on {sha[:12]}. Cause: fetch_failed"
+
+
+def test_git_fallback_recovery_invalidates_earlier_unchanged_proof(update_tree, tmp_path, monkeypatch):
+    from hermes_cli import update_cmd, update_receipt
+    from hermes_cli._early_recovery_zip import write_zip_swap_journal, zip_entry_identity
+    from tests.hermes_cli.test_update_target_identity import git
+
+    source = update_tree.clone
+    git(source, "checkout", "-q", "main")
+    sha = git(source, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    request = pending(home, reason=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_receipt, "_receipt_dir", lambda: home / "logs/update_receipts")
+    monkeypatch.setattr(update_receipt, "_code_identity", lambda **_: {"sha": git(source, "rev-parse", "HEAD")})
+    monkeypatch.setattr("gateway.update_notifications.__file__", str(source / "gateway/update_notifications.py"))
+    update_tree.args.channel = "main"
+    before = (source / "content.txt").read_text()
+
+    def fail_git(*_a, **_kw):
+        # A previous swap's installed bytes happen to match HEAD. Its backup does not.
+        backup = source / "content.txt.hermes-update-old"
+        backup.write_text("source before interrupted swap\n")
+        write_zip_swap_journal(source, "swapping", [[
+            "content.txt", True, zip_entry_identity(source / "content.txt"), zip_entry_identity(backup),
+        ]], "0123456789ab")
+        raise subprocess.CalledProcessError(1, ["git", "status"])
+
+    monkeypatch.setattr(update_cmd._check, "report_pack_tidy", fail_git)
+    monkeypatch.setattr(update_cmd, "_should_zip_fallback_on_update_error", lambda _: True)
+    with update_receipt.update_receipt_scope():
+        with pytest.raises(SystemExit) as exc:
+            update_cmd._cmd_update_impl(update_tree.args, gateway_mode=False)
+        assert exc.value.code == 1
+        path = update_receipt.finalize_update_receipt("failed", stop_reason="sys.exit(1)")
+    assert path is not None
+    receipt = json.loads(path.read_text())
+    assert receipt["pre_update"]["sha"] == receipt["post_update"]["sha"] == sha
+    assert receipt["stop_class"] == "local_changes_blocked"
+    steps = {step["name"]: step for step in receipt["steps"]}
+    assert steps["local_changes_stash"]["ok"] is True
+    assert steps["local_changes_stash"]["detail"].startswith("not_needed: ")
+    assert steps["zip_source_swap"]["ok"] is False
+    assert "interrupted ZIP swap recovery" in steps["zip_source_swap"]["detail"]
+    assert (source / "content.txt").read_text() != before
+    assert (source / "content.txt").read_text() == "source before interrupted swap\n"
+    (home / ".update_process_exit_code").write_text("1")
+    success, detail = final_outcome(home, request)
+    assert success is False
+    assert "Nothing changed" not in detail
+    assert "Runtime state is unverified" in detail
 
 
 @pytest.mark.parametrize("failure", ["direct-zip", "fallback-zip", "refusal", "branch-name"])
@@ -357,7 +409,7 @@ def test_failed_exit_never_claims_unchanged_without_current_receipt_proof(tmp_pa
             receipt["steps"] = []
         elif case == "stale":
             receipt["started_at"] = receipt["finished_at"] = (
-                datetime.now(timezone.utc) - timedelta(days=1)
+                datetime.now(UTC) - timedelta(days=1)
             ).isoformat()
         elif case == "bad_timestamp":
             receipt["finished_at"] = "not a timestamp"
@@ -392,6 +444,20 @@ def test_failed_exit_never_claims_unchanged_without_current_receipt_proof(tmp_pa
     assert "Nothing changed" not in detail and "Still on" not in detail
     if case in {"changed", "missing_sha", "restart", "fleet", "transition", "release_pending", "fleet_pending"}:
         assert "Cause: candidate plugin smoke failed on plugin rea." in detail
+
+
+def test_failed_update_without_a_source_checkout_keeps_state_unverified(tmp_path, notification_checkout):
+    # ZIP/non-git installs cannot prove the absence of source-keyed recovery debt.
+    (notification_checkout / ".git").unlink()
+    request = pending(tmp_path, reason=False)
+    finalize_update(tmp_path, outcome="failed", noop=True)
+    (tmp_path / ".update_process_exit_code").write_text("1")
+
+    success, detail = final_outcome(tmp_path, request)
+
+    assert success is False
+    assert "Nothing changed" not in detail
+    assert "Runtime state is unverified" in detail
 
 
 @pytest.mark.parametrize("stop_class, expected", [
