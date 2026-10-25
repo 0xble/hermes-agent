@@ -1852,8 +1852,13 @@ class TurnRunner(TaskCardProgressMixin):
             if persist_id is not None:
                 kwargs["persist_user_platform_id"] = str(persist_id)
             from agent.notification_presentation import notification_turn
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx):
-                return agent.run_conversation(api_message, **kwargs)
+            from gateway.session_context import (
+                current_message_reaction_acknowledged, reaction_acknowledgement, scoped_turn_message,
+            )
+            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx), scoped_turn_message(ctx.source, ctx.inbound_message_id or ctx.source.message_id), reaction_acknowledgement():
+                result = agent.run_conversation(api_message, **kwargs)
+                result["acknowledged_by_reaction"] = current_message_reaction_acknowledged()
+                return result
         finally:
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
@@ -2121,6 +2126,7 @@ class TurnRunner(TaskCardProgressMixin):
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "recovered_reply": result.get("recovered_reply", False),
+            "acknowledged_by_reaction": result.get("acknowledged_by_reaction", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
             **usage,

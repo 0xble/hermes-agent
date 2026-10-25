@@ -8917,14 +8917,20 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         if not self._bot:
             return False
         try:
-            await self._bot.set_message_reaction(chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reaction=emoji)
-            return True
+            return bool(await self._bot.set_message_reaction(
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reaction=emoji))
         except Exception as e:
             if emoji is None:
                 logger.debug("[%s] clear reactions failed: %s", self.name, _redact_telegram_error_text(e))
             else:
                 logger.debug("[%s] set_message_reaction failed (%s): %s", self.name, emoji, _redact_telegram_error_text(e))
             return False
+
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        from telegram.constants import ReactionEmoji
+        if emoji not in {item.value for item in ReactionEmoji}:
+            return False
+        return await self._set_reaction(chat_id, message_id, emoji)
 
     async def _clear_reactions(self, chat_id: str, message_id: str) -> bool:
         """Clear all bot-set reactions."""
