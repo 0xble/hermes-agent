@@ -213,6 +213,8 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
 
     project_data = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8-sig"))
     groups = project_data["project"].get("optional-dependencies", {})
+    if not groups:
+        return []
     installed = set(_active_distributions(source_python))
     declared: dict[str, set[str]] = {}
     for extra, requirements in groups.items():
@@ -332,12 +334,19 @@ def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv
 def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv",
                  source: Path | None = None, source_python: Path | None = None) -> tuple[Path, str]:
     """Build at the final release path: venv scripts and metadata are not relocatable."""
+    extras: set[str] = set()
     if source is not None:
         source_python = source_python or _source_install_python(source)
-        extras = _active_locked_extras(source_python, release)
-    else:
-        extras = []
-    _build_venv(release, uv=uv, extras=extras, python=source_python)
+        extras.update(_active_locked_extras(source_python, release))
+    if previous is not None:
+        # The source interpreter is frozen at first migration. Extras added since
+        # (`hermes pm install --extra`, lazy installs) live only in the active
+        # release's committed PM environment, so carry those forward as well.
+        from pm.environments import project_python
+        previous_python = project_python(previous)
+        if previous_python.is_file():
+            extras.update(_active_locked_extras(previous_python, release))
+    _build_venv(release, uv=uv, extras=sorted(extras), python=source_python)
     if source is not None:
         restore_active_distributions(source, release, uv=uv, source_python=source_python)
     return release / ".venv", "built"
