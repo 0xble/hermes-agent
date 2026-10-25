@@ -6,9 +6,9 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v0.22.2`, `d923a5eb487a17c0a68801bba9ef0f56c81040a8`.
-The prior baseline `v0.22.0` (`e06df9c2eae6901f4c88f464e0ae6e753c0428b8`)
-remains an ancestor. The earlier `v0.21.6` baseline
+`v0.22.5`, `bf0203a794a07aac3ff764972ab9087baa4e4f4e`.
+The prior baselines `v0.22.2` (`d923a5eb487a17c0a68801bba9ef0f56c81040a8`) and
+`v0.22.0` (`e06df9c2eae6901f4c88f464e0ae6e753c0428b8`) remain ancestors. The earlier `v0.21.6` baseline
 (`818c13be1dc4fd28987e1e881a9408224afd4535`) also remains an ancestor.
 Brian waived only the 24-hour release-age wait for `v0.21.6` on 2026-10-08;
 every other sync gate applied. The earlier baseline,
