@@ -65,6 +65,17 @@ def _compact(db, physical, mode):
 
 
 @pytest.mark.asyncio
+async def test_resume_restores_local_history_without_blocking_the_owner_loop(tmp_path, monkeypatch):
+    import hermes_loop_guard
+    authority, actor, ref, physical = await _local_session(tmp_path, monkeypatch)
+    _append(authority.db, physical, 'QUESTION', 'ANSWER')
+    monkeypatch.setattr(hermes_loop_guard, '_loop_thread', threading.get_ident())
+    rows = (await _resume(authority, actor, ref))['messages']
+    assert [row['content'] for row in rows] == ['QUESTION', 'ANSWER']
+    assert [row['row_id'] for row in rows] == [row['id'] for row in authority.db.get_messages(physical)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('mode', ['in_place', 'rotated'])
 async def test_resume_shows_the_turns_a_compression_archived(tmp_path, monkeypatch, mode):
     authority, actor, ref, physical = await _local_session(tmp_path, monkeypatch)

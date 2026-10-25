@@ -720,6 +720,14 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- Local history preparation offloads receipt restoration and its guarded session-store lock.
+  The synchronous snapshot re-reads the receipt target without repeating restoration under the
+  viewer event lock, preserving live-row and deletion races. History, side-question and preview
+  RPCs likewise resolve their target off-loop. The loop-thread guard stays unchanged.
+  Guards: local recovery, compression resume, display-history race coverage, canonical history
+  and fresh CLI first-message suites (26 passed, 13 platform skips), including a guarded-loop
+  attach regression. Hosted qualification remains required.
+
 - Fork patch identity: `v0225-merge-integration`.
 - Merging upstream `v0.22.5`, current fork main and the installed display-fold fix (#765) left five bindings that Git merged cleanly but that no longer resolved. Exact-head CI caught them on the first hosted run.
   - `gateway/run_inbound.py` kept the fork's `metadata=_UNSET` default on `_transcribe_and_echo_pending_voice` but lost the `from gateway.run_common import _UNSET` import that upstream's side never had. Every `gateway.run` import raised `NameError`, which accounted for most failures in the first run.

@@ -202,7 +202,7 @@ async def btw(connection, ref, params):
     agent = authority.agent(ref)
     snapshot = list(getattr(agent, '_session_messages', None) or [])
     from gateway.session_local_recovery import transcript_target
-    target = None if snapshot else transcript_target(authority, ref)
+    target = None if snapshot else await asyncio.to_thread(transcript_target, authority, ref)
 
     handle = _SideQuestionStop()
 
@@ -259,7 +259,7 @@ async def preview_restart(connection, ref, params):
     authority = connection.authority
     cwd, context = (str(params.get(key) or '').strip() for key in ('cwd', 'context'))
     from gateway.session_local_recovery import transcript_target
-    target = transcript_target(authority, ref)
+    target = await asyncio.to_thread(transcript_target, authority, ref)
     holder = [None]
 
     def progress(text):

@@ -123,8 +123,8 @@ async def session_history(connection, ref, params):
     _live_ref(connection, ref, params, {'session_id', 'profile'}, 'session:read')
     authority = connection.authority
     from gateway.session_local_recovery import transcript_target
-    # On the loop, as ``attach`` resolves it: a local restore publishes the live entry.
-    target = transcript_target(authority, ref)
+    # Authorization restored the live entry; receipt validation and store locking stay off-loop.
+    target = await asyncio.to_thread(transcript_target, authority, ref)
 
     def read():
         from gateway.session_controls import display_projection

@@ -252,6 +252,13 @@ def transcript_target(authority, ref):
     live = authority.sessions[ref.session_id]
     if live.source is not None and live.source.platform == Platform.LOCAL:
         restore_local_session(authority, ref.session_id)
+    return _history_target(authority, ref)
+
+
+def _history_target(authority, ref):
+    """Read the current target without repeating restoration under a viewer's event lock."""
+    live = authority.sessions[ref.session_id]
+    if live.source is not None and live.source.platform == Platform.LOCAL:
         return local_receipt(authority.db, ref.session_id)['entry']['session_id']
     return authority.physical_target(ref)
 
@@ -298,7 +305,7 @@ def _fit_archive(live_rows, display):
 
 async def prepare_history(authority, ref):
     """``local_history``'s lineage read, off the owner loop; the locked part re-reads only the live tip."""
-    target = transcript_target(authority, ref)
+    target = await asyncio.to_thread(transcript_target, authority, ref)
     return target, await asyncio.to_thread(display_rows, authority.db, target)
 
 
@@ -345,7 +352,7 @@ def local_history(authority, ref, prepared=None):
     (``display_rows``), the first row carries ``archived_truncated: true``.
     """
     db = authority.db
-    target = transcript_target(authority, ref)
+    target = _history_target(authority, ref) if prepared is not None else transcript_target(authority, ref)
     read_live, display, truncated = (prepared[1] if prepared is not None and prepared[0] == target
                                      else display_rows(db, target))
     live = db.get_messages_as_conversation(target, include_row_ids=True)
