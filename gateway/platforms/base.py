@@ -5688,15 +5688,17 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def truncate_message(content: str, max_length: int = 4096,
-                         len_fn: Optional[Callable[[str], int]] = None) -> list[str]:
+                         len_fn: Optional[Callable[[str], int]] = None, *,
+                         indicator_overhead: int = 0) -> list[str]:
         """Split a long message into chunks preserving code blocks: a split inside a fence closes it
         at the chunk end and reopens it (same language tag) in the next; multi-chunk output gets
-        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram)."""
+        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram).
+        ``indicator_overhead`` reserves additional length units for caller-side suffix encoding."""
         _len = len_fn or len
         if _len(content) <= max_length:
             return [content]
         # Every split consumes a source codepoint, so len(content) bounds both indicator numbers.
-        INDICATOR_RESERVE = _len(fr" \({len(content)}/{len(content)}\)" + "\n")
+        INDICATOR_RESERVE = _len(f" ({len(content)}/{len(content)})") + indicator_overhead
         FENCE_CLOSE = "\n```"
         chunks: list[str] = []
         remaining = content
