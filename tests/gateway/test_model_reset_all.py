@@ -269,7 +269,7 @@ def test_turn_release_drains_pending_bulk_reset():
     runner._bulk_reset_pending_sessions = {"running"}
     runner._persist_active_agents = Mock()
     runner._is_session_run_current = lambda *_args: True
-    turn = SimpleNamespace(lease=None, clear=Mock())
+    turn = SimpleNamespace(lease=None, retired_agents=[], clear=Mock())
     runner._peek_session_state = lambda _key: SimpleNamespace(turn=turn)
 
     assert runner._release_running_agent_state("running") is True

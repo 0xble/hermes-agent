@@ -720,6 +720,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- Integration fixtures supply the actual memory warning sink and retired-agent turn state.
+  The 1Password service-account stub returns the exact revealed JSON item, preserving vault
+  identity and purpose-selected password validation. Drain assertions follow upstream background
+  delegation wording, including the worker PID, while retaining both fork timeout knobs.
+  Guards: synthetic prompt, vault backends, drain report and model reset suites (1,410 passed).
+
 - Local history preparation offloads receipt restoration and its guarded session-store lock.
   The synchronous snapshot re-reads the receipt target without repeating restoration under the
   viewer event lock, preserving live-row and deletion races. History, side-question and preview

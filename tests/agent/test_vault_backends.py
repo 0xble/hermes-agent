@@ -248,11 +248,13 @@ if argv[:2] == ["item", "get"]:
         sys.stderr.write("a vault query must be provided when this command is called by a service account\n"); sys.exit(1)
     if "item-c" in argv:  # a revoked/garbled token: op's own wording mentions a session
         sys.stderr.write("error initializing client: Validation: (failed to session.DecodeSACredentials)\n"); sys.exit(1)
-    if "--format" in argv:  # metadata-only read: the item's verified vault, never a secret
+    if "--format" in argv:  # metadata read, or the exact authorized item's revealed JSON
         i = argv[2]
         print(json.dumps({"id": i, "title": i, "category": "LOGIN", "state": "ACTIVE",
                           "vault": {"id": argv[argv.index("--vault") + 1]},
-                          "urls": [{"href": "https://example.com/login"}]})); sys.exit(0)
+                          "urls": [{"href": "https://example.com/login"}],
+                          "fields": [{"purpose": "PASSWORD", "value": "dummy-password"}]
+                                    if "--reveal" in argv else []})); sys.exit(0)
     print("123456" if "--otp" in argv else "dummy-password"); sys.exit(0)
 sys.exit(2)
 '''
@@ -284,7 +286,7 @@ def test_onepassword_service_account_reads_name_the_items_own_vault(fake_op_serv
     assert new_backend().resolve_otp("op:item-a") == "123456"  # the display listing is reused, not re-run
     calls = [a[:2] if a[:2] == ["item", "list"] else a for a in map(json.loads, log.read_text(encoding="utf-8-sig").splitlines())]
     assert calls == [["item", "list"], ["item", "get", "item-b", "--vault", "vault-b", "--format", "json"],
-                     ["item", "get", "item-b", "--vault", "vault-b", "--fields", "label=password", "--reveal"],
+                     ["item", "get", "item-b", "--vault", "vault-b", "--format", "json", "--reveal"],
                      ["item", "get", "item-a", "--vault", "vault-a", "--format", "json"],
                      ["item", "get", "item-a", "--vault", "vault-a", "--otp"]]
 
