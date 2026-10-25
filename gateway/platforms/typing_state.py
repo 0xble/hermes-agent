@@ -41,6 +41,29 @@ def typing_metadata_for_event(event):
     return typing_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
 
+def pause_typing_for_prompt(adapter, session_key, chat_id, metadata=None):
+    """Remember the turn's refresh surface before an answer can arrive on another route."""
+    adapter.__dict__.setdefault("_typing_prompt_surfaces", {})[session_key] = (
+        chat_id, dict(metadata) if metadata is not None else None,
+    )
+    call_typing_with_metadata(adapter.pause_typing_for_chat, chat_id, metadata=metadata)
+
+
+def resume_typing_after_prompt(adapter, session_key, chat_id, metadata=None):
+    surfaces = adapter.__dict__.get("_typing_prompt_surfaces", {})
+    chat_id, metadata = surfaces.pop(session_key, (chat_id, metadata))
+    call_typing_with_metadata(adapter.resume_typing_for_chat, chat_id, metadata=metadata)
+
+
+def forget_typing_prompt_surface(adapter, chat_id, metadata=None):
+    """Turn teardown owns abandoned prompts, including timeout and cancellation."""
+    scope = adapter._typing_scope_key(chat_id, metadata)
+    surfaces = adapter.__dict__.get("_typing_prompt_surfaces", {})
+    for session_key, (original_chat, original_metadata) in list(surfaces.items()):
+        if adapter._typing_scope_key(original_chat, original_metadata) == scope:
+            surfaces.pop(session_key, None)
+
+
 class TypingStateMixin:
     def _typing_scope_key(self, chat_id: str, metadata: Optional[dict[str, Any]] = None):
         """Adapters may refine the surface identity (for example, a workspace)."""

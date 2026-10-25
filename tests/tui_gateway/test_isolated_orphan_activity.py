@@ -254,7 +254,9 @@ def _run_child(mode, directory):
 
     def init(sid, key, agent, history, **kwargs):
         s = _session(sid)
-        s.update(agent=agent, running=False, transport=None,
+        # Preserve the workspace forwarded by the real host. Dropping it makes
+        # unrelated session-info probes inspect the checkout's launch directory.
+        s.update(agent=agent, running=False, transport=None, cwd=kwargs["cwd"],
                  image_counter=0, slash_worker=None, show_reasoning=False,
                  tool_progress_mode="all")
         server._sessions[sid] = s
