@@ -63,7 +63,7 @@ def test_idle_hook_reads_external_goal_writes(hermes_home, monkeypatch, autonomy
             cached.wait_for_seconds(120)
     # A registered tool uses its own native manager, not the CLI's cached one.
     writer = goals.GoalManager(cli.session_id)
-    if writer.has_goal():
+    if writer.has_goal() and autonomy:
         assert writer.revise(goal="tool-authored goal", reason="tool update")["ok"]
     else:
         writer.set("tool-authored goal")
