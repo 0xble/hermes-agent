@@ -109,3 +109,9 @@ Guard: `tests/hermes_cli/test_web_server_cron_profiles.py`.
 JS/TS and bootstrap-installer checks also use standard hosted runners. Their
 large-runner labels inherited from upstream are unavailable to this fork. All
 existing commands and acceptance checks remain in both jobs.
+
+The desktop Local Models pane fixture must return the jobs seeded by each test
+from its backend poll mock. Returning an empty registry erased the running
+quickstart job when a poll from the preceding test fired. The unchanged progress,
+setup-button, download, and completion-navigation assertions remain the guard in
+`apps/desktop/src/app/settings/local-models-settings.test.tsx`.
