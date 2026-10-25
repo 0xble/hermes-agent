@@ -559,3 +559,17 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   trailer, while retaining a legacy fallback for old logs.
 - Guard: `tests/hermes_cli/test_kanban_worker_exit_trailer.py`
   (`test_logged_exit_code_matches_worker_pid_across_appended_retries`).
+
+## Catalog Entry Hides Plugin Credentials
+
+- Fork patch identity: `meridian-provider-credentials`.
+- Deploy-base repair for [PR #791](https://github.com/0xble/hermes-agent/pull/791).
+  Once models.dev listed CommandCode, `get_provider` returned its `CMD_API_KEY`
+  catalog entry before consulting the registered plugin's `COMMANDCODE_API_KEY`.
+  Model switches therefore stopped recognizing the credential Hermes setup uses.
+- Merge credential names from the catalog, registered profile and overlay without
+  treating URL variables as credentials or changing endpoint/transport precedence.
+- Guard: `tests/hermes_cli/test_provider_catalog_credentials.py` exercises real
+  plugin discovery against absent and alternate catalog credentials. The existing
+  `tests/plugins/model_providers/test_commandcode_profile.py` assertion stays intact.
+- Retire when upstream provider resolution preserves the same credential union.
