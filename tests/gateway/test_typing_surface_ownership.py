@@ -68,6 +68,19 @@ def test_normal_scope_metadata_agrees(platform, chat_type, thread_id):
     _, _, status = runner._run_agent_progress_threading(source, event.message_id, False)
     assert a._typing_scope_key(source.chat_id, initial) == a._typing_scope_key(source.chat_id, status)
 
+def test_slack_status_keeps_turn_scoped_recipient_identity():
+    a = slack_fixture.__wrapped__()
+    source = SessionSource(platform=Platform.SLACK, chat_id="C123", thread_id="171.1",
+                           scope_id="T1", user_id="U1")
+    runner = object.__new__(GatewayRunner)
+    runner._delivery_adapter_for = lambda source: a
+    _, _, status = runner._run_agent_progress_threading(source, "171.2", True)
+    assert status["user_id"] == "U1"
+    assert status["scope_id"] == status["slack_team_id"] == "T1"
+    event = MessageEvent(text="test", source=source, message_id="171.2")
+    assert a._typing_scope_key("C123", status) == a._typing_scope_key("C123", _thread_metadata_for_event(event))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reply_in_thread", [True, False])
 async def test_top_level_slack_without_thread_sessions_uses_same_scope(reply_in_thread):
