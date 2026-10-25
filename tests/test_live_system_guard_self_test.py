@@ -352,6 +352,46 @@ def test_signal_guard_keeps_owned_orphan_identity(request, primitive):
 
 
 @pytest.mark.platforms("posix")
+def test_signal_guard_owns_orphans_in_a_live_owned_session(request):
+    """A shell can orphan helpers itself, before Python ever sends a signal."""
+    import psutil
+
+    script = (
+        "import os,sys\n"
+        "middle = os.fork()\n"
+        "if middle == 0:\n"
+        " if os.fork() != 0: os._exit(0)\n"
+        " print(os.getpid(), flush=True)\n"
+        "else:\n"
+        " os.waitpid(middle, 0)\n"
+        " print('ready', flush=True)\n"
+        "sys.stdin.buffer.read()\n"
+    )
+    with _record_signal_delivery(request, deliver=True) as (_, killpg), subprocess.Popen(
+        [sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        start_new_session=True, text=True,
+    ) as leader:
+        assert leader.stdin is not None and leader.stdout is not None
+        lines = {leader.stdout.readline().strip(), leader.stdout.readline().strip()}
+        assert "ready" in lines
+        helper = psutil.Process(int((lines - {"ready"}).pop()))
+        try:
+            assert leader.poll() is None
+            assert all(parent.pid != os.getpid() for parent in helper.parents())
+            assert os.getsid(helper.pid) == os.getsid(leader.pid) == leader.pid
+            assert os.getpgid(helper.pid) == leader.pid
+            os.killpg(leader.pid, signal.SIGKILL)
+            assert killpg is not None
+            killpg.assert_called_once_with(leader.pid, signal.SIGKILL)
+            assert leader.wait(timeout=5) == -signal.SIGKILL
+            assert leader.stdout.read() == ""
+        finally:
+            leader.stdin.close()  # EOF releases both processes even if the guard refuses.
+            leader.wait(timeout=5)
+            leader.stdout.close()
+
+
+@pytest.mark.platforms("posix")
 @pytest.mark.parametrize("state", ["owned", "recycled", "unverifiable", "foreign", "mixed"])
 @pytest.mark.parametrize("leader_exited", [False, True])
 def test_signal_guard_rechecks_group_members(request, monkeypatch, state, leader_exited):
@@ -402,6 +442,114 @@ def test_signal_guard_rechecks_group_members(request, monkeypatch, state, leader
         else:
             with pytest.raises(RuntimeError, match="live-system guard"):
                 os.killpg(leader_pid, signal.SIGKILL)
+            killpg.assert_not_called()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("state", [
+    "owned", "foreign_session", "older_member", "recycled_member", "recycled_leader",
+    "unverifiable_member", "unverifiable_session", "changed_session", "leader_gone",
+    "cached_stale_member", "not_session_leader", "changed_leader_session", "changed_leader_identity",
+    "changed_group",
+])
+def test_signal_guard_requires_verified_session_provenance(request, monkeypatch, state):
+    """Group membership alone never authorizes an otherwise unowned process."""
+    import psutil
+
+    pgid = 987654321
+    leader = Mock(pid=pgid)
+    leader.create_time.return_value = 10.0
+    leader.children.return_value = []
+    leader.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
+    member = Mock(pid=pgid + 1)
+    member.create_time.return_value = 11.0
+    member.parents.return_value = []
+    owner = Mock()
+    owner.children.return_value = [leader, member] if state == "cached_stale_member" else [leader]
+    monkeypatch.setattr(psutil, "Process", lambda pid: {
+        os.getpid(): owner, pgid: leader, member.pid: member,
+    }[pid])
+    monkeypatch.setattr(psutil, "pids", lambda: [member.pid, pgid])
+    monkeypatch.setattr(os, "getpgid", lambda pid: pgid)
+    getsid = Mock(return_value=pgid)
+    monkeypatch.setattr(os, "getsid", getsid)
+
+    def foreign_session():
+        getsid.side_effect = lambda pid: pgid + 2 if pid == member.pid else pgid
+
+    def older_member():
+        member.create_time.return_value = 9.0
+
+    def recycled_member():
+        # psutil caches create_time on a handle. Only a fresh lookup sees
+        # the replacement, so re-reading the original handle is unsafe.
+        replacement = Mock(pid=member.pid)
+        replacement.create_time.return_value = 12.0
+        member_handles = iter([member, member, replacement])
+        lookup = psutil.Process
+        monkeypatch.setattr(psutil, "Process", lambda pid: (
+            next(member_handles) if pid == member.pid else lookup(pid)
+        ))
+
+    def recycled_leader():
+        leader.create_time.return_value = 12.0
+
+    def unverifiable_member():
+        member.create_time.side_effect = psutil.AccessDenied(member.pid)
+
+    def unverifiable_session():
+        getsid.side_effect = PermissionError()
+
+    def changed_session():
+        member_sessions = iter([pgid, pgid + 2])
+        getsid.side_effect = lambda pid: next(member_sessions) if pid == member.pid else pgid
+
+    def leader_gone():
+        leader.create_time.side_effect = psutil.NoSuchProcess(pgid)
+
+    def cached_stale_member():
+        member.create_time.return_value = 12.0
+
+    def not_session_leader():
+        getsid.side_effect = lambda pid: pgid + 2 if pid == pgid else pgid
+
+    def changed_leader_session():
+        leader_sessions = iter([pgid, pgid + 2])
+        getsid.side_effect = lambda pid: next(leader_sessions) if pid == pgid else pgid
+
+    def changed_leader_identity():
+        leader.create_time.side_effect = [10.0, 10.0, 10.0, 12.0]
+
+    def changed_group():
+        member_groups = iter([pgid, pgid + 2])
+        monkeypatch.setattr(os, "getpgid", lambda pid: next(member_groups))
+
+    arrange = {
+        "owned": lambda: None,
+        "foreign_session": foreign_session,
+        "older_member": older_member,
+        "recycled_member": recycled_member,
+        "recycled_leader": recycled_leader,
+        "unverifiable_member": unverifiable_member,
+        "unverifiable_session": unverifiable_session,
+        "changed_session": changed_session,
+        "leader_gone": leader_gone,
+        "cached_stale_member": cached_stale_member,
+        "not_session_leader": not_session_leader,
+        "changed_leader_session": changed_leader_session,
+        "changed_leader_identity": changed_leader_identity,
+        "changed_group": changed_group,
+    }
+
+    with _record_signal_delivery(request) as (_, killpg):
+        arrange[state]()
+        assert killpg is not None
+        if state == "owned":
+            os.killpg(pgid, signal.SIGKILL)
+            killpg.assert_called_once_with(pgid, signal.SIGKILL)
+        else:
+            with pytest.raises(RuntimeError, match="live-system guard"):
+                os.killpg(pgid, signal.SIGKILL)
             killpg.assert_not_called()
 
 

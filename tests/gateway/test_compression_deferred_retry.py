@@ -52,15 +52,6 @@ async def test_hygiene_turnhold_retries_inputs_after_commit(monkeypatch, tmp_pat
                 db.release_compression_lock(sid, "hygiene-worker")
 
     runner, adapter, first = _make_cooldown_runner(monkeypatch, tmp_path, Compressor, db, sid)
-    wait_for_summary = runner._hmwa_hygiene_wait_for_summary
-
-    async def wait_after_watermark(*args):
-        # This fixture exercises retained admission, not late-admission cancellation.
-        # Admit the stub before the real waiter can expire its 0.01s turn budget.
-        assert await asyncio.to_thread(started.wait, 5), "hygiene worker did not mark its watermark"
-        return await wait_for_summary(*args)
-
-    monkeypatch.setattr(runner, "_hmwa_hygiene_wait_for_summary", wait_after_watermark)
     key = runner.session_store.get_or_create_session.return_value.session_key
     monkeypatch.setattr(runner, "_lookup_session_id_under_store_lock", lambda *_: sid)
     runner._run_post_turn_hooks = AsyncMock()

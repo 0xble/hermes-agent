@@ -145,6 +145,36 @@ def _live_system_guard(request, monkeypatch):
             except ProcessLookupError:
                 continue
 
+    def _is_owned_session_member(pid: int, pgid: int) -> bool:
+        # An orphan may lose its Python ancestry before our first signal. A
+        # process cannot join an existing POSIX session, so a still-live owned
+        # session leader also proves the origin of its younger session members.
+        # Never override a rejected cached identity with this alternate proof.
+        if _psutil is None or pid in _owned_processes:
+            return False
+        try:
+            member = _psutil.Process(pid)
+            identity = member.create_time()
+            if _os.getsid(pid) != pgid or _os.getsid(pgid) != pgid:
+                return False
+            if not _is_own_subtree(pgid):
+                return False
+            leader_identity = _owned_processes[pgid]
+            if identity < leader_identity:
+                return False
+            # Use fresh psutil handles, since create_time caches per instance.
+            # A stale/recycled leader or a moving member cannot confer ownership.
+            if (_psutil.Process(pgid).create_time() != leader_identity
+                    or _psutil.Process(pid).create_time() != identity
+                    or _os.getsid(pgid) != pgid
+                    or _os.getsid(pid) != pgid
+                    or _os.getpgid(pid) != pgid):
+                return False
+            _owned_processes[pid] = identity
+            return True
+        except (OSError, _psutil.Error):
+            return False
+
     def _group_is_owned(pgid: int) -> bool:
         # Neither an owned leader nor an absent leader proves group ownership.
         # Every surviving member needs its own verified process identity.
@@ -156,7 +186,8 @@ def _live_system_guard(request, monkeypatch):
                 try:
                     if _os.getpgid(pid) != pgid:
                         continue
-                    if not _is_own_subtree(pid):
+                    if not (_is_own_subtree(pid)
+                            or _is_owned_session_member(pid, pgid)):
                         return False
                     found = True
                 except ProcessLookupError:
