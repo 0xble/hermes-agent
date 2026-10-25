@@ -2020,7 +2020,13 @@ class SlackAdapter(BasePlatformAdapter):
         just guarantees it runs without letting a cleanup error mask the caller's SendResult.
         """
         try:
-            await self.stop_typing(chat_id, metadata=metadata)
+            md = metadata or {}
+            # Slack clears status when a bot posts. An intermediate post must restore the
+            # running surface immediately, not leave it blank until the next 2s refresh.
+            if self._typing_is_active(chat_id, metadata) and not md.get("notify"):
+                await self.send_typing(chat_id, metadata=metadata)
+            elif not (md.get("_interim_send") or md.get("expect_edits")):
+                await self.stop_typing(chat_id, metadata=metadata)
         except Exception as e:  # pragma: no cover - defensive cleanup
             logger.debug("[Slack] status cleanup failed: %s", e)
 
@@ -2125,6 +2131,29 @@ class SlackAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=f"{type(exc).__name__}: {exc}",
                                   retryable=retryable and not held, held=held,
                                   retry_after=self._retry_after_from_exc(exc) if retryable else None)
+
+    async def _start_native_task_card_stream(
+        self, client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
+    ) -> None:
+        """chat.startStream a plan-mode card in ``stream``'s thread; sets ``stream.stream_ts``."""
+        start_payload: dict[str, Any] = {
+            "channel": stream.channel, "thread_ts": stream.thread_ts,
+            "task_display_mode": "plan"}
+        md = metadata or {}
+        recipients = (
+            ("recipient_team_id", ("recipient_team_id", "team_id", "slack_team_id")),
+            ("recipient_user_id", ("recipient_user_id", "user_id")))
+        for key, sources in recipients:
+            value = _first_truthy(md, sources)
+            if value:
+                start_payload[key] = value
+        result = await client.api_call("chat.startStream", json=start_payload)
+        if hasattr(result, "get"):
+            stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
+        if not stream.stream_ts:
+            raise RuntimeError("Slack startStream returned no stream timestamp")
+        if self._typing_is_active(stream.channel, metadata):
+            await self.send_typing(stream.channel, metadata=metadata)
 
     @staticmethod
     def _task_update_chunk(task: dict[str, str]) -> dict[str, Any]:
@@ -2231,9 +2260,8 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             from .message_delivery import post_chunks
             last_result = await post_chunks(self, chat_id, team_id, content, formatted, thread_ts, metadata)
-            # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
-                await self.stop_typing(chat_id, metadata=metadata)
+                await self._clear_thread_status_quietly(chat_id, metadata)
             # Track sent ts (and the thread root) so thread replies get answered
             # without an @mention.
             sent_ts = last_result.get("ts") if last_result else None
@@ -2529,6 +2557,8 @@ class SlackAdapter(BasePlatformAdapter):
             "ts": str(ts), "draft_id": draft_id, "sent": text, "started": time.time(),
             "base": base}
         self._bot_message_ts.add(str(ts))
+        if self._typing_is_active(chat_id, metadata):
+            await self.send_typing(chat_id, metadata=metadata)
         return SendResult(success=True, message_id=str(ts))
 
     # A turn that ends without a matching final (crash, interrupt, rewritten final) leaves its
@@ -2714,10 +2744,16 @@ class SlackAdapter(BasePlatformAdapter):
             self._evict_oldest_by_ts(
                 self._active_status_threads, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
         # May lack assistant:write scope or assistant context; reactions still work.
-        _status = getattr(self, "_status_text", {}).get(str(chat_id)) or getattr(
+        _status = self.get_status_text(chat_id, metadata) or getattr(
             self.config, "typing_status_text", None)
         _status = _status or self._default_status_text(_status_started)
+        owner = getattr(self, "_typing_refresh_owners", {}).get(self._typing_scope_key(chat_id, metadata))
         await self._set_thread_status(chat_id, team_id, thread_ts, _status, "failed")
+        # Final cleanup removes the tracked surface even when no base owner exists
+        # (or its cancellation times out). A late set must not leave idle status behind.
+        if ((status_key and status_key not in self._active_status_threads)
+                or (owner is not None and not self._typing_is_active(chat_id, metadata))):
+            await self.stop_typing(chat_id, metadata=metadata)
 
     async def _set_thread_status(
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:

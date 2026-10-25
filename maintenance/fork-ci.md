@@ -370,6 +370,26 @@ exact-head hosted Linux proof before qualifying the regrouping. Retire this
 adaptation when the accepted upstream harness independently schedules the cells
 within the same finite budget without sacrificing fresh-install isolation.
 
+## Test-Owned Session Provenance
+
+The `fork-ci-reliability` identity also covers process ownership in the live-system
+guard. A shell can orphan helpers before Python's first signal, while its owned
+session leader remains alive. Live ancestry and a pre-signal descendant snapshot
+then miss legitimate members of the group. Require every member's identity as
+before, with POSIX session membership as an alternate origin proof only while the
+same verified owned session leader is alive. Recheck both process creation times,
+SID and PGID, reject members older than the leader, and never override a stale
+cached identity. Shared foreign sessions, unverifiable processes and genuinely
+unowned groups remain blocked. Previously verified identities continue to cover
+leaderless groups without trusting a bare PID or PGID.
+
+Run the live-system guard canary, process registry and PTY suites, plus the real
+handoff publication fixture. The canary creates an inert orphan before the first
+signal and covers stale identities, vanished leaders and changing membership.
+Linux handoff behavior requires native Linux evidence, not a macOS platform skip.
+Retire this adaptation when the accepted upstream guard proves the same owned
+process topologies without allowing signals to unrelated live processes.
+
 ## Verification and retirement
 
 The host-installation tripwire also protects the captured account's `.local/bin`
