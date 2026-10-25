@@ -54,8 +54,10 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks, sanitize_blocks
+    from .task_card_stream import start_native_task_card_stream
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from task_card_stream import start_native_task_card_stream  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -2089,7 +2091,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Start or update a Slack-native plan/task progress stream."""
         title = title or t("platform.slack.task_card.title")
         if not self._app:
-            return SendResult(success=False, error="Not connected")
+            return SendResult(success=False, error="Not connected", retryable=True, pre_send=True)
         if not tasks:
             return SendResult(success=False, error="No tasks")
         key = self._native_task_card_key(chat_id, reply_to, metadata)
@@ -2106,7 +2108,7 @@ class SlackAdapter(BasePlatformAdapter):
             try:
                 client = self._get_client(chat_id, team_id=stream.team_id)
                 if not stream.stream_ts:
-                    await self._start_native_task_card_stream(client, stream, metadata)
+                    await start_native_task_card_stream(client, stream, metadata)
                 chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": str(title)[:256]}]
                 chunks.extend(self._task_update_chunk(task) for task in tasks)
                 # chunks-only: Slack rejects markdown_text alongside chunks
@@ -2118,46 +2120,29 @@ class SlackAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     if not _slack_error_is(exc, "message_not_in_streaming_state"):
                         raise
-                    # Slack seals a native stream server-side after a few minutes of a long
-                    # turn (live-observed at ~5m20s, 2026-09-16; the lifetime is not
-                    # documented). The sealed message is a regular message now, so reopen a
-                    # fresh card in the same thread. Every frame already carries the FULL
-                    # visible projection, so nothing is lost; the user sees the card
-                    # continue instead of degrading to text bubbles. One reopen per update:
-                    # a second rejection is a real failure.
+                    # Slack can seal a stream mid-turn. Reopen in the same thread with the
+                    # full projection, once per update. A second rejection reaches the gateway.
                     logger.info(
                         "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
                         "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts)
                     stream.stream_ts = ""
-                    await self._start_native_task_card_stream(client, stream, metadata)
+                    await start_native_task_card_stream(client, stream, metadata)
                     await client.api_call(
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
-                logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
-                return SendResult(success=False, error=str(exc), retryable=True)
-
-    @staticmethod
-    async def _start_native_task_card_stream(
-        client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
-    ) -> None:
-        """chat.startStream a plan-mode card in ``stream``'s thread; sets ``stream.stream_ts``."""
-        start_payload: dict[str, Any] = {
-            "channel": stream.channel, "thread_ts": stream.thread_ts,
-            "task_display_mode": "plan"}
-        md = metadata or {}
-        recipients = (
-            ("recipient_team_id", ("recipient_team_id", "team_id", "slack_team_id")),
-            ("recipient_user_id", ("recipient_user_id", "user_id")))
-        for key, sources in recipients:
-            value = _first_truthy(md, sources)
-            if value:
-                start_payload[key] = value
-        result = await client.api_call("chat.startStream", json=start_payload)
-        if hasattr(result, "get"):
-            stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
-        if not stream.stream_ts:
-            raise RuntimeError("Slack startStream returned no stream timestamp")
+                retryable = isinstance(exc, (TimeoutError, ConnectionError)) or self._is_retryable_upload_error(exc)
+                # A timed-out start may already have created a card. Only a positive
+                # rate-limit rejection proves it is safe to start again.
+                rate_limited = (_slack_error_is(exc, "ratelimited")
+                                or getattr(getattr(exc, "response", None), "status_code", None) == 429)
+                held = not stream.stream_ts and (
+                    (retryable and not rate_limited)
+                    or str(exc) == "Slack startStream returned no stream timestamp")
+                logger.error("[Slack] Native task-card progress error (%s): %r", type(exc).__name__, exc, exc_info=True)
+                return SendResult(success=False, error=f"{type(exc).__name__}: {exc}",
+                                  retryable=retryable and not held, held=held,
+                                  retry_after=self._retry_after_from_exc(exc) if retryable else None)
 
     @staticmethod
     def _task_update_chunk(task: dict[str, str]) -> dict[str, Any]:
