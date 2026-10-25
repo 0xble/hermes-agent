@@ -255,3 +255,27 @@ class TestSplitTextFenceBalanced:
             )
 
 
+
+
+class TestEmphasisAroundInlineCode:
+    """2026-10-24: ``1. **`typing_indicator: false`** turns…`` rendered the ``**`` halves as text."""
+
+    def _list_items(self, md):
+        rich = next(b for b in render_blocks(md) if b["type"] == "rich_text")
+        lst = next(e for e in rich["elements"] if e["type"] == "rich_text_list")
+        return [item["elements"] for item in lst["elements"]]
+
+    def test_bold_wrapping_code_is_bold_code_not_literal_stars(self):
+        (item,) = self._list_items("1. **`typing_indicator: false`** turns the status off.")
+        assert item[0] == {"type": "text", "text": "typing_indicator: false", "style": {"bold": True, "code": True}}
+        assert item[1] == {"type": "text", "text": " turns the status off."}
+        assert not any("*" in el.get("text", "") for el in item)
+
+    def test_bold_span_with_code_and_trailing_text(self):
+        (item,) = self._list_items("- **`live_status`:** picks the detail")
+        assert [el.get("style") for el in item] == [{"bold": True, "code": True}, {"bold": True}, None]
+        assert "".join(el["text"] for el in item) == "live_status: picks the detail"
+
+    def test_code_stays_opaque_to_emphasis(self):
+        (item,) = self._list_items("- `a*b*c` and `__init__`")
+        assert [el["text"] for el in item if el.get("style", {}).get("code")] == ["a*b*c", "__init__"]
