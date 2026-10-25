@@ -980,6 +980,125 @@ def test_prepare_venv_identical_lock_still_builds_in_place(tmp_path, monkeypatch
     assert called == [new]
 
 
+@pytest.mark.parametrize("carrier", ["previous", "source"])
+def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path, monkeypatch, carrier):
+    """An extra installed into the active release survives the next release build.
+
+    The migration-bound source interpreter never sees `hermes pm install --extra` or a lazy
+    install; only the active release's committed PM environment does. Building from the source
+    interpreter alone dropped Slack on every update. At first migration nothing is active yet,
+    so the source checkout's own committed environment carries instead.
+    """
+    from pm.environments import install_state_dir, runtime_facts_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    pyproject = ("[project]\nname='hermes-agent'\nversion='0.1.0'\n[project.optional-dependencies]\n"
+                 "slack=['slack-bolt==1.30.0']\ntelegram=['python-telegram-bot==22.8']\n")
+    previous, new = tmp_path / "releases" / "previous", tmp_path / "releases" / "new"
+    source = tmp_path / "source"
+    for release in (previous, new, source):
+        release.mkdir(parents=True)
+        (release / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    carried = previous if carrier == "previous" else source
+    environment = install_state_dir(carried) / "environments" / "generation" / "venv"
+    (environment / "bin").mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("", encoding="utf-8")
+    (environment / "bin" / "python").symlink_to(sys.executable)
+    facts = runtime_facts_path(carried)
+    facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(environment), "extras": ["slack", "telegram"]}}}), encoding="utf-8")
+
+    def distributions(python):
+        installed = {"python-telegram-bot": "22.8"}
+        if Path(python).parent.parent == environment.resolve():
+            installed["slack-bolt"] = "1.30.0"
+        return installed
+
+    monkeypatch.setattr(releases, "_active_distributions", distributions)
+    monkeypatch.setattr(releases, "restore_active_distributions", lambda *args, **kwargs: None)
+    built = []
+    monkeypatch.setattr(releases, "_build_venv",
+                        lambda release, uv="uv", extras=(), python=None: built.append(list(extras)))
+    releases.prepare_venv(new, previous if carrier == "previous" else None,
+                          source=source, source_python=Path(sys.executable))
+    assert built == [["slack", "telegram"]]
+
+
+def test_smoke_runs_the_interpreter_the_candidate_boots(tmp_path, monkeypatch):
+    """After a carry commits a PM generation, staging smokes that generation, not `.venv`."""
+    from pm.environments import install_state_dir, runtime_facts_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    release = tmp_path / "releases" / "B"
+    _fake_release(release, "B")
+    generation = install_state_dir(release) / "environments" / "generation" / "venv"
+    (generation / "bin").mkdir(parents=True)
+    (generation / "pyvenv.cfg").write_text("", encoding="utf-8")
+    (generation / "bin" / "python").symlink_to(sys.executable)
+    runtime_facts_path(release).write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(generation), "extras": ["slack"]}}}), encoding="utf-8")
+    ran = []
+    monkeypatch.setattr(releases.subprocess, "run",
+                        lambda argv, **kwargs: ran.append(argv[0]) or subprocess.CompletedProcess(argv, 0, "", ""))
+    releases.smoke_plugins(release, tmp_path / "profile")
+    assert ran == [str(generation.resolve() / "bin" / "python")]
+
+
+def test_ready_candidate_from_older_builder_commits_active_extras_before_activation(tmp_path, monkeypatch):
+    """A release staged by the frozen source checkout gets the active release's extras.
+
+    `hermes update` re-enters the source checkout, whose older `prepare_venv` built B without
+    the `slack` that A's committed PM generation carries. The post-swap child, importing B,
+    reaches B through `stage_release`'s ready path and must commit `slack` before activation.
+    PM's record supplies `documents`, which inference from installed packages cannot see.
+    A recorded extra that is platform-gated off here is never re-synced.
+    """
+    from pm.environments import install_state_dir, runtime_facts_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    home = tmp_path / "profile"
+    a, b = home / "releases" / "A", home / "releases" / "B"
+    for release in (a, b):
+        _fake_release(release, release.name)
+        (release / "pyproject.toml").write_text(
+            "[project]\nname='hermes-agent'\nversion='0.1.0'\n[project.optional-dependencies]\n"
+            "slack=['slack-bolt==1.30.0']\ntelegram=['python-telegram-bot==22.8']\n"
+            "documents=['docx-pkg==1.0']\ngated=['gated-pkg==1.0; sys_platform == \"none\"']\n",
+            encoding="utf-8")
+        (release / ".venv" / "bin" / "python").unlink()
+        (release / ".venv" / "bin" / "python").symlink_to(sys.executable)
+    releases.promote(home, a)
+    generation = install_state_dir(a) / "environments" / "generation" / "venv"
+    (generation / "bin").mkdir(parents=True)
+    (generation / "pyvenv.cfg").write_text("", encoding="utf-8")
+    (generation / "bin" / "python").symlink_to(sys.executable)
+    runtime_facts_path(a).write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(generation), "extras": ["documents", "gated", "slack", "telegram"]}}}),
+        encoding="utf-8")
+
+    def distributions(python):
+        installed = {"python-telegram-bot": "22.8"}
+        if Path(python).parent.parent == generation.resolve():
+            installed["slack-bolt"] = "1.30.0"
+        return installed
+
+    synced, steps = [], []
+    monkeypatch.setattr("hermes_cli.update_receipt.record_step", lambda *args, **kwargs: steps.append(args))
+    monkeypatch.setattr(releases, "_active_distributions", distributions)
+    monkeypatch.setattr(releases, "smoke_plugins", lambda *args, **kwargs: None)
+    monkeypatch.setattr("pm.sync_venv", lambda extras, **kwargs: synced.append((extras, kwargs)))
+    # Pre-handoff: the source checkout's code finds B ready and must not touch B's environment.
+    monkeypatch.setattr("pm.paths.repo_root", lambda: tmp_path / "source")
+    assert releases.stage_release(tmp_path / "source", home, sha="B") == (b, "existing")
+    assert synced == []
+    # Post-swap: B's own code commits the missing extra before activate_release runs.
+    monkeypatch.setattr("pm.paths.repo_root", lambda: b.resolve())
+    assert releases.stage_release(tmp_path / "source", home, sha="B") == (b, "existing")
+    assert synced == [(["documents", "slack"],
+                       {"explicit": True, "project_root": b, "evict_incompatible_plugins": True})]
+    assert steps == [("immutable_extras_carry", True, f"carried documents, slack from {a.resolve()}")]
+
+
 def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
     home = tmp_path / "profile"
     release_paths = [home / "releases" / str(i) for i in range(9)]
