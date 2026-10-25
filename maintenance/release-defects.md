@@ -771,6 +771,11 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   the fixture is proving that maintenance uses an isolated worktree. The real subprocess and
   maintenance assertions remain unchanged. Guard: `test_worktree_maintenance_isolation.py`
   passed in the canonical runner (`r5-fixtures.log`, 1 passed).
+- Route fork plugin-command effects through the upstream shared handler so opt-in source,
+  session ID, live-message bindings and choices survive without dropping the loop-wake fence.
+  Cron script tests bind the canonical registered store and admitted execution instead of
+  booting an external gateway client. Guards: session env, exec quick commands and cron
+  script propagation (19 passed). The live-system subprocess guard is unchanged.
 - Keep MCP serve in the agent-command registry and restore inline discovery for commands
   without a dedicated startup owner, while preserving gateway-owned discovery for chat.
   Release-hold isolation explicitly permits dropping the synthetic main branch so the

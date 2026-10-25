@@ -1437,36 +1437,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 from hermes_cli.plugins import get_plugin_command_handler
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
-                    # The agent-turn path binds HERMES_SESSION_* via _set_session_env; this dispatch
-                    # sits before it, so a handler reading get_session_env() would see an empty or a
-                    # foreign (cron agent's os.environ) session (#108698). No session_entry exists yet,
-                    # so session_key is derived from source. Sync handlers run on the gateway pool
-                    # (contextvars carried), never the loop thread: blocking I/O there starves the
-                    # liveness watchdog and the process exits 75 mid-handler (#105279).
-                    _plugin_context = build_session_context(source, self.config)
-                    _plugin_context.session_key = self._session_key_for_source(source)
-                    user_args = event.get_command_args().strip()
-                    with self._session_env_scope(_plugin_context):
-                        if asyncio.iscoroutinefunction(plugin_handler):
-                            started, result = await self._invoke_loop_wake_effect(
-                                event, plugin_handler, user_args,
-                            )
-                        else:
-                            started, result = await self._run_in_executor_with_context(
-                                self._invoke_loop_wake_sync_effect, event, plugin_handler, user_args,
-                            )
-                            if asyncio.iscoroutine(result):
-                                pending_result = result
-                                async def await_result():
-                                    return await pending_result
-                                started, result = await self._invoke_loop_wake_effect(
-                                    event, await_result,
-                                )
-                                if not started:
-                                    pending_result.close()
-                        if not started:
-                            return _CommandDispatch.SUPPRESSED, None, command
-                    return True, str(result) if result else None, command
+                    started, result = await self._invoke_loop_wake_effect(
+                        event, self._hm_run_plugin_handler, plugin_handler, event, source,
+                    )
+                    if not started:
+                        return _CommandDispatch.SUPPRESSED, None, command
+                    return True, result, command
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
         return False, None, command
