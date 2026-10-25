@@ -757,6 +757,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   release uses the canonical source module, not the removed status export.
   Guard: the complete replace-ownership suite, including stamp durability and no-signal refusal.
 - Fork patch identity: `v0225-merge-integration`.
+- Memory-provider eviction resolves the shutdown handoff under the shutdown lock.
+  A worker that captured the manager owns session-end and shutdown, while eviction
+  detaches its claimed reference without taking that ownership back. Reset's
+  pre-flush still retains the manager until the worker captures it.
+  Guards: both `test_agent_cache_memory_lifetime.py` and
+  `test_agent_cache_memory_lifecycle.py`, 18 passing tests on Linux Python 3.14.7.
 - Merging upstream `v0.22.5`, current fork main and the installed display-fold fix (#765) left five bindings that Git merged cleanly but that no longer resolved. Exact-head CI caught them on the first hosted run.
   - `gateway/run_inbound.py` kept the fork's `metadata=_UNSET` default on `_transcribe_and_echo_pending_voice` but lost the `from gateway.run_common import _UNSET` import that upstream's side never had. Every `gateway.run` import raised `NameError`, which accounted for most failures in the first run.
   - `hermes_state_messages.py` raised `CompressionLeaseLostError` from the compaction lease check without importing it.

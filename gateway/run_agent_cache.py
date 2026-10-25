@@ -1224,6 +1224,11 @@ class GatewayAgentCacheMixin:
             lock = nullcontext()
         with lock:
             manager = getattr(agent, "_memory_manager", None)
+            if getattr(agent, "_memory_provider_shutdown", False) is True:
+                # The shutdown worker captured the manager under this same lock.
+                # Its local reference owns retirement, even while extraction is running.
+                agent._memory_manager = None
+                return None
             if manager is not None:
                 claim = getattr(manager, "claim_teardown", None)
                 if callable(claim) and not claim(session_end=False):
