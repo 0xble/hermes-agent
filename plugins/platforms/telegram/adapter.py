@@ -159,6 +159,7 @@ from plugins.platforms.telegram.disconnect_handover import run_disconnect
 
 from gateway.authz_mixin import _coerce_allow_set
 from gateway.config import Platform, PlatformConfig, normalize_telegram_rich_messages
+from gateway.platforms.typing_state import call_typing_with_metadata
 from agent.i18n import get_language, t
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
@@ -6146,7 +6147,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         await self._edit_md_quiet(query, edit_text)
         # Typing was paused when the approval was sent; the text /approve and /deny paths resume it too.
         if count and cb["chat_id"] is not None:
-            self.resume_typing_for_chat(str(cb["chat_id"]), metadata=typing_metadata)
+            call_typing_with_metadata(self.resume_typing_for_chat, str(cb["chat_id"]), metadata=typing_metadata)
 
     async def _handle_slash_confirm_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``sc:<choice>:<confirm_id>`` — resolve a slash-command confirmation."""

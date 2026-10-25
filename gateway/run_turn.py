@@ -4376,7 +4376,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             else None
         )
         if source.platform == Platform.SLACK:
-            _status_thread_metadata = _thread_metadata_for_source(source, event_message_id)
+            _status_thread_metadata = {
+                **(self._thread_metadata_for_source(source, event_message_id) or {}),
+                **(_thread_metadata_for_source(source, event_message_id) or {}),
+            } or None
         elif source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             _status_thread_metadata = {"thread_id": _progress_thread_id, "reply_to_message_id": event_message_id}
         else:
