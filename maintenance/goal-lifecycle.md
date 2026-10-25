@@ -148,3 +148,9 @@ Landing is not runtime promotion or activation.
 The v2026.9.21 integration preserves trusted user-turn admission across upstream
 prompt metadata and compute-host changes. Title previews remain presentation data,
 and hidden or relayed turns do not acquire user authority.
+
+The notice policy also gates CLI/TUI judge, automatic resume, and lifted-wait
+output. Judging and queued follow-ups remain active. Explicit controls and
+compression-failure recovery warnings remain visible. Guards:
+`tests/hermes_cli/test_goal_notice_surfaces.py` and
+`tests/tui_gateway/test_goal_notice_surfaces.py`.
