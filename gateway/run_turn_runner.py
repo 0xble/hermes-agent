@@ -1402,6 +1402,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 decision.reason == "attended"
                 and not decision.new_session
                 and not unavailable_emitted
+                # Turn-start resolution may already have selected and announced this route.
+                # A changed desired key alone does not mean the live model switched.
+                and destination_route != current_route
                 and not (previous_key and previous_key[-1])
             ):
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
@@ -1601,15 +1604,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 break
             answers[entry["qid"]] = None if raw == SKIPPED else raw
         return reply
-
-    async def _send_shared_clarify(self, entry, **kwargs):
-        result = await self._ctx._status_adapter.send_clarify(**kwargs)
-        if self._approval_owner is not None and result.success:
-            authority, session_id, generation = self._approval_owner
-            from gateway import local_viewer_events
-            authority.register_clarify(session_id, generation, entry,
-                                       timeout_s=local_viewer_events.prompt_timeout_s(self, "clarify"))
-        return result
 
     def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True) -> tuple[str, bool]:
         """One card: register, send, wait, then retire it (no answer) or re-arm (answer).
