@@ -50,6 +50,18 @@ def test_no_park_retries_only_explicit_context_consent(handoff, monkeypatch, rel
     assert session["tab_id"] == "owned-tab"
 
 
+@pytest.mark.parametrize("release,code,success", [
+    (False, "context_restart_required", {"ok": True, "focused": True, "tabId": "owned-tab", "restarted": False}),
+    (True, "context_close_required", {"ok": True, "released": False}),
+])
+def test_consent_retry_warns_only_when_state_was_discarded(handoff, monkeypatch, release, code, success):
+    cf, _session = handoff
+    monkeypatch.setattr(cf, "_post", Mock(side_effect=[_conflict({"code": code}), success]))
+    result = json.loads(cf.camofox_handoff("test", "test-task", release=release))
+    assert result["success"] is True
+    assert "warning" not in result
+
+
 @pytest.mark.parametrize("release", [False, True])
 def test_parked_path_never_requests_context_destruction(handoff, monkeypatch, release):
     cf, session = handoff
