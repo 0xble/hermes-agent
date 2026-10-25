@@ -17,6 +17,11 @@ def small_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(lim, "_cached_limits", {hermes_home_key(): {
         "max_bytes": 2000, "max_lines": 2000, "max_line_length": 2000,
     }})
+    from tools.environments import base_output
+    # Join a prune left by an earlier test so this one's first call starts its own.
+    if (prune := getattr(base_output, "_spill_prune_thread", None)) is not None:
+        prune.join(timeout=5)
+    monkeypatch.setattr(base_output, "_spill_prune_last", {}, raising=False)
     return tmp_path
 
 
@@ -60,6 +65,10 @@ class TestTruncationSpill:
         os.utime(stale, (1, 1))
         json.loads(terminal_tool(
             "python3 -c \"[print('z'*90) for i in range(200)]\"", task_id="t-spill-4"))
+        from tools.environments import base_output
+        prune = getattr(base_output, "_spill_prune_thread", None)
+        if prune is not None:  # pruning runs off the terminal call's thread
+            prune.join(timeout=5)
         assert not stale.exists()
 
     @pytest.mark.platforms("linux")
