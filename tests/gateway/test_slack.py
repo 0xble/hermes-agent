@@ -3167,6 +3167,40 @@ class TestAssistantThreadLifecycle:
 
 
     @pytest.mark.asyncio
+    async def test_app_home_opened_does_not_block_the_loop_on_a_stalled_session_store(
+        self, assistant_adapter
+    ):
+        """2026-10-25: the DM seed read state.db on the event loop; behind slow writes the loop missed
+        its liveness probes and the gateway was killed twice. The ack must return while the store waits."""
+        import threading
+        import time
+
+        release = threading.Event()
+        seeded = []
+
+        class StalledStore:
+            def get_or_create_session(self, source):
+                release.wait(5)
+                seeded.append(source)
+
+        assistant_adapter._session_store = StalledStore()
+        assistant_adapter._app.client.assistant_threads_setSuggestedPrompts = AsyncMock()
+        event = {"type": "app_home_opened", "tab": "messages", "team": "T_TEAM",
+                 "channel": "D123", "user": "U_USER"}
+
+        started = time.monotonic()
+        await asyncio.wait_for(assistant_adapter._handle_app_home_opened(event), timeout=2)
+        assert time.monotonic() - started < 2
+        assert seeded == []  # still waiting on the store, off the loop
+        release.set()
+        for _ in range(100):
+            if seeded:
+                break
+            await asyncio.sleep(0.05)
+        assert len(seeded) == 1 and seeded[0].chat_id == "D123"
+
+
+    @pytest.mark.asyncio
     async def test_assistant_thread_cache_is_scoped_per_workspace(
         self, assistant_adapter
     ):
