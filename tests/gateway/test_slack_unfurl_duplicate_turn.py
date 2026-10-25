@@ -267,6 +267,7 @@ class TestClaimReleasedOnFailure:
         edit = _unfurl_event()
         edit["message"]["text"] = "<@U0BCLP7DB7B> edited text"
         edit["message"]["edited"] = {"user": USER, "ts": "1787365412.000000"}
+        edit["ts"] = edit["event_ts"] = edit["message"]["edited"]["ts"]
 
         async def scenario():
             with pytest.raises(RuntimeError):
@@ -300,6 +301,67 @@ class TestClaimReleasedOnFailure:
             except RuntimeError:
                 pass
             assert ORIGINAL_TS in adapter._processed_message_ts
+
+        asyncio.run(scenario())
+        assert len(delivered) == 1
+
+
+class TestColdCacheChanges:
+    """Thread bookkeeping is not user input, even after restart or cache eviction.
+
+    Related upstream reports: #118349 and #131688. Retained edited markers,
+    agent-session status changes, and file metadata refreshes are also bookkeeping.
+    """
+
+    @pytest.mark.parametrize("variant", [
+        "reply_metadata", "agent_session", "retained_edit", "unfurl",
+        "file_metadata", "no_previous", "no_previous_retained_edit",
+    ])
+    def test_metadata_change_does_not_dispatch_a_user_turn(self, variant):
+        delivered = []
+        adapter = _make_adapter(delivered)
+        adapter._resolve_user_name = AsyncMock(return_value="richard")
+        event = _unfurl_event()
+        previous = dict(event["message"])
+        previous.pop("attachments")
+        event["previous_message"] = previous
+        if variant == "reply_metadata":
+            event["message"].update(reply_count=4, latest_reply=UNFURL_EVENT_TS)
+        elif variant == "agent_session":
+            event["message"]["agent_session"] = {"status": "active", "title": "Thread"}
+        elif variant in {"retained_edit", "no_previous_retained_edit"}:
+            edit = {"user": USER, "ts": "1787365410.000000"}
+            previous["edited"] = edit
+            event["message"]["edited"] = edit
+        elif variant == "file_metadata":
+            previous["files"] = [{"id": "F123", "title": "upload", "size": 3}]
+            event["message"]["files"] = [{"id": "F123", "title": "upload", "size": 4}]
+        if variant.startswith("no_previous"):
+            event.pop("previous_message")
+
+        asyncio.run(adapter._handle_slack_message(event, _body()))
+
+        assert delivered == []
+        assert ORIGINAL_TS not in adapter._processed_message_ts
+
+    @pytest.mark.parametrize("variant", ["text", "files", "edited_without_previous"])
+    def test_genuine_change_dispatches_once_on_a_fresh_adapter(self, variant):
+        delivered = []
+        adapter = _make_adapter(delivered)
+        adapter._resolve_user_name = AsyncMock(return_value="richard")
+        event = _unfurl_event()
+        event["previous_message"] = dict(event["message"])
+        if variant == "text":
+            event["message"]["text"] = "<@U0BCLP7DB7B> corrected text"
+        elif variant == "files":
+            event["message"]["files"] = [{"id": "F_NEW", "mimetype": "text/plain"}]
+        else:
+            event.pop("previous_message")
+            event["message"]["edited"] = {"user": USER, "ts": UNFURL_EVENT_TS}
+
+        async def scenario():
+            await adapter._handle_slack_message(event, _body())
+            await adapter._handle_slack_message(event, _body())
 
         asyncio.run(scenario())
         assert len(delivered) == 1

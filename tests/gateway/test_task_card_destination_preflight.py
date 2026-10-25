@@ -95,9 +95,9 @@ async def test_destination_preflight_survives_transport_recovery(
     stop.assert_awaited_once_with("D1", reply_to=reply_to, metadata=metadata)
     assert metadata == original_metadata
     if kind == "native":
-        assert bool(io.chat_postMessage.await_count) is eligible
-        assert bool(io.chat_update.await_count) is eligible
-        io.api_call.assert_not_awaited()  # Disconnected first attempt stays on fallback.
+        io.chat_postMessage.assert_not_awaited()
+        io.chat_update.assert_not_awaited()
+        io.api_call.assert_not_awaited()  # Events inside the transient cooldown coalesce.
     else:
         ops = [frame["op"] for frame in io.frames]
         assert ops == (["task_card", "send", "edit", "edit", "task_card_stop"]

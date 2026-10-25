@@ -3324,6 +3324,21 @@ class TestMessageSplitting:
 
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("size", [77_965, 77_968])
+    async def test_send_keeps_two_chunk_boundary_without_transport_overhead(self, adapter, size):
+        """Raw Slack indicators must not spend Telegram escaping or an unused final fence."""
+        content = "x" * size
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        result = await adapter.send("C123", content)
+
+        assert result.success is True
+        posts = [call.kwargs["text"] for call in adapter._app.client.chat_postMessage.call_args_list]
+        assert len(posts) == 2
+        assert all(len(post) <= adapter.MAX_MESSAGE_LENGTH for post in posts)
+        assert "".join(post.removesuffix(f" ({i}/2)") for i, post in enumerate(posts, 1)) == content
+
+    @pytest.mark.asyncio
     async def test_send_coerces_string_unfurl_options(self, adapter):
         """`hermes config set` / Railway persist YAML booleans as strings.
 
