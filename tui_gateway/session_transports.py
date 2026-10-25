@@ -8,6 +8,12 @@ from tui_gateway.method_ctx import bind_module
 _session_transport_lock = threading.RLock()
 
 
+def _new_session_publisher(transport) -> FanoutTransport:
+    """One ordering authority from creation, including stdio and single-peer sessions."""
+    peers = transport.transports() if isinstance(transport, FanoutTransport) else [transport]
+    return FanoutTransport(*(peer for peer in peers if peer is not None and peer is not _detached_ws_transport))
+
+
 def _transport_is_live_peer(transport) -> bool:
     """Exclude the process fallback sink, parked sentinel, and closed peers."""
     return (transport is not None
@@ -15,6 +21,33 @@ def _transport_is_live_peer(transport) -> bool:
             and transport is not _stdio_transport
             and not isinstance(transport, (_DropTransport, StdioTransport))
             and not _transport_is_dead(transport))
+
+
+def _publish_session_frame(obj: dict, transport: Transport, *, accept=None) -> bool:
+    """Publish through the captured session mailbox, never resolve an owner after stamping."""
+    from tui_gateway.event_replay import _stamp_event
+    from tui_gateway.hosted_room_member_activity import project_room_member_activity
+
+    admitted = False
+
+    def prepare(frame):
+        nonlocal admitted
+        if accept is not None and not accept():
+            return False
+        _stamp_event(frame)
+        admitted = True
+
+    if isinstance(transport, FanoutTransport):
+        result = transport.publish(obj, prepare)
+    else:
+        # Request-local/legacy sinks have no session mailbox. Live sessions are
+        # created with one even when their only peer is stdio or a host pipe.
+        if prepare(obj) is False:
+            return False
+        result = transport.write(obj)
+    if admitted:
+        project_room_member_activity(obj, _sessions)
+    return result
 
 
 def _session_transport_contains(session: dict | None, transport) -> bool:
@@ -79,28 +112,25 @@ def _attach_session_transport(session: dict | None, transport) -> bool:
             attached = [_attach_session_transport(session, peer) for peer in transport.transports()]
             return any(attached)
         existing = session.get("transport")
+        if not isinstance(existing, FanoutTransport):
+            # Compatibility for records supplied by embedders. Gateway creation
+            # already installs the mailbox before the first event can be emitted.
+            existing = session["transport"] = _new_session_publisher(existing)
         if _transport_is_dead(transport):
-            if isinstance(existing, FanoutTransport):
-                existing.detach(transport)
+            existing.detach(transport)
             return False
-        if not _transport_is_live_peer(transport):
-            if _session_has_live_transport(session):
-                return False
-            session["transport"] = transport
-            return True
-        if existing is transport:
-            return True
-        if isinstance(existing, FanoutTransport):
-            if not existing.contains(transport):
-                _warn_foreign_login(session, transport)
-            existing.attach(transport)
-            return existing.contains(transport)
-        _warn_foreign_login(session, transport)
-        if _transport_is_live_peer(existing):
-            session["transport"] = FanoutTransport(existing, transport)
-        else:
-            session["transport"] = transport
-        return True
+        live_peer = _transport_is_live_peer(transport)
+        if not live_peer and _session_has_live_transport(session):
+            return False
+        if live_peer and not existing.contains(transport):
+            _warn_foreign_login(session, transport)
+        # Replace only fallback/dead membership, never the publisher or its
+        # in-flight writers. In particular, attaching WS must not leak to stdio.
+        for peer in existing.transports():
+            if peer is not transport and not _transport_is_live_peer(peer):
+                existing.detach(peer)
+        existing.attach(transport)
+        return existing.contains(transport)
 
 
 def _detach_session_transport(session: dict | None, transport) -> bool:
@@ -110,8 +140,14 @@ def _detach_session_transport(session: dict | None, transport) -> bool:
     with _session_transport_lock:
         (session.get("viewers") or {}).pop(transport, None)
         existing = session.get("transport")
+        if not isinstance(existing, FanoutTransport):
+            existing = session["transport"] = _new_session_publisher(existing)
         if isinstance(existing, FanoutTransport):
             existing.detach(transport)
+            # A closed sibling must not keep an otherwise parked mailbox alive.
+            for peer in existing.transports():
+                if _transport_is_dead(peer):
+                    existing.detach(peer)
             viewers = session.get("viewers") or {}
             for viewer in list(viewers):
                 if not existing.contains(viewer) or _transport_is_dead(viewer):
