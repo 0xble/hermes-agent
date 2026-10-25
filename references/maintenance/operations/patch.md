@@ -25,6 +25,15 @@ See [Reaction Tool Name](../../../maintenance/react-tool-name.md) for the contra
 - **Rollback:** Revert the committed-route guard in turn-start resolution and the route-equality guard in API-boundary emission, plus their matching tests. No configuration, schema, dependency or state migration.
 - **Retirement:** Remove when the shared routing owner derives switch announcements solely from committed route transitions and equivalent regressions pass upstream.
 
+## slack-progress-card-recovery
+- **Status:** Draft candidate, not landed or activated.
+- **Contract:** Retry transient append failures on the existing stream, coalescing the latest projection even while tools are idle. Honor Retry-After. Retry a start only after a positive rate-limit rejection. Suppress ambiguous starts and SDK connection retries instead of creating a duplicate card or fallback. Permanent failures log and use human-readable tool labels, never executable previews.
+- **Source surfaces:** `gateway/run_task_card_progress.py`, `gateway/run_turn_runner.py`, `plugins/platforms/slack/adapter.py`, `plugins/platforms/slack/task_card_stream.py`; [behavior record](../../../maintenance/slack-progress-card-recovery.md).
+- **Root cause:** `_task_card_publish` latched `native_failed` after every unsuccessful SendResult, ignoring retryable transport failures. Base `fdcba2ab110d`; timeout logs immediately precede the fallback warning. A retryable failure that did not latch this flag would falsify the diagnosis.
+- **Upstream findings:** Related [#137803](https://github.com/NousResearch/hermes-agent/pull/137803) handles explicit stream expiry, not ambiguous start or transient append timeouts. [#103197](https://github.com/NousResearch/hermes-agent/pull/103197) addressed incompatible payloads, a distinct cause. No matching transient recovery repair found in the scoped searches.
+- **Verification:** Regression against base production modules: 12 failed, exit 1. Candidate regression: 12 passed. Affected gateway tests and exact-head results are recorded in the draft PR. Repository-wide static failures are inherited: shebangs, oversized AGENTS.md, and Ruff.
+- **Outbound budget:** Retry gaps 2,4,8,16,30 seconds give attempts at 0,2,6,14,30,60. At most 5 logical attempts in a half-open 60-second window, or 10 HTTP append attempts with the SDK connection retry, versus appendStream Tier 3 floor 50/min (20%). Later retries are at most 4 HTTP attempts/min (8%). Positive start rejection uses Retry-After, startStream has no SDK retry. Existing successful native progress, reply and typing paths lack shared admission, so aggregate per-conversation budget compliance is not established. Keep draft pending qualification.
+- **Rollback and retirement:** Revert this patch and matching presentation assertions. No schema, dependency or config change. Retire when upstream preserves the same retry, ambiguity and clean-fallback contract.
 ## mcp-verbatim-tool-labels
 
 - **Status:** Candidate.
