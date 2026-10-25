@@ -3129,7 +3129,7 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             for k, v in barrier.items():
                 setattr(state, k, v)
             if goal_autonomy_enabled() and (state.waiting_on_pid or state.waiting_on_session):
-                state.waiting_until = time.time() + 900
+                state.waiting_until = time.time() + self._autonomy_wait_seconds()
             if state.waiting_on_pid is not None:
                 state.waiting_on_pid_live_at_park = _pid_alive(state.waiting_on_pid)
             if state.waiting_on_session is not None:
@@ -3445,7 +3445,7 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
         unobservable here, so the caller continues instead."""
         state = self._require_active()
         if goal_autonomy_enabled() and wait_directive.get("user_message"):
-            wait_directive = {"seconds": 900}
+            wait_directive = {"seconds": self._autonomy_wait_seconds()}
         if wait_directive.get("session_id"):
             tgt = f"session {self.wait_on_session(str(wait_directive['session_id']), reason=reason).waiting_on_session}"
         elif wait_directive.get("pid"):

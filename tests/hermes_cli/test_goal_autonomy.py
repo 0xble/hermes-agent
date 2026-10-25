@@ -176,11 +176,14 @@ def test_automatic_stops_leave_active_timed_wakes(home, monkeypatch, scenario):
         assert not mgr.complete(reason="escape failed gate", evidence={})["ok"]
 
 
-def test_live_external_barrier_is_rechecked_on_a_timer(home, monkeypatch):
-    mgr = manager()
+@pytest.mark.parametrize("gap", [0, 1800])
+def test_live_external_barrier_is_rechecked_on_a_timer(home, monkeypatch, gap):
+    manager()
+    mgr = goals.GoalManager("autonomy", min_continuation_gap_seconds=gap)
     monkeypatch.setattr(goals, "_session_waiting", lambda _sid: True)
     mgr.wait_on_session("still-running", reason="external work")
     assert mgr.state.waiting_until > time.time()
+    assert mgr.state.waiting_until - mgr.state.waiting_since >= max(900, gap) - 1
     mgr.state.waiting_until = time.time() - 1
     mgr._save()
     assert mgr.lifted_barrier_prompt() is not None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from collections.abc import Mapping
@@ -178,6 +179,9 @@ def autonomous_verdict(state, verdict, reason, wait_directive):
 
 
 class GoalAutonomyMixin:
+    def _autonomy_wait_seconds(self):
+        return max(900, math.ceil(self.min_continuation_gap_seconds))
+
     def _autonomy_budget_checkpoint(self, state, reason):
         state.revisions.append({"at": time.time(), "kind": "budget_checkpoint", "reason": reason,
                                 "turns_used": state.turns_used, "actor": "system", "authority": "autonomy"})
@@ -269,7 +273,7 @@ class GoalAutonomyMixin:
 
         self.state.last_verdict = "continue"
         self.state.last_reason = reason
-        self.wait_for_seconds(900, reason="Try a new route: " + reason)
+        self.wait_for_seconds(self._autonomy_wait_seconds(), reason="Try a new route: " + reason)
         self._save()
         return _decision("active", False, None, "wait", reason, "")
 
