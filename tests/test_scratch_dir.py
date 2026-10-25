@@ -729,3 +729,107 @@ def test_prune_owner_lookup_survives_symlinked_scratch_and_drops_orphaned_mcp_he
         if helper.poll() is None:
             helper.kill()
             helper.wait(timeout=10)
+
+
+def _age_tree(path: Path, hours: float = 30) -> None:
+    """Make *path* and everything beneath it look idle for *hours* (symlinks not followed)."""
+    ancient = time.time() - hours * 3600
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            os.utime(os.path.join(dirpath, name), (ancient, ancient), follow_symlinks=False)
+    os.utime(path, (ancient, ancient), follow_symlinks=False)
+
+
+def _pin(declaring: Path, *inputs: Path) -> None:
+    import json
+
+    (declaring / "input-pins.json").write_text(
+        json.dumps({"files": {str(p): {"sha256": "0" * 64} for p in inputs}}), encoding="utf-8")
+
+
+def test_prune_keeps_idle_input_pinned_by_another_entry_and_removes_unpinned_control(tmp_path):
+    """An old, closed input pinned by a different retained payload is in use even though nothing
+    touched it: deleting it would break the payload's frozen-input admission. An equally idle
+    entry nothing declares is still pruned."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    payload, pinned, control = scratch / "payload", scratch / "pinned-input", scratch / "control"
+    for d in (payload, pinned / "sub", control):
+        d.mkdir(parents=True)
+    (pinned / "sub" / "findings.md").write_text("x", encoding="utf-8")
+    (control / "f").write_text("x", encoding="utf-8")
+    _pin(payload, pinned / "sub" / "findings.md")
+    for d in (payload, pinned, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert payload.exists() and pinned.exists() and not control.exists()
+
+
+def test_prune_follows_pins_transitively_and_through_directory_and_alias_paths(tmp_path):
+    """A pinned entry that declares its own inputs holds them too. A directory pin and a symlinked
+    alias of a pinned path both resolve to the entry that holds them."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    a, b, c, d = (scratch / n for n in ("a", "b", "c", "d"))
+    for x in (a, b, c / "build", d):
+        x.mkdir(parents=True)
+    (b / "dep").write_text("x", encoding="utf-8")
+    (c / "build" / "out").write_text("x", encoding="utf-8")
+    alias = tmp_path / "alias-to-c"
+    alias.symlink_to(c)
+    _pin(a, b / "dep")
+    _pin(b, alias / "build")
+    for x in (a, b, c, d):
+        _age_tree(x)
+    assert prune_scratch_dir(scratch) == 1
+    assert a.exists() and b.exists() and c.exists() and not d.exists()
+
+
+def test_prune_keeps_every_idle_entry_when_a_declaration_is_unreadable(tmp_path):
+    """A malformed declaration hides its dependencies, so no idle entry can be shown free of
+    them: the pass removes nothing rather than guess."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    broken, other = scratch / "broken", scratch / "other"
+    broken.mkdir()
+    other.mkdir()
+    (broken / "input-pins.json").write_text("{not json", encoding="utf-8")
+    (other / "f").write_text("x", encoding="utf-8")
+    for x in (broken, other):
+        _age_tree(x)
+    assert prune_scratch_dir(scratch) == 0
+    assert broken.exists() and other.exists()
+
+
+def test_prune_honors_keep_marker_but_not_package_fixture_markers(tmp_path):
+    """A ``.keep`` anywhere in an entry holds it. One inside ``node_modules`` is a package
+    fixture, not a retention declaration."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    kept, fixture = scratch / "kept", scratch / "fixture"
+    (kept / "deep").mkdir(parents=True)
+    (kept / "deep" / ".keep").write_text("", encoding="utf-8")
+    (fixture / "node_modules" / "pkg").mkdir(parents=True)
+    (fixture / "node_modules" / "pkg" / ".keep").write_text("", encoding="utf-8")
+    for x in (kept, fixture):
+        _age_tree(x)
+    assert prune_scratch_dir(scratch) == 1
+    assert kept.exists() and not fixture.exists()
+
+
+def test_prune_rereads_declarations_before_removal(tmp_path, monkeypatch):
+    """A declaration written after idle selection (during the process reap) still holds its
+    input: retention is read again immediately before the destructive step."""
+    import hermes_constants_scratch as scratch_mod
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    payload, pinned = scratch / "payload", scratch / "pinned"
+    payload.mkdir()
+    pinned.mkdir()
+    (pinned / "f").write_text("x", encoding="utf-8")
+    for x in (payload, pinned):
+        _age_tree(x)
+
+    def reap_then_declare(root, doomed, audit=None):
+        _pin(payload, pinned / "f")
+        return 0
+
+    monkeypatch.setattr(scratch_mod, "reap_processes_rooted_in", reap_then_declare)
+    assert prune_scratch_dir(scratch) == 0
+    assert payload.exists() and pinned.exists()
