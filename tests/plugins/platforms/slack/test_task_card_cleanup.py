@@ -166,6 +166,91 @@ async def test_retention_opt_out_preserves_completed_card(slack):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_method", ["chat.stopStream", "chat.delete"])
+async def test_cancelled_cleanup_reclaims_its_card_without_waiting_for_retry_delay(
+    slack, monkeypatch, cancel_method,
+):
+    adapter, client = slack
+    adapter._team_clients["T1"] = client
+    monkeypatch.setattr(task_cards, "RETRY_SECONDS", 3600)
+    await adapter.send_native_task_card_progress("C1", TASKS, metadata=METADATA)
+    original = client.api_call.side_effect
+    entered = asyncio.Event()
+    deleted = asyncio.Event()
+    block_once = True
+
+    async def api_call(method, *, json):
+        nonlocal block_once
+        if method == cancel_method and block_once:
+            block_once = False
+            entered.set()
+            await asyncio.Event().wait()
+        result = await original(method, json=json)
+        if method == "chat.delete":
+            assert json["ts"] == "card-1"
+            deleted.set()
+        return result
+
+    client.api_call.side_effect = api_call
+    stopping = asyncio.create_task(adapter.stop_native_task_card_progress("C1", metadata=METADATA))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        await asyncio.wait_for(deleted.wait(), timeout=2)
+        await asyncio.wait_for(adapter._task_card_cleanup.task, timeout=2)
+        assert json.loads(adapter._task_card_cleanup.path.read_text()) == []
+        assert not adapter._native_task_card_streams
+        # Recovery must not carry the stopped turn's state into the next turn.
+        result = await adapter.send_native_task_card_progress("C1", TASKS, metadata=METADATA)
+        assert result.success and result.message_id == "card-2"
+        assert [entry["ts"] for entry in json.loads(adapter._task_card_cleanup.path.read_text())] == ["card-2"]
+    finally:
+        stopping.cancel()
+        await adapter._task_card_cleanup.close()
+
+
+@pytest.mark.asyncio
+async def test_new_cleanup_wakes_an_existing_retry_worker(slack, monkeypatch):
+    adapter, client = slack
+    adapter._team_clients["T1"] = client
+    monkeypatch.setattr(task_cards, "RETRY_SECONDS", 3600)
+    original = client.api_call.side_effect
+    old_attempts = 0
+    retry_started = asyncio.Event()
+    old_deleted = asyncio.Event()
+    recover = False
+
+    async def api_call(method, *, json):
+        nonlocal old_attempts
+        if method == "chat.delete" and json["ts"] == "card-1":
+            old_attempts += 1
+            if old_attempts >= 2:
+                retry_started.set()
+            if not recover:
+                raise SlackApiError("not yet deletable", {"error": "cant_delete_message"})
+            old_deleted.set()
+        return await original(method, json=json)
+
+    client.api_call.side_effect = api_call
+    try:
+        await adapter.send_native_task_card_progress("C1", TASKS, metadata=METADATA)
+        await adapter.stop_native_task_card_progress("C1", metadata=METADATA)
+        await asyncio.wait_for(retry_started.wait(), timeout=2)
+        recover = True
+        result = await adapter.send_native_task_card_progress("C1", TASKS, metadata=METADATA)
+        assert result.success and result.message_id == "card-2"
+        await adapter.stop_native_task_card_progress("C1", metadata=METADATA)
+        await asyncio.wait_for(old_deleted.wait(), timeout=2)
+        await asyncio.wait_for(adapter._task_card_cleanup.task, timeout=2)
+        assert json.loads(adapter._task_card_cleanup.path.read_text()) == []
+        assert old_attempts == 3
+    finally:
+        await adapter._task_card_cleanup.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_delete_is_retried_until_confirmed_even_after_24h(slack, monkeypatch):
     adapter, client = slack
     adapter._team_clients["T1"] = client

@@ -61,6 +61,7 @@ class TaskCardCleanup:
         # Bind once in the adapter's owning profile, not a later routed turn.
         self.path = get_hermes_home() / "state" / "slack_task_cards.json"
         self.task = None
+        self.wake = asyncio.Event()
 
     def enabled(self) -> bool:
         extra = self.adapter.config.extra or {}
@@ -141,15 +142,22 @@ class TaskCardCleanup:
             logger.warning("[Slack] Native task-card sweep failed: %s", exc)
 
     def start(self, *, immediate: bool = False) -> None:
-        if self.enabled() and self._read() and (self.task is None or self.task.done()):
-            self.task = asyncio.create_task(self._run(immediate))
+        if not self.enabled() or not self._read():
+            return
+        if immediate:
+            self.wake.set()
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._run())
 
-    async def _run(self, immediate: bool) -> None:
+    async def _run(self) -> None:
         try:
-            if immediate:
-                await self.sweep()
             while self.enabled() and self._read():
-                await asyncio.sleep(RETRY_SECONDS)
+                if not self.wake.is_set():
+                    try:
+                        await asyncio.wait_for(self.wake.wait(), timeout=RETRY_SECONDS)
+                    except TimeoutError:
+                        pass
+                self.wake.clear()
                 await self.sweep()
         except Exception as exc:
             logger.warning("[Slack] Native task-card retry worker failed: %s", exc)

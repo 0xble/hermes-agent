@@ -2154,7 +2154,9 @@ class SlackAdapter(BasePlatformAdapter):
             finally:
                 if self._native_task_card_streams.get(key) is stream:
                     self._native_task_card_streams.pop(key, None)
-                self._task_card_cleanup.start()
+                # Cancellation can interrupt sealing or deletion. The adapter-owned
+                # worker must reclaim that card now, not after its retry delay.
+                self._task_card_cleanup.start(immediate=True)
 
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
