@@ -13,6 +13,8 @@ from typing import Any
 from agent.i18n import t
 from rich.markup import escape as _escape
 
+from hermes_cli.goal_notices import goal_notices_enabled
+
 
 def _fresh_start() -> str:
     """Banner line printed after /clear — resolved at call time so the active language applies."""
@@ -607,7 +609,8 @@ class CLILoopsMixin:
             prompt = mgr.lifted_barrier_prompt()
             if prompt:
                 from cli import _DIM, _RST, _cprint
-                _cprint(f"  {_DIM}{t('cli.goal.barrier_lifted')}{_RST}")
+                if goal_notices_enabled():
+                    _cprint(f"  {_DIM}{t('cli.goal.barrier_lifted')}{_RST}")
                 since = mgr.state.waiting_since
                 instance = mgr.state.created_at
                 self._pending_input.put(prompt)
@@ -800,7 +803,8 @@ class CLILoopsMixin:
         decision = mgr.evaluate_after_turn(
             last_response, user_initiated=getattr(self, "_goal_turn_user_initiated", True),
             background_processes=_bg_procs, active_delegations=_active_deleg)
-        _print_decision_message(decision)
+        if goal_notices_enabled():
+            _print_decision_message(decision)
         if decision.get("should_continue"):
             prompt = decision.get("continuation_prompt")
             if prompt:

@@ -69,6 +69,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Build store dependencies | Resolve package hook dependencies from the caller-owned build store, with scoped cleanup and ordinary sealed-store fallback | PM install lifecycle, dependency lookup, archived web builds, or ARM64 Windows ripgrep staging | [Build store dependencies](maintenance/build-store-dependencies.md) |
 | Documents extra | Opt-in, platform-gated document toolchain extra that bundles never preinstall and PM detects once installed | Optional extras, opt-in or platform gates, extra anchors, or document toolchain pins | [Documents extra](maintenance/documents-extra.md) |
 | TTS discovery without installation | Defer optional SDK installation until TTS use instead of blocking unrelated turns | TTS capability registration, lazy SDK imports, or tool-schema discovery changes | [TTS discovery](maintenance/tts-discovery-no-install.md) |
+| LPG runtime preservation | Preserve silent goal evaluation, catalog fallback credentials, and human Slack/API behavior on a modern signed runtime | LPG runtime repins, goal notice surfaces, custom provider credential resolution, or Slack sender/status changes | [LPG runtime preservation](maintenance/lpg-runtime-preservation.md) |
 | Autonomous goals | Opt-in contract-preserving agent controls, recorded completion proof and timed blocker recovery | Goal tools, judging, revisions, approval or idle wake changes | [Autonomous goals](maintenance/goal-autonomy.md) |
 | Goal lifecycle | Complete judge criteria, conversational recovery of blocker pauses, and durable command authority during judging | Goal judging, admission, continuation, or concurrent goal-command changes | [Goal lifecycle](maintenance/goal-lifecycle.md) |
 | Loop lifecycle | Versioned agent-authorized /loop revisions preserve user authority, cadence state, and cross-surface wakeup persistence | LoopManager revisions, loop wakeup prompts, stale loop-manager caches, or loop receipts | [Loop lifecycle](maintenance/loop-lifecycle.md) |
@@ -519,6 +520,15 @@ so unreviewed remembered resolutions cannot silently resolve a new release confl
 - **Focused regression:** `HERMES_HOME=<isolated test home> .venv/bin/python -m pytest -q tests/hermes_cli/test_update_main_guard.py tests/hermes_cli/test_update_autostash.py tests/hermes_cli/test_update_fleet_restart_pending.py tests/hermes_cli/test_source_channel_integration.py`.
 - **Retirement:** Remove when the maintained upstream update path preserves live `origin/main` commits with equivalent refusal, receipt, override, and orphan-rescue coverage.
 - **Rollback:** Revert the commits carrying `Fork-Patch: update-main-drop-guard`.
+
+## Goal Notice Policy
+
+The `goals.notices` setting gates automatic gateway, CLI and TUI goal receipts,
+verdicts, resumes and lifted-wait output. Evaluation and queued follow-ups remain
+active. Explicit controls and compression-failure recovery warnings remain visible.
+Guards: `tests/gateway/test_goal_notices_config.py`,
+`tests/hermes_cli/test_goal_notice_surfaces.py` and
+`tests/tui_gateway/test_goal_notice_surfaces.py`.
 
 ## Eager plugin tools
 

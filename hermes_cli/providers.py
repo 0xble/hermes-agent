@@ -204,7 +204,10 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     if mdev_info is not None:
         ov = overlay or HermesOverlay()
         env_vars = list(mdev_info.env)
-        for ev in ov.extra_env_vars:
+        # Catalog metadata must not hide credentials declared by a registered plugin.
+        profile = _plugin_profile_pdef(canonical)
+        plugin_keys = profile.api_key_env_vars if profile is not None else ()
+        for ev in (*plugin_keys, *ov.extra_env_vars):
             if ev not in env_vars:
                 env_vars.append(ev)
         return _overlay_pdef(canonical, ov, mdev_info.name, tuple(env_vars), ov.base_url_override or mdev_info.api,

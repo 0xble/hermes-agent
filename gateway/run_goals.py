@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 from gateway.run_loop_wake import GatewayLoopWakeMixin
+from hermes_cli.goal_notices import goal_notices_enabled
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -379,8 +380,11 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _send_goal_status_notice(
         self, source: Any, message: str, *, notice_kind: Optional[str] = None,
+        goal_notice: bool = True,
     ) -> None:
         """Send a /goal judge status line without holding the turn open for flood recovery."""
+        if goal_notice and not goal_notices_enabled():
+            return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
@@ -414,19 +418,23 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         )
         self._track_goal_notice_retry(task)
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self, source: Any, message: str, *, goal_notice: bool = True,
+    ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The adapter sends the agent response after this caller returns, so for reading order use
         its one-shot post-delivery callback when available, else deliver directly (never drop).
         """
+        if goal_notice and not goal_notices_enabled():
+            return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
 
         async def _deliver() -> None:
             try:
-                await self._send_goal_status_notice(source, message)
+                await self._send_goal_status_notice(source, message, goal_notice=goal_notice)
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 
@@ -837,7 +845,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             functools.partial(mgr.complete_tick, final_response or "", tick=loop_tick))
         msg = decision.get("message") or ""
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            await self._defer_goal_status_notice_after_delivery(source, msg, goal_notice=False)
 
     async def _post_command_loop_completion(self, event: Any, source: Any) -> None:
         """Settle only a command dispatch that completed without falling through to model work."""

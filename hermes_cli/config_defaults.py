@@ -1456,6 +1456,8 @@ DEFAULT_CONFIG = {
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
         "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
+        # Hide lifecycle notices, not explicit queries, errors or approval requests.
+        "notices": True,
         # Max turns before pausing, or a paced counter checkpoint when autonomy is enabled.
         "max_turns": 20,
         # Minimum seconds between autonomous continuation turns (continuation after continuation,
