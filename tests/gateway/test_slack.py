@@ -383,6 +383,7 @@ class TestAppMentionHandler:
         assert "reaction_removed" in registered_events
         assert "assistant_thread_started" in registered_events
         assert "assistant_thread_context_changed" in registered_events
+        assert "agent_session_stopped" in registered_events
         # Slack slash commands are registered via a single regex matcher
         # covering every COMMAND_REGISTRY entry (e.g. /hermes, /btw, /stop,
         # /model, ...) so users get native-slash parity with Discord and
@@ -3323,6 +3324,21 @@ class TestMessageSplitting:
 
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("size", [77_965, 77_968])
+    async def test_send_keeps_two_chunk_boundary_without_transport_overhead(self, adapter, size):
+        """Raw Slack indicators must not spend Telegram escaping or an unused final fence."""
+        content = "x" * size
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        result = await adapter.send("C123", content)
+
+        assert result.success is True
+        posts = [call.kwargs["text"] for call in adapter._app.client.chat_postMessage.call_args_list]
+        assert len(posts) == 2
+        assert all(len(post) <= adapter.MAX_MESSAGE_LENGTH for post in posts)
+        assert "".join(post.removesuffix(f" ({i}/2)") for i, post in enumerate(posts, 1)) == content
+
+    @pytest.mark.asyncio
     async def test_send_coerces_string_unfurl_options(self, adapter):
         """`hermes config set` / Railway persist YAML booleans as strings.
 
@@ -4765,7 +4781,7 @@ class TestNativeTaskCardProgress:
 
         await adapter.stop_native_task_card_progress("C1", metadata=metadata)
 
-        assert team_client.api_call.await_args.args[0] == "chat.stopStream"
+        assert team_client.api_call.await_args.args[0] == "chat.delete"
         assert adapter._native_task_card_streams == {}
 
     @pytest.mark.asyncio
@@ -4822,7 +4838,7 @@ class TestNativeTaskCardProgress:
         assert [call.args[0] for call in client.api_call.await_args_list] == [
             "chat.startStream",
             "chat.appendStream",
-            "chat.stopStream",
+            "chat.stopStream", "chat.delete",
         ]
         assert adapter._native_task_card_streams == {}
 
@@ -4917,8 +4933,8 @@ class TestNativeTaskCardProgress:
         assert stream.stream_ts == "stream-2" and stream.stopped is False
 
         await adapter.stop_native_task_card_progress("C1", metadata=metadata)
-        stop = client.api_call.await_args_list[-1]
-        assert stop.args[0] == "chat.stopStream" and stop.kwargs["json"]["ts"] == "stream-2"
+        assert [(c.args[0], c.kwargs["json"]["ts"]) for c in client.api_call.await_args_list[-3:]] == [
+            ("chat.stopStream", "stream-2"), ("chat.delete", "stream-1"), ("chat.delete", "stream-2")]
         assert adapter._native_task_card_streams == {}
 
     @pytest.mark.asyncio

@@ -29,6 +29,9 @@ adapter state — so it is trivially unit-testable.
 from __future__ import annotations
 
 import re
+
+from .rich_media import (cards_block, presentation_line, sanitize_carousel,
+                         sanitize_context, sanitize_image, thumbnail)
 from typing import Any, Dict, List, Optional, Tuple
 
 # Slack Block Kit hard limits (https://docs.slack.dev/reference/block-kit/blocks)
@@ -74,6 +77,9 @@ def _indent_level(spaces: str) -> int:
 
 # Order matters: code first (opaque), then links, then emphasis.
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+# Private-use delimiters for held-out code spans; they carry no markdown meaning.
+_CODE_HOLD_OPEN, _CODE_HOLD_CLOSE = "", ""
+_CODE_HOLD_RE = re.compile(f"{_CODE_HOLD_OPEN}(\\d+){_CODE_HOLD_CLOSE}")
 _LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^()\s]+(?:\([^()]*\)[^()\s]*)*)\)")
 # Slack mrkdwn autolink: <scheme:target> or <scheme:target|label>.
 # Mentions (<@U…>, <#C…>, <!here>) have no scheme: and stay as text.
@@ -81,7 +87,9 @@ _SLACK_LINK_RE = re.compile(
     r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^>|]+)(?:\|([^>]+))?>"
 )
 _BOLD_RE = re.compile(r"(?:\*\*|__)(.+?)(?:\*\*|__)")
-_ITALIC_RE = re.compile(r"(?<![\*_])(?:\*|_)(?![\*_\s])(.+?)(?<![\*_\s])(?:\*|_)(?![\*_])")
+# Delimiters must not touch a word character outside the span, so snake_case, file_names and
+# 2*3 arithmetic stay literal (CommonMark's rule for ``_``; agents rarely use intraword ``*``).
+_ITALIC_RE = re.compile(r"(?<![\w*_])(?:\*|_)(?![\*_\s])(.+?)(?<![\*_\s])(?:\*|_)(?![\w*_])")
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
 
 
@@ -90,27 +98,48 @@ def _inline_elements(text: str) -> list[dict[str, Any]]:
     Produces ``text`` elements (optionally styled bold/italic/strike/code) and ``link`` elements.
     Unmatched markup is emitted verbatim as plain text, so this never loses characters."""
     elements: list[dict[str, Any]] = []
+    # Inline code is opaque, but emphasis may wrap it (``**`key`:**``). Code spans become
+    # placeholders so emphasis can span them, then come back as code elements that keep the
+    # surrounding style. Splitting on code first left the ``**`` halves as literal text.
+    codes: list[str] = []
+
+    def _hold_code(m: re.Match[str]) -> str:
+        codes.append(m.group(1))
+        return f"{_CODE_HOLD_OPEN}{len(codes) - 1}{_CODE_HOLD_CLOSE}"
+
+    def _held(m: re.Match[str]) -> Optional[str]:
+        i = int(m.group(1))
+        return codes[i] if i < len(codes) else None  # a literal delimiter pair in the input
+
+    def _restore_code(s: str) -> str:
+        return _CODE_HOLD_RE.sub(lambda m: m.group(0) if _held(m) is None else f"`{_held(m)}`", s)
 
     def emit_text(s: str, style: Optional[dict[str, bool]] = None) -> None:
+        pos = 0
+        for m in _CODE_HOLD_RE.finditer(s):
+            code = _held(m)
+            if code is None:
+                continue
+            _emit_plain(s[pos : m.start()], style)
+            _emit_plain(code, {**(style or {}), "code": True})
+            pos = m.end()
+        _emit_plain(s[pos:], style)
+
+    def _emit_plain(s: str, style: Optional[dict[str, bool]]) -> None:
         if not s:
             return
         el: dict[str, Any] = {"type": "text", "text": s}
         if style:
-            el["style"] = style
+            el["style"] = dict(style)
         elements.append(el)
 
-    # Tokenize by the highest-priority markers first using a single scan.
-    # We recursively split on code, then links, then emphasis to keep spans
-    # from overlapping incorrectly.
+    # Tokenize by the highest-priority markers first: code is held out, then links, then
+    # emphasis, recursing so spans never overlap incorrectly.
     def walk(s: str, style: dict[str, bool]) -> None:
-        pos = 0
-        # inline code is opaque — no nested styling
-        for m in _INLINE_CODE_RE.finditer(s):
-            _walk_links(s[pos : m.start()], style)
-            emit_text(m.group(1), {**style, "code": True})
-            pos = m.end()
-        _walk_links(s[pos:], style)
+        _walk_links(_INLINE_CODE_RE.sub(_hold_code, s), style)
+
     def _emit_link(url: str, text: str, style: dict[str, bool]) -> None:
+        url, text = _restore_code(url), _restore_code(text)
         link_el: dict[str, Any] = {"type": "link", "url": url, "text": text}
         if style:
             link_el["style"] = dict(style)
@@ -360,6 +389,17 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
         while i < n:
             line = lines[i]
 
+            special = presentation_line(line, fmt)
+            if special:
+                accessory = thumbnail(line) if para else None
+                flush_para()
+                if accessory and blocks and blocks[-1]["type"] == "section":
+                    blocks[-1]["accessory"] = accessory
+                else:
+                    blocks.append(special)
+                i += 1
+                continue
+
             # Blank line: paragraph boundary
             if not line.strip():
                 flush_para()
@@ -377,7 +417,9 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
                     body.append(lines[i])
                     i += 1
                 i += 1  # consume closing fence
-                blocks.append(_preformatted_block("\n".join(body)))
+                text = "\n".join(body)
+                card = cards_block(text, fmt) if fence.group(2).strip() == "cards" else None
+                blocks.append(card or _preformatted_block(text))
                 continue
 
             # Horizontal rule → divider
@@ -568,6 +610,12 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
             btype = block["type"]
 
             if btype == "section":
+                accessory = block.get("accessory")
+                if isinstance(accessory, dict) and accessory.get("type") == "image":
+                    block = dict(block)
+                    block["accessory"] = sanitize_image(accessory)
+                    if not block["accessory"]:
+                        block.pop("accessory")
                 text_obj = block.get("text")
                 has_body = bool(block.get("fields")) or bool(block.get("accessory"))
                 if isinstance(text_obj, dict):
@@ -588,17 +636,17 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
                     block = dict(block)
                     block["text"] = clamped
             elif btype == "context":
-                elements = block.get("elements") or []
-                if not elements:
+                block = sanitize_context(block)
+                if not block:
                     continue
-                clamped_els = [
-                    _clamp_text_obj(el, MAX_SECTION_TEXT)
-                    if isinstance(el, dict) and el.get("type") in ("mrkdwn", "plain_text")
-                    else el
-                    for el in elements]
-                if any(c is not e for c, e in zip(clamped_els, elements)):
-                    block = dict(block)
-                    block["elements"] = clamped_els
+            elif btype == "image":
+                block = sanitize_image(block, block=True)
+                if not block:
+                    continue
+            elif btype == "carousel":
+                block = sanitize_carousel(block)
+                if not block:
+                    continue
             elif btype in ("rich_text", "actions", "context_actions"):
                 if not block.get("elements"):
                     continue

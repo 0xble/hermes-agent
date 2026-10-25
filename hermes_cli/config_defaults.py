@@ -157,13 +157,13 @@ DEFAULT_CONFIG = {
             # drops from 3 to 1. Unknown pricing / missing usage leaves it untouched.
             "cost_threshold_usd": 0.25,
         },
-        # Fast mode: "" / "normal" (off), "fast" (always), "auto" (first fast_auto_seconds of every
-        # turn), "cold" (first turn of a session only). Messaging gateway sessions only:
-        # agent.fast_expiry_seconds is the seconds before a session fast/ultrafast override switches
-        # to normal; 0 disables. CLI/TUI sessions do not expire.
+        # Fast: ""/normal (off), fast (always), auto (first fast_auto_seconds each turn),
+        # cold (first turn only). Gateway sessions expire per tier: Fast 30m, Ultrafast 5m.
+        # Zero disables that tier's expiry. CLI/TUI sessions do not expire.
         "service_tier": "",
         "fast_auto_seconds": 60,
-        "fast_expiry_seconds": 0,
+        "fast_expiry_seconds": 1800,
+        "ultrafast_expiry_seconds": 300,
         # Responses API final-answer length (`text.verbosity`): "" = not sent (provider default),
         # or low | medium | high. Responses-family transports only; chat_completions never sends it.
         "text_verbosity": "",
@@ -2282,7 +2282,7 @@ DEFAULT_CONFIG = {
         # Media is read fully into memory first, so unbounded uploads (Discord Nitro: 500 MB) or
         # huge remote URLs can OOM-kill constrained deployments. Enforced in
         # gateway/platforms/base.py for every adapter. 0 = no cap. Default 128 MiB.
-        "max_inbound_media_bytes": 134217728,
+        "max_inbound_media_bytes": 128 * 1024 * 1024,
         # Let adapters read HTTP_PROXY/HTTPS_PROXY/NO_PROXY/SSL_CERT_FILE from the environment and
         # auto-detect generic/macOS system proxies. False when the gateway inherits a proxy it must
         # not use (e.g. a scheduled task picking up a Clash/V2Ray HTTP_PROXY -> "Cannot connect to

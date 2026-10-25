@@ -195,6 +195,26 @@ had relabelled the task as a background trigger (2026-10-08 to 10-10, ~170 failu
 Telegram adapter now runs post-delivery callbacks under the trigger of the turn that registered
 them. Regression: `tests/gateway/test_telegram_daily_quota.py`.
 
+**Daily call budget** (`daily_quota.py`, 2026-10-24). Messages alone did not bound the day: the
+2026-10-24 bans (2967s at 02:17 PDT, 36261s at 17:03 PDT) came after 26174 and 19875 metered calls
+while message counts (3024, 2407) were below ban-free days (3112, 4157). Typing and edits create no
+messages, so background producers spent ~9k calls overnight before the message rule engaged, and
+typed turns (10116 of the 19875) were never shed. Every metered call now also counts against
+`daily_call_soft_ceiling` (default 12000): background cosmetics shed at 50% of it, and at 100%
+typed turns shed typing, interim edits and explicitly labelled progress while labelled background
+notices shed too. Typed notices and all finals are never shed, and a typed turn's unlabelled
+`_interim_send` sends (/login codes, approval fallbacks, stuck warnings) are not inferred as progress.
+Untagged traffic (busy acks, button taps, restart and recovery notes, cron delivery: a few hundred
+calls a day) is outside the call rule and metered by the message rule only. Known gap: an outbox
+row persisted from an unlabelled typed `_interim_send` replays as progress (`gateway/outbox.py`
+`_outbound_class_for_payload`), so a restart can shed it once the call budget is past 50%. A penalty of 600s or more halves the call budget for the 24h
+after the penalty ends (a shorter penalty never pulls that end earlier), persisted in `daily_penalty` in `telegram-flood-state.db` and re-read on
+every flush so a penalty the standalone lane records reaches the running gateway. Visible effect: on a heavy day, typed
+turns lose the typing indicator and live progress bubble late in the Telegram day; the answer still
+arrives. `0` disables the call budget (counting continues). Regression: the call-budget cases in
+`tests/gateway/test_telegram_daily_quota.py`. Rollback: revert the `fix(telegram): bound daily
+calls` commit; the extra table is ignored by older code.
+
 **User voice echoes** (`telegram-chat-budget`). The shared gateway STT echo path
 classifies a response to a non-internal voice event as `OUTBOUND_FINAL` for budget
 priority, regardless of the queued task's inherited trigger or outbound class.

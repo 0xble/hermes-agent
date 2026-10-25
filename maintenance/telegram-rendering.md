@@ -378,11 +378,14 @@ check the returned blocks. Rollback removes that function and its call in
 
 Long split replies derive their indicator reserve from the source codepoint
 length: every iteration consumes at least one codepoint, so neither the chunk
-index nor total can exceed that bound. The reserve measures the bounded suffix,
-both MarkdownV2 parenthesis escapes, and a possible fence-separation newline
-through the caller's length function. The final-chunk budget also includes fence
-closure. Tiny limits retain monotonic progress even when a single codepoint or
-the required wrappers cannot fit.
+index nor total can exceed that bound. The shared splitter measures its raw
+suffix through the caller's length function. Telegram explicitly supplies
+`indicator_overhead=3` for both MarkdownV2 parenthesis escapes and a conservative
+fence-separation newline, including standalone MarkdownV2 sends. HTML sends and
+other platforms retain the neutral default of zero. The final-chunk budget
+reserves fence closure only for a reopened fence that remains open, not plain
+text. Tiny limits retain monotonic progress even when a single codepoint or the
+required wrappers cannot fit.
 
 Upstream PR #126100 supplies the static three-digit fix (12 units), not this
 arbitrary-width protection: four-digit counts still reached 4,097–4,098 UTF-16
@@ -391,7 +394,17 @@ units on that candidate. The dynamic bound is fork-owned under the existing
 the full behavior. `tests/gateway/test_telegram_chunk_indicator_budget.py` checks
 actual mocked outbound payloads at 99/100, 999/1000, and higher counts, including
 astral characters, exact indices/totals, and balanced fences. Its cheap helper
-cases cover arbitrary budgets/count widths and final reopened-fence closure.
+cases opt into Telegram's adapter overhead and cover arbitrary budgets/count
+widths and final reopened-fence closure. Slack's full send path keeps 77,965 and
+77,968 characters in 2 complete posts, and Discord's 15,850-character send fits
+its 8-message cap without substituting a truncation notice. These boundaries
+also protect against reserving an unnecessary final closing fence.
+
+The transport-isolation repair changes no producer, limiter, concurrency, or
+Telegram chunk boundary. Slack posts decrease from 3 to 2 at the regression
+boundary. Discord needs 8 rather than 9 pre-cap chunks, delivering 8 either way.
+No conversation's request rate or duration allowance increases.
+
 Retire only when a released upstream splitter passes these regressions unchanged;
 an open PR or static reserve increase alone does not qualify.
 

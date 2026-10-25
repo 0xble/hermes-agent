@@ -53,9 +53,21 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 try:  # sibling module; support both package and flat plugin-dir import
+    from .attachment_errors import describe_download_exception
     from .block_kit import render_blocks, sanitize_blocks
+    from .message_changes import log_message_ingress, normalize_changed_message
+    from .thread_cleanup import process_changed_message
+    from .adapter_native_stop import handle_agent_session_stopped
+    from .task_card_stream import start_native_task_card_stream
+    from .task_cards import finish_task_card
 except ImportError:  # pragma: no cover - plugin loaded outside package context
+    from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from message_changes import log_message_ingress, normalize_changed_message  # type: ignore
+    from adapter_native_stop import handle_agent_session_stopped  # type: ignore
+    from task_card_stream import start_native_task_card_stream  # type: ignore
+    from task_cards import finish_task_card  # type: ignore
+    from thread_cleanup import process_changed_message
 
 
 logger = logging.getLogger(__name__)
@@ -334,6 +346,7 @@ class _NativeTaskCardStream:
     channel: str
     thread_ts: str
     stream_ts: str = ""
+    message_timestamps: list[str] = field(default_factory=list)
     stopped: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -952,12 +965,6 @@ _TRANSIENT_UPLOAD_MARKERS = (
 _SLACK_PERMISSION_ERRORS = frozenset(
     {"access_denied", "file_access_denied", "no_permission", "not_allowed_token_type", "restricted_action"}
 )
-_SLACK_HTTP_STATUS_TEMPLATES = {
-    401: "Slack attachment access failed for {file_label} with HTTP 401. The bot token is not "
-         "authorized for this file.",
-    403: "Slack attachment access failed for {file_label} with HTTP 403. The bot likely lacks "
-         "permission or scope to read this file.",
-    404: "Slack attachment {file_label} returned HTTP 404 and is no longer reachable."}
 # (error codes, user-facing template) for ``_describe_slack_api_error``; first match wins.
 _SLACK_API_ERROR_TEMPLATES = (
     ({"not_authed", "invalid_auth", "account_inactive", "token_revoked"},
@@ -1445,25 +1452,8 @@ class SlackAdapter(BasePlatformAdapter):
     def _describe_slack_download_failure(
         self, exc: Exception, *, file_obj: Optional[dict[str, Any]] = None) -> Optional[str]:
         """Translate Slack download exceptions into user-facing attachment diagnostics."""
-        file_label = _attachment_label(file_obj)
-        response = getattr(exc, "response", None)
-        api_detail = self._describe_slack_api_error(response, file_obj=file_obj)
-        if api_detail:
-            return api_detail
-        try:
-            import httpx
-        except Exception:  # pragma: no cover
-            httpx = None
-        if httpx is not None and isinstance(exc, httpx.HTTPStatusError):
-            template = _SLACK_HTTP_STATUS_TEMPLATES.get(exc.response.status_code)
-            if template:
-                return template.format(file_label=file_label)
-        message = str(exc)
-        if "Slack returned HTML instead of media" in message or "non-image data" in message:
-            return (
-                f"Slack attachment access failed for {file_label}: Slack returned an HTML/login or non-media response. "
-                "This usually means a scope, auth, or file-permission problem.")
-        return None
+        return self._describe_slack_api_error(getattr(exc, "response", None), file_obj=file_obj) or (
+            describe_download_exception(exc, _attachment_label(file_obj)))
 
     # Slash-command ephemeral helpers. response_url is valid 30 min; the much shorter TTL avoids
     # routing unrelated messages as ephemeral after a slow/dropped handler. Hard cap because TTL
@@ -1655,7 +1645,8 @@ class SlackAdapter(BasePlatformAdapter):
             ("file_change", _noop), ("reaction_added", _reaction(False)),
             ("reaction_removed", _reaction(True)),
             ("assistant_thread_started", self._handle_assistant_thread_lifecycle_event),
-            ("assistant_thread_context_changed", self._handle_assistant_thread_lifecycle_event)):
+            ("assistant_thread_context_changed", self._handle_assistant_thread_lifecycle_event),
+            ("agent_session_stopped", functools.partial(handle_agent_session_stopped, self))):
             self._app.event(event_type)(_listener_for(handler))
         # Catch-all ack: unacked envelopes count as failures and past 95%/60-min Slack disables
         # Event Subscriptions (ALL inbound). Registered AFTER all named handlers (first match wins).
@@ -2096,7 +2087,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Start or update a Slack-native plan/task progress stream."""
         title = title or t("platform.slack.task_card.title")
         if not self._app:
-            return SendResult(success=False, error="Not connected")
+            return SendResult(success=False, error="Not connected", retryable=True, pre_send=True)
         if not tasks:
             return SendResult(success=False, error="No tasks")
         key = self._native_task_card_key(chat_id, reply_to, metadata)
@@ -2113,7 +2104,7 @@ class SlackAdapter(BasePlatformAdapter):
             try:
                 client = self._get_client(chat_id, team_id=stream.team_id)
                 if not stream.stream_ts:
-                    await self._start_native_task_card_stream(client, stream, metadata)
+                    await start_native_task_card_stream(client, stream, metadata)
                 chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": str(title)[:256]}]
                 chunks.extend(self._task_update_chunk(task) for task in tasks)
                 # chunks-only: Slack rejects markdown_text alongside chunks
@@ -2125,46 +2116,29 @@ class SlackAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     if not _slack_error_is(exc, "message_not_in_streaming_state"):
                         raise
-                    # Slack seals a native stream server-side after a few minutes of a long
-                    # turn (live-observed at ~5m20s, 2026-09-16; the lifetime is not
-                    # documented). The sealed message is a regular message now, so reopen a
-                    # fresh card in the same thread. Every frame already carries the FULL
-                    # visible projection, so nothing is lost; the user sees the card
-                    # continue instead of degrading to text bubbles. One reopen per update:
-                    # a second rejection is a real failure.
+                    # Slack can seal a stream mid-turn. Reopen in the same thread with the
+                    # full projection, once per update. A second rejection reaches the gateway.
                     logger.info(
                         "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
                         "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts)
                     stream.stream_ts = ""
-                    await self._start_native_task_card_stream(client, stream, metadata)
+                    await start_native_task_card_stream(client, stream, metadata)
                     await client.api_call(
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
-                logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
-                return SendResult(success=False, error=str(exc), retryable=True)
-
-    @staticmethod
-    async def _start_native_task_card_stream(
-        client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
-    ) -> None:
-        """chat.startStream a plan-mode card in ``stream``'s thread; sets ``stream.stream_ts``."""
-        start_payload: dict[str, Any] = {
-            "channel": stream.channel, "thread_ts": stream.thread_ts,
-            "task_display_mode": "plan"}
-        md = metadata or {}
-        recipients = (
-            ("recipient_team_id", ("recipient_team_id", "team_id", "slack_team_id")),
-            ("recipient_user_id", ("recipient_user_id", "user_id")))
-        for key, sources in recipients:
-            value = _first_truthy(md, sources)
-            if value:
-                start_payload[key] = value
-        result = await client.api_call("chat.startStream", json=start_payload)
-        if hasattr(result, "get"):
-            stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
-        if not stream.stream_ts:
-            raise RuntimeError("Slack startStream returned no stream timestamp")
+                retryable = isinstance(exc, (TimeoutError, ConnectionError)) or self._is_retryable_upload_error(exc)
+                # A timed-out start may already have created a card. Only a positive
+                # rate-limit rejection proves it is safe to start again.
+                rate_limited = (_slack_error_is(exc, "ratelimited")
+                                or getattr(getattr(exc, "response", None), "status_code", None) == 429)
+                held = not stream.stream_ts and (
+                    (retryable and not rate_limited)
+                    or str(exc) == "Slack startStream returned no stream timestamp")
+                logger.error("[Slack] Native task-card progress error (%s): %r", type(exc).__name__, exc, exc_info=True)
+                return SendResult(success=False, error=f"{type(exc).__name__}: {exc}",
+                                  retryable=retryable and not held, held=held,
+                                  retry_after=self._retry_after_from_exc(exc) if retryable else None)
 
     @staticmethod
     def _task_update_chunk(task: dict[str, str]) -> dict[str, Any]:
@@ -2183,11 +2157,14 @@ class SlackAdapter(BasePlatformAdapter):
                 return
             stream.stopped = True
             try:
-                if self._app and stream.stream_ts:
-                    await self._get_client(stream.channel, team_id=stream.team_id).api_call(
-                        "chat.stopStream", json={"channel": stream.channel, "ts": stream.stream_ts})
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.debug("[Slack] Native task-card stopStream failed: %s", exc)
+                if self._app and (stream.stream_ts or stream.message_timestamps):
+                    extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+                    ephemeral = extra.get("native_task_cards_ephemeral", True)
+                    await finish_task_card(
+                        self._get_client(stream.channel, team_id=stream.team_id), stream,
+                        delete=self._truthy_config(ephemeral))
+            except Exception as exc:  # Never let progress cleanup block the real reply.
+                logger.warning("[Slack] Native task-card cleanup failed: %s", exc)
             finally:
                 if self._native_task_card_streams.get(key) is stream:
                     self._native_task_card_streams.pop(key, None)
@@ -2195,7 +2172,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None) -> None:
-        """Finalize an active Slack-native progress stream exactly once."""
+        """Seal and remove transient progress, including on interrupted turns."""
         key = self._native_task_card_key(chat_id, reply_to, metadata)
         if key is None:
             return
@@ -3196,6 +3173,15 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:  # pragma: no cover - renderer already guards itself
             logger.debug("[Slack] block render failed; using plain text", exc_info=True)
             return None
+
+    def extract_images(self, content: str) -> tuple[list[tuple[str, str]], str]:
+        """Native image syntax stays in blocks, other images remain attachments."""
+        if (self._extra_flag("rich_blocks") and not self._extra_flag("markdown_blocks")
+                and len(self.format_message(content)) <= self.MAX_MESSAGE_LENGTH
+                and self._maybe_blocks(content)):
+            from .rich_media import extract_attachment_images
+            return extract_attachment_images(content, super().extract_images)
+        return super().extract_images(content)
 
     def format_tool_preview(self, preview) -> str:
         """Keep compact tool arguments out of mrkdwn emphasis conversion."""
@@ -4203,19 +4189,22 @@ class SlackAdapter(BasePlatformAdapter):
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         return getattr(runner, "_is_user_authorized", None)
 
-    def _early_reject_unauthorized(self, user_id: str, channel_id: str, is_dm: bool) -> bool:
+    def _early_reject_unauthorized(
+        self, user_id: str, channel_id: str, is_dm: bool, *, thread_id: Optional[str] = None
+    ) -> bool:
         """True (logged) when the sender is definitively unauthorized. Injected profile-bound check
         first (works under multiplex, where the handler has no ``__self__``), then runner
         introspection. Unknown (None) is NOT a rejection."""
         chat_type = "dm" if is_dm else "group"
         decision = (
-            self._is_sender_authorized(user_id, chat_type, channel_id)
+            self._is_sender_authorized(user_id, chat_type, channel_id, thread_id=thread_id)
             if user_id and getattr(self, "_authorization_check", None) is not None
             else None)
         auth_fn = self._runner_auth_fn()
         if decision is None and user_id and callable(auth_fn):
             source = self.build_source(
-                chat_id=channel_id, chat_name="", chat_type=chat_type, user_id=user_id, user_name=""
+                chat_id=channel_id, chat_name="", chat_type=chat_type, user_id=user_id, user_name="",
+                thread_id=thread_id
             )
             decision = bool(auth_fn(source))
         if decision is False:
@@ -4265,29 +4254,8 @@ class SlackAdapter(BasePlatformAdapter):
         return True
 
     def _normalize_changed_message(self, event: dict) -> Optional[dict]:
-        """Turn a ``message_changed`` envelope into a plain message event.
-        None if malformed or the original was already routed to the agent. The edit's own ts rides
-        along as ``_slack_changed_event_ts`` for dedup."""
-        updated_message = event.get("message")
-        if not isinstance(updated_message, dict):
-            return None
-        original_message_ts = str(updated_message.get("ts") or "")
-        if original_message_ts and original_message_ts in self._processed_message_ts:
-            return None
-        edited = updated_message.get("edited")
-        edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
-        outer_event_ts = str(event.get("ts") or "")
-        changed_event_ts = (
-            str(event.get("event_ts") or edited_ts or "")
-            or (outer_event_ts if outer_event_ts != original_message_ts else "")
-            or (f"{original_message_ts}:changed" if original_message_ts else ""))
-        normalized_event = dict(updated_message)
-        for key in ("channel", "channel_type", "team", "team_id"):
-            if not normalized_event.get(key) and event.get(key):
-                normalized_event[key] = event.get(key)
-        if changed_event_ts:
-            normalized_event["_slack_changed_event_ts"] = changed_event_ts
-        return normalized_event
+        """Normalize unseen user edits, excluding metadata-only thread-root updates."""
+        return normalize_changed_message(self, event)
 
     @staticmethod
     def _append_link_unfurls(text: str, slack_attachments: list) -> str:
@@ -4516,24 +4484,12 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: dict, payload: Optional[dict]) -> Optional[tuple[dict, str, str]]:
         """Normalize edits, then drop replays / ignored channels / bot posts / deletions.
         Returns ``(event, team_id, channel_id)`` for messages the handler should consider."""
-        # Entry log BEFORE any filtering so operators can tell "dropped here"
-        # from "never subscribed in the manifest". Metadata only, never text.
-        # DEBUG entry log — fires BEFORE any filtering so users debugging bot-to-bot interop, allow_bots
-        # config, or SLACK_ALLOWED_USERS drops can confirm whether the event actually arrived from Slack
-        # (vs. being silently filtered upstream by the app's event subscriptions — Socket Mode will not
-        # deliver events the app manifest hasn't subscribed to). See #30091.
-        if logger.isEnabledFor(logging.DEBUG):
-            _bot_profile = event.get("bot_profile") or {}
-            logger.debug(
-                "[Slack] event received type=%s subtype=%s user=%s bot_id=%s bot_name=%s "
-                "channel=%s ts=%s thread_ts=%s", event.get("type"), event.get("subtype"),
-                event.get("user", "") or "", event.get("bot_id", "") or "",
-                (_bot_profile.get("name") if isinstance(_bot_profile, dict) else "") or "",
-                event.get("channel", ""), event.get("ts", ""), event.get("thread_ts", ""))
+        log_message_ingress(event, payload)
         if event.get("subtype") == "message_changed":
-            event = self._normalize_changed_message(event)
-            if event is None:
+            normalized_event = await process_changed_message(self, event, payload)
+            if normalized_event is None:
                 return None
+            event = normalized_event
         # Socket Mode redelivers after reconnects. Scope by workspace: ts is only unique per team.
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777) Scope the dedup id by
         # workspace: Slack event ts values are only unique within one workspace, so two teams' events with
@@ -6643,21 +6599,32 @@ async def _resolve_slack_user_dm(token: str, user_id: str) -> Optional[str]:
 
 
 def _standalone_post_kwargs(
-    chat_id: str, text: Any, unfurl_kwargs: dict[str, Any], thread_id: Optional[str]
+    chat_id: str, text: Any, unfurl_kwargs: dict[str, Any], thread_id: Optional[str], blocks=None
 ) -> dict[str, Any]:
     """``chat.postMessage`` kwargs for the standalone senders (key order is the wire order)."""
     kwargs: dict[str, Any] = {"channel": chat_id, "text": text, "mrkdwn": True, **unfurl_kwargs}
+    if blocks:
+        kwargs["blocks"] = blocks
     if thread_id:
         kwargs["thread_ts"] = thread_id
     return kwargs
 
 
 async def _standalone_post_text(
-    client, chat_id: str, text: Any, unfurl_kwargs: dict[str, Any], thread_id: Optional[str]
+    client, chat_id: str, text: Any, unfurl_kwargs: dict[str, Any], thread_id: Optional[str], blocks=None
 ) -> dict[str, Any]:
-    """``chat.postMessage`` via the SDK client; returns the response as a plain dict."""
-    kwargs = _standalone_post_kwargs(chat_id, text, unfurl_kwargs, thread_id)
-    return _slack_response_payload(await client.chat_postMessage(**kwargs))
+    """Post a media caption with the same rejected-block fallback as live replies."""
+    kwargs = _standalone_post_kwargs(chat_id, text, unfurl_kwargs, thread_id, blocks)
+    try:
+        payload = _slack_response_payload(await client.chat_postMessage(**kwargs))
+    except Exception as error:
+        if not blocks or not SlackAdapter._is_block_payload_rejection(error):
+            raise
+        payload = {"error": "invalid_blocks"}
+    if blocks and payload.get("error") in {"invalid_blocks", "msg_too_long", "too_many_blocks"}:
+        kwargs.pop("blocks")
+        payload = _slack_response_payload(await client.chat_postMessage(**kwargs))
+    return payload
 
 
 async def _standalone_upload_file(
@@ -6692,7 +6659,7 @@ async def _standalone_upload_file(
 
 async def _standalone_send_media(
     token: str, chat_id: str, media_files: list, thread_id: Optional[str], formatted: Optional[str],
-    formatted_caption: Optional[str], unfurl_kwargs: dict[str, Any]) -> dict[str, Any]:
+    formatted_caption: Optional[str], unfurl_kwargs: dict[str, Any], blocks=None) -> dict[str, Any]:
     """Media branch of ``_standalone_send``: ``files_upload_v2`` per file (+ optional text post).
     ``caption`` rides as ``initial_comment`` on the first successful upload unless
     link-preview controls are explicit (the upload API cannot carry them)."""
@@ -6708,12 +6675,12 @@ async def _standalone_send_media(
     _apply_slack_proxy(client, resolve_proxy_url())
     last_message_id = None
     # The upload API cannot carry unfurl controls; explicit ones need a separate caption post.
-    caption_as_upload_comment = bool(formatted_caption) and not unfurl_kwargs
+    caption_as_upload_comment = bool(formatted_caption) and not unfurl_kwargs and not blocks
     text_to_send = "" if caption_as_upload_comment else (formatted_caption or formatted or "")
     if text_to_send.strip():
         try:
             post_payload = await _standalone_post_text(
-                client, chat_id, text_to_send, unfurl_kwargs, thread_id)
+                client, chat_id, text_to_send, unfurl_kwargs, thread_id, blocks)
             if not post_payload.get("ok", True):
                 return send_error(f"Slack API error: {post_payload.get('error', 'unknown')}")
             last_message_id = post_payload.get("ts")
@@ -6730,7 +6697,7 @@ async def _standalone_send_media(
                 # Deliver the caption even though the file is missing.
                 try:
                     fb = await _standalone_post_text(
-                        client, chat_id, formatted_caption, unfurl_kwargs, thread_id)
+                        client, chat_id, formatted_caption, unfurl_kwargs, thread_id, blocks)
                     if fb.get("ok", True):
                         last_message_id = fb.get("ts") or last_message_id
                         caption_pending = False
@@ -6809,9 +6776,14 @@ async def _standalone_send(
     formatted = _standalone_format_mrkdwn(message) if message else message
     formatted_caption = _standalone_format_mrkdwn(caption) if caption else caption
     unfurl_kwargs = _slack_unfurl_kwargs(getattr(pconfig, "extra", None))
+    renderer = SlackAdapter.__new__(SlackAdapter)
+    renderer.config = pconfig
+    display_text = (caption or message) if media_files else message
+    blocks = renderer._maybe_blocks(display_text) if display_text and len(
+        _standalone_format_mrkdwn(display_text)) <= SlackAdapter.MAX_MESSAGE_LENGTH else None
     if media_files:
         return await _standalone_send_media(
-            token, chat_id, media_files, thread_id, formatted, formatted_caption, unfurl_kwargs)
+            token, chat_id, media_files, thread_id, formatted, formatted_caption, unfurl_kwargs, blocks)
     # --- Text-only path (existing aiohttp chat.postMessage) ---
     if not formatted or not formatted.strip():
         logger.debug("[Slack] _standalone_send: skipping empty/whitespace message")
@@ -6825,9 +6797,12 @@ async def _standalone_send(
         last_error = "unknown"
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            payload = _standalone_post_kwargs(chat_id, formatted, unfurl_kwargs, thread_id)
+            payload = _standalone_post_kwargs(chat_id, formatted, unfurl_kwargs, thread_id, blocks)
             for tok in tokens:
                 data = await _slack_json_post(session, tok, "chat.postMessage", payload, _req_kw)
+                if "blocks" in payload and data.get("error") in {"invalid_blocks", "msg_too_long", "too_many_blocks"}:
+                    payload.pop("blocks")
+                    data = await _slack_json_post(session, tok, "chat.postMessage", payload, _req_kw)
                 if data.get("ok"):
                     return {
                         "success": True, "platform": "slack", "chat_id": chat_id,
