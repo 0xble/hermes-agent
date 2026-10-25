@@ -5,6 +5,9 @@ pre-#531 main (3c537dad), and pre-rebase #551 (d662844);
 these fixtures deliberately do not import the current or legacy formatter constants.
 """
 
+import json
+from pathlib import Path
+
 import pytest
 
 from agent.synthetic_prompt import auto_recall_query, human_prompt_text
@@ -161,6 +164,60 @@ def _render(template: str) -> str:
 
 def _rows(formatter: str):
     return [row for row in GOAL_PROMPT_REGISTRY if row["formatter"] == formatter]
+
+
+FROZEN_REGISTRY_ROWS = json.loads(
+    (Path(__file__).parents[1] / "fixtures" / "goal_prompt_history.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("new_wording", [False, True])
+def test_regeneration_keeps_frozen_history_outside_reachable_commits(tmp_path, monkeypatch, new_wording):
+    import runpy
+    import sys
+    from scripts.dev import snapshot_goal_prompt_history as snapshot
+
+    historical = FROZEN_REGISTRY_ROWS[0]
+    output = tmp_path / "hermes_cli" / "goals_prompt_registry.py"
+    output.parent.mkdir()
+    output.write_text(f"GOAL_PROMPT_REGISTRY: tuple = ({historical!r},)\n", encoding="utf-8")
+    current = "A new contract for {goal}: {contract_block}." if new_wording else historical["template"]
+    (output.parent / "goals.py").write_text(
+        f"CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = {current!r}\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(snapshot, "REPO", tmp_path)
+    monkeypatch.setattr(snapshot, "OUTPUT", output)
+    monkeypatch.setattr(snapshot, "_commits", list)
+    monkeypatch.setattr(sys, "argv", ["snapshot_goal_prompt_history.py"])
+
+    assert snapshot.main() == 0
+    rows = runpy.run_path(str(output))["GOAL_PROMPT_REGISTRY"]
+    by_template = {row["template"]: row for row in rows}
+    assert set(by_template) == {historical["template"], current}
+    assert by_template[historical["template"]]["source_commits"] == tuple(historical["source_commits"])
+    if new_wording:
+        assert by_template[current]["source_commits"] == ("working-tree",)
+
+
+@pytest.mark.parametrize("row", FROZEN_REGISTRY_ROWS, ids=lambda row: row["source_commits"][0][:8])
+def test_frozen_unreachable_history_stays_out_of_both_memory_paths(row):
+    prompt = _render(row["template"])
+    if row["formatter"] == "revisions":
+        prompt = _render(BASE_SIMPLE_TEMPLATE) + prompt
+    assert human_prompt_text(prompt) is None
+    assert auto_recall_query(prompt) == ""
+    assert filter_retain_messages(prompt, "[SILENT]") == (None, None)
+
+    merged = prompt + "\n\n" + HUMAN
+    if row["formatter"] == "revisions":
+        # Unframed revision quotes can span arbitrary paragraphs, so their suffix is ambiguous.
+        assert human_prompt_text(merged) is None
+        assert auto_recall_query(merged) == ""
+        assert filter_retain_messages(merged, "[SILENT]") == (None, None)
+    else:
+        assert human_prompt_text(merged) == HUMAN
+        assert auto_recall_query(merged) == HUMAN
+        assert filter_retain_messages(merged, "[SILENT]")[0] == HUMAN
 
 
 def test_registry_covers_every_current_goal_formatter_constant():

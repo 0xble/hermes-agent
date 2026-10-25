@@ -26,14 +26,14 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'replacing. Never use complete or replace to escape constraints, failing checks or unsolved work. Use '
               'goal_set complete only with an evidence mapping from EVERY verification criterion to concrete recorded '
               'tool output. Never clear a goal. If nothing material changed, reply exactly [SILENT].',
-  'source_commits': ('02752d9f92e53b210af963bede45be9d52fbc00b',)},
+  'source_commits': ('b2628bda1a8279dbb74e7bd6ecc82fb2e077e865', '0295c3b67d17fc24939cdb695083bfd0fbc3d3c7')},
  {'formatter': 'plain',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
               '\n'
               'Continue working toward this goal. Take the next concrete step. If you believe the goal is complete, '
               'state so explicitly and stop. If you are blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('3724ace0c881a583c56f49760e754e7e0848f3fa', '265bd59c1d9f8dea658f243b257d4fae3685af53')},
+  'source_commits': ('b1ccce898b5f7c4112658f5c0aebb731c7be080f', '265bd59c1d9f8dea658f243b257d4fae3685af53')},
  {'formatter': 'plain',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -57,7 +57,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward this goal. Take the next concrete step. If you believe the goal is complete, '
               'state so explicitly, cite the proof (exact identifiers or output lines from tool results, in '
               'backticks), and stop. If you are blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
  {'formatter': 'plain',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -99,7 +99,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward this goal. Take the next concrete step. If you believe the goal is complete, '
               'state so explicitly, cite the proof (exact identifiers or output lines from tool results, in '
               'backticks), and stop. If you are blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '5dc1a7f693d97c02e73e6f291d222c693ff60515')},
+  'source_commits': ('c1bc50da497da9d430ab71dbe723ce19fb92e6ad', '5dc1a7f693d97c02e73e6f291d222c693ff60515')},
  {'formatter': 'plain',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -123,7 +123,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward this goal. Take the next concrete step. If you believe the goal is complete, '
               'state so explicitly, cite the proof (exact identifiers or output lines from tool results, in '
               'backticks), and stop. If you are blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('511d3b72b438b4a9005c8b9d171fd6b5d649175e',)},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '511d3b72b438b4a9005c8b9d171fd6b5d649175e')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -136,7 +136,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Verification criterion and show the concrete evidence (command output, file contents, test result). If '
               'you hit the stated stop condition or are otherwise blocked and need user input, say so clearly and '
               'stop.',
-  'source_commits': ('3724ace0c881a583c56f49760e754e7e0848f3fa', '2ba1cfeb2e28c77a3ae2323772e5a6bca43844cb')},
+  'source_commits': ('b1ccce898b5f7c4112658f5c0aebb731c7be080f', '2ba1cfeb2e28c77a3ae2323772e5a6bca43844cb')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -176,7 +176,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'section that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run '
               'ids, URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or '
               'are otherwise blocked and need user input, say so clearly and stop.',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -201,7 +201,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, '
               'URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or are '
               'otherwise blocked and need user input, say so clearly and stop.',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '89b40ca2dd596ec8c5da782b014c01f96a82420f')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '1ceabf68cabce7f42d80f4d77e86b259fb7d4ce2')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -259,7 +259,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'section (plain or collapsible) that quotes exact identifiers or output lines from tool results in '
               'backticks (commit SHAs, run ids, URLs, `N passed` lines), so the runtime can locate them. If you hit '
               'the stated stop condition or are otherwise blocked and need user input, say so clearly and stop.',
-  'source_commits': ('07ff4afe2c23f111b696bb040176716d7978d26b', '5dc1a7f693d97c02e73e6f291d222c693ff60515')},
+  'source_commits': ('46824125f365d6220cc391378bb4398faa13b1cb', '5dc1a7f693d97c02e73e6f291d222c693ff60515')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -290,7 +290,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, '
               'URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or are '
               'otherwise blocked and need user input, say so clearly and stop.',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '07095e2044da368da0b90ed5ac7796c0ddccc5e6')},
+  'source_commits': ('c1bc50da497da9d430ab71dbe723ce19fb92e6ad', 'c4ed80e35fa6b561df01aa7b9adb41e9bfd27cd5')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -354,7 +354,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, '
               'URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or are '
               'otherwise blocked and need user input, say so clearly and stop.',
-  'source_commits': ('511d3b72b438b4a9005c8b9d171fd6b5d649175e',)},
+  'source_commits': ('ecf9e5a9eb7026ecc63708ee04af9965a36171e6', '511d3b72b438b4a9005c8b9d171fd6b5d649175e')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -389,6 +389,78 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'passed` lines), so the runtime can locate them. If you hit the stated stop condition or are otherwise '
               'blocked and need user input, say so clearly and stop.',
   'source_commits': ('665b47ab0a2c25689fc222e52f8957f4f71b6711', '47afd1c2e0009b4b519180e55ef0b0a572b0c848')},
+ {'formatter': 'contract',
+  'template': '[Continuing toward your standing goal]\n'
+              'Goal: {goal}\n'
+              '\n'
+              'Completion contract:\n'
+              '{contract_block}\n'
+              '\n'
+              'Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. If since your last '
+              "visible update nothing new and material happened and nothing needs the user's action (for example, you "
+              'are still waiting on an external party, a scheduled check, or a background process), reply with exactly '
+              '[SILENT] and nothing else. Never post status like "no change", "still waiting", plain acknowledgements, '
+              '"next check at", or what you did not do.\n'
+              'When something changed, report only the new fact or needed action briefly, in one or two short lines. '
+              'The FIRST time you claim the goal is done, include an Evidence section with exact proof and make that '
+              'claim visible above it. Evidence may be a collapsed <details><summary>Evidence</summary>...</details> '
+              'block where the platform renders toggles; keep exact identifiers and output lines verbatim in '
+              'backticks. Make a done claim visible again only when its substance changed because new evidence, new '
+              'state, or a changed blocker appeared. If you already reported done and nothing material changed since '
+              'that report, reply with exactly [SILENT] and nothing else; the runtime will still re-check completion. '
+              'A restart, update, or new release by itself is not news, and re-running a check that returns the same '
+              'result as your last visible report counts as unchanged; reply with exactly [SILENT] and nothing else. '
+              'The FIRST time you are blocked or need user input, say so visibly. While the same blocker or input need '
+              'is unchanged, reply with exactly [SILENT] and nothing else.\n'
+              'Continue working toward the outcome above. Take the next concrete step. Stay within the stated '
+              'boundaries and do not violate the constraints. Your method may change in the plan without changing the '
+              'contract. goal_set action=revise is additive only. If an enrolled criterion is contradictory, obsolete, '
+              'or already falsified by history, name the conflict and propose prospective verification through '
+              'goal_set action=replace, preserving all unrelated requirements and hard limits. Use the latest real '
+              'user instruction verbatim when it authorizes replacement, otherwise request the precise session-control '
+              'approval card. Do not ask the user to clear the goal or compose a slash command. Explicit /goal remove '
+              '<kind> <N> remains available for user-directed removal. Before claiming the goal is done, audit each '
+              'Verification item against current state and end with an Evidence section that quotes exact identifiers '
+              'or output lines from tool results in backticks (commit SHAs, run ids, URLs, `N passed` lines), so the '
+              'runtime can locate them. If you hit the stated stop condition or are otherwise blocked and need user '
+              'input, say so clearly and stop.',
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b',)},
+ {'formatter': 'contract',
+  'template': '[Continuing toward your standing goal]\n'
+              'Goal: {goal}\n'
+              '\n'
+              'Completion contract:\n'
+              '{contract_block}\n'
+              '\n'
+              'Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. If since your last '
+              "visible update nothing new and material happened and nothing needs the user's action (for example, you "
+              'are still waiting on an external party, a scheduled check, or a background process), reply with exactly '
+              '[SILENT] and nothing else. Never post status like "no change", "still waiting", plain acknowledgements, '
+              '"next check at", or what you did not do.\n'
+              'When something changed, report only the new fact or needed action briefly, in one or two short lines. '
+              'The FIRST time you claim the goal is done, include an Evidence section with exact proof and make that '
+              'claim visible above it. Evidence may be a collapsed <details><summary>Evidence</summary>...</details> '
+              'block where the platform renders toggles; keep exact identifiers and output lines verbatim in '
+              'backticks. Make a done claim visible again only when its substance changed because new evidence, new '
+              'state, or a changed blocker appeared. If you already reported done and nothing material changed since '
+              'that report, reply with exactly [SILENT] and nothing else; the runtime will still re-check completion. '
+              'A restart, update, or new release by itself is not news, and re-running a check that returns the same '
+              'result as your last visible report counts as unchanged; reply with exactly [SILENT] and nothing else. '
+              'The FIRST time you are blocked or need user input, say so visibly. While the same blocker or input need '
+              'is unchanged, reply with exactly [SILENT] and nothing else.\n'
+              'Continue working toward the outcome above. Take the next concrete step. Stay within the stated '
+              'boundaries and do not violate the constraints. Your method may change in the plan without changing the '
+              'contract. goal_set action=revise can only add requirements. If an enrolled criterion is contradictory, '
+              'obsolete, or already falsified by history, name the conflict and propose prospective verification '
+              'through goal_set action=replace, preserving all unrelated requirements and hard limits. Use the latest '
+              'real user instruction verbatim when it authorizes replacement, otherwise request the precise '
+              'session-control approval card. Do not ask the user to clear the goal or compose a slash command. '
+              'Explicit /goal remove <kind> <N> remains available for user-directed removal. Before claiming the goal '
+              'is done, audit each Verification item against current state and end with an Evidence section that '
+              'quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, URLs, `N '
+              'passed` lines), so the runtime can locate them. If you hit the stated stop condition or are otherwise '
+              'blocked and need user input, say so clearly and stop.',
+  'source_commits': ('working-tree',)},
  {'formatter': 'subgoals',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -399,7 +471,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward the goal AND all additional criteria. Take the next concrete step. If you '
               'believe the goal and every additional criterion are complete, state so explicitly and stop. If you are '
               'blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('57a44a82a9de48b5be53b59a9d84d8bc47c620ea', '8f19078c6ad72300676376f5824fcf50cd9b693b')},
+  'source_commits': ('b1ccce898b5f7c4112658f5c0aebb731c7be080f', '8f19078c6ad72300676376f5824fcf50cd9b693b')},
  {'formatter': 'subgoals',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -418,7 +490,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward the goal AND all additional criteria. Take the next concrete step. If you '
               'believe the goal and every additional criterion are complete, state so explicitly and stop. If you are '
               'blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
  {'formatter': 'subgoals',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -466,7 +538,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward the goal AND all additional criteria. Take the next concrete step. If you '
               'believe the goal and every additional criterion are complete, state so explicitly and stop. If you are '
               'blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '5dc1a7f693d97c02e73e6f291d222c693ff60515')},
+  'source_commits': ('c1bc50da497da9d430ab71dbe723ce19fb92e6ad', '5dc1a7f693d97c02e73e6f291d222c693ff60515')},
  {'formatter': 'subgoals',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -493,7 +565,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward the goal AND all additional criteria. Take the next concrete step. If you '
               'believe the goal and every additional criterion are complete, state so explicitly and stop. If you are '
               'blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('511d3b72b438b4a9005c8b9d171fd6b5d649175e',)},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '511d3b72b438b4a9005c8b9d171fd6b5d649175e')},
  {'formatter': 'gate_failed',
   'template': '[Continuing toward your standing goal — a quality gate failed]\n'
               'Goal: {goal}\n'
@@ -509,7 +581,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               '\n'
               'Fix the underlying problem so this gate passes, then re-run it to confirm. Do not declare the goal '
               'complete while any gate fails. If the gate itself is wrong or cannot pass, say so clearly and stop.',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '6e041d524439b69ddfec73398816f8a7b01edfa0')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '6e041d524439b69ddfec73398816f8a7b01edfa0')},
  {'formatter': 'revisions',
   'template': '\n'
               '\n'
@@ -517,7 +589,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'message cited for that revision plainly instructs that specific change. When in doubt, honor the '
               'earlier requirement.\n'
               '{revision_lines}',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', 'c6721afec7b627430f6b43c322539cb85eb176a6')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', 'c6721afec7b627430f6b43c322539cb85eb176a6')},
  {'formatter': 'revisions',
   'template': '\n'
               '\n'
@@ -526,7 +598,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'user message cited for that revision plainly instructs that specific change. When in doubt, honor the '
               'earlier requirement.\n'
               '{revision_lines}',
-  'source_commits': ('140ed73f258ccfb09ac37675155133a28a2145c7', '0316e624e2b0f34898769878c32e2a2ba2ef502c')},
+  'source_commits': ('46824125f365d6220cc391378bb4398faa13b1cb', '0316e624e2b0f34898769878c32e2a2ba2ef502c')},
  {'formatter': 'revisions',
   'template': '\n'
               '\n'
@@ -582,33 +654,33 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
   'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '47afd1c2e0009b4b519180e55ef0b0a572b0c848')},
  {'formatter': 'barrier_lift',
   'template': '[Goal wait lifted: ',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '847864a02221e4cbbe6f722db9c09af51dcf4d9f')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '847864a02221e4cbbe6f722db9c09af51dcf4d9f')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: pid {note_field_0} has exited. Verify its result before continuing.]',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: pid {note_field_0} is still running after Check its progress before waiting again.]',
-  'source_commits': ('working-tree',)},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '5022441c66a78d8c7a563c241f9a315695fed752')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} is still running after Check its progress before '
               'waiting again.]',
-  'source_commits': ('working-tree',)},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '5022441c66a78d8c7a563c241f9a315695fed752')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: pid {note_field_0} is still running after {note_field_1} minutes. Check its progress '
               'before waiting again.]',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
+  'source_commits': ('eb37323b4dbcd047211c1aa1565ea95b63c91579', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} is still running after {note_field_1} minutes. '
               'Check its progress before waiting again.]',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
+  'source_commits': ('eb37323b4dbcd047211c1aa1565ea95b63c91579', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} finished ({note_field_1}, exit {note_field_2}). '
               'Read its output with the process tool before continuing.]',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} is no longer tracked and its outcome is unknown. '
               'Check its output or artifacts and verify the real state before rerunning; do not assume it succeeded.]',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '2cdfc5934d369ed84736915b7da12795d4cfaeae')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '2cdfc5934d369ed84736915b7da12795d4cfaeae')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} is no longer tracked, most likely because the '
               'gateway restarted. Its outcome is unknown; verify the real state before relying on it and do not assume '
@@ -618,7 +690,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
   'template': '[Goal wait lifted: background process {note_field_0} {note_field_1} before it finished (exit '
               '{note_field_2}). Its result is incomplete; check it with the process tool and verify the real state '
               'before deciding whether to rerun that work.]',
-  'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '2cdfc5934d369ed84736915b7da12795d4cfaeae')},
+  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '2cdfc5934d369ed84736915b7da12795d4cfaeae')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} was killed by {note_field_1} before it finished '
               '(exit {note_field_2}). Its result is incomplete; check it with the process tool and verify the real '
@@ -636,77 +708,53 @@ CURRENT_GOAL_FORMATTER_NAMES: Final[tuple[tuple[str, str], ...]] = (
     ("barrier_lift", "GOAL_WAIT_LIFTED_NOTE_OPEN"),
 )
 
-GOAL_PROMPT_REGISTRY_COUNTS: Final[dict[str, int]] = {'autonomy': 1, 'plain': 6, 'contract': 10, 'subgoals': 5, 'gate_failed': 1, 'revisions': 6, 'barrier_lift': 1, 'barrier_lift_note': 10}
+GOAL_PROMPT_REGISTRY_COUNTS: Final[dict[str, int]] = {'autonomy': 1, 'plain': 6, 'contract': 12, 'subgoals': 5, 'gate_failed': 1, 'revisions': 6, 'barrier_lift': 1, 'barrier_lift_note': 10}
 
 # All historical goal formatter versions contributing to the frozen registry. Individual rows
 # name their newest and oldest source commits instead of repeating this complete list per row.
-SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('915777a8321b4186faad8e87e7fc00077a6bcca9',
- '20202751b2c641d8a2572df06c2052ca481bb8bf',
- '557665444e8118a0e3643a787334da641906e71e',
- 'c28ef4e9ef05d9f3499c633767622d31ffcd035d',
- '89b40ca2dd596ec8c5da782b014c01f96a82420f',
- '07095e2044da368da0b90ed5ac7796c0ddccc5e6',
- '70a1b4ab682b03fbdfaa988a6fde1f01b79c47f4',
- '9a39f1e24cbee4ac4a26e45578490dfa5befe67c',
- '0e8613ca7a5792097df0bde2dd66918a71f3d43b',
- '4795b6253cae51601615a63c25f1b34d1f49a212',
- '583a9132164404a974e00638084a15f01507e919',
- 'd25d181f8d7a93a882301668dd76d281f6d6dce5',
- '665b47ab0a2c25689fc222e52f8957f4f71b6711',
- '16d478e49de1825f8f76d0eb0f000c93f6472569',
- '2829819ba657cc21d369d46a699b4655a16fec55',
- '47afd1c2e0009b4b519180e55ef0b0a572b0c848',
- '07ff4afe2c23f111b696bb040176716d7978d26b',
- 'b9409e9df58b464bfa187c403d4bc58a02dd3e96',
- 'f22e0ce567f8b46ff3dd3f1c4e74cdf0e1807310',
- '0e8ee202a70e44d782f1b7e64f4dbaf60f63f387',
- 'fb8dc7d55965d9b12530914b65e22ea9208e6344',
- '2a15f88b50a6b5bbce56201cb7c78c40e236998f',
- 'b9a58b2c6bbebc1c094e3dcc6dcad3c4fb0b5175',
- '39266896ca575f94c3e7c62aad756e9425cbaf6f',
- '0c592eb2d9fc0177acd803ab73295c48932a159c',
- '961a1b7bd4bcbf6414abb016c9f94cb3d62f3d25',
- 'efcc8b9f564eaf09953950bf44bec3b9aa809cc0',
- 'fd5b7942171bb530cb1c9e8b60d6bbf41b1cb531',
- '9bc48d6d581e969a6f7e2624f75887fbbc4d04ef',
- '3b0f37546b4f086c83ec7b1a188e8b9605c8de82',
- '7cda8c02a8053b17ca139e9a320ef126b815f3d8',
- 'd832cf5c079640c6d2de0d450c1b4f4f979c317c',
- '733e8786e4e1b30f6f4f29e084b7341b1b09a1b3',
- 'b1eaccd9e235fdece7d602f525f7d7fb6e89923b',
- '140ed73f258ccfb09ac37675155133a28a2145c7',
- '62c31c67cc966dbc065033d5a780e1dd1bc0c886',
- '3e64756cc28ec8b49fe01c28a1b7fcdb8a01a291',
- 'e8d6c1fb5fbfbefd333221dae8d30a85efa2407c',
- 'd0f7761cf12fb5433829153aaa535c9805d2189d',
- '0eba014271497247765691b7b8a29a23c4565352',
- '8b2b55a8bf532d510ed493484ffab32613df03f6',
- '8df46227d3e081d4c36bad5fae5cee3b1baed769',
- 'f7b06b8e71508c2d99ed9562fd98a4dbd111c74e',
- '1dba1be6866d788d0e32b6decc3c5a3d1fb4fb2c',
- '79a9a976b5a84c55f7e26b3b99709887786fe73c',
- '10e3b865c27eb01d3bc77eb2a5a4ae030e4205e8',
- 'a1cfbd8c05bae4a06038e1ca5afa544b2b7914e0',
- '15c32ccee01bb5f49c1caaaa8b9c34b2587ae750',
- '36229c2a25a2936da726cc8500246712ca3cbb3f',
- 'eb1da1251b75efa4b4c3f9543fd828d2128193d5',
- 'da8ca94f0a168631901f128472f0bb77a9b47a66',
- '9e50af4fc489694b9ddeef094b77197835dd1b1f',
- 'a019495e1356a970867eb20388a55f30e60f50fe',
- 'b1a04d992c2fba972e569ad4eae62e20c6b090f9',
- '800f2295f15fbf4376a92b7ad114208829807a21',
- '0c02087a8e5252e86de2ff735e038ace508f6465',
- '987081e7990902ad0183cf7abe46fea79579dce1',
- '19254e69b26184bb152af51738d940a1d3130d45',
- 'd5c844b6cef3cdda287f9b93fae6421f8acf964b',
- '1aa0d7e7c0ecbce5e5036b415a36aa7d074009d3',
- '0316e624e2b0f34898769878c32e2a2ba2ef502c',
- 'c66ae73dff88560658286501316e672129a6454a',
- '974399844654de4db9411f8cf01dd437b8b194c5',
- '05ac7885fe9781498723a64726febe9d2daa400f',
- '186bb661aaa9a9f5344fc0e8a53748c27a29602f',
- '5b9448345321162cfe380aa6eb13703dc95ed1be',
- '5dc1a7f693d97c02e73e6f291d222c693ff60515',
+SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b',
+ 'ecf9e5a9eb7026ecc63708ee04af9965a36171e6',
+ '48e3d0b325efa74934483f73925a93a9826cfb9a',
+ 'fc8eeea4a6fcc16b84d68db4dc9c089bcd902568',
+ '511d3b72b438b4a9005c8b9d171fd6b5d649175e',
+ 'c1bc50da497da9d430ab71dbe723ce19fb92e6ad',
+ '130983f173cf9a981b9fcc5bc561acee56f216dd',
+ '3157a564eb15dee45072541a15d36770ce03d5a7',
+ '3ff30c8d0029699d8a1f130d5e338d515694111a',
+ '4f17526d5bf144a218ded092b7421857e4e0f01a',
+ '09e54a7a733fc8e232cf3de489e0f318cdc374e6',
+ 'd0bb43fba40f826a29969b70441b477ef8bcc1c7',
+ '4ea88827c9770b81e4c525aebc134b1b04fb8fc9',
+ '1b6d840f3a03b39ef6b8e4b01912479b6e031107',
+ '7f5a3330295a4f6512539881670f8a8d2873090b',
+ '9c6ef8ccb99390e5aef5066886eea55503ed946c',
+ '9cd7f22756d1ef74fa7575a6bafbc4b6e8b60fbb',
+ 'd28c84fff07bf6d0463eba619071d1ec5422d0ca',
+ 'ee6026a2dd0ed5e861d3160dfa837580d900d6a5',
+ 'fabcf2535aefe638fae398a0c6385cc6e7cc9868',
+ 'f929801a5dbd349149d11ce6322f79c9ae6701aa',
+ '7c80503be82665f3a81b1bd53c9e5ee9ba6ae584',
+ 'a95b94dba01b33cd8f6a8edd9d7bc54626b50d53',
+ '27fcf8d4d51a0b71ddb7e809a5cc48975fd1cd6f',
+ '245b92100507b1a352991801ee0d1641f0d7f793',
+ '512f39e0092eba69f87d7ff41a780e05ba2ac5e9',
+ '02219d1937e92536b6b0ddbc14da12896788375d',
+ 'b4671f5e7cda0a4792eab493ce4e6915dcba405d',
+ '66046715b503e9408e312e1be904fe31871c64d2',
+ 'dfd4965bc9bf346d50ce390e30f53e53c540818a',
+ '426388b1599b789a4551da6a3946254373822cdf',
+ '534a7b27db35d490f2f53e868825ffd521118c26',
+ '91584695827dda5c426ff83990c71efd05bd81b2',
+ '2313c09e1f6dfa5f3624e1df161cb430c25a4289',
+ '53bea4d3bd78cc335a454836a71b7b4d604def02',
+ '0c821f35251b070f28117188cfa7fd9cb86a3917',
+ 'e7264b6e18dcbee36063df35c932af5d63439a7c',
+ 'c0229915718ab873587ae04ccf9ecadbd1527ad9',
+ '10cc2599359e6dd559351b8e88946eb2f1e06743',
+ '13aa69b0350e5d61cd762153c53e4ce4f5392de7',
+ '7a7ab568ca484988b73bb518f37da2dcfa7b45ed',
+ 'c4ed80e35fa6b561df01aa7b9adb41e9bfd27cd5',
+ '1ceabf68cabce7f42d80f4d77e86b259fb7d4ce2',
  'ab7eec2f94aa2c0060087013cc0648c183b06b48',
  '9a1dee83b916429b3c4e7f79ad306c782653e35a',
  '1b6d17e52791b5ee87e81bf5da6304ad5601668a',
@@ -758,6 +806,68 @@ SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('915777a8321b4186faad8e87
  'aaa646b747182adc4c2abe6176e0b31bb5ed9ff7',
  'ef2beecd1d327dc48b71d3c70f849400e8b130fa',
  '11aa16592efeec426e9869e8fc5b3b23f2d9a400',
+ '46824125f365d6220cc391378bb4398faa13b1cb',
+ 'ae63f0cc701f51a3504dbac9ca94a29647814341',
+ '291731741e67d8e440079f6c9d496491070a1dea',
+ '4629286149fb5d2c7a1d4abb878a55851e9246aa',
+ '21790d00f5d1e39ad3dc6000f3d118643360ae44',
+ 'ece0e9db0676e37669a35f8dca391ee55049514c',
+ 'e5bc781b7b3b1c7cd3d65457d831051c539d6731',
+ '7784f02228f98ad431f47b53e99bbc72879d6f49',
+ '6d6245e3006eb91b7d182f4127aafde361c758c6',
+ '4f015563a80e0cf8a17e942e8588833144ff9c1b',
+ '5022441c66a78d8c7a563c241f9a315695fed752',
+ 'eb37323b4dbcd047211c1aa1565ea95b63c91579',
+ '7a54d7b6aa79f77a66c8f49a72634ba6fb0df7bb',
+ 'b7c6bcfde13749551312194ba5d8884e55b2b21a',
+ '8a4849cb3e44964b55bdc35b09261a14620d653f',
+ '3a743bdd9b17a0968677217d1ba29a68904fd9c7',
+ '5ccc051dbaeb06aecd8514e47c1008d4bfb387a8',
+ 'b5e61fff88d6c08a01a956318b2a433edc124571',
+ 'f253b0a1e6186a02038338882761cdc3fe59ffec',
+ '7b17d8838e77955dcef51e9c0c9bccf73a041d3e',
+ '140ed73f258ccfb09ac37675155133a28a2145c7',
+ '62c31c67cc966dbc065033d5a780e1dd1bc0c886',
+ '3e64756cc28ec8b49fe01c28a1b7fcdb8a01a291',
+ 'e8d6c1fb5fbfbefd333221dae8d30a85efa2407c',
+ 'd0f7761cf12fb5433829153aaa535c9805d2189d',
+ '0eba014271497247765691b7b8a29a23c4565352',
+ '8b2b55a8bf532d510ed493484ffab32613df03f6',
+ '8df46227d3e081d4c36bad5fae5cee3b1baed769',
+ 'f7b06b8e71508c2d99ed9562fd98a4dbd111c74e',
+ '1dba1be6866d788d0e32b6decc3c5a3d1fb4fb2c',
+ '79a9a976b5a84c55f7e26b3b99709887786fe73c',
+ '10e3b865c27eb01d3bc77eb2a5a4ae030e4205e8',
+ 'a1cfbd8c05bae4a06038e1ca5afa544b2b7914e0',
+ '15c32ccee01bb5f49c1caaaa8b9c34b2587ae750',
+ '36229c2a25a2936da726cc8500246712ca3cbb3f',
+ 'eb1da1251b75efa4b4c3f9543fd828d2128193d5',
+ 'da8ca94f0a168631901f128472f0bb77a9b47a66',
+ '9e50af4fc489694b9ddeef094b77197835dd1b1f',
+ 'a019495e1356a970867eb20388a55f30e60f50fe',
+ 'b1a04d992c2fba972e569ad4eae62e20c6b090f9',
+ '800f2295f15fbf4376a92b7ad114208829807a21',
+ '0c02087a8e5252e86de2ff735e038ace508f6465',
+ '987081e7990902ad0183cf7abe46fea79579dce1',
+ '19254e69b26184bb152af51738d940a1d3130d45',
+ 'd5c844b6cef3cdda287f9b93fae6421f8acf964b',
+ '1aa0d7e7c0ecbce5e5036b415a36aa7d074009d3',
+ '0316e624e2b0f34898769878c32e2a2ba2ef502c',
+ 'c66ae73dff88560658286501316e672129a6454a',
+ 'f6190a90c85479f8a9abc4aceb83bc8efe383d8c',
+ '6122d7fc4061df652326d9e30d5d4125136a9cc3',
+ '974399844654de4db9411f8cf01dd437b8b194c5',
+ '48a0797097293f5a50e4a83225389415261f5540',
+ 'b168c831a486660de2a7c14ba3b16877ef130159',
+ '05ac7885fe9781498723a64726febe9d2daa400f',
+ '22e4b23fea48cee719ea2adf298c84c63dec26a3',
+ '186bb661aaa9a9f5344fc0e8a53748c27a29602f',
+ '3d8900187b21d1fb8af850438430be9843a83cce',
+ 'f41bf93c9ddc93cbad79e13b60302b17fb365440',
+ 'af8491a0fd78f97d7f125a58ec9a9e892f0eddf0',
+ 'ad9f46770d619e19925e7d75fc6918ee519136b7',
+ '5b9448345321162cfe380aa6eb13703dc95ed1be',
+ '5dc1a7f693d97c02e73e6f291d222c693ff60515',
  'e07a10459b74a2edc93b79c1617608d34fdfe13f',
  '6a67e5f73372bed8098549c30b188f65de3e0544',
  'c5183ef5c1e53f011f3ff9d34df5125d6c1e9e39',
@@ -772,120 +882,23 @@ SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('915777a8321b4186faad8e87
  '69c46c47c7af87dd8bb7b689bae2e2bcfeac4df9',
  '94dbbb143de6151f2e53076d94af190c59b0c57b',
  '3e4f2d53c3b5dc681a31904dac89b6d472f4ea1a',
- '57a44a82a9de48b5be53b59a9d84d8bc47c620ea',
- '3b6de315aa8f74de6d2ce60853e6a33055645f57',
- '435130279acac0a815b88ba26e53937b52f2e6da',
- '8b3721e90effff48bccc3fd261217c12bc4d4d74',
- '0128aa862b59b30724f8774eefc2d39f33d92289',
- 'd3ea11eb46fc827073fee818711841243d726683',
- '1082058d7be3d49910071da04c1809ada8e8bfb3',
- 'e6f2be27d92b2966eb1441551ac09ebf501fa84e',
- '9d045400603c807452d191dfc1c3f90edd4791d0',
- '922b8fb6f284ac4471d5e6b61c6b9bf0926bbe6d',
- 'caf5230ab0637c794f4de6a7af6c49c5c3612a54',
- 'ba9b64f36ef69b521a9aacb0d7b836555ff65d7e',
- '0b15cbf2403c970d7168375c1cf73270fb88c8b9',
- '8017a0b920077fc5f8e78e374d93031de98912f6',
- 'ea232538d7c65c3676122ac2687e833a03e8963b',
- '15f3556988d62d02fcb9ad1f9b200d01201d3cbf',
- 'a3acd3497a5309d12b61c143a8fbdd47b07fa42c',
- '95461828c51eb5c367f822646243f3ce0435ce6f',
- '93347ab6cb15675806b1691f5c3343c195865f4b',
- '333b09592db092a3cdbec04f265b4bb3e13556c0',
- '847864a02221e4cbbe6f722db9c09af51dcf4d9f',
- '21aa63ef056e603de07d667fc254f354e0edcb08',
- '9c9aefcc3699dcf7cb564f8f2c814aa831b23c80',
- '2fe0d6e9aacdc26f47f3a47ef75f1850f204ae6c',
- 'fb209f7d09682129184a531f2391bd87010a8c67',
- 'd202ef938c1fef2849ce3a66e2ce644ad83134fb',
- '93b17ea3219d9b03a104d56297da79e20eb7c52c',
- '7044dd3da185306f4d1e26a9b735aa819f016d84',
- '624b7895a07170dc2423d43d7796cf6f40b4b527',
- '717390025fbe1bdf4142748e56c872511f19d5b7',
- '04e408f7df5d6a017336b749f4566520fb198a25',
- 'ecf5cbd66a40946066ed7b3a494bf9f436aacd78',
- '955fb5cd83aeffb337b6115526049f0a989c15ca',
- 'd8404715020e5689ec62bb3d79fabb110521daf7',
- 'f7db043b892a19bc7b49573f1b8afe266ed7612d',
- 'd805bccdc6b882c14fc6bf56dec0cc25ca4d3887',
- 'e2e2135c1c6b56076be19bb98606e3a395432fb9',
- '6f6d901e6bc5c5ebcef8e1a25c18d755f2332ac5',
- 'fa485c6f670a65b5e9cc651dd1a31c74674423af',
- 'a99e1bba7a430059fdb94dc983b06a185a28019c',
- 'b7bc21f369a749650653f98b165d96fd59e315ed',
- 'e9a918a924706268ca76069d62e8c1c43a549d19',
- 'fd4c61c7531005d7a567e64e472184e91e08ea0d',
- 'd8cbb91ebc9a8587a64d1049cd0c4663f37302d4',
- '5e598612db6b5cab6ba297850831c71cfccc9bca',
- '06fb767c5ed089a6bbfbba0747561aee76c1a638',
- '918bf215c2f19399b8072a10ba7eb75fd421b2df',
- 'e788edc9509be98489c2aac82ee0810f98f2163f',
- '4950ce728585bfc3c19b5bc53ede083d87978a1c',
- '946a90f74a062f5365d5ef6d98f8c48c5465a2f2',
- 'bfe62af69be6a584142e82c3dd5ee7902ecbd18f',
- '6a7929fb1f143add7d3a80a1363e20ecdd033e6e',
- '1c4178e8b7123ecb1c2ba85c18758af377e961ac',
- 'f14f9c8a47d31cc6ece1a25f89da2bd41568de32',
- 'f1b1575e87f57b2273c29b8fc81d795d248a3f31',
- '67b09db8644f2548134aa81a8974924c88551444',
- '20a82ed4259f340d1ac25eb86b6ce5c74bcb737f',
- 'c9c0db29b98f45ed6de84eed6bedaff6b9935ba8',
- '8d71cd02e6cbf879e53d90ac2a9b43d138e0d09d',
- 'eedb8859367c97064654d282ff2ef77da7b81a79',
- '011e73e89fa7cff1e7ab1b95dccc149bb250c7b3',
- 'ae373825f249c6b1643dfeafdd9b8d8571b3b3fc',
- 'c2a7807bdf44c36d41db12b38d0cd140b10ea0ff',
- '68667dcd38ddfe8be6bf45692ed165865152a7f4',
- '2b70335668aba826ef3758a0b39481c8a9174f07',
- 'c7c9109f1d43cd31da53df114faab232dabab77b',
- 'af8b992b2eb0e4db6ea0927fe3d89fefe0bdf133',
- '4539df1c953ae3459401b433dcbe95d705732966',
- '74fc53e3342a890045ea0a855fb1803687b74391',
- 'dc7a83e3dbdccd1da90bac5ce38c8c68b6f254d3',
- '6902fde1e1319aa896fc4f5341b848e3ae5445fe',
- '98553ff158c379bba5208f5c6c692f55a3428d4b',
- 'e8b22ae8b7d7dc1ae327a9b3c05faf710f081333',
- 'd5ad69e567b058d68efb5819dfec6c8719ee5b12',
- '3cd3a67088a94254ca9b8e0f079a9ee84767b8a5',
- '80c9b993a33332102791e2f969cce7687715ca51',
- 'd8d416c69e17f8f5d27f581ed957f1d0425a22f9',
- 'a8d0f4606ba0317c19a0f3cc6551dfe18123a6fb',
- '9243a8d5e9a46728125c00c98594e00285ed0019',
- '19e9bb23254316b54b0d3afbc94812c1b9d87fc2',
- '8237ac5184d83281d9089e66d807a2381df305a5',
- '667064f2c3f97c42c082d41299eae03a75af13b9',
- '98e60a40bb65e98b87376f30e3fc9d9d88ecfe63',
- '18a68d57c015d5a3f27ca840da9029b7cb0752e4',
- 'f787eedef477ce0753d9af58e178c970ca668dea',
- '5786f7e2a07efbd9593cd2e843bdfd97bbd5da2b',
- '7e08307d31b59e36e9280bfbeac928d05ed5691b',
- '9b451b64fd403bda19b1363abb351d7aca596079',
- '798aef596cdb924684357e7563ec4d89c25619ed',
- '30c1c90e610292fe8a0202199971a72a34d0d4de',
- 'ae0d2bad68c3312b01925541deeb8100e27cef4b',
- '6605156b25dee360c4ccae7eb41c740bd33726ed',
- '41cdbd3c79f5bcd4353540ade40a1aae987ef0df',
- 'bac988683e055082b3465bb53d21139324fa4580',
- 'bf3e251f7432b187d0d26662e153db7cfec7314d',
- '5393e1748959f35990d057bf22e19060dc4a8a3a',
- '23ea472c5608b08191734edc94b8cf34bf9dad89',
- '5cf09a8e444fd6b5569ac081a531f55bba782b16',
- 'b5512d1ca905063d14f62f1dddb1ad61f6d1644d',
- 'dbe92ae4078a93c52d51c5f9deae6cf14b11ed0d',
- 'e085f1eb395da48f2f29087411c7459f953d8c46',
- '9dd2376ba2c948805906c20ce5bacb92f523e90f',
- '681bd7b3b1d353689482a49d41385788f81724b5',
- 'ecd1caaf7d575ab937260710735a9cc327145d5a',
- '94b9f7cf464d5c905ad74371a9511856419c763b',
- 'bcf382f17585138ccfa959e47e22eca1e9b3f49a',
- 'a11ccc2b62cdd6d9c9247b180db748befaefc35d',
- 'f9b37669b300c8935945beb72baecc02a7d0ff95',
- 'c6721afec7b627430f6b43c322539cb85eb176a6',
- '0ed15552039f30fb9a27d64639685a839a7979e4',
- '1bfd803b46f574acac977e4fbae3f1f4c5643761',
- '0d5188608b44253ef5983cb57f184dedad426592',
- '7bafc94d3fc2f6e7fe76a7d40b6518ff9c9e718a',
- '8a5d8f76f7288e0de4fff910400f27d28f22b444',
+ 'b1ccce898b5f7c4112658f5c0aebb731c7be080f',
+ '9456670d2f9e6936d3b53e23cecc6a702bd0a365',
+ '0006a5e229aedbe6144d6b6140e2471dba8b738d',
+ '408cc0d12ee32758e67aef9934176e9e3960408a',
+ 'cf23a1a5cc3e02b2a2d4526b4a1ac66ffaac614b',
+ '4b30ad428235560f3ff672b07452c54a10a15d7e',
+ '040dbb9053da214c1babef0024d1a1fd7fccfdd8',
+ '2ff58849f4c4cc27253588ef03d7aed940d6b7da',
+ '9eab688b429b0088229868ee681cf8838ddef92a',
+ 'ac6e7cc1c23c83d3c1d08ab727546125b946f9e0',
+ '607a23e858a2d5c050d7645d0f24d09dc6c849fb',
+ '8ac5c74432d1f217033993c8370e911b2c91b04a',
+ '65bec86e37aef5a3058bff58ce9eaedd9e3796ef',
+ '74f1f17a7ef4653beaa2344eb90daaf541f3e2a5',
+ '302c5d9f679333ae957c256d76a3dff35120f4e0',
+ 'd76cce4f1161bdac895f7e373ce41cbd04e7c2f2',
+ '1e500ebce2a9ba5951ee82e7b93795bb39b3ffb1',
  '3724ace0c881a583c56f49760e754e7e0848f3fa',
  '242244bf6861c86f49b2d3e61ad647c7b4c0cc06',
  '238967f797778a1bce2d87afcb16bd568ce8e2e5',
@@ -928,9 +941,11 @@ SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('915777a8321b4186faad8e87
  '8753d1e980d1cef1fb40aa345726b3717dcb1088',
  '7de8728cba339065329f141cf92686bf06d2c171',
  '189220cb42610c5c3c74aacee14aff1c65a6c281',
+ '444dd0af3b56e90f259890e3f2c1a0e0fe120b2c',
  '97de4b4ef8a1fca59fac2e6d860ee12fcbae81ee',
  '85cb540e6dfbcbbabc78a5b93ef7e57d206a5aba',
  '00c45c084ddbd8f2fd868908616ecf04c2260e11',
+ 'eec5bd667387b4237c7b4a993371e178973501a3',
  '2dcfb8b9c88fe48d13d1c3c4f713c43442aa196d',
  'e89f8bca6c8b8258702f4cc79cc2ff4e9f3b3116',
  '7381ad36ae43a6c9e04b10daa08a975eb2eecb7d',
@@ -950,6 +965,7 @@ SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('915777a8321b4186faad8e87
  '4ff64a1d06eb8e1e35717362ad2ee826c46c3abe',
  '1539a1a9dabd1fcc80404fbd7d8db4b1a504c2f3',
  '1a4d8761769f22f2930bdee65d23a977d7296dfe',
+ '43c477571e9b759be2926505afcd42a04ba5dfe2',
  'bb745a0e9bf0c055132ff1163ad844ecf1615355',
  'b55767be82b4f42fc5d748baf7a47c182df7b6b0',
  'ee07fcd4d716959f1701ec95cc52bce5b4f3b8f1',
@@ -958,8 +974,10 @@ SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('915777a8321b4186faad8e87
  '30d78cd85eef490262f4272f81c712b523a28e62',
  '52cf71d037f30826a006517000adb3ab94766685',
  '612d542281bde96a033898736cb58b06650fc7db',
+ '2d23cfcf698dd413ed47ac5a67cf94bec516542a',
  '72617cecfc02791dbee4588be40cb6493e2cb1c6',
  '84f59e2064d77a205efc92fae81a4e76bcb2d39d',
+ 'b17aa114d2d0be8a5cc96b76ffa6df91686d3f3e',
  'e8af4c06107fe63e2fe45f46d039b3c26b43d304',
  'cc01ae9d44a099eb7e3297b442ba78b18a020076',
  '6806a3808453f4a8374f4d5692060f3bf556fa46',
@@ -967,6 +985,7 @@ SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('915777a8321b4186faad8e87
  '8d79c2ff57bba4b07e5b37ed90387b16541aef53',
  '05d705dd695d1084388529124dc2ffe5ce919e89',
  '3868ee9a128362867ba1a8d4f1fe477163b4e905',
+ '7e2c7e15814df08b29e725846b126460e6dc7cea',
  'aeecb110f81b9b1af14adcc2fbcacc9c97de2552',
  'd47adec28fa5bcc48d71cbd5e6293792275fd36d',
  '15860dfe9f3e6398ca207741396b8eccfa962fea',
@@ -1461,5 +1480,144 @@ SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('915777a8321b4186faad8e87
  '5ad030d19d71523bb4c901991bc0fac47cdd1ebf',
  '0159f25fd024c76a5a1f66fdbca39a828e4e2a61',
  '265bd59c1d9f8dea658f243b257d4fae3685af53',
- '02752d9f92e53b210af963bede45be9d52fbc00b',
- '511d3b72b438b4a9005c8b9d171fd6b5d649175e')
+ '57a44a82a9de48b5be53b59a9d84d8bc47c620ea',
+ '3b6de315aa8f74de6d2ce60853e6a33055645f57',
+ '435130279acac0a815b88ba26e53937b52f2e6da',
+ '8b3721e90effff48bccc3fd261217c12bc4d4d74',
+ '0128aa862b59b30724f8774eefc2d39f33d92289',
+ 'd3ea11eb46fc827073fee818711841243d726683',
+ '1082058d7be3d49910071da04c1809ada8e8bfb3',
+ 'e6f2be27d92b2966eb1441551ac09ebf501fa84e',
+ '9d045400603c807452d191dfc1c3f90edd4791d0',
+ '922b8fb6f284ac4471d5e6b61c6b9bf0926bbe6d',
+ 'caf5230ab0637c794f4de6a7af6c49c5c3612a54',
+ 'ba9b64f36ef69b521a9aacb0d7b836555ff65d7e',
+ '0b15cbf2403c970d7168375c1cf73270fb88c8b9',
+ '8017a0b920077fc5f8e78e374d93031de98912f6',
+ 'ea232538d7c65c3676122ac2687e833a03e8963b',
+ '15f3556988d62d02fcb9ad1f9b200d01201d3cbf',
+ 'a3acd3497a5309d12b61c143a8fbdd47b07fa42c',
+ '95461828c51eb5c367f822646243f3ce0435ce6f',
+ '93347ab6cb15675806b1691f5c3343c195865f4b',
+ '333b09592db092a3cdbec04f265b4bb3e13556c0',
+ '847864a02221e4cbbe6f722db9c09af51dcf4d9f',
+ '21aa63ef056e603de07d667fc254f354e0edcb08',
+ '9c9aefcc3699dcf7cb564f8f2c814aa831b23c80',
+ '2fe0d6e9aacdc26f47f3a47ef75f1850f204ae6c',
+ 'fb209f7d09682129184a531f2391bd87010a8c67',
+ 'd202ef938c1fef2849ce3a66e2ce644ad83134fb',
+ '93b17ea3219d9b03a104d56297da79e20eb7c52c',
+ '7044dd3da185306f4d1e26a9b735aa819f016d84',
+ '624b7895a07170dc2423d43d7796cf6f40b4b527',
+ '717390025fbe1bdf4142748e56c872511f19d5b7',
+ '04e408f7df5d6a017336b749f4566520fb198a25',
+ 'ecf5cbd66a40946066ed7b3a494bf9f436aacd78',
+ '955fb5cd83aeffb337b6115526049f0a989c15ca',
+ 'd8404715020e5689ec62bb3d79fabb110521daf7',
+ 'f7db043b892a19bc7b49573f1b8afe266ed7612d',
+ 'd805bccdc6b882c14fc6bf56dec0cc25ca4d3887',
+ 'e2e2135c1c6b56076be19bb98606e3a395432fb9',
+ '6f6d901e6bc5c5ebcef8e1a25c18d755f2332ac5',
+ 'fa485c6f670a65b5e9cc651dd1a31c74674423af',
+ 'a99e1bba7a430059fdb94dc983b06a185a28019c',
+ 'b7bc21f369a749650653f98b165d96fd59e315ed',
+ 'e9a918a924706268ca76069d62e8c1c43a549d19',
+ 'fd4c61c7531005d7a567e64e472184e91e08ea0d',
+ 'd8cbb91ebc9a8587a64d1049cd0c4663f37302d4',
+ '5e598612db6b5cab6ba297850831c71cfccc9bca',
+ '06fb767c5ed089a6bbfbba0747561aee76c1a638',
+ '918bf215c2f19399b8072a10ba7eb75fd421b2df',
+ 'e788edc9509be98489c2aac82ee0810f98f2163f',
+ '4950ce728585bfc3c19b5bc53ede083d87978a1c',
+ '946a90f74a062f5365d5ef6d98f8c48c5465a2f2',
+ 'bfe62af69be6a584142e82c3dd5ee7902ecbd18f',
+ '6a7929fb1f143add7d3a80a1363e20ecdd033e6e',
+ '1c4178e8b7123ecb1c2ba85c18758af377e961ac',
+ 'f14f9c8a47d31cc6ece1a25f89da2bd41568de32',
+ 'f1b1575e87f57b2273c29b8fc81d795d248a3f31',
+ '67b09db8644f2548134aa81a8974924c88551444',
+ '20a82ed4259f340d1ac25eb86b6ce5c74bcb737f',
+ 'c9c0db29b98f45ed6de84eed6bedaff6b9935ba8',
+ '8d71cd02e6cbf879e53d90ac2a9b43d138e0d09d',
+ 'eedb8859367c97064654d282ff2ef77da7b81a79',
+ '011e73e89fa7cff1e7ab1b95dccc149bb250c7b3',
+ 'ae373825f249c6b1643dfeafdd9b8d8571b3b3fc',
+ 'c2a7807bdf44c36d41db12b38d0cd140b10ea0ff',
+ '68667dcd38ddfe8be6bf45692ed165865152a7f4',
+ '2b70335668aba826ef3758a0b39481c8a9174f07',
+ 'c7c9109f1d43cd31da53df114faab232dabab77b',
+ 'af8b992b2eb0e4db6ea0927fe3d89fefe0bdf133',
+ '4539df1c953ae3459401b433dcbe95d705732966',
+ '74fc53e3342a890045ea0a855fb1803687b74391',
+ 'dc7a83e3dbdccd1da90bac5ce38c8c68b6f254d3',
+ '6902fde1e1319aa896fc4f5341b848e3ae5445fe',
+ '98553ff158c379bba5208f5c6c692f55a3428d4b',
+ 'e8b22ae8b7d7dc1ae327a9b3c05faf710f081333',
+ 'd5ad69e567b058d68efb5819dfec6c8719ee5b12',
+ '3cd3a67088a94254ca9b8e0f079a9ee84767b8a5',
+ '80c9b993a33332102791e2f969cce7687715ca51',
+ 'd8d416c69e17f8f5d27f581ed957f1d0425a22f9',
+ 'a8d0f4606ba0317c19a0f3cc6551dfe18123a6fb',
+ '9243a8d5e9a46728125c00c98594e00285ed0019',
+ '19e9bb23254316b54b0d3afbc94812c1b9d87fc2',
+ '8237ac5184d83281d9089e66d807a2381df305a5',
+ '667064f2c3f97c42c082d41299eae03a75af13b9',
+ '98e60a40bb65e98b87376f30e3fc9d9d88ecfe63',
+ '18a68d57c015d5a3f27ca840da9029b7cb0752e4',
+ 'f787eedef477ce0753d9af58e178c970ca668dea',
+ '5786f7e2a07efbd9593cd2e843bdfd97bbd5da2b',
+ '7e08307d31b59e36e9280bfbeac928d05ed5691b',
+ '9b451b64fd403bda19b1363abb351d7aca596079',
+ '798aef596cdb924684357e7563ec4d89c25619ed',
+ '30c1c90e610292fe8a0202199971a72a34d0d4de',
+ 'ae0d2bad68c3312b01925541deeb8100e27cef4b',
+ '6605156b25dee360c4ccae7eb41c740bd33726ed',
+ '41cdbd3c79f5bcd4353540ade40a1aae987ef0df',
+ 'bac988683e055082b3465bb53d21139324fa4580',
+ 'bf3e251f7432b187d0d26662e153db7cfec7314d',
+ '5393e1748959f35990d057bf22e19060dc4a8a3a',
+ '23ea472c5608b08191734edc94b8cf34bf9dad89',
+ '5cf09a8e444fd6b5569ac081a531f55bba782b16',
+ 'b5512d1ca905063d14f62f1dddb1ad61f6d1644d',
+ 'dbe92ae4078a93c52d51c5f9deae6cf14b11ed0d',
+ 'e085f1eb395da48f2f29087411c7459f953d8c46',
+ '9dd2376ba2c948805906c20ce5bacb92f523e90f',
+ '681bd7b3b1d353689482a49d41385788f81724b5',
+ 'ecd1caaf7d575ab937260710735a9cc327145d5a',
+ '94b9f7cf464d5c905ad74371a9511856419c763b',
+ 'bcf382f17585138ccfa959e47e22eca1e9b3f49a',
+ 'a11ccc2b62cdd6d9c9247b180db748befaefc35d',
+ 'f9b37669b300c8935945beb72baecc02a7d0ff95',
+ 'c6721afec7b627430f6b43c322539cb85eb176a6',
+ '0ed15552039f30fb9a27d64639685a839a7979e4',
+ '1bfd803b46f574acac977e4fbae3f1f4c5643761',
+ '0d5188608b44253ef5983cb57f184dedad426592',
+ '7bafc94d3fc2f6e7fe76a7d40b6518ff9c9e718a',
+ '8a5d8f76f7288e0de4fff910400f27d28f22b444',
+ '70a1b4ab682b03fbdfaa988a6fde1f01b79c47f4',
+ 'd25d181f8d7a93a882301668dd76d281f6d6dce5',
+ '665b47ab0a2c25689fc222e52f8957f4f71b6711',
+ '47afd1c2e0009b4b519180e55ef0b0a572b0c848',
+ '0c592eb2d9fc0177acd803ab73295c48932a159c',
+ 'd832cf5c079640c6d2de0d450c1b4f4f979c317c',
+ '733e8786e4e1b30f6f4f29e084b7341b1b09a1b3',
+ 'b1eaccd9e235fdece7d602f525f7d7fb6e89923b',
+ '07ff4afe2c23f111b696bb040176716d7978d26b',
+ '39266896ca575f94c3e7c62aad756e9425cbaf6f',
+ '915777a8321b4186faad8e87e7fc00077a6bcca9',
+ 'b2628bda1a8279dbb74e7bd6ecc82fb2e077e865',
+ 'deb018da2e4c71906ec9f532cdf74b15feaca6c2',
+ 'f14ce50d82057b08c4a3c7c7ef4e5502bf894f37',
+ '28d911dbf733ef4f9955f4367d58df97eb47f779',
+ '1d8f926ca5c390016ba030280b51c2b8d47ee77f',
+ 'f913c596c1a8fa7c23980b38aee9449b4a23b738',
+ 'fd80cdfa3082459074d4784c46173e1ddff877a8',
+ '9ef24ff7f32de2f7681a4b95e4ef90aa5eb5e43f',
+ '81caf8fd720dfa9a0a8783c31fc6d00507e0a2cb',
+ 'b1781d587bba94cc31375843b2d007d9bac0eabc',
+ '19508c776608edb28638eb7f79e53f6843f64d51',
+ 'c61b5b42ce48e2417e137c67471b98f4c50b541a',
+ 'cd07e74ff3fa33b38657685eeeccd915e76b2ecf',
+ '2f907325d9424654b4b6106c76a2480f49711e66',
+ '1f76f1e7dba6b76d245fde223c473bcb2b5e0732',
+ '0295c3b67d17fc24939cdb695083bfd0fbc3d3c7')

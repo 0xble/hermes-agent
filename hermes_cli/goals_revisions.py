@@ -10,6 +10,20 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _paused_by_contract_verdict(state) -> bool:
+    """Whether the judge paused this goal over its contract (a BLOCKED verdict).
+
+    A user-authorized replacement supersedes that contract, so it may lift such a pause. User and
+    interrupt pauses, an exhausted budget, and judge-infrastructure or barrier pauses are not about
+    the contract and stay until ``/goal resume``."""
+    from hermes_cli.goals import _BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX
+
+    reason = state.paused_reason or ""
+    if state.status != "paused":
+        return False
+    return state.last_verdict == "blocked" and reason.startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX))
+
+
 def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
     from hermes_cli.goals import GoalState, _get_session_db
     from hermes_cli.goals_evaluation import (
@@ -231,7 +245,7 @@ class GoalRevisionsMixin:
         the superseded contract (blocked/disputed) is lifted; every other pause stays.
         """
         from hermes_cli.goals import (
-            GoalContract, _paused_by_contract_verdict, goal_remove_usage, normalize_goal_max_turns,
+            GoalContract, goal_remove_usage, normalize_goal_max_turns,
         )
 
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled

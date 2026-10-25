@@ -421,7 +421,13 @@ def test_replacement_prompts_bind_only_the_current_contract(state, via, replacem
         })["ok"]
     history = copy.deepcopy(manager.state.revisions)
     assert history[0] == original_revision
-    assert len(history) == 2 * replacement_count + 1
+    assert len(history) == 3 * replacement_count + 1
+    removals = [row for row in history if row.get("kind") == "remove"]
+    assert len(removals) == replacement_count
+    for row, item in zip(removals, ("production shard", "include local examples")):
+        assert (row["actor"], row["authority"]) == ("user", "explicit_command")
+        assert row["before"] == {"subgoals": [item]}
+        assert row["after"] == {"subgoals": []}
     assert manager.state.revisions[-1].get("actor") == "agent"
 
     with patch("agent.auxiliary_client.call_llm", return_value=MagicMock(
