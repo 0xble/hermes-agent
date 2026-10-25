@@ -42,7 +42,7 @@ def test_opt_out_keeps_plain_polling(sleeper, tmp_path, monkeypatch):
     for _ in range(3):
         result = _wait(session.id)
         assert result["status"] == "timeout"
-        assert "Poll again later" in result["timeout_note"] and "notify_on_complete" not in result
+        assert "wait again with a bounded timeout" in result["timeout_note"] and "notify_on_complete" not in result
     assert session.notify_on_complete is False
 
 
@@ -55,7 +55,7 @@ def test_caller_that_does_not_own_the_completion_keeps_plain_polling(tmp_path, m
     try:
         for _ in range(3):
             result = _wait(session.id)
-            assert "Poll again later" in result["timeout_note"] and "notify_on_complete" not in result
+            assert "wait again with a bounded timeout" in result["timeout_note"] and "notify_on_complete" not in result
         assert session.notify_on_complete is False
     finally:
         pr.process_registry.kill_process(session.id)

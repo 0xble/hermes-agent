@@ -849,18 +849,16 @@ def _notif_poll_ready(queue, session, parked):
     now = time.monotonic()
     ready = [parked.pop(key) for key, evt in list(parked.items()) if _notif_retry_not_before(session, evt) <= now]
     timeout = min([0.5, *[max(0.0, _notif_retry_not_before(session, evt) - now) for evt in parked.values()]])
-    try:
-        events = [queue.get(timeout=0.0 if ready else timeout)]
-    except Exception:
-        events = []
-    for _ in range(queue.qsize()):
-        try:
-            events.append(queue.get_nowait())
-        except Exception:
-            break
+    # Keep the owner alive from the atomic dequeue through parked retry and routing.
+    from tools.process_registry_awaiting import take_ready
+    events = take_ready(queue, 0.0 if ready else timeout)
     for evt in events:
         if _notif_retry_not_before(session, evt) > time.monotonic():
-            parked[_notification_event_dedup_key(evt)] = evt
+            key = _notification_event_dedup_key(evt)
+            if previous := parked.get(key):
+                from tools.process_registry_awaiting import release
+                release([previous])
+            parked[key] = evt
         else:
             ready.append(evt)
     return ready
@@ -1017,7 +1015,7 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         for evt in deferred:
             queue.put(evt)
     finally:
-        release_in_flight(ready)
+        release_in_flight([*ready, *parked.values()])
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:

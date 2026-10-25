@@ -252,7 +252,6 @@ def test_graceful_cleanup_allows_a_later_foreground_command(monkeypatch):
     """Cleanup can run in-process without permanently refusing later terminal work."""
     from tools import terminal_tool_lifecycle
 
-    monkeypatch.setattr(terminal_tool_lifecycle, "_scratch_paths", lambda: [])
     env = LocalEnvironment(cwd="/tmp")
     try:
         terminal_tool_lifecycle.cleanup_all_environments()
@@ -311,7 +310,6 @@ def test_graceful_exit_kills_foreground_spawn_before_publication(monkeypatch):
     """Exit cleanup must not miss a child born before it snapshots the live commands."""
     from tools import terminal_tool_lifecycle
 
-    monkeypatch.setattr(terminal_tool_lifecycle, "_scratch_paths", lambda: [])
     env = LocalEnvironment(cwd="/tmp")
     spawned = threading.Event()
     release = threading.Event()

@@ -195,6 +195,33 @@ def test_poller_holds_session_between_dequeue_and_routing(server, registry, deta
     assert server._session_is_reapable(sid, session), "routing returned: the hold is released"
 
 
+def test_parked_retry_and_duplicate_keep_one_owner_hold(server, registry, detached, monkeypatch):
+    from tools.process_registry_awaiting import release
+
+    sid, session, _ = detached
+    event = {"type": "completion", "session_id": "parked-process",
+             "owner_task_id": session["session_key"], "session_key": session["session_key"]}
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    key = server._notification_event_dedup_key(event)
+    session["_notification_retry_backoff"] = {key: (1.0, 101.0)}
+    registry.completion_queue.put(event)
+    registry.completion_queue.put(dict(event))
+    parked = {}
+    ready = []
+    try:
+        assert server._notif_poll_ready(registry.completion_queue, session, parked) == []
+        assert len(parked) == 1 and registry.completion_queue.empty()
+        assert not server._session_is_reapable(sid, session)
+        clock.now = 101.0
+        ready = server._notif_poll_ready(registry.completion_queue, session, parked)
+        assert ready == [event] and not parked
+        assert not server._session_is_reapable(sid, session)
+    finally:
+        release([*ready, *parked.values()])
+    assert server._session_is_reapable(sid, session)
+
+
 @pytest.mark.parametrize("persist", [False, True])
 def test_stop_releases_session_even_with_a_running_watch(server, registry, detached, persist):
     """After Stop no notification turn can start until the user's next prompt, so a never-exiting watched server

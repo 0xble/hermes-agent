@@ -26,7 +26,7 @@ def test_canonical_busy_notification_backs_off_without_consuming_work(monkeypatc
         emitted = []
         monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
         waits = []
-        monkeypatch.setattr(server, "time", SimpleNamespace(sleep=waits.append, time=lambda: 1))
+        monkeypatch.setattr(server, "time", SimpleNamespace(sleep=waits.append, time=lambda: 1, monotonic=lambda: 1))
         session = {"history_lock": threading.RLock(), "session_key": key, "running": False}
         registry = SimpleNamespace(completion_queue=queue.Queue())
         monkeypatch.setattr("tools.process_registry.process_registry", registry)
@@ -77,7 +77,7 @@ def test_a_refusal_that_is_not_requeued_does_not_delay_the_poller(monkeypatch):
     """Kanban and /loop callers keep their notice themselves; the poller thread must not sleep for them
     (it also drives the kanban and loop polls)."""
     waits = []
-    monkeypatch.setattr(server, "time", SimpleNamespace(sleep=waits.append, time=lambda: 1))
+    monkeypatch.setattr(server, "time", SimpleNamespace(sleep=waits.append, time=lambda: 1, monotonic=lambda: 1))
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: False)
     session = {"history_lock": threading.RLock(), "running": True}
     assert server._notif_submit("r", "ui", session, "tick", "loop wakeup send failed") is False

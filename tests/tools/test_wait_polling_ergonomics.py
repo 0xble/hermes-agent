@@ -19,6 +19,7 @@ CEILING = 180
 
 
 def _timed_out_wait(monkeypatch, *, notify, requested=None, owner_task_id="", parent_session_id="", session_key=""):
+    monkeypatch.setattr("tools.process_registry_wait_policy._state", {})
     clock = SimpleNamespace(now=0.0)
     monkeypatch.setattr(processes, "_monotonic", lambda: clock.now)
     monkeypatch.setenv("TERMINAL_TIMEOUT", str(CEILING))
@@ -100,6 +101,7 @@ def test_subagent_owned_process_keeps_full_default_and_wait_again(monkeypatch):
 
 
 def test_yield_release_uses_full_wait_guidance_for_unroutable_process(monkeypatch):
+    monkeypatch.setattr("tools.process_registry_wait_policy._state", {})
     clock = SimpleNamespace(now=0.0)
     monkeypatch.setattr(processes, "_monotonic", lambda: clock.now)
     monkeypatch.setenv("TERMINAL_TIMEOUT", str(CEILING))

@@ -771,6 +771,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   the fixture is proving that maintenance uses an isolated worktree. The real subprocess and
   maintenance assertions remain unchanged. Guard: `test_worktree_maintenance_isolation.py`
   passed in the canonical runner (`r5-fixtures.log`, 1 passed).
+- Retry parking retains the atomic process-notification owner hold until routing or shutdown
+  requeue, including duplicate replacement. Keep wait-policy observations isolated per synthetic
+  registry and preserve the bounded wait requirement when automatic notification is unavailable.
+  Cleanup tests no longer patch the upstream-removed scratch reaper. Guards: process wait,
+  polling ergonomics, interrupt cleanup, detached keepalive and refusal backoff (51 passed,
+  2 platform skips, including duplicate parked-hold regression).
 - Preserve the reserved multiplex home set after parking profiles and route drain-time notices
   through an active session authority before falling back to the adapter pending queue.
   Contract fixtures use the real JSON batch result, positional runtime config, authored pinned
