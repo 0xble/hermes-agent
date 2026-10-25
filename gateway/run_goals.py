@@ -14,6 +14,7 @@ from contextlib import nullcontext, suppress
 from typing import TYPE_CHECKING, Any, Optional
 
 from gateway.platforms.event import MessageEvent, MessageType
+from hermes_cli.goal_notices import goal_notices_enabled
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -201,8 +202,12 @@ class GatewayGoalsMixin:
             logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
         return adapter
 
-    async def _send_goal_status_notice(self, source: Any, message: str) -> None:
+    async def _send_goal_status_notice(
+        self, source: Any, message: str, *, goal_notice: bool = True,
+    ) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
+        if goal_notice and not goal_notices_enabled():
+            return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
@@ -215,19 +220,23 @@ class GatewayGoalsMixin:
                 "goal continuation: status send failed: %s", getattr(result, "error", "unknown error"),
             )
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self, source: Any, message: str, *, goal_notice: bool = True,
+    ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The adapter sends the agent response after this caller returns, so for reading order use
         its one-shot post-delivery callback when available, else deliver directly (never drop).
         """
+        if goal_notice and not goal_notices_enabled():
+            return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
 
         async def _deliver() -> None:
             try:
-                await self._send_goal_status_notice(source, message)
+                await self._send_goal_status_notice(source, message, goal_notice=goal_notice)
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 
@@ -363,7 +372,7 @@ class GatewayGoalsMixin:
         decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
         msg = decision.get("message") or ""
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            await self._defer_goal_status_notice_after_delivery(source, msg, goal_notice=False)
 
     async def _loop_wakeup_fire_one(
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
