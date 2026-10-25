@@ -51,7 +51,7 @@ Guidance checked at upstream `5141460529ad320140f9916be0b88ab1f0af563e`:
 root `AGENTS.md` and `CONTRIBUTING.md`. Prior-art searches for display identity
 and compaction writer cost found related transcript-index work, including
 [split display generations](https://github.com/NousResearch/hermes-agent/pull/128296)
-and [user rewrite invalidation](https://github.com/NousResearch/hermes-agent/issues/133880),
+and [display-order replay drift](https://github.com/NousResearch/hermes-agent/issues/133880),
 not a reason to retain metadata rereads. Existing invalidation is preserved.
 No upstream contribution is associated with this fork-only correction.
 

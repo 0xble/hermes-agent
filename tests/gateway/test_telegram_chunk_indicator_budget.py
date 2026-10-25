@@ -58,7 +58,7 @@ async def test_long_single_line_fence_chunks_fit_telegram_limit(count, body_unit
 @pytest.mark.parametrize("len_fn,character", [(len, "x"), (utf16_len, "😀")])
 def test_splitter_budgets_actual_indicators_at_arbitrary_limits(limit, count, fenced, len_fn, character):
     content = ("```\n" if fenced else "") + character * count
-    chunks = BasePlatformAdapter.truncate_message(content, limit, len_fn=len_fn)
+    chunks = BasePlatformAdapter.truncate_message(content, limit, len_fn=len_fn, indicator_overhead=TelegramAdapter.CHUNK_INDICATOR_OVERHEAD)
     assert len(chunks) <= len(content)
     if count == 100_000:
         assert len(chunks) >= 10_000  # five-digit counts without megabyte transport fixtures
@@ -79,7 +79,7 @@ def test_splitter_budgets_actual_indicators_at_arbitrary_limits(limit, count, fe
 
 def test_plain_text_does_not_reserve_a_fence_that_is_not_needed():
     content = "x" * 8155
-    chunks = BasePlatformAdapter.truncate_message(content, 4096, len_fn=utf16_len)
+    chunks = BasePlatformAdapter.truncate_message(content, 4096, len_fn=utf16_len, indicator_overhead=TelegramAdapter.CHUNK_INDICATOR_OVERHEAD)
 
     assert len(chunks) == 2
     assert "".join(re.sub(r" \(\d+/\d+\)$", "", chunk) for chunk in chunks) == content
@@ -88,11 +88,11 @@ def test_plain_text_does_not_reserve_a_fence_that_is_not_needed():
 
 
 def test_splitter_preserves_approved_chunk_boundaries():
-    plain_8150 = BasePlatformAdapter.truncate_message("x" * 8150, 4096, len_fn=utf16_len)
-    plain_8155 = BasePlatformAdapter.truncate_message("x" * 8155, 4096, len_fn=utf16_len)
-    plain_20000 = BasePlatformAdapter.truncate_message("x" * 20000, 4096, len_fn=utf16_len)
+    plain_8150 = BasePlatformAdapter.truncate_message("x" * 8150, 4096, len_fn=utf16_len, indicator_overhead=TelegramAdapter.CHUNK_INDICATOR_OVERHEAD)
+    plain_8155 = BasePlatformAdapter.truncate_message("x" * 8155, 4096, len_fn=utf16_len, indicator_overhead=TelegramAdapter.CHUNK_INDICATOR_OVERHEAD)
+    plain_20000 = BasePlatformAdapter.truncate_message("x" * 20000, 4096, len_fn=utf16_len, indicator_overhead=TelegramAdapter.CHUNK_INDICATOR_OVERHEAD)
     open_fence = BasePlatformAdapter.truncate_message(
-        "```python\n" + "x" * 8128, 4096, len_fn=utf16_len)
+        "```python\n" + "x" * 8128, 4096, len_fn=utf16_len, indicator_overhead=TelegramAdapter.CHUNK_INDICATOR_OVERHEAD)
 
     assert [len(chunk) for chunk in plain_8150] == [4083, 4079]
     assert len(plain_8155) == 2
@@ -126,7 +126,7 @@ def test_fence_state_scan_is_bounded_for_long_fenced_input(monkeypatch):
 
 def test_final_open_fence_is_closed_within_the_utf16_budget():
     content = "```python\n" + "x" * 185
-    chunks = BasePlatformAdapter.truncate_message(content, 64, len_fn=utf16_len)
+    chunks = BasePlatformAdapter.truncate_message(content, 64, len_fn=utf16_len, indicator_overhead=TelegramAdapter.CHUNK_INDICATOR_OVERHEAD)
 
     assert len(chunks) == 5
     for index, chunk in enumerate(chunks, 1):

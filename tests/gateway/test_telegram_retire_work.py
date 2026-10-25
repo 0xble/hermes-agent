@@ -1,4 +1,5 @@
 """Retirement discovers every native owner and moves authoritative routes, not just briefs."""
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -26,7 +27,7 @@ def runtime(tmp_path, monkeypatch):
                              _delivery_adapter_for=lambda _: adapter,
                              session_store=SimpleNamespace(peek_session_id=lambda key: "old" if key == "old-key" else "next"))
     state = {"generation": "gen", "phase": "pending", "session_id": "old", "session_key": "old-key",
-             "target": "", "handoffs": {}}
+             "target": "", "handoffs": {}, "reason": "Current work is finished."}
     monkeypatch.setattr(work, "locate_command", lambda _: SimpleNamespace(command=()))
     from cron import jobs
     import tools.async_delegation as delegation
@@ -117,8 +118,9 @@ async def test_active_claim_blocks_and_partial_task_inventory_fails_closed(runti
 
 
 @pytest.mark.asyncio
-async def test_obvious_owner_moves_before_one_numbered_question(runtime, monkeypatch):
+async def test_obvious_owner_moves_and_unknown_owner_gets_one_internal_preparation(runtime, monkeypatch):
     r = runtime
+    r.state["owners"] = {"goal": "Service Operations"}
     known = {"id": "goal", "kind": "goal", "title": "Service Operations"}
     unknown = {"id": "task:x", "kind": "task", "title": "Unclear work"}
     remaining = [known, unknown]
@@ -128,6 +130,9 @@ async def test_obvious_owner_moves_before_one_numbered_question(runtime, monkeyp
             return {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
         raise ValueError("unclear")
     monkeypatch.setattr(work, "destination", destination)
+    async def admit(event):
+        event._gateway_accepted = True
+    r.adapter.handle_message = AsyncMock(side_effect=admit)
     sent = AsyncMock(return_value={"receipt_id": "r1", "address": "hermes:default/next"})
     monkeypatch.setattr(work, "receipt", sent)
     async def transfer(*args):
@@ -135,11 +140,52 @@ async def test_obvious_owner_moves_before_one_numbered_question(runtime, monkeyp
     monkeypatch.setattr(work, "transfer", transfer)
     assert not await work.prepare(r.runner, r.source, r.state)
     assert r.state["handoffs"]["goal"]["moved"]
-    assert r.state["questions"] == [{"id": "task:x", "title": "Unclear work", "suggestion": "Unclear work"}]
-    assert "1. Unclear work" in r.adapter.send.await_args.args[1]
+    r.adapter.send.assert_not_awaited()
+    event = r.adapter.handle_message.await_args.args[0]
+    assert event.internal and event.reply_expected is False
+    assert event.metadata["retirement_generation"] == "gen"
+    assert "task:x" in event.text
     assert not await work.prepare(r.runner, r.source, r.state)
-    assert r.adapter.send.await_count == 1
+    assert r.adapter.handle_message.await_count == 1
     assert sent.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["process", "cron"])
+async def test_unchanged_live_work_does_not_repeat_preparation(runtime, monkeypatch, kind):
+    from cron import jobs
+    from tools.process_registry import process_registry
+
+    r = runtime
+    samples = iter(range(3))
+
+    def live_records(**_):
+        sample = next(samples)
+        if kind == "process":
+            return [{"session_id": "worker", "command": "watch service", "status": "running",
+                     "owner_task_id": "old", "uptime_seconds": sample,
+                     "output_preview": f"Health check {sample}"}]
+        return [{"id": "watch", "name": "Service Watch", "enabled": True,
+                 "deliver": "telegram:101:17", "last_run": sample, "next_run": sample + 1}]
+
+    if kind == "process":
+        monkeypatch.setattr(process_registry, "list_sessions", live_records)
+    else:
+        monkeypatch.setattr(jobs, "list_jobs", live_records)
+
+    async def admit(event):
+        event._gateway_accepted = True
+
+    r.adapter.handle_message = AsyncMock(side_effect=admit)
+    await retire.save(r.runner, r.source, r.state)
+    for _ in range(3):
+        state = await retire.load(r.runner, r.source)
+        assert state is not None
+        assert not await work.prepare(r.runner, r.source, state)
+    assert r.adapter.handle_message.await_count == 1
+    waiting = await retire.load(r.runner, r.source)
+    assert waiting is not None and waiting["phase"] == "waiting"
+    r.adapter.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -161,15 +207,91 @@ async def test_pending_handoff_reconciles_even_when_item_no_longer_in_inventory(
 
 
 @pytest.mark.asyncio
-async def test_owner_answers_accept_semicolons_and_fence_other_input(runtime, monkeypatch):
+async def test_merge_hands_context_over_even_without_open_items_and_reuses_its_receipt(runtime, monkeypatch):
     r = runtime
-    monkeypatch.setattr(work, "destination", AsyncMock(return_value={"session_id": "next"}))
-    r.state["phase"] = "waiting"
-    r.state["questions"] = [{"id": "goal"}, {"id": "loop"}]
-    assert not await work.resolve_answers(r.runner, r.source, r.state, "unrelated work")
-    assert not await work.resolve_answers(r.runner, r.source, r.state, "1 Service Operations")
-    assert await work.resolve_answers(r.runner, r.source, r.state, "1 Service Operations; 2 Watch Service")
-    assert r.state["owners"] == {"goal": "Service Operations", "loop": "Watch Service"}
+    r.state["target"] = "Service Operations"
+    r.state["context"] = "The service is live. Preserve its standing uptime limit and next maintenance action."
+    dest = {"session_id": "next", "session_key": "next-key", "thread_id": "19", "title": "Service Operations"}
+    monkeypatch.setattr(work, "destination", AsyncMock(return_value=dest))
+    monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[]))
+    sent = AsyncMock(return_value={"receipt_id": "context-proof"})
+    moved = AsyncMock()
+    monkeypatch.setattr(work, "receipt", sent)
+    monkeypatch.setattr(work, "transfer", moved)
+    assert await work.prepare(r.runner, r.source, r.state)
+    assert r.state["merge_destination"] == dest
+    context = sent.await_args.args[3]
+    assert context["kind"] == "context" and context["record"]["source_session"] == "old"
+    assert context["record"]["reason"] == r.state["reason"]
+    assert context["record"]["summary"] == r.state["context"]
+    assert await work.prepare(r.runner, r.source, r.state)
+    sent.assert_awaited_once()
+    moved.assert_awaited_once()
+    r.adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_context_settlement_carries_the_summary_without_inventing_a_ledger_obligation(runtime, monkeypatch):
+    from pathlib import Path
+    r = runtime
+    summary = "Service is live. The uptime limit and maintenance owner remain unchanged."
+    item = {"id": "context:next", "kind": "context", "record": {"source_session": "old", "summary": summary}}
+    dest = {"session_id": "next", "thread_id": "19"}
+    async def cli(*args, **kwargs):
+        command = args[2:]
+        assert command[0] == "relay"
+        if "send" in command:
+            assert "--fyi" in command and "--task" not in command
+            body = Path(command[command.index("--body-file") + 1]).read_text()
+            assert summary in body and '"source_session": "old"' in body
+            return {"id": "context-proof"}
+        assert "status" in command
+        return {"id": "context-proof", "target": "hermes:default/next", "status": "delivered"}
+    mocked = AsyncMock(side_effect=cli)
+    monkeypatch.setattr(work, "cli", mocked)
+    result = await work.receipt(r.runner, r.source, r.state, item, dest)
+    assert result["receipt_id"] == "context-proof" and mocked.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_active_claims_are_quiet_and_destination_controls_are_not_overwritten(runtime, monkeypatch):
+    r = runtime
+    async def admit(event):
+        event._gateway_accepted = True
+    r.adapter.handle_message = AsyncMock(side_effect=admit)
+    monkeypatch.setattr(work, "inventory", AsyncMock(side_effect=work.WorkInProgress("Active claim")))
+    assert not await work.prepare(r.runner, r.source, r.state)
+    assert "Active claim" in r.adapter.handle_message.await_args.args[0].text
+    r.adapter.send.assert_not_awaited()
+    record = {"goal": "Maintain Service", "status": "active"}
+    r.db.set_meta("goal:next", json.dumps(record))
+    r.state["owners"] = {"goal": "Service Operations"}
+    item = {"id": "goal", "kind": "goal", "title": "Maintain Service", "record": record}
+    monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[item]))
+    monkeypatch.setattr(work, "destination", AsyncMock(return_value={"session_id": "next", "title": "Service Operations"}))
+    sent = AsyncMock()
+    monkeypatch.setattr(work, "receipt", sent)
+    assert not await work.prepare(r.runner, r.source, r.state)
+    assert "Destination already has a control" in r.adapter.handle_message.await_args.args[0].text
+    assert json.loads(r.db.get_meta("goal:next")) == record
+    sent.assert_not_awaited()
+    r.adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preparation_records_owners_but_cannot_rearm_a_cancelled_generation(runtime):
+    r = runtime
+    await retire.save(r.runner, r.source, r.state)
+    result = await retire.request(r.runner, r.source, owners={"goal": "Service Operations"},
+                                 reason="Service Operations owns the continuing service.", generation="gen")
+    state = await retire.load(r.runner, r.source)
+    assert state["owners"] == {"goal": "Service Operations"}
+    assert result["generation"] != "gen"
+    await retire.request(r.runner, r.source, cancel=True)
+    with pytest.raises(ValueError, match="superseded"):
+        await retire.request(r.runner, r.source, target="Service Operations", reason="Old preparation",
+                             generation=result["generation"])
+    assert (await retire.load(r.runner, r.source))["phase"] == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -290,7 +412,32 @@ async def test_receipt_accepts_actual_direct_relay_shape(runtime, monkeypatch):
                                     "report_to": "hermes:default/parent"}},
                                 {"session_id": "next", "session_key": "next-key", "thread_id": "18"})
     assert result["receipt_id"] == "r1" and result["address"] == target
-    assert command.await_args.args[-2:] == ("status", "r1")
+    # A Hermes receipt is `posted` until the target stores it. Relay reconciles
+    # for a bounded time and the subprocess deadline outlasts that wait.
+    assert command.await_args.args[-4:] == ("status", "--wait", f"{work.RELAY_CONFIRM_WAIT}s", "r1")
+    assert command.await_args.kwargs["timeout"] > work.RELAY_CONFIRM_WAIT
+
+
+@pytest.mark.asyncio
+async def test_cli_honors_a_longer_deadline_for_waiting_reads(runtime, monkeypatch, tmp_path):
+    from tools.environments import local
+    r = runtime
+    r.runner._resolve_profile_home_for_source = lambda _: tmp_path
+    monkeypatch.setattr(local, "served_profile_child_env", lambda **_: {})
+    monkeypatch.setattr(work, "locate_command", lambda _: SimpleNamespace(command=("/fake/relay",)))
+    process = SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b'{"id":"r1"}', b"")))
+    monkeypatch.setattr(work.asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    deadlines = []
+    real_wait_for = asyncio.wait_for
+
+    async def wait_for(awaitable, timeout):
+        deadlines.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(work.asyncio, "wait_for", wait_for)
+    await work.cli(r.runner, r.source, "relay", "--json", "status", "r1")
+    await work.cli(r.runner, r.source, "relay", "--json", "status", "r1", timeout=90)
+    assert deadlines == [30, 90]
 
 
 @pytest.mark.asyncio
@@ -307,7 +454,7 @@ async def test_task_handoff_preserves_reportback_and_reconciles_assignment(runti
     delivered = {"id": "r1", "target": target, "status": "delivered"}
     writes, keys = [], []
 
-    async def command(_runner, source, *args):
+    async def command(_runner, source, *args, **_):
         if "assignments" in args:
             return [dict(a) for a in assignments]
         if "accept" in args:
@@ -349,7 +496,7 @@ async def test_native_handoff_is_created_under_destination_not_reassigned_on_ret
     keys = []
     saved, assignments, sends = {}, [], []
 
-    async def command(runner, source, *args):
+    async def command(runner, source, *args, **_):
         if "add" in args:
             sid = runner.session_store.peek_session_id(runner._session_key_for_source(source))
             assert work.address(source, sid) == "hermes:default/next"

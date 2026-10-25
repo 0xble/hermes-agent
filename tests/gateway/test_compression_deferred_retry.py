@@ -68,6 +68,19 @@ async def test_hygiene_turnhold_retries_inputs_after_commit(monkeypatch, tmp_pat
         encoding="utf-8",
     )
 
+    # This case requires an already-watermarked worker. Thread-pool startup can
+    # exceed the tiny turn-hold budget, so establish that precondition before
+    # entering the real waiter without changing its clock or budget.
+    wait_for_summary = runner._hmwa_hygiene_wait_for_summary
+
+    async def wait_for_watermarked_summary(attempt, hs, session_entry):
+        assert await asyncio.to_thread(started.wait, 5), "hygiene worker did not start"
+        assert attempt.commit_fence.commit_watermark_fenced
+        assert not attempt.commit_fence.is_cancelled
+        return await wait_for_summary(attempt, hs, session_entry)
+
+    monkeypatch.setattr(runner, "_hmwa_hygiene_wait_for_summary", wait_for_watermarked_summary)
+
     async def run_agent(**kwargs):
         assert committed.is_set(), "model ran against history still owned by hygiene"
         assert kwargs["history"] == summary

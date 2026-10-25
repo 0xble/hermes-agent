@@ -89,7 +89,7 @@ In the desktop app and dashboard chat, the backend keeps firing an active loop a
 
 ## Mixing with `/goal`
 
-Both features inject synthetic turns at idle boundaries, so they follow one rule: **an active goal owns the session.** While a `/goal` is actively driving (judge saying "continue"), loop wakeups defer. The loop resumes using idle time as soon as the goal finishes, pauses, or parks itself on a wait barrier (`/goal wait`, or the judge's automatic WAIT verdict). A parked goal plus a `/loop` is a natural combo: the goal waits on the big async thing while the loop keeps a heartbeat on something else.
+Both features inject synthetic turns at idle boundaries, so **only an active, non-waiting goal defers loop wakeups.** While a `/goal` is actively driving (judge saying "continue"), loop wakeups defer. Parked/waiting, paused, and done goals do not block loop ticks. The loop resumes using idle time as soon as the goal finishes, pauses, or parks itself on a wait barrier (`/goal wait`, or the judge's automatic WAIT verdict). The overlap warning appears only when the goal currently blocks loop ticks, not merely because a goal exists. A parked goal plus a `/loop` is a natural combo: the goal waits on the big async thing while the loop keeps a heartbeat on something else.
 
 A real user message always wins over both — wakeups only fire while the session is idle and nothing of yours is queued.
 

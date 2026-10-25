@@ -69,8 +69,11 @@ and the existing 24-hour outcome expiry bounds retries.
 **Fork patch identity:** `telegram-topic-retire`. `/retire [topic|now|cancel]`
 and `telegram_topic`'s `retire`/`cancel_retire` actions share the profile-local
 `state_meta` record and executor in `gateway/telegram_retire.py`. Pending
-retirement gates new user work, but accepts cancellation, owner answers and
-already-owned internal completions. `now` requests interruption first.
+retirement gates new user work, but accepts cancellation and already-owned
+internal completions. Only an explicit user request to retire or delete this topic
+authorizes invocation, including a deferred request after its named conditions
+are verified and its result delivered. Finishing, inactivity, splitting or handing
+off never grants permission. `now` requires an explicit interruption request.
 Retirement waits until the active turn settles before discovering obligations.
 
 `gateway/telegram_retire_work.py` discovers goals, loops, active and paused cron
@@ -85,10 +88,21 @@ row and relay's self-send refusal. Stable, bounded plain-token relay keys and
 assignment reconciliation prevent duplicate offers during recovery.
 A changed session binding holds retirement for an explicit cancel/retry instead
 of guessing which session owns a compacted turn's work. The existing live
-exact-title matcher selects unambiguous subject owners. Other owners require
-1 numbered question or an explicit target topic. Receipt IDs, transfer intentions
-and verified moves persist independently of discovery, so a restart cannot
-forget an item that has already left the source inventory.
+exact-title matcher can select unambiguous subject-owner candidates. A bare
+command or unresolved owner quietly reuses the source session's normal internal
+turn to decide merge versus delete and choose compatible owners, creating a
+subject-specific successor only when needed. This wake is pinned to the source
+session and retirement generation. A cancelled or superseded wake cannot re-arm
+retirement. Active claims are a quiet wait, not a failed retirement. No standing
+commitment is cancelled merely because its owner is unclear. A merge hands off
+the source context summary (the tool's existing `message` field) even with no
+executable items. This context-only settlement is a verified FYI, not a fabricated
+task. Actual obligations retain their task-linked handoffs. The merge records
+its destination and keeps
+existing automation owner keys as shared redirects. Source histories are not
+combined. The closing note states the choice, its reason, and continuing owners.
+Receipt IDs, transfer intentions and verified moves persist independently of
+discovery, so a restart cannot forget an item already moved.
 
 Deletion requires the same generation's complete successful closing SendResult,
 including a message ID and the original thread. Partial, deferred, held,
@@ -99,11 +113,15 @@ back absence before removing the existing topic binding and routing index entry.
 The session and transcript remain. The user CLI's exact `topic list --id` probe
 is preferred when installed. Its DM peer is the bot's dialog, not the Bot API
 user chat ID. The strict Bot API missing-thread probe serves other installations.
-An unresolved delete is quiescent, not retried by housekeeping. `/retire` or
-`/retire cancel` first probes the exact topic under the executor lock. Confirmed
-absence only cleans up its binding. Confirmed existence permits cancellation or
-a fresh generation that inventories again and requires a new closing receipt.
-An unknown result leaves the previous dispatch unresolved and never repeats it.
+Housekeeping never retries an unresolved destructive request or sends a probe.
+When the user CLI is available, it may passively reconcile exact-topic absence
+under the executor lock and the saved generation-matching closing receipt, then
+finish unbinding. Existing, unknown or incomplete lookup results, disconnected
+transports and invalid receipts leave the record quiet and unchanged. `/retire`
+or `/retire cancel` explicitly probes the exact topic under the same lock.
+Confirmed absence only cleans up its binding. Confirmed existence permits
+cancellation or a fresh generation that inventories again and requires a new
+closing receipt. An unknown result never repeats the previous dispatch.
 
 Proof surfaces: `tests/gateway/test_telegram_retire.py` and
 `test_telegram_retire_work.py`, plus the existing topic-tool, topic-mode,
