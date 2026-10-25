@@ -96,3 +96,7 @@ its constructor-owned channel-type cache. Local quickstart sequencing tests use
 the existing deterministic preflight fixture, preserving both successful setup
 leg assertions and the separate refusal tests. Guards: `tests/conformance/test_vector_generator.py`,
 `tests/gateway/test_slack_mention.py`, and `tests/hermes_cli/test_local_quickstart.py`.
+
+The inherited `fallback.min_switch_reset_seconds` setting also needs its
+`fallback` category folded into the existing agent tab through `_CATEGORY_MERGE`.
+The existing `test_no_single_field_categories` contract remains unchanged.

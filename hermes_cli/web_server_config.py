@@ -183,6 +183,7 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "prompt_caching": "agent",
     "bot_mode": "agent",
     "goals": "agent",
+    "fallback": "agent",
     "updates": "general",
     "onboarding": "agent",
     "telegram": "discord",
