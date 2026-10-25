@@ -53,6 +53,9 @@ def _build_full_manifest(
         # is enabled; the adapter uses it to preserve the referred channel across the agent turn.
         bot_events.extend(["app_context_changed", "app_home_opened"])
 
+    if messaging_experience != "none":
+        bot_events.append("agent_session_stopped")
+
     bot_scopes.sort()
     bot_events.sort()
 
