@@ -126,10 +126,11 @@ async def test_background_task_failure_notice_honors_policy(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_background_task_requested_result_is_never_suppressed(tmp_path, monkeypatch):
+@pytest.mark.parametrize("platform", [Platform.TELEGRAM, Platform.SLACK])
+async def test_background_task_requested_result_is_never_suppressed(tmp_path, monkeypatch, platform):
     """Control: a successful background task's requested result is delivered under true."""
     _configure(tmp_path, monkeypatch, True)
     from tests.gateway import test_background_command as tbc
     # Reuse the existing success-path test body under the suppressing config.
     t = tbc.TestRunBackgroundTask()
-    await t.test_successful_task_sends_result()
+    await t.test_successful_task_sends_result(platform)
