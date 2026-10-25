@@ -40,3 +40,38 @@ def test_user_replacement_preserves_omitted_fields(goal, contract):
     assert (saved.max_turns, saved.turns_used) == (before.max_turns, before.turns_used)
     assert saved.revisions[-1]["before"]["contract"] == before.contract.to_dict()
     assert saved.revisions[-1]["after"]["contract"] == expected
+
+
+@pytest.mark.parametrize("status", ["active", "paused"])
+@pytest.mark.parametrize("drafting", [False, True], ids=["inline", "draft"])
+@pytest.mark.parametrize(("field", "label", "value"), [
+    ("verification", "verify", "BETA is verified"),
+    ("constraints", "constraints", "Keep the BETA hard limit"),
+    ("boundaries", "boundaries", "BETA scope only"),
+])
+def test_bare_replacement_preserves_unmentioned_contract(
+    goal, monkeypatch, status, drafting, field, label, value,
+):
+    from hermes_cli import goals
+    from hermes_cli.goal_command import dispatch_goal_command
+
+    goal.state.status = status
+    goal.state.turns_used = 5
+    goal._save()
+    before = goals.load_goal("preservation")
+    assert before is not None
+    if drafting:
+        monkeypatch.setattr(goals, "draft_contract", lambda _: goals.GoalContract(**{field: value}))
+    command = "draft BETA" if drafting else f"BETA\n{label}: {value}"
+    result = dispatch_goal_command(goal, command, authorize_gate=lambda: None)
+    assert not result.error, result
+
+    saved = goals.load_goal("preservation")
+    assert saved is not None
+    expected = before.contract.to_dict() | {field: value}
+    assert saved.goal == "BETA"
+    assert saved.contract.to_dict() == expected
+    assert saved.subgoals == before.subgoals
+    assert saved.status == before.status
+    assert (saved.max_turns, saved.turns_used) == (before.max_turns, before.turns_used)
+    assert saved.revisions[-1]["after"]["contract"] == expected
