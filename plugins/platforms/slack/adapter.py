@@ -60,12 +60,14 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .task_cards import TaskCardCleanup, finish_task_card
     from .adapter_slash_lane import SlashHandoffLanes
     from .adapter_slash_payload import slash_command_text, slash_thread_id
+    from .adapter_native_stop import handle_agent_session_stopped
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
     from task_cards import TaskCardCleanup, finish_task_card  # type: ignore
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
+    from adapter_native_stop import handle_agent_session_stopped  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -1627,7 +1629,8 @@ class SlackAdapter(BasePlatformAdapter):
             ("file_change", _noop), ("reaction_added", _reaction(False)),
             ("reaction_removed", _reaction(True)),
             ("assistant_thread_started", self._handle_assistant_thread_lifecycle_event),
-            ("assistant_thread_context_changed", self._handle_assistant_thread_lifecycle_event)):
+            ("assistant_thread_context_changed", self._handle_assistant_thread_lifecycle_event),
+            ("agent_session_stopped", functools.partial(handle_agent_session_stopped, self))):
             self._app.event(event_type)(_listener_for(handler))
         # Catch-all ack: unacked envelopes count as failures and past 95%/60-min Slack disables
         # Event Subscriptions (ALL inbound). Registered AFTER all named handlers (first match wins).
