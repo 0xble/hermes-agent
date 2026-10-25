@@ -101,8 +101,14 @@ async def test_thread_typing_continuity_during_sibling_pause_and_completion(adap
     gates = {name: asyncio.Queue() for name in ("thread_a", "thread_b")}
     waiting = {name: asyncio.Event() for name in gates}
 
+    real_sleep = asyncio.sleep
+
     async def tick_gate(delay):
-        name = asyncio.current_task().get_name()
+        if delay == 0:
+            return await real_sleep(0)
+        task = asyncio.current_task()
+        assert task is not None
+        name = task.get_name()
         waiting[name].set()
         await gates[name].get()
 
@@ -150,7 +156,7 @@ async def test_intermediate_delivery_restores_running_thread_status(adapter, del
         await adapter.send_typing("D123", metadata=md)
         before = status.await_count
         if delivery == "progress":
-            result = await adapter.send_status_update("D123", "progress", "tool running", metadata=md)
+            result = await adapter.send_or_update_status("D123", "progress", "tool running", metadata=md)
         elif delivery == "draft":
             result = await adapter.send_draft("D123", 1, "working", metadata=md)
         else:
