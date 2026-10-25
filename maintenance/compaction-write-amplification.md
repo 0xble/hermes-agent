@@ -105,7 +105,7 @@ phases distinguish planned, full, indexed, decode and update work.
 
 ## GIL-Bound Scans
 
-The off-lock plan, the in-lock full fold, the stale-row decode and the in-lock display index (`_visible_display_index`) read rows through `one_step_rows`. It fetches each page in one SQLite step, as a `json_group_array` that decodes to the exact values and types `sqlite3` returns. BLOBs travel as hex. REALs use `printf('%!.17g')`, because the runtime's JSON REAL rendering keeps only 15 digits. A page containing a REAL zero is refetched conventionally, since no text form keeps the sign of zero. `display_identity` (`hermes_state_identity.py`) feeds sha256 in chunks of 2,047 bytes, so hashlib never releases the GIL. The digest is unchanged.
+The off-lock plan (200-row pages) and the in-lock display index (`_visible_display_index`, identities only) read rows through `one_step_rows`. The payload-reading no-plan full fold and stale-row decode keep streaming cursors under the bounded-payload contract. `one_step_rows` fetches each page in one SQLite step, as a `json_group_array` that decodes to the exact values and types `sqlite3` returns. BLOBs travel as hex. REALs use `printf('%!.17g')`, because the runtime's JSON REAL rendering keeps only 15 digits. A page containing a REAL zero is refetched conventionally, since no text form keeps the sign of zero. `display_identity` (`hermes_state_identity.py`) feeds sha256 in chunks of 2,047 bytes, so hashlib never releases the GIL. The digest is unchanged.
 
 Every row a cursor yields, and every large hash, releases the GIL and must take it back. On the loaded gateway each re-take waits a switch interval. A live session's plan, measured on a 16,969-row snapshot (76 MB) on 2026-10-25:
 

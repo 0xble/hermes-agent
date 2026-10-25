@@ -20,6 +20,9 @@ _DISPLAY_FOLD_COLUMNS = ("id", "role", "content", "timestamp", "tool_call_id", "
 _DISPLAY_FOLD_COLUMNS_SQL = f"SELECT {', '.join(_DISPLAY_FOLD_COLUMNS)} FROM messages"
 _DISPLAY_FOLD_SCAN_SQL = (_DISPLAY_FOLD_COLUMNS_SQL + " INDEXED BY idx_messages_session_id "
                          "WHERE session_id = ? AND id > ?" + _VISIBLE + " ORDER BY id LIMIT 1000")
+# The plan's one-step pages hold the page as JSON too (up to ~5x a fetchall, ~17x for control
+# characters), so they stay small enough for memory and SQLITE_MAX_LENGTH; ~85 steps per 17k rows.
+_DISPLAY_PLAN_PAGE_SQL = _DISPLAY_FOLD_SCAN_SQL.replace("LIMIT 1000", "LIMIT 200")
 
 
 def _exact_cell(column: str) -> str:
@@ -143,7 +146,7 @@ class DisplayFoldMixin:
                 try:
                     last_id = 0
                     while True:
-                        rows = fold_rows(conn, _DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
+                        rows = fold_rows(conn, _DISPLAY_PLAN_PAGE_SQL, (session_id, last_id))
                         if not rows:
                             break
                         for row in rows:
@@ -204,7 +207,7 @@ class DisplayFoldMixin:
         if plan is not None:
             try:
                 visible = self._visible_display_index(conn, session_id)
-            except sqlite3.OperationalError as exc:  # a display index is missing: full scan
+            except sqlite3.DatabaseError as exc:  # a display index is missing (or a page too long): full scan
                 logger.debug("display index read failed for %s, full fold: %s", session_id, exc)
             else:
                 self._fold_display_orders(conn, visible, plan)
