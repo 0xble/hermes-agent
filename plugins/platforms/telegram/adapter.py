@@ -31,7 +31,7 @@ from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.telegram_reconnect import TelegramReconnectMixin
-from plugins.platforms.telegram.daily_quota import DailyQuota, quota_from_platform_extra
+from plugins.platforms.telegram.daily_quota import DailyQuota, quota_from_platform_extra, send_outbound_class
 from plugins.platforms.telegram.session_control_cards import session_control_outcome
 from plugins.platforms.telegram.chat_budget import (
     EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
@@ -4786,8 +4786,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         if not (isinstance(metadata, dict) and metadata.get("copy_block")):
             content = _normalize_dollar_entities(content)
         # Copy blocks are intentionally opaque: preserve the body byte-for-byte and bypass all rich rendering.
-        outbound = current_outbound_class() or (
-            OUTBOUND_PROGRESS if isinstance(metadata, dict) and metadata.get("_interim_send") else None)
+        outbound = send_outbound_class(current_outbound_class(), metadata, current_trigger())
         if self._daily_sheds(chat_id, outbound):
             return SendResult(success=False, error=SEND_SHED_BY_BUDGET)
         if not self._bot:

@@ -13,7 +13,7 @@ import os
 import re
 import time
 import weakref
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from difflib import SequenceMatcher
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +21,7 @@ from typing import Dict, List, Optional
 
 from agent.i18n import t
 from gateway.config import Platform
-from gateway.platforms.base import build_auto_tts_output_path
+from gateway.platforms.base import OUTBOUND_FINAL, build_auto_tts_output_path, outbound_class
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 
@@ -421,6 +421,34 @@ class GatewayVoiceMixin:
         # Dedup: base adapter auto-TTS already handles voice input (play_tts plays in VC when
         # connected) — unless streaming consumed the text (already_sent): then the runner must.
         return not (is_voice_input and not already_sent)
+
+    async def _echo_stt_transcripts(
+        self, adapter, source: SessionSource, transcripts: List[str], *, event: MessageEvent,
+        metadata=None, log_context: str = "Transcript",
+    ) -> None:
+        """Echo successful STT without changing quota priority or stream-finalization metadata."""
+        # A user's echo is a direct response, even when a busy background turn spawned its task.
+        # Give it answer priority based on the originating event, not the ambient outbound class
+        # or trigger. Keep _interim_send metadata: stream sealing and quota priority are separate.
+        # Internal producers retain their existing budget classification; this is no blanket STT
+        # exemption for background traffic.
+        echo_scope = nullcontext() if event.internal else outbound_class(OUTBOUND_FINAL)
+        with echo_scope:
+            for tx in transcripts:
+                try:
+                    echo_metadata = metadata
+                    if source.platform == Platform.SLACK:
+                        # Preserve the legacy text for transports without native transcript rendering.
+                        echo_metadata = {**(metadata or {}), "_stt_transcript": {
+                            "text": tx, "shared_by": source.user_name or source.user_id or "",
+                        }}
+                    result = await adapter.send(
+                        source.chat_id, t("gateway.voice.transcript_echo_short", text=tx), metadata=echo_metadata,
+                    )
+                    if getattr(result, "success", True) is False:
+                        logger.warning("%s echo failed (non-fatal): %s", log_context, result.error)
+                except Exception as echo_exc:
+                    logger.warning("%s echo failed (non-fatal): %s", log_context, echo_exc)
 
     def _should_echo_stt_transcripts(self) -> bool:
         return bool(getattr(self.config, "stt_echo_transcripts", True))

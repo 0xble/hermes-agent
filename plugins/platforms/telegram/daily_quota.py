@@ -59,6 +59,7 @@ BACKGROUND_CALL_FRACTION = 0.5
 STRICT_PENALTY_SECS = 600.0
 STRICT_WINDOW_SECS = 86400.0
 STRICT_FACTOR = 0.5
+TRIGGER_UNTAGGED = "untagged"  # chat_budget.TRIGGER_UNTAGGED; that module imports this one
 LOG_INTERVAL_SECS = 3600.0
 FLUSH_INTERVAL_SECS = 60.0
 # A server penalty this long is a window reset, not a burst penalty, so it re-anchors the window.
@@ -197,7 +198,9 @@ class DailyQuota:
         """
         if kind is None or kind == OUTBOUND_FINAL:
             return False
-        calls = self.call_pressure(chat_key)
+        # Untagged traffic (busy acks, button taps, restart and recovery notes, cron delivery) is a
+        # few hundred calls a day and mostly answers the user, so only the message rule meters it.
+        calls = 0.0 if trigger == TRIGGER_UNTAGGED else self.call_pressure(chat_key)
         if trigger == "typed":
             return kind != OUTBOUND_NOTICE and calls >= 1.0
         pressure = self.pressure(chat_key)
@@ -214,7 +217,9 @@ class DailyQuota:
             chat_key, wait, window.messages, sum(window.calls.values()),
             time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(window.start)), _top(window.calls))
         if wait >= STRICT_PENALTY_SECS:
-            self._penalized_at[chat_key] = self._wall()
+            # The strict day starts when sending resumes; time inside the ban spends nothing.
+            # A shorter penalty landing inside a longer one must not pull that end earlier.
+            self._penalized_at[chat_key] = max(self._wall() + wait, self._penalized_at.get(chat_key, 0.0))
             self._persist_penalty(chat_key)
         if wait < RESET_PENALTY_SECS:
             return
@@ -304,11 +309,14 @@ class DailyQuota:
                 # Read the shared totals back: another lane (the standalone sender) spends the same day.
                 totals = conn.execute("SELECT endpoint, count FROM daily_volume WHERE chat_id=? AND window_start=?",
                                       (key, window.start)).fetchall()
+                penalty = conn.execute("SELECT at FROM daily_penalty WHERE chat_id=?", (key,)).fetchone()
         except (OSError, sqlite3.Error):
             logger.warning("Could not persist Telegram daily volume for chat %s", key, exc_info=True)
             return
         window.dirty.clear()
         window.dirty_messages = 0
+        if penalty is not None:  # the standalone lane records penalties too
+            self._penalized_at[key] = max(float(penalty[0]), self._penalized_at.get(key, 0.0))
         for endpoint, count in totals:
             if endpoint == "__messages__":
                 window.messages = int(count)
@@ -336,11 +344,22 @@ class DailyQuota:
             return
         try:
             with self._db() as conn:
-                conn.execute("INSERT INTO daily_penalty VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET at=excluded.at",
+                conn.execute("INSERT INTO daily_penalty VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET at=MAX(at, excluded.at)",
                              (key, self._penalized_at[key]))
                 conn.commit()
         except (OSError, sqlite3.Error):
             logger.warning("Could not persist Telegram long penalty for chat %s", key, exc_info=True)
+
+
+def send_outbound_class(explicit: Optional[str], metadata: Any, trigger: Optional[str]) -> Optional[str]:
+    """Outbound class for a plain send: the explicit label, else progress for an ``_interim_send``.
+    A typed turn's unlabelled interim sends include /login codes, approval fallbacks and stuck
+    warnings, so they stay unclassed (never shed); only labelled progress sheds for typed turns."""
+    if explicit:
+        return explicit
+    if isinstance(metadata, dict) and metadata.get("_interim_send") and trigger != "typed":
+        return OUTBOUND_PROGRESS
+    return None
 
 
 def _extra_int(extra: Any, key: str, default: int, label: str) -> int:
