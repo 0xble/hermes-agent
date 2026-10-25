@@ -2729,10 +2729,12 @@ class SlackAdapter(BasePlatformAdapter):
         _status = self.get_status_text(chat_id, metadata) or getattr(
             self.config, "typing_status_text", None)
         _status = _status or self._default_status_text(_status_started)
-        owner = getattr(self, "_typing_tasks", {}).get(self._typing_scope_key(chat_id, metadata))
+        owner = getattr(self, "_typing_refresh_owners", {}).get(self._typing_scope_key(chat_id, metadata))
         await self._set_thread_status(chat_id, team_id, thread_ts, _status, "failed")
-        # An interim reassertion can finish after final cleanup has removed its owner.
-        if owner is not None and not self._typing_is_active(chat_id, metadata):
+        # Final cleanup removes the tracked surface even when no base owner exists
+        # (or its cancellation times out). A late set must not leave idle status behind.
+        if ((status_key and status_key not in self._active_status_threads)
+                or (owner is not None and not self._typing_is_active(chat_id, metadata))):
             await self.stop_typing(chat_id, metadata=metadata)
 
     async def _set_thread_status(

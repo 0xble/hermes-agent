@@ -39,6 +39,13 @@ Telegram's topic re-arm isolation, its 4.5-second cadence and retry budget, Slac
 legacy free-text API, elapsed heartbeat and explicit untracked-status cleanup.
 No configuration, dependency, schema or gateway activation change is needed.
 
+Late Slack status requests must re-clear a surface removed during their await,
+including explicit clears without a base refresh owner. The owner fence reads
+`_typing_refresh_owners`, not the adapter transport's `_typing_tasks`. The Discord
+boundary probe supplies concrete Route attributes because the optional SDK shim's
+MagicMock does not preserve constructor fields. It still runs the real base
+refresh and Discord transport loop and asserts the POST method, path and channel.
+
 Remove the fork delta when released upstream provides equivalent per-thread
 ownership and intermediate-post continuity. Roll back by reverting this focused
 commit, without changing the separate Telegram cadence or Slack API patches.
