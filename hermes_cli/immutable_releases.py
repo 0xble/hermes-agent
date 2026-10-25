@@ -661,12 +661,16 @@ def _write_txn(paths: ReleasePaths, record: dict[str, Any]) -> None:
 
 
 def _finish_txn(paths: ReleasePaths, record: dict[str, Any]) -> None:
-    # Prune after pointer verification, while the transaction can still recover.
+    # Prune after pointer verification. Refs only retain synthetic objects, so a
+    # Git or journal failure here must not leave the pointer switch unfinished.
     journal = paths.home / "release-layout.json"
-    if journal.is_file():
-        source = Path(json.loads(journal.read_text(encoding="utf-8-sig"))["source"])
-        if (source / ".git").exists():
-            prune_carry_forward_refs(source, paths)
+    try:
+        if journal.is_file():
+            source = Path(json.loads(journal.read_text(encoding="utf-8-sig"))["source"])
+            if (source / ".git").exists():
+                prune_carry_forward_refs(source, paths)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        print(f"  ! Could not prune carry-forward refs: {exc}", file=sys.stderr)
     # Keep a durable completion identity: after the pending record's final unlink,
     # an immediate CLI --rollback retry must not interpret the newly exchanged
     # previous pointer as a fresh request to roll back the rollback.

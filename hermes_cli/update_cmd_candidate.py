@@ -54,9 +54,12 @@ def candidate_branch(home: Path, release: Path | None, *, source: Path) -> str |
     candidate = carried_candidate(source, release.name)
     directory = home / "logs" / "update_receipts"
     for path in sorted(directory.glob("update_*.json"), reverse=True):
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-        if (data.get("release_transition") or {}).get("to_sha") != candidate:
-            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            if data["release_transition"]["to_sha"] != candidate:
+                continue
+        except (OSError, ValueError, KeyError, TypeError):
+            continue  # Not provenance for this candidate; other evidence still decides.
         argv = data.get("argv") or []
         for index, arg in enumerate(argv):
             if arg == "--branch" and index + 1 < len(argv):
@@ -75,13 +78,15 @@ def candidate_branch(home: Path, release: Path | None, *, source: Path) -> str |
 
 
 def candidate_landing_status(
-    source: Path, candidate: str, *, base_branches: set[str],
+    source: Path, candidate: str, *, base_branches: set[str], target: str,
 ) -> Literal["merged", "unmerged", "unknown"]:
-    """Authoritative GitHub PR evidence: merged, exact open head, or unknown.
+    """Authoritative GitHub PR evidence: merged into target, exact open head, or unknown.
 
     Patch identity cannot prove landing across squash/rebase context changes.
     Absence of a PR is not proof the change never landed. Only an exact open
-    head permits a carry, after all associated PR pages rule out a landing.
+    head permits a carry, after all associated PR pages rule out a landing. A
+    merge the target does not contain (another branch, a fetch that predates
+    it) is unknown: returning the bare target would drop the candidate.
     """
     from hermes_cli.source_check import _request
     from hermes_cli.source_releases import _GITHUB_ORIGIN
@@ -92,7 +97,7 @@ def candidate_landing_status(
     if match is None:
         return "unknown"
     repository = match[1]
-    open_head = False
+    open_head = uncontained = False
     try:
         # A bounded incomplete listing is unknown, never negative evidence.
         for page in range(1, 11):
@@ -106,11 +111,17 @@ def candidate_landing_status(
                         or base["ref"] not in base_branches):
                     continue
                 if isinstance(row["merged_at"], str) and row["merged_at"] and row["state"] == "closed":
-                    return "merged"
+                    merge = row.get("merge_commit_sha")
+                    if isinstance(merge, str) and _git_run(
+                            ["git"], ["merge-base", "--is-ancestor", merge, target],
+                            cwd=source, check=False).returncode == 0:
+                        return "merged"
+                    uncontained = True
+                    continue
                 if row["state"] == "open" and row["head"]["sha"] == candidate:
                     open_head = True
             if len(rows) < 100:
-                return "unmerged" if open_head else "unknown"
+                return "unmerged" if open_head and not uncontained else "unknown"
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return "unknown"
     return "unknown"
@@ -149,12 +160,14 @@ def select_update_candidate(source: Path, home: Path, target: str,
         main = run(["rev-parse", "--verify", "origin/main^{commit}"], check=False)
         if main.returncode == 0 and ancestor(candidate, main.stdout.strip()):
             return target
-        landing = candidate_landing_status(source, candidate, base_branches={"main", target_branch})
+        landing = candidate_landing_status(
+            source, candidate, base_branches={"main", target_branch}, target=target)
         if landing == "merged":
             return target
         if landing != "unmerged":
             raise RuntimeError(f"cannot establish authoritative landing status for candidate {candidate}. "
-                               "An exact open GitHub PR head is required to carry it")
+                               "Carrying needs an exact open GitHub PR head; returning the target needs "
+                               "a merged PR whose merge commit the target contains")
         stop = "merge_conflict"
         tree = releases.merge_release_tree(source, target, candidate)
         if tree == run(["rev-parse", f"{target}^{{tree}}"]).stdout.strip():

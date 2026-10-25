@@ -156,13 +156,14 @@ prints the full live SHA and records a failed `candidate_carry_forward` step.
 `hermes update --replace-candidate <exact-live-SHA>` explicitly authorizes replacing
 only that installed candidate. The authorization must be a complete 40-hex SHA
 and match the current release exactly, ignoring hex letter case. It does not bypass the separate
-`--allow-drop-main` guard.
+`--allow-drop-main` guard. Neither flag crosses the post-swap handoff: the child
+runs the target's parser, which may predate them, and never selects a target.
 
 Successful selection prints the carried or replaced SHA and records
 `candidate_update_target`, `carried_candidates` or `replaced_candidate` in
 the update receipt. The shared immutable updater owns this selection for both
-CLI updates and `request_update`. The request-update plugin forwards its optional
-`replace_candidate` argument to the same CLI flag.
+CLI updates and `request_update`. Replacing a candidate is a CLI-only escape:
+`request_update` has no replacement argument.
 
 ## Nous free tier sign-in
 
