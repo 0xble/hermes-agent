@@ -13,6 +13,9 @@ from unittest.mock import patch
 import pytest
 
 from gateway.platforms.base import SendResult
+from gateway.config import Platform
+from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
 
 
 class _CardAdapter:
@@ -57,7 +60,8 @@ def _run_clarify(adapter, questions=_ONE_QUESTION, answers=(), via_tool=False):
 
     runner = object.__new__(TurnRunner)
     runner._approval_owner = None  # no owning authority: the controls snapshot is skipped
-    runner._ctx = SimpleNamespace(
+    runner._ctx = TurnContext(
+        source=SessionSource(platform=Platform.DISCORD, chat_id="C1"),
         _status_adapter=adapter, _status_chat_id="C1", _status_thread_metadata={},
         session_key="sk1", stream_consumer_holder=[None])
     labels: list[str] = []
