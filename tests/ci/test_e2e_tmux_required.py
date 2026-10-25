@@ -55,8 +55,8 @@ def test_every_tmux_suite_uses_the_gate_instead_of_a_bare_skip():
 
 def test_the_e2e_job_requires_tmux():
     yaml = pytest.importorskip("hermes_yaml")
-    job = yaml.safe_load((_REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8"))["jobs"]["e2e"]
-    run_step = next(s for s in job["steps"] if s.get("name") == "Run e2e tests")
+    job = yaml.safe_load((_REPO / ".github" / "workflows" / "gate.yml").read_text(encoding="utf-8"))["jobs"]["python-shard"]
+    run_step = next(s for s in job["steps"] if s.get("name") == "Exact-SHA Python shard")
     assert run_step["env"]["HERMES_E2E_REQUIRE_TUI"] == "1"
     assert any("tmux" in s.get("run", "") and "tmux -V" in s.get("run", "") for s in job["steps"]), \
         "the e2e job must install/verify tmux before the tmux suites run"

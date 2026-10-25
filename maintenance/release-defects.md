@@ -720,6 +720,11 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- Compaction hook fixtures mark discovery complete before synchronous dispatch, matching
+  the upstream plugin observer contract. Cron runner delivery assertions follow
+  `cron/executions.py:750-763`, which intentionally projects terminal receipts into
+  `delivery_outcome` for detached owners as well as gateways. The tmux requirement follows the fork's Python/e2e shard
+  workflow and explicitly requires the TUI environment and verifies tmux before the shard.
 - Integration fixtures supply the actual memory warning sink and retired-agent turn state.
   The 1Password service-account stub returns the exact revealed JSON item, preserving vault
   identity and purpose-selected password validation. Drain assertions follow upstream background

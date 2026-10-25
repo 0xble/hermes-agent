@@ -159,7 +159,7 @@ def _finish_successful_run(job, *, owner_kind, delivery, **_):
         assert row["delivery_status"] is None
     else:
         assert row["delivery_status"] == delivery
-        assert row["delivery_outcome"] is None
+        assert row["delivery_outcome"] == delivery
     return True
 
 

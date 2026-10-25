@@ -17,6 +17,7 @@ from agent.conversation_compression import compress_context
 def ctx(monkeypatch):
     mgr = PluginManager()
     mgr._discovered = True
+    mgr._discovery_complete = True
     monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
     monkeypatch.setattr(plugins_mod, "_plugin_managers_by_home", {})
     return PluginContext(PluginManifest(name="compaction-observer", source="user"), mgr)

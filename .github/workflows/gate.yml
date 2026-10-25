@@ -85,8 +85,13 @@ jobs:
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
           uv python install 3.14.7
           npm install --global npm@12.0.0
+      - name: Verify tmux for e2e coverage
+        shell: bash
+        run: tmux -V
       - name: Exact-SHA Python shard
         shell: bash
+        env:
+          HERMES_E2E_REQUIRE_TUI: "1"
         run: |
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
