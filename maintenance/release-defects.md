@@ -851,6 +851,11 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   worktree fixtures isolate host process discovery and drive the actual boot-delay gate.
   Guards: provider fork contracts, completion delivery, watch-reset pins, worktree pushed tier,
   parked-profile refusal and startup-recovery parking (120 passed across the focused runs).
+- The high-fd PTY regression waits for the complete marker line before checking idle-read
+  timing. A legitimate split between the marker and CRLF otherwise makes pending output look
+  like a failed idle wait. Native and forced-split variants retain the fd, output, timeout
+  and EMFILE fallback assertions. Guard: `test_drain_high_fd.py` passes 3 tests on Linux, and
+  the forced split reproduces the original pending-CRLF failure with the old boundary.
 - Retire once the next release sync no longer carries these merge points.
 
 ## v0.21.6 merge integration

@@ -88,7 +88,8 @@ def _assert_idle_read_waits(bridge):
 
 
 @pytest.mark.platforms("posix")
-def test_pty_bridge_reads_and_waits_above_fd_setsize(high_fds, monkeypatch):
+@pytest.mark.parametrize("split_line", [False, True])
+def test_pty_bridge_reads_and_waits_above_fd_setsize(high_fds, monkeypatch, split_line):
     """The PTY bridge delivers output at a high fd and an idle read blocks for its timeout;
     when the selector cannot be created (EMFILE), the bridge either still waits (poll
     fallback) or refuses to spawn, never a busy-looping bridge (macOS poll on a PTY)."""
@@ -101,13 +102,30 @@ def test_pty_bridge_reads_and_waits_above_fd_setsize(high_fds, monkeypatch):
     bridge = PtyBridge.spawn(["/bin/sh", "-c", "echo pty-high-fd; exec sleep 30"])
     try:
         assert bridge._fd >= 1024
+        if split_line:
+            read = bridge.read
+            pending = []
+
+            def read_split_line(timeout=0.05):
+                if pending:
+                    return pending.pop()
+                chunk = read(timeout)
+                if chunk is not None and chunk.endswith(b"pty-high-fd\r\n"):
+                    pending.append(chunk[-2:])
+                    return chunk[:-2]
+                return chunk
+
+            monkeypatch.setattr(bridge, "read", read_split_line)
         buf = bytearray()
         deadline = time.monotonic() + 5
-        while b"pty-high-fd" not in buf and time.monotonic() < deadline:
+        # PTY reads are byte chunks, not lines: a read can end after the marker and
+        # leave CRLF pending. Consume the complete line before asserting the PTY is idle.
+        marker_line = b"pty-high-fd\r\n"
+        while marker_line not in buf and time.monotonic() < deadline:
             chunk = bridge.read(timeout=0.2)
             assert chunk is not None, f"PTY reported EOF before output (got {bytes(buf)!r})"
             buf.extend(chunk)
-        assert b"pty-high-fd" in buf
+        assert marker_line in buf
         _assert_idle_read_waits(bridge)
     finally:
         bridge.close()
