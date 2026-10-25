@@ -19,7 +19,7 @@ or overriding scheduler internals. No core tool or dependency is added.
 
 `GoalManager.complete(reason=..., evidence=...)` accepts a mapping from every
 exact verification item and additive criterion to a recorded proof excerpt. With
-no explicit criteria, the outcome or objective is the required key. Proof must
+no verification items, the outcome or objective is also a required key. Proof must
 match an eligible tool result recorded since this goal began, including archived
 rows. Agent prose and goal bookkeeping cannot supply proof. Existing quality
 gates run before completion and must pass. This validates recorded provenance
@@ -53,9 +53,11 @@ Input waits become timed sleeps. PID and session waits have timed rechecks even
 when the target stays live. Existing native idle wake admission, CAS markers,
 source routing and busy-session fences remain in charge of waking the goal.
 
-Automatic budget and gate-retry pauses become timed holds. A finite exhausted
-budget remains exhausted and no extra model turns are charged by evaluation.
-Autonomous resume and replacement do not refund it. Genuine explicit pauses
+Automatic budget and gate-retry pauses become timed holds. In autonomous mode,
+`max_turns` is a pacing checkpoint: exhaustion records the consumed turns in
+history, resets the continuation counter and sleeps before automatically waking.
+This permits ongoing model spend. Explicit contract hard limits still bind.
+Autonomous resume and replacement do not refund the current counter. Genuine explicit pauses
 remain paused. Legacy blocked/input/approval states and automatic pauses migrate
 to active timed waits on load. Idle scans include those rows so migration is not
 dependent on a new user message. Stale resume_pending takeover continues through

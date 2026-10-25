@@ -157,14 +157,20 @@ def test_automatic_stops_leave_active_timed_wakes(home, monkeypatch, scenario):
         import sys
         monkeypatch.setattr(goals, "_gate_workspace", lambda: (str(root), None))
         mgr.add_gate(f"{shlex.quote(sys.executable)} -c 'raise SystemExit(1)'", max_retries=1)
-    for _ in range(3):
+    for _ in range(1 if scenario == "budget" else 3):
         result = mgr.evaluate_after_turn("continue", user_initiated=True)
         assert result["status"] == "active"
         assert result["verdict"] != "blocked"
         assert not mgr.state.waiting_on_user_message
         assert "say so clearly and stop" not in (result.get("continuation_prompt") or "")
     if scenario == "budget":
-        assert mgr.state.turns_used == mgr.state.max_turns
+        assert mgr.state.turns_used == 0
+        assert mgr.state.revisions[-1]["kind"] == "budget_checkpoint"
+        assert mgr.state.revisions[-1]["turns_used"] == mgr.state.max_turns
+        mgr.state.waiting_until = time.time() - 1
+        mgr._save()
+        result = mgr.evaluate_after_turn("next route", user_initiated=False)
+        assert mgr.state.turns_used == 1 and mgr.state.status == "active"
     assert result["should_continue"] or mgr.state.waiting_until > time.time()
     if scenario == "gate":
         assert not mgr.complete(reason="escape failed gate", evidence={})["ok"]
@@ -293,3 +299,20 @@ def test_failed_migration_reports_persistence_failure_without_a_blocked_state(ho
     result = loaded.evaluate_after_turn("continue")
     assert result["status"] == "active" and not result["should_continue"]
     assert result["verdict"] == "persistence_failed"
+
+
+@pytest.mark.parametrize("action", ["replace", "revise", "subgoal_add"])
+def test_an_implicit_outcome_cannot_be_replaced_by_an_easy_check(home, action):
+    _, db = home
+    mgr = goals.GoalManager("autonomy")
+    mgr.set("Ship the full repair")
+    if action == "replace":
+        assert mgr.replace(reason="alternate route", goal="Check status")["ok"]
+    elif action == "revise":
+        assert mgr.revise(reason="add a check", contract={"verification": "Status checked"})["ok"]
+    else:
+        mgr.add_subgoal("Status checked")
+    db.append_message("autonomy", "tool", "status is green", tool_name="terminal")
+    result = mgr.complete(reason="only the easy check", evidence={"Status checked": "status is green"})
+    assert not result["ok"] and "Ship the full repair" in result["error"]
+    assert goals.load_goal("autonomy").status == "active"

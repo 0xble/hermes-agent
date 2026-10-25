@@ -3534,6 +3534,8 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
         )
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> dict[str, Any]:
+        if goal_autonomy_enabled():
+            return self._autonomy_budget_checkpoint(state, reason)
         return self._pause_decision(
             f"turn budget exhausted ({_goal_budget_label(state.turns_used, state.max_turns)})", verdict, reason,
             f"⏸ Goal paused — {_goal_budget_label(state.turns_used, state.max_turns)} turns used{note}. "
@@ -3615,7 +3617,7 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
                 state.clear_wait(preserve_notice_key=True)
 
         if self._autonomy_budget_exhausted(state):
-            return self._autonomy_retry("turn budget exhausted; preserve the limit")
+            return self._autonomy_budget_checkpoint(state, "turn pacing checkpoint reached")
         state.turns_used += 1
         state.last_turn_at = time.time()
         gap_floor = max(float(self.min_continuation_gap_seconds), float(DEFAULT_MIN_CONTINUATION_GAP_SECONDS))

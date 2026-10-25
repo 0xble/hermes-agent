@@ -31,9 +31,8 @@ def goal_autonomy_enabled() -> bool:
 def completion_criteria(state) -> list[str]:
     from hermes_cli.goals import contract_items
 
-    items = [*contract_items("verification", state.contract.verification),
-             *contract_items("subgoals", state.subgoals)]
-    return list(dict.fromkeys(items or [state.contract.outcome or state.goal]))
+    items = contract_items("verification", state.contract.verification) or [state.contract.outcome or state.goal]
+    return list(dict.fromkeys([*items, *contract_items("subgoals", state.subgoals)]))
 
 
 def record_hard_limit_breach(state, reason: str) -> None:
@@ -62,6 +61,10 @@ def migrate_autonomous_goal(state) -> bool:
     if not system_pause and not state.waiting_on_user_message and not untimed_external:
         return False
     reason = state.last_reason or state.paused_reason or "legacy input wait"
+    if (state.paused_reason or "").startswith("turn budget exhausted"):
+        state.revisions.append({"at": time.time(), "kind": "budget_checkpoint", "reason": reason,
+                                "turns_used": state.turns_used, "actor": "system", "authority": "autonomy"})
+        state.turns_used = 0
     if state.last_verdict == "blocked":
         record_hard_limit_breach(state, reason)
     state.status = "active"
@@ -93,6 +96,11 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
         return {"ok": False, "error_code": "reason_required", "error": "a revision needs a reason"}
     before = {"goal": state.goal, **state.contract.to_dict(), "subgoals": list(state.subgoals),
               "max_turns": state.max_turns}
+    # A goal without explicit verification still has an implicit completion bar.
+    # Materialize it before editing so adding a tiny check or changing the objective
+    # cannot retire the unmet original outcome.
+    if not contract_items("verification", before["verification"]):
+        before["subgoals"] = list(dict.fromkeys([*before["subgoals"], before["outcome"] or before["goal"]]))
     after = dict(before)
     after.update(contract.to_dict() if isinstance(contract, GoalContract) else dict(contract or {}))
     if goal is not None:
@@ -170,6 +178,12 @@ def autonomous_verdict(state, verdict, reason, wait_directive):
 
 
 class GoalAutonomyMixin:
+    def _autonomy_budget_checkpoint(self, state, reason):
+        state.revisions.append({"at": time.time(), "kind": "budget_checkpoint", "reason": reason,
+                                "turns_used": state.turns_used, "actor": "system", "authority": "autonomy"})
+        state.turns_used = 0
+        return self._autonomy_retry(reason)
+
     def _gate_failure_prompt(self, gate, exit_code, output):
         from hermes_cli.goals import CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE
 
