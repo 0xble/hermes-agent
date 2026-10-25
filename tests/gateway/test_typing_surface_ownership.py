@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.typing_state import typing_metadata_for_event
+from gateway.platforms.typing_state import typing_metadata_for_event, typing_metadata_for_source
 from gateway.platforms.typing_state import call_typing_with_metadata
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
@@ -83,7 +83,7 @@ def test_slack_status_keeps_turn_scoped_recipient_identity():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reply_in_thread", [True, False])
-async def test_top_level_slack_without_thread_sessions_uses_same_scope(reply_in_thread):
+async def test_top_level_slack_typing_scope_is_independent_of_send_routing(reply_in_thread):
     a = slack_fixture.__wrapped__()
     a.config.extra["dm_top_level_threads_as_sessions"] = False
     a.config.extra["reply_in_thread"] = reply_in_thread
@@ -95,13 +95,15 @@ async def test_top_level_slack_without_thread_sessions_uses_same_scope(reply_in_
     runner = object.__new__(GatewayRunner)
     runner._delivery_adapter_for = lambda source: a
     initial = typing_metadata_for_event(event)
-    _, _, status = runner._run_agent_progress_threading(source, root_ts, False)
-    assert initial == status
+    prompt_typing = typing_metadata_for_source(source, root_ts)
+    assert initial == prompt_typing
+    _, _, delivery = runner._run_agent_progress_threading(source, root_ts, False)
+    assert (delivery or {}).get("thread_id") == (root_ts if reply_in_thread else None)
     await a.send_typing(source.chat_id, metadata=initial)
     if not reply_in_thread:
         a._app.client.assistant_threads_setStatus.assert_not_called()
-    a.pause_typing_for_chat(source.chat_id, metadata=status)
-    assert a._typing_is_paused(source.chat_id, initial), (initial, status, a._typing_paused)
+    a.pause_typing_for_chat(source.chat_id, metadata=prompt_typing)
+    assert a._typing_is_paused(source.chat_id, initial), (initial, prompt_typing, a._typing_paused)
 
 @pytest.mark.asyncio
 async def test_scoped_telegram_pause_cancels_own_rearm_only():

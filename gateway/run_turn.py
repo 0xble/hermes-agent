@@ -30,7 +30,7 @@ from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, turn_origin_for_event
-from gateway.platforms.typing_state import call_typing_with_metadata, typing_metadata_for_source
+from gateway.platforms.typing_state import call_typing_with_metadata
 from gateway.session_context import bound_turn_origin, set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
@@ -4375,9 +4375,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             or _relay_prospective_thread_id
             else None
         )
-        if source.platform == Platform.SLACK:
-            _status_thread_metadata = typing_metadata_for_source(source, event_message_id)
-        elif source.platform == Platform.FEISHU and source.thread_id and event_message_id:
+        if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             _status_thread_metadata = {"thread_id": _progress_thread_id, "reply_to_message_id": event_message_id}
         else:
             _status_thread_metadata = self._thread_metadata_for_progress(
