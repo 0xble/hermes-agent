@@ -55,9 +55,12 @@ async def post_chunks(
         messages = transcript_messages(transcript["text"], transcript["shared_by"])
     else:
         chunks = adapter.truncate_message(formatted, adapter.MAX_MESSAGE_LENGTH)
-        blocks = adapter._maybe_blocks(content) if len(chunks) == 1 else None
+        blocks = adapter._maybe_blocks(content, metadata) if len(chunks) == 1 else None
         messages = [dict(text=chunk, mrkdwn=True, **({"blocks": blocks} if blocks and i == 0 else {}))
                     for i, chunk in enumerate(chunks)]
+    if transcript is None and blocks and blocks[0]["type"] == "context":
+        from gateway.platforms.helpers import strip_markdown
+        messages[0]["text"] = strip_markdown(content)
     broadcast = adapter.config.extra.get("reply_broadcast", False)
     last_result = None
     for i, message in enumerate(messages):

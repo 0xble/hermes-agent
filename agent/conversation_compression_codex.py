@@ -8,6 +8,8 @@ one source.
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import contextlib
 import logging
 from typing import Any, Optional
@@ -94,7 +96,7 @@ def _compress_context_via_codex_app_server(
         return messages, _existing_system_prompt(agent, system_message)
     logger.info("codex app-server compaction started: session=%s messages=%d tokens=~%s", _sid, len(messages), _tokens)
     with contextlib.suppress(Exception):
-        agent._emit_status(COMPACTION_STATUS)
+        agent._emit_status(ContextNotice(COMPACTION_STATUS))
     _activity_heartbeat = _CompressionActivityHeartbeat(agent, emit_client_status=True).start()
     try:
         result = codex_session.compact_thread()

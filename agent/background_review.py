@@ -300,7 +300,8 @@ def _warn_review_routing_fallback(agent: Any, task_provider: str, task_model: st
     emit = getattr(agent, "_emit_warning", None)
     if callable(emit):
         with suppress(Exception):
-            emit(message)
+            from gateway.notice_style import ContextNotice
+            emit(ContextNotice(message))
 
 
 def _parent_can_emit_tool_calls(agent: Any) -> bool:
@@ -861,7 +862,8 @@ def _warn_ignored_reasoning_effort(agent: Any, task_cfg: Optional[dict[str, Any]
     emit = getattr(agent, "_emit_warning", None)
     if callable(emit):
         with suppress(Exception):
-            emit(message)
+            from gateway.notice_style import ContextNotice
+            emit(ContextNotice(message))
     logger.warning("%s", message)
 
 

@@ -9,6 +9,8 @@ retries (budgeted, deterministic-empty short-circuit) → fallback provider → 
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import logging
 import re
 from dataclasses import dataclass
@@ -174,7 +176,7 @@ def recover_empty_response(
             "Partial stream content delivered (%d chars) — using as final response",
             len(_recovered),
         )
-        agent._emit_diagnostic_status("↻ Stream interrupted — using delivered content " "as final response")
+        agent._emit_diagnostic_status(ContextNotice("↻ Stream interrupted — using delivered content " "as final response"))
         final_response = _recovered
         # A streamed fragment isn't a confirmed preview: gateway fallback delivery
         # sends the text plus the abnormal-turn explanation.
@@ -188,7 +190,7 @@ def recover_empty_response(
     if fallback and getattr(agent, '_last_content_tools_all_housekeeping', False):
         _turn_exit_reason = "fallback_prior_turn_content"
         logger.info("Empty follow-up after tool calls — using prior turn content as final response")
-        agent._emit_diagnostic_status("↻ Empty response after tool calls — using earlier content as final answer")
+        agent._emit_diagnostic_status(ContextNotice("↻ Empty response after tool calls — using earlier content as final answer"))
         agent._last_content_with_tools = None
         agent._last_content_tools_all_housekeeping = False
         agent._empty_content_retries = 0
