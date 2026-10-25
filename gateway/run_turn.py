@@ -503,8 +503,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         route = attended_runtime_route(decision)
         target_model = cfg.model or decision.model
         session_last_model = last_model or conversation.last_resolved_model or ""
-        load_route_active = getattr(self, "_load_attended_route_active", None)
-        route_active = load_route_active(session_key) if callable(load_route_active) else None
+        if route_active is _NO_ATTENDED_ACTIVITY_STAMP:  # loop callers pass the off-loop snapshot's value
+            load_route_active = getattr(self, "_load_attended_route_active", None)
+            route_active = load_route_active(session_key) if callable(load_route_active) else None
         if (
             decision.reason != "role"
             and not decision.new_session
