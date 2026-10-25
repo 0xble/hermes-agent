@@ -13,6 +13,7 @@ import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from threading import RLock
     from tools.process_registry import ProcessSession
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,10 @@ _LIVE_CLAIM_NONCES: set[str] = set()
 
 class ProcessSurvivalMixin:
     """Keep restart survival separate from ordinary pipe/PTY process supervision."""
+
+    if TYPE_CHECKING:
+        _lock: RLock
+        _running: dict[str, ProcessSession]
 
     def _spawn_local_survivor(
         self, session: ProcessSession, safe_command: str, env_vars: dict, *, restart_safe: bool = True,
@@ -306,6 +311,19 @@ class ProcessSurvivalMixin:
     def _file_backed(session: ProcessSession) -> bool:
         """True when the job writes to its own log/exit files instead of a gateway pipe."""
         return bool(getattr(session, "survive_restart", False) or getattr(session, "exit_path", ""))
+
+    def _survives_gateway_exit(self, session: ProcessSession, source: str) -> bool:
+        """A handover transfers durable I/O, a host shutdown preserves only explicit survivors."""
+        if source == "gateway_shutdown":
+            return session.survive_restart
+        return bool(source == "gateway_handover" and
+                    (session.persist_on_release or session.survive_restart) and self._file_backed(session))
+
+    def count_handover_blockers(self) -> int:
+        """Finite commands still need their owner, file-backed persistent jobs do not."""
+        with self._lock:
+            return sum(not self._survives_gateway_exit(session, "gateway_handover")
+                       for session in self._running.values())
 
     def prune_survivor_run_dir(self, session: ProcessSession) -> None:
         """Prune an aged survivor only after its completion was delivered.

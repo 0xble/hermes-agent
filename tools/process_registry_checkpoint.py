@@ -5,7 +5,10 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from tools.process_registry import ProcessSession
 
 from agent.redact import redact_sensitive_text
 
@@ -18,7 +21,18 @@ def _foreign_registry_live(registry, entry) -> bool:
                 and registry._detached_host_fate(pid, entry.get("registry_owner_started_at")) == "running")
 
 
+def _retain_foreign_checkpoint(registry, entry) -> bool:
+    """A file-backed result remains recoverable after its registry owner exits."""
+    pid = entry.get("registry_owner_pid")
+    return bool(isinstance(pid, int) and pid > 0 and pid != os.getpid()
+                and (entry.get("exit_path") or _foreign_registry_live(registry, entry)))
+
+
 class ProcessCheckpointMixin:
+    if TYPE_CHECKING:
+        _running: dict[str, ProcessSession]
+        _finished: dict[str, ProcessSession]
+
     def _detached_host_fate(self, pid: Optional[int], expected_start: Optional[int]) -> str:
         """Subclass supplies the live PID decision. See ProcessRegistry."""
         raise NotImplementedError
@@ -32,6 +46,7 @@ class ProcessCheckpointMixin:
         try:
             with self._lock:
                 entries = []
+                known_ids = self._running.keys() | self._finished.keys()
                 pending_survivors = [
                     s for s in self._finished.values()
                     if self._retain_survivor_completion(s)
@@ -64,9 +79,11 @@ class ProcessCheckpointMixin:
                     previous = json.loads(path.read_text(encoding="utf-8-sig"))
                 except (OSError, ValueError):
                     previous = []
-                local_ids = {e.get("session_id") for e in entries}
+                local_ids = known_ids | {e.get("session_id") for e in entries}
+                # Ordinary successor writes can race its predecessor-adoption tick.
+                # Keep foreign file-backed results until recovery adopts or discards them.
                 entries.extend(e for e in previous if e.get("session_id") not in local_ids
-                               and _foreign_registry_live(self, e))
+                               and _retain_foreign_checkpoint(self, e))
                 atomic_json_write(path, entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)

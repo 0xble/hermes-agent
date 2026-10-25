@@ -404,14 +404,23 @@ def recorded_contents_since(session_key: str, since: float) -> Dict[str, int]:
 
 
 def owned_pending_count() -> int:
-    """Unsettled final deliveries of this process, including delayed retry obligations."""
+    """Deliveries this process can still settle, including delayed runtime retries.
+
+    A failed row parked for boot recovery cannot keep its owner alive waiting for
+    that same owner to die. Leave it intact for the existing recovery policy.
+    """
     if not _db_path().exists():
         return 0
-    pid, started = _owner_stamp()
+    now, (pid, started) = time.time(), _owner_stamp()
     with _transaction() as conn:
-        return conn.execute("""SELECT COUNT(*) FROM delivery_obligations
+        rows = conn.execute("""SELECT state, attempts, created_at, updated_at, last_error
+            FROM delivery_obligations
             WHERE owner_pid=? AND owner_started_at IS ? AND state IN ('pending','attempting','failed')""",
-                            (pid, started)).fetchone()[0]
+                            (pid, started)).fetchall()
+    return sum(state != "failed" or (
+        attempts < MAX_ATTEMPTS and now - created_at <= STALE_AFTER_SECONDS
+        and retry_not_before(updated_at, last_error, attempts) is not None
+    ) for state, attempts, created_at, updated_at, last_error in rows)
 
 
 def mark_attempting(obligation_id: str) -> None:

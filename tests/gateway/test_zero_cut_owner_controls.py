@@ -163,3 +163,66 @@ async def test_forwarded_inline_button_preserves_original_approval_and_authoriza
         bot.edit_message_text.assert_not_called()
     assert not new._approval_state
     bot.answer_callback_query.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized", [False, True])
+async def test_slash_confirm_routes_to_original_session_while_successor_has_its_own_prompt(
+    waiting_owner, telegram_sdk, monkeypatch, tmp_path, authorized,
+):
+    from tools import slash_confirm
+
+    sdk, adapter_module = telegram_sdk
+    owner, source, old_key, _waiter = waiting_owner
+    successor = run.GatewayRunner(GatewayConfig(zero_cut_handover_enabled=True, sessions_dir=tmp_path / "new-sessions"))
+    new_source = SessionSource(platform=Platform.TELEGRAM, chat_id="987", user_id="456", chat_type="dm")
+    new_key = successor._session_key_for_source(new_source)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "456")
+    bot = AsyncMock()
+    bot.id = 789
+    bot.defaults = None
+    bot.send_message.return_value = SimpleNamespace(message_id=99)
+    old_handler, new_handler = AsyncMock(return_value="old resolved"), AsyncMock(return_value="new resolved")
+    adapters = []
+    for runner in (owner, successor):
+        adapter = adapter_module.TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+        adapter._bot = bot
+        adapter._app = SimpleNamespace(bot=bot)
+        adapter.gateway_runner = runner
+        runner.adapters[Platform.TELEGRAM] = adapter
+        adapters.append(adapter)
+    old, new = adapters
+    try:
+        for runner, target, handler in ((owner, source, old_handler), (successor, new_source, new_handler)):
+            await runner._request_slash_confirm(event=MessageEvent("/reset", source=target), command="reset",
+                                                title="Reset", message="Reset this session?", handler=handler)
+        old_id, new_id = next(iter(old._slash_confirm_state)), next(iter(new._slash_confirm_state))
+        assert old_id != new_id
+        data = f"sc:once:{old_id}"
+        assert len(data.encode("utf-8")) <= 64
+        monkeypatch.setattr("gateway.gateway_slot.effective_gateway_slot", lambda: "b")
+        update = sdk.Update.de_json({
+            "update_id": 101,
+            "callback_query": {"id": "old-slash-tap", "chat_instance": "chat", "data": data,
+                "from": {"id": 456 if authorized else 999, "is_bot": False, "first_name": "Caller"},
+                "message": {"message_id": 99, "date": 1, "text": "Reset this session?",
+                            "chat": {"id": 123, "type": "private"}}},
+        }, bot)
+        await new._handle_callback_query(update, None)
+        new_handler.assert_not_awaited()
+        assert slash_confirm.get_pending(new_key)["confirm_id"] == new_id
+        if authorized:
+            old_handler.assert_awaited_once_with("once")
+            assert slash_confirm.get_pending(old_key) is None
+            # A repeated tap cannot execute either handler again.
+            await new._handle_callback_query(update, None)
+            old_handler.assert_awaited_once()
+            new_handler.assert_not_awaited()
+        else:
+            old_handler.assert_not_awaited()
+            assert slash_confirm.get_pending(old_key)["confirm_id"] == old_id
+    finally:
+        slash_confirm.clear(old_key)
+        slash_confirm.clear(new_key)
+        successor.session_store.close_all_db_handles()
+        successor.close_all_session_db_handles()

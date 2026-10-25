@@ -507,13 +507,16 @@ async def test_promoted_slot_adopts_host_role_and_replays_outbox_only_after_pred
 
     monkeypatch.setattr("gateway.outbox.recover_gateway_destinations", recover)
     predecessor = _hold_lock(tmp_path / "gateway.lock")  # slot a still alive, finishing its turns
-    runner = SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=True))
+    monkeypatch.setattr("tools.process_registry.process_registry.recover_from_checkpoint",
+                        lambda: calls.append("processes"))
+    runner = SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=True),
+                             _recover_secondary_process_checkpoints=lambda registry: calls.append("profiles"))
     task = asyncio.create_task(zcs._adopt_predecessor_duties(runner))
     await asyncio.sleep(0.1)
     assert calls == []
     predecessor.close()  # slot a exits
     await asyncio.wait_for(task, 2)
-    assert calls == ["claim", "record", "outbox"]
+    assert calls == ["processes", "profiles", "claim", "record", "outbox"]
 
 
 @pytest.mark.asyncio
@@ -524,8 +527,12 @@ async def test_adopt_skips_outbox_replay_when_durable_outbox_is_off(monkeypatch,
     monkeypatch.setattr("gateway.run._refresh_host_gateway_record", lambda r: calls.append("record"))
     monkeypatch.setattr("gateway.outbox.recover_gateway_destinations",
                         lambda r: asyncio.sleep(0, result=calls.append("outbox")))
-    await zcs._adopt_predecessor_duties(SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=False)))
-    assert calls == ["claim", "record"]
+    monkeypatch.setattr("tools.process_registry.process_registry.recover_from_checkpoint",
+                        lambda: calls.append("processes"))
+    await zcs._adopt_predecessor_duties(SimpleNamespace(
+        config=SimpleNamespace(durable_outbox_enabled=False),
+        _recover_secondary_process_checkpoints=lambda registry: calls.append("profiles")))
+    assert calls == ["processes", "profiles", "claim", "record"]
 
 
 def test_clients_follow_a_promoted_b_once_a_is_gone(monkeypatch, tmp_path):

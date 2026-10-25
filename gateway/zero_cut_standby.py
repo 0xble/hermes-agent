@@ -289,6 +289,11 @@ async def _adopt_predecessor_duties(runner) -> None:
     home = _get_process_hermes_home()
     while await asyncio.to_thread(slot_lock_held, home, other):
         await asyncio.sleep(_PREDECESSOR_POLL_S)
+    # Startup recovery correctly left live-predecessor checkpoints untouched.
+    # Now adopt its durable processes, without re-running their commands.
+    from tools.process_registry import process_registry
+    await asyncio.to_thread(process_registry.recover_from_checkpoint)
+    await asyncio.to_thread(runner._recover_secondary_process_checkpoints, process_registry)
     from gateway.run import _claim_host_gateway_role, _refresh_host_gateway_record
     try:
         _claim_host_gateway_role()  # on the loop thread, so its SIGTERM cleanup handler installs

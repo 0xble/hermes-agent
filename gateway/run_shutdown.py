@@ -2295,7 +2295,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
 
     @staticmethod
     def _stop_kill_tool_subprocesses(
-        phase: str, *, restart: bool = False, deadline: Optional[float] = None, stop_event: Optional[threading.Event] = None,
+        phase: str, *, restart: bool = False, handover: bool = False,
+        deadline: Optional[float] = None, stop_event: Optional[threading.Event] = None,
     ) -> list:
         """Kill tool subprocesses + terminal envs + browsers; returns cron job IDs marked interrupted.
 
@@ -2324,9 +2325,9 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
 
         def _kill_processes() -> None:
             from tools.process_registry import process_registry
-            # Host shutdown: kill even persist_on_release jobs or they become
-            # PPID=1 orphans (#41225/#46778); an explicit source reaches them.
-            kill_kwargs: dict[str, Any] = {"source": "gateway_shutdown"}
+            # A serving successor adopts file-backed persistent jobs after we exit.
+            # An ordinary host shutdown still stops persist_on_release jobs.
+            kill_kwargs: dict[str, Any] = {"source": "gateway_handover" if handover else "gateway_shutdown"}
             if deadline is not None:
                 kill_kwargs["deadline"] = deadline
             if stop_event is not None:
@@ -2389,7 +2390,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
 
     @staticmethod
     async def _stop_kill_tool_subprocesses_off_loop(
-        phase: str, *, timeout: Optional[float] = None, restart: bool = False,
+        phase: str, *, timeout: Optional[float] = None, restart: bool = False, handover: bool = False,
     ) -> list:
         """Run the shutdown kill sweep off-loop with a cooperative deadline.
 
@@ -2399,6 +2400,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         deadline = time.monotonic() + timeout if timeout is not None else None
         stop_event = threading.Event() if timeout is not None else None
         kill_kwargs: dict[str, Any] = {"phase": phase, "deadline": deadline, "restart": restart}
+        if handover:
+            kill_kwargs["handover"] = True
         if stop_event is not None:
             kill_kwargs["stop_event"] = stop_event
         task = asyncio.create_task(asyncio.to_thread(
@@ -2965,9 +2968,12 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
+        handover = getattr(self, "_zero_cut_handover_state", None) or {}
+        handover_options = {"handover": True} if handover.get("idle") and not handover.get("failed") else {}
         await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
             "final-cleanup", restart=self._restart_requested,
             timeout=min(2.0, self._restart_shutdown_bound()) if self._restart_requested else None,
+            **handover_options,
         )
         logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.

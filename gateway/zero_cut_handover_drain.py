@@ -38,7 +38,7 @@ def _owned_work(runner) -> int:
     try:
         count = getattr(runner, "_active_work_count", runner._running_agent_count)()
         from tools.process_registry import process_registry as registry
-        count += registry.count_running() + registry.completion_queue.qsize()
+        count += registry.count_handover_blockers() + registry.completion_queue.qsize()
         from gateway.delivery_ledger import owned_pending_count as deliveries
         from tools.async_delegation import owned_pending_count as delegations
         from tools.approval import pending_gateway_approval_count
