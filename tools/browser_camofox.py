@@ -947,16 +947,20 @@ def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[st
 
 def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool = False) -> str:
     """Open/focus a shared identity, or release it back to headless-by-default."""
+    from tools.browser_camofox_handoff import post_lifecycle
+
     try:
         session = _get_session(task_id, account)
         # Headless-to-visible restart and clean shutdown can exceed the ordinary 30s command timeout.
         lifecycle_timeout = max(_get_command_timeout(), 90)
         if release:
-            data = _post(f"/browser/identities/{session['user_id']}/release", {}, timeout=lifecycle_timeout)
+            data = post_lifecycle(f"/browser/identities/{session['user_id']}/release", {},
+                                  release=True, timeout=lifecycle_timeout)
             if data.get("ok") is not True or not isinstance(data.get("released"), bool):
                 return tool_error("Camofox did not confirm account release; the task's tab was not changed", success=False)
             keep_task_tabs(task_id, keep=False)
-            return json.dumps({"success": True, "account": session["account"], "released": data["released"]})
+            return json.dumps({"success": True, "account": session["account"], "released": data["released"],
+                               **({"warning": data["warning"]} if "warning" in data else {})})
         prior_tab_id = session.get("tab_id")
         user_id = session["user_id"]
         open_body = {"tabId": prior_tab_id} if prior_tab_id else {}
@@ -966,7 +970,8 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
         with _sessions_lock:
             _handoffs_in_flight[user_id] = _handoffs_in_flight.get(user_id, 0) + 1
         try:
-            data = _post(f"/browser/identities/{user_id}/open", open_body, timeout=lifecycle_timeout)
+            data = post_lifecycle(f"/browser/identities/{user_id}/open", open_body,
+                                  release=False, timeout=lifecycle_timeout)
             tab_id = data.get("tabId")
             if data.get("ok") is not True or not isinstance(tab_id, str) or not tab_id:
                 return tool_error("Camofox did not return a shared tab; the task's tab was not changed", success=False)
@@ -1024,7 +1029,7 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
             result["replacedTab"] = True
         if isinstance(data.get("restarted"), bool):
             result["restarted"] = data["restarted"]
-        for field in ("url", "title"):
+        for field in ("url", "title", "warning"):
             if isinstance(data.get(field), str):
                 result[field] = data[field]
         return json.dumps(result)

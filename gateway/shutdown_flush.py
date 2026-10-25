@@ -269,6 +269,7 @@ def _serialise_value(value: Any) -> Optional[dict]:
         if recovery_id is not None and _json_safe(recovery_id):
             result["recovery_id"] = recovery_id
         for attr in ("user_id", "user_name", "media_urls", "media_types", "media_text_inlined",
+                     "_attended_activity_received_at",
                      "reply_to_message_id", "reply_to_text", "reply_to_author_id", "reply_to_author_name"):
             val = getattr(value, attr, None)
             if val is not None and _json_safe(val):

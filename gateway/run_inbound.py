@@ -291,6 +291,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
             return None
 
+        # Capture before any admission buffer can park input for shutdown spooling,
+        # including restore gates, compression deferral, and orphan FIFO rescue.
+        if is_genuine_user_message(event) and getattr(event, "_attended_activity_received_at", None) is None:
+            setattr(event, "_attended_activity_received_at", time.time())
+
         reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
         startup_restore_keys = getattr(self, "_startup_restore_keys", None)
         # Session-key normalization precedes the turn's key derivation. The
@@ -312,6 +317,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             and not executing_admission.get()
             and not _is_restore_control_event(event)
         ):
+            # Persist only after the normal user and bot admission checks on drain.
             self._queue_startup_restore_event(event, session_key=reconnect_key)
             return None
 
@@ -1683,7 +1689,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return
         if getattr(event, "_attended_activity_task", None) is not None:
             return
-        event._attended_activity_received_at = time.time()
+        if getattr(event, "_attended_activity_received_at", None) is None:
+            event._attended_activity_received_at = time.time()
         task = asyncio.create_task(self._mark_attended_user_activity(
             event, source, session_key, retry_on_failure=True,
         ))
@@ -1842,7 +1849,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if self._draining and not self._hm_is_registered_command(event):
             from gateway.session_retry_admission import refuse_deferred_retry
             refuse_deferred_retry(event)
-            self._preserve_drain_event(self._session_key_for_source(source), event)
+            session_key = self._session_key_for_source(source)
+            self._schedule_attended_user_activity(event, source, session_key)
+            self._preserve_drain_event(session_key, event)
             return None
         # Expand alias quick commands before the running-session split (fork patch: the idle
         # path re-expands harmlessly since the target is then a resolvable built-in).
