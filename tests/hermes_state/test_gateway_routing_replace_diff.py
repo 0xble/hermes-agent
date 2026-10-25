@@ -6,6 +6,8 @@ Every session update full-saves the gateway routing index. Rewriting each of the
 
 from __future__ import annotations
 
+import pytest
+
 from hermes_state import SessionDB
 
 
@@ -40,6 +42,14 @@ def test_replace_writes_only_the_difference_and_keeps_replace_semantics(tmp_path
         db.close()
 
 
+class _FetchedRows(list):
+    def fetchall(self):
+        return list(self)
+
+    def fetchone(self):
+        return self[0] if self else None
+
+
 class _CountingConn:
     """Counts Python<->SQLite row round trips made by a write callback. Each fetched row and each
     executemany parameter set is one GIL release/re-take while the writer lock is held."""
@@ -53,7 +63,7 @@ class _CountingConn:
         cursor = self._conn.execute(sql, params)
         rows = cursor.fetchall()
         self.round_trips += len(rows)
-        return iter(rows)
+        return _FetchedRows(rows)
 
     def executemany(self, sql, seq):
         seq = list(seq)
@@ -86,8 +96,18 @@ def test_replace_round_trips_under_the_writer_lock_do_not_grow_with_the_index(tm
         db.replace_gateway_routing_entries(entries, scope="s")
         del db._execute_write
 
-        assert counted and counted[-1].round_trips <= 4
+        assert counted and counted[-1].round_trips <= 4, counted[-1].round_trips
         stored = {k: v[0] for k, v in _rows(db, "s").items()}
         assert stored == entries
+    finally:
+        db.close()
+
+
+def test_replace_rejects_an_unencodable_key_instead_of_storing_invalid_utf8(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        with pytest.raises(UnicodeEncodeError):
+            db.replace_gateway_routing_entries({"x\ud800": "1"}, scope="s")
+        assert db.load_gateway_routing_entries(scope="s") == {}
     finally:
         db.close()

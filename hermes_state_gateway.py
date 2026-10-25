@@ -356,7 +356,9 @@ class SessionGatewayMixin:
         threads every re-take waits a switch interval, which stretched a 10 ms diff of 2,753 rows
         into 3-17 s writer-lock holds on the live gateway (callback CPU ~0.4 s)."""
         now = time.time()
-        payload = json.dumps({k: v for k, v in entries.items() if k and v})
+        # ensure_ascii=False keeps an unpaired surrogate a bind-time UnicodeEncodeError (the caller's
+        # sessions.json fallback) instead of invalid UTF-8 that json_each would store.
+        payload = json.dumps({k: v for k, v in entries.items() if k and v}, ensure_ascii=False)
         def _do(conn):
             conn.execute(
                 "DELETE FROM gateway_routing WHERE scope = ? "
