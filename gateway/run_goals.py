@@ -689,7 +689,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             return  # the classic CLI viewer judges and continues through ``session.automation``
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         from hermes_cli.goal_turn_outcome import is_successful_goal_turn
-        successful = is_successful_goal_turn(
+        successful = not self._turn_failed() and is_successful_goal_turn(
             agent_result, final_text, succeeded=getattr(event, "_agent_turn_succeeded", None),
         )
         if not successful:

@@ -1755,6 +1755,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                 # next session loads stale memory (#73297). Bounded, like the CLI exit path; never blocks.
                 # The teardown claim comes first: a /new that stops waiting on this job evicts the agent,
                 # and that soft release must leave extraction + provider shutdown to us.
+                session_messages = getattr(agent, "_session_messages", None)
                 _mm = getattr(agent, "_memory_manager", None)
                 if _mm is not None:
                     with suppress(Exception):
@@ -1763,7 +1764,6 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                         _mm.flush_pending(timeout=10)
                 # Pass the real transcript so ``on_session_end`` hooks don't see the empty default.
                 # ``_session_messages`` may be absent on ``object.__new__`` test stubs, hence getattr (#15165).
-                session_messages = getattr(agent, "_session_messages", None)
                 if isinstance(session_messages, list):
                     agent.shutdown_memory_provider(session_messages)
                 else:

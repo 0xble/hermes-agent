@@ -349,6 +349,7 @@ async def test_failed_turn_with_text_never_drives_goal_or_until_judge(loop_env, 
     try:
         await GatewayRunner._run_post_turn_hooks(
             runner, agent_result=refusal, source=_make_event("wakeup").source, is_internal=True,
+            event=_loop_wake_event(mgr),
         )
     finally:
         execution_result.reset(token)

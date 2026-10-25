@@ -1078,11 +1078,13 @@ async def test_hygiene_lock_in_flight_defers_turn_without_sibling_compressor(
         # The lock starts after admission, and the transport drains the retained input.
         key = runner.session_store.get_or_create_session.return_value.session_key
         adapter._active_sessions[key] = asyncio.Event()
-        runner._session_has_compression_in_flight = AsyncMock(side_effect=[False, True])
+        runner._session_has_compression_in_flight = AsyncMock(
+            side_effect=lambda *_: runner._session_has_compression_in_flight.await_count > 1
+        )
         assert await runner._handle_message(event) is None
         assert ShouldNotRunAgent.instances == 0
         assert runner._run_agent.await_count == 0
-        assert runner._session_has_compression_in_flight.await_count == 2
+        assert runner._session_has_compression_in_flight.await_count == 3
         assert adapter._pending_messages[key] is event
         assert adapter.sent == []
     finally:

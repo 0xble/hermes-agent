@@ -720,6 +720,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- Post-turn goal/loop bookkeeping retains the owner's failed-result fence even for text-only
+  refusal returns. Soft eviction honors the memory manager's teardown claim during a reset's
+  pre-extraction flush and cleanup captures its transcript before eviction clears the agent.
+  The compression-lock fixture holds the lock until transport retry instead of exhausting
+  a call-count list after the upstream added another pre-model fence.
+
 - Compaction hook fixtures mark discovery complete before synchronous dispatch, matching
   the upstream plugin observer contract. Cron runner delivery assertions follow
   `cron/executions.py:750-763`, which intentionally projects terminal receipts into

@@ -1223,6 +1223,13 @@ class GatewayAgentCacheMixin:
         except Exception:  # no instance __dict__ (slotted test double): nothing can race the claim
             lock = nullcontext()
         with lock:
+            manager = getattr(agent, "_memory_manager", None)
+            if manager is not None:
+                claim = getattr(manager, "claim_teardown", None)
+                if callable(claim) and not claim(session_end=False):
+                    # A timed-out reset may still be flushing before it claims the agent flag.
+                    # Leave its manager attached so extraction and shutdown finish in that worker.
+                    return None
             if commit_key is not None:
                 if boundary:
                     self._commit_memory_before_soft_evict(agent, commit_key, True)
