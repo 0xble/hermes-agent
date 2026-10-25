@@ -137,8 +137,41 @@ async def test_retire_tool_preserves_immediate_mode(monkeypatch, immediate):
     ))
 
     assert result["status"] == "queued"
-    request.assert_awaited_once_with(runner, source, target="Owner", now=immediate, cancel=False)
+    request.assert_awaited_once_with(runner, source, target="Owner", now=immediate, cancel=False,
+                                     owners=None, reason="", generation="", context="")
     assert topic_tool.TELEGRAM_TOPIC_SCHEMA["parameters"]["properties"]["now"]["type"] == "boolean"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supplied", ["", "old-generation", "wrong-generation"])
+async def test_retire_tool_fences_preparation_even_when_the_model_omits_generation(monkeypatch, supplied):
+    import gateway.telegram_retire as retirement
+    import tools.send_message_tool as send_tool
+    import tools.telegram_topic_tool as topic_tool
+
+    source = _source(thread_id="297206")
+    turn = SimpleNamespace(event=SimpleNamespace(metadata={"retirement_generation": "old-generation"}))
+    runner = SimpleNamespace(_session_state=lambda _: SimpleNamespace(turn=turn),
+                             _session_key_for_source=lambda _: "caller-key")
+    request = AsyncMock(return_value={"status": "queued"})
+    monkeypatch.setattr(retirement, "request", request)
+    monkeypatch.setattr(topic_tool, "_live_runner", lambda: runner)
+    monkeypatch.setattr(topic_tool, "_calling_source", lambda _: source)
+    async def dispatch(_runner, make_coro, _error):
+        return await make_coro()
+    monkeypatch.setattr(send_tool, "_dispatch_on_gateway_loop", dispatch)
+    result = json.loads(await topic_tool.telegram_topic_tool({
+        "action": "retire", "owners": {"goal": "Owner"}, "reason": "Same subject.",
+        "message": "Preserve the maintenance limit.", "generation": supplied,
+    }))
+    if supplied == "wrong-generation":
+        assert "does not match" in str(result)
+        request.assert_not_awaited()
+    else:
+        assert result["status"] == "queued"
+        request.assert_awaited_once_with(runner, source, target=None, now=False, cancel=False,
+            owners={"goal": "Owner"}, reason="Same subject.", generation="old-generation",
+            context="Preserve the maintenance limit.")
 
 
 @pytest.mark.asyncio

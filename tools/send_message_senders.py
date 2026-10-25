@@ -416,7 +416,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if _cap is not None and utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
         # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
-        chunks = BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else []
+        # HTML keeps raw suffixes; MarkdownV2 adds 2 escapes and a possible fence-lift newline.
+        chunks = BasePlatformAdapter.truncate_message(
+            formatted, 4096, len_fn=utf16_len,
+            indicator_overhead=0 if _has_html else 3) if formatted.strip() else []
         if len(chunks) > 1 and not _has_html:
             # truncate_message appends a raw " (1/2)" suffix after format_message escaped the text;
             # escape the MarkdownV2-special parentheses, as the live adapter does (#74004).
