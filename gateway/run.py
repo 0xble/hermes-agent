@@ -48,7 +48,7 @@ from agent.session_activity import ActivityProvenance
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
-from gateway.replay_scheduler import ReplayHandle, ReplayScheduler
+from gateway.run_background_admission import GatewayBackgroundAdmissionMixin
 
 # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
 _AGENT_CACHE_MAX_SIZE = 128
@@ -136,12 +136,12 @@ def _hygiene_cooldown_for_failure(gateway, session_key: str, base_cooldown_secon
     (#79624). The streak is mirrored to SQLite by rotation-stable ``session_key`` so it outlives both the
     per-run agent and gateway restarts; ``PersistentState`` keeps the hot in-process view.
     """
-    streak, state = 1, None
-    try:
-        state = gateway._session_state(session_key).persistent
+    increment, streak, state = getattr(_gateway_session_db_inner(gateway), "increment_hygiene_failure_streak", None), 1, None
+    try:  # SQLite authoritative: refresh only a live session (off-loop get-or-create resurrects one)
+        lookup = gateway._peek_session_state if callable(increment) else gateway._session_state
+        state = getattr(lookup(session_key), "persistent", None)
     except Exception as exc:
         logger.debug("hygiene failure streak update failed: %s", exc)
-    increment = getattr(_gateway_session_db_inner(gateway), "increment_hygiene_failure_streak", None)
     if callable(increment):
         try:
             streak = max(1, int(increment(session_key)))
@@ -2691,7 +2691,7 @@ _INTERRUPT_TOOL_REASON_TIMEOUT = "gateway inactivity watchdog"
 _INTERRUPT_REASON_EVICTED = "Session ended while the turn was running"
 # ``tool_reason`` for eviction / shutdown: these stops are system-issued, not user stops (#112647).
 _INTERRUPT_TOOL_REASON_EVICTED = "session evicted"
-_INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN = "gateway shutdown"
+from tools.interrupt import INTERRUPT_REASON_GATEWAY_SHUTDOWN as _INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
@@ -3458,7 +3458,8 @@ class GatewayRunner(
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, ZeroCutBusyRoutingMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewaySessionControlsMixin, GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
+    GatewaySessionControlsMixin, GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin,
+    GatewayBackgroundAdmissionMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
@@ -3589,51 +3590,6 @@ class GatewayRunner(
         self._init_runtime_caches()
         self._init_session_db()
         self._init_registries_and_clocks()
-
-    def _get_replay_scheduler(self) -> ReplayScheduler:
-        """Return the one gateway-wide replay admission scheduler.
-
-        Bare test runners are often built with ``object.__new__``; retain a lazy
-        fallback there while normal construction creates this before adapters start.
-        """
-        scheduler = self.__dict__.get("_replay_scheduler")
-        if scheduler is None:
-            scheduler = ReplayScheduler(getattr(self.config, "restart_replay_concurrency", 2))
-            self.__dict__["_replay_scheduler"] = scheduler
-        return scheduler
-
-    def _enqueue_replay(
-        self, *, priority: int, kind: str, session_key: Optional[str],
-        dispatch: Callable[[], Any], profile_home: Any = None, on_drop: Optional[Callable[[], Any]] = None,
-    ) -> ReplayHandle:
-        """Queue one replay with its owning profile captured at enqueue time."""
-        captured_home = profile_home
-        scheduler = self._get_replay_scheduler()
-
-        async def _scoped_call(callback) -> Any:
-            from contextlib import nullcontext
-            from inspect import isawaitable
-            scope = nullcontext()
-            if captured_home is not None and getattr(self.config, "multiplex_profiles", False):
-                scope = _async_profile_runtime_scope(captured_home)
-            async with scope:
-                result = callback()
-                return await result if isawaitable(result) else result
-
-        return scheduler.enqueue(
-            priority=priority,
-            kind=kind,
-            session_key=session_key,
-            profile_home=captured_home,
-            dispatch=lambda: _scoped_call(dispatch),
-            on_drop=(lambda: _scoped_call(on_drop)) if on_drop is not None else None,
-        )
-
-    def _init_replay_scheduler(self) -> None:
-        """Construct replay admission before any adapter can deliver an event."""
-        self._replay_scheduler = ReplayScheduler(
-            getattr(self.config, "restart_replay_concurrency", 2)
-        )
 
     def _init_runtime_settings(self) -> None:
         """Load ephemeral per-call config (prefill, reasoning, busy modes, timeouts, routing)."""
@@ -4639,19 +4595,6 @@ class GatewayRunner(
         _native_slack_task_cards: Any = None
         needs_progress_queue: Any = None
         _generic_status_phrase: Any = None
-
-    @dataclasses.dataclass
-    class _RunAgentWorker:
-        """Executor future + inactivity-watchdog handles for one ``_run_agent_inner`` turn."""
-        executor_task: Any = None
-        agent_timeout: Optional[float] = None
-        agent_warning: Optional[float] = None
-        task_id: str = ""
-        process_baseline: Any = None
-        worker_done: Any = None
-        timeout_fired: Any = None
-        cleanup_lock: Any = None
-        is_current: Any = None
 
 
 def _run_planned_stop_watcher(

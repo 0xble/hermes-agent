@@ -654,6 +654,9 @@ class GatewayConfig:
     thread_sessions_per_user: bool = False  # False = threads shared across participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active sessions
     restart_replay_concurrency: int = 2  # Gateway-wide cap for restart/reconnect replay admission
+    # Gateway-wide cap on running turns nobody typed (restart resumes, goal/loop wakes, completions);
+    # typed messages are never capped. See gateway/run_background_admission.py.
+    background_turn_concurrency: int = 8
     # The default profile's gateway serves every profile on the host (profiles stamped into session
     # keys, per-profile adapters/credentials). On by default (DEFAULT_CONFIG), but UNSET here is
     # ``None``: a request the gateway settles at boot, not a verdict. ``hermes_cli.gateway_multiplex_mode
@@ -701,7 +704,8 @@ class GatewayConfig:
     _SCALAR_DICT_FIELDS = (
         "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
-        "max_concurrent_sessions", "restart_replay_concurrency", "multiplex_profiles",
+        "max_concurrent_sessions", "restart_replay_concurrency", "background_turn_concurrency",
+        "multiplex_profiles",
         "on_all_adapters_down",
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
@@ -857,6 +861,13 @@ class GatewayConfig:
                 key_label("restart_replay_concurrency"),
             )
             restart_replay_concurrency = 2
+        background_turn_concurrency = _coerce_int(pick("background_turn_concurrency"), 8)
+        if isinstance(pick("background_turn_concurrency"), bool) or background_turn_concurrency < 1:
+            logger.warning(
+                "Ignoring invalid %s (expected a positive integer); using 8",
+                key_label("background_turn_concurrency"),
+            )
+            background_turn_concurrency = 8
 
         try:
             session_store_max_age_days = max(int(data.get("session_store_max_age_days", 90)), 0)
@@ -892,6 +903,7 @@ class GatewayConfig:
             on_all_adapters_down=on_all_adapters_down,
             max_concurrent_sessions=max_concurrent_sessions,
             restart_replay_concurrency=restart_replay_concurrency,
+            background_turn_concurrency=background_turn_concurrency,
             unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), UNAUTHORIZED_DM_BEHAVIORS, "pair"),
             restart_resume_policy=pick("restart_resume_policy"),
             auto_resume_on_boot=_coerce_bool(pick("auto_resume_on_boot"), True),

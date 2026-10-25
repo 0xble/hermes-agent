@@ -8,8 +8,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.run_turn_runner import TurnRunner
+from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from tools import approval, approval_context, approval_prompt
 from tools.approval_gateway_wait import _ApprovalEntry, _await_gateway_decision
@@ -45,7 +47,8 @@ def test_gateway_scope_reaches_telegram_and_controls_resolution(monkeypatch, one
     adapter._bot.send_message.return_value = SimpleNamespace(message_id=42)
     adapter._app = MagicMock()
     runner: Any = object.__new__(TurnRunner)
-    runner._ctx = SimpleNamespace(
+    runner._ctx = TurnContext(
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345"),
         _status_adapter=adapter, _status_chat_id="12345", _status_thread_metadata={},
         session_key=session,
     )

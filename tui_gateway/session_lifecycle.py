@@ -677,12 +677,16 @@ def _close_session_by_id(
 
 
 def _ws_session_is_detached(session: dict | None) -> bool:
-    """True if a live session is still bound to the disconnected-WS sentinel."""
-    return bool(session and not session.get("_finalized") and session.get("transport") is _detached_ws_transport)
+    """True for a parked mailbox (or a legacy disconnected-WS sentinel)."""
+    if not session or session.get("_finalized"):
+        return False
+    transport = session.get("transport")
+    return (transport is _detached_ws_transport
+            or isinstance(transport, FanoutTransport) and not transport.transports())
 
 
 def _ws_session_is_orphaned(session: dict | None) -> bool:
-    """True if a WS session sits on ``_detached_ws_transport`` (where ``handle_ws`` parks disconnected clients), idle."""
+    """True if a WS session has no attached peer and is idle."""
     return bool(_ws_session_is_detached(session) and not session.get("running"))
 
 
@@ -1001,14 +1005,12 @@ def _schedule_ws_orphan_reap(
 
 
 def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect") -> tuple[int, int]:
-    """Single WS-disconnect teardown entry point: reap close_on_disconnect sessions (sidecar/dashboard) immediately;
-    re-point the rest at the detached transport (later emits miss the dead socket) for the grace-windowed WS-orphan
-    reaper. Returns ``(reaped, detached)`` counts.
+    """Detach a departing WS peer from every session, preserving other viewers' streams.
 
-    Multi-client fan-out: the departing transport is DETACHED from every session first. A session that still has
-    another client attached keeps streaming and is neither parked nor reaped — a watcher leaving must not end the
-    turn the remaining client is reading. Only the sessions left clientless take the historical
-    close_on_disconnect / park-sentinel path, so a single-client disconnect behaves exactly as it always has."""
+    Clientless close_on_disconnect sessions are reaped immediately. The rest keep
+    their empty mailbox through the WS-orphan grace window and any reconnect.
+    Returns ``(reaped, detached)`` counts.
+    """
     clientless = _detach_transport_from_sessions(transport)
     reaped = detached = 0
     for sid, session in clientless:
@@ -1035,9 +1037,8 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
             if current.get("close_on_disconnect"):
                 claimed_for_teardown = _pop_session_by_id(sid)
             else:
-                # Point at the drop sentinel (NOT real stdio) so _ws_session_is_orphaned recognizes it; standalone
-                # `hermes --tui` keeps real _stdio. UNLESS another window (pop-out viewer) still shows the session:
-                # re-bind to the most recent surviving viewer instead.
+                # Attach any surviving legacy viewer to the stable mailbox.
+                # A disconnected WebSocket must never fall back to process stdio.
                 viewers = current.get("viewers") or {}
                 # See #83716.
                 viewers.pop(transport, None)
@@ -1045,7 +1046,8 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
                 if live:
                     _rebind_live_transport(sid, current, live[-1])
                 else:
-                    current["transport"] = _detached_ws_transport
+                    # Keep the empty mailbox and any in-flight detached writer.
+                    # Reconnect changes membership, never the ordering authority.
                     current.pop("_client_gone_interrupt_requested", None)
                     current.pop("_client_gone_interrupt_polls", None)
                     should_schedule_reap = True

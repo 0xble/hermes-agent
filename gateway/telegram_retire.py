@@ -99,7 +99,7 @@ async def request(runner, source, *, target=None, now=False, cancel=False, owner
     if existing and existing["phase"] in {"deleting", "delete_unresolved", "done"}:
         return {"action": "retire", "status": existing["phase"], "thread_id": str(source.thread_id)}
     session_key = runner._session_key_for_source(source)
-    session_id = runner.session_store.peek_session_id(session_key)
+    session_id = await asyncio.to_thread(runner.session_store.peek_session_id, session_key)
     if not session_id:
         raise TopicRequestError("This topic has no bound session to retire.")
     # A changed decision fences preparation and closing callbacks without losing
@@ -272,7 +272,7 @@ async def advance(runner, source):
                 raise RuntimeError("The previous delete was not confirmed. Use /retire to retry or /retire cancel to keep this topic.")
             from gateway.telegram_retire_work import prepare
             # Inventory happens here, after the turn, not when /retire was typed.
-            if runner.session_store.peek_session_id(key) != state["session_id"]:
+            if await asyncio.to_thread(runner.session_store.peek_session_id, key) != state["session_id"]:
                 raise RuntimeError("The bound session changed during retirement. Cancel and retry from its current session.")
             if not await prepare(runner, source, state):
                 return
