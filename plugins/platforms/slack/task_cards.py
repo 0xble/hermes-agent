@@ -2,13 +2,14 @@
 
 import logging
 
-from slack_sdk.errors import SlackApiError
-
 logger = logging.getLogger(__name__)
 
 
 async def finish_task_card(client, stream, *, delete: bool) -> None:
     """Seal first so a failed deletion cannot leave Slack's live indicator armed."""
+    # Adapter discovery must remain importable without the optional Slack SDK.
+    from slack_sdk.errors import SlackApiError
+
     if stream.stream_ts:
         try:
             await client.api_call("chat.stopStream", json={"channel": stream.channel, "ts": stream.stream_ts})
