@@ -179,32 +179,47 @@ class TestInboundLogPrivacy:
 
 
     @pytest.mark.asyncio
-    async def test_entry_diagnostic_log_is_metadata_only(self, caplog):
-        """#30185's event-arrival DEBUG line surfaces routing metadata
-        (type/subtype/user/bot_id/channel/ts) but never the message text."""
+    @pytest.mark.parametrize("subtype", ["bot_message", "message_changed"])
+    async def test_entry_diagnostic_log_is_metadata_only(self, caplog, subtype):
+        """INFO ingress receipts preserve routing metadata without outer,
+        nested-message, block, or payload content, even when filtering drops it."""
         secret = "bot payload that must stay out of logs"
+        block_secret = "private block content"
         adapter = self._make_adapter()
         adapter._dedup = MagicMock(is_duplicate=MagicMock(return_value=True))
 
         event = {
             "type": "message",
-            "subtype": "bot_message",
+            "subtype": subtype,
             "user": "U_OTHER_BOT",
             "bot_id": "B_OTHER",
             "bot_profile": {"name": "Peer Bot"},
             "ts": "12345.6789",
             "channel": "C_SHARED",
             "text": secret,
+            "blocks": [{"text": block_secret}],
         }
-        with caplog.at_level(logging.DEBUG, logger=ADAPTER_LOGGER):
-            await adapter._handle_slack_message(event)
+        if subtype == "message_changed":
+            message = {"ts": "12300.1", "user": "U_OTHER_BOT", "text": secret,
+                       "blocks": [{"text": block_secret}]}
+            event["message"] = message
+            event["previous_message"] = dict(message)
+        payload = {"event_id": "Ev_TEST", "event": event, "private": secret}
+        with caplog.at_level(logging.DEBUG):
+            await adapter._handle_slack_message(event, payload)
 
         entry_lines = [
-            r.getMessage() for r in caplog.records if "event received" in r.getMessage()
+            r for r in caplog.records if "[Slack] ingress:" in r.getMessage()
         ]
-        assert entry_lines, "entry diagnostic DEBUG line must fire"
-        assert "bot_id=B_OTHER" in entry_lines[0]
+        assert len(entry_lines) == 1, "one ingress receipt must precede filtering"
+        assert entry_lines[0].levelno == logging.INFO
+        receipt = entry_lines[0].getMessage()
+        for metadata in ("event_id=Ev_TEST", "type=message", f"subtype={subtype}",
+                         "user=U_OTHER_BOT", "bot_id=B_OTHER", "channel=C_SHARED",
+                         "ts=12345.6789"):
+            assert metadata in receipt
         assert secret not in caplog.text
+        assert block_secret not in caplog.text
 
 
 class TestClarifyLogPrivacy:
