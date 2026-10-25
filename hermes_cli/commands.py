@@ -193,8 +193,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
-    CommandDef("attend", "Pin the attended model until released", "Configuration",
-               gateway_only=True, args_hint="[off|status]", subcommands=("off", "status"), busy_policy="dispatch"),
+    CommandDef("attend", "Pin the attended model permanently or for a duration", "Configuration",
+               gateway_only=True, args_hint="[duration|off|status]", subcommands=("off", "status"), busy_policy="dispatch"),
     CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
                args_hint="[model] [--provider name] [--reasoning level] [--global|--session|--once] [--refresh] [--all]",
                busy_policy="defer_until_idle", desktop="hidden"),

@@ -168,7 +168,7 @@ async def _current(runner, source, generation):
     return state if state and state["generation"] == generation and state["phase"] not in {"cancelled", "done"} else None
 
 
-async def _probe_deleted(bot, source, *, runner=None):
+async def _probe_deleted(bot, source, *, runner=None, read_only=False):
     from gateway.telegram_retire_work import cli
     from hermes_platform.resolver import locate_command
     if runner is not None and locate_command("telegram").command:
@@ -177,6 +177,8 @@ async def _probe_deleted(bot, source, *, runner=None):
         if not isinstance(topics, list):
             raise RuntimeError("Exact-topic lookup returned an incomplete response")
         return not topics
+    if read_only:
+        return False
     # The Bot API has no getForumTopic. A thread-strict send is the documented
     # absence probe. Never retry or fall back to the chat root.
     try:
@@ -214,7 +216,7 @@ async def _unbind(runner, source, state):
 async def advance(runner, source):
     """Resume persisted retirement only after the active turn relinquishes its lane."""
     state = await load(runner, source)
-    if not state or state["phase"] in {"cancelled", "done", "failed", "delete_unresolved"}:
+    if not state or state["phase"] in {"cancelled", "done", "failed"}:
         return
     key = state["session_key"]
     adapter = runner._delivery_adapter_for(source)
@@ -232,7 +234,7 @@ async def advance(runner, source):
         return
     async with lock:
         state = await _current(runner, source, state["generation"])
-        if not state or state["phase"] in {"failed", "delete_unresolved"}:
+        if not state or state["phase"] == "failed":
             return
         generation = state["generation"]
         bot = getattr(adapter, "_bot", None)
@@ -247,8 +249,13 @@ async def advance(runner, source):
                         or receipt.get("chat_id") != str(source.chat_id)
                         or receipt.get("thread_id") != str(source.thread_id)):
                     raise RuntimeError("Missing exact-topic confirmed closing receipt")
-                if await _probe_deleted(bot, source, runner=runner):
-                    await _unbind(runner, source, state)
+                passive = state["phase"] == "delete_unresolved"
+                if await _probe_deleted(bot, source, runner=runner, read_only=passive):
+                    state = await _current(runner, source, generation)
+                    if state:
+                        await _unbind(runner, source, state)
+                    return
+                if passive:
                     return
                 raise RuntimeError("The previous delete was not confirmed. Use /retire to retry or /retire cancel to keep this topic.")
             from gateway.telegram_retire_work import prepare
@@ -299,6 +306,11 @@ async def advance(runner, source):
         except RetirementSuperseded:
             return
         except Exception as exc:
+            if state and state["phase"] == "delete_unresolved":
+                # A deleted topic cannot receive another user retry. Quietly
+                # reconcile read-only evidence without replaying sends/deletes.
+                logger.debug("Topic retirement reconciliation deferred for %s: %s", key, exc)
+                return
             logger.warning("Topic retirement failed for %s: %s", key, exc, exc_info=True)
             current = await _current(runner, source, generation)
             if current:
@@ -316,7 +328,7 @@ async def resume_all(runner):
     for _, raw in await runner._session_db.list_meta_prefix(PREFIX):
         try:
             state = json.loads(raw)
-            if state["phase"] not in {"cancelled", "done", "failed", "delete_unresolved"}:
+            if state["phase"] not in {"cancelled", "done", "failed"}:
                 source = SessionSource(**{**state["source"], "platform": Platform.TELEGRAM})
                 async with runner._async_profile_scope_for_source(source):
                     await advance(runner, source)

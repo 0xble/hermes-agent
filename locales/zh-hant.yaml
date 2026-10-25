@@ -43,11 +43,13 @@ approval:
     second_other: "{count} 秒"
 gateway:
   attend:
-    usage: "用法：/attend、/attend off 或 /attend status。"
+    usage: "用法：/attend [duration]、/attend off 或 /attend status。時長必須為正值，例如 30m、2h、1h30m 或 1d。不指定時長則永久固定。"
     disabled: "尚未設定活躍時段模型路由。請先設定 model.attended。"
-    pinned: "已固定使用活躍時段模型（{model}）。使用 /attend off 解除固定。明確的 /model 選擇仍優先。"
+    pinned: "已永久固定使用活躍時段模型（{model}）。使用 /attend off 解除固定。明確的 /model 選擇仍優先。"
+    pinned_timed: "已固定使用活躍時段模型（{model}），持續 {duration}，至 {until}。使用 /attend off 解除固定。明確的 /model 選擇仍優先。"
     released: "已解除活躍時段模型固定。{minutes} 分鐘閒置計時現在開始。"
-    status_pinned: "活躍時段模型：已固定。目前路由：{model}。"
+    status_pinned: "活躍時段模型：已永久固定。目前路由：{model}。"
+    status_timed: "活躍時段模型：固定剩餘 {remaining}，至 {until}。目前路由：{model}。"
     status_unpinned: "活躍時段模型：未固定。目前路由：{model}。"
     session_changed: "工作階段已變更。請重新執行 /attend。"
     configured_model: "已設定的路由"
@@ -1497,7 +1499,7 @@ platform:
     prompt_expired: ⌛ 該提示已不再等待回答。請以一般訊息傳送您的回覆。
 slash:
   attend:
-    description: "固定使用活躍時段模型，直到解除"
+    description: "永久或定時固定使用活躍時段模型"
   approve:
     description: "批准待處理的危險指令"
   bg:

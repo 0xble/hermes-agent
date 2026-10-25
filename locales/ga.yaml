@@ -43,11 +43,13 @@ approval:
     second_other: "{count} soicind"
 gateway:
   attend:
-    usage: "Úsáid: /attend, /attend off nó /attend status."
+    usage: "Úsáid: /attend [duration], /attend off nó /attend status. Caithfidh an fad a bheith dearfach, m.sh. 30m, 2h, 1h30m nó 1d. Gan fad, tá an phionnáil buan."
     disabled: "Níl ródú le linn úsáide gníomhaí cumraithe. Socraigh model.attended ar dtús."
-    pinned: "Tá an tsamhail don úsáid ghníomhach pionnáilte ({model}). Úsáid /attend off chun í a scaoileadh. Bíonn tosaíocht fós ag roghanna sainráite /model."
+    pinned: "Tá an tsamhail don úsáid ghníomhach pionnáilte go buan ({model}). Úsáid /attend off chun í a scaoileadh. Bíonn tosaíocht fós ag roghanna sainráite /model."
+    pinned_timed: "Tá an tsamhail don úsáid ghníomhach pionnáilte ({model}) ar feadh {duration}, go dtí {until}. Úsáid /attend off chun í a scaoileadh. Bíonn tosaíocht fós ag roghanna sainráite /model."
     released: "Tá an tsamhail don úsáid ghníomhach scaoilte. Tosaíonn an t-amadóir díomhaointis {minutes} nóiméad anois."
-    status_pinned: "Úsáid ghníomhach: samhail pionnáilte. An bealach reatha: {model}."
+    status_pinned: "Úsáid ghníomhach: samhail pionnáilte go buan. An bealach reatha: {model}."
+    status_timed: "Úsáid ghníomhach: samhail pionnáilte ar feadh {remaining} eile, go dtí {until}. An bealach reatha: {model}."
     status_unpinned: "Úsáid ghníomhach: samhail gan phionnáil. An bealach reatha: {model}."
     session_changed: "Tá an seisiún athraithe. Rith /attend arís."
     configured_model: "bealach cumraithe"
@@ -1497,7 +1499,7 @@ platform:
     prompt_expired: ⌛ Níl an leid sin ag fanacht le freagra a thuilleadh. Seol do fhreagra mar ghnáth-theachtaireacht.
 slash:
   attend:
-    description: "Pionnáil an tsamhail don úsáid ghníomhach go dtí go scaoilfear í"
+    description: "Pionnáil samhail na húsáide gníomhaí go buan nó ar feadh tréimhse"
   approve:
     description: "Ceadaigh ordú contúirteach atá ag fanacht"
   bg:

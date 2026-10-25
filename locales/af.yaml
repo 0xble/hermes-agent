@@ -43,11 +43,13 @@ approval:
     second_other: "{count} sekondes"
 gateway:
   attend:
-    usage: "Gebruik: /attend, /attend off of /attend status."
+    usage: "Gebruik: /attend [duration], /attend off of /attend status. Die duur moet positief wees, bv. 30m, 2h, 1h30m of 1d. Sonder ’n duur is die vaspen permanent."
     disabled: "Roetering vir aktiewe gebruik is nie opgestel nie. Stel eers model.attended in."
-    pinned: "Model vir aktiewe gebruik vasgespeld ({model}). Gebruik /attend off om dit los te maak. Uitdruklike /model-keuses kry steeds voorkeur."
+    pinned: "Model vir aktiewe gebruik permanent vasgespeld ({model}). Gebruik /attend off om dit los te maak. Uitdruklike /model-keuses kry steeds voorkeur."
+    pinned_timed: "Model vir aktiewe gebruik vir {duration} vasgespeld ({model}), tot {until}. Gebruik /attend off om dit los te maak. Uitdruklike /model-keuses kry steeds voorkeur."
     released: "Model vir aktiewe gebruik losgemaak. Die onaktiwiteitstydhouer van {minutes} minute begin nou."
-    status_pinned: "Aktiewe gebruik: model vasgespeld. Huidige roete: {model}."
+    status_pinned: "Aktiewe gebruik: model permanent vasgespeld. Huidige roete: {model}."
+    status_timed: "Aktiewe gebruik: model nog vir {remaining} vasgespeld, tot {until}. Huidige roete: {model}."
     status_unpinned: "Aktiewe gebruik: model nie vasgespeld nie. Huidige roete: {model}."
     session_changed: "Die sessie het verander. Voer /attend weer uit."
     configured_model: "opgestelde roete"
@@ -1497,7 +1499,7 @@ platform:
     prompt_expired: ⌛ Daardie navraag wag nie meer op 'n antwoord nie. Stuur jou antwoord as 'n gewone boodskap.
 slash:
   attend:
-    description: "Speld die model vir aktiewe gebruik vas totdat dit losgemaak word"
+    description: "Speld die model vir aktiewe gebruik permanent of vir ’n tydperk vas"
   approve:
     description: "Keur 'n hangende gevaarlike opdrag goed"
   bg:

@@ -43,11 +43,13 @@ approval:
     second_other: "{count} segundos"
 gateway:
   attend:
-    usage: "Uso: /attend, /attend off o /attend status."
+    usage: "Uso: /attend [duration], /attend off o /attend status. La duración debe ser positiva, por ejemplo 30m, 2h, 1h30m o 1d. Sin duración, la fijación es permanente."
     disabled: "El enrutamiento durante el uso activo no está configurado. Configura primero model.attended."
-    pinned: "Se ha fijado el modelo para uso activo ({model}). Usa /attend off para liberarlo. Las selecciones explícitas con /model siguen teniendo prioridad."
+    pinned: "Se ha fijado permanentemente el modelo para uso activo ({model}). Usa /attend off para liberarlo. Las selecciones explícitas con /model siguen teniendo prioridad."
+    pinned_timed: "Se ha fijado el modelo para uso activo ({model}) durante {duration}, hasta {until}. Usa /attend off para liberarlo. Las selecciones explícitas con /model siguen teniendo prioridad."
     released: "Se ha liberado el modelo para uso activo. El temporizador de inactividad de {minutes} minutos empieza ahora."
-    status_pinned: "Uso activo: modelo fijado. Ruta actual: {model}."
+    status_pinned: "Uso activo: modelo fijado permanentemente. Ruta actual: {model}."
+    status_timed: "Uso activo: modelo fijado durante {remaining} más, hasta {until}. Ruta actual: {model}."
     status_unpinned: "Uso activo: modelo no fijado. Ruta actual: {model}."
     session_changed: "La sesión ha cambiado. Ejecuta /attend de nuevo."
     configured_model: "ruta configurada"
@@ -1497,7 +1499,7 @@ platform:
     prompt_expired: ⌛ Esa solicitud ya no espera respuesta. Envía tu respuesta como un mensaje normal.
 slash:
   attend:
-    description: "Fijar el modelo para uso activo hasta liberarlo"
+    description: "Fijar el modelo para uso activo permanentemente o por una duración"
   approve:
     description: "Aprobar un comando peligroso pendiente"
   bg:

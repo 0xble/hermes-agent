@@ -43,11 +43,13 @@ approval:
     second_other: "{count} saniye"
 gateway:
   attend:
-    usage: "Kullanım: /attend, /attend off veya /attend status."
+    usage: "Kullanım: /attend [duration], /attend off veya /attend status. Süre pozitif olmalıdır, ör. 30m, 2h, 1h30m veya 1d. Süre belirtilmezse sabitleme kalıcıdır."
     disabled: "Etkin kullanım yönlendirmesi yapılandırılmamış. Önce model.attended ayarını yapın."
-    pinned: "Etkin kullanım modeli sabitlendi ({model}). Bırakmak için /attend off kullanın. Açık /model seçimleri yine önceliklidir."
+    pinned: "Etkin kullanım modeli kalıcı olarak sabitlendi ({model}). Bırakmak için /attend off kullanın. Açık /model seçimleri yine önceliklidir."
+    pinned_timed: "Etkin kullanım modeli ({model}) {duration} boyunca, {until} zamanına kadar sabitlendi. Bırakmak için /attend off kullanın. Açık /model seçimleri yine önceliklidir."
     released: "Etkin kullanım modelinin sabitlemesi kaldırıldı. {minutes} dakikalık boşta kalma sayacı şimdi başlıyor."
-    status_pinned: "Etkin kullanım: model sabitlenmiş. Geçerli rota: {model}."
+    status_pinned: "Etkin kullanım: model kalıcı olarak sabitlenmiş. Geçerli rota: {model}."
+    status_timed: "Etkin kullanım: model {remaining} daha, {until} zamanına kadar sabitlenmiş. Geçerli rota: {model}."
     status_unpinned: "Etkin kullanım: model sabitlenmemiş. Geçerli rota: {model}."
     session_changed: "Oturum değişti. /attend komutunu yeniden çalıştırın."
     configured_model: "yapılandırılmış rota"
@@ -1497,7 +1499,7 @@ platform:
     prompt_expired: ⌛ Bu istem artık yanıt beklemiyor. Yanıtınızı normal bir mesaj olarak gönderin.
 slash:
   attend:
-    description: "Bırakılana kadar etkin kullanım modelini sabitle"
+    description: "Etkin kullanım modelini kalıcı olarak veya belirli bir süre sabitle"
   approve:
     description: "Bekleyen tehlikeli bir komutu onayla"
   bg:

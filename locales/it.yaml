@@ -43,11 +43,13 @@ approval:
     second_other: "{count} secondi"
 gateway:
   attend:
-    usage: "Uso: /attend, /attend off oppure /attend status."
+    usage: "Uso: /attend [duration], /attend off oppure /attend status. La durata deve essere positiva, ad esempio 30m, 2h, 1h30m o 1d. Senza durata, il vincolo è permanente."
     disabled: "L’instradamento durante l’uso attivo non è configurato. Imposta prima model.attended."
-    pinned: "Modello per l’uso attivo fissato ({model}). Usa /attend off per sbloccarlo. Le scelte esplicite con /model mantengono la priorità."
+    pinned: "Modello per l’uso attivo fissato in modo permanente ({model}). Usa /attend off per sbloccarlo. Le scelte esplicite con /model mantengono la priorità."
+    pinned_timed: "Modello per l’uso attivo fissato ({model}) per {duration}, fino a {until}. Usa /attend off per sbloccarlo. Le scelte esplicite con /model mantengono la priorità."
     released: "Vincolo al modello per l’uso attivo rimosso. Il timer di inattività di {minutes} minuti parte ora."
-    status_pinned: "Uso attivo: modello fissato. Instradamento attuale: {model}."
+    status_pinned: "Uso attivo: modello fissato in modo permanente. Instradamento attuale: {model}."
+    status_timed: "Uso attivo: modello fissato per altri {remaining}, fino a {until}. Instradamento attuale: {model}."
     status_unpinned: "Uso attivo: modello non fissato. Instradamento attuale: {model}."
     session_changed: "La sessione è cambiata. Esegui nuovamente /attend."
     configured_model: "instradamento configurato"
@@ -1497,7 +1499,7 @@ platform:
     prompt_expired: ⌛ Quella richiesta non attende più una risposta. Invia la tua risposta come messaggio normale.
 slash:
   attend:
-    description: "Fissa il modello per l’uso attivo finché non viene sbloccato"
+    description: "Fissa il modello per l’uso attivo permanentemente o per una durata"
   approve:
     description: "Approva un comando pericoloso in attesa"
   bg:

@@ -43,11 +43,13 @@ approval:
     second_other: "{count} 秒"
 gateway:
   attend:
-    usage: "使い方: /attend、/attend off、または /attend status。"
+    usage: "使い方: /attend [duration]、/attend off、または /attend status。期間には 30m、2h、1h30m、1d などの正の値を指定してください。期間を省略すると無期限に固定します。"
     disabled: "操作中のモデルルーティングが未設定です。先に model.attended を設定してください。"
-    pinned: "操作中のモデル（{model}）に固定しました。/attend off で解除します。明示的な /model 選択が引き続き優先されます。"
+    pinned: "操作中のモデル（{model}）に無期限で固定しました。/attend off で解除します。明示的な /model 選択が引き続き優先されます。"
+    pinned_timed: "操作中のモデル（{model}）に {duration} 固定しました。解除時刻: {until}。/attend off で解除します。明示的な /model 選択が引き続き優先されます。"
     released: "操作中のモデルの固定を解除しました。{minutes} 分のアイドルタイマーを今から開始します。"
-    status_pinned: "操作中のモデル: 固定中。現在のルート: {model}。"
+    status_pinned: "操作中のモデル: 無期限で固定中。現在のルート: {model}。"
+    status_timed: "操作中のモデル: 固定の残り時間 {remaining}、解除時刻 {until}。現在のルート: {model}。"
     status_unpinned: "操作中のモデル: 固定なし。現在のルート: {model}。"
     session_changed: "セッションが変更されました。/attend を再実行してください。"
     configured_model: "設定済みルート"
@@ -1497,7 +1499,7 @@ platform:
     prompt_expired: ⌛ このプロンプトはもう回答を待っていません。通常のメッセージとして返信を送ってください。
 slash:
   attend:
-    description: "解除するまで操作中のモデルに固定"
+    description: "操作中のモデルに無期限または指定期間固定"
   approve:
     description: "保留中の危険なコマンドを承認"
   bg:

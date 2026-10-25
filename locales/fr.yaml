@@ -43,11 +43,13 @@ approval:
     second_other: "{count} secondes"
 gateway:
   attend:
-    usage: "Utilisation : /attend, /attend off ou /attend status."
+    usage: "Utilisation : /attend [duration], /attend off ou /attend status. La durée doit être positive, par exemple 30m, 2h, 1h30m ou 1d. Sans durée, la fixation est permanente."
     disabled: "Le routage en utilisation active n’est pas configuré. Définissez d’abord model.attended."
-    pinned: "Modèle d’utilisation active fixé ({model}). /attend off pour le libérer. Les choix explicites avec /model restent prioritaires."
+    pinned: "Modèle d’utilisation active fixé de façon permanente ({model}). /attend off pour le libérer. Les choix explicites avec /model restent prioritaires."
+    pinned_timed: "Modèle d’utilisation active fixé ({model}) pour {duration}, jusqu’à {until}. /attend off pour le libérer. Les choix explicites avec /model restent prioritaires."
     released: "Fixation du modèle d’utilisation active levée. Le délai d’inactivité de {minutes} minutes commence maintenant."
-    status_pinned: "Utilisation active : modèle fixé. Route actuelle : {model}."
+    status_pinned: "Utilisation active : modèle fixé de façon permanente. Route actuelle : {model}."
+    status_timed: "Utilisation active : modèle fixé pour encore {remaining}, jusqu’à {until}. Route actuelle : {model}."
     status_unpinned: "Utilisation active : modèle non fixé. Route actuelle : {model}."
     session_changed: "La session a changé. Relancez /attend."
     configured_model: "route configurée"
@@ -1749,7 +1751,7 @@ platform:
     prompt_expired: ⌛ Cette invite n'attend plus de réponse. Envoyez votre réponse comme un message normal.
 slash:
   attend:
-    description: "Fixer le modèle d’utilisation active jusqu’à sa libération"
+    description: "Fixer le modèle d’utilisation active de façon permanente ou pour une durée"
   approve:
     description: "Approuver une commande dangereuse en attente"
   bg:

@@ -248,7 +248,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/status` | Show session info, followed by a local **Session recap** block (recent turn counts, top tools used, files touched, latest prompt + reply). |
 | `/stop` | Kill all running background processes and interrupt the running agent. |
 | `/discard` | Drop a turn Hermes lost in a restart so this chat's queued messages run again. The lost turn is not re-run (only you know whether to send it again); it is recorded as interrupted. Hermes offers this when it pauses a conversation on a lost turn. On Slack use `/hermes discard`. |
-| `/attend [off\|status]` | **Messaging only.** With `model.attended` configured, `/attend` pins this session to the attended model without an idle return. The pin persists across gateway restarts and applies at the next API request boundary, without interrupting the current request. Explicit `/model` picks still take precedence. `/attend off` releases the pin and starts the idle timer from now. `/attend status` shows the pin state and current route. |
+| `/attend [duration\|off\|status]` | **Messaging only.** With `model.attended` configured, `/attend` pins this session to the attended model permanently. `/attend 30m`, `/attend 2h`, `/attend 1h30m`, or `/attend 1d` pins it for that duration. The pin persists across gateway restarts and applies at the next API request boundary, without interrupting the current request. Explicit `/model` picks still take precedence. `/attend off` releases an active pin and starts the idle timer from now. `/attend status` shows the pin state and current route, plus the remaining duration and local release time for a timed pin. |
 | `/pause [reason \| off]` | Global emergency stop, the in-chat form of [`hermes pause`](./cli-commands.md): puts new cron, kanban and gateway work on hold until `/pause off`. In-flight work finishes normally, and slash commands keep working while paused, so a messaging-only operator can always lift it. |
 | `/model [provider:model]` | Show or change the model. Supports provider switches (`/model zai:glm-5`), custom endpoints (`/model custom:model`), named custom providers (`/model custom:local:qwen`), auto-detect (`/model custom`), OpenRouter account presets (`/model @preset/<slug>` — account-scoped, skips the public model-listing check), and user-defined aliases (`/model fav`, `/model grok` — see [Custom model aliases](#custom-model-aliases)). Use `--global` to persist the change to config.yaml; a successful `--global` pick (typed or picker) also drops this chat's session-only override, so config.yaml alone decides the model after a gateway restart (a chat with a `channel_overrides` model keeps the override, since the channel setting would otherwise outrank config.yaml; the CLI/TUI deliberately keep their per-session pin so resume restores the model that chat used). `/model reset` clears the current session's explicit model pick. Gateway admins can use `/model reset --all` to clear every persisted and in-memory explicit model and reasoning pick; it reports the number of sessions cleared and never reroutes a turn already in progress. **Note:** `/model` can only switch between already-configured providers. To add a new provider or set up API keys, use `hermes model` from your terminal (outside the chat session). **Cost note:** a mid-session model switch resets the prompt cache (the cache key includes the model), so the next message re-reads the whole conversation at full input price. |
 | `/codex-runtime [auto\|codex_app_server\|on\|off]` | Toggle the optional [Codex app-server runtime](../user-guide/features/codex-app-server-runtime). Persists to `model.openai_runtime` in config.yaml and evicts the cached agent so the next message picks up the new runtime. Effective on next session. |
@@ -313,6 +313,29 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/debug` | Upload debug report (system info + logs) and get shareable links. |
 | `/help` | Show messaging help. |
 | `/<skill-name>` | Invoke any installed skill by name. |
+
+### Attended Pin Durations
+
+A timed `/attend` hold ends at its wall-clock deadline. Expiry starts the normal
+attended idle window at that deadline, rather than switching immediately to the
+default model. Later genuine user activity can extend the idle window. The
+existing API-call quiet window and default-model compression guard still apply,
+so a busy autonomous turn can remain attended. Expiry itself does not rewrite
+persisted pin state or interrupt a request.
+
+Durations must be positive and include a unit. Seconds, minutes, hours, days,
+weeks, fractional units such as `1.5h`, and compact combinations such as `1h30m`
+are accepted. Invalid input, for example `/attend 0m`, `/attend -2h`,
+`/attend NaN`, `/attend 30`, or `/attend tomorrow`, shows usage without changing
+the current pin. A new timed pin replaces the deadline with now plus its
+duration. Plain `/attend` replaces a timed pin with a permanent pin.
+
+Timed confirmations and `/attend status` show the release date and time in the
+owning profile's local timezone, including AM/PM and the timezone abbreviation.
+Status also shows the remaining duration. `/attend off` on an already-inactive
+or expired pin only reports status and does not restart the idle window.
+Permanent and timed pins survive non-boundary session repoints. Session reset,
+`/resume`, and `/branch` clear the pin and its deadline.
 
 ## Notes
 
