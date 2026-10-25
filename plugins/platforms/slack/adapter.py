@@ -2131,6 +2131,8 @@ class SlackAdapter(BasePlatformAdapter):
         self, client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
     ) -> None:
         await self._task_card_cleanup.start_stream(client, stream, metadata)
+        if self._typing_is_active(stream.channel, metadata):
+            await self.send_typing(stream.channel, metadata=metadata)
 
     @staticmethod
     def _task_update_chunk(task: dict[str, str]) -> dict[str, Any]:
