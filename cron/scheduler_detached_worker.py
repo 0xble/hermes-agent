@@ -11,13 +11,45 @@ from __future__ import annotations
 import concurrent.futures
 import math
 import os
+import contextlib
 import subprocess
 import threading
+import time
 from typing import Optional
 
 
-def hard_wall_timeout_seconds() -> float:
-    """Finite config.yaml bound, separate from inactivity and script timeouts."""
+HARD_WALL_TIMEOUT_ERROR_PREFIX = "Detached cron run exceeded hard wall-clock timeout ("
+HARD_WALL_WATCHDOG_GRACE_SECONDS = 60.0
+HARD_WALL_WATCHDOG_MINIMUM_SECONDS = 4.0
+
+
+def hard_wall_watchdog_grace_seconds(seconds: float) -> float:
+    """Bounded post-wall cleanup allowance used by the worker and its waiter."""
+    return min(HARD_WALL_WATCHDOG_GRACE_SECONDS, max(HARD_WALL_WATCHDOG_MINIMUM_SECONDS, seconds))
+
+
+def normalize_hard_wall_timeout(value) -> Optional[float]:
+    """Positive finite seconds; None/zero/empty clears a per-job override."""
+    if value is None or value == "":
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("hard_wall_timeout_seconds must be positive finite seconds or 0 to clear.") from None
+    if isinstance(value, bool) or not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("hard_wall_timeout_seconds must be positive finite seconds or 0 to clear.")
+    return seconds or None
+
+
+def hard_wall_timeout_seconds(job: Optional[dict] = None) -> float:
+    """Job override or finite profile bound, separate from inactivity/script limits."""
+    if job:
+        try:
+            override = normalize_hard_wall_timeout(job.get("hard_wall_timeout_seconds"))
+            if override is not None:
+                return override
+        except ValueError:
+            pass  # Malformed legacy payloads retain the finite profile safety cap.
     from cron.scheduler import load_config_readonly
     try:
         value = float((load_config_readonly().get("cron") or {}).get("hard_wall_timeout_seconds", 7200))
@@ -87,7 +119,8 @@ def _terminate_owned_descendants(
 class HardWallFence:
     """Lifetime timer only; the SQLite execution row is the sole result fence."""
 
-    def __init__(self) -> None:
+    def __init__(self, deadline: float) -> None:
+        self.deadline = deadline
         self.stopped = threading.Event()
 
     def set(self) -> None:
@@ -100,7 +133,7 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
     from cron.executions import _owner_identity, _process_start_time, finish_execution, get_execution
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    fence = HardWallFence()
+    fence = HardWallFence(time.monotonic() + seconds)
     pid = os.getpid()
     fingerprint = _process_start_time(pid)
     if fingerprint is None:
@@ -116,14 +149,14 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
                 if _owner_identity(pid, fingerprint) == "live":
                     timeout_won = finish_execution(
                         execution_id, success=False,
-                        error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
+                        error=f"{HARD_WALL_TIMEOUT_ERROR_PREFIX}{seconds:g}s).",
                         require_running=True,
                     ) is not None
                 # Reserve the final 3s for bounded descendant cleanup. The
                 # post-commit allowance is derived from the configured wall cap,
                 # with enough headroom to include cleanup inside cap+grace.
                 if not timeout_won:
-                    grace = min(60.0, max(4.0, seconds))
+                    grace = hard_wall_watchdog_grace_seconds(seconds)
                     fence.stopped.wait(grace - 3.0)
             finally:
                 try:
@@ -152,9 +185,24 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
     return fence
 
 
+def _close_late_session_db_result(future: concurrent.futures.Future) -> None:
+    """Done-callback: close a SessionDB whose constructor finished after run_job's init timeout
+    (worker abandoned via ``shutdown(wait=False)``), else its .db/WAL/SHM handles leak to EMFILE.
+
+    If the constructor later completes inside that abandoned worker, the Future's result — an open
+    SessionDB holding .db / WAL / SHM file handles — would be orphaned and never closed, leaking
+    descriptors until EMFILE (#72782). This callback retrieves and closes that eventual late result.
+    """
+    with contextlib.suppress(Exception):
+        db = future.result()
+        if db is not None:
+            from hermes_state_registry import release_or_close
+            release_or_close(db)
+
+
 def defer_teardown_to_running_worker(
     future: Optional[concurrent.futures.Future], session_db, agent, job_id: str, job_name: str,
-    cron_session_id: str,
+    cron_session_id: str, workdir: Optional[str] = None,
 ) -> bool:
     """Return True when the worker is still running and its Future will finalize the session
     and tear the agent down on completion; False when the caller must do it now."""
@@ -165,7 +213,8 @@ def defer_teardown_to_running_worker(
     def _finish(_future) -> None:
         try:
             if session_db:
-                _finalize_cron_session(session_db, agent, job_id, job_name, cron_session_id)
+                _finalize_cron_session(session_db, agent, job_id, job_name, cron_session_id,
+                                       workdir=workdir)
         finally:
             _teardown_cron_agent(agent, job_id)
 

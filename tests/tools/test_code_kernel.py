@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Tests for execute_code's session kernel mode.
+"""Tests for execute_code's session kernel.
 
-``code_execution.kernel_mode: session`` keeps one Python child alive per
-(task, mode, interpreter, cwd, tool-set) so state survives across calls.
-These tests pin the contract:
+Session kernels are always on (the ``code_execution.kernel_mode`` key is
+retired): each (task, mode, interpreter, cwd, tool-set) owner keeps one
+Python child alive so state survives across calls. These tests pin the
+contract:
 
-  - default stays per-call (no state carries over unless opted in)
   - state persists across cells and reset=true discards it
   - a raised exception keeps the kernel (and its state) alive
   - a timeout kills the kernel; the next call gets a fresh one
   - fd-level output from user-spawned subprocesses reaches the result
   - sys.exit() inside a cell ends the kernel deliberately
 
-Mode is sourced from ``code_execution.kernel_mode`` in config.yaml only;
+Mode is sourced from ``code_execution.mode`` in config.yaml only;
 tests patch ``_load_config`` directly, mirroring test_code_execution_modes.
 """
 
@@ -35,7 +35,7 @@ os.environ["TERMINAL_ENV"] = "local"
 
 @pytest.fixture(autouse=True)
 def _force_local_terminal(monkeypatch):
-    """Mirror test_code_execution.py — guarantee local backend under xdist."""
+    """Mirror test_code_execution.py — guarantee local backend."""
     monkeypatch.setenv("TERMINAL_ENV", "local")
 
 
@@ -45,8 +45,10 @@ from tools.code_kernel import _KERNELS, shutdown_all_kernels
 
 @contextmanager
 def _kernel_config(**overrides):
-    """Pin code_execution config; strict mode keeps the test hermetic."""
-    config = {"mode": "strict", "kernel_mode": "session", "timeout": 30}
+    """Pin code_execution config; strict mode keeps the test hermetic.
+    ``mode`` (strict/project) is the only config knob — session kernels are
+    always on; the retired ``kernel_mode`` key is ignored by the tool."""
+    config = {"mode": "strict", "timeout": 30}
     config.update(overrides)
     with patch("tools.code_execution_tool._load_config", return_value=config):
         yield
@@ -371,6 +373,63 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
             kernel.proc.wait(timeout=10)
             self.assertFalse(kernel.alive())
 
+    def test_lru_eviction_reports_state_reset(self):
+        with _kernel_config(max_session_kernels=1):
+            first = self._run_as("conv-a", "x = 41", task_id="turn-a")
+            self.assertFalse(first["kernel"]["state_reset"])
+            self._run_as("conv-b", "y = 1", task_id="turn-b")
+            after = self._run_as("conv-a", "print(x + 1)", task_id="turn-a-2")
+        self.assertEqual(after["status"], "error", after)
+        self.assertIn("NameError", after.get("error", ""))
+        self.assertFalse(after["kernel"]["reused"])
+        self.assertTrue(after["kernel"]["state_reset"])
+        self.assertIn("kernel evicted", after["kernel"]["note"])
+        self.assertIn("re-create variables", after["kernel"]["note"])
+
+    def test_conversation_reset_drops_eviction_signal(self):
+        from tools.approval import clear_session
+
+        with _kernel_config(max_session_kernels=1):
+            self._run_as("conv-a", "x = 41", task_id="turn-a")
+            self._run_as("conv-b", "y = 1", task_id="turn-b")
+            clear_session("conv-a")
+            after = self._run_as("conv-a", "print('hello')", task_id="turn-new")
+        self.assertEqual(after["status"], "success", after)
+        self.assertFalse(after["kernel"]["state_reset"], after)
+        self.assertNotIn("note", after["kernel"])
+
+    def test_eviction_signal_is_present_when_replacement_spawn_fails(self):
+        from unittest.mock import patch
+
+        with _kernel_config(max_session_kernels=1):
+            self._run_as("conv-a", "x = 41", task_id="turn-a")
+            self._run_as("conv-b", "y = 1", task_id="turn-b")
+            with patch("tools.code_kernel._spawn", side_effect=OSError("spawn failed")):
+                failed = self._run_as("conv-a", "print(x + 1)", task_id="turn-a-2")
+        self.assertEqual(failed["status"], "error", failed)
+        self.assertTrue(failed["kernel"]["state_reset"], failed)
+        self.assertIn("re-create variables", failed["kernel"]["note"])
+
+    def test_reset_during_failing_recovery_call_does_not_restore_note(self):
+        from unittest.mock import patch
+
+        from tools.approval import clear_session
+
+        def _spawn_then_reset(*_args, **_kwargs):
+            clear_session("conv-a")
+            raise BrokenPipeError("kernel killed by session reset")
+
+        with _kernel_config(max_session_kernels=1):
+            self._run_as("conv-a", "x = 41", task_id="turn-a")
+            self._run_as("conv-b", "y = 1", task_id="turn-b")
+            with patch("tools.code_kernel._spawn", side_effect=_spawn_then_reset):
+                failed = self._run_as("conv-a", "print(x + 1)", task_id="turn-a-2")
+            self.assertEqual(failed["status"], "error", failed)
+            after = self._run_as("conv-a", "print('hello')", task_id="turn-new")
+        self.assertEqual(after["status"], "success", after)
+        self.assertFalse(after["kernel"]["state_reset"], after)
+        self.assertNotIn("note", after["kernel"])
+
     def test_idle_kernels_are_reaped(self):
         import time as time_module
 
@@ -388,32 +447,66 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
         """Parallel cells for one owner race the first spawn. Each racer
         used to see proc=None as 'dead', replace the registry entry, and
         orphan the winner's process — 110 live kernels under a 4-capped
-        process (Sep 2026). Every kernel process must stay registry-owned."""
+        process (Sep 2026). Every kernel process must stay registry-owned.
+
+        Capture actual children so an unregistered spawn cannot hide behind
+        the registry count. The owned process must exit on teardown."""
         import threading
 
+        spawned = []
+        real_popen = subprocess.Popen
+
+        def _capturing_popen(args, **kwargs):
+            proc = real_popen(args, **kwargs)
+            spawned.append((proc, list(args)))
+            return proc
+
         results = []
-        with _kernel_config():
-            def _cell():
-                results.append(self._run_as("conv-a", "import time; time.sleep(0.3)", task_id="t"))
-            threads = [threading.Thread(target=_cell) for _ in range(6)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+        with patch("tools.code_kernel.subprocess.Popen", side_effect=_capturing_popen):
+            with _kernel_config():
+                def _cell():
+                    results.append(self._run_as("conv-a", "import time; time.sleep(0.3)", task_id="t"))
+                threads = [threading.Thread(target=_cell) for _ in range(6)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
         self.assertEqual([r["status"] for r in results], ["success"] * 6)
         self.assertEqual(len(_KERNELS), 1)
-        import psutil
-        live = [child.pid for child in psutil.Process().children()
-                if any(os.path.basename(arg) == "hermes_kernel_runner.py"
-                       for arg in child.cmdline())]
-        self.assertEqual(live, [next(iter(_KERNELS.values())).proc.pid])
+        runners = [proc for proc, args in spawned
+                   if len(args) == 2 and Path(args[1]).name == "hermes_kernel_runner.py"]
+        self.assertEqual(len(runners), 1, "parallel cells spawned an unowned kernel")
+        kernel = next(iter(_KERNELS.values()))
+        self.assertIs(kernel.proc, runners[0])
+        self.assertIsNone(kernel.proc.poll())
+        shutdown_all_kernels()
+        for proc in runners:
+            proc.wait(timeout=10)
+            self.assertIsNotNone(proc.returncode)
+
+
+class TestInScriptToolErrors(unittest.TestCase):
+    def test_ignored_helper_error_is_reported_for_that_cell_only(self):
+        """A file-tool HermesToolError fails only its cell and is still listed in tool_errors."""
+        def _handle(tool_name, tool_args, task_id=None, **_ids):
+            if tool_name == "write_file":
+                return json.dumps({"error": "Refusing to overwrite a.py: never read"})
+            return json.dumps({"ok": True})
+
+        with _kernel_config(), patch("model_tools.handle_function_call", new=_handle):
+            failed = _run("import hermes_tools\nhermes_tools.write_file('a.py', 'x')\nprint('done')\n")
+            clean = _run("import hermes_tools\nhermes_tools.web_search(query='q')\n")
+        self.assertEqual(failed["status"], "error", failed)
+        self.assertIn("HermesToolError", failed.get("error", "") + failed.get("output", ""))
+        self.assertEqual(failed["tool_errors"], [{"tool": "write_file", "error": "Refusing to overwrite a.py: never read"}])
+        self.assertNotIn("tool_errors", clean)
 
 
 class TestPerCellRpcAuthority(unittest.TestCase):
     """Interpreter state persists across cells; RPC authority must not."""
 
     def _recorder(self, seen):
-        def _handle(tool_name, tool_args, task_id=None):
+        def _handle(tool_name, tool_args, task_id=None, **_ids):
             from tools.thread_context import _callback_api
 
             (get_approval, _set_a), *_rest = _callback_api()
@@ -493,6 +586,20 @@ class TestPerCellRpcAuthority(unittest.TestCase):
         authority.retire()
         result = authority.dispatch("web_search", {"query": "q"})
         self.assertIn("No active execute_code cell", result)
+
+    def test_cell_authority_assigns_a_unique_tool_call_id_per_nested_call(self):
+        """Local execute_code dispatches nested tool calls through CellAuthority, not
+        _default_dispatch; without a per-call id concurrent cells collapse into one hook
+        gate key and a fail-closed pre_tool_call guard blocks the second (#98382 class)."""
+        from tools.code_kernel import CellAuthority
+
+        authority = CellAuthority("turn-1")
+        with patch("model_tools.handle_function_call", return_value='{"ok": true}') as handle:
+            authority.dispatch("read_file", {"path": "a"})
+            authority.dispatch("read_file", {"path": "b"})
+        ids = [c.kwargs.get("tool_call_id") for c in handle.call_args_list]
+        self.assertTrue(all(ids), ids)
+        self.assertNotEqual(ids[0], ids[1])
 
     def test_each_cell_installs_a_fresh_authority(self):
         with _kernel_config():

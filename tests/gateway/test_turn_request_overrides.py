@@ -62,6 +62,22 @@ def test_provider_request_overrides_merged_under_fast_mode(monkeypatch):
     assert route["request_overrides"]["service_tier"] == "priority"
 
 
+
+def test_provider_top_level_service_tier_survives_normal_rewire():
+    from types import SimpleNamespace
+    from gateway.run_turn_runner import TurnRunner
+
+    baseline = {"service_tier": "provider-default", "extra_body": {"keep": True}}
+    agent = SimpleNamespace(request_overrides={"service_tier": "priority"})
+    turn_route = {"request_overrides": baseline}
+
+    TurnRunner._merge_turn_request_overrides(agent, turn_route)
+
+    assert agent.request_overrides == {
+        "service_tier": "provider-default", "extra_body": {"keep": True},
+    }
+
+
 def test_no_provider_overrides_yields_empty():
     """Regression: absent provider overrides, behaviour is unchanged ({})."""
     runner = _runner(service_tier=None)
@@ -85,7 +101,7 @@ def test_resolve_runtime_agent_kwargs_carries_request_overrides(monkeypatch):
         lambda *a, **k: dict(fake_runtime),
     )
     monkeypatch.setattr(
-        "hermes_cli.runtime_provider._get_model_config", lambda: {}
+        "hermes_cli.runtime_provider._get_model_config", dict
     )
     rk = gateway_run._resolve_runtime_agent_kwargs()
     assert rk["request_overrides"] == PROVIDER_OVERRIDES

@@ -5,7 +5,7 @@ parses subcommands and mutates goal state. It never changes conversation history
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from typing import Callable
 
@@ -29,11 +29,44 @@ def _english(key, default, **values):
 
 
 def _status(mgr, arg, render):
-    return GoalCommandResult(mgr.status_line())
+    details = "\n".join(filter(None, (mgr.render_removable_items(), mgr.render_completion_history())))
+    return GoalCommandResult(mgr.status_line() + (f"\n{details}" if details else ""))
 
 
 def _show(mgr, arg, render):
-    return GoalCommandResult(f"{mgr.status_line()}\n{mgr.render_contract()}")
+    details = "\n".join(filter(None, (mgr.render_removable_items(), mgr.render_completion_history())))
+    return GoalCommandResult(f"{mgr.status_line()}\n{mgr.render_contract()}" + (f"\n{details}" if details else ""))
+
+
+def _replace(mgr, arg, render):
+    if not arg.strip():
+        return GoalCommandResult("Usage: /goal replace <text>", error=True)
+    result = mgr.replace(reason="explicit /goal replace command", goal=arg.strip(), actor="user")
+    if not result.get("ok"):
+        return GoalCommandResult(result.get("error", "goal replacement failed"), error=True)
+    return GoalCommandResult(
+        output=f"✓ Goal replaced: {arg.strip()}", clear_pending="replace",
+        prompt=mgr.next_continuation_prompt(),
+    )
+
+
+def _remove(mgr, arg, render):
+    tokens = arg.split()
+    if len(tokens) != 2 or tokens[0].lower() not in {*goals.contract_remove_aliases(), "subgoal"}:
+        return GoalCommandResult(f"Usage: {goals.goal_remove_usage()}", error=True)
+    kind = tokens[0].lower()
+    try:
+        index = int(tokens[1])
+    except ValueError:
+        return GoalCommandResult("/goal remove: <N> must be an integer.", error=True)
+    try:
+        removed = mgr.remove_subgoal(index) if kind == "subgoal" else mgr.remove_contract_item(kind, index)
+    except (RuntimeError, ValueError, IndexError) as exc:
+        return GoalCommandResult(f"/goal remove {kind}: {exc}", error=True)
+    return GoalCommandResult(
+        output=f"✓ Removed {kind} {index}: {removed}", clear_pending="remove",
+        prompt=mgr.next_continuation_prompt(),
+    )
 
 
 def _pause(mgr, arg, render):
@@ -54,7 +87,7 @@ def _resume(mgr, arg, render):
 
 
 def _clear(mgr, arg, render):
-    had = mgr.has_goal()
+    had = mgr.has_goal() or mgr.unreadable
     mgr.clear()
     return GoalCommandResult(render("gateway.goal_cleared", "✓ Goal cleared.") if had else
                              render("gateway.no_active_goal", "No active goal."), clear_pending="clear")
@@ -98,8 +131,22 @@ def _gate_clear(mgr, arg):
 _GATE_HANDLERS = {"add": _gate_add, "remove": _gate_remove, "rm": _gate_remove, "clear": _gate_clear}
 _EXACT_HANDLERS = {
     "": _status, "status": _status, "show": _show, "pause": _pause,
-    "resume": _resume, "clear": _clear, "stop": _clear, "done": _clear, "unwait": _unwait,
+    "resume": _resume, "continue": _resume, "unpause": _resume,
+    "clear": _clear, "stop": _clear, "done": _clear, "unwait": _unwait,
 }
+# Non-destructive control verbs: with trailing words the verb still wins, so
+# `/goal resume last goal` resumes instead of silently replacing the goal text.
+# clear/stop/done stay out — guessing wrong would end a goal the user meant to keep.
+_BARE_CONTROL_VERBS = frozenset({"resume", "continue", "unpause", "pause", "status", "show", "unwait"})
+# First words that make a command goal control (the gateway busy path dispatches these).
+_CONTROL_FIRST_WORDS = _BARE_CONTROL_VERBS | {"wait", "gate", "replace", "remove"}
+
+
+def _bare_control(mgr, verb, rest, render):
+    result = _EXACT_HANDLERS[verb](mgr, "", render)
+    return replace(result, output=result.output + (
+        f"\n(ignored {rest!r}: a control command never sets goal text — use /goal -- <text> "
+        "when the goal really starts with a control word.)"))
 
 
 def _gate(mgr, arg, authorize_gate):
@@ -136,9 +183,49 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
     else:
         headline, contract = goals.parse_contract(arg)
         contract = contract if not contract.is_empty() else None
-    state = mgr.set(headline or arg, contract=contract)
+    goal_text = headline or arg
+    authoring_findings = goals.goal_authoring_findings(
+        goal_text, contract,
+    )
+    previous = mgr.state.goal if mgr.has_goal() else ""
+    if previous:
+        # A failed legacy-contract migration is deliberately not replaceable: preserve the
+        # durable row until a later mutation can retry and save the migration safely.
+        if getattr(mgr.state, "_legacy_migration_pending", False):
+            # Re-read once: a migration that now saves is adopted and replaced normally, so a
+            # cached CLI manager is not stuck; a still-pending migration is never overwritten.
+            try:
+                live = goals.load_goal(mgr.session_id)
+            except Exception:
+                live = None
+            if live is None or getattr(live, "_legacy_migration_pending", False):
+                return GoalCommandResult(
+                    "existing goal migration was not saved; refusing to overwrite it; try again",
+                    error=True,
+                )
+            mgr._adopt(live)
+        # Bare /goal text is an in-place edit of the current objective. It must not
+        # reset history or enqueue a turn: a paused goal remains paused, while an
+        # active goal remains active until its existing continuation path runs.
+        result = mgr.replace(
+            reason="explicit /goal replacement command", goal=headline or arg,
+            contract=contract, actor="user",
+        )
+        if not result.get("ok"):
+            return GoalCommandResult(result.get("error", "goal replacement failed"), error=True)
+        state = result["state"]
+        budget = "∞" if state.max_turns == 0 else str(state.max_turns)
+        output = render("gateway.goal.set", "⊙ Goal set ({budget}-turn budget): {goal}",
+                        budget=budget, goal=state.goal)
+        output += f"\n(replaced the previous goal)\n  was: {previous}"
+        if authoring_findings:
+            output += "\n" + goals.format_goal_authoring_warning(authoring_findings)
+        return GoalCommandResult(output, clear_pending="replace")
+
+    state = mgr.set(goal_text, contract=contract)
+    budget = "∞" if state.max_turns == 0 else str(state.max_turns)
     output = render("gateway.goal.set", "⊙ Goal set ({budget}-turn budget): {goal}",
-                    budget=state.max_turns, goal=state.goal)
+                    budget=budget, goal=state.goal)
     if state.has_contract():
         label = "Drafted completion contract:" if drafting else "Completion contract:"
         output += f"\n{label}\n{state.contract.render_block()}"
@@ -153,6 +240,8 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
         output += (f"\nAfter each turn, a judge model checks if the goal is done{against}. "
                    "Hermes keeps working until it is, you pause/clear it, or the budget is "
                    "exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.")
+    if authoring_findings:
+        output += "\n" + goals.format_goal_authoring_warning(authoring_findings)
     return GoalCommandResult(output if goal_notices_enabled() else "",
                              goals.goal_kick_prompt(state.goal, last_user_message), kickoff=True)
 
@@ -160,7 +249,8 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
 def is_goal_control(arg: str) -> bool:
     """Whether this command controls an existing goal rather than replacing it."""
     normalized = arg.strip().lower()
-    return normalized in _EXACT_HANDLERS or normalized.split(None, 1)[0] in {"wait", "gate"}
+    first = normalized.split(None, 1)[0] if normalized else ""
+    return normalized in _EXACT_HANDLERS or first in _CONTROL_FIRST_WORDS
 
 
 def dispatch_goal_command(
@@ -179,8 +269,20 @@ def dispatch_goal_command(
     rest = tokens[1].strip() if len(tokens) > 1 else ""
     prefix = "Invalid goal"
     try:
+        if verb == "--":
+            # Verbatim goal text for goals that start with a control word (`/goal -- pause the cron`).
+            return _set(mgr, rest, drafting=False, last_user_message=last_user_message,
+                        render=render, progress=progress)
         if handler := _EXACT_HANDLERS.get(arg.lower()):
             return handler(mgr, "", render)
+        if verb in _BARE_CONTROL_VERBS:
+            return _bare_control(mgr, verb, rest, render)
+        if verb == "replace":
+            prefix = "/goal replace"
+            return _replace(mgr, rest, render)
+        if verb == "remove":
+            prefix = "/goal remove"
+            return _remove(mgr, rest, render)
         if verb == "wait":
             prefix = "/goal wait"
             return _wait(mgr, rest)

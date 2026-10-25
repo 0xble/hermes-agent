@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -168,8 +169,8 @@ class TestDynamicContextFileCap:
     @pytest.fixture(autouse=True)
     def _no_explicit_config(self, monkeypatch):
         # No explicit context_file_max_chars → dynamic path is eligible.
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
-        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+        monkeypatch.setattr("hermes_cli.config.load_config", dict)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", dict)
 
 
 
@@ -274,6 +275,29 @@ class TestBuildSkillsSystemPrompt:
         result = build_skills_system_prompt()
         # "search" should appear only once per category
         assert result.count("- search") == 1
+
+    def test_external_dirs_use_source_maintenance_guidance(self, monkeypatch, tmp_path):
+        """External installs must not receive the local skill patching nudge."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local = tmp_path / "skills" / "tools" / "local-skill"
+        local.mkdir(parents=True)
+        (local / "SKILL.md").write_text("---\nname: local-skill\ndescription: Local\n---\n")
+        external = tmp_path / "external-skills" / "remote-skill"
+        external.mkdir(parents=True)
+        (external / "SKILL.md").write_text(
+            "---\nname: remote-skill\ndescription: External\n---\n"
+        )
+        (tmp_path / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external.parent}\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "remote-skill" in result
+        assert "If a skill has issues, fix it with skill_manage(action='patch')." not in result
+        assert "Skills from skills.external_dirs are read-only installs" in result
+        assert "change them at their source in the owning repository" in result
+        assert "fix it with skill_manage(action='patch')" in result
 
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
@@ -496,10 +520,7 @@ class TestBuildContextFilesPrompt:
         assert "Project Context" in result
 
 
-    @pytest.mark.skipif(
-        sys.platform == "darwin",
-        reason="APFS default volume is case-insensitive; CLAUDE.md and claude.md alias the same path",
-    )
+    @pytest.mark.platforms("not macos")  # APFS default volume is case-insensitive; CLAUDE.md and claude.md alias the same path
     def test_claude_md_uppercase_takes_priority(self, tmp_path):
         uppercase = tmp_path / "CLAUDE.md"
         lowercase = tmp_path / "claude.md"
@@ -568,7 +589,11 @@ class TestFindHermesMd:
         with patch("agent.prompt_builder._find_git_root", return_value=None):
             assert _find_hermes_md(cwd) is None
 
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+    @pytest.mark.platforms("posix")
+    @pytest.mark.skipif(
+        getattr(os, "geteuid", lambda: -1)() == 0,
+        reason="root bypasses directory permissions",
+    )
     def test_unreadable_cwd_is_treated_as_not_found(self, tmp_path):
         """A cwd the process cannot stat yields "no context file" instead of a PermissionError
         escaping prompt construction and taking down every surface sharing the gateway (#112430:
@@ -597,7 +622,11 @@ class TestFindGitRoot:
 
 
 class TestCursorrulesCandidates:
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+    @pytest.mark.platforms("posix")
+    @pytest.mark.skipif(
+        getattr(os, "geteuid", lambda: -1)() == 0,
+        reason="root bypasses directory permissions",
+    )
     def test_unreadable_cwd_is_treated_as_absent(self, tmp_path):
         """Same crash shape as ``_find_hermes_md``: ``.is_dir()`` on ``<cwd>/.cursor/rules`` inside an
         unreadable cwd must not raise; a readable sibling project still yields its rules."""
@@ -693,6 +722,48 @@ class TestEnvironmentHints:
         monkeypatch.chdir(tmp_path)
         _pb._BACKEND_PROBE_CACHE.clear()
         assert f"Current working directory: {tmp_path}" in _pb.build_environment_hints()
+
+    def test_running_bot_screen_rides_the_environment_hints(self, monkeypatch):
+        """#125830: with this profile's Bot Screen up, the local-backend hints must NAME it —
+        display number and lease holder — so 'open chrome in screen 20' resolves to the bot's own
+        screen instead of launching on the user's display via a confused terminal call."""
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.setattr("tools.bot_desktop.runtime.published_env",
+                            lambda: {"DISPLAY": ":20", "XAUTHORITY": "/run/x"})
+        monkeypatch.setattr("tools.bot_desktop.lease.get", lambda: SimpleNamespace(holder="agent"))
+        hints = _pb.build_environment_hints()
+        assert "Bot Screen" in hints and "display :20" in hints and "you hold it" in hints
+
+    def test_human_held_bot_screen_says_so(self, monkeypatch):
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.setattr("tools.bot_desktop.runtime.published_env", lambda: {"DISPLAY": ":20"})
+        monkeypatch.setattr("tools.bot_desktop.lease.get", lambda: SimpleNamespace(holder="human"))
+        hints = _pb.build_environment_hints()
+        assert "a human holds it" in hints and "do not drive the screen" in hints
+
+    def test_stopped_bot_screen_leaves_no_hint(self, monkeypatch):
+        """No screen running → nothing added; the block must drop out entirely, not say 'None'."""
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.setattr("tools.bot_desktop.runtime.published_env", dict)
+        _pb._BACKEND_PROBE_CACHE.clear()
+        assert "Bot Screen" not in _pb.build_environment_hints()
+
+    def test_remote_backend_never_sees_a_host_bot_screen(self, monkeypatch):
+        """A sandboxed terminal cannot open windows on the gateway host, so the hint is local-only."""
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: None)
+        monkeypatch.setattr("tools.bot_desktop.runtime.published_env",
+                            lambda: {"DISPLAY": ":20"})
+        _pb._BACKEND_PROBE_CACHE.clear()
+        assert "Bot Screen" not in _pb.build_environment_hints()
 
 
 

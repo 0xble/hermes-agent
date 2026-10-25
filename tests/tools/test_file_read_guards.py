@@ -6,6 +6,7 @@ context compression.
 
 Run with:  python -m pytest tests/tools/test_file_read_guards.py -v
 """
+import pytest
 
 import json
 import os
@@ -56,8 +57,8 @@ def _make_fake_ops(content="hello\n", total_lines=1, file_size=6):
 
 
 def _make_safe_tempdir(prefix: str) -> str:
-    """Create a temp dir outside macOS system-sensitive /private/var paths."""
-    return tempfile.mkdtemp(prefix=prefix, dir=os.getcwd())
+    """Keep transient fixtures outside the checkout walked by other pytest workers."""
+    return tempfile.mkdtemp(prefix=prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +68,7 @@ def _make_safe_tempdir(prefix: str) -> str:
 class TestDevicePathBlocking(unittest.TestCase):
     """Paths like /dev/zero should be rejected before any I/O."""
 
+    @pytest.mark.platforms("linux")
     def test_blocked_device_detection(self):
         for dev in ("/dev/zero", "/dev/random", "/dev/urandom", "/dev/stdin",
                      "/dev/tty", "/dev/console", "/dev/stdout", "/dev/stderr",
@@ -77,11 +79,13 @@ class TestDevicePathBlocking(unittest.TestCase):
         self.assertFalse(_is_blocked_device("/dev/null"))
         self.assertFalse(_is_blocked_device("/dev/sda1"))
 
+    @pytest.mark.platforms("linux")
     def test_proc_fd_blocked(self):
         self.assertTrue(_is_blocked_device("/proc/self/fd/0"))
         self.assertTrue(_is_blocked_device("/proc/12345/fd/2"))
 
 
+    @pytest.mark.platforms("linux")
     def test_proc_sensitive_pseudo_files_blocked(self):
         """environ/cmdline/maps (and maps variants) under /proc/<pid> must be blocked (issue #4427)."""
         for path in (
@@ -106,6 +110,7 @@ class TestDevicePathBlocking(unittest.TestCase):
         ):
             self.assertTrue(_is_blocked_device(path), f"{path} should be blocked")
 
+    @pytest.mark.platforms("linux")
     def test_proc_task_thread_sensitive_files_blocked(self):
         """Per-thread /proc/<pid>/task/<tid>/<file> aliases leak the same data."""
         for path in (
@@ -122,6 +127,7 @@ class TestDevicePathBlocking(unittest.TestCase):
         for path in ("/proc/cpuinfo", "/proc/meminfo", "/proc/uptime", "/proc/version"):
             self.assertFalse(_is_blocked_device(path), f"{path} should not be blocked")
 
+    @pytest.mark.platforms("linux")
     def test_normpath_alias_to_blocked_device_is_blocked(self):
         self.assertTrue(_is_blocked_device("/dev/../dev/zero"))
         self.assertTrue(_is_blocked_device("/dev/./urandom"))
@@ -152,6 +158,7 @@ class TestDevicePathBlocking(unittest.TestCase):
             self.assertFalse(_is_blocked_device(link_path))
 
 
+    @pytest.mark.platforms("linux")
     def test_read_file_tool_rejects_device(self):
         """read_file_tool returns an error without any file I/O."""
         result = json.loads(read_file_tool("/dev/zero", task_id="dev_test"))
@@ -228,7 +235,7 @@ class TestNonRegularFileReads(unittest.TestCase):
         def call():
             try:
                 box["raw"] = read_file_tool(path, task_id=task_id)
-            except BaseException as exc:  # noqa: BLE001
+            except BaseException as exc:
                 box["exc"] = exc
 
         worker = threading.Thread(target=call, daemon=True)
@@ -407,6 +414,63 @@ class TestFileDedup(unittest.TestCase):
         self.assertNotIn("dedup", fork)
         self.assertIn("content", fork)
         self.assertTrue(_background_review_has_read(Path(self._tmpfile)))
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_sandbox_read_bypasses_dedup_before_write(self, mock_ops):
+        """A sandbox read after a parent read must not hand write_file an empty stub."""
+        from tools.code_execution_rpc import _handle_rpc_request
+
+        fake = _make_fake_ops(content="line one\nline two\n", file_size=20)
+        fake.write_file = MagicMock(return_value=_FakeReadResult())
+        mock_ops.return_value = fake
+        path = self._tmpfile
+
+        parent = json.loads(read_file_tool(path, task_id="dup"))
+        assert parent["content"] == "line one\nline two\n"
+
+        def dispatch(name, args):
+            return read_file_tool(args["path"], task_id="dup")
+
+        nested = json.loads(_handle_rpc_request(
+            {"tool": "read_file", "args": {"path": path}},
+            allowed_tools=frozenset({"read_file"}), tool_call_counter=[0], max_tool_calls=2,
+            dispatch=dispatch, tool_call_log=[], call_start=time.monotonic(), where="test",
+        ))
+        self.assertEqual(nested["content"], parent["content"])
+        written = json.loads(write_file_tool(path, nested.get("content", ""), task_id="dup"))
+        self.assertNotIn("error", written)
+        fake.write_file.assert_called_once_with(os.path.realpath(path), "line one\nline two\n")
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_session_kernel_sandbox_read_bypasses_dedup(self, mock_ops):
+        """Local session kernels run tools in the cell-start context copy, which lacks a
+        flag set later by the RPC handler; the bypass must still reach read_file_tool."""
+        from tools.code_execution_rpc import _handle_rpc_request
+        from tools.code_kernel import CellAuthority
+
+        mock_ops.return_value = _make_fake_ops(content="line one\nline two\n", file_size=20)
+        path = self._tmpfile
+        authority = CellAuthority("dup")  # snapshot taken before the RPC sets the flag
+
+        parent = json.loads(read_file_tool(path, task_id="dup"))
+        assert parent["content"] == "line one\nline two\n"
+
+        def run_nested():
+            return json.loads(_handle_rpc_request(
+                {"tool": "read_file", "args": {"path": path}},
+                allowed_tools=frozenset({"read_file"}), tool_call_counter=[0], max_tool_calls=2,
+                dispatch=authority.dispatch, tool_call_log=[], call_start=time.monotonic(),
+                where="test",
+            ))
+
+        with patch("model_tools.handle_function_call",
+                   side_effect=lambda name, args, task_id, tool_call_id: read_file_tool(
+                       args["path"], task_id=task_id)):
+            first, second = run_nested(), run_nested()
+        self.assertEqual(first.get("content"), parent["content"])
+        self.assertEqual(second.get("content"), parent["content"])
+        # The parent's ordinary reads keep their deduplication.
+        self.assertTrue(json.loads(read_file_tool(path, task_id="dup")).get("dedup"))
 
     @patch("tools.file_tools._get_file_ops")
     def test_write_rejects_internal_read_status_text(self, mock_ops):

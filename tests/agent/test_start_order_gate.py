@@ -21,6 +21,9 @@ import pytest
 def _isolate_hermes(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / ".hermes").mkdir(exist_ok=True)
+    from tests.plugin_helpers import mock_completed_plugin_discovery
+
+    mock_completed_plugin_discovery(monkeypatch)
 
 
 def _make_agent(monkeypatch):

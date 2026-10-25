@@ -15,3 +15,23 @@ FIRE_CLAIM_SKEW_SECONDS = 60
 # wall-clock cap, so healthy runs may legitimately exceed it and a TTL of exactly the timeout
 # would expire live claims.
 CLAIM_TTL_INACTIVITY_HEADROOM = 3
+
+
+PROTECTED_INTERVAL_MAX_SECONDS = 120
+PROTECTED_INTERVAL_HEADROOM_SECONDS = 30
+
+
+def is_protected_interval(job: dict) -> bool:
+    """Short interval schedules share one reserved worker, independent of job names or IDs."""
+    schedule = job.get("schedule") or {}
+    if not isinstance(schedule, dict) or schedule.get("kind") != "interval":
+        return False
+    try:
+        return 0 < float(schedule.get("minutes", 0)) * 60 <= PROTECTED_INTERVAL_MAX_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+def is_recurring(job: dict) -> bool:
+    """A cron/interval job (vs a one-shot); a null ``schedule`` counts as not recurring."""
+    return (job.get("schedule") or {}).get("kind") in {"cron", "interval"}

@@ -14,6 +14,7 @@ import pytest
 from agent.interrupt_control import InterruptControlMixin
 from agent.turn_context import _bind_interrupt_scope
 from tools import async_delegation
+from tools import delegate_tool_dispatch as dispatch_module
 from tools.delegate_tool_dispatch import _Batch, _dispatch_background
 from tools.interrupt import is_interrupted, set_interrupt
 from tools.process_registry import process_registry
@@ -40,7 +41,7 @@ class _ControlledChild(_Parent):
         self._delegate_depth = 1
         self._delegate_saved_tool_names = []
         self._credential_pool = None
-        self._subagent_id = None
+        self._subagent_id: str | None = None
         self.tool_progress_callback = None
         self.model = "test-model"
         self.started = threading.Event()
@@ -88,7 +89,7 @@ class _ControlledChild(_Parent):
         return {"api_call_count": 0}
 
     def close(self):
-        self.closed_while_running |= not self.finished.is_set()
+        self.closed_while_running |= self.started.is_set() and not self.finished.is_set()
         self.close_count += 1
         self.closed.set()
 
@@ -123,7 +124,44 @@ def registry_state(tmp_path, monkeypatch):
     async_delegation._reset_for_tests()
 
 
-@pytest.mark.parametrize("rejection", ["capacity", "schedule_failure", "partial_schedule_failure"])
+def test_sync_fallback_serializes_unexpected_result_values(monkeypatch):
+    parent, child = _Parent(), _ControlledChild()
+    batch = _batch(parent, child)
+    monkeypatch.setattr(
+        dispatch_module,
+        "_execute_and_aggregate",
+        lambda _batch: {"results": [{"summary": object()}]},
+    )
+
+    result = json.loads(dispatch_module._run_sync_with_note(batch, "schedule_failure"))
+
+    assert isinstance(result["results"][0]["summary"], str)
+    assert result["note"] == dispatch_module._SYNC_FALLBACK_NOTES["schedule_failure"]
+
+
+def test_early_terminal_unit_is_handled_without_sync_rerun(registry_state, monkeypatch):
+    parent, child = _Parent(), _ControlledChild()
+    batch = _batch(parent, child)
+    worker_runs = []
+
+    def early_dispatch(*_args, **_kwargs):
+        worker_runs.append("async")
+        return {"status": "completed", "accepted": True, "delegation_id": "early-unit"}
+
+    def sync_fallback(*_args, **_kwargs):
+        worker_runs.append("sync")
+        return {"results": [{"task_index": 0, "status": "completed"}]}
+
+    monkeypatch.setattr(dispatch_module, "_dispatch_unit", early_dispatch)
+    monkeypatch.setattr(dispatch_module, "_execute_and_aggregate", sync_fallback)
+    result = json.loads(_dispatch_background(batch))
+
+    assert result["status"] == "dispatched"
+    assert worker_runs == ["async"]
+    dispatch_module._restore_parent_cancellation(batch)
+
+
+@pytest.mark.parametrize("rejection", ["schedule_failure", "partial_schedule_failure", "capacity"])
 @pytest.mark.parametrize("stop_timing", ["running", "during_admission"])
 @pytest.mark.parametrize("stop_kind", ["soft", "hard"])
 def test_rejected_background_child_stops_with_parent(
@@ -157,6 +195,7 @@ def test_rejected_background_child_stops_with_parent(
         return {"status": "completed", "summary": "slot released"}
 
     if rejection == "capacity":
+        monkeypatch.setattr("tools.delegate_tool._get_max_queued_delegations", lambda: 0)
         accepted = async_delegation.dispatch_async_delegation(
             goal="occupy the only slot", context=None, toolsets=None, role="leaf",
             model=child.model, session_key="other-session", runner=occupy_slot,
@@ -220,6 +259,18 @@ def test_rejected_background_child_stops_with_parent(
         if stop_timing == "during_admission":
             request_stop(stop_message)
         continue_admission.set()
+        if rejection == "capacity":
+            if stop_timing == "running":
+                request_stop(stop_message)
+            result = outcome.result(timeout=5)
+            assert result["status"] == "rejected"
+            assert result["rejected_units"]
+            assert not child.started.is_set()
+            assert child.closed.wait(5)
+            assert child.close_count == 1
+            assert not child.closed_while_running
+            assert parent._active_children == []
+            return
         assert child.started.wait(5)
         if stop_timing == "running":
             request_stop(stop_message)
@@ -303,3 +354,72 @@ def test_accepted_background_child_keeps_registry_cancellation_ownership(registr
             child.hard_interrupt("test teardown")
         child.allow_finish.set()
         assert child.closed.wait(5)
+
+
+def test_queued_cancellation_closes_delegation_metrics(monkeypatch, registry_state):
+    import tools.delegate_tool_dispatch as dispatch_mod
+    from hermes_cli.observability.shared_metrics_loop import begin_delegation_run
+
+    release = threading.Event()
+    occupied = async_delegation.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    parent, child = _Parent(), _ControlledChild()
+    batch = _batch(parent, child)
+    finished = []
+    monkeypatch.setattr(
+        dispatch_mod,
+        "finish_delegation_unit",
+        lambda call_key, results, *, background: finished.append((call_key, results, background)),
+    )
+    begin_delegation_run(batch.task_list, subagents=1, depth=1)
+    result = json.loads(_dispatch_background(batch))
+    assert result["status"] == "queued"
+    assert async_delegation.interrupt_delegation(result["delegation_id"], reason="metrics cleanup")
+    assert finished and finished[0][0] is batch.task_list
+    assert finished[0][2] is True
+    release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        event = registry_state.get(timeout=5)
+        if event["delegation_id"] == occupied["delegation_id"]:
+            break
+    else:
+        pytest.fail("occupier completion did not arrive")
+
+
+def test_capacity_queues_background_batch_without_inline_execution(registry_state, monkeypatch):
+    """Gateway-capable background admission never runs a full pool inline."""
+    release = threading.Event()
+    occupied = async_delegation.dispatch_async_delegation(
+        goal="occupy the only slot", context=None, toolsets=None, role="leaf", model="m",
+        session_key="other-session", runner=lambda: (release.wait(30), {"status": "completed"})[1],
+        max_async_children=1,
+    )
+    monkeypatch.setattr("tools.delegate_tool_dispatch._resolve_async_wake_sid", lambda *_args: "")
+    monkeypatch.setattr("tools.delegate_tool._get_max_async_children", lambda: 1)
+    monkeypatch.setattr("tools.delegate_tool._get_max_queued_delegations", lambda: 1)
+    parent, child = _Parent(), _ControlledChild()
+    child._subagent_id = "would-be-live-id"
+
+    result = json.loads(_dispatch_background(_batch(parent, child)))
+
+    assert occupied["status"] == "dispatched"
+    assert result["status"] == "queued"
+    assert "subagent_ids" not in result
+    assert "control_hint" not in result
+    assert "delegation_id" in result["note"]
+    assert result["delegation_id"] in result["queued_units"]
+    assert not child.started.is_set()
+    assert parent._active_children == []
+
+    release.set()
+    assert registry_state.get(timeout=5)["delegation_id"] == occupied["delegation_id"]
+    assert child.started.wait(5)
+    assert async_delegation.interrupt_for_session(parent_session_id=parent.session_id, reason="test cleanup") == 1
+    assert child.unwinding.wait(5)
+    child.allow_finish.set()
+    assert registry_state.get(timeout=10)["type"] == "async_delegation"
+    assert child.finished.is_set()
+    assert child.closed.wait(5)

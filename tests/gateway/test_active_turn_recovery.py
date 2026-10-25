@@ -303,6 +303,89 @@ def test_existing_resume_reason_and_freshness_are_preserved(tmp_path):
     assert recovered.active_turn_started_at is None
 
 
+def test_successor_active_turn_gets_a_new_resume_marker(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source("successor-turn")
+    entry = store.get_or_create_session(source)
+    predecessor_marked_at = datetime.now() - timedelta(minutes=1)
+
+    with store._lock:
+        current = store._entries[entry.session_key]
+        current.resume_pending = True
+        current.resume_reason = "restart_interrupted"
+        current.resume_marker_token = "marker-a"
+        current.resume_turn_id = "turn-a"
+        current.resume_human = True
+        current.last_resume_marked_at = predecessor_marked_at
+        current.restart_notes = [{
+            "session_id": current.session_id,
+            "marker_token": "marker-a",
+            "turn_id": "turn-a",
+            "marked_at": predecessor_marked_at,
+            "message_id": "message-a",
+        }]
+        current.restart_note_message_id = "message-a"
+        current.restart_note_marker_token = "marker-a"
+        current.restart_note_turn_id = "turn-a"
+        current.restart_note_marked_at = predecessor_marked_at
+        current.active_turn_token = "turn-b"
+        current.active_turn_started_at = datetime.now()
+        current.active_turn_human = False
+        store._save()
+
+    assert store.recover_interrupted_turns() == 1
+
+    recovered = _entry_for(store, source)
+    assert recovered.resume_pending is True
+    assert recovered.resume_reason == "restart_interrupted"
+    assert recovered.resume_turn_id == "turn-b"
+    assert recovered.resume_marker_token not in (None, "marker-a")
+    assert recovered.resume_human is False
+    assert recovered.restart_note_reconcile_attempts == 0
+    assert recovered.last_resume_marked_at is not None
+    assert recovered.last_resume_marked_at > predecessor_marked_at
+    assert recovered.active_turn_token is None
+    assert recovered.active_turn_started_at is None
+    assert recovered.restart_notes == [{
+        "session_id": recovered.session_id,
+        "marker_token": "marker-a",
+        "turn_id": "turn-a",
+        "marked_at": predecessor_marked_at,
+        "message_id": "message-a",
+    }]
+
+
+def test_same_turn_drain_timeout_marker_is_preserved(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source("same-turn-drain")
+    entry = store.get_or_create_session(source)
+    marked_at = datetime.now() - timedelta(minutes=1)
+
+    with store._lock:
+        current = store._entries[entry.session_key]
+        current.resume_pending = True
+        current.resume_reason = "shutdown_timeout"
+        current.resume_marker_token = "drain-marker"
+        current.resume_turn_id = "turn-drain"
+        current.resume_human = True
+        current.last_resume_marked_at = marked_at
+        current.active_turn_token = "turn-drain"
+        current.active_turn_started_at = datetime.now()
+        current.active_turn_human = True
+        store._save()
+
+    assert store.recover_interrupted_turns() == 0
+
+    recovered = _entry_for(store, source)
+    assert recovered.resume_pending is True
+    assert recovered.resume_reason == "shutdown_timeout"
+    assert recovered.resume_marker_token == "drain-marker"
+    assert recovered.resume_turn_id == "turn-drain"
+    assert recovered.last_resume_marked_at == marked_at
+    assert recovered.active_turn_token is None
+    assert recovered.active_turn_started_at is None
+
+
 def test_ancient_active_marker_is_cleared_without_auto_resume(tmp_path):
     store = _make_store(tmp_path)
     source = _make_source()
@@ -384,15 +467,7 @@ async def test_runner_active_turn_carrier_clears_the_exact_resolved_key():
     runner.session_store = MagicMock()
     mark_active = AsyncMock(return_value="token-1")
     clear_active = AsyncMock(return_value=True)
-    setattr(
-        runner,
-        "_async_session_store",
-        SimpleNamespace(
-            _store=runner.session_store,
-            mark_turn_active=mark_active,
-            clear_turn_active=clear_active,
-        ),
-    )
+    runner._async_session_store = SimpleNamespace(_store=runner.session_store, mark_turn_active=mark_active, clear_turn_active=clear_active)
     event = SimpleNamespace()
 
     await runner._mark_durable_active_turn(
@@ -416,14 +491,7 @@ async def test_runner_active_turn_clear_is_best_effort():
     clear_active = AsyncMock(
         side_effect=[OSError("disk unavailable"), True]
     )
-    setattr(
-        runner,
-        "_async_session_store",
-        SimpleNamespace(
-            _store=runner.session_store,
-            clear_turn_active=clear_active,
-        ),
-    )
+    runner._async_session_store = SimpleNamespace(_store=runner.session_store, clear_turn_active=clear_active)
     event = SimpleNamespace(
         _gateway_active_turn_session_key="resolved-session-key",
         _gateway_active_turn_token="token-1",
@@ -441,14 +509,7 @@ async def test_runner_active_turn_clear_stops_after_bounded_retries():
     runner = object.__new__(GatewayRunner)
     runner.session_store = MagicMock()
     clear_active = AsyncMock(side_effect=OSError("disk unavailable"))
-    setattr(
-        runner,
-        "_async_session_store",
-        SimpleNamespace(
-            _store=runner.session_store,
-            clear_turn_active=clear_active,
-        ),
-    )
+    runner._async_session_store = SimpleNamespace(_store=runner.session_store, clear_turn_active=clear_active)
     event = SimpleNamespace(
         _gateway_active_turn_session_key="resolved-session-key",
         _gateway_active_turn_token="token-1",
@@ -521,13 +582,14 @@ _WAKE = {"display_kind": "internal_notification"}
     ("[SILENT]", _WAKE, []),
     ("NO_REPLY", _WAKE, []),
     ("disk is 91% full", {**_WAKE, "display_metadata": {"notification_category": "diagnostic"}}, []),
-    ("NO_REPLY", {}, ["⚠️ The model returned only a silence marker for a message that needed a reply. "
-                      "Try again or rephrase."]),
+    ("NO_REPLY", {}, ["⚠️ No reply was written for this message. Send it again if you expected one."]),
+    ("NO_REPLY", {"display_metadata": {"reply_expected": False}}, []),
 ])
 async def test_unclean_restart_never_redelivers_a_reply_live_delivery_suppressed(tmp_path, reply, prompt, owed):
     """A crash-left reply is owed exactly what live delivery would have sent: nothing for a silence
-    marker on a machinery turn or a muted diagnostic wake (and the finished turn is not resumed), the
-    unexpected-silence notice for a human turn, never the raw marker."""
+    marker on a machinery turn, a muted diagnostic wake or a message the adapter reported as not
+    addressed to the bot (and the finished turn is not resumed), the unexpected-silence notice for
+    any other human turn, never the raw marker."""
     from gateway.delivery_ledger import sweep_recoverable
 
     (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text("display: {suppress_warning_notifications: true}\n", encoding="utf-8")

@@ -15,6 +15,7 @@ from tools.connectors.gateway.bridge import ConnectorLeg, connector_describe
 from tools.connectors.gateway.errors import GatewayAuthError
 from tools.tool_search import (
     CONNECTOR_BATCH_SENTINEL,
+    LOCAL_BATCH_SENTINEL,
     ToolSearchConfig,
     assemble_tool_defs,
     dispatch_tool_describe,
@@ -80,15 +81,37 @@ def test_resolve_single_connector_entry_returns_sentinel():
     assert args["calls"][0]["arguments"] == {"to": "x"}
 
 
-def test_resolve_multi_local_batch_echoes_first_entry_as_the_retry_shape():
-    # The correction restates the valid single-entry shape with the caller's OWN first
-    # entry (a 9B model re-sent the identical two-entry array when told only the rule).
+def test_resolve_multi_local_batch_returns_lossless_local_sentinel():
     first = {"name": "some_local_tool", "arguments": {"query": "alpha", "limit": 20}}
     name, args, err = resolve_underlying_call({"calls": [first, {"name": "another_local", "arguments": {}}]})
-    assert name is None
-    assert "you sent 2" in err
-    retry = err.split("Retry with only: ", 1)[1].split(" then issue", 1)[0]
-    assert json.loads(retry) == {"calls": [first]}
+    assert err is None
+    assert name == LOCAL_BATCH_SENTINEL
+    assert args["calls"] == [first, {"name": "another_local", "arguments": {}}]
+
+
+def test_direct_local_batch_dispatches_every_entry_in_order(monkeypatch):
+    import model_tools
+
+    calls = []
+
+    def fake_handle(name, args, **kwargs):
+        calls.append((name, args, kwargs["tool_call_id"]))
+        assert not (kwargs["skip_pre_tool_call_hook"] or kwargs["skip_tool_request_middleware"]
+                    or kwargs["skip_tool_execution_middleware"])
+        return json.dumps({"response": name})
+
+    monkeypatch.setattr(model_tools, "handle_function_call", fake_handle)
+    ids = model_tools._CallIds(task_id="task", tool_call_id="parent")
+    result = json.loads(model_tools._dispatch_local_batch(
+        [{"name": "first_local", "arguments": {"n": 1}},
+         {"name": "second_local", "arguments": {"n": 2}}],
+        ids, user_task=None, enabled_tools=None, middleware_trace=[],
+        enabled_toolsets=None, disabled_toolsets=None,
+    ))
+    assert [name for name, _, _ in calls] == ["first_local", "second_local"]
+    assert [call_id for _, _, call_id in calls] == ["parent:0", "parent:1"]
+    assert [item["response"] for item in result["results"]] == [
+        {"response": "first_local"}, {"response": "second_local"}]
 
 
 def test_resolve_unknown_name_points_at_tool_search_not_direct_call():
@@ -96,7 +119,7 @@ def test_resolve_unknown_name_points_at_tool_search_not_direct_call():
     # NOT be told "call it directly" — that is the opposite of the required correction.
     from tools.registry import registry
 
-    name, args, err = resolve_underlying_call({"name": "not_a_real_tool", "arguments": {}})
+    name, _args, err = resolve_underlying_call({"name": "not_a_real_tool", "arguments": {}})
     assert name is None
     assert "not a known tool name" in err and "call it directly" not in err.lower()
     registry.register(name="mcp__mempalace__mempalace_search", toolset="mcp-mempalace",
@@ -471,7 +494,7 @@ def test_describe_connector_names_fall_to_not_found_when_dark_and_to_connectors_
 
 
 def test_peel_admits_pure_connector_batch_as_sentinel():
-    name, args = _peel_bridge_call(
+    name, _args = _peel_bridge_call(
         "tool_call",
         {"calls": [
             {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
@@ -487,14 +510,18 @@ def test_peel_keeps_mixed_and_local_batches_as_sequential_barrier():
         {"name": "write_file", "arguments": {"path": "x"}},
     ]}
     name, args = _peel_bridge_call("tool_call", mixed)
-    assert name == "tool_call"  # barrier: local entries never got admission
+    assert name == "tool_call"  # barrier: mixed entries are not admitted as one parallel unit
+    assert args == mixed
+
 
     all_local = {"calls": [
         {"name": "write_file", "arguments": {"path": "x"}},
         {"name": "read_file", "arguments": {"path": "x"}},
     ]}
-    name, _ = _peel_bridge_call("tool_call", all_local)
+    name, args = _peel_bridge_call("tool_call", all_local)
     assert name == "tool_call"
+    assert args == all_local
+
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +540,7 @@ def _connectors_on(monkeypatch, client_factory):
 
     monkeypatch.setattr(config, "connectors_available", lambda: True)
     monkeypatch.setattr(bridge, "connectors_available", lambda: True)
-    monkeypatch.setattr(bridge, "_default_client_factory", client_factory)
+    monkeypatch.setattr(bridge, "_default_client_factory", lambda call=None: client_factory())
     invalidate_check_fn_cache()
 
 
@@ -595,26 +622,18 @@ class _FakeResponse:
 
 
 class _RecordingTransport:
-    """Records every outgoing request; answers each with `data` echoes."""
+    """Records every outgoing request; answers each single call with a `data` echo."""
 
     def __init__(self):
         self.requests = []
 
     def request(self, method, url, *, headers=None, json=None, timeout=None):
         self.requests.append({"method": method, "url": url, "json": json})
-        tools = (json or {}).get("tools") or []
-        results = [
-            {"index": i, "connector": t.get("connector"), "tool": t.get("tool"), "data": "ok"}
-            for i, t in enumerate(tools)
-        ]
+        if url.endswith("/schemas"):  # the file-input lookup on a schema-cache miss
+            return _FakeResponse({"schemas": {}})
+        call = (json or {}).get("call") or {}
         return _FakeResponse(
-            {
-                "results": results,
-                "successCount": len(results),
-                "errorCount": 0,
-                "totalCount": len(results),
-            }
-        )
+            {"result": {"connector": call.get("connector"), "tool": call.get("tool"), "data": "ok"}})
 
 
 def _recording_client_factory(transport):
@@ -628,12 +647,11 @@ def _recording_client_factory(transport):
 
 
 def _sent_tools(transport):
-    assert len(transport.requests) == 1
-    return transport.requests[0]["json"]["tools"]
+    return [request["json"]["call"] for request in transport.requests if request["url"].endswith("/execute")]
 
 
 def test_hook_rewrite_and_restored_vendor_slug_reach_the_gateway_request_body(monkeypatch):
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     transport = _RecordingTransport()
     _connectors_on(monkeypatch, _recording_client_factory(transport))
@@ -648,7 +666,7 @@ def test_hook_rewrite_and_restored_vendor_slug_reach_the_gateway_request_body(mo
         {"connector": "gmail", "tool": "GMAIL_SEND_EMAIL",
          "arguments": {"to": "x@example.com", "body": "[REDACTED]"}},
     ]
-    assert "sk-secret" not in json.dumps(transport.requests[0]["json"])
+    assert "sk-secret" not in json.dumps([request["json"] for request in transport.requests])
     assert out["results"][0]["response"] == "ok"  # correlation survives the rewrite
 
 

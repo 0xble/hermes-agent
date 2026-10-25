@@ -16,6 +16,9 @@ from plugins.platforms.telegram.adapter import TelegramAdapter
 def _make_adapter():
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._bot = AsyncMock()
+    # These tests pin failure classification and cooldown on back-to-back ticks; switch off the
+    # per-chat typing share (test_telegram_chat_outbound_budget.py) so only the cooldown is measured.
+    adapter._telegram_chat_outbound_slot_secs = 0.0
     return adapter
 
 
@@ -56,7 +59,6 @@ async def test_typing_dm_topic_fallback_success_does_not_cool_down(monkeypatch):
         calls.append(kwargs)
         if "message_thread_id" in kwargs:
             raise RuntimeError("message thread not found")
-        return None
 
     adapter._bot.send_chat_action = AsyncMock(side_effect=send_chat_action)
 

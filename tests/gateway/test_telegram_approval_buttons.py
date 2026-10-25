@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent.i18n import t
 from gateway.platforms.base import unauthorized_action_notice, utf16_len
 
 # ---------------------------------------------------------------------------
@@ -132,7 +133,7 @@ class TestTelegramExecApproval:
         buttons = []
         monkeypatch.setattr(
             "plugins.platforms.telegram.adapter.InlineKeyboardButton",
-            lambda text, callback_data: buttons.append(text) or text,
+            lambda text, callback_data, **kwargs: buttons.append((text, kwargs.get("style"))) or text,
         )
         monkeypatch.setattr(
             "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
@@ -143,7 +144,10 @@ class TestTelegramExecApproval:
             allow_permanent=False,
         )
 
-        assert buttons == ["✅ Allow Once", "✅ Session", "❌ Deny"]
+        assert buttons == [
+            (t(f"platform.telegram.approval.action_{c}"), "success" if c != "deny" else None)
+            for c in ("once", "session", "deny")
+        ]
 
 
 
@@ -155,7 +159,7 @@ class TestTelegramExecApproval:
         captured_rows = []
         monkeypatch.setattr(
             "plugins.platforms.telegram.adapter.InlineKeyboardButton",
-            lambda text, callback_data: text,
+            lambda text, callback_data, **kwargs: text,
         )
         monkeypatch.setattr(
             "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
@@ -168,8 +172,49 @@ class TestTelegramExecApproval:
         )
 
         assert captured_rows == [
-            ["✅ Allow Once", "❌ Deny"],
+            [t("platform.telegram.approval.action_once"), t("platform.telegram.approval.action_deny")],
         ]
+
+
+    @pytest.mark.asyncio
+    async def test_approve_buttons_are_success_style_and_denials_are_unstyled(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+
+        class FakeButton:
+            def __init__(self, text, callback_data, **kwargs):
+                self.text = text
+                self.callback_data = callback_data
+                self.style = kwargs.get("style")
+
+        class FakeMarkup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardButton", FakeButton)
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardMarkup", FakeMarkup)
+
+        async def keyboard_for(send):
+            adapter._bot.send_message.reset_mock()
+            result = await send()
+            assert result.success
+            return adapter._bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard
+
+        update_rows = await keyboard_for(lambda: adapter.send_update_prompt("12345", "restart?"))
+        assert update_rows[0][0].style == "success"
+        assert update_rows[0][1].style is None
+
+        control_rows = await keyboard_for(lambda: adapter.send_control_request("12345", "Clear session?", "r1"))
+        assert control_rows[0][0].style == "success"
+        assert control_rows[0][1].style is None
+
+        exec_rows = await keyboard_for(lambda: adapter.send_exec_approval(
+            "12345", "echo hi", "s1", allow_permanent=True, allow_session=True))
+        assert [button.style for row in exec_rows for button in row] == ["success", "success", "success", None]
+
+        slash_rows = await keyboard_for(lambda: adapter.send_slash_confirm(
+            "12345", "Confirm", "Proceed?", "s1", "c1"))
+        assert [button.style for row in slash_rows for button in row] == ["success", "success", None]
 
 
     @pytest.mark.asyncio

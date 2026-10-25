@@ -11,6 +11,7 @@ into the calling agent's activity tracker — otherwise the gateway inactivity
 watchdog kills the parent turn at ~1800s.
 """
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -20,10 +21,8 @@ from unittest.mock import patch
 from tools.cronjob_tools import cronjob, _execute_job_now
 from tools.environments.base import set_activity_callback
 
-
 _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
         "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
-
 
 class TestCronjobRunExecutesImmediately:
     def test_run_action_claims_and_fires_via_run_one_job(self):
@@ -114,7 +113,6 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["execution_success"] is False
         assert out["job"]["execution_error"] == "provider 500"
 
-
     def test_execute_job_now_passes_live_gateway_context_to_delivery(self):
         """Manual runs must deliver on the live gateway adapter's owning loop."""
         adapters = {"matrix": object()}
@@ -135,6 +133,90 @@ class TestCronjobRunExecutesImmediately:
             loop=gateway_loop,
             extra_prompt=None,
         )
+
+    def test_execute_job_now_delivers_through_owner_profile_adapters(self):
+        """Under multiplex a manual run fired from a secondary profile must deliver through THAT
+        profile's adapters, not the default profile's ``runner.adapters`` (wrong Telegram bot)."""
+        from pathlib import Path
+
+        default_adapters = {"telegram": object()}
+        work_adapters = {"telegram": object()}
+        gateway_loop = object()
+        runner = SimpleNamespace(
+            adapters=default_adapters,
+            _gateway_loop=gateway_loop,
+            _adapters_for_profile=lambda profile: work_adapters if profile == "work" else default_adapters,
+        )
+        completed = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
+             patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("hermes_constants.get_hermes_home", return_value=Path("/srv/hermes/profiles/work")), \
+             patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+             patch("tools.cronjob_tools.get_job", return_value=completed):
+            res = _execute_job_now(dict(_JOB))
+
+        assert res["success"] is True
+        assert m_run.call_args.kwargs["adapters"] is work_adapters
+
+    def test_execute_job_now_grants_a_shared_bot_satellite_only_its_routed_targets(self):
+        """A credentialless satellite that posts through the primary's bot gets the ticker's
+        route-restricted view (``SharedRouteAdapters``), never the whole primary adapter map: an
+        unrouted target is a miss (fail closed), the routed one resolves the primary adapter."""
+        from pathlib import Path
+
+        from cron.scheduler_preflight import SharedRouteAdapters
+        from gateway.profile_routing import ProfileRoute
+
+        primary_bot = object()
+        default_adapters = {"telegram": primary_bot}
+        runner = SimpleNamespace(
+            adapters=default_adapters, _gateway_loop=object(),
+            _adapters_for_profile=lambda profile: default_adapters,  # what authz hands a shared-bot satellite
+            _is_shared_bot_satellite=lambda profile: profile == "keeper",
+        )
+        route = ProfileRoute(name="ops", platform="telegram", profile="keeper", chat_id="-100")
+        completed = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
+             patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("hermes_constants.get_hermes_home", return_value=Path("/srv/hermes/profiles/keeper")), \
+             patch("cron.scheduler_preflight._primary_profile_routes_for_current_home", return_value=[route]), \
+             patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+             patch("tools.cronjob_tools.get_job", return_value=completed):
+            res = _execute_job_now(dict(_JOB))
+
+        assert res["success"] is True
+        adapters = m_run.call_args.kwargs["adapters"]
+        assert isinstance(adapters, SharedRouteAdapters)
+        assert adapters.get("telegram", {"chat_id": "-100"}) is primary_bot
+        assert adapters.get("telegram", {"chat_id": "-999"}) is None
+        assert adapters.get("telegram") is None
+
+    def test_execute_job_now_fails_instead_of_falling_back_when_owner_resolution_raises(self):
+        """Fail closed: if the owner profile cannot be resolved, the run is marked failed with the
+        error surfaced — it must NOT silently fall back to ``runner.adapters`` (the default bot)."""
+        default_adapters = {"telegram": object()}
+
+        def boom(profile):
+            raise RuntimeError("profile adapters unavailable")
+
+        runner = SimpleNamespace(adapters=default_adapters, _gateway_loop=object(),
+                                 _adapters_for_profile=boom)
+
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
+             patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+             patch("tools.cronjob_tools.mark_job_run") as m_mark, \
+             patch("tools.cronjob_tools.get_job", return_value=dict(_JOB)):
+            res = _execute_job_now(dict(_JOB))
+
+        assert res["claimed"] is True
+        assert res["success"] is False
+        assert "profile adapters unavailable" in res["error"]
+        m_run.assert_not_called()
+        m_mark.assert_called_once()
+        assert m_mark.call_args.args[1] is False
 
     def test_execute_job_now_remains_standalone_without_gateway(self):
         """CLI-only runs retain the standalone delivery path."""
@@ -204,7 +286,6 @@ class TestCronjobRunExecutesImmediately:
         finally:
             set_activity_callback(None)
 
-
     def test_heartbeat_stops_at_ceiling_but_job_completes(self):
         """Past _CRON_RUN_HEARTBEAT_CEILING the heartbeat stops (so the
         gateway watchdog regains authority over a wedged run) while the job
@@ -268,6 +349,64 @@ class TestCronjobRunExecutesImmediately:
         finally:
             set_activity_callback(None)
 
+def test_manual_run_keeps_live_detached_claim_after_waiter_error(tmp_path, monkeypatch):
+    """A post-handoff waiter error must not release a live worker's manual claim."""
+    import cron.scheduler as scheduler
+
+    job_id = "manual-live-detached-worker"
+    process = SimpleNamespace(alive=True)
+
+    def poll():
+        return None if process.alive else 0
+
+    def wait(timeout=None):
+        if process.alive:
+            raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+        return 0
+
+    process.poll = poll
+    process.wait = wait
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("tools.cronjob_tools.mark_job_run", lambda *args, **kwargs: None)
+
+    owner_holder = {}
+
+    def waiter_error(job, **_kwargs):
+        key = scheduler._inflight_key(job["id"], tmp_path)
+        with scheduler._running_lock:
+            owner = scheduler._running_registration_owners[key]
+        owner_holder["owner"] = owner
+        scheduler._defer_external_worker_claim_release(
+            job["id"],
+            tmp_path,
+            owner,
+            process,
+            execution_id="exec-manual-live",
+        )
+        raise RuntimeError("post-handoff waiter error")
+
+    try:
+        claimed = {"id": job_id, "name": "manual live worker", "fire_claim": {"by": "manual-owner"}}
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
+             patch("cron.scheduler.run_one_job", side_effect=waiter_error):
+            result = _execute_job_now({"id": job_id, "name": "manual live worker"})
+
+        key = scheduler._inflight_key(job_id, tmp_path)
+        assert result["success"] is False
+        assert result["error"] == "post-handoff waiter error"
+        assert scheduler.is_job_running(job_id, home=tmp_path)
+        assert scheduler._external_worker_claims[key] == (owner_holder["owner"], process)
+
+        process.alive = False
+        deadline = time.monotonic() + 2.0
+        while scheduler.is_job_running(job_id, home=tmp_path) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not scheduler.is_job_running(job_id, home=tmp_path)
+    finally:
+        process.alive = False
+        if owner_holder:
+            scheduler.release_running_job(job_id, home=tmp_path, owner=owner_holder["owner"], force=True)
+
 
 class TestManualRunReportsDeliveryFailure:
     """#83993: a manual run whose agent succeeded but whose delivery failed
@@ -290,4 +429,3 @@ class TestManualRunReportsDeliveryFailure:
         assert res["claimed"] is True
         assert res["success"] is False
         assert "502" in res["error"]
-

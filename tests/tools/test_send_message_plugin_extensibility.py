@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from gateway.config import Platform
 from gateway.platform_registry import PlatformEntry, platform_registry
 from tools.send_message_tool import resolve_send_target, send_message_tool
@@ -128,7 +130,7 @@ def test_plugin_validator_custom_diagnostic_blocks_delivery(plugin_platform):
 @pytest.mark.parametrize("async_handler", [False, True])
 def test_host_send_honors_sync_and_async_plugin_handlers(plugin_platform, async_handler):
     name, entry, seen = plugin_platform
-    platform, pconfig, config = _config_for(name)
+    _platform, _pconfig, config = _config_for(name)
 
     if not async_handler:
         def sync_handler(args, chat_id, platform_name, pconfig):
@@ -195,7 +197,7 @@ def test_force_reload_unregisters_profile_owned_platform(plugin_platform, monkey
     name, _entry, _seen = plugin_platform
     manager = PluginManager()
     manager._plugin_platform_names.add(name)
-    manager._discovered = True
+    mark_plugin_discovery_complete(manager)
     monkeypatch.setattr(manager, "_discover_and_load_inner", lambda: None)
 
     manager.discover_and_load(force=True)

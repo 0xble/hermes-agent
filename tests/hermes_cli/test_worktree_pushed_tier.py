@@ -12,6 +12,8 @@ no network and no mocks.
 import os
 import subprocess
 import time
+from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -20,7 +22,8 @@ from hermes_cli import worktree_ops
 
 def _run(args, cwd):
     return subprocess.run(
-        args, cwd=cwd, capture_output=True, text=True, encoding="utf-8"
+        args, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        check=False,
     )
 
 
@@ -210,7 +213,7 @@ class TestAttendedGcPushedTier:
     """worktree_gc audit/reclaim behavior for the pushed tier."""
 
     def test_audit_verdict_and_reclaim_keeps_branch(self, repo_with_bare_origin):
-        import cli  # noqa: F401  (worktree_gc lazily imports cli)
+        import cli
         from hermes_cli import worktree_gc
 
         repo = repo_with_bare_origin
@@ -227,7 +230,7 @@ class TestAttendedGcPushedTier:
         assert _branch_exists(repo, "salv/pushed-lane")
 
     def test_audit_never_pushed_keeps(self, repo_with_bare_origin):
-        import cli  # noqa: F401
+        import cli
         from hermes_cli import worktree_gc
 
         repo = repo_with_bare_origin
@@ -241,6 +244,30 @@ class TestAttendedGcPushedTier:
 
 
 class TestCronWorktreeMaintenance:
+    @pytest.fixture(autouse=True)
+    def _inside_deletion_window(self, monkeypatch):
+        import hermes_time
+
+        monkeypatch.setattr(hermes_time, "now", lambda: datetime(2026, 10, 12, 3, 0).astimezone())
+
+    def test_outside_deletion_window_leaves_the_throttle_unspent(self, monkeypatch):
+        import cron.scheduler as sched
+        import hermes_time
+
+        calls = []
+        monkeypatch.setattr(sched, "_last_worktree_maintenance_at", None)
+        monkeypatch.setattr(
+            sched.threading, "Thread",
+            lambda *a, **k: type("T", (), {"start": lambda self: calls.append(k.get("name"))})(),
+        )
+        monkeypatch.setattr(hermes_time, "now", lambda: datetime(2026, 10, 12, 14, 0).astimezone())
+        sched._maybe_run_worktree_maintenance()
+        assert calls == [] and sched._last_worktree_maintenance_at is None
+
+        monkeypatch.setattr(hermes_time, "now", lambda: datetime(2026, 10, 13, 2, 30).astimezone())
+        sched._maybe_run_worktree_maintenance()
+        assert calls == ["cron-worktree-prune"]
+
     def test_throttle_dispatches_once_per_interval(self, monkeypatch):
         import cron.scheduler as sched
 
@@ -256,6 +283,27 @@ class TestCronWorktreeMaintenance:
 
         assert len(calls) == 1
 
+    def test_first_pass_waits_past_boot(self, monkeypatch):
+        """A boot already saturates disk and state.db: the first prune waits out the boot delay."""
+        import cron.scheduler as sched
+
+        calls = []
+        boot = time.monotonic()
+        monkeypatch.setattr(sched, "_last_worktree_maintenance_at",
+                            boot - sched._WORKTREE_MAINTENANCE_INTERVAL_SECONDS
+                            + sched._WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS)
+        monkeypatch.setattr(
+            sched.threading, "Thread",
+            lambda *a, **k: type("T", (), {"start": lambda self: calls.append(k.get("name"))})(),
+        )
+        sched._maybe_run_worktree_maintenance()
+        assert calls == []
+        # Once the boot delay has elapsed, the first pass runs.
+        monkeypatch.setattr(sched, "_last_worktree_maintenance_at",
+                            boot - sched._WORKTREE_MAINTENANCE_INTERVAL_SECONDS - 1)
+        sched._maybe_run_worktree_maintenance()
+        assert calls == ["cron-worktree-prune"]
+
     def test_repo_discovery_requires_worktrees_dir(self, monkeypatch, tmp_path):
         import cron.scheduler as sched
 
@@ -268,12 +316,12 @@ class TestCronWorktreeMaintenance:
             lambda: [{"workdir": str(repo)}],
         )
         repos = sched._worktree_maintenance_repos()
-        assert str(repo) not in repos
+        assert repo not in [Path(p) for p in repos]
 
         # Adding .worktrees/ makes it eligible.
         (repo / ".worktrees").mkdir()
         repos = sched._worktree_maintenance_repos()
-        assert str(repo) in repos
+        assert repo in [Path(p) for p in repos]
 
     def test_maintenance_prunes_via_real_pruner(self, repo_with_bare_origin, monkeypatch):
         import cron.scheduler as sched

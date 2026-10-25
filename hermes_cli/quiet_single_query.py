@@ -74,7 +74,7 @@ def write_turn_report(path: str | None, *, exit_code: int, error: str = "", repl
 def read_turn_report(path: str, pid: int) -> dict | None:
     """The child's turn report, or None while absent, unreadable, or written by another process."""
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             record = json.load(fh)
     except (OSError, ValueError):
         return None
@@ -209,6 +209,7 @@ def continue_quiet_notify_completions(
     budget handshake below).
     """
     from tools.process_registry import process_registry
+    from tools.process_registry_notifications import acknowledge_survivor_notifications
     from tools.async_delegation import claim_event_delivery, complete_event_delivery
 
     last: Any = None
@@ -235,12 +236,31 @@ def continue_quiet_notify_completions(
         # async_delegation results. Keep everything that rendered.
         texts = [text for _event, text in drained if text]
         if texts:
-            follow = run_turn("\n\n".join(texts))
+            follow = None
+            try:
+                follow = run_turn("\n\n".join(texts))
+            finally:
+                admitted = bool(follow) and not (
+                    isinstance(follow, dict) and (
+                        follow.get("failed") or follow.get("partial") or follow.get("interrupted")
+                        or follow.get("completed") is False
+                    )
+                )
+                if admitted:
+                    acknowledge_survivor_notifications(process_registry, drained)
+                else:
+                    # Release/reoffer only our survivor leases; peer claims stay fenced.
+                    for event, _text in drained:
+                        if (event.get("type", "completion") == "completion"
+                                and process_registry.release_survivor_completion(event.get("session_id", ""))):
+                            process_registry.completion_queue.put(event)
             # Same admission rule as the interactive CLI turn: a wake made ONLY of automatic
             # diagnostics (early failure / watch notices) still runs, but under suppression its
             # reply never displaces the requested one-shot answer on stdout.
             if not _diagnostic_only_wake_muted([event for event, text in drained if text]):
                 last = follow
+            if not admitted:
+                return last
         if wait.get("timed_out"):
             break
         if not texts:

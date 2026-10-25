@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -59,6 +59,15 @@ def _make_runner():
     return runner
 
 
+def _loop_wake_event(mgr) -> MessageEvent:
+    """The stamped wake the scheduler injects for the tick ``mgr`` just fired."""
+    from hermes_cli.session_controls import loop_wake_metadata
+    event = _make_event("wakeup")
+    event.internal = True
+    event.metadata = loop_wake_metadata(mgr.session_id, mgr.state)
+    return event
+
+
 def _make_event(text: str) -> MessageEvent:
     return MessageEvent(
         text=text,
@@ -107,13 +116,16 @@ async def test_gateway_loop_status_pause_stop(loop_env):
 
 
 @pytest.mark.asyncio
+# health: allow F841 -- loop wake completion tests intentionally retain the local manager for exact tick identity assertions.
 async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
 
     entry = _FakeSessionEntry()
     await GatewayRunner._post_turn_loop_completion(
@@ -121,9 +133,37 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
         session_entry=entry,
         source=None,
         final_response="CI is done.\nLOOP_COMPLETE",
+        loop_tick=(mgr.state.created_at, mgr.state.ticks_fired),
     )
     reloaded = loops.load_loop("sid-gateway-loop")
     assert reloaded.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_post_turn_completion_does_not_stop_a_loop_revised_during_the_turn(loop_env):
+    """The gateway completes with a fresh manager: a stop verdict on prompt A must not end B."""
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll prompt A"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop("sid-gateway-loop", mgr.state)
+    fired = loops.LoopManager(session_id="sid-gateway-loop")
+    assert fired.fire_tick() is not None
+    tick = (fired.state.created_at, fired.state.ticks_fired)
+    revised = loops.LoopManager(session_id="sid-gateway-loop").revise(
+        reason="new target", prompt="poll prompt B",
+        user_quote="switch the loop to polling prompt B",
+        user_messages=["Please switch the loop to polling prompt B now"])
+    assert revised["ok"] is True, revised
+
+    await GatewayRunner._post_turn_loop_completion(
+        runner, session_entry=_FakeSessionEntry(), source=None,
+        final_response="Prompt A is done.\nLOOP_COMPLETE", loop_tick=tick,
+    )
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.status == "active" and reloaded.prompt == "poll prompt B"
+    assert reloaded.awaiting_response is False
 
 
 @pytest.mark.asyncio
@@ -160,14 +200,41 @@ def test_streamed_already_sent_none_recovers_text_for_hooks():
 
 
 @pytest.mark.asyncio
+async def test_non_streamed_stripped_reply_still_completes_loop_tick(loop_env):
+    """Non-streamed delivery returns display text with LOOP_COMPLETE stripped; the post-turn
+    hook must read the raw reply stashed on the event so the loop still finishes."""
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
+    mgr.state.next_due_at = time.time() - 1
+    assert mgr.fire_tick() is not None
+    assert mgr.state is not None
+
+    event = _make_event("wakeup")
+    event._raw_final_response = "CI is done.\nLOOP_COMPLETE"
+    # _handle_message_with_agent returned the stripped display text.
+    final_text = GatewayRunner._final_text_for_post_turn_hooks("CI is done.", event)
+    assert final_text == "CI is done.\nLOOP_COMPLETE"
+
+    await GatewayRunner._post_turn_loop_completion(
+        runner, session_entry=_FakeSessionEntry(), source=None, final_response=final_text,
+        loop_tick=(mgr.state.created_at, mgr.state.ticks_fired),
+    )
+    assert loops.load_loop("sid-gateway-loop").status == "done"
+
+
+@pytest.mark.asyncio
 async def test_streamed_already_sent_completes_loop_tick(loop_env):
     """A streamed wakeup must not leave awaiting_response stuck."""
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
     assert mgr.state.awaiting_response is True
     assert mgr.is_due() is False
 
@@ -182,10 +249,52 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
         session_entry=_FakeSessionEntry(),
         source=None,
         final_response=final_text,
+        loop_tick=(mgr.state.created_at, mgr.state.ticks_fired),
     )
     reloaded = loops.load_loop("sid-gateway-loop")
     assert reloaded.awaiting_response is False
     assert reloaded.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_loop_tick_is_not_reclassified_as_external_evidence(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
+    mgr.state.next_due_at = time.time() - 1
+    assert mgr.fire_tick() is not None
+    event = _loop_wake_event(mgr)
+    runner._post_turn_goal_continuation = AsyncMock()
+    with patch("hermes_cli.loops.wake_loop_for_external_event") as wake:
+        await GatewayRunner._run_post_turn_hooks(
+            runner,
+            agent_result={"final_response": "still working"},
+            source=event.source,
+            is_internal=True,
+            event=event,
+        )
+    wake.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_trusted_external_result_wakes_loop_once(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    event = _make_event("result")
+    event.internal = True
+    event.metadata = {"notification_origin": "delegation_result", "notification_category": "result"}
+    runner._post_turn_goal_continuation = AsyncMock()
+    with patch("hermes_cli.loops.wake_loop_for_external_event", return_value=True) as wake:
+        await GatewayRunner._run_post_turn_hooks(
+            runner,
+            agent_result={"final_response": "delegation completed"},
+            source=event.source,
+            is_internal=True,
+            event=event,
+        )
+    wake.assert_called_once_with("sid-gateway-loop")
 
 
 @pytest.mark.asyncio
@@ -194,16 +303,21 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
     assert mgr.state.awaiting_response is True
 
+    event = _make_event("wakeup")
+    event.metadata["gateway_loop_tick"] = [mgr.state.created_at, mgr.state.ticks_fired]
     runner._post_turn_goal_continuation = AsyncMock()
     await GatewayRunner._run_post_turn_hooks(
         runner,
         agent_result={"final_response": ""},
-        source=_make_event("wakeup").source,
+        source=event.source,
         is_internal=True,
+        event=_loop_wake_event(mgr),
     )
 
     runner._post_turn_goal_continuation.assert_not_awaited()
@@ -219,16 +333,21 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
 
+    event = _make_event("wakeup")
+    assert mgr.state is not None
+    event.metadata["gateway_loop_tick"] = [mgr.state.created_at, mgr.state.ticks_fired]
     runner._post_turn_goal_continuation = AsyncMock(side_effect=RuntimeError("judge failed"))
     with caplog.at_level(logging.DEBUG, logger="gateway.run"):
         await GatewayRunner._run_post_turn_hooks(
             runner,
             agent_result={"final_response": "still working"},
-            source=_make_event("wakeup").source,
+            source=event.source,
             is_internal=True,
+            event=_loop_wake_event(mgr),
         )
 
     reloaded = loops.load_loop("sid-gateway-loop")
@@ -253,6 +372,7 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
 
         async def handle_message(self, event):
             self.handled.append(event.text)
+            event._gateway_accepted = True  # the admission receipt a real adapter returns
 
     runner.adapters = {Platform.DISCORD: _Adapter()}
     runner._build_process_event_source = lambda evt: SimpleNamespace(
@@ -286,13 +406,13 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
         _record("list_active_loops")
         return real_list(*a, **k)
 
-    def _fire_tick(self):
+    def _fire_tick(self, *args, **kwargs):
         _record("fire_tick")
-        return real_fire(self)
+        return real_fire(self, *args, **kwargs)
 
-    def _complete_tick(self, last_response):
+    def _complete_tick(self, last_response, *, tick=None):
         _record("complete_tick")
-        return real_complete(self, last_response)
+        return real_complete(self, last_response, tick=tick)
 
     orig_sleep = asyncio.sleep
     calls = {"n": 0}
@@ -318,10 +438,8 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
 
 
 @pytest.mark.asyncio
-async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env, monkeypatch, tmp_path):
-    """A secondary profile with no ACTIVE loop must not get its runtime scope entered on
-    every tick (each entry re-parses the profile's config/secrets — the dominant idle-CPU
-    cost on multiplex gateways); a profile holding an active loop must still be scanned."""
+async def test_loop_wakeup_watcher_scans_owning_home_without_pre_admission_hydration(loop_env, monkeypatch, tmp_path):
+    """Loop discovery reads the owning store without hydrating secrets before tick admission."""
     from hermes_state import SessionDB
 
     work_home = tmp_path / "profiles" / "work"
@@ -330,7 +448,14 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
     goals._DB_CACHE[str(work_home)] = work_db
 
     scopes = [(None, None), ("work", work_home)]
-    monkeypatch.setattr("gateway.run._handoff_watch_scopes", lambda _r: scopes)
+    on_main_thread = []
+
+    def _scopes(_runner):
+        # profiles_to_serve() walks the filesystem: it must resolve off the loop thread.
+        on_main_thread.append(threading.current_thread() is threading.main_thread())
+        return scopes
+
+    monkeypatch.setattr("gateway.run._handoff_watch_scopes", _scopes)
 
     entered = []
 
@@ -348,8 +473,16 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
     monkeypatch.setattr("gateway.run._async_profile_runtime_scope", _SpyScope)
 
     runner = _make_runner()
+    runner.config.multiplex_profiles = True
     runner._running_agents = {}
     runner.adapters = {}
+    from hermes_constants import get_hermes_home
+    admitted = []
+
+    async def admission(sid, state, now, warned, profile=None):
+        admitted.append((sid, get_hermes_home(), profile))
+
+    runner._loop_wakeup_fire_one = admission
 
     orig_sleep = asyncio.sleep
 
@@ -372,6 +505,7 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
         # Idle: no loop rows in the work profile's store → its scope is never entered.
         await _run_one_tick()
         assert entered == [], f"idle profile scope must not be entered; got {entered}"
+        assert on_main_thread == [False], f"scopes must resolve off the loop; got {on_main_thread}"
 
         # An ACTIVE loop row in the work profile's store opens the gate.
         await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
@@ -379,21 +513,241 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
         assert raw
         work_db.set_meta("loop:sid-work-loop", raw)
         await _run_one_tick()
-        assert entered == [work_home], (
-            f"profile with an active loop must still be scanned; got {entered}")
+        assert entered == [], f"secret hydration preceded admission: {entered}"
+        assert admitted == [
+            ("sid-gateway-loop", loop_env, None),
+            ("sid-work-loop", work_home, "work"),
+        ]
 
         # A cleared loop keeps its row (status=cleared): the gate must read status, not key existence.
         entered.clear()
         cleared = loops.LoopState.from_json(raw)
         cleared.status = "cleared"
         work_db.set_meta("loop:sid-work-loop", cleared.to_json())
+        admitted.clear()
         await _run_one_tick()
         assert entered == [], f"cleared loop row must not open the gate; got {entered}"
+        assert admitted == [("sid-gateway-loop", loop_env, None)]
 
         # Fail OPEN: a store the probe cannot open is "unknown", never "idle" — the scan runs.
         monkeypatch.setattr("gateway.run_idle_gates._profile_session_db_probe", lambda _home: None)
         await _run_one_tick()
-        assert entered == [work_home], (
-            f"unavailable store must fall back to the historical scan; got {entered}")
+        assert entered == [], f"an unavailable store triggered pre-admission hydration: {entered}"
     finally:
         work_db.close()
+
+
+@pytest.mark.asyncio
+async def test_post_turn_completion_judges_only_the_tick_its_wake_carried(loop_env):
+    """A stop, re-set and new tick before A's hooks run: A's LOOP_COMPLETE must not finish B."""
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll prompt A"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop("sid-gateway-loop", mgr.state)
+    fired_a = loops.LoopManager(session_id="sid-gateway-loop")
+    assert fired_a.fire_tick() is not None
+    tick_a = (fired_a.state.created_at, fired_a.state.ticks_fired)
+
+    loops.LoopManager(session_id="sid-gateway-loop").clear()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll prompt B"))
+    b = loops.LoopManager(session_id="sid-gateway-loop")
+    b.state.next_due_at = time.time() - 1
+    loops.save_loop("sid-gateway-loop", b.state)
+    assert loops.LoopManager(session_id="sid-gateway-loop").fire_tick() is not None
+
+    await GatewayRunner._post_turn_loop_completion(
+        runner, session_entry=_FakeSessionEntry(), source=None,
+        final_response="Prompt A is done.\nLOOP_COMPLETE", loop_tick=tick_a,
+    )
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.status == "active" and reloaded.prompt == "poll prompt B"
+    assert reloaded.awaiting_response is True  # B's own tick is still in flight
+
+
+def test_post_turn_identity_carries_the_loop_tick_from_the_wake():
+    from gateway.platforms.event import MessageEvent, MessageType
+    from hermes_cli.session_controls import loop_wake_metadata
+
+    runner = _make_runner()
+    state = loops.LoopState(prompt="p", interval_seconds=300, created_at=123.0, ticks_fired=4)
+    event = MessageEvent(text="tick", message_type=MessageType.TEXT, source=_make_event("x").source,
+                         internal=True, metadata=loop_wake_metadata("sid", state))
+    assert GatewayRunner._post_turn_goal_identity(runner, event)["loop_tick"] == [123.0, 4]
+
+
+@pytest.mark.asyncio
+async def test_unstamped_turn_does_not_settle_a_tick_this_gateway_claimed(loop_env):
+    """A human turn ending while a new tick is in flight must leave that tick to its own wake."""
+    runner = _make_runner()
+    runner._gateway_started_at = time.time() - 60
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop("sid-gateway-loop", mgr.state)
+    assert loops.LoopManager(session_id="sid-gateway-loop").fire_tick() is not None
+
+    await GatewayRunner._post_turn_loop_completion(
+        runner, session_entry=_FakeSessionEntry(), source=None,
+        final_response="Unrelated answer.\nLOOP_COMPLETE", loop_tick=None,
+    )
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.status == "active" and reloaded.awaiting_response is True
+
+
+@pytest.mark.asyncio
+async def test_unstamped_turn_releases_a_tick_claimed_before_this_gateway_started(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop("sid-gateway-loop", mgr.state)
+    assert loops.LoopManager(session_id="sid-gateway-loop").fire_tick() is not None
+    runner._gateway_started_at = time.time() + 1
+
+    await GatewayRunner._post_turn_loop_completion(
+        runner, session_entry=_FakeSessionEntry(), source=None,
+        final_response="still polling", loop_tick=None,
+    )
+    assert loops.load_loop("sid-gateway-loop").awaiting_response is False
+
+
+def test_slash_command_wake_is_fenced_after_its_tick_completes_but_not_after_a_pause(loop_env):
+    from hermes_cli.session_controls import loop_wake_is_current, loop_wake_metadata
+
+    runner = _make_runner()
+    del runner
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.set("/recap", interval_seconds=300, route={"platform": "telegram", "chat_id": "1"})
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop("sid-gateway-loop", mgr.state)
+    fired = loops.LoopManager(session_id="sid-gateway-loop")
+    assert fired.fire_tick() == "/recap"
+    metadata = loop_wake_metadata("sid-gateway-loop", fired.state, command=True)
+    fired.complete_tick("")  # the scheduler completes command ticks right after dispatch
+    assert loop_wake_is_current(metadata, "sid-gateway-loop") is True
+    loops.LoopManager(session_id="sid-gateway-loop").pause("approved in Telegram")
+    assert loop_wake_is_current(metadata, "sid-gateway-loop") is False
+
+
+@pytest.mark.asyncio
+async def test_chain_loop_tick_settles_the_wake_a_human_follow_up_queued_behind(loop_env):
+    """Loop wake head + human terminal turn: the chain's loop completion settles the wake's tick."""
+    runner = _make_runner()
+    runner._gateway_started_at = time.time() - 60
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop("sid-gateway-loop", mgr.state)
+    fired = loops.LoopManager(session_id="sid-gateway-loop")
+    assert fired.fire_tick() is not None
+    head = _loop_wake_event(fired)
+    # The queued human turn is terminal; the chain recorded the wake's loop tick on the head.
+    head._post_turn_goal_identity = {"user_turn": True, "goal_instance": None, "loop_tick": None}
+    head._post_turn_loop_tick = [fired.state.created_at, fired.state.ticks_fired]
+    runner._post_turn_goal_continuation = AsyncMock()
+    await GatewayRunner._run_post_turn_hooks(
+        runner, agent_result={"final_response": "answered the human"},
+        source=head.source, is_internal=True, event=head,
+    )
+    assert loops.load_loop("sid-gateway-loop").awaiting_response is False
+
+
+@pytest.mark.parametrize("cap", ["times", "max_ticks"])
+def test_final_capped_command_tick_still_runs(loop_env, cap):
+    from hermes_cli.session_controls import loop_wake_is_current, loop_wake_metadata
+
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    kwargs = {"times": 1} if cap == "times" else {}
+    mgr.set("/recap", interval_seconds=300, route={"platform": "telegram", "chat_id": "1"}, **kwargs)
+    if cap == "max_ticks":
+        mgr.state.max_ticks = 1
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop("sid-gateway-loop", mgr.state)
+    fired = loops.LoopManager(session_id="sid-gateway-loop")
+    assert fired.fire_tick() == "/recap"
+    metadata = loop_wake_metadata("sid-gateway-loop", fired.state, command=True)
+    fired.complete_tick("")
+    assert loops.load_loop("sid-gateway-loop").status == ("done" if cap == "times" else "paused")
+    assert loop_wake_is_current(metadata, "sid-gateway-loop") is True
+
+
+@pytest.mark.asyncio
+async def test_unaccepted_loop_wake_skips_started_tick(loop_env):
+    """A refused wake stays started until the watcher recovers it, never replaying the tick."""
+    runner = _make_runner()
+    route = {"platform": "discord", "chat_id": "chat-loop", "chat_type": "channel", "user_id": "u"}
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.set("poll CI", interval_seconds=300, route=route)
+    mgr.state.next_due_at = 0
+    loops.save_loop("sid-gateway-loop", mgr.state)
+
+    class _Refusing:
+        async def handle_message(self, event):
+            event._gateway_accepted = False  # e.g. an occupied internal slot
+
+    adapter = _Refusing()
+    runner._adapters_for_profile = lambda profile: {Platform.DISCORD: adapter}
+    runner._build_process_event_source = lambda evt: SessionSource(
+        platform=Platform.DISCORD, chat_id=evt["chat_id"], chat_type=evt["chat_type"],
+        user_id=evt["user_id"])
+    runner._session_key_for_source = lambda source: "agent:main:discord:channel:chat-loop"
+    runner._running_agents = {}
+
+    async def _inline(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _inline
+    state = loops.load_loop("sid-gateway-loop")
+    await GatewayRunner._loop_wakeup_fire_one(runner, "sid-gateway-loop", state, 1e12, set())
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is True and reloaded.ticks_fired == 1
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner, "sid-gateway-loop", loops.load_loop("sid-gateway-loop"), 1e12, set())
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is False and reloaded.ticks_fired == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_adapter_without_receipt_is_a_refusal_not_a_replay(loop_env):
+    """Direct adapters follow admit_internal_event's receipt rule: MessageEvent defaults the
+    receipt to False, so a handler that never confirms admission leaves the started command tick
+    for skip-only recovery. The next scan skips it once and never runs the command again."""
+    runner = _make_runner()
+    route = {"platform": "discord", "chat_id": "chat-loop", "chat_type": "channel", "user_id": "u"}
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.set("/status", interval_seconds=300, route=route)
+    mgr.state.next_due_at = 0
+    loops.save_loop("sid-gateway-loop", mgr.state)
+
+    class _NoReceipt:
+        handled = []
+
+        async def handle_message(self, event):
+            self.handled.append(event.text)  # never sets _gateway_accepted
+
+    adapter = _NoReceipt()
+    runner._adapters_for_profile = lambda profile: {Platform.DISCORD: adapter}
+    runner._build_process_event_source = lambda evt: SessionSource(
+        platform=Platform.DISCORD, chat_id=evt["chat_id"], chat_type=evt["chat_type"],
+        user_id=evt["user_id"])
+    runner._session_key_for_source = lambda source: "agent:main:discord:channel:chat-loop"
+    runner._running_agents = {}
+
+    async def _inline(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _inline
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner, "sid-gateway-loop", loops.load_loop("sid-gateway-loop"), 1e12, set())
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is True and reloaded.ticks_fired == 1
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner, "sid-gateway-loop", loops.load_loop("sid-gateway-loop"), 1e12, set())
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is False and reloaded.ticks_fired == 1
+    assert adapter.handled == ["/status"]

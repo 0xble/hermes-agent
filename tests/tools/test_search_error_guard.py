@@ -77,12 +77,15 @@ class TestSearchErrorGuard:
         assert res.error is None
         assert len(res.matches) == 5
 
-    def test_hard_error_is_surfaced(self, method, match_tree):
-        # An invalid regex makes rg/grep exit 2 with only diagnostics in
-        # stdout. The guard MUST surface it — not return empty matches.
+    def test_hard_error_is_surfaced_or_recovered_explicitly(self, method, match_tree):
+        # rg recovers malformed regexes with an explicit literal-search warning;
+        # grep still surfaces its hard error. Neither parses diagnostics as hits.
         res = _search(_ops(match_tree), method, "[", match_tree)
-        assert res.error is not None, "search error was silently swallowed"
-        assert "Search failed" in res.error
+        if method == "_search_with_rg":
+            assert res.error is None
+            assert "fixed-string" in res.warning
+        else:
+            assert "Search failed" in res.error
         assert not res.matches
 
 

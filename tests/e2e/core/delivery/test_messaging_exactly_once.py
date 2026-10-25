@@ -68,9 +68,9 @@ class Director:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.scripts: Dict[str, List] = {}
-        self.turns: Dict[str, int] = {}
-        self.resumes: Dict[str, int] = {}
+        self.scripts: dict[str, list] = {}
+        self.turns: dict[str, int] = {}
+        self.resumes: dict[str, int] = {}
 
     def script(self, token: str, *responses) -> None:
         with self._lock:
@@ -94,7 +94,8 @@ class Director:
         # A resumed turn's recovery note can arrive merged with the original tagged user message
         # (the unanswered user row and the note are consecutive user turns). It is still a resume,
         # not a second run of that token.
-        resumed = "previous turn was interrupted" in last.lower()
+        from gateway.run import RESUME_NOTE_PREFIX
+        resumed = RESUME_NOTE_PREFIX in last
         tokens = [] if resumed else _TOKEN_RE.findall(last)
         # A tool-result continuation re-sends the same last user message: it is the same turn.
         continuation = request["messages"][-1].get("role") == "tool"
@@ -139,7 +140,7 @@ def gw(tmp_path_factory, llm):
     proc.stop()
 
 
-def ledger_rows(db_path: Path, chat: str) -> List[tuple]:
+def ledger_rows(db_path: Path, chat: str) -> list[tuple]:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
     try:
         return conn.execute("SELECT state, attempts, content FROM delivery_obligations WHERE chat_id=?",
@@ -265,7 +266,7 @@ STREAM_ACK_LOST_SIGNATURE = r"^\d+ unmarked copies of A-fk_(tg|dc)\.ack_lost \(s
 XFAILED_TOKENS: set = set()
 
 
-def faults_fired(gw: GatewayProcess, aid: str) -> List[dict]:
+def faults_fired(gw: GatewayProcess, aid: str) -> list[dict]:
     chat = "m-" + aid[2:].replace(".", "-", 1)
     return [f for f in read_jsonl(gw.spool / "faults_fired.jsonl") if f.get("chat_id") == chat]
 
@@ -419,23 +420,13 @@ CRASH_POINTS = {
     # streaming: the platform accepted a preview edit that already shows the complete answer, while
     # the provider stream (so the turn) is still open -> nothing persisted when the process dies
     "stream_accepted_unpersisted": ("any", "hold_after"),
+    # Same crash after a real preview EDIT: the initial send ACK supplied its ID.
+    "stream_accepted_edit_unpersisted": ("edit", "hold_after"),
 }
 
 # completed_not_ledgered: the turn is persisted and the handler returned, but the final text never
 # reached the delivery ledger; recovery must hand the persisted reply to the ledger rather than
 # re-run the turn. Either way exactly one complete reply must show.
-
-STREAM_CRASH_AFTER_ACCEPT_GAP = (
-    "LIVE GAP: streaming turn, the platform already shows the complete final answer, SIGKILL before "
-    "the turn is persisted -> restart auto-resumes and the model answers AGAIN; the second answer is "
-    "unmarked and the first (visible) answer was never persisted (visible != transcript).")
-# No fix PR yet: run-time xfail only when the visible pair is exactly the gap's shape, the held
-# original answer AND an auto-resumed re-answer, both unmarked.
-STREAM_CRASH_AFTER_ACCEPT_SIGNATURE = (
-    r"(?s)^(2 unmarked complete replies after catch-up|both the held answer and an auto-resumed "
-    r"re-answer are visible)\n.*<<A-fk_tg\.crash-stream_accepted_unpersisted>>.*"
-    r"<<R-fk_tg\.crash-stream_accepted_unpersisted-\d>>")
-
 
 def _replies(gw: GatewayProcess, platform: str, chat: str, token: str, aid: str):
     msgs = gw.platform_view().visible(platform, chat)
@@ -447,16 +438,25 @@ def _replies(gw: GatewayProcess, platform: str, chat: str, token: str, aid: str)
 CRASH_MATRIX = [("completed_not_ledgered", "fk_ne"),  # streaming finals are sent before the handler returns
                 ("send_in_flight", "fk_ne"), ("send_in_flight", "fk_tg"),
                 ("sent_ack_lost", "fk_ne"), ("sent_ack_lost", "fk_tg"),
-                ("stream_accepted_unpersisted", "fk_tg")]
+                ("stream_accepted_unpersisted", "fk_tg"),
+                ("stream_accepted_edit_unpersisted", "fk_tg")]
+
+
+STREAM_CONTINUE_POINTS = {"stream_accepted_unpersisted", "stream_accepted_edit_unpersisted"}
 
 
 @pytest.fixture
-def fresh_gw(tmp_path, llm):
+def fresh_gw(request, tmp_path, llm):
     """A gateway on its OWN home: one unclean restart per home keeps the restart-loop breaker and
     the 120 s recency fallback of other scenarios out of the picture."""
     keep = os.environ.get("C12_SPOOL_ROOT")
     root = Path(keep) / f"crash-{tmp_path.name}" if keep else tmp_path / "gw"
-    proc = GatewayProcess(root, platforms=PLATFORMS, llm_base_url=llm.base_url, extra_config=EXTRA_CONFIG)
+    extra = EXTRA_CONFIG
+    if request.node.callspec.params.get("point") in STREAM_CONTINUE_POINTS:
+        # Preview adoption and recovery marking are a `continue`-policy contract; under the
+        # default `ask` the resume turn only asks, and the partial preview stays untouched.
+        extra += "restart_resume_policy: continue\n"
+    proc = GatewayProcess(root, platforms=PLATFORMS, llm_base_url=llm.base_url, extra_config=extra)
     proc.start()
     yield proc
     proc.stop()
@@ -476,13 +476,19 @@ def test_crash_between_completion_and_send(fresh_gw, director, point, platform):
     chat = f"k-{platform}-{point}"
     aid = f"A-{token}"
     answer = Director.answer(aid, "answer computed before the crash.")
-    if point == "stream_accepted_unpersisted":  # the whole answer streams, then the stream stays open
-        answer = StallMidStream(text=answer.text, after_chars=len(answer.text), seconds=60)
+    if point in {"stream_accepted_unpersisted", "stream_accepted_edit_unpersisted"}:
+        # The legacy case emits all text at once and holds the FIRST SEND, not an
+        # edit. The edit case first gets an acknowledged partial preview ID.
+        answer = StallMidStream(text=answer.text, after_chars=len(answer.text), seconds=60,
+                                prefix_chars=32 if point == "stream_accepted_edit_unpersisted" else 0,
+                                prefix_delay=0.5 if point == "stream_accepted_edit_unpersisted" else 0)
     director.script(token, answer)
     gw.fault(platform=platform, op=op, kind=kind, contains=footer(aid), chat_id=chat)
     gw.inject(platform, f"[in:{token}] question", message_id=f"in-{token}", chat_id=chat)
     wait_until(lambda: any(footer(aid) in h["content"] for h in gw.holds()), f"{token} to reach the crash point",
                proc=gw.proc, log=gw.log)
+    preview_ids = [m.message_id for m in gw.platform_view().visible(platform, chat)
+                   if header(aid) in m.text] if point == "stream_accepted_edit_unpersisted" else []
     if point == "sent_ack_lost":  # the stream's footer edit can land before the turn is persisted
         wait_until(lambda: persisted_answers(gw.db_path, aid), f"{token} answer persisted before the kill",
                    proc=gw.proc, log=gw.log)
@@ -497,19 +503,45 @@ def test_crash_between_completion_and_send(fresh_gw, director, point, platform):
                proc=gw.proc, log=gw.log)
     gw.wait_idle([chat], f"{token} to settle after restart")
     wait_until(lambda: ledger_quiescent(gw.db_path, chat), f"{token} ledger to settle", proc=gw.proc, log=gw.log)
-    # Every wait above must have succeeded before a known gap may XFAIL the cell: only the final
-    # assertions run under the run-time xfail, so a lost reply or a failed restart stays red.
-    guard = (known_failure(STREAM_CRASH_AFTER_ACCEPT_SIGNATURE, STREAM_CRASH_AFTER_ACCEPT_GAP)
-             if point == "stream_accepted_unpersisted" else contextlib.nullcontext())
-    with guard:
-        _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming)
+    _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming,
+                               preview_ids=preview_ids)
 
 
-def _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming) -> None:
+def _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming,
+                               *, preview_ids=None) -> None:
     ctx = dump(gw, platform, chat)
     originals, resumes = _replies(gw, platform, chat, token, aid)
     complete = [c for c in originals + resumes if c.complete]
     unmarked = [c for c in complete if not c.marked]
+    if point == "stream_accepted_edit_unpersisted":
+        # The acknowledged preview ID is the durable edit target across the
+        # restart. The resumed complete copy must finish that message in place;
+        # an old incomplete preview must not remain beside it.
+        assert preview_ids, f"no acknowledged preview captured before crash\n{ctx}"
+        assert len(complete) == 1, f"expected one resumed complete copy\n{ctx}"
+        assert complete[0].message_ids == preview_ids, (
+            f"resumed completion changed platform message ownership: "
+            f"preview={preview_ids}, complete={complete[0].message_ids}\n{ctx}")
+        assert not [c for c in originals + resumes if not c.complete], ctx
+        return
+    if point == "stream_accepted_unpersisted":
+        # The first send's ACK died with the gateway, so its ID cannot be edited.
+        # The docstring's honest at-least-once contract governs this one cell:
+        # the unfinished model turn legitimately runs twice, never a fabricated completion.
+        assert len(unmarked) <= 1, f"{len(unmarked)} unmarked complete replies after catch-up\n{ctx}"
+        assert len(resumes) == 1 and resumes[0].complete and resumes[0].marked, ctx
+        assert not [c for c in originals if c.marked], ctx
+        final_aid = f"R-{token}-{director.resumes.get(token, 0)}"
+        persisted = persisted_answers(gw.db_path, final_aid)
+        # visible_copies strips the marker before constructing Copy.text.
+        assert len(persisted) == 1 and norm(persisted[0]) == resumes[0].text, (
+            f"visible final reply is not the (single) persisted assistant text: persisted={persisted}\n{ctx}")
+        # Director versions may count resume calls separately; only this cell
+        # permits two model turns for one inbound (one original, one recovery).
+        assert director.turns.get(token) in (1, 2), ctx
+        assert director.resumes.get(token) == 1, ctx
+        assert len(persisted_user_rows(gw.db_path, f"[in:{token}]")) == 1, ctx
+        return
     assert len(unmarked) <= 1, f"{len(unmarked)} unmarked complete replies after catch-up\n{ctx}"
     assert len(complete) - len(unmarked) <= (1 if point == "sent_ack_lost" else 0) or not unmarked, (
         f"unexpected extra marked copies\n{ctx}")
@@ -546,7 +578,7 @@ def test_zz_whole_run_audit(gw, director):
                if m.group(1) in (f"A-{token}",) or m.group(1).startswith((f"R-{token}-", f"{token}-extra"))}
         unmarked = 0
         for aid in ids:
-            by_chat: Dict[str, list] = {}
+            by_chat: dict[str, list] = {}
             for v in visible:
                 by_chat.setdefault((v.platform, v.chat_id), []).append(v)
             for msgs in by_chat.values():
@@ -592,7 +624,7 @@ def test_zzz_unclean_restart_reruns_nothing(gw, director):
 
 
 
-def all_ledger_rows(db_path: Path) -> List[tuple]:
+def all_ledger_rows(db_path: Path) -> list[tuple]:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
     try:
         return conn.execute("SELECT state, attempts, chat_id FROM delivery_obligations").fetchall()

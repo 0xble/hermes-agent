@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml
+import hermes_yaml as yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TURN_TIMEOUT = 180.0
@@ -125,7 +125,7 @@ def run_chat(nh: NativeHome, prompt: str, *, resume: str | None = None, env: dic
         argv += ["--resume", resume]
     started = time.monotonic()
     proc = subprocess.run(argv, cwd=nh.project, env=nh.env(env), capture_output=True, text=True,
-                          timeout=timeout, stdin=subprocess.DEVNULL)
+                          timeout=timeout, stdin=subprocess.DEVNULL, check=False)
     return ChatResult(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started)
 
 

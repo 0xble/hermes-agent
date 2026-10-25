@@ -38,7 +38,7 @@ def test_observer_prepare_failure_prevents_write(tmp_path, monkeypatch):
         raise OSError("journal unavailable")
         yield
 
-    unregister = register_memory_transaction_observer("test", refuse)
+    unregister = register_memory_transaction_observer("test", refuse, durable=True)
     try:
         with pytest.raises(OSError, match="journal unavailable"):
             MemoryStore().add("memory", "A")
@@ -58,6 +58,31 @@ def test_restore_compares_under_native_lock_and_preserves_prompt(tmp_path, monke
     assert store.compare_and_restore("memory", expected="A\n§\nB", replacement="A")["success"]
     assert (tmp_path / "memories/MEMORY.md").read_text() == "A"
     assert store._system_prompt_snapshot == prompt
+
+
+def test_durable_registration_is_profile_scoped_and_ownership_safe(tmp_path, monkeypatch):
+    from tools.memory_transactions import (
+        has_durable_memory_transaction_observer, register_memory_transaction_observer,
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "a"))
+
+    @contextmanager
+    def observe(transaction):
+        yield
+
+    old = register_memory_transaction_observer("test", observe)
+    assert not has_durable_memory_transaction_observer()
+    current = register_memory_transaction_observer("test", observe, durable=True)
+    try:
+        old()  # The old owner must not unregister a later registration of the same callback.
+        assert has_durable_memory_transaction_observer()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "b"))
+        assert not has_durable_memory_transaction_observer()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "a"))
+        assert has_durable_memory_transaction_observer()
+    finally:
+        current()
+    assert not has_durable_memory_transaction_observer()
 
 
 def test_observer_registration_is_profile_scoped(tmp_path, monkeypatch):

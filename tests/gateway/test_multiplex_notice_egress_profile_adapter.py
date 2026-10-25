@@ -6,11 +6,12 @@ user's chat with the wrong bot (and for ``/loop`` the wakeup ran the default pro
 must use the session's own profile adapter and fail closed when that profile has none.
 """
 import json
+import weakref
 from types import SimpleNamespace
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -27,6 +28,7 @@ class _Adapter:
 
     async def handle_message(self, event):
         self.handled.append(event.text)
+        event._gateway_accepted = True  # the admission receipt a real adapter returns
 
 
 def _runner():
@@ -64,7 +66,7 @@ async def test_restart_marker_from_secondary_session_notifies_via_its_own_bot(tm
     r = _runner()
     src = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42", profile="sec")
     event = MessageEvent(text="/restart", message_type=MessageType.TEXT, source=src, message_id="7")
-    (tmp_path / ".restart_notify.json").write_text(json.dumps(_restart_notify_payload(event)))
+    (tmp_path / ".restart_notify.json").write_text(json.dumps(_restart_notify_payload(event)), encoding="utf-8")
 
     assert await r._send_restart_notification() == ("telegram", "42", None)
     assert r._profile_adapters["sec"][Platform.TELEGRAM].sent == ["42"]
@@ -73,10 +75,13 @@ async def test_restart_marker_from_secondary_session_notifies_via_its_own_bot(tm
 
 @pytest.mark.asyncio
 async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkeypatch):
+    from agent import estop
     from hermes_cli import loops
 
+    fired = []
+
     class _Mgr:
-        state = SimpleNamespace(ticks_fired=1)
+        state = SimpleNamespace(ticks_fired=1, created_at=1.0, control_generation=0)
 
         def __init__(self, session_id=None):
             pass
@@ -84,7 +89,11 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
         def is_due(self, now):
             return True
 
-        def fire_tick(self):
+        def fire_tick(self, run_generation=0, *, can_claim=None):
+            # Mirrors LoopManager.fire_tick: admission claims only while the gateway still owns the run.
+            if can_claim is not None and not can_claim():
+                return None
+            fired.append(1)
             return "tick"
 
         def complete_tick(self, *_):
@@ -92,13 +101,148 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
 
     monkeypatch.setattr(loops, "LoopManager", _Mgr)
     monkeypatch.setattr(loops, "goal_blocks_loop_tick", lambda sid: False)
+    # The fake manager stores no loop row; this test covers bot routing, not the tick fence.
+    from hermes_cli import session_controls
+    monkeypatch.setattr(session_controls, "loop_wake_is_current", lambda *_a, **_k: True)
     r = _runner()
     r._running = True
     route = {"platform": "telegram", "chat_id": "42", "chat_type": "dm", "user_id": "42", "profile": "sec"}
     state = SimpleNamespace(awaiting_response=False, next_due_at=0, route=route)
+
+    # `hermes pause`: loop wakeups are internal events that bypass the inbound estop gate, so the
+    # watcher itself must hold the tick — unclaimed (fire_tick never runs), so it stays due for resume.
+    estop.engage(reason="maintenance")
+    try:
+        await r._loop_wakeup_fire_one("sid", state, 1e12, set())
+        assert (fired, r._profile_adapters["sec"][Platform.TELEGRAM].handled) == ([], [])
+    finally:
+        estop.disengage()
 
     await r._loop_wakeup_fire_one("sid", state, 1e12, set())
     await r._loop_wakeup_fire_one("sid2", SimpleNamespace(**{**vars(state), "route": {**route, "profile": "nobot"}}), 1e12, set())
 
     assert r._profile_adapters["sec"][Platform.TELEGRAM].handled == ["tick"]
     assert r.adapters[Platform.TELEGRAM].handled == []
+    assert fired == [1]  # resume: the held tick fires once; the bot-less route never claims one
+
+
+def _home_config(platform: Platform, chat_id: str, *, notify: bool = True) -> GatewayConfig:
+    return GatewayConfig(platforms={platform: PlatformConfig(
+        enabled=True, token="t", gateway_restart_notification=notify,
+        home_channel=HomeChannel(platform=platform, chat_id=chat_id, name=chat_id))})
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notice_reaches_every_served_profiles_home_channel(monkeypatch):
+    """The home-channel shutdown broadcast covers EVERY served profile, through its own bot.
+
+    ``self.adapters``/``self.config`` are the launch profile's alone, so a served profile's home
+    channel never heard the gateway was going down (#118233). Two bots with the same positive
+    Telegram id are two private conversations: both are owed a notice. A served profile's own
+    ``gateway_restart_notification=false`` opt-out is honoured from ITS config.
+    """
+    monkeypatch.setattr("gateway.drain_control.drain_notification_suppressed", lambda: False)
+    r = _runner()
+    r.config = _home_config(Platform.TELEGRAM, "8776018003")
+    r._profile_configs = {
+        "sec": _home_config(Platform.TELEGRAM, "8776018003"),
+        "quiet": _home_config(Platform.DISCORD, "-quiet", notify=False),
+    }
+    r._profile_adapters = {"sec": {Platform.TELEGRAM: _Adapter()}, "quiet": {Platform.DISCORD: _Adapter()}}
+    r._served_profile_homes = {}
+    r._snapshot_running_agents = list
+
+    await r._notify_active_sessions_of_shutdown()
+
+    assert r.adapters[Platform.TELEGRAM].sent == ["8776018003"]
+    assert r._profile_adapters["sec"][Platform.TELEGRAM].sent == ["8776018003"], "own bot, own conversation"
+    assert r._profile_adapters["quiet"][Platform.DISCORD].sent == [], "served profile's opt-out is its own"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["active", "home", "update", "update-satellite"])
+@pytest.mark.parametrize("chat_id", ["8776018003", "-8776018003"])
+async def test_shutdown_delivery_debt_distinguishes_private_bots_but_dedupes_shared_groups(
+    tmp_path, monkeypatch, mode, chat_id,
+):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr("gateway.drain_control.drain_notification_suppressed", lambda: False)
+    r = _runner()
+    r.config = _home_config(Platform.TELEGRAM, chat_id)
+    r._profile_configs = {"sec": _home_config(Platform.TELEGRAM, chat_id)}
+    r._served_profile_homes = {}
+    if mode == "active":
+        r._running_agents = {f"agent:main:telegram:dm:{chat_id}": object(),
+                             f"agent:sec:telegram:dm:{chat_id}": object()}
+    if mode.startswith("update"):
+        r._restart_requested = True
+        marker_profile = "default"
+        if mode == "update-satellite":
+            from gateway.profile_routing import parse_profile_routes
+
+            r.config.multiplex_profiles = True
+            r.config.profile_routes = parse_profile_routes([
+                {"platform": "telegram", "profile": "sec", "chat_id": chat_id},
+            ])
+            r._profile_adapters["sec"] = {}
+            monkeypatch.setattr(gateway_run, "_multiplex_profile_homes", lambda config: [
+                ("default", tmp_path), ("sec", tmp_path / "sec"),
+            ])
+            marker_profile = "sec"
+        (tmp_path / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram", "chat_id": chat_id, "profile": marker_profile,
+        }))
+
+        async def already_delivered(phase):
+            return True
+
+        r._send_update_phase = already_delivered
+    r._snapshot_running_agents = lambda: list(r._running_agents)
+
+    await r._notify_active_sessions_of_shutdown()
+
+    assert r.adapters[Platform.TELEGRAM].sent == ([] if mode.startswith("update") else [chat_id])
+    if mode == "update-satellite":
+        assert r._profile_adapters["sec"] == {}
+    else:
+        assert r._profile_adapters["sec"][Platform.TELEGRAM].sent == (
+            [] if chat_id.startswith("-") else [chat_id]
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_profile", ["sec", "default"])
+async def test_secondary_restart_request_exempts_only_its_transport_from_diagnostic_policy(
+    tmp_path, monkeypatch, runtime_profile,
+):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    r = _runner()
+    r.config.multiplex_profiles = True
+    chat_id = "8776018003"
+    r._running_agents = {f"agent:main:telegram:dm:{chat_id}": object(),
+                         f"agent:sec:telegram:dm:{chat_id}": object()}
+    r._snapshot_running_agents = lambda: list(r._running_agents)
+    r._restart_requested = True
+    r._restart_command_source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm", profile=runtime_profile,
+    )
+    r._restart_command_source._transport_adapter_ref = weakref.ref(r._profile_adapters["sec"][Platform.TELEGRAM])
+    diagnostics = []
+
+    async def present(send, *, diagnostic=True, **kwargs):
+        diagnostics.append((send.__defaults__[0], diagnostic))
+        await send()
+        return True
+
+    monkeypatch.setattr("gateway.warning_notifications.present_notification", present)
+
+    await r._notify_active_sessions_of_shutdown()
+
+    assert dict(diagnostics) == {r.adapters[Platform.TELEGRAM]: True,
+                                r._profile_adapters["sec"][Platform.TELEGRAM]: False}
+    assert r.adapters[Platform.TELEGRAM].sent == [chat_id]
+    assert r._profile_adapters["sec"][Platform.TELEGRAM].sent == [chat_id]

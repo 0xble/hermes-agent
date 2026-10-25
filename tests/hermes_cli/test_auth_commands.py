@@ -8,7 +8,7 @@ import time
 from unittest.mock import patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 
 def _write_auth_store(tmp_path, payload: dict) -> None:
@@ -889,8 +889,8 @@ def test_seed_from_singletons_respects_hermes_pkce_suppression(tmp_path, monkeyp
     hermes_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    import yaml
-    (hermes_home / "config.yaml").write_text(yaml.dump({"model": {"provider": "anthropic", "model": "claude"}}))
+    import hermes_yaml as yaml
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump({"model": {"provider": "anthropic", "model": "claude"}}))
     (hermes_home / "auth.json").write_text(json.dumps({
         "version": 1,
         "providers": {},
@@ -906,7 +906,7 @@ def test_seed_from_singletons_respects_hermes_pkce_suppression(tmp_path, monkeyp
 
     from agent.credential_pool import _seed_from_singletons
     entries = []
-    changed, active = _seed_from_singletons("anthropic", entries)
+    _changed, active = _seed_from_singletons("anthropic", entries)
     # hermes_pkce suppressed, claude_code returns None → nothing should be seeded
     assert entries == []
     assert "hermes_pkce" not in active
@@ -1046,6 +1046,8 @@ def test_openrouter_loopback_callback_binds_nonce_path_and_rejects_forged_redire
     import hermes_cli.auth_openrouter as orm
 
     seen: dict = {}
+    workers = []
+    errors = []
 
     def _browser(url):
         callback = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["callback_url"][0]
@@ -1054,20 +1056,46 @@ def test_openrouter_loopback_callback_binds_nonce_path_and_rejects_forged_redire
 
         def _redirects():
             try:
-                urllib.request.urlopen(forged, timeout=5)
-            except urllib.error.HTTPError as exc:
-                seen["forged_status"] = exc.code
-            with urllib.request.urlopen(f"{callback}?code=good-code", timeout=5) as resp:
-                seen["genuine_status"] = resp.status
+                try:
+                    urllib.request.urlopen(forged, timeout=5)
+                except urllib.error.HTTPError as exc:
+                    seen["forged_status"] = exc.code
+                with urllib.request.urlopen(f"{callback}?code=good-code", timeout=5) as resp:
+                    seen["genuine_status"] = resp.status
+            except Exception as exc:
+                errors.append(exc)
 
-        threading.Thread(target=_redirects, daemon=True).start()
+        worker = threading.Thread(target=_redirects, daemon=True)
+        workers.append(worker)
+        worker.start()
         return True
 
     monkeypatch.setattr(orm, "_can_open_graphical_browser", lambda: True)
     monkeypatch.setattr(orm.webbrowser, "open", _browser)
 
-    code = orm._openrouter_loopback_code(
-        {"code_challenge": "c", "code_challenge_method": "S256"}, open_browser=True, timeout_seconds=10)
+    loopback_error = None
+    try:
+        code = orm._openrouter_loopback_code(
+            {"code_challenge": "c", "code_challenge_method": "S256"}, open_browser=True, timeout_seconds=10)
+    except BaseException as exc:
+        loopback_error = exc
+        raise
+    finally:
+        # The server publishing a code does not mean the browser thread has
+        # observed its HTTP response. Join that owner before reading its results
+        # (and before monkeypatch restores the client on any failure).
+        for worker in workers:
+            worker.join(timeout=12)
+        if loopback_error is not None:
+            # Keep the original exception and traceback, with worker diagnostics
+            # attached rather than an assertion in cleanup hiding the cause.
+            if any(worker.is_alive() for worker in workers):
+                loopback_error.add_note("OpenRouter browser redirects did not finish")
+            if errors:
+                loopback_error.add_note(f"OpenRouter browser redirect failed: {errors!r}")
+    for worker in workers:
+        assert not worker.is_alive(), "OpenRouter browser redirects did not finish"
+    assert not errors, f"OpenRouter browser redirect failed: {errors!r}"
 
     parsed = urllib.parse.urlparse(seen["callback"])
     assert parsed.hostname == "127.0.0.1" and parsed.path.startswith("/callback/") and len(parsed.path) > 20

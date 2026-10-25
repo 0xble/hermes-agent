@@ -23,7 +23,7 @@ def test_cli_goal_notice_policy_preserves_continuation(monkeypatch, enabled):
     }
     client = cli_loops_mixin.CLILoopsMixin()
     client._get_goal_manager = lambda: manager
-    client._last_assistant_response_text = lambda: "Completed work"
+    client._last_turn_result = {"final_response": "Completed work", "completed": True}
     client._pending_input = queue.Queue()
     client.session_id = "notice-policy"
     client.agent = SimpleNamespace(session_id="notice-policy")

@@ -150,7 +150,7 @@ auxiliary:
 
         from agent.auxiliary_client import resolve_vision_provider_client
         from urllib.parse import urlparse
-        provider, client, model = resolve_vision_provider_client()
+        _provider, client, model = resolve_vision_provider_client()
         assert client is not None, "openai alias should produce a usable client"
         # Exact hostname comparison (not substring) — defends against URLs
         # like ``api.openai.com.evil.example`` and keeps CodeQL happy.
@@ -180,6 +180,17 @@ model:
 """)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
+
+        # Exercise the text-only catalog verdict without depending on a live
+        # models.dev fetch or whichever capabilities happen to be cached.
+        from types import SimpleNamespace
+        monkeypatch.setattr(
+            "agent.models_dev.get_model_capabilities",
+            lambda provider, model, **kwargs: (
+                SimpleNamespace(supports_vision=False)
+                if (provider, model) == ("deepseek", "deepseek-v4-pro") else None
+            ),
+        )
 
         from agent.auxiliary_client import resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")

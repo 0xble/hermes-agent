@@ -67,7 +67,7 @@ def _make_multiplex_runner():
         platform=Platform.TELEGRAM, chat_type="dm",
     ))
 
-    async def _switch(key, sid):
+    async def _switch(key, sid, *, preserve_prompt_pin=True):
         captured["session_key"] = key
         return SessionEntry(
             session_key=key, session_id=sid,
@@ -84,6 +84,7 @@ def _make_multiplex_runner():
         _store=store,
         get_or_create_session=store.get_or_create_session,
         switch_session=store.switch_session,
+        get_resume_pending_marker=lambda _key: None,
     )
     runner._evict_cached_agent = MagicMock()
     runner._release_running_agent_state = MagicMock()
@@ -151,7 +152,7 @@ async def test_secondary_profile_handoff_uses_its_own_adapter(monkeypatch):
 @pytest.mark.asyncio
 async def test_default_profile_handoff_keeps_primary_adapter(monkeypatch):
     """The default/root path must behave exactly as before the fix."""
-    runner, captured = _make_multiplex_runner()
+    runner, _captured = _make_multiplex_runner()
 
     used = {}
     monkeypatch.setattr(

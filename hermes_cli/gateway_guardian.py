@@ -9,49 +9,58 @@ import argparse
 import json
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import time
 import uuid
-import yaml
+import hermes_yaml as yaml
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from hermes_constants import get_hermes_home
+from hermes_cli.forward_only_guard import _LAUNCHCTL_SERVICE_NOT_FOUND
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
 
 GUARDIAN_LABEL = "ai.hermes.gateway-guardian"
 INTERVAL = 30
 MAX_REPAIRS = 3
+STARTUP_SECONDS = 45
+ROLLBACK_SECONDS = 60
+POLL_SECONDS = 5
 
 
-def _domain(label: str) -> str:
+def _domain(label: str, *, deadline: float | None = None) -> str:
     if sys.platform != "darwin":
         raise RuntimeError("gateway guardian requires macOS launchd")
     from hermes_cli.gateway_launchd import _probe_launchd_domain_for_label
-    return _probe_launchd_domain_for_label(label)
+    return _probe_launchd_domain_for_label(label, budget=lambda cap: _bounded_timeout(cap, deadline))
 
 
-def _gateway_domain(label: str, preferred: str | None) -> str:
-    """Observe both domains before trusting a saved domain or starting an unloaded job."""
+def _gateway_domain(label: str, preferred: str | None, *, deadline: float | None = None) -> str:
+    """Observe both domains before trusting a saved domain or starting an unloaded job. Every
+    launchctl probe here spends the caller's deadline, so discovery cannot run outside the bound."""
     domains = (f"gui/{os.getuid()}", f"user/{os.getuid()}")  # windows-footgun: ok (macOS launchd only)
     if preferred is not None and preferred not in domains:
         raise RuntimeError("guardian domain is not a gateway launchd domain for this user")
     states = {}
     for candidate in domains:
         try:
-            states[candidate] = _launch_state(candidate, label)
-        except RuntimeError:
+            states[candidate] = _launch_state(candidate, label, deadline=deadline)
+        except subprocess.TimeoutExpired:
             states[candidate] = "unknown"
-    loaded = [candidate for candidate, state in states.items() if state == "loaded"]
+        except RuntimeError:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
+            states[candidate] = "unknown"
+    loaded = [candidate for candidate, state in states.items() if state in {"loaded", "parked"}]
     if len(loaded) > 1:
         raise RuntimeError("gateway label is loaded in both launchd domains")
     if loaded:
         return loaded[0]
     if "unknown" in states.values():
         raise RuntimeError("cannot prove gateway unloaded in both launchd domains")
-    return preferred or _domain(label)
+    return preferred or _domain(label, deadline=deadline)
 
 
 def intent_path(home: Path) -> Path:
@@ -77,7 +86,7 @@ def receipt(home: Path, action: str, outcome: str, **detail: object) -> Path:
             if prior.stat().st_mtime < cutoff:
                 prior.unlink()
             elif outcome in {"alert", "capped"}:
-                old = json.loads(prior.read_text(encoding="utf-8"))
+                old = json.loads(prior.read_text(encoding="utf-8-sig"))
                 if {k: v for k, v in old.items() if k != "at"} == {k: v for k, v in payload.items() if k != "at"}:
                     return prior
         except (OSError, ValueError):
@@ -101,7 +110,7 @@ def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
         path = home / name
         if not path.exists():
             continue
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(record, dict) or record.get("version") != 1:
             raise ValueError(f"invalid release receipt: {path}")
         if record.get("operation") not in {"promote", "first-migration"} or record.get("reload_ack"):
@@ -116,7 +125,9 @@ def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
     return "none", None
 
 
-def healthy(home: Path, label: str, expected: Path) -> bool:
+def healthy(home: Path, label: str, expected: Path, deadline: float | None = None) -> bool:
+    """Running-release proof. ``deadline`` caps the ``launchctl list`` probe so a stalled launchctl
+    cannot carry the guardian past its startup or rollback bound."""
     from gateway.status import read_runtime_status, runtime_status_is_stale
     from hermes_cli.gateway_launchd import _launchctl_supervised_pid
     import psutil
@@ -126,32 +137,58 @@ def healthy(home: Path, label: str, expected: Path) -> bool:
         return False
     if state.get("code_sha") != expected.name or runtime_status_is_stale(state):
         return False
-    supervised = _launchctl_supervised_pid(label)
+    if deadline is not None and deadline - time.monotonic() <= 0:
+        return False
+    supervised = _launchctl_supervised_pid(label, timeout=_bounded_timeout(10, deadline))
     if supervised is None:
         return False
     try:
         process = psutil.Process(pid)
-        return (process.is_running() and
-                (supervised == pid or supervised in {p.pid for p in process.parents()}) and
-                process.cwd() == str(expected))
+        proven = (process.is_running() and
+                  (supervised == pid or supervised in {p.pid for p in process.parents()}) and
+                  process.cwd() == str(expected))
     except (psutil.Error, OSError):
         return False
+    # A proof that finished after the bound does not count: the caller's deadline has already passed.
+    return proven and (deadline is None or time.monotonic() < deadline)
 
 
-def _launch_state(domain: str, label: str) -> str:
+def _bounded_timeout(requested: float, deadline: float | None) -> float:
+    if deadline is None:
+        return requested
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("guardian overall deadline expired")
+    return min(requested, remaining)
+
+
+def _sleep_within(seconds: float, deadline: float) -> None:
+    """Poll pause that never sleeps past ``deadline``."""
+    time.sleep(max(0.0, min(seconds, deadline - time.monotonic())))
+
+
+def _launch_state(domain: str, label: str, *, deadline: float | None = None) -> str:
     result = subprocess.run(["launchctl", "print", f"{domain}/{label}"],
-                            capture_output=True, text=True, encoding="utf-8", timeout=5)
+                            capture_output=True, text=True, encoding="utf-8", timeout=_bounded_timeout(5, deadline))
     if result.returncode == 0:
+        # A loaded job with no live PID whose last exit was clean is parked: KeepAlive's
+        # SuccessfulExit=false will never relaunch it (exit 0, or EX_CONFIG 78 mapped to 0).
+        pid = re.search(r"^\s*pid\s*=\s*(\d+)\s*$", result.stdout, re.MULTILINE)
+        last_exit = re.search(r"^\s*last exit (?:code|status)\s*=\s*(\d+)\s*$", result.stdout, re.MULTILINE)
+        if (not pid or int(pid[1]) == 0) and last_exit and int(last_exit[1]) == 0:
+            return "parked"
         return "loaded"
-    if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
+    if _LAUNCHCTL_SERVICE_NOT_FOUND in result.stderr or _LAUNCHCTL_SERVICE_NOT_FOUND in result.stdout:
         return "unloaded"
     raise RuntimeError(f"launchctl print could not establish unload (exit {result.returncode})")
 
 
-def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None) -> bool:
+def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None,
+                    deadline: float | None = None) -> bool:
     """Use S2 rollback with a targeted reload, never the ambient live gateway label."""
     from hermes_cli import gateway
     from hermes_cli.immutable_releases import wait_for_release_acknowledgement
+    deadline = deadline or time.monotonic() + ROLLBACK_SECONDS
     paths = ReleasePaths.for_home(home)
     pending = home / "release-txn.json"
     if pending.exists():
@@ -165,34 +202,54 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         # A disposable label uses its own plist; never regenerate the real service.
         definition["WorkingDirectory"] = str(old)
         body = plistlib.dumps(definition)
-    domain = domain or _domain(label)
+    domain = domain or _domain(label, deadline=deadline)
     def reload_target():
         import psutil
         from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
-        old_pid = _launchctl_supervised_pid(label)
-        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
+        old_pid = _launchctl_supervised_pid(label, timeout=_bounded_timeout(10, deadline))
+        if old_pid is not None:
+            # The rollback is a reload, not a crash: the gateway takes its bounded restart path.
+            from gateway.status import write_planned_restart_marker
+            write_planned_restart_marker(old_pid, hermes_home=home)
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
+                       timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
         if old_pid is not None:
             try:
-                psutil.Process(old_pid).wait(timeout=30)
+                psutil.Process(old_pid).wait(timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
             except psutil.NoSuchProcess:
                 pass
-        _launchctl_bootstrap(domain, plist, label, timeout=30)
+        # The exact remaining budget: flooring it to a whole second would hand the bootstrap a fresh
+        # second past the rollback deadline.
+        _launchctl_bootstrap(domain, plist, label, timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
         return True
     result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
     if result.get("reload_pending"):
         # The S2 acknowledgement may arrive after this one-shot invocation; live
         # process identity below is the independent health proof for this action.
-        wait_for_release_acknowledgement(home, timeout_seconds=5)
-    deadline = time.monotonic() + 12
+        wait_for_release_acknowledgement(home, timeout_seconds=_bounded_timeout(5, deadline))
+    deadline = deadline or time.monotonic() + 12
     while time.monotonic() < deadline:
-        if healthy(home, label, old):
+        if healthy(home, label, old, deadline):
             return True
-        time.sleep(.25)
+        _sleep_within(.25, deadline)
     return False
 
 
-def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None) -> str:
+def _refuse_leftovers_before_launch(home: Path, deadline: float | None = None) -> None:
+    """Never (re)bootstrap the legacy gateway beside withdrawn handover state.
+
+    A live generation job plus a bootstrapped legacy job would be two pollers on one bot token.
+    Raises RuntimeError (leftovers found or launchd uninspectable); run_once records it as an alert.
+    Checked only right before a launch so inspection-only outcomes never shell out.
+    """
+    from hermes_cli.forward_only_guard import refuse_if_forward_only_leftovers
+    refuse_if_forward_only_leftovers(home, timeout_for=lambda cap: _bounded_timeout(cap, deadline))
+
+
+def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
+         deadline: float | None = None) -> str:
     from hermes_cli.immutable_releases import _verify_transaction
+    deadline = deadline or time.monotonic() + STARTUP_SECONDS
     if intent_path(home).exists():
         return "stopped"
     if not plist.is_file():
@@ -215,15 +272,15 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     switch_state, switch = _switch(home, grace=grace)
     if switch_state == "waiting":
         return "waiting"
-    domain = _gateway_domain(label, domain)
-    state = _launch_state(domain, label)
-    if state == "loaded" and healthy(home, label, current):
+    domain = _gateway_domain(label, domain, deadline=deadline)
+    state = _launch_state(domain, label, deadline=deadline)
+    if state == "loaded" and healthy(home, label, current, deadline):
         pending = home / "release-txn.json"
         if pending.exists():
-            record = json.loads(pending.read_text(encoding="utf-8"))
+            record = json.loads(pending.read_text(encoding="utf-8-sig"))
             if record.get("operation") in {"rollback", "first-migration-rollback"}:
                 from hermes_cli.immutable_releases import acknowledge_running_release
-                acknowledge_running_release(home)
+                acknowledge_running_release(home, probe_timeout=_bounded_timeout(10, deadline))
         return "healthy"
     if switch:
         old = Path(switch["previous_intended"])
@@ -236,8 +293,9 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         if _repair_count(home) >= MAX_REPAIRS:
             receipt(home, "rollback", "capped", candidate=str(current))
             return "capped"
+        _refuse_leftovers_before_launch(home, deadline)
         receipt(home, "rollback", "attempt", candidate=str(current), previous=str(old))
-        ok = rollback_switch(home, plist, label, old, domain=domain)
+        ok = rollback_switch(home, plist, label, old, domain=domain, deadline=deadline)
         receipt(home, "rollback", "rolled_back" if ok else "failed", candidate=str(current), previous=str(old))
         return "rolled_back" if ok else "failed"
     if state == "loaded":
@@ -245,14 +303,25 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     if _repair_count(home) >= MAX_REPAIRS:
         receipt(home, "bootstrap", "capped", label=label)
         return "capped"
+    _refuse_leftovers_before_launch(home, deadline)
     receipt(home, "bootstrap", "attempt", label=label)
-    subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=10)
-    deadline = time.monotonic() + 12
+    if state == "parked":
+        # Deliberate stops short-circuit above via the stopped intent, so a parked job here
+        # is an unintended clean exit. Bootstrap would fail on a still-loaded label: boot it
+        # out first and prove it unloaded. MAX_REPAIRS bounds a config-fatal relaunch loop.
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
+                       timeout=_bounded_timeout(10, deadline))
+        if _launch_state(domain, label, deadline=deadline) != "unloaded":
+            receipt(home, "bootstrap", "failed", label=label, reason="parked label bootout did not read back unloaded")
+            return "failed"
+    subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True,
+                   timeout=_bounded_timeout(10, deadline))
+    deadline = deadline or time.monotonic() + 12
     while time.monotonic() < deadline:
-        if _launch_state(domain, label) == "loaded" and healthy(home, label, current):
+        if _launch_state(domain, label, deadline=deadline) == "loaded" and healthy(home, label, current, deadline):
             receipt(home, "bootstrap", "repaired", label=label, release=str(current))
             return "repaired"
-        time.sleep(.25)
+        _sleep_within(.25, deadline)
     receipt(home, "bootstrap", "failed", label=label, reason="gateway not healthy after bootstrap")
     return "failed"
 
@@ -262,7 +331,7 @@ def _repair_count(home: Path) -> int:
     count = 0
     for path in (home / "logs/guardian").glob("*.json"):
         try:
-            row = json.loads(path.read_text(encoding="utf-8"))
+            row = json.loads(path.read_text(encoding="utf-8-sig"))
             if row.get("action") in {"bootstrap", "rollback"} and row.get("outcome") == "attempt" and datetime.fromisoformat(row["at"]).timestamp() > cutoff:
                 count += 1
         except (OSError, ValueError, KeyError):
@@ -282,43 +351,15 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
         except BlockingIOError:
             return "locked"
         try:
+            # Stopped intent is authoritative and must short-circuit config loading: a
+            # deliberately parked gateway stays parked even if config is now malformed.
+            if intent_path(home).exists():
+                return "stopped"
             from hermes_cli.config import _validate_updates
-            from hermes_cli.config_effective import load_user_config_effective
-            config: dict[str, Any]
             if grace is None:
+                from hermes_cli.config_effective import load_user_config_effective
                 config = load_user_config_effective(home / "config.yaml", fail_closed=True)
             else:
-                config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
-                # Explicit grace historically needs no config load. Only inspect the
-                # opt-in marker when present; a malformed unrelated config cannot alert.
-                config_path = home / "config.yaml"
-                try:
-                    flag_text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
-                except (OSError, UnicodeError):
-                    return "waiting"  # Unreadable flag cannot authorize legacy repair.
-                if "overlap_handover" in flag_text:
-                    try:
-                        flag_config = yaml.safe_load(flag_text) or {}
-                    except yaml.YAMLError as exc:
-                        receipt(home, "inspect", "alert", reason=str(exc))
-                        return "alert"
-                    if not isinstance(flag_config, dict):
-                        receipt(home, "inspect", "alert", reason="overlap_handover config must be a mapping")
-                        return "alert"
-                    raw_gateway = flag_config.get("gateway") or {}
-                    overlap = raw_gateway.get("overlap_handover") if isinstance(raw_gateway, dict) else None
-                    if overlap is not None and (not isinstance(overlap, dict) or
-                                                overlap.get("enabled") is not False):
-                        return "waiting"
-                    config["gateway"] = raw_gateway
-            # The legacy guardian only knows one launchd label. Until overlap repair has
-            # its own fenced protocol, it must not bootstrap or roll back either generation.
-            gateway_config = config.get("gateway") or {}
-            if (isinstance(gateway_config, dict) and
-                    isinstance(gateway_config.get("overlap_handover"), dict) and
-                    gateway_config["overlap_handover"].get("enabled") is True):
-                return "waiting"
-            if grace is not None:
                 config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
             updates = config.get("updates")
             if updates is not None and not isinstance(updates, dict):
@@ -369,11 +410,6 @@ def cli(argv: list[str] | None = None) -> int:
     path = Path(pwd.getpwuid(getattr(os, 'getuid')()).pw_dir) / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
     if args.action == "status":
         print(f"enabled={enabled(home)} installed={path.is_file()} intent_stopped={intent_path(home).exists()}")
-        from hermes_cli.gateway_generation_status import read_generation_status
-        for row in read_generation_status(home):
-            lease = ", ".join(row["leases"]) or "none"
-            print(f"generation={row['id']} sha={row['release_sha']} label={row['label']} "
-                  f"pid={row['pid']} lease={lease} state={row['state']}")
         return 0
     if args.action == "uninstall":
         subprocess.run(["launchctl", "bootout", f"{args.domain}/{GUARDIAN_LABEL}"], capture_output=True, timeout=10)

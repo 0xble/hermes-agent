@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
@@ -19,8 +20,40 @@ logger = logging.getLogger(__name__)
 MIN_INTERVAL_SECONDS = 60  # floor: re-entering more often than once a minute is a busy-loop, not a heartbeat
 POLL_SECONDS = 5.0  # how often drivers poll for due heartbeats; not user-facing
 
+HEARTBEAT_PROMPT_PREFIX = "[Heartbeat — recurring instruction, fires every "
+# Canonical successful no-op reply for gateway-authored recurring checks. The gateway recognizes
+# this exact marker and suppresses it on machinery turns while retaining the turn in history.
+SILENCE_MARKER = "[SILENT]"
+_SILENCE_RESPONSE_MARKERS = frozenset({
+    "[SILENT]", "SILENT", "NO_REPLY", "NO REPLY",
+    "[静默]", "静默", "[沉默]", "沉默",
+})
+
+
+def is_intentional_silence_response(response: Any) -> bool:
+    """Return True only for a complete autonomous no-reply marker."""
+    if not isinstance(response, str) or not 0 < len(response.strip()) <= 64:
+        return False
+    candidates = [response.strip()]
+    depunctuated = candidates[0]
+    while depunctuated and unicodedata.category(depunctuated[0]).startswith("P") and depunctuated[0] not in "[]":
+        depunctuated = depunctuated[1:]
+    while depunctuated and unicodedata.category(depunctuated[-1]).startswith("P") and depunctuated[-1] not in "[]":
+        depunctuated = depunctuated[:-1]
+    if depunctuated != candidates[0]:
+        candidates.append(depunctuated.strip())
+    return any(" ".join(candidate.upper().split()) in _SILENCE_RESPONSE_MARKERS for candidate in candidates)
+
+
 HEARTBEAT_PROMPT_TEMPLATE = (
-    "[Heartbeat — recurring instruction, fires every {interval}]\n{prompt}\n\n"
+    f"{HEARTBEAT_PROMPT_PREFIX}{{interval}}]\n{{prompt}}\n\n"
+    "If there is nothing meaningful to do or report for this instruction "
+    f"right now, reply with exactly {SILENCE_MARKER} and nothing else — do not invent work."
+)
+# Wording before the silence contract. Stored rows still carry it, so the generated-turn
+# classifier (agent/synthetic_prompt.py) keeps recognizing it; never render it.
+_PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE = (
+    f"{HEARTBEAT_PROMPT_PREFIX}{{interval}}]\n{{prompt}}\n\n"
     "If there is nothing meaningful to do or report for this instruction "
     "right now, reply briefly that nothing has changed and stop — do not invent work."
 )
@@ -76,7 +109,7 @@ class HeartbeatState:
         return json.dumps(asdict(self), ensure_ascii=False)
 
     @classmethod
-    def from_json(cls, raw: str) -> "HeartbeatState":
+    def from_json(cls, raw: str) -> HeartbeatState:
         data = json.loads(raw)
         return cls(**{name: coerce(data.get(name) or default) for name, (coerce, default) in _STATE_FIELDS.items()})
 
@@ -267,14 +300,14 @@ def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bo
 
 
 __all__ = [
-    "HeartbeatState", "HeartbeatManager", "parse_interval", "format_interval", "load_heartbeat", "save_heartbeat",
-    "migrate_heartbeat_to_session", "HEARTBEAT_PROMPT_TEMPLATE", "MIN_INTERVAL_SECONDS", "POLL_SECONDS",
+    "HEARTBEAT_PROMPT_TEMPLATE",
+    "MIN_INTERVAL_SECONDS",
+    "POLL_SECONDS",
+    "HeartbeatManager",
+    "HeartbeatState",
+    "format_interval",
+    "load_heartbeat",
+    "migrate_heartbeat_to_session",
+    "parse_interval",
+    "save_heartbeat",
 ]
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import Dict  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----

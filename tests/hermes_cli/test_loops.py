@@ -24,10 +24,16 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     from hermes_cli import goals
+    from hermes_state_registry import close_all_under
 
+    # These tests own fresh temporary DB files, never live process-held generations.
+    # Enumerating every host FD on each open/close dominates the loop tests on macOS;
+    # native retired-WAL detection is exercised by the hermes_state tests instead.
+    monkeypatch.setattr("hermes_state_dbfile._iter_darwin_fd_targets", lambda: iter(()))
     goals._DB_CACHE.clear()
     yield home
     goals._DB_CACHE.clear()
+    close_all_under(home)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -343,6 +349,58 @@ class TestTickLifecycle:
         assert mgr.is_due() is False  # can't double-fire mid-turn
         assert mgr.fire_tick() is None
 
+    def test_wakeup_prompt_allows_quiet_no_change_reply(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="t3-prompt")
+        mgr.set("check the queue", interval_seconds=300)
+        wakeup = mgr.fire_tick()
+        assert wakeup is not None
+        assert "the /loop the user set" not in wakeup
+        assert "reply with exactly [SILENT] and nothing else" in wakeup
+        # No-change, acknowledgement and "still waiting" ticks must stay silent, and the old
+        # report-every-tick instruction must be gone (it overrode the silence contract).
+        assert "plain acknowledgements" in wakeup
+        assert '"still waiting"' in wakeup
+        assert "one or two short lines" in wakeup
+        assert "Report concisely what you found" not in wakeup
+
+    def test_loop_reply_rules_keep_goal_silence_but_not_goal_evidence(self, hermes_home):
+        """Loop wakeups share the goal contract's no-change silence paragraph verbatim, but a
+        visible loop reply, including the completing one, stays one or two short lines with no
+        Evidence section. Goal continuations keep their own done-with-evidence wording."""
+        from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE, _AUTONOMOUS_REPLY_RULES
+        from hermes_cli.loops import WAKEUP_PROMPT_TEMPLATE, WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE
+
+        silence = _AUTONOMOUS_REPLY_RULES.split("\n", 1)[0]
+        assert "The FIRST time you claim the goal is done, include an Evidence section" in CONTINUATION_PROMPT_TEMPLATE
+        for template in (WAKEUP_PROMPT_TEMPLATE, WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE):
+            assert silence + "\n" in template
+            assert "Evidence section)" not in template
+            assert "with the evidence" not in template
+            assert "No Evidence section" in template
+            assert "say so in the same one or two short lines, then put LOOP_COMPLETE on its own line" in template
+
+    def test_every_stored_wakeup_wording_is_still_a_quiet_wakeup(self, hermes_home):
+        import hermes_cli.loops as loops
+
+        fields = {"tick": 3, "cadence": ", every 5m", "prompt": "check CI", "until": "CI is green"}
+        for name in ("_ORIGINAL_WAKEUP_PROMPT_TEMPLATE", "_PREVIOUS_WAKEUP_PROMPT_TEMPLATE",
+                     "_SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE", "_GOAL_RULES_WAKEUP_PROMPT_TEMPLATE"):
+            for suffix in ("", "_WITH_UNTIL"):
+                template = getattr(loops, name.replace("_PROMPT_TEMPLATE", f"_PROMPT{suffix}_TEMPLATE"))
+                assert loops.is_quiet_wakeup_prompt(template.format(**fields)), name + suffix
+
+    def test_until_wakeup_prompt_no_longer_demands_evidence_every_tick(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="t3-until-prompt")
+        mgr.set("watch the queue", interval_seconds=300, until="queue is empty")
+        wakeup = mgr.fire_tick()
+        assert "Stop condition: queue is empty" in wakeup
+        assert "reply with exactly [SILENT] and nothing else" in wakeup
+        assert "show concrete evidence of the stop condition's status" not in wakeup
+
     def test_slash_prompt_returned_raw(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
@@ -351,7 +409,7 @@ class TestTickLifecycle:
         state.next_due_at = time.time() - 1
         assert mgr.fire_tick() == "/recap"
 
-    def test_abandon_tick_rolls_back(self, hermes_home):
+    def test_abandon_tick_skips_without_refund(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t5")
@@ -360,7 +418,8 @@ class TestTickLifecycle:
         mgr.fire_tick()
         mgr.abandon_tick()
         assert mgr.state.awaiting_response is False
-        assert mgr.state.ticks_fired == 0
+        assert mgr.state.status == "active"
+        assert mgr.state.ticks_fired == 1
 
     def test_complete_tick_marker_stops(self, hermes_home):
         from hermes_cli.loops import LoopManager
@@ -410,6 +469,311 @@ class TestTickLifecycle:
         assert decision["stopped"] is True
         assert decision["status"] == "paused"
 
+    @pytest.mark.parametrize("change, expected", [
+        ("pause", "paused"),
+        ("clear", "cleared"),
+        ("stop_then_set", "active"),
+    ])
+    @pytest.mark.parametrize("response", ["still building", "The deploy is live.\nLOOP_COMPLETE"])
+    def test_change_during_tick_survives_completion(self, hermes_home, change, expected, response):
+        """A pause, stop or re-set that lands mid-tick is never overwritten by the tick's outcome."""
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-mid")
+        state = mgr.set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        other = LoopManager(session_id="t-mid")
+        if change == "pause":
+            other.pause("paused from another session")
+        elif change == "clear":
+            other.clear()
+        else:
+            other.clear()
+            time.sleep(0.01)
+            LoopManager(session_id="t-mid").set("a different task", interval_seconds=600)
+        decision = mgr.complete_tick(response)
+        stored = load_loop("t-mid")
+        assert stored.status == expected
+        assert decision["stopped"] is False
+        if change == "stop_then_set":
+            assert stored.prompt == "a different task"
+            assert stored.awaiting_response is False
+
+    @pytest.mark.parametrize("change, expected", [
+        ("pause", "paused"),
+        ("clear", "cleared"),
+        ("stop_then_set", "active"),
+    ])
+    def test_change_before_fire_is_not_resurrected(self, hermes_home, change, expected):
+        """A scheduler's preloaded manager cannot fire a loop paused, stopped or re-set since load."""
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        state = LoopManager(session_id="t-pre").set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        save_loop("t-pre", state)
+        scheduler = LoopManager(session_id="t-pre")
+        assert scheduler.is_due()
+        other = LoopManager(session_id="t-pre")
+        if change == "pause":
+            other.pause("paused from another session")
+        elif change == "clear":
+            other.clear()
+        else:
+            other.clear()
+            time.sleep(0.01)
+            LoopManager(session_id="t-pre").set("a different task", interval_seconds=600)
+        assert scheduler.fire_tick() is None
+        stored = load_loop("t-pre")
+        assert stored.status == expected
+        assert stored.awaiting_response is False
+        assert stored.ticks_fired == 0
+        if change == "stop_then_set":
+            assert stored.prompt == "a different task"
+
+    def test_revise_before_fire_fires_the_revised_prompt(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        state = LoopManager(session_id="t-prerev").set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        save_loop("t-prerev", state)
+        scheduler = LoopManager(session_id="t-prerev")
+        quote = "Please switch the loop to polling the revised target"
+        revised = LoopManager(session_id="t-prerev").revise(
+            reason="new target", prompt="poll the revised target",
+            user_quote="switch the loop to polling the revised target", user_messages=[quote])
+        assert revised["ok"] is True, revised
+        wakeup = scheduler.fire_tick()
+        assert wakeup and "poll the revised target" in wakeup
+        after = load_loop("t-prerev")
+        assert after.awaiting_response is True and after.ticks_fired == 1
+        assert after.prompt == "poll the revised target" and after.version == 2
+
+    def test_prompt_revision_resets_self_paced_delay(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-revise-backoff")
+        state = mgr.set("watch A")
+        state.current_delay = 4 * 60 * 60
+        state.backoff_level = 2
+        state.last_response_digest = "old"
+        state.next_due_at = time.time() + 4 * 60 * 60
+        mgr._save()
+        quote = "Please switch the loop to watching B"
+        result = LoopManager(session_id="t-revise-backoff").revise(
+            reason="new target", prompt="watch B", user_quote="switch the loop to watching B",
+            user_messages=[quote])
+        assert result["ok"] is True, result
+        revised = load_loop("t-revise-backoff")
+        assert revised.current_delay == 60
+        assert revised.backoff_level == 0
+        assert revised.last_response_digest == ""
+        assert revised.next_due_at <= time.time() + 60 + 1
+
+    def test_revise_after_fire_does_not_inherit_the_old_stop_verdict(self, hermes_home):
+        """LOOP_COMPLETE answering prompt A cannot finish the loop after it was revised to B."""
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-oldv")
+        state = mgr.set("poll prompt A", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        assert mgr.fire_tick()
+        revised = LoopManager(session_id="t-oldv").revise(
+            reason="new target", prompt="poll prompt B",
+            user_quote="switch the loop to polling prompt B",
+            user_messages=["Please switch the loop to polling prompt B now"])
+        assert revised["ok"] is True, revised
+        decision = mgr.complete_tick("All done.\nLOOP_COMPLETE")
+        stored = load_loop("t-oldv")
+        assert decision["stopped"] is False
+        assert stored.status == "active" and stored.prompt == "poll prompt B"
+        assert stored.awaiting_response is False
+
+    def test_old_manager_completion_cannot_settle_a_new_instance_tick(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop
+
+        old = LoopManager(session_id="t-newi")
+        state = old.set("old task", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        assert old.fire_tick()
+        LoopManager(session_id="t-newi").clear()
+        time.sleep(0.01)
+        fresh = LoopManager(session_id="t-newi")
+        new_state = fresh.set("new task", interval_seconds=300)
+        new_state.next_due_at = time.time() - 1
+        assert fresh.fire_tick()
+        decision = old.complete_tick("All done.\nLOOP_COMPLETE")
+        stored = load_loop("t-newi")
+        assert decision["stopped"] is False
+        assert stored.status == "active" and stored.prompt == "new task"
+        assert stored.awaiting_response is True
+
+    def test_cadence_revise_before_fire_postpones_the_tick(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        state = LoopManager(session_id="t-cad").set("poll", interval_seconds=30)
+        state.next_due_at = time.time() - 1
+        save_loop("t-cad", state)
+        scheduler = LoopManager(session_id="t-cad")
+        assert scheduler.is_due()
+        revised = LoopManager(session_id="t-cad").revise(
+            reason="slow down", interval_seconds=900,
+            user_quote="slow the loop down to every fifteen minutes",
+            user_messages=["Please slow the loop down to every fifteen minutes"])
+        assert revised["ok"] is True, revised
+        assert load_loop("t-cad").next_due_at > time.time() + 60
+        assert scheduler.fire_tick() is None
+        stored = load_loop("t-cad")
+        assert stored.ticks_fired == 0 and stored.awaiting_response is False
+
+    def test_resume_since_load_postpones_a_stale_scheduler(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        state = LoopManager(session_id="t-pr").set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        save_loop("t-pr", state)
+        scheduler = LoopManager(session_id="t-pr")
+        assert scheduler.is_due()
+        LoopManager(session_id="t-pr").pause("hold on")
+        resumed = LoopManager(session_id="t-pr")
+        resumed.resume()
+        assert not LoopManager(session_id="t-pr").is_due()
+        assert scheduler.fire_tick() is None
+        stored = load_loop("t-pr")
+        assert stored.ticks_fired == 0 and stored.awaiting_response is False
+
+    def test_reset_under_a_frozen_clock_is_a_new_instance(self, hermes_home, monkeypatch):
+        """Clear-then-set at the same clock reading must not let the old scheduler or tick match."""
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        frozen = 1_800_000_000.0
+        monkeypatch.setattr(time, "time", lambda: frozen)
+        state = LoopManager(session_id="t-frz").set("old task", interval_seconds=300)
+        state.next_due_at = frozen - 1
+        save_loop("t-frz", state)
+        scheduler = LoopManager(session_id="t-frz")
+        inflight = LoopManager(session_id="t-frz")
+        assert inflight.fire_tick()
+        LoopManager(session_id="t-frz").clear()
+        fresh = LoopManager(session_id="t-frz").set("new task", interval_seconds=300)
+        assert fresh.created_at > state.created_at
+        fresh.next_due_at = frozen - 1
+        save_loop("t-frz", fresh)
+        assert scheduler.fire_tick() is None
+        decision = inflight.complete_tick("All done.\nLOOP_COMPLETE")
+        stored = load_loop("t-frz")
+        assert decision["stopped"] is False
+        assert stored.status == "active" and stored.prompt == "new task" and stored.ticks_fired == 0
+
+    @pytest.mark.parametrize("cap", ["times", "max_ticks"])
+    @pytest.mark.parametrize("response", ["check complete", "All done.\nLOOP_COMPLETE"])
+    def test_cadence_revise_mid_tick_does_not_lift_run_caps(self, hermes_home, cap, response):
+        """A revise changes the definition version but never grants extra runs."""
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        mgr = LoopManager(session_id="t-cap")
+        state = mgr.set("poll", interval_seconds=60, times=1 if cap == "times" else 0)
+        if cap == "max_ticks":
+            state.max_ticks = 1
+        state.next_due_at = time.time() - 1
+        save_loop("t-cap", state)
+        assert mgr.fire_tick()
+        revised = LoopManager(session_id="t-cap").revise(
+            reason="slow down", interval_seconds=120,
+            user_quote="slow the loop down to every two minutes",
+            user_messages=["Please slow the loop down to every two minutes"])
+        assert revised["ok"] is True, revised
+        decision = mgr.complete_tick(response)
+        stored = load_loop("t-cap")
+        expected = "done" if cap == "times" else "paused"
+        assert decision["stopped"] is True and stored.status == expected
+        assert stored.awaiting_response is False and stored.interval_seconds == 120
+
+    def test_revise_during_tick_survives_completion(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-rev")
+        state = mgr.set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        stored = load_loop("t-rev")
+        stored.revisions.append({"reason": "slow down"})
+        stored.interval_seconds = 900.0
+        from hermes_cli.loops import save_loop
+        save_loop("t-rev", stored)
+        mgr.complete_tick("still building")
+        after = load_loop("t-rev")
+        assert after.interval_seconds == 900.0
+        assert after.revisions == [{"reason": "slow down"}]
+        assert after.awaiting_response is False
+        assert after.current_delay == 900.0
+        later = LoopManager(session_id="t-rev")
+        assert later.is_due(time.time() + 901)
+        later.state.next_due_at = time.time() - 1
+        assert later.fire_tick() is not None
+
+    def test_revise_during_until_judge_keeps_loop_schedulable(self, hermes_home):
+        """A revise landing while the --until judge runs is kept and the tick still settles."""
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-judge")
+        state = mgr.set("poll", interval_seconds=300, until="the suite is green")
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+
+        def judge(*_args, **_kwargs):
+            LoopManager(session_id="t-judge").revise(reason="slow down", interval_seconds=900)
+            return ("continue", "not yet", False, None, False)
+
+        with patch("hermes_cli.goals.judge_goal", side_effect=judge):
+            decision = mgr.complete_tick("still red")
+        after = load_loop("t-judge")
+        assert decision["status"] == "active"
+        assert after.interval_seconds == 900.0
+        assert after.version == 2
+        assert after.awaiting_response is False
+        assert LoopManager(session_id="t-judge").is_due(time.time() + 86400)
+
+    @pytest.mark.parametrize("verdict", ["done", "blocked"])
+    def test_condition_revised_during_judge_discards_stale_verdict(self, hermes_home, verdict):
+        """A done/blocked verdict on the old condition must not end or pause the revised loop."""
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-cond")
+        state = mgr.set("poll", interval_seconds=300, until="the build finishes")
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+
+        def judge(*_args, **_kwargs):
+            quote = "watch the production deploy instead"
+            revised = LoopManager(session_id="t-cond").revise(
+                reason="watch the deploy instead", until="production deploy finishes",
+                user_quote=quote, user_messages=[quote])
+            assert revised["ok"] is True
+            return (verdict, "the build finished", False, None, False)
+
+        with patch("hermes_cli.goals.judge_goal", side_effect=judge):
+            decision = mgr.complete_tick("Build finished green.")
+        after = load_loop("t-cond")
+        assert decision["stopped"] is False
+        assert after.status == "active"
+        assert after.until == "production deploy finishes"
+        assert after.awaiting_response is False
+        assert LoopManager(session_id="t-cond").is_due(time.time() + 86400)
+
+    def test_abandon_after_external_pause_keeps_pause(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-ab")
+        state = mgr.set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        LoopManager(session_id="t-ab").pause("paused elsewhere")
+        mgr.abandon_tick()
+        stored = load_loop("t-ab")
+        assert stored.status == "paused"
+        assert stored.ticks_fired == 1
+
     def test_until_judge_done_stops(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
@@ -433,9 +797,9 @@ class TestTickLifecycle:
             decision = mgr.complete_tick("3 tests still failing")
         assert decision["stopped"] is False
 
-    def test_until_judge_blocked_pauses(self, hermes_home):
-        """An unachievable stop condition pauses the loop instead of spinning to the tick budget."""
-        from hermes_cli.loops import LoopManager
+    def test_until_judge_blocked_backoffs_but_stays_active(self, hermes_home):
+        """An unachievable stop condition backs off instead of pausing the loop."""
+        from hermes_cli.loops import LoopManager, _NO_PROGRESS_BACKOFF_S
 
         mgr = LoopManager(session_id="t11b")
         state = mgr.set("poll", interval_seconds=300, until="the deleted repo's CI is green")
@@ -443,9 +807,51 @@ class TestTickLifecycle:
         mgr.fire_tick()
         with patch("hermes_cli.goals.judge_goal", return_value=("blocked", "repo no longer exists", False, None, False)):
             decision = mgr.complete_tick("The repository was deleted; there is no CI to watch.")
-        assert decision["stopped"] is True
-        assert decision["status"] == "paused"
+        assert decision["stopped"] is False
+        assert decision["status"] == "active"
+        assert mgr.state is not None
+        assert mgr.state.status == "active"
+        assert mgr.state.next_due_at >= time.time() + max(300, _NO_PROGRESS_BACKOFF_S[0]) - 1
         assert "unachievable" in decision["message"]
+
+    def test_until_judge_blocked_honors_times_cap(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="t11b-cap-times")
+        state = mgr.set("poll", interval_seconds=300, until="the deleted repo's CI is green", times=1)
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        with patch("hermes_cli.goals.judge_goal", return_value=("blocked", "repo no longer exists", False, None, False)):
+            decision = mgr.complete_tick("The repository was deleted; there is no CI to watch.")
+        assert decision["stopped"] is True
+        assert decision["status"] == "done"
+
+    def test_until_judge_blocked_honors_max_ticks_cap(self, hermes_home, monkeypatch):
+        from hermes_cli.loops import LoopManager
+
+        monkeypatch.setattr("hermes_cli.loops.max_ticks_default", lambda: 1)
+        mgr = LoopManager(session_id="t11b-cap-max")
+        state = mgr.set("poll", interval_seconds=300, until="the deleted repo's CI is green")
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        with patch("hermes_cli.goals.judge_goal", return_value=("blocked", "repo no longer exists", False, None, False)):
+            decision = mgr.complete_tick("The repository was deleted; there is no CI to watch.")
+        assert decision["stopped"] is True
+        assert decision["status"] in {"done", "paused"}
+
+    def test_until_judge_is_not_called_for_a_silent_tick(self, hermes_home):
+        """A bare [SILENT] is the wakeup prompt's no-change reply: no evidence, so no model call."""
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="t11c")
+        state = mgr.set("poll", interval_seconds=300, until="the suite is green")
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        with patch("hermes_cli.goals.judge_goal", side_effect=AssertionError("judge called")) as judge:
+            decision = mgr.complete_tick("[SILENT]")
+        judge.assert_not_called()
+        assert decision["stopped"] is False
+        assert decision["status"] == "active"
 
     def test_until_judge_error_fails_open(self, hermes_home):
         from hermes_cli.loops import LoopManager
@@ -460,7 +866,24 @@ class TestTickLifecycle:
 
 
 class TestSelfPacedBackoff:
-    def test_backoff_doubles_on_unchanged_and_resets_on_change(self, hermes_home):
+    def test_superseded_self_paced_release_uses_floor_when_delay_missing(self, hermes_home):
+        from copy import deepcopy
+        from hermes_cli.loops import LoopManager, _get_session_db, self_paced_floor_seconds
+        from hermes_cli.loops_snapshot import _release_superseded_tick
+
+        mgr = LoopManager(session_id="sp-superseded-floor")
+        mgr.set("watch the queue")
+        mgr.fire_tick()
+        mgr.state.current_delay = 0.0
+        mgr.state.interval_seconds = 0.0
+        mgr._save()
+        original = deepcopy(mgr.state)
+        before = time.time()
+        _release_superseded_tick(mgr, original, _get_session_db())
+        assert mgr.state.awaiting_response is False
+        assert mgr.state.next_due_at >= before + self_paced_floor_seconds()
+
+    def test_backoff_uses_shared_ladder_and_resets_on_change(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="sp1")
@@ -474,23 +897,116 @@ class TestSelfPacedBackoff:
         mgr.complete_tick("queue depth is 5")
         assert mgr.state.current_delay == floor
 
-        # Tick 2: same response → backoff doubles.
+        # Tick 2: same response → first shared no-progress step (15m).
         mgr.state.next_due_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 5")
-        assert mgr.state.current_delay == floor * 2
+        assert mgr.state.current_delay == 15 * 60
 
-        # Tick 3: same again → doubles again.
+        # Tick 3: same again → 1h.
         mgr.state.next_due_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 5")
-        assert mgr.state.current_delay == floor * 4
+        assert mgr.state.current_delay == 60 * 60
 
-        # Tick 4: changed response → snaps back to floor.
+        # Tick 4: same again → 4h.
+        mgr.state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        mgr.complete_tick("queue depth is 5")
+        assert mgr.state.current_delay == 4 * 60 * 60
+
+        # Tick 5: same again → 24h cap.
+        mgr.state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        mgr.complete_tick("queue depth is 5")
+        assert mgr.state.current_delay == 24 * 60 * 60
+
+        # Tick 6: changed response → snaps back to floor.
         mgr.state.next_due_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 2 — draining")
         assert mgr.state.current_delay == floor
+
+    def test_external_event_makes_one_delayed_tick_due_without_duplicates(self, hermes_home):
+        from hermes_cli.loops import LoopManager, wake_loop_for_external_event
+
+        mgr = LoopManager(session_id="external-wake")
+        state = mgr.set("watch the queue")
+        state.next_due_at = time.time() + 60 * 60
+        state.backoff_level = 3
+        mgr._save()
+        assert wake_loop_for_external_event("external-wake") is True
+        assert wake_loop_for_external_event("external-wake") is False
+        fresh = LoopManager(session_id="external-wake")
+        assert fresh.is_due()
+        assert fresh.state is not None and fresh.state.backoff_level == 0
+        assert fresh.fire_tick() is not None
+        assert fresh.fire_tick() is None
+        assert wake_loop_for_external_event("external-wake") is False
+        fresh.complete_tick("changed evidence")
+        assert fresh.state is not None
+        fresh.state.last_fired_at = time.time() - 61
+        fresh.state.next_due_at = time.time() + 60 * 60
+        fresh._save()
+        assert wake_loop_for_external_event("external-wake") is True
+
+    def test_external_wake_state_survives_reload(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop, wake_loop_for_external_event
+
+        mgr = LoopManager(session_id="external-wake-reload")
+        state = mgr.set("watch the queue")
+        state.next_due_at = time.time() + 3600
+        mgr._save()
+        assert wake_loop_for_external_event("external-wake-reload") is True
+        saved = load_loop("external-wake-reload")
+        assert saved is not None
+        assert saved.last_external_wake_tick == saved.ticks_fired == 0
+        assert saved.backoff_level == 0
+
+    def test_external_event_resets_blocked_until_ladder_for_interval_loops(self, hermes_home):
+        from hermes_cli.loops import LoopManager, wake_loop_for_external_event
+
+        mgr = LoopManager(session_id="external-interval-wake")
+        state = mgr.set("watch the queue", interval_seconds=300, until="queue is empty")
+        state.next_due_at = time.time() + 60 * 60
+        state.backoff_level = 3
+        state.last_response_digest = "old"
+        mgr._save()
+        assert wake_loop_for_external_event("external-interval-wake") is True
+        fresh = LoopManager(session_id="external-interval-wake")
+        assert fresh.state is not None
+        assert fresh.state.backoff_level == 0
+        assert fresh.state.last_response_digest == ""
+        assert fresh.state.current_delay == 300
+
+    def test_backoff_treats_consecutive_silent_wakeups_as_unchanged(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="sp-silent")
+        state = mgr.set("watch the queue")
+        floor = state.current_delay
+
+        for _ in range(2):
+            mgr.state.next_due_at = time.time() - 1
+            mgr.fire_tick()
+            mgr.complete_tick("[SILENT]")
+
+        assert mgr.state.current_delay == 15 * 60
+
+    def test_backoff_treats_every_silence_marker_form_as_unchanged(self, hermes_home):
+        """The digest uses the judge skip's marker set, so NO_REPLY and '[SILENT].' back off too."""
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="sp-silent-forms")
+        state = mgr.set("watch the queue")
+        floor = state.current_delay
+
+        for reply in ("[SILENT]", "NO_REPLY", "[SILENT].", " no reply ", "NO_REPLY"):
+            mgr.state.next_due_at = time.time() - 1
+            mgr.fire_tick()
+            mgr.complete_tick(reply)
+
+        assert mgr.state.current_delay == 24 * 60 * 60
 
     def test_timestamp_only_changes_do_not_reset(self, hermes_home):
         from hermes_cli.loops import LoopManager
@@ -504,7 +1020,7 @@ class TestSelfPacedBackoff:
         mgr.state.next_due_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("Still building. Checked at 14:07:33")
-        assert mgr.state.current_delay == floor * 2  # digest ignored the clock
+        assert mgr.state.current_delay == 15 * 60  # digest ignored the clock
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -521,16 +1037,24 @@ class TestControls:
         assert state.interval_seconds >= min_interval_seconds()
 
     def test_pause_resume(self, hermes_home):
-        from hermes_cli.loops import LoopManager
+        from hermes_cli.loops import LoopManager, self_paced_floor_seconds
 
         mgr = LoopManager(session_id="c2")
-        state = mgr.set("poll", interval_seconds=300)
+        state = mgr.set("poll")
         state.next_due_at = time.time() - 1
         mgr.pause()
         assert mgr.is_active() is False
         assert mgr.is_due() is False
+        assert mgr.state is not None
+        mgr.state.backoff_level = 3
+        mgr.state.current_delay = 4 * 60 * 60
+        mgr.state.last_response_digest = "old"
+        mgr._save()
         mgr.resume()
         assert mgr.is_active() is True
+        assert mgr.state.backoff_level == 0
+        assert mgr.state.current_delay == self_paced_floor_seconds()
+        assert mgr.state.last_response_digest == ""
 
     def test_paused_mid_tick_clears_awaiting(self, hermes_home):
         from hermes_cli.loops import LoopManager
@@ -541,6 +1065,33 @@ class TestControls:
         mgr.fire_tick()
         mgr.pause(reason="user-interrupted")
         assert mgr.state.awaiting_response is False
+
+    def test_control_fence_is_assigned_by_the_save_chokepoint(self, hermes_home):
+        """Every control bumps the stored fence; a definition-only revise and the tick's own
+        claim/start do not; a stale cached copy can never write an older fence back."""
+        from hermes_cli.loops import LoopManager, load_loop, loop_control_generation
+
+        mgr = LoopManager(session_id="c4")
+        mgr.set("poll", interval_seconds=300)
+        gens = [load_loop("c4").control_generation]
+        stale = LoopManager(session_id="c4")
+        for control in (lambda m: m.pause(), lambda m: m.resume(), lambda m: m.clear()):
+            control(LoopManager(session_id="c4"))
+            gens.append(load_loop("c4").control_generation)
+        assert gens == sorted(set(gens)), gens
+        stale.state.status = "active"
+        stale._save()  # stale whole-row saves must not revive a newer clear or advance its fence
+        assert load_loop("c4").status == "cleared"
+        assert load_loop("c4").control_generation == gens[-1]
+        assert loop_control_generation("c4", default=None) is None  # retired: sync fence fails closed
+
+        fresh = LoopManager(session_id="c5")
+        fresh.set("poll", interval_seconds=300)
+        before = load_loop("c5").control_generation
+        assert fresh.fire_tick()
+        assert fresh.state.claim_phase == "started"
+        assert fresh.revise(reason="slower", interval_seconds=600)["ok"]
+        assert load_loop("c5").control_generation == before
 
 
 
@@ -587,6 +1138,34 @@ class TestGoalMixing:
 
 
 class TestDispatchLoopCommand:
+
+    @pytest.mark.parametrize("goal_status", ["active", "waiting", "paused", "done", "absent"])
+    def test_set_warning_matches_goal_deferral(self, hermes_home, goal_status):
+        from hermes_cli.goals import GoalManager
+        from hermes_cli.loops import LoopManager, dispatch_loop_command, goal_blocks_loop_tick, load_loop
+
+        goal = GoalManager(session_id="d-goal")
+        if goal_status != "absent":
+            goal.set("ship the release")
+        if goal_status == "waiting":
+            goal.wait_for_seconds(3600, reason="waiting on CI")
+        elif goal_status == "paused":
+            goal.pause()
+        elif goal_status == "done":
+            goal.mark_done("release shipped")
+        result = dispatch_loop_command(LoopManager(session_id="d-goal"), "5m check CI")
+        stored = load_loop("d-goal")
+        assert result["created"] is True
+        assert stored is not None
+        assert goal_blocks_loop_tick("d-goal") is (goal_status == "active")
+        if goal_status == "active":
+            assert "loop ticks defer now" in result["output"]
+            assert "only while the goal is actively taking turns" in result["output"]
+            assert "parked/waiting, paused, or done" in result["output"]
+            assert stored.goal_warning and stored.goal_warning in result["output"]
+        else:
+            assert stored.goal_warning is None
+            assert "loop ticks defer" not in result["output"]
 
     def test_create_self_paced(self, hermes_home):
         from hermes_cli.loops import LoopManager, dispatch_loop_command

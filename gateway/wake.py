@@ -39,6 +39,10 @@ class WakeNotAccepted(RuntimeError):
     """No adapter admission: retry without treating a healthy chat as dead."""
 
 
+class WakeSuperseded(WakeNotAccepted):
+    """The control's saved goal definition no longer authorizes this continuation."""
+
+
 def session_owned_by_profile(config: Any, profile: Optional[str], session_id: Any) -> bool:
     """True when a stateless (``api_server``) destination's raw session id is canonically owned by
     served *profile*'s own session store.
@@ -83,6 +87,18 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
     not model execution, authorization of a later turn, or successful outbound delivery.
     """
     event._gateway_accepted = False
+    metadata = getattr(event, "metadata", None)
+    from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
+    if is_gateway_wake(event) and not await asyncio.to_thread(internal_wake_is_current, event):
+        raise WakeSuperseded("goal continuation or loop tick superseded before admission")
+    # Last strict-pin check before admission: an idle adapter admits without awaiting again, so a
+    # /new or /resume rebind after the caller's lookup would otherwise be acknowledged here and
+    # only dropped at execution. Resolved on the runner's class so test doubles are not awaited.
+    runner = getattr(adapter, "gateway_runner", None)
+    pin_holds = getattr(type(runner), "_strict_session_pin_holds", None)
+    if (isinstance(metadata, dict) and metadata.get("gateway_session_strict") and pin_holds is not None
+            and not await pin_holds(runner, event)):
+        raise WakeNotAccepted("pinned session no longer owns its key")
     await adapter.handle_message(event)
     if event._gateway_accepted is not True:
         raise WakeNotAccepted("internal wake not accepted by adapter")
@@ -247,7 +263,7 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
                     await resp.read()
                     logger.info("wake self-post delivered for session %s (attempt %d)", session_id, attempt + 1)
                     return
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        except (TimeoutError, aiohttp.ClientError, OSError) as exc:
             last_err = exc
             logger.warning("wake self-post transient failure for session %s (attempt %d/%d): %s",
                            session_id, attempt + 1, attempts, exc)

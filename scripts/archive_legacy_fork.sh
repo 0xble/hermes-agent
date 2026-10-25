@@ -5,7 +5,8 @@
 # tracking refs, stashes, and the unmerged upstream-PR branches such as #106906 and #106101),
 # plus a manifest of ref -> SHA and a list of dirty or untracked paths that a bundle cannot
 # carry. Verifies the bundle with `git bundle verify` and proves it restores by cloning it into
-# a scratch directory and comparing ref counts. Never modifies the legacy checkout.
+# a scratch directory and comparing exact refs and every stash commit, including
+# reflog-only stashes. Never modifies the legacy checkout.
 #
 # Usage: archive_legacy_fork.sh --legacy <checkout> --out <dir>
 set -euo pipefail
@@ -28,9 +29,9 @@ echo "legacy HEAD: $head"
 
 # 1. Everything a bundle can carry.
 git -C "$legacy" for-each-ref --format='%(refname) %(objectname)' > "$dir/refs.txt"
-git -C "$legacy" stash list --format='%H %gs' > "$dir/stashes.txt" || true
+git -C "$legacy" stash list --format='%H %gs' > "$dir/stashes.txt"
 git -C "$legacy" worktree list --porcelain > "$dir/worktrees.txt"
-git -C "$legacy" bundle create "$dir/legacy-fork.bundle" --all 2>&1 | tail -1
+git -C "$legacy" bundle create "$dir/legacy-fork.bundle" --all --reflog 2>&1 | tail -1
 git -C "$legacy" bundle verify "$dir/legacy-fork.bundle" 2>&1 | tail -1
 
 # 2. Everything a bundle cannot: uncommitted work, per worktree.
@@ -47,11 +48,21 @@ uncommitted_lines="$(grep -vc '^#' "$dir/uncommitted.txt" || true)"
 
 # 3. Restore rehearsal: clone the bundle and compare.
 scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
 git clone --quiet --mirror "$dir/legacy-fork.bundle" "$scratch/restore.git"
 restored_refs="$(git -C "$scratch/restore.git" for-each-ref | wc -l | tr -d ' ')"
 bundle_refs="$(git -C "$legacy" bundle list-heads "$dir/legacy-fork.bundle" | wc -l | tr -d ' ')"
-git -C "$scratch/restore.git" cat-file -e "$head" && restored_head=yes || restored_head=no
-rm -rf "$scratch"
+git -C "$scratch/restore.git" cat-file -e "$head^{commit}" || { echo "Restored HEAD is missing" >&2; exit 1; }
+restored_head=yes
+while read -r ref sha; do
+  actual="$(git -C "$scratch/restore.git" rev-parse --verify "$ref")"
+  [[ "$actual" == "$sha" ]] || { echo "Restored ref mismatch: $ref" >&2; exit 1; }
+done < "$dir/refs.txt"
+while read -r sha _subject; do
+  git -C "$scratch/restore.git" cat-file -e "$sha^{commit}" || {
+    echo "Restored stash is missing: $sha" >&2; exit 1;
+  }
+done < "$dir/stashes.txt"
 
 shasum -a 256 "$dir/legacy-fork.bundle" > "$dir/legacy-fork.bundle.sha256"
 cat > "$dir/MANIFEST.md" <<EOF
@@ -63,7 +74,7 @@ cat > "$dir/MANIFEST.md" <<EOF
 - Refs in bundle: $bundle_refs
 - Refs after restore rehearsal: $restored_refs
 - HEAD present after restore: $restored_head
-- Stash entries: $(wc -l < "$dir/stashes.txt" | tr -d ' ') (listed in stashes.txt; stashes are refs and ARE in the bundle)
+- Stash entries: $(wc -l < "$dir/stashes.txt" | tr -d ' ') (including reflog-only entries, each commit verified after restore)
 - Uncommitted or untracked paths not carried by the bundle: $uncommitted_lines (see uncommitted.txt; preserve these by hand before any cleanup)
 - Bundle SHA-256: $(cut -d' ' -f1 "$dir/legacy-fork.bundle.sha256")
 

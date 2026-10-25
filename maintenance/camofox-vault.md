@@ -3,21 +3,25 @@
 Load this unit when changing named Camofox browser accounts, vault login classification,
 the browser vault fill tool, or the 1Password backends.
 
+- Fork patch identity: `vault-origin-aliases`.
+
 ## Required behavior
 
 - A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.
   Only explicit navigation creates/retries a tab, once; page actions and vault evaluations
   never replay on replacement tabs, and account identity survives invalidation.
-- Named Camofox accounts route per profile; account aliases are profile-specific. Their
-  shared identity userId is `hermes_camofox_` plus the first 24 lowercase hex
-  characters of SHA-256 over `camofox-account:{profile_camofox_state_dir}:{alias}`;
-  this matches the server and dotfiles launcher contract. The session key is unchanged.
-  This is a hard cutover from the old `hermes_<10hex>` account IDs: the parent's
-  server-side cutover retires old account profiles and moves their data to these
-  derived IDs; Hermes does not dual-read, map, or migrate profiles.
+- Named Camofox account aliases are profile-configured, but resolve to the server's
+  canonical persistent userId through `GET /browser/identities`. Clients do not
+  derive a named identity from their local Hermes home: the same server alias must
+  reuse its existing profile from Mac and Linux clients. Each mapping must name exactly
+  one `hermes_camofox_<24 lowercase hex>` identity. Missing, invalid, duplicate, or
+  unavailable mappings fail closed before navigation or handoff, including for an
+  already-bound task. Session keys remain scoped to the client profile state directory.
+  Hermes does not create an empty fallback identity, copy profiles, or migrate cookies.
   `browser_handoff(account=...)` opens/focuses that account's shared identity, restarts
   its headless-by-default browser as visible, adopts the returned tabId for subsequent
-  browser actions, and never returns the userId. The restart restores the last URL but
+  browser actions (across turns, see [Camofox tab reuse](camofox-tab-reuse.md)), and never
+  returns the userId. The restart restores the last URL but
   can lose page-only state such as half-filled forms; logins persist. Confirm no other
   work is using the account, then call handoff before the step whose page state matters
   (for example, before submitting a password when an OTP is likely). A server-side 404
@@ -30,10 +34,20 @@ the browser vault fill tool, or the 1Password backends.
   it was already stopped. Successful release invalidates only Hermes's local tab ID,
   retaining the task's account binding. Busy (409) leaves it intact for retry; neither
   action exposes userId.
-- Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are
-  minted from Connect one-time-password fields, automatic 2FA is announced only when a code
-  can really be minted, an unusable OTP field never hides a usable one, and upstream
-  multi-origin metadata is preserved for Connect.
+- Login origin aliases are an agent-writable, exact-origin registry under `vault.origin_aliases`.
+  On `origin_mismatch`, the agent may run `hermes config set vault.origin_aliases.<item-id> '["https://origin.example"]'`;
+  `set` replaces that item's full alias list, so existing entries must be included. The active config is read on each
+  vault list/fill call, so this does not require a restart. Alias-only login fills prompt once per session with the
+  full origin and item label; cross-registrable-domain aliases warn with both domains when the advisory fallback recognizes
+  those suffixes. The warning is advisory, has partial suffix coverage and never authorizes a fill; the full origin is
+  always shown. Declines and unanswered prompts
+  remain fail-closed for retries in the same session. An accepted prompt re-reads `vault.origin_aliases` before
+  writing and refuses with `origin_alias_revoked` (nothing written, acceptance not cached) when the alias was removed
+  while the prompt waited. Never rewrite a 1Password item to add a URL because template
+  rewrites can delete passkeys.
+- Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are minted from Connect
+  one-time-password fields, automatic 2FA is announced only when a code can really be minted, an unusable OTP field
+  never hides a usable one, and upstream multi-origin metadata is preserved for Connect.
 - Login forms inside open shadow roots (web-component inputs) are discovered and filled.
 - Service-account `op item get` passes `--vault`; the Connect read path stays ahead of the
   CLI selector.
@@ -88,6 +102,15 @@ the browser vault fill tool, or the 1Password backends.
 
 ## Provenance and patches
 
+- Fork patch identity: `vault-native-password-precedence`. Fork
+  [PR 742](https://github.com/0xble/hermes-agent/pull/742) keeps CLI and Connect
+  password selection native-first, with an unambiguous nonblank custom fallback.
+  The CLI reads exact-item JSON transiently and validates item, vault, category and
+  active state before selection. This PR includes no upstream contribution.
+  Preserve the synthetic subprocess and Connect precedence, ambiguity, malformed
+  output and byte-preservation regressions in the existing vault tests below.
+  Retire only when released upstream provides equivalent selection and validation.
+  Source publication does not imply runtime activation.
 - Fork patch identities: `op-batched-secret-loader` (one `op run` over distinct
   refs, private JSON handoff, per-ref fallback except on 429). Upstream
   [PR 116616](https://github.com/NousResearch/hermes-agent/pull/116616) proposes
@@ -95,6 +118,14 @@ the browser vault fill tool, or the 1Password backends.
   an injected text template and preserves the existing cooldown and partial cache.
   Retire when a released upstream batches refs with equivalent failure isolation,
   last-good behavior, and safe handling of multiline values.
+  References containing dotenv expansion, comment, quote, escape, or line-break
+  syntax use exact `op read` arguments instead. Simple references keep batching.
+  Successful exact reads are reused for duplicate references. An identity-wide
+  rate limit stops both routes and preserves the existing cache cooldown.
+  Verify `test_batch_dotenv_sensitive_references_use_exact_read` and
+  `test_batch_rate_limit_also_stops_exact_sensitive_reads` in
+  `tests/agent/test_onepassword_secrets.py`. The parser contract is documented in
+  [1Password environment files](https://www.1password.dev/cli/secrets-environment-variables).
 - Fork patch identities: `slice-8-camofox-accounts` (local, no upstream submission),
   `slice-8-camofox-visible-handoff` (fork-only shared-window handoff; upstream does not
   expose these server endpoints); `slice-9-vault-camofox`, `slice-9-vault-shadow-dom`,
@@ -110,7 +141,13 @@ the browser vault fill tool, or the 1Password backends.
   multi-account vault logins as of 2026-09-26), and
   `op-quota-resilience` (own fork fix: last-good 1Password secrets on rate limit or
   outage, a display-only listing cache, https for bare-host websites, and a stop at the
-  first 429 with a 15-minute per-identity cooldown shared across processes).
+  first 429 with a 15-minute per-identity cooldown shared across processes). Since
+  2026-10-08 the vault listing is reused for 15 minutes for display, fetched single-flight
+  per backend/account/credential fingerprint, and a fill reuses only a listing fetched
+  fresh within the last 5 seconds, so one fill spends one `op item list` plus its
+  `op item get`. `invalidate_listing_cache()` clears both; Hermes has no path that writes
+  1Password items, and `browser_vault_save_login` writes only the uncached local vault.
+  Upstream (`908e4a4b444`) has no vault listing cache to adopt.
   `vault-card-retry-guard` (separate fork-only safety fix: session/origin-scoped
   ten-minute in-memory refusal after a declined/unanswered prompt; retire when released
   upstream enforces equivalent no-reprompt behavior), and
@@ -144,6 +181,33 @@ the browser vault fill tool, or the 1Password backends.
 - Surfaces: `tools/browser_camofox*.py`, `tools/browser_tool.py`, `toolsets.py`,
   `agent/vault_login_classifier.py`, `agent/vault_backends/`, `tools/browser_vault_tool.py`.
 
+## Vault OTP and checkout hardening
+
+- `vault-origin-aliases` also governs authenticator codes: resolve a handle's login
+  metadata and exact allowed origins before minting an OTP; alias-only origins use the
+  password-fill consent/refusal cache and revalidate config after consent. Re-read the
+  live page origin after inspection; never authorize the requested or stale focus origin.
+  Keep the checked origin in the atomic write script, including after a user-code wait.
+- `vault-card-redaction-scope` keeps PAN/CVC global and low-entropy card metadata scoped.
+  Register canonical PAN digits even when the manager stores spaces/dashes, then redact
+  known PANs with whitespace/dash formatting without broadening short CVC matching.
+- `slice-9-vault-op-cards` ignores issue/start/valid-from date heuristics despite MM/YY
+  placeholders and permits masked password-type CVV only when classified as `cc-csc`.
+- Narrow fixes adapted from open upstream PRs
+  [128194](https://github.com/NousResearch/hermes-agent/pull/128194) at
+  `d0761c1092601b685c77259c7e4c966a7852cbe6` (OTP origin and stale navigation),
+  [136639](https://github.com/NousResearch/hermes-agent/pull/136639) at
+  `227a3f196dbeac096d419cd8dc901f1ecd182995` (PAN variants and issue dates), and
+  [134723](https://github.com/NousResearch/hermes-agent/pull/134723) at
+  `0811fe95947d932d01470f1b6b614485470f079f` (masked CVV). Inspection pinned released
+  upstream/main to `1fd18277267152893a8a24792b79213e7ca3f899`; these fixes were not
+  present there. Retire the adaptations only when released upstream satisfies both the
+  exact-origin alias-consent contract and this fork's scoped card redaction contract.
+- Regression: `tests/tools/test_browser_vault_otp_origin.py` (registered handler, synthetic
+  manager, isolated home) and `tests/tools/test_browser_vault_manager_card.py` (fill boundary,
+  PAN formatting, issue dates and masked CVV). Roll back the bundle's small commits bearing
+  the existing identities; do not retire the surrounding fork features.
+
 ## Verification
 
 `scripts/run_tests.sh` on `tests/tools/test_browser_camofox_accounts.py`,
@@ -152,6 +216,7 @@ the browser vault fill tool, or the 1Password backends.
 `tests/agent/test_vault_onepassword_subprocess.py` (real subprocess, fake `op`),
 `tests/agent/test_vault_protected_fields.py`,
 `tests/agent/test_vault_onepassword_accounts.py` (multi-account, real config + fake `op`),
+`tests/agent/test_vault_onepassword_listing_quota.py` (counts `op` calls per list and fill),
 `tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification,
 first-429 stop and cross-process cooldown),
 `tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`, and

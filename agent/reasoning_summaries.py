@@ -14,7 +14,23 @@ from typing import Any
 
 from agent.message_content import flatten_message_text
 
-__all__ = ["append_streamed_reasoning_detail", "separate_glued_reasoning_blocks"]
+__all__ = [
+    "append_streamed_reasoning_detail",
+    "is_responses_reasoning_summary",
+    "separate_glued_reasoning_blocks",
+]
+
+
+def is_responses_reasoning_summary(agent: Any, message: Any) -> bool:
+    """True when *message*'s reasoning is a Responses/Codex summary: provider metadata (a bolded
+    title plus summary paragraphs), never answer text, a draft preview or a refusal reason.
+
+    Chat-completions parsers that file the whole answer as reasoning (vLLM's Nemotron route)
+    carry no ``codex_reasoning_items`` and run outside ``codex_responses``, so they stay False.
+    """
+    return getattr(agent, "api_mode", None) == "codex_responses" or bool(
+        getattr(message, "codex_reasoning_items", None)
+    )
 
 
 def separate_glued_reasoning_blocks(previous: str, delta: Any) -> str:
@@ -34,6 +50,16 @@ def separate_glued_reasoning_blocks(previous: str, delta: Any) -> str:
 # reasoning_details entry types whose consecutive fragments are ONE logical block.
 _MERGEABLE_DETAIL_TEXT_KEYS = {"reasoning.text": "text", "reasoning.summary": "summary"}
 _BACKFILL_DETAIL_KEYS = ("signature", "id", "format", "index")
+
+
+def streamed_reasoning_detail_text(detail: Any) -> str:
+    """Readable text from a detail delta; never expose opaque replay material."""
+    dtype = detail.get("type") if isinstance(detail, dict) else getattr(detail, "type", None)
+    key = _MERGEABLE_DETAIL_TEXT_KEYS.get(dtype) if isinstance(dtype, str) else None
+    if key is None:
+        return ""
+    text = detail.get(key) if isinstance(detail, dict) else getattr(detail, key, None)
+    return text if isinstance(text, str) else ""
 
 
 def append_streamed_reasoning_detail(details_acc: list, detail: Any) -> None:

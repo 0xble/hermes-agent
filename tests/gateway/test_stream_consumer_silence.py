@@ -122,4 +122,136 @@ class TestStreamedSilenceSuppression:
         assert consumer.final_content_delivered is False
         assert consumer.already_sent is False
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("marker", ("NO_REPLY", "[SILENT]", "no reply"))
+    async def test_substantive_stream_final_edit_removes_trailing_marker(self, marker):
+        """A substantive final never leaves a standalone silence marker visible."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta(f"Done.\n\n{marker}")
+        consumer.finish()
+        await consumer.run()
+
+        assert consumer.delivered_final_matches("Done.") is True
+        assert any(text == "Done." for text in _sent_and_edited(adapter))
+        assert all(marker not in text for text in _sent_and_edited(adapter))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw", (
+        "NO_REPLY\n\nDocs are signed.", "Docs are signed.\n\nNO_REPLY",
+    ))
+    async def test_marker_beside_prose_never_reaches_any_edit(self, raw):
+        """Marker + prose streams deliver only the prose, mid-stream and final."""
+        import asyncio
+
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        runner = asyncio.create_task(consumer.run())
+        for i in range(0, len(raw), 4):
+            consumer.on_delta(raw[i:i + 4])
+            await asyncio.sleep(0.03)
+        consumer.finish()
+        await runner
+
+        texts = _sent_and_edited(adapter)
+        assert texts and all("NO_REPLY" not in t for t in texts), texts
+        assert consumer.delivered_final_matches("Docs are signed.") is True
+
+    @pytest.mark.asyncio
+    async def test_leading_marker_in_a_tool_segment_is_dropped_at_the_boundary(self):
+        """A segment that opens with a marker line keeps its prose and loses the marker."""
+        import asyncio
+
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        runner = asyncio.create_task(consumer.run())
+        consumer.on_delta("NO_REPLY\n\nChecking the ledger first.")
+        await asyncio.sleep(0.1)
+        consumer.on_segment_break()
+        await asyncio.sleep(0.1)
+        consumer.on_delta("Ledger matches.")
+        consumer.finish()
+        await runner
+
+        texts = _sent_and_edited(adapter)
+        assert all("NO_REPLY" not in t for t in texts), texts
+        assert any("Checking the ledger first." in t for t in texts), texts
+        assert any("Ledger matches." in t for t in texts), texts
+
+    @pytest.mark.asyncio
+    async def test_autonomous_stream_keeps_trailing_marker_semantics(self):
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1,
+                                 strip_trailing_silence_markers=False),
+        )
+        raw = "Done.\n\nNO_REPLY"
+        consumer.on_delta(raw)
+        consumer.finish()
+        await consumer.run()
+
+        assert any(text == raw for text in _sent_and_edited(adapter))
+
+    @pytest.mark.asyncio
+    async def test_trailing_marker_in_a_later_delta_never_reaches_an_interim_edit(self):
+        """Prose is flushed first; a marker arriving later must not appear mid-stream."""
+        import asyncio
+
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        runner = asyncio.create_task(consumer.run())
+        consumer.on_delta("Done.\n\n")
+        await asyncio.sleep(0.1)
+        for part in ("NO", "_REP", "LY"):
+            consumer.on_delta(part)
+            await asyncio.sleep(0.1)
+        consumer.finish()
+        await runner
+
+        texts = _sent_and_edited(adapter)
+        assert all("NO_REPLY" not in t and not t.rstrip("▉ ").endswith("NO") for t in texts), texts
+        assert consumer.delivered_final_matches("Done.") is True
+
+    @pytest.mark.asyncio
+    async def test_prose_line_resembling_a_marker_prefix_still_streams(self):
+        """Only the last top-level line is held, and only while it could become a marker."""
+        import asyncio
+
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        runner = asyncio.create_task(consumer.run())
+        consumer.on_delta("Done.\n\nNo problem, shipped it.")
+        await asyncio.sleep(0.1)
+        interim = list(_sent_and_edited(adapter))
+        consumer.finish()
+        await runner
+
+        assert any("No problem" in t for t in interim), interim
+
+
+def test_ends_with_partial_silence_marker_scopes_to_last_top_level_line():
+    from gateway.response_filters import ends_with_partial_silence_marker as f
+
+    assert f("Done.\n\nNO")
+    assert f("Done.\n\nNO_REPLY\n")
+    assert not f("Done.\n\nNo problem")
+    assert not f("```\nNO")
+    assert not f("NO_REPLY is a marker.")
+
 

@@ -6,8 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 
 # ---------------------------------------------------------------------------
 # Shared fixture — isolate HERMES_HOME so save_config writes to tmp_path
@@ -20,16 +19,13 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     return tmp_path
 
-
 def _write_config(home: Path, data: dict) -> None:
     config_path = home / ".hermes" / "config.yaml"
     config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
 
-
 def _read_config(home: Path) -> dict:
     config_path = home / ".hermes" / "config.yaml"
-    return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-
+    return yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
 
 # ---------------------------------------------------------------------------
 # _read_chain / _write_chain
@@ -50,14 +46,12 @@ class TestReadChain:
             {"provider": "nous", "model": "Hermes-4-Llama-3.1-405B"},
         ]
 
-
     def test_returns_copies_not_aliases(self):
         from hermes_cli.fallback_cmd import _read_chain
         cfg = {"fallback_providers": [{"provider": "nous", "model": "foo"}]}
         result = _read_chain(cfg)
         result[0]["provider"] = "mutated"
         assert cfg["fallback_providers"][0]["provider"] == "nous"
-
 
 # ---------------------------------------------------------------------------
 # _extract_fallback_from_model_cfg
@@ -72,11 +66,9 @@ class TestExtractFallback:
             "model": "anthropic/claude-sonnet-4.6",
         }
 
-
     def test_returns_none_without_model(self):
         from hermes_cli.fallback_cmd import _extract_fallback_from_model_cfg
         assert _extract_fallback_from_model_cfg({"provider": "openrouter"}) is None
-
 
 # ---------------------------------------------------------------------------
 # cmd_fallback_list
@@ -99,7 +91,6 @@ class TestListCommand:
         assert "Hermes-4" in out
         # Primary should be shown too
         assert "claude-sonnet-4-6" in out
-
 
 # ---------------------------------------------------------------------------
 # cmd_fallback_add — mock select_provider_and_model
@@ -141,7 +132,6 @@ class TestAddCommand:
                 "api_mode": "chat_completions",
             }
         ]
-
 
     def test_add_rejects_same_as_primary(self, isolated_home):
         _write_config(isolated_home, {
@@ -275,7 +265,6 @@ class TestAddCommand:
         assert persisted["model"] == primary_model
         assert persisted["theme"] == "midnight"
 
-
 # ---------------------------------------------------------------------------
 # cmd_fallback_remove
 # ---------------------------------------------------------------------------
@@ -302,7 +291,6 @@ class TestRemoveCommand:
             {"provider": "anthropic", "model": "claude-sonnet-4-6"},
         ]
 
-
 # ---------------------------------------------------------------------------
 # cmd_fallback_clear
 # ---------------------------------------------------------------------------
@@ -323,6 +311,147 @@ class TestClearCommand:
         cfg = _read_config(isolated_home)
         assert cfg.get("fallback_providers") == []
 
+# ---------------------------------------------------------------------------
+# hermes fallback cooldowns — shared primary-model cooldowns, separate from the chain
+# ---------------------------------------------------------------------------
+
+def _parse(argv):
+    import argparse
+    from hermes_cli.subcommands.fallback import build_fallback_parser
+    parser = argparse.ArgumentParser()
+    build_fallback_parser(parser.add_subparsers(dest="command"))
+    return parser.parse_args(argv)
+
+
+def _arm(provider, model):
+    import time
+    from agent.shared_primary_cooldown import arm_cooldown
+    return arm_cooldown((provider, "http://127.0.0.1:8317/v1", model), reason="rate_limit", reset_at=time.time() + 7200)
+
+
+def _cooling_models():
+    from agent.shared_primary_cooldown import list_cooldowns
+    return sorted((r["provider"], r["model"]) for r in list_cooldowns())
+
+
+class TestCooldownsCommand:
+
+    def test_bare_clear_still_clears_only_the_chain(self, isolated_home, monkeypatch):
+        _write_config(isolated_home, {"fallback_providers": [{"provider": "openrouter", "model": "gpt-5.4"}]})
+        _arm("custom:claude-proxy", "claude-opus-5-5")
+        monkeypatch.setattr("builtins.input", lambda *a, **kw: "y")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "clear"]))
+        assert _read_config(isolated_home).get("fallback_providers") == []
+        assert _cooling_models() == [("custom:claude-proxy", "claude-opus-5-5")]
+
+    def test_clear_takes_no_model_argument(self, isolated_home):
+        with pytest.raises(SystemExit):
+            _parse(["fallback", "clear", "claude-opus-5-5"])
+
+    def test_cooldowns_lists_by_default_and_status_is_an_alias(self, isolated_home, capsys):
+        _arm("custom:claude-proxy", "claude-opus-5-5")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "cooldowns"]))
+        listed = capsys.readouterr().out
+        cmd_fallback(_parse(["fallback", "status"]))
+        assert "claude-opus-5-5 via custom:claude-proxy" in listed
+        assert capsys.readouterr().out == listed
+
+    def test_clear_all_removes_every_cooldown_and_keeps_the_chain(self, isolated_home, capsys):
+        chain = [{"provider": "openrouter", "model": "gpt-5.4"}]
+        _write_config(isolated_home, {"fallback_providers": chain})
+        _arm("custom:claude-proxy", "claude-opus-5-5")
+        _arm("custom:codex-proxy", "gpt-6.1-sol")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "cooldowns", "clear", "--all"]))
+        assert _cooling_models() == []
+        assert _read_config(isolated_home)["fallback_providers"] == chain
+        out = capsys.readouterr().out
+        assert "Cleared: claude-opus-5-5 via custom:claude-proxy" in out
+        assert "next turn start" in out
+
+    def test_clear_target_is_exact(self, isolated_home, capsys):
+        _arm("custom:claude-proxy", "claude-opus-5-5")
+        _arm("custom:claude-proxy", "claude-opus-5")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "cooldowns", "clear", "opus"]))
+        assert "No shared primary cooldown matches 'opus'" in capsys.readouterr().out
+        assert len(_cooling_models()) == 2
+        cmd_fallback(_parse(["fallback", "cooldowns", "clear", "custom:claude-proxy/claude-opus-5"]))
+        assert _cooling_models() == [("custom:claude-proxy", "claude-opus-5-5")]
+
+    @pytest.mark.parametrize("argv", [
+        ["fallback", "cooldowns", "clear"],
+        ["fallback", "cooldowns", "clear", "--all", "claude-opus-5-5"],
+    ])
+    def test_clear_requires_exactly_one_selector(self, isolated_home, argv):
+        with pytest.raises(SystemExit):
+            _parse(argv)
+
+    def test_malformed_state_status_is_truthful(self, isolated_home, capsys):
+        from agent.shared_primary_cooldown import _state_path
+        path = _state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{", encoding="utf-8")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "status"]))
+        status = capsys.readouterr().out
+        assert "unreadable" in status.lower()
+        assert "No primary-model cooldowns active" not in status
+        assert path.read_text(encoding="utf-8-sig") == "{"
+
+    @pytest.mark.parametrize("failure", ["malformed", "wrong_shape", "permission"])
+    def test_unreadable_state_clear_all_quarantines_it(self, isolated_home, capsys, monkeypatch, failure):
+        from pathlib import Path
+        from agent.shared_primary_cooldown import _state_path, read_cooldown
+        path = _state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = "[]" if failure == "wrong_shape" else "{"
+        path.write_text(original, encoding="utf-8")
+        real_read = Path.read_text
+        if failure == "permission":
+            def denied(self, *args, **kwargs):
+                if self == path:
+                    raise PermissionError("unreadable cooldown fixture")
+                return real_read(self, *args, **kwargs)
+            monkeypatch.setattr(Path, "read_text", denied)
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "cooldowns", "clear", "--all"]))
+        assert not path.exists()
+        backups = list(path.parent.glob(path.name + ".corrupt-*"))
+        assert len(backups) == 1
+        assert backups[0].read_text(encoding="utf-8-sig") == original
+        assert "Quarantined" in capsys.readouterr().out
+        monkeypatch.setattr(Path, "read_text", real_read)
+        assert read_cooldown(("custom", "https://fixture.invalid/v1", "primary")) is None
+
+    def test_status_survives_a_non_finite_record(self, isolated_home, capsys):
+        import json
+        from agent.shared_primary_cooldown import _state_path, route_key
+        route = {"provider": "custom:claude-proxy", "base_url": "http://127.0.0.1:8317/v1", "model": "claude-opus-5-5"}
+        path = _state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 1, "routes": {route_key(**route): {
+            **route, "reset_at": float("inf"), "recorded_at": 0, "reason": "overloaded", "outage_id": "x",
+        }}}), encoding="utf-8")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "status"]))
+        assert "No primary-model cooldowns active" in capsys.readouterr().out
+        assert not path.exists()
+
+    def test_status_survives_a_huge_finite_record(self, isolated_home, capsys):
+        import json
+        from agent.shared_primary_cooldown import _state_path, route_key
+        route = {"provider": "custom:claude-proxy", "base_url": "http://127.0.0.1:8317/v1", "model": "claude-opus-5-5"}
+        path = _state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 1, "routes": {route_key(**route): {
+            **route, "reset_at": 1e20, "recorded_at": 0, "reason": "rate_limit", "outage_id": "x",
+        }}}), encoding="utf-8")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "status"]))
+        assert "No primary-model cooldowns active" in capsys.readouterr().out
 
 # ---------------------------------------------------------------------------
 # cmd_fallback dispatcher
@@ -330,15 +459,12 @@ class TestClearCommand:
 
 class TestDispatcher:
 
-
     def test_unknown_subcommand_exits(self, isolated_home):
         _write_config(isolated_home, {})
         from hermes_cli.fallback_cmd import cmd_fallback
         with pytest.raises(SystemExit):
             cmd_fallback(types.SimpleNamespace(fallback_command="nope"))
 
-
 # ---------------------------------------------------------------------------
 # argparse wiring — verify the subparser is registered
 # ---------------------------------------------------------------------------
-

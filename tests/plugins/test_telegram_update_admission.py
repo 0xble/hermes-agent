@@ -20,7 +20,9 @@ from telegram.request import BaseRequest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.event import MessageType
+from plugins.platforms.telegram import adapter as tg_adapter
 from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.update_admission import DEFAULT_MAX_CONCURRENT_UPDATES, PerChatUpdateProcessor
 
 
 class NoNetwork(BaseRequest):
@@ -214,6 +216,33 @@ async def test_replay_is_admitted_once_before_dispatch(monkeypatch, tmp_path, ki
             assert len(delivered) == 2
 
 
+@pytest.mark.asyncio
+async def test_pre_handoff_base_failure_keeps_update_retryable(monkeypatch):
+    from gateway.platforms.base import BasePlatformAdapter
+
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        original = BasePlatformAdapter.handle_message
+        failed = False
+
+        async def fail_before_handoff(base, event):
+            nonlocal failed
+            if not failed:
+                failed = True
+                event._gateway_accepted = False
+                raise RuntimeError("preparation failed")
+            return await original(base, event)
+
+        monkeypatch.setattr(BasePlatformAdapter, "handle_message", fail_before_handoff)
+        incoming = update(app.bot, kind="command")
+        await app.process_update(incoming)
+        assert not adapter._seen_update_ids
+        assert not adapter._inflight_update_ids
+
+        await app.process_update(incoming)
+        assert len(delivered) == 1
+        assert not adapter._inflight_update_ids
+
+
 async def _check_sticker_handoff(monkeypatch, adapter, app, delivered, stage):
     from gateway import sticker_cache
     from tools import vision_tools
@@ -395,11 +424,13 @@ async def _check_error_registration(monkeypatch, adapter, app):
 async def _check_error_cancel_before_entry(monkeypatch, adapter, app, delivered):
     scheduled, effects = [], []
     create = app._Application__create_task
+    callbacks_finished = asyncio.Event()
 
     def cancel_on_schedule(coroutine, *args, **kwargs):
         task = create(coroutine, *args, **kwargs)
         if kwargs.get("is_error_handler"):
             scheduled.append((task, coroutine))
+            task.add_done_callback(lambda _: callbacks_finished.set())
             task.cancel()
         return task
 
@@ -415,6 +446,9 @@ async def _check_error_cancel_before_entry(monkeypatch, adapter, app, delivered)
         await app.process_update(update(app.bot))
         await app.stop()
     assert len(scheduled) == 1 and not effects
+    # A done task can leave its registered callbacks queued for the next loop
+    # iteration. Wait for that boundary before asserting admission cleanup.
+    await asyncio.wait_for(callbacks_finished.wait(), 5)
     assert not adapter._inflight_update_ids and not adapter._seen_update_ids
     # The cancelled PTB task never awaited the callback coroutine: it must be closed too.
     try:
@@ -508,7 +542,7 @@ async def test_only_pre_handoff_failure_reopens_admission(monkeypatch, tmp_path,
                 await app.process_update(update(app.bot))
             assert not adapter._seen_update_ids and not adapter._inflight_update_ids
             assert adapter._updates_dispatched_total == 2
-            for _ in range(3):
+            for _ in range(tg_adapter._INGRESS_DISPATCH_STALL_HEARTBEATS):
                 adapter._check_ingress_dispatch_stall()
             assert not any("healthy but deaf" in record.message for record in caplog.records)
             return
@@ -590,7 +624,7 @@ async def test_only_pre_handoff_failure_reopens_admission(monkeypatch, tmp_path,
 
             conversation = ConversationHandler(entry_points=[TypeHandler(Update, entry)], states={}, fallbacks=[])
             app.add_handler(conversation, group=-1)
-            async with connected(monkeypatch, bot_id=222) as (other, other_app, _):
+            async with connected(monkeypatch, bot_id=222) as (_other, other_app, _):
                 other_app.add_handler(conversation, group=-1)
                 for _ in range(2):
                     await other_app.process_update(update(other_app.bot))
@@ -711,7 +745,18 @@ async def test_only_pre_handoff_failure_reopens_admission(monkeypatch, tmp_path,
             first.cancel()
             await asyncio.gather(first, return_exceptions=True)
             raise
-        if failure == "cancel":
+        if stage == "media_warning":
+            # The retry notice is a paced delivery, so it runs off the update consumer: the update
+            # is accepted and finished before the notice lands, and a failed or cancelled notice
+            # cannot reopen it.
+            await asyncio.wait_for(first, 2)
+            notices = [task for task in adapter._background_tasks if "media-retry-notice" in task.get_name()]
+            assert len(notices) == 1
+            if failure == "cancel":
+                notices[0].cancel()
+            release.set()
+            await asyncio.gather(*notices, return_exceptions=True)
+        elif failure == "cancel":
             if stage in ("enqueued", "dispatch", "batch_prepare"):
                 release.set()
             else:
@@ -790,3 +835,97 @@ async def test_redelivery_to_rebuilt_adapter_is_dropped(monkeypatch, tmp_path):
         await app.process_update(update(app.bot, 30))
         await asyncio.gather(*adapter._pending_text_batch_tasks.values())
         assert len(delivered) == 1
+
+
+@pytest.mark.asyncio
+async def test_connect_builds_concurrent_update_processor(monkeypatch):
+    """The PTB Application must not run with the library default max_concurrent_updates=1:
+    the update fetcher then awaits each update's full handler chain inline, so one slow
+    update deafens every other chat (and local commands) until it finishes. The adapter
+    must enable a bounded concurrent processor, overridable via config extra (#125098)."""
+    async with connected(monkeypatch) as (_adapter, app, _delivered):
+        assert isinstance(app.update_processor, PerChatUpdateProcessor)
+        assert app.concurrent_updates == DEFAULT_MAX_CONCURRENT_UPDATES
+
+    async with connected(monkeypatch, extra={"max_concurrent_updates": 7}) as (_adapter, app, _delivered):
+        assert app.concurrent_updates == 7
+
+    for bad in ("lots", float("inf")):  # .inf in YAML: int() raises OverflowError
+        async with connected(monkeypatch, extra={"max_concurrent_updates": bad}) as (_adapter, app, _delivered):
+            assert app.concurrent_updates == DEFAULT_MAX_CONCURRENT_UPDATES
+
+    # Cancelling a waiting same-chat update must neither fail its running predecessor nor
+    # let the next update of that chat overtake it.
+    processor, order, gate = app.update_processor, [], asyncio.Event()
+
+    async def handler(name):
+        order.append(f"start {name}")
+        if name == "A":
+            await gate.wait()
+        order.append(f"end {name}")
+
+    chat = SimpleNamespace(effective_chat=SimpleNamespace(id=1))
+    tasks = []
+    for name in "ABC":
+        tasks.append(asyncio.create_task(processor.process_update(chat, handler(name))))
+        await asyncio.sleep(0.01)
+    tasks[1].cancel()
+    await asyncio.sleep(0.01)
+    gate.set()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    assert results[0] is None and results[2] is None
+    assert order == ["start A", "end A", "start C", "end C"]  # C waits for A even after B is cancelled
+
+
+@pytest.mark.asyncio
+async def test_slow_update_does_not_block_other_chats(monkeypatch):
+    """End-to-end through the real PTB fetcher path (update_queue → __update_fetcher):
+    while one chat's update is parked inside its handler chain, a different chat's
+    update must still be dequeued, dispatched and delivered (#125098). Under the PTB
+    default (max_concurrent_updates=1) the fetcher awaits each update inline, so the
+    second update is never dequeued while the first is parked. A later update of the
+    PARKED chat must wait for it: plain concurrency would deliver it first."""
+    gate = asyncio.Event()
+
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        async def gate_keeper(update, context):
+            if update.update_id == 10:
+                await gate.wait()
+
+        # Group -1 runs before every core handler group inside PTB's real dispatch.
+        app.add_handler(TypeHandler(Update, gate_keeper), group=-1)
+
+        app.update_queue.put_nowait(update(app.bot, uid=10, chat=42))
+        for _ in range(200):  # event-based: u10 has been dequeued and parked in the gate
+            if adapter._inflight_update_ids:
+                break
+            await asyncio.sleep(0.01)
+        assert adapter._inflight_update_ids, "update 10 never started processing"
+
+        app.update_queue.put_nowait(update(app.bot, uid=11, chat=43))
+        app.update_queue.put_nowait(update(app.bot, uid=12, chat=42, text="second"))
+        dequeued = False
+        for _ in range(500):
+            if app.update_queue.qsize() == 0:
+                dequeued = True
+                break
+            await asyncio.sleep(0.01)
+        # THE regression discriminator: the fetcher must pull update 11 while update 10
+        # is still parked. Serial processing leaves it sitting in the queue.
+        assert dequeued, "fetcher never dequeued update 11 while update 10 was parked"
+
+        for _ in range(500):  # u11 flows through batching to the session handler
+            if delivered:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.gather(*adapter._pending_text_batch_tasks.values())
+        assert [e.source.chat_id for e in delivered] == ["43"]
+        gate.set()
+        for _ in range(500):  # released u10 finishes its chain, then u12 follows it
+            if any("second" in e.text for e in delivered):
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.gather(*adapter._pending_text_batch_tasks.values())
+        assert next(e.source.chat_id for e in delivered) == "43"
+        same_chat = "\n".join(e.text for e in delivered if e.source.chat_id == "42")
+        assert same_chat == "hello\nsecond"

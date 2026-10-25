@@ -82,22 +82,25 @@ print(json.dumps(summaries, indent=2))
 ### 批量文件重构
 
 ```python
-from hermes_tools import search_files, read_file, patch
+from hermes_tools import search_files, patch, HermesToolError
 
-# Find all Python files using deprecated API and fix them
+# 查找所有使用弃用 API 的 Python 文件并修复
 matches = search_files("old_api_call", path="src/", file_glob="*.py")
 fixed = 0
 for match in matches.get("matches", []):
-    result = patch(
-        path=match["path"],
-        old_string="old_api_call(",
-        new_string="new_api_call(",
-        replace_all=True
-    )
-    if "error" not in str(result):
+    try:
+        patch(
+            path=match["path"],
+            old_string="old_api_call(",
+            new_string="new_api_call(",
+            replace_all=True
+        )
         fixed += 1
+    except HermesToolError:
+        # 文件工具错误会抛出 HermesToolError；跳过失败项并继续处理。
+        pass
 
-print(f"Fixed {fixed} files out of {len(matches.get('matches', []))} matches")
+print(f"已修复 {fixed} 个文件，共 {len(matches.get('matches', []))} 个匹配项")
 ```
 
 ### 构建与测试流水线

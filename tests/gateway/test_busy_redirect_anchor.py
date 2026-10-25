@@ -25,6 +25,9 @@ class Receiver:
     def redirect(self, text):
         return self.accept
 
+    def steer(self, text):
+        return self.accept
+
 
 def _running_turn(runner, key, receiver):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
@@ -74,3 +77,117 @@ async def test_refused_or_foreign_redirect_leaves_the_anchor_on_the_opening_mess
     opening2, ctx2, redirecting2, _ = _running_turn(runner, "key2", Receiver())
     assert await runner._resolve_busy_steer_or_redirect(redirecting2, "key2", "interrupt", displaced)
     assert _reply_anchor_for_event(opening2) == "461" and ctx2.event_message_id == "461"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route", ["busy_interrupt", "priority_interrupt", "busy_steer", "priority_steer", "slash_steer"])
+async def test_a_turn_that_takes_in_an_addressed_message_keeps_the_silence_fallback(route):
+    """Redirect and steer fold a new message into the running turn, which then answers it too: if
+    that message was addressed to the bot, a bare silence marker must not end the turn silently."""
+    runner = GatewayRunner(config=GatewayConfig())
+    receiver = Receiver()
+    opening, ctx, incoming, source = _running_turn(runner, "key", receiver)
+    opening.reply_expected, incoming.reply_expected = False, True
+
+    if route == "priority_interrupt":
+        await runner._hm_busy_interrupt(incoming, source, receiver, "key")
+    elif route == "priority_steer":
+        runner._hm_busy_steer(incoming, receiver, "key")
+    elif route == "slash_steer":
+        incoming.text = "/steer " + incoming.text
+        assert (await runner._busy_steer_command(incoming, "key", source)).startswith("⏩")
+    else:
+        outcome = await runner._resolve_busy_steer_or_redirect(incoming, "key", route[5:], receiver)
+        assert outcome.redirected or outcome.steered
+
+    assert (opening.reply_expected, ctx.reply_expected) == (True, True)
+
+
+@pytest.mark.asyncio
+async def test_accepted_relay_steer_keeps_a_relay_turn_unaddressed_and_sends_no_ack():
+    """Relay sends "/steer <header>"; admission sees the slash and cannot mark it. Folding an
+    unknown expectation into a relay-opened turn used to reset False to None, so a bare NO_REPLY
+    posted the visible fallback again."""
+    runner = GatewayRunner(config=GatewayConfig())
+    receiver = Receiver()
+    opening, ctx, incoming, source = _running_turn(runner, "key", receiver)
+    opening.reply_expected = ctx.reply_expected = False
+    incoming.text = "/steer [relay from=agent@example.com receipt=receipt-2]\nplease also check this"
+
+    reply = await runner._busy_steer_command(incoming, "key", source)
+
+    assert reply is None
+    assert incoming.reply_expected is False
+    assert (opening.reply_expected, ctx.reply_expected) == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_addressed_relay_steer_keeps_its_expectation_and_ack():
+    runner = GatewayRunner(config=GatewayConfig())
+    receiver = Receiver()
+    opening, ctx, incoming, source = _running_turn(runner, "key", receiver)
+    incoming.text = "/steer [relay from=agent@example.com receipt=receipt-3]\nplease answer me"
+    incoming.reply_expected = True
+
+    reply = await runner._busy_steer_command(incoming, "key", source)
+
+    assert reply
+    assert incoming.reply_expected is True
+    assert ctx.reply_expected is True
+
+
+@pytest.mark.asyncio
+async def test_addressed_relay_steer_queue_fallback_keeps_its_ack():
+    runner = GatewayRunner(config=GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
+    queued = []
+    runner._delivery_adapter_for = lambda _source: object()
+    runner._enqueue_fifo = lambda _key, queued_event, _adapter: queued.append(queued_event)
+    runner._peek_session_state = lambda _key: None
+    event = MessageEvent(
+        text="/steer [relay from=agent@example.com receipt=receipt-4]\nplease answer me",
+        source=source, message_id="steer-4", reply_expected=True,
+    )
+
+    reply = await runner._busy_steer_command(event, "key", source)
+
+    assert reply == "No active agent — /steer queued for the next turn."
+    assert queued[0].reply_expected is True
+
+
+@pytest.mark.asyncio
+async def test_steer_queue_fallback_marks_relay_origin_unaddressed():
+    runner = GatewayRunner(config=GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
+    queued = []
+    runner._delivery_adapter_for = lambda _source: object()
+    runner._enqueue_fifo = lambda _key, queued_event, _adapter: queued.append(queued_event)
+    runner._peek_session_state = lambda _key: None
+    event = MessageEvent(
+        text="/steer [relay from=agent@example.com receipt=receipt-1]\nplease handle this",
+        source=source, message_id="steer-1",
+    )
+
+    reply = await runner._busy_steer_command(event, "key", source)
+
+    assert reply is None
+    assert len(queued) == 1
+    assert queued[0].reply_expected is False
+
+
+@pytest.mark.asyncio
+async def test_typed_steer_queue_fallback_keeps_its_ack():
+    runner = GatewayRunner(config=GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
+    queued = []
+    runner._delivery_adapter_for = lambda source: object()
+    runner._enqueue_fifo = lambda session_key, queued_event, adapter: queued.append(queued_event)
+    runner._peek_session_state = lambda session_key: None
+    event = MessageEvent(text="/steer please handle this", source=source, message_id="steer-2")
+
+    reply = await runner._busy_steer_command(event, "key", source)
+
+    assert reply == "No active agent — /steer queued for the next turn."
+    assert len(queued) == 1
+    assert queued[0].reply_expected is None

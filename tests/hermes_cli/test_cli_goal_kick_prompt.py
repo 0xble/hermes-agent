@@ -19,6 +19,9 @@ def _cli(history):
 
 
 def _kick(cli, text):
+    # Each kick sets a fresh goal: bare `/goal <text>` on an existing goal replaces it in place
+    # without a kickoff turn, so clear the shared session's goal first.
+    cli._get_goal_manager().clear()
     cli._handle_goal_command("/goal " + text)
     return cli._pending_input.get_nowait()
 

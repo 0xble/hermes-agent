@@ -7,7 +7,7 @@ the layout the opt-in exists for: one local proxy URL serving two entries, one p
 from __future__ import annotations
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from agent.anthropic_adapter import build_anthropic_kwargs
 from hermes_cli.models import fast_mode_route_ignored, resolve_fast_mode_overrides

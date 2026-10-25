@@ -61,6 +61,10 @@ def _dispatch_row(delegation_id="deleg_resume_1", *, goal="port the widget", con
         record["is_batch"] = True
         record["goals"] = goals or ["a", "b"]
     ad._persist_dispatch(record)
+    # These tests cover the legacy one-shot path, which now applies only to rows written before the
+    # durable retry engine existed (retry_state='none'); new rows are owned by tests/tools/test_delegation_retry.py.
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_state='none' WHERE delegation_id=?", (delegation_id,))
     return delegation_id
 
 
@@ -73,6 +77,124 @@ def _mark(delegation_id, state, result=None):
             "WHERE delegation_id=?",
             (state, now, now, json.dumps({"status": state}), json.dumps(result or {"status": state}), delegation_id),
         )
+
+
+def test_pruning_preserves_delivered_interrupted_delegation_for_resume(monkeypatch):
+    """A delivered completion must not evict a still-eligible recovery row."""
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
+    resumable = _dispatch_row("deleg_prune_resumable")
+    _mark(resumable, "interrupted")
+    filler_ids = []
+    for index in range(2):
+        did = _dispatch_row(f"deleg_prune_filler_{index}")
+        _mark(did, "completed")
+        filler_ids.append(did)
+
+    old = time.time() - 60.0
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='delivered', updated_at=? WHERE delegation_id=?",
+            (old, resumable),
+        )
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='superseded', updated_at=? "
+            "WHERE delegation_id IN (?, ?)",
+            (time.time(), *filler_ids),
+        )
+
+    # Dispatch is the production pruning trigger. The old cap ordering deletes
+    # the delivered interrupted row before the unsuccessful terminal fillers.
+    _dispatch_row("deleg_prune_new_dispatch")
+
+    record, reason = dr.claim_resume(resumable)
+    assert reason is None
+    assert record["state"] == "interrupted"
+
+
+def test_pruning_deletes_delivered_rows_before_an_undelivered_completion(monkeypatch):
+    """A pending completion is the parent's only copy of a child result: delivered
+    audit rows must be pruned first, never the undelivered one."""
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
+    base = time.time() - 120.0
+    delivered = []
+    for index in range(3):
+        did = _dispatch_row(f"deleg_prune_delivered_{index}")
+        _mark(did, "completed")
+        delivered.append(did)
+    pending = _dispatch_row("deleg_prune_pending")
+    _mark(pending, "completed")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        for offset, did in enumerate(delivered):
+            conn.execute(
+                "UPDATE async_delegations SET delivery_state='delivered', updated_at=? WHERE delegation_id=?",
+                (base + offset, did),
+            )
+        # Oldest of all, so an updated_at-first ordering would delete it.
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='pending', updated_at=? WHERE delegation_id=?",
+            (base - 60.0, pending),
+        )
+
+    _dispatch_row("deleg_prune_trigger")
+
+    with ad._DB_LOCK, ad._transaction() as conn:
+        remaining = {row[0] for row in conn.execute("SELECT delegation_id FROM async_delegations")}
+    assert pending in remaining
+    assert delivered[0] not in remaining
+
+
+def test_pruning_deletes_other_undelivered_rows_before_a_pending_completion(monkeypatch):
+    """With no delivered rows left to prune, a pending result still goes last (it never counts
+    toward the history cap at all)."""
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 1)
+    base = time.time() - 120.0
+    pending = _dispatch_row("deleg_prune_last_pending")
+    _mark(pending, "completed")
+    dropped = _dispatch_row("deleg_prune_last_dropped")
+    _mark(dropped, "error")
+    newer_dropped = _dispatch_row("deleg_prune_last_dropped_newer")
+    _mark(newer_dropped, "error")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='pending', updated_at=? WHERE delegation_id=?",
+            (base - 60.0, pending),
+        )
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='dropped', updated_at=? WHERE delegation_id=?",
+            (base, dropped),
+        )
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='dropped', updated_at=? WHERE delegation_id=?",
+            (base + 10.0, newer_dropped),
+        )
+
+    _dispatch_row("deleg_prune_last_trigger")
+
+    with ad._DB_LOCK, ad._transaction() as conn:
+        remaining = {row[0] for row in conn.execute("SELECT delegation_id FROM async_delegations")}
+    assert pending in remaining
+    assert dropped not in remaining
+
+
+def test_pruning_preserves_origin_only_interrupted_delegation_for_resume(monkeypatch):
+    """Retention matches explicit-resume eligibility: an origin session alone owns it."""
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 1)
+    resumable = _dispatch_row("deleg_prune_origin_only")
+    _mark(resumable, "interrupted")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET parent_session_id=NULL, origin_session_id='origin-1', "
+            "delivery_state='delivered', updated_at=? WHERE delegation_id=?",
+            (time.time() - 60.0, resumable),
+        )
+    filler = _dispatch_row("deleg_prune_origin_filler")
+    _mark(filler, "completed")
+
+    _dispatch_row("deleg_prune_origin_trigger")
+
+    record, reason = dr.inspect_resumable(resumable)
+    assert reason is None
+    assert record["state"] == "interrupted"
 
 
 # ---------------------------------------------------------------------------
@@ -285,11 +407,12 @@ def test_resume_action_second_call_is_refused():
     assert "already been claimed" in second
 
 
-def test_resume_action_batch_refusal_is_truthful():
+def test_resume_action_batch_returns_unfinished_children():
     did = _dispatch_row("deleg_action_batch", is_batch=True)
     _mark(did, "unknown")
-    out = _handle_control_action("resume", did, None, _Parent())
-    assert "multi-task batch" in out
+    out = json.loads(_handle_control_action("resume", did, None, _Parent()))
+    assert out["status"] == "recovery_claimed"
+    assert [task["goal"] for task in out["tasks"]] == ["a", "b"]
 
 
 def test_resume_routes_through_delegate_task_entrypoint():

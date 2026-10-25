@@ -39,6 +39,9 @@ class _FakeAdapter:
 
 
 def _make_runner():
+    # Match the completed startup barrier that this bare runner bypasses.
+    from hermes_cli.plugins import get_plugin_manager
+    get_plugin_manager().discover_and_load()
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
@@ -86,7 +89,6 @@ async def test_sentinel_placed_before_agent_setup():
     concurrent message sees the session as occupied."""
     runner = _make_runner()
     event = _make_event()
-    session_key = build_session_key(event.source)
 
     # Patch _handle_message_with_agent to capture state at entry
     sentinel_was_set = False
@@ -293,19 +295,18 @@ async def test_stop_during_sentinel_force_cleans_session():
     session_key = build_session_key(event1.source)
 
     barrier = asyncio.Event()
+    agent_setup_entered = asyncio.Event()
 
     async def slow_inner(self_inner, ev, src, qk, generation):
+        agent_setup_entered.set()
         await barrier.wait()
         return "ok"
 
     with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
         task1 = asyncio.create_task(runner._handle_message(event1))
-        for _ in range(50):
-            await asyncio.sleep(0)
-            if runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL:
-                break
+        await asyncio.wait_for(agent_setup_entered.wait(), timeout=10)
 
-        # Sentinel should be set
+        # Sentinel should be set before the blocked agent setup.
         assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
 
         # Send /stop — should force-clean the sentinel
@@ -408,6 +409,7 @@ async def test_reset_like_commands_invalidate_deferred_queue(command_text):
     runner.adapters[Platform.TELEGRAM] = adapter
     runner._peek_session_state = lambda _key: None
     runner._interrupt_running_turn = lambda *_args, **_kwargs: 1
+    runner._is_session_run_current = lambda *_args: True
     runner._thread_metadata_for_source = lambda _source: {}
     runner._drop_turn_slot = lambda *_args, **_kwargs: None
     runner._overflow_queue = lambda _key: []
@@ -432,15 +434,7 @@ async def test_shutdown_invalidates_all_deferred_commands():
         async def send(self, *args, **kwargs): pass
         async def get_chat_info(self, *args, **kwargs): return None
 
-    adapter = object.__new__(_Adapter)
-    adapter._deferred_commands = {}
-    adapter._session_generations = {}
-    adapter._background_tasks = set()
-    adapter._expected_cancelled_tasks = set()
-    adapter._session_tasks = {}
-    adapter._pending_messages = {}
-    adapter._active_sessions = {}
-    adapter._text_debounce = {}
+    adapter = _Adapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
     adapter.defer_command_until_idle("session", _make_event("/undo"))
     before = adapter._session_generations["session"]
 

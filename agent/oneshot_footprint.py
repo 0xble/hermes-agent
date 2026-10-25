@@ -8,8 +8,8 @@ back into context. Three rules follow, all keyed on the same session marker the 
 delegation dispatcher already read (``HERMES_SINGLE_QUERY_SESSION``), so interactive sessions are untouched:
 
 * ``skill_manage`` is not offered (``skills_list``/``skill_view`` stay: reading a domain skill can still win);
-* the ## Skills prompt drops the "record it / patch it / offer to save" coaching and the "load process skills
-  even for tasks you already know" push, keeping only "load a skill when it adds knowledge you lack";
+* the ## Skills prompt drops the "record it / patch it / offer to save" coaching while still requiring
+  task-governing skills whose procedures, permissions, workflow, or user/project conventions apply;
 * delegation is capped per session (``delegation.oneshot_max_children``): subagents each re-pay a cold
   system prompt and re-explore the repo, and the observed spawns were mostly "independent review of my own
   work" rather than parallel work.
@@ -31,7 +31,7 @@ def is_single_query_session() -> bool:
     return str(get_session_env("HERMES_SINGLE_QUERY_SESSION", "") or "") == "1"
 
 
-def prune_oneshot_tools(tools: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def prune_oneshot_tools(tools: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """*tools* minus ``ONESHOT_HIDDEN_TOOLS``; identity when the session is not one-shot."""
     tools = list(tools)
     if not is_single_query_session():
@@ -41,8 +41,9 @@ def prune_oneshot_tools(tools: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 ONESHOT_SKILLS_LOAD_GUIDANCE = (
     "## Skills\n"
-    "Scan the skills below and load one with skill_view(name) only when it carries domain knowledge you lack "
-    "for THIS task (an API, a tool's commands, a project's conventions). Do not load general process skills "
-    "(testing, debugging, review methodology) for work you already know how to do, and do not create or edit "
-    "skills: this is a one-shot run with no later session to reuse them.\n"
+    "Scan the skills below and load one with skill_view(name) when it carries domain knowledge, "
+    "task-specific procedures, permissions, required workflow, or user/project conventions relevant "
+    "to THIS task, even if you already know the general process. Do not load unrelated skills merely "
+    "because they describe broadly useful process. Do not create or edit skills: this is a one-shot run "
+    "with no later session to reuse them.\n"
 )

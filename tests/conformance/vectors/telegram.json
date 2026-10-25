@@ -2,7 +2,7 @@
   "$comment": "GENERATED — do not hand-edit. Regenerate with hermes-agent scripts/generate_conformance_vectors.py; the native renderers are the oracle (executable spec).",
   "oracle": {
     "repo": "NousResearch/hermes-agent",
-    "commit": "e5d121dfd63d0bb1d24816385efb5e94a2f0332b",
+    "commit": "d8d416c69e17f8f5d27f581ed957f1d0425a22f9",
     "generator": "scripts/generate_conformance_vectors.py",
     "generator_version": 1
   },
@@ -319,7 +319,7 @@
       "category": "adversarial",
       "expect": "semantic",
       "input": "```\na\n```\nmid\n```\nb\n```\nend ```inline``` tail",
-      "native_output": "```\na\n```\nmid\n```\nb\n```\nend ```inline``` tail"
+      "native_output": "```\na\n```\nmid\n```\nb\n```\nend `inline` tail"
     }
   ]
 }

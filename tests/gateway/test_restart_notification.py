@@ -25,7 +25,7 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     marker = tmp_path / ".restart_pending.json"
 
     assert gateway_run._planned_restart_notification_pending() is False
-    marker.write_text("{}")
+    marker.write_text("{}", encoding="utf-8")
     assert gateway_run._planned_restart_notification_pending() is True
 
     gateway_run._planned_restart_notification_path().unlink()
@@ -56,7 +56,7 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
 
     notify_path = tmp_path / ".restart_notify.json"
     assert notify_path.exists()
-    data = json.loads(notify_path.read_text())
+    data = json.loads(notify_path.read_text(encoding="utf-8-sig"))
     assert data["platform"] == "telegram"
     assert data["chat_id"] == "42"
     assert data["chat_type"] == "dm"
@@ -258,7 +258,7 @@ async def test_relay_restart_notification_uses_logical_platform_and_owner(tmp_pa
                 "delivered_via_upstream_relay": True,
             }
         )
-    )
+    , encoding="utf-8")
 
     runner, _native = make_restart_runner()
     relay = MagicMock()
@@ -303,7 +303,7 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
     notify_path.write_text(json.dumps({
         "platform": "telegram",
         "chat_id": "42",
-    }))
+    }), encoding="utf-8")
 
     runner, adapter = make_restart_runner()
     adapter.send = AsyncMock(
@@ -341,6 +341,73 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
 
 
 @pytest.mark.asyncio
+async def test_survivor_notification_acknowledges_only_successful_gateway_admission(tmp_path, monkeypatch):
+    import asyncio
+    import contextlib
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
+    registry = ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    run_dir = home / "process-runs" / "proc_notice"
+    run_dir.mkdir(parents=True)
+    session = ProcessSession(id="proc_notice", command="echo ok", task_id="task",
+                             session_key="session", survive_restart=True, exited=True,
+                             exit_code=0, notify_on_complete=True, log_path=str(run_dir / "out.log"),
+                             delivered_path=str(run_dir / "delivered"), output_buffer="ok")
+    registry._finished[session.id] = session
+    runner, _ = make_restart_runner()
+    runner._completion_event_scope = lambda _: contextlib.nullcontext()
+    runner._load_background_notifications_mode = lambda: "off"
+    runner._launching_turn_active = AsyncMock(return_value=False)
+    attempts = []
+
+    async def admit(_text, _event, **kwargs):
+        assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["state"] == "claimed"
+        attempts.append("admit")
+        return len(attempts) > 1
+
+    runner._enqueue_process_completion_notification = admit
+    runner._build_process_completion_event = lambda *_: {"type": "completion", "session_id": session.id,
+                                                         "output": "ok", "command": session.command,
+                                                         "exit_code": 0, "task_id": "task"}
+    await asyncio.wait_for(runner._run_process_watcher({
+        "session_id": session.id, "check_interval": 0.01, "notify_on_complete": True,
+    }), timeout=5)
+    assert attempts == ["admit", "admit"]
+    assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
+    assert not registry.is_completion_consumed(session.id)
+    await runner._run_process_watcher({
+        "session_id": session.id, "check_interval": 0.01, "notify_on_complete": True,
+    })
+    assert attempts == ["admit", "admit"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_fences_survivor_pollers_before_work_drain(monkeypatch):
+    from gateway.run_shutdown import GatewayShutdownMixin
+    from tools.process_registry import process_registry
+
+    runner, _ = make_restart_runner()
+    calls = []
+    monkeypatch.setattr(process_registry, "stop_survivor_pollers", lambda: calls.append("fence"))
+    runner._stop_hosted_room_worker = AsyncMock(return_value=True)
+    runner._stop_systemd_watchdog = AsyncMock()
+    runner._cancel_secondary_profile_reconnect_tasks = AsyncMock()
+    runner._notify_active_sessions_of_shutdown = AsyncMock()
+    runner._mark_api_runs_shutdown_requested = lambda: calls.append("begin-drain")
+    runner._stop_drain_active_work = AsyncMock(side_effect=lambda *_: calls.append("drain"))
+    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0)
+
+    await runner._stop_begin_teardown(ctx)
+    await runner._stop_drain_active_work(0, ctx)
+
+    assert calls == ["fence", "begin-drain", "drain"]
+
+
+@pytest.mark.asyncio
 async def test_shutdown_notifications_have_one_aggregate_deadline(monkeypatch):
     """A stuck transport must not serialize one timeout per active chat."""
     import asyncio
@@ -363,6 +430,30 @@ async def test_shutdown_notifications_have_one_aggregate_deadline(monkeypatch):
     await runner._stop_begin_teardown(ctx)
     assert entered.is_set()
     assert time.monotonic() - started < 5.0
+@pytest.mark.asyncio
+async def test_shutdown_home_channel_broadcast_carries_interim_marker():
+    """Active-chat and home-channel shutdown sends are interim sends (#98432): a
+    stream-is-the-message adapter must not seal an in-flight answer with the advisory,
+    including when the home channel has no thread routing metadata."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="active-42", chat_type="dm")
+    session_key = build_session_key(source)
+
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m"))
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    targets = [c.args[0] for c in adapter.send.await_args_list]
+    assert targets == ["active-42", "home-42"]
+    for call in adapter.send.await_args_list:
+        assert call.kwargs["metadata"]["_interim_send"] is True
 
 
 @pytest.mark.asyncio
@@ -385,4 +476,117 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
 
     adapter.send.assert_not_awaited()
 
+
+
+
+@pytest.mark.asyncio
+async def test_survivor_watcher_does_not_admit_completion_claimed_by_live_peer(tmp_path, monkeypatch):
+    """A peer gateway's unacknowledged claim fences admission; its ack ends the watcher."""
+    import asyncio
+    import contextlib
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
+    run_dir = home / "process-runs" / "proc_peer"
+    run_dir.mkdir(parents=True)
+
+    def survivor():
+        return ProcessSession(id="proc_peer", command="echo ok", task_id="task", session_key="session",
+                              survive_restart=True, exited=True, exit_code=0, notify_on_complete=True,
+                              log_path=str(run_dir / "out.log"), delivered_path=str(run_dir / "delivered"),
+                              output_buffer="ok")
+
+    peer, registry = ProcessRegistry(), ProcessRegistry()
+    peer._finished["proc_peer"] = survivor()
+    registry._finished["proc_peer"] = survivor()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    assert peer._claim_survivor_delivery(peer._finished["proc_peer"]) is True
+    runner, _ = make_restart_runner()
+    runner._completion_event_scope = lambda _: contextlib.nullcontext()
+    runner._load_background_notifications_mode = lambda: "off"
+    runner._launching_turn_active = AsyncMock(return_value=False)
+    admitted = []
+    runner._enqueue_process_completion_notification = AsyncMock(side_effect=lambda *a, **k: admitted.append(a) or True)
+    runner._build_process_completion_event = lambda *_: {"type": "completion", "session_id": "proc_peer",
+                                                         "output": "ok", "command": "echo ok",
+                                                         "exit_code": 0, "task_id": "task"}
+    watcher = asyncio.ensure_future(runner._run_process_watcher({
+        "session_id": "proc_peer", "check_interval": 0.01, "notify_on_complete": True,
+    }))
+    await asyncio.sleep(0.1)
+    assert admitted == []
+    peer.acknowledge_survivor_completion("proc_peer")
+    await asyncio.wait_for(watcher, timeout=5)
+    assert admitted == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["concise", "off"])
+async def test_survivor_text_watcher_acknowledges_after_presenting(tmp_path, monkeypatch, mode):
+    """The text-only watcher claims before sending and settles the claim after it."""
+    import contextlib
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
+    run_dir = home / "process-runs" / "proc_text"
+    run_dir.mkdir(parents=True)
+    registry = ProcessRegistry()
+    registry._finished["proc_text"] = ProcessSession(
+        id="proc_text", command="echo ok", task_id="task", session_key="session", survive_restart=True,
+        exited=True, exit_code=0, log_path=str(run_dir / "out.log"),
+        delivered_path=str(run_dir / "delivered"), output_buffer="ok")
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    runner, _ = make_restart_runner()
+    runner._completion_event_scope = lambda _: contextlib.nullcontext()
+    runner._load_background_notifications_mode = lambda: mode
+    sent = []
+
+    async def send(*args):
+        sent.append(json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["state"])
+
+    runner._send_watcher_message = send
+    await runner._run_process_watcher({"session_id": "proc_text", "check_interval": 0.01})
+    assert sent == ([] if mode == "off" else ["claimed"])
+    assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
+
+
+@pytest.mark.asyncio
+async def test_survivor_text_watcher_retries_failed_send_before_acknowledging(tmp_path, monkeypatch):
+    import asyncio
+    import contextlib
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
+    run_dir = home / "process-runs" / "proc_retry"
+    run_dir.mkdir(parents=True)
+    registry = ProcessRegistry()
+    registry._finished["proc_retry"] = ProcessSession(
+        id="proc_retry", command="echo ok", task_id="task", session_key="session", survive_restart=True,
+        watcher_platform="telegram", watcher_chat_id="123",
+        exited=True, exit_code=0, log_path=str(run_dir / "out.log"),
+        delivered_path=str(run_dir / "delivered"), output_buffer="ok")
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    runner, adapter = make_restart_runner()
+    runner._completion_event_scope = lambda _: contextlib.nullcontext()
+    runner._load_background_notifications_mode = lambda: "concise"
+    runner._build_process_event_source = lambda _: make_restart_source(chat_id="123")
+    runner._resolve_injection_adapter = lambda *_: adapter
+    sent = []
+
+    async def send(*args, **kwargs):
+        sent.append(json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["state"])
+        return SendResult(success=len(sent) > 1)
+
+    adapter.send = send
+    await asyncio.wait_for(runner._run_process_watcher({
+        "session_id": "proc_retry", "session_key": "session", "check_interval": 0.01,
+        "platform": "telegram", "chat_id": "123"}), timeout=5)
+    assert sent == ["claimed", "claimed"]
+    assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
 

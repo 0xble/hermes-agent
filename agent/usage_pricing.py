@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
-from dataclasses import dataclass, fields
-from datetime import datetime, timezone
+from dataclasses import dataclass, fields, replace
+from datetime import datetime, timezone, UTC
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
 
-from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
+from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata, strip_codex_context_variant_suffix
 from utils import base_url_host_matches, base_url_hostname, base_url_origin
 
 logger = logging.getLogger(__name__)
 
-_ZERO = Decimal("0")
-_ONE_MILLION = Decimal("1000000")
+_ZERO = Decimal(0)
+_ONE_MILLION = Decimal(1000000)
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 # Pay-per-token first-party APIs whose models.dev rate card is the vendor's own
 # list price, keyed by billing-route provider -> API domain. A model missing from
@@ -36,24 +37,26 @@ _SUBCENT_THRESHOLD = Decimal("0.01")
 _INCLUDED_NOTE = "subscription-included; no provider invoice for usage"
 
 
-def format_cost_label(amount: Decimal) -> str:
+def format_cost_label(amount: Decimal, *, approx: bool = True) -> str:
     """Cost display label: zero → "$0.00"; sub-cent → "~$0.0046" (4 dp, or
     "~$<0.0001" when it rounds to 0.0000 so the label never reads as zero);
     else "~$1.23". Shared by per-response labels and insights cost buckets.
+    ``approx=False`` drops the ``~`` for provider-reported (billed) amounts.
 
     This fixes #79220 where sub-cent per-turn costs on cheap models (DeepSeek, etc.) rendered as "$0.00"
     despite amount_usd carrying full Decimal precision.
     """
     if amount == _ZERO:
         return "$0.00"
+    prefix = "~" if approx else ""
     if amount < _SUBCENT_THRESHOLD:
-        label = f"~${amount:.4f}"
+        label = f"{prefix}${amount:.4f}"
         # Compare the rendered label: a naive `< 0.00005` threshold misses
         # the exact boundary under ROUND_HALF_EVEN.
         # A positive amount that rounds to 0.0000 at 4 dp would render "~$0.0000" — a zero-looking label,
         # the exact #79220 dishonesty.
-        return label if label != "~$0.0000" else "~$<0.0001"
-    return f"~${amount:.2f}"
+        return label if label != f"{prefix}$0.0000" else f"{prefix}$<0.0001"
+    return f"{prefix}${amount:.2f}"
 
 CostStatus = Literal["actual", "estimated", "included", "unknown"]
 CostSource = Literal[
@@ -80,7 +83,7 @@ class CanonicalUsage:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.output_tokens
 
-    def __add__(self, other: "CanonicalUsage") -> "CanonicalUsage":
+    def __add__(self, other: CanonicalUsage) -> CanonicalUsage:
         """Sum two usage buckets. ``raw_usage`` (single-response detail) is
         dropped; ``request_count`` adds so callers see how many API calls a
         combined figure covers."""
@@ -133,7 +136,7 @@ class CostResult:
     notes: tuple[str, ...] = ()
 
 
-_UTC_NOW = lambda: datetime.now(timezone.utc)
+_UTC_NOW = lambda: datetime.now(UTC)
 _INCLUDED_ENTRY = PricingEntry(
     input_cost_per_million=_ZERO, output_cost_per_million=_ZERO, cache_read_cost_per_million=_ZERO,
     cache_write_cost_per_million=_ZERO, source="none", pricing_version="included-route",
@@ -162,6 +165,7 @@ _ANTHROPIC_URL = "https://platform.claude.com/docs/en/about-claude/pricing"
 _GOOGLE_URL = "https://ai.google.dev/pricing"
 _OPUS = ("5.00", "25.00", "0.50", "6.25")
 _SONNET = ("3.00", "15.00", "0.30", "3.75")
+_OPUS_5_5 = ("4.00", "20.00", "0.20", "5.00")
 _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
     # OpenAI GPT-5.6 (Sol/Terra/Luna). Cache write = 1.25x input, cache read =
     # 0.10x input. "-pro" high-effort modes bill at the same per-token rates
@@ -193,7 +197,7 @@ _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
     # Opus 5.5 cache hits are 0.05x input (every other Opus: 0.1x).
     ("anthropic", _ANTHROPIC_URL, "anthropic-pricing-2026-09", {
         "claude-opus-5": _OPUS,
-        "claude-opus-5-5": ("4.00", "20.00", "0.20", "5.00"),
+        "claude-opus-5-5": _OPUS_5_5,
     }),
     ("openai", "https://openai.com/api/pricing/", "openai-pricing-2026-03-16", {
         "gpt-4o": ("2.50", "10.00", "1.25"), "gpt-4o-mini": ("0.15", "0.60", "0.075"),
@@ -206,6 +210,10 @@ _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
     ("deepseek", "https://api-docs.deepseek.com/quick_start/pricing", "deepseek-pricing-2026-09-10", {
         ("deepseek-flash", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"): ("0.15", "0.60", "0.003"),
         "deepseek-v4-pro": ("0.66", "1.98", "0.022"),
+    }),
+    # Introductory rates through 2026-11-30; from 2026-12-01 they double ($4 / $20 / $0.20).
+    ("google", "https://ai.google.dev/gemini-api/docs/pricing", "google-pricing-2026-10-13", {
+        "gemini-4-argon": ("2.00", "10.00", "0.10"),
     }),
     ("google", "https://ai.google.dev/gemini-api/docs/pricing", "google-pricing-2026-09-02", {
         ("gemini-3.8-flash", "gemini-3.7-flash"): ("0.75", "3.75", "0.075"),
@@ -223,6 +231,9 @@ _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
     # Price List API had not published these SKUs machine-readably).
     ("bedrock", _BEDROCK_URL, "anthropic-list-2026-07", {
         ("anthropic.claude-opus-4-8", "anthropic.claude-opus-4-7", "anthropic.claude-opus-4-6"): _OPUS,
+    }),
+    ("bedrock", _BEDROCK_URL, "anthropic-list-2026-09", {
+        "anthropic.claude-opus-5": _OPUS, "anthropic.claude-opus-5-5": _OPUS_5_5,
     }),
     ("bedrock", _BEDROCK_URL, "bedrock-pricing-2026-06", {"anthropic.claude-sonnet-5": _SONNET}),
     ("bedrock", _BEDROCK_URL, "bedrock-pricing-2026-04", {
@@ -249,7 +260,7 @@ _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
     }),
 )
 
-_OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {}
+_OFFICIAL_DOCS_PRICING: dict[tuple[str, str], PricingEntry] = {}
 for _provider, _url, _version, _rows in _SNAPSHOTS:
     for _models, _rates in _rows.items():
         _entry = _snap(*_rates, version=_version, url=_url)
@@ -276,6 +287,8 @@ _OFFICIAL_DOCS_PRICING[("openai", "gpt-6-astra")] = _snap(
 # Terra has no published model page yet, so it deliberately has no row.
 for _slug, _inp, _out, _read, _write, _inp_above, _out_above, _read_above, _write_above in (
     ("gpt-6-sol", "2.00", "10.00", "0.20", "2.50", "4.00", "15.00", "0.40", "5.00"),
+    # 6.1 Sol: same input/output as 6 Sol, but cached input is 0.05x input (not 0.10x).
+    ("gpt-6.1-sol", "2.00", "10.00", "0.10", "2.50", "4.00", "15.00", "0.20", "5.00"),
     ("gpt-6-luna", "0.10", "0.50", "0.01", "0.125", "0.20", "0.75", "0.02", "0.25"),
 ):
     _OFFICIAL_DOCS_PRICING[("openai", _slug)] = _snap(
@@ -289,6 +302,32 @@ for _slug, _inp, _out, _read, _write, _inp_above, _out_above, _read_above, _writ
         cache_write_cost_per_million_above=Decimal(_write_above),
     )
 del _slug, _inp, _out, _read, _write, _inp_above, _out_above, _read_above, _write_above
+
+# OpenAI Ultrafast (``service_tier: "ultrafast"``): 6x Standard on every bucket, same 272K
+# whole-request tier. Selected by the tier the response reports it was SERVED at (a request asking
+# for Ultrafast can be served at ``default``, and is then billed at Standard).
+_OPENAI_ULTRAFAST_PRICING: dict[str, PricingEntry] = {
+    "gpt-6-astra": _snap(
+        "60.00", "300.00", "6.00", "75.00",
+        url="https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast",
+        version="openai-ultrafast-2026-09",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("120.00"),
+        output_cost_per_million_above=Decimal("450.00"),
+        cache_read_cost_per_million_above=Decimal("12.00"),
+        cache_write_cost_per_million_above=Decimal("150.00"),
+    ),
+    "gpt-6.1-sol": _snap(
+        "12.00", "60.00", "0.60", "15.00",
+        url="https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast",
+        version="openai-ultrafast-2026-10-08",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("24.00"),
+        output_cost_per_million_above=Decimal("90.00"),
+        cache_read_cost_per_million_above=Decimal("1.20"),
+        cache_write_cost_per_million_above=Decimal("30.00"),
+    ),
+}
 
 # Context-tiered Gemini Pro: above 200k prompt tokens the *_above rates apply to
 # the whole request (see PricingEntry).
@@ -304,7 +343,7 @@ _OFFICIAL_DOCS_PRICING[("google", "gemini-2.5-pro")] = _snap(
 )
 # Anthropic fast mode (``speed: "fast"``): a premium on the whole context window, with the
 # prompt-caching multipliers applied on top. Selected per response by ``usage.speed``.
-_ANTHROPIC_FAST_MODE_PRICING: Dict[str, PricingEntry] = {
+_ANTHROPIC_FAST_MODE_PRICING: dict[str, PricingEntry] = {
     _model: _snap(*_rates, version="anthropic-fast-mode-2026-09", url=f"{_ANTHROPIC_URL}#fast-mode-pricing")
     for _models, _rates in (
         (("claude-opus-4-8", "claude-opus-5"), ("10.00", "50.00", "1.00", "12.50")),
@@ -312,7 +351,7 @@ _ANTHROPIC_FAST_MODE_PRICING: Dict[str, PricingEntry] = {
     )
     for _model in _models
 }
-del _BEDROCK_URL, _ANTHROPIC_URL, _GOOGLE_URL, _OPUS, _SONNET
+del _BEDROCK_URL, _ANTHROPIC_URL, _GOOGLE_URL, _OPUS, _SONNET, _OPUS_5_5
 
 # GPT-5.6 / GPT-6 tier "-pro" high-effort variants bill at the base tier's per-token
 # rates (more tokens per task, not a higher rate); the Hermes-side "-900k" Codex
@@ -320,9 +359,9 @@ del _BEDROCK_URL, _ANTHROPIC_URL, _GOOGLE_URL, _OPUS, _SONNET
 # The direct Gemini provider emits preview IDs for two models; key the snapshot
 # by both the documented stable name and the emitted ID.
 for _provider, _alias, _canonical in (
-    *((("openai", f"{m}-{suffix}", m)
-       for m in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna")
-       for suffix in ("pro", "900k"))),
+    *(("openai", f"{m}-{suffix}", m)
+       for m in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol")
+       for suffix in ("pro", "900k")),
     ("google", "gemini-3.1-pro-preview", "gemini-3.1-pro"),
     ("google", "gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite"),
 ):
@@ -403,6 +442,8 @@ def resolve_billing_route(
         elif provider_name == "fireworks" or host("api.fireworks.ai"):
             snapshot_provider = "fireworks"
     if snapshot_provider:
+        if snapshot_provider == "openai" and (not url or host("api.openai.com")):
+            bare = strip_codex_context_variant_suffix(bare)
         return BillingRoute(provider=snapshot_provider, model=bare, base_url=url, billing_mode="official_docs_snapshot")
     if provider_name in {"custom", "local"} or (base and base_url_hostname(base) in ("localhost", "127.0.0.1")):
         return BillingRoute(provider=provider_name or "custom", model=model, base_url=url, billing_mode="unknown")
@@ -449,6 +490,19 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
     return _OFFICIAL_DOCS_PRICING.get((route.provider, normalized)) if normalized != model else None
 
 
+def with_served_service_tier(usage: CanonicalUsage, response: Any) -> CanonicalUsage:
+    """``usage`` with the response's served ``service_tier`` folded into ``raw_usage``. OpenAI reports
+    the tier on the response, not inside ``usage``, and pricing reads it from ``raw_usage``."""
+    tier = getattr(response, "service_tier", None)
+    if not isinstance(tier, str) or not tier.strip():
+        return usage
+    return replace(usage, raw_usage={**(usage.raw_usage or {}), "service_tier": tier.strip().lower()})
+
+
+def _served_openai_tier(usage: CanonicalUsage) -> Optional[str]:
+    return usage.raw_usage.get("service_tier") if isinstance(usage.raw_usage, dict) else None
+
+
 def _served_fast(usage: CanonicalUsage) -> bool:
     """Anthropic names the speed that served a fast-mode request in ``usage.speed``."""
     return isinstance(usage.raw_usage, dict) and usage.raw_usage.get("speed") == "fast"
@@ -469,7 +523,7 @@ def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
 
 
 def _pricing_entry_from_metadata(
-    metadata: Dict[str, Dict[str, Any]], model_id: str, *, source_url: str, pricing_version: str
+    metadata: dict[str, dict[str, Any]], model_id: str, *, source_url: str, pricing_version: str
 ) -> Optional[PricingEntry]:
     if model_id not in metadata:
         return None
@@ -624,12 +678,45 @@ def normalize_usage(
     return CanonicalUsage(
         input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens, reasoning_tokens=reasoning_tokens,
-        raw_usage=dict(u) if isinstance(u, dict) else (u.model_dump() if callable(getattr(u, 'model_dump', None)) else None),
+        raw_usage=dict(u) if isinstance(u, dict) else (
+            u.model_dump() if callable(getattr(u, 'model_dump', None))
+            # Plain-attribute usage objects can carry provider extensions such as ``cost``.
+            else (dict(vars(u)) if hasattr(u, '__dict__') and vars(u) else None)
+        ),
     )
 
 
 def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
     return CostResult(amount_usd=None, status="unknown", source=source, label="n/a", notes=notes)
+
+
+def provider_reported_cost(usage: CanonicalUsage) -> Optional[Decimal]:
+    """The provider's finite, non-negative per-call billed amount, if the usage carries one.
+
+    Nous reports it as ``cost_details.upstream_inference_cost``; OpenRouter as a flat ``cost``.
+    Some OpenRouter responses pair a zero ``upstream_inference_cost`` with a positive flat
+    ``cost``; the zero must not mask that billed amount.
+    """
+    raw = usage.raw_usage if isinstance(usage.raw_usage, dict) else None
+    if raw is None:
+        return None
+
+    def read(path: tuple[str, ...]) -> Optional[Decimal]:
+        value: Any = raw
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else getattr(value, key, None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        cost = float(value)
+        if not math.isfinite(cost) or cost < 0:
+            return None
+        return Decimal(str(cost))
+
+    nested = read(("cost_details", "upstream_inference_cost"))
+    flat = read(("cost",))
+    if nested is not None and (nested > 0 or flat is None or flat <= 0):
+        return nested
+    return flat
 
 
 def estimate_usage_cost(
@@ -648,11 +735,24 @@ def estimate_usage_cost(
             pricing_version="included-route", notes=(_INCLUDED_NOTE,),
         )
 
+    # A provider-reported amount already applies the provider's billing rules, so it wins
+    # over any local pricing-table estimate.
+    billed = provider_reported_cost(usage)
+    if billed is not None:
+        return CostResult(
+            amount_usd=billed, status="actual", source="provider_cost_api",
+            label=format_cost_label(billed, approx=False),
+        )
+
     entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
     if route.provider == "anthropic" and _served_fast(usage):
         entry = _anthropic_fast_mode_entry(route.model)
         if not entry:
             return _unknown_cost("official_docs_snapshot", "fast-mode pricing unavailable for model")
+    if route.provider == "openai" and _served_openai_tier(usage) == "ultrafast":
+        entry = _OPENAI_ULTRAFAST_PRICING.get(route.model)
+        if not entry:
+            return _unknown_cost("official_docs_snapshot", "ultrafast pricing unavailable for model")
     if not entry:
         return _unknown_cost("none")
 
@@ -728,12 +828,3 @@ def format_token_count_compact(value: int) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return f"{sign}{text}{suffix}"
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-
-DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
-# ---- END PLUGIN-COMPAT ----

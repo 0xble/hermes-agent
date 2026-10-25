@@ -99,6 +99,7 @@ def test_fail_closed_probe_reports_guard_active():
 # ──────────────────── kill primitives ─────────────────────────
 
 
+@pytest.mark.platforms("linux")
 def test_os_kill_blocks_foreign_pid():
     with pytest.raises(RuntimeError, match="live-system guard"):
         os.kill(FOREIGN_PID, signal.SIGTERM)
@@ -121,38 +122,221 @@ def test_os_killpg_blocks_foreign_pgid():
 
 def test_subprocess_run_systemctl_restart_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["systemctl", "--user", "restart", "hermes-gateway"])
+        subprocess.run(["systemctl", "--user", "restart", "hermes-gateway"], check=False)
+
+
+@pytest.mark.parametrize(
+    "executable",
+    [
+        r"C:\repo\.venv\Scripts\hermes.exe",
+        r"C:\repo\.venv\Scripts\HERMES.EXE",
+        r"C:\repo\hermes.exe",
+        r"C:\repo\HERMES.EXE",
+        r"C:\repo\.venv\Scripts\hermes",
+        r"C:\repo\.venv\Scripts\HERMES",
+        r"C:\repo\hermes",
+        r"C:\repo\HERMES",
+    ],
+)
+def test_subprocess_run_windows_native_hermes_update_blocked(executable):
+    """Native Windows argv preserves backslashes and must still block updates."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        _check_update_command_without_spawning([executable, "update"])
+
+
+def _check_update_command_without_spawning(command, kwargs=None):
+    # Exercise the installed guard, never a real updater if the canary fails.
+    import inspect
+
+    check = inspect.getclosurevars(subprocess.run).nonlocals["_check_subprocess_cmd"]
+    check("Popen", command, kwargs)
+
+
+@pytest.mark.parametrize(
+    "command, blocked",
+    [
+        pytest.param(["bash", "-c", "hermes update --gateway"], True, id="bash-c"),
+        pytest.param(["setsid", "bash", "-c", "python -m hermes_cli.main update --gateway"], True, id="setsid-bash-c"),
+        pytest.param(["sh", "-lc", "hermes update"], True, id="sh-lc"),
+        pytest.param(["bash", "-lc", "--", "hermes update"], True, id="shell-command-option-boundary"),
+        pytest.param(["zsh", "-ic", "hermes update"], True, id="zsh-ic"),
+        pytest.param(["dash", "-ilc", "hermes update"], True, id="dash-combined-c"),
+        pytest.param(["env", "MODE=test", "nohup", "timeout", "10", "sudo", "-u", "nobody", "/bin/bash", "-lc", "hermes update"], True, id="prefixed-bash-lc"),
+        pytest.param(["cmd", "/c", r"C:\repo\hermes.exe update"], True, id="cmd-c"),
+        pytest.param(["cmd.exe", "/c", r'"C:\Program Files\hermes.exe" update'], True, id="cmd-exe-c-quoted"),
+        pytest.param(["powershell", "-Command", r"C:\repo\hermes.exe update"], True, id="powershell-command"),
+        pytest.param(["pwsh", "-c", r"& 'C:\Program Files\hermes.exe' update"], True, id="pwsh-c-quoted"),
+        pytest.param(["bash", "-c", "sh -lc 'hermes update'"], True, id="nested-shells"),
+        pytest.param(["bash", "-c", "hermes update '"], True, id="malformed-shell-fail-closed"),
+        pytest.param(["bash", "-c", "hermes update; true"], True, id="shell-operator"),
+        pytest.param(["bash", "-c", "echo ok; sh -c 'hermes update'"], True, id="nested-after-command"),
+        pytest.param(["bash", "-c", "sh -c true; sh -c 'hermes update'"], True, id="second-shell-payload"),
+        pytest.param(["bash", "-c", "python -m hermes_cli.main update '"], True, id="malformed-module-fail-closed"),
+        pytest.param(["bash", "-c", "hermes status"], False, id="shell-read-only"),
+        pytest.param(["cmd", "/c", r"C:\hermes-ci-home\npm-fixture\npm.cmd update"], True, id="cmd-npm-update-conservative-base"),
+        pytest.param(["python", "-c", "print(\"hermes update\")"], False, id="non-shell-payload"),
+        pytest.param(["bash", "-c", r'printf %s "C:\Program Files\npm.cmd update"'], False, id="shell-data-argument"),
+    ],
+)
+def test_shell_wrapper_hermes_update_blocked_without_spawning(command, blocked):
+    if blocked:
+        with pytest.raises(RuntimeError, match="would run.*hermes update"):
+            _check_update_command_without_spawning(command)
+    else:
+        _check_update_command_without_spawning(command)
+
+
+@pytest.mark.parametrize(
+    "command, blocked",
+    [
+        pytest.param(r"C:\repo\.venv\Scripts\hermes.exe update", True, id="native-windows-string"),
+        pytest.param(r'"C:\Program Files\hermes.exe" update', True, id="quoted-windows-spaces"),
+        pytest.param(r"C:\Program Files\hermes.exe update", True, id="unquoted-windows-spaces"),
+        pytest.param(r'"C:\Program Files\hermes.exe update', True, id="malformed-windows-fail-closed"),
+        pytest.param(r"C:\hermes-ci-home\npm-fixture\npm.cmd update", True, id="native-npm-update-conservative-base"),
+        pytest.param(r'"C:\Program Files\hermes.exe" status', False, id="windows-read-only"),
+    ],
+)
+def test_windows_string_hermes_update_blocked_without_spawning(command, blocked):
+    if blocked:
+        with pytest.raises(RuntimeError, match="would run.*hermes update"):
+            _check_update_command_without_spawning(command)
+    else:
+        _check_update_command_without_spawning(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(["python", "hermes_cli/main.py", "update"], id="relative-script"),
+        pytest.param(["python", "/repo/hermes_cli/main.py", "update"], id="absolute-posix-script"),
+        pytest.param(["python", r"C:\repo\hermes_cli\main.py", "update"], id="windows-script"),
+        pytest.param(["bash", "-c", "python hermes_cli/main.py update"], id="bash-script"),
+        pytest.param(["bash", "-c", 'exec hermes "$@"', "--", "update"], id="shell-positional-update"),
+    ],
+)
+def test_round_three_updater_bypasses_blocked_without_spawning(command):
+    with pytest.raises(RuntimeError, match="would run.*hermes update"):
+        _check_update_command_without_spawning(command)
+
+
+def test_updater_guard_is_at_least_as_blocking_as_pre_pr_base():
+    """Cross-product regression: every updater the frozen baseline blocks stays blocked."""
+    import inspect
+    import shlex
+
+    check = inspect.getclosurevars(subprocess.run).nonlocals["_check_subprocess_cmd"]
+    base = inspect.getclosurevars(check).nonlocals["_base_is_hermes_update"]
+    entrypoints = [
+        ["hermes"], ["HERMES"], ["hermes.exe"], ["hermes.cmd"],
+        ["/repo/.venv/bin/hermes"], ["/repo with spaces/.venv/bin/hermes"],
+        [r"C:\repo\.venv\Scripts\hermes.exe"], [r"C:\Program Files\HERMES.EXE"],
+        ["python", "-m", "hermes_cli.main"], ["python3", "-m", "hermes_cli.main.py"],
+        ["python", "hermes_cli/main.py"], ["python", "/repo/hermes_cli/main.py"],
+        ["python", r"C:\repo\hermes_cli\main.py"],
+    ]
+    suffixes = [["update"], ["update", "--gateway"], ["--profile", "test", "update"],
+                ["UPDATE"], ["update", "--yes"], ["update;", "true"]]
+    wrappers = [
+        lambda argv: argv,
+        lambda argv: ["env", "MODE=test", *argv],
+        lambda argv: ["setsid", *argv],
+        lambda argv: ["sudo", "-u", "nobody", *argv],
+        lambda argv: ["bash", "-c", " ".join(argv)],
+        lambda argv: ["setsid", "bash", "-lc", " ".join(argv)],
+        lambda argv: ["bash", "-c", 'exec "$@"', "--", *argv],
+        lambda argv: ["cmd.exe", "/c", " ".join(argv)],
+        lambda argv: ["powershell", "-Command", " ".join(argv)],
+        lambda argv: ["bash", "-c", "sh -lc " + shlex.quote(" ".join(argv))],
+    ]
+    matched = 0
+    for entrypoint in entrypoints:
+        for suffix in suffixes:
+            for wrap in wrappers:
+                argv = wrap([*entrypoint, *suffix])
+                text = " ".join(argv)
+                for command in (argv, tuple(argv), text, text.encode()):
+                    # Frozen behavior from adaf68a8, independent of the live helper.
+                    low = text.lower()
+                    base_blocked = "update" in low and (
+                        ("hermes" in low and "update" in low.split())
+                        or ("hermes_cli" in low and "update" in low.split())
+                        or (".venv/bin/hermes" in low and "update" in low)
+                    )
+                    assert base(command) == base_blocked, command
+                    if base_blocked:
+                        matched += 1
+                        with pytest.raises(RuntimeError, match="would run.*hermes update"):
+                            _check_update_command_without_spawning(command)
+    assert matched > 0  # The implication must not pass vacuously.
+    print(f"pre-PR base implication: {matched} updater shapes blocked")
+
+
+def test_npm_refresh_allowance_is_only_the_direct_temporary_fixture(tmp_path, monkeypatch):
+    import tempfile
+
+    temp = tmp_path / "hermes-ci-home"
+    root = temp / "pm-deps-fixture"
+    repo = root / "repo"
+    repo.mkdir(parents=True)
+    binary = root / "store" / "npm-fixture"
+    binary = binary / "npm.cmd" if os.name == "nt" else binary / "bin" / "npm"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("fixture, never executed")
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp))
+    command = [str(binary), "update"]
+    kwargs = {"cwd": str(repo)}
+    _check_update_command_without_spawning(command, kwargs)
+    _check_update_command_without_spawning(tuple(command), kwargs)
+
+    # The exception is not an npm basename allowlist or a shell-string exemption.
+    denied = [
+        (command, None), (command, {"cwd": str(temp)}),
+        (command, {**kwargs, "shell": True}),
+        (command, {**kwargs, "executable": "hermes"}),
+        ([*command, "--gateway"], kwargs),
+        (" ".join(command), kwargs),
+        (["bash", "-c", " ".join(command)], kwargs),
+        (["cmd.exe", "/c", " ".join(command)], kwargs),
+        ([str(root / "store" / "npm-fixture" / "hermes.exe"), "update"], kwargs),
+        ([str(root / ".venv" / "bin" / "hermes"), "update"], kwargs),
+        (["python", str(root / "hermes_cli" / "main.py"), "update"], kwargs),
+        (["bash", "-c", 'exec hermes "$@"', "--", "update"], kwargs),
+    ]
+    for candidate, options in denied:
+        with pytest.raises(RuntimeError, match="would run.*hermes update"):
+            _check_update_command_without_spawning(candidate, options)
 
 
 def test_subprocess_run_full_path_systemctl_blocked():
     """``/usr/bin/systemctl`` (full path) must be blocked too."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["/usr/bin/systemctl", "--user", "stop", "hermes-gateway"])
+        subprocess.run(["/usr/bin/systemctl", "--user", "stop", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_sudo_systemctl_blocked():
     """``sudo systemctl ...`` defeated the old head==systemctl check."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["sudo", "systemctl", "restart", "hermes-gateway"])
+        subprocess.run(["sudo", "systemctl", "restart", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_env_systemctl_blocked():
     """``env systemctl ...`` similarly defeated the old head check."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["env", "systemctl", "--user", "restart", "hermes-gateway"])
+        subprocess.run(["env", "systemctl", "--user", "restart", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_bash_c_systemctl_blocked():
     """``bash -c "systemctl ..."`` must also be caught."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["bash", "-c", "systemctl --user restart hermes-gateway"])
+        subprocess.run(["bash", "-c", "systemctl --user restart hermes-gateway"], check=False)
 
 
 
 
 def test_subprocess_run_setsid_systemctl_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["setsid", "systemctl", "kill", "hermes-gateway"])
+        subprocess.run(["setsid", "systemctl", "kill", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_string_shell_true_blocked():
@@ -160,6 +344,7 @@ def test_subprocess_run_string_shell_true_blocked():
         subprocess.run(
             "systemctl --user restart hermes-gateway",
             shell=True,
+            check=False,
         )
 
 
@@ -209,6 +394,7 @@ def test_os_popen_systemctl_blocked():
 # ──────────────────── pty.spawn ────────────────────────────────
 
 
+@pytest.mark.platforms("linux")
 def test_pty_spawn_systemctl_blocked():
     import pty
     with pytest.raises(RuntimeError, match="live-system guard"):
@@ -247,7 +433,7 @@ def test_asyncio_create_subprocess_shell_systemctl_blocked():
 
 def test_subprocess_pkill_hermes_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["pkill", "-f", "hermes"])
+        subprocess.run(["pkill", "-f", "hermes"], check=False)
 
 
 
@@ -255,12 +441,12 @@ def test_subprocess_pkill_hermes_blocked():
 def test_subprocess_pkill_python_dash_f_blocked():
     """``pkill -f python`` matches the gateway's "python -m hermes_cli.main"."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["pkill", "-f", "python"])
+        subprocess.run(["pkill", "-f", "python"], check=False)
 
 
 def test_subprocess_killall_hermes_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["killall", "hermes"])
+        subprocess.run(["killall", "hermes"], check=False)
 
 
 # ──────────────────── pass-through cases (must NOT raise) ──────
@@ -295,6 +481,19 @@ def test_subprocess_popen_real_gateway_restart_blocked():
         )
 
 
+def test_subprocess_popen_inline_source_restart_watcher_blocked():
+    """``gateway._spawn_gateway_restart_watcher`` hides the real gateway argv behind
+    ``python -c <src> <old_pid> …``. The identity matcher must ignore that trailing argv (#107002),
+    but the guard reads it as SPAWN INTENT — otherwise the watcher sails through, waits out its
+    120s deadline and leaves a real detached gateway squatting the webhook port."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(1)", "4242",
+             sys.executable, "-m", "hermes_cli.main", "gateway", "run"],
+            start_new_session=True,
+        )
+
+
 def test_subprocess_run_gateway_status_passes_through():
     """Only lifecycle verbs are blocked: ``gateway status`` (and every other
     read-only subcommand) must still spawn — via the canonical matcher, not an
@@ -302,6 +501,7 @@ def test_subprocess_run_gateway_status_passes_through():
     result = subprocess.run(
         [sys.executable, "-c", "import sys; print(sys.argv[1:])", "-m", "hermes_cli.main", "gateway", "status"],
         capture_output=True, text=True,
+        check=False,
     )
     assert result.returncode == 0
 
@@ -321,3 +521,5 @@ def test_bypass_marker_disables_guard():
     # so we get the real os.kill. Calling os.kill(os.getpid(), 0) just
     # checks that the PID exists — harmless.
     os.kill(os.getpid(), 0)  # No exception — guard is OFF.
+    # Signal 0 passes the guard too, so prove the patch itself is absent.
+    assert not _live_system_guard_is_active()

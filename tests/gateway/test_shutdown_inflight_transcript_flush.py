@@ -35,7 +35,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -59,6 +59,9 @@ def _make_runner():
         return func(*args)
 
     runner._run_in_executor_with_context = _inline_executor
+    runner._run_housekeeping_in_executor = _inline_executor
+    runner._run_release_in_profile_scope = lambda func, args, _session_key: func(*args)
+    runner._FINALIZE_TIMEOUT_S = 10.0
     return runner
 
 
@@ -84,6 +87,8 @@ class _FakeAgent:
             self._drop_trailing_empty_response_scaffolding = MagicMock()
         self.shutdown_memory_provider = MagicMock()
         self.close = MagicMock()
+        self._memory_manager = MagicMock()
+        self._memory_manager.flush_pending = MagicMock(return_value=True)
         self.session_id = "sess-1"
 
 
@@ -106,6 +111,40 @@ class TestFinalizeShutdownFlushesInflightTranscript:
         agent._flush_messages_to_session_db.assert_called_once_with(inflight)
         # Cleanup still happens after the flush.
         agent.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_all_interrupted_transcripts_flush_before_slow_finalize_hook(self):
+        """A slow first hook must not prevent later interrupted transcripts from flushing."""
+        runner = _make_runner()
+        agent_a = _FakeAgent(session_messages=[{"role": "tool", "content": "A partial"}])
+        agent_b = _FakeAgent(session_messages=[{"role": "tool", "content": "B partial"}])
+        async def slow_finalize(**kwargs):
+            await asyncio.sleep(kwargs.get("timeout") or 0)
+
+        runner._finalize_session_off_loop = slow_finalize
+
+        await runner._finalize_shutdown_agents(
+            {"a": agent_a, "b": agent_b},
+            interrupted=True,
+            deadline=asyncio.get_running_loop().time() + 0.01,
+        )
+
+        agent_a._flush_messages_to_session_db.assert_called_once_with(agent_a._session_messages)
+        agent_b._flush_messages_to_session_db.assert_called_once_with(agent_b._session_messages)
+
+    @pytest.mark.asyncio
+    async def test_timed_out_agent_runs_bounded_hooks_after_flush(self):
+        runner = _make_runner()
+        agent = _FakeAgent(session_messages=[{"role": "tool", "content": "partial"}])
+        runner._finalize_session_off_loop = AsyncMock()
+        runner._cleanup_agent_resources_off_loop = AsyncMock()
+
+        await runner._finalize_shutdown_agents({"session:interrupted": agent}, interrupted=True)
+
+        agent._flush_messages_to_session_db.assert_called_once_with(agent._session_messages)
+        runner._finalize_session_off_loop.assert_awaited_once()
+        runner._cleanup_agent_resources_off_loop.assert_not_awaited()
+        agent._memory_manager.flush_pending.assert_called_once_with(timeout=10.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────

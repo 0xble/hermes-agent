@@ -102,7 +102,9 @@ class SessionPersistenceMixin:
             if home is None:
                 return self._db
             return self._open_session_db_for_active_scope(db_path=home / "state.db")
-        except Exception:
+        except Exception as exc:
+            if _is_live_system_guard(exc):
+                raise
             return None
 
     def _named_profile_for_key(self, session_key: Optional[str]) -> Optional[str]:
@@ -162,7 +164,9 @@ class SessionPersistenceMixin:
                 return self._db
             try:
                 return self._open_session_db_for_active_scope(db_path=routing_home / "state.db")
-            except Exception:
+            except Exception as exc:
+                if _is_live_system_guard(exc):
+                    raise
                 return None
         home = self._profile_home_for_key(session_key)
         if home is None:
@@ -174,7 +178,9 @@ class SessionPersistenceMixin:
             return None
         try:
             return self._open_session_db_for_active_scope(db_path=home / "state.db")
-        except Exception:
+        except Exception as exc:
+            if _is_live_system_guard(exc):
+                raise
             return None  # same contract as ``_db``: a failed open degrades to JSONL fallback
 
     def _owner_key_for_session_id(self, session_id: Optional[str]) -> Optional[str]:
@@ -290,7 +296,7 @@ class SessionPersistenceMixin:
         if not sessions_file.exists():
             return
         try:
-            with open(sessions_file, "r", encoding="utf-8") as f:
+            with open(sessions_file, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             imported = 0
             for key, entry_data in data.items():
@@ -339,6 +345,8 @@ class SessionPersistenceMixin:
                     self._entries[key] = verdict
                     recovered_keys += 1
         except Exception as exc:
+            if _is_live_system_guard(exc):
+                raise
             logger.warning("gateway.session: stale-entry pruning skipped due to DB error: %s", exc)
             return
         for key in stale_keys:
@@ -368,6 +376,12 @@ class SessionPersistenceMixin:
                 "gateway.session: repointing stale sessions.json entry %r from ended %s "
                 "(end_reason=%r) to recovered %s", key, entry.session_id, row["end_reason"],
                 recovered_entry.session_id)
+            if entry.prompt_pin and (
+                self._compression_tip_for_session_id(entry.session_id) == recovered_entry.session_id
+            ):
+                # The compression child continues this conversation: its internal turns keep the
+                # pinned system bytes (the rebuilt entry is minimal and would drop them).
+                recovered_entry.prompt_pin = entry.prompt_pin
             return recovered_entry
         # Same-id recovery == successful resume: keep the ORIGINAL entry object (the recovered one
         # is rebuilt minimal and would drop counters, model_override, resume markers, metadata).
@@ -384,7 +398,7 @@ class SessionPersistenceMixin:
             "a crashed gateway", key, entry.session_id, row["end_reason"])
         return "prune"
 
-    def _entries_as_dicts(self) -> Dict[str, Any]:
+    def _entries_as_dicts(self) -> dict[str, Any]:
         """Serializable snapshot of ``_entries``. Lock held."""
         return {key: entry.to_dict() for key, entry in self._entries.items()}
 
@@ -428,12 +442,12 @@ class SessionPersistenceMixin:
         self._routing_db_loaded = True
         self._routing_fallback_baseline = None
 
-    def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
+    def _snapshot_routing_locked(self) -> tuple[dict[str, Any], int]:
         """Capture immutable routing data and a monotonic generation."""
         self._reconcile_recovered_routing_locked()
         return self._entries_as_dicts(), self._next_routing_generation_locked()
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(self, data: dict[str, Any], generation: int) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         with self._lazy("_save_lock", threading.Lock):
             if generation <= getattr(self, "_persisted_routing_generation", 0):
@@ -471,7 +485,7 @@ class SessionPersistenceMixin:
                 for key in [k for k, (rev, _) in fast_persisted.items() if rev <= generation]:
                     del fast_persisted[key]
 
-    def _save_sessions_json(self, data: Dict[str, Any]) -> None:
+    def _save_sessions_json(self, data: dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""
         atomic_json_write(self.sessions_dir / "sessions.json", {"_README": _SESSIONS_JSON_README, **data}, mode=0o600)
 
@@ -482,7 +496,7 @@ class SessionPersistenceMixin:
         self._persist_routing_data(data, generation)
 
     def _save_entry(
-        self, session_key: str, *, entry_data: Optional[Dict[str, Any]] = None,
+        self, session_key: str, *, entry_data: Optional[dict[str, Any]] = None,
         lock_held: bool = False) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path (a full rewrite fsyncs a
         multi-MB sessions.json). The key -> session_id mapping never changes here: structural

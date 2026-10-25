@@ -18,6 +18,7 @@ silently stalling goal loops on messaging gateways.
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 import pytest
 
@@ -189,7 +190,8 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     with patch(
         "hermes_cli.goals.judge_goal",
         return_value=("continue", "still needs work", False, None, False),
-    ):
+    ), patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -202,3 +204,95 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
         f"drains: pending keys={list(adapter._pending_messages)} "
         f"expected={adapter_key}"
     )
+
+
+@pytest.mark.asyncio
+async def test_gateway_goal_continuation_uses_synthetic_provenance(hermes_home):
+    """The real gateway post-turn caller must count chained continuations as automatic turns."""
+    from datetime import datetime
+    from unittest.mock import MagicMock, patch
+    import uuid
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
+    runner._queued_events = {}
+    entry = SessionEntry(
+        session_key=key, session_id=f"synthetic-{uuid.uuid4().hex[:8]}", created_at=datetime.now(),
+        updated_at=datetime.now(), platform=Platform.SLACK, chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store._generate_session_key.return_value = key
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+    GoalManager(entry.session_id).set("wait for external review", max_turns=20)
+
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "external review still pending", False, None, False),
+    ):
+        await runner._post_turn_goal_continuation(
+            session_entry=entry, source=src, final_response="nothing new",
+        )
+
+    # Counted as automatic: a no-evidence CONTINUE parks on the first rung of the
+    # quiet no-progress ladder instead of chaining a continuation.
+    state = GoalManager(entry.session_id).state
+    assert state is not None and state.status == "active"
+    assert state.consecutive_no_progress == 1
+    assert state.backoff_level == 1
+    assert state.waiting_until - state.waiting_since == pytest.approx(900, abs=1)
+    assert key not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_gateway_chained_no_progress_continuations_park_silently_on_the_ladder(hermes_home):
+    """The first no-progress automatic turn parks silently; later wakes are held unjudged."""
+    from datetime import datetime
+    from unittest.mock import MagicMock, patch
+    import uuid
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
+    runner._queued_events = {}
+    entry = SessionEntry(
+        session_key=key, session_id=f"gap-{uuid.uuid4().hex[:8]}", created_at=datetime.now(),
+        updated_at=datetime.now(), platform=Platform.SLACK, chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store._generate_session_key.return_value = key
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+    GoalManager(entry.session_id).set("wait for external review", max_turns=20)
+
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "external review still pending", False, None, False),
+    ) as judge:
+        for _ in range(3):
+            await runner._post_turn_goal_continuation(
+                session_entry=entry, source=src, final_response="nothing new",
+            )
+
+    state = GoalManager(entry.session_id).state
+    assert state is not None and state.status == "active"
+    assert state.waiting_until > state.waiting_since
+    assert state.backoff_level == 1
+    assert judge.call_count == 1 and state.turns_used == 1  # later wakes held without a judge call
+    assert key not in adapter._pending_messages
+    assert adapter.sent == []  # the ladder is quiet

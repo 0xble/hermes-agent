@@ -24,6 +24,9 @@ from gateway.config import GatewayConfig
 from gateway.session import SessionStore
 from hermes_state import SessionDB
 
+# These probe the live-DB guard against the real root on purpose.
+pytestmark = pytest.mark.allow_real_home_io
+
 # Must match the root the guard itself computes.  Hardcoding ``~/.hermes``
 # silently disarmed every assertion below on Windows, where the real root is
 # ``%LOCALAPPDATA%\hermes``: the paths under test were then *correctly*
@@ -120,8 +123,11 @@ class TestSessionStoreLoudFailure:
             )
 
         monkeypatch.setattr(hermes_state, "SessionDB", _boom)
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        # SessionStore construction is intentionally DB-free; the guard must still be loud at
+        # the first lazy state.db access rather than degrading to the JSONL fallback.
         with pytest.raises(RuntimeError, match="live-system guard"):
-            SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+            store._ensure_loaded()
 
     def test_ordinary_db_failure_still_degrades_to_jsonl(
         self, tmp_path, monkeypatch
@@ -163,6 +169,7 @@ class TestSubprocessChildCovered:
             text=True,
             env=env,
             timeout=120,
+            check=False,
         )
         assert proc.returncode != 0
         assert "live-system guard" in proc.stderr
@@ -189,6 +196,7 @@ class TestSubprocessChildCovered:
             text=True,
             env=env,
             timeout=120,
+            check=False,
         )
         assert proc.returncode == 0, proc.stderr
         assert "OK" in proc.stdout

@@ -13,8 +13,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli import gateway, gateway_launchd, immutable_releases as releases, update_cmd, update_cmd_fleet, update_receipt
-from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions
+from hermes_cli import (gateway, gateway_launchd, immutable_releases as releases, update_cmd, update_cmd_fleet,
+                        update_cmd_fleet_verify, update_receipt)
+from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions, install_probe_process_dependency
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -43,6 +44,7 @@ def release_job(tmp_path, monkeypatch, request):
     for root in (a, b):
         root.mkdir(parents=True)
         venv.EnvBuilder(with_pip=False).create(root / ".venv")
+        install_probe_process_dependency(root / ".venv")
         (root / ".release-ready").write_text(root.name + "\n")
         (root / ".hermes_build_sha").write_text(root.name + "\n")
         (root / "probe.py").write_text(
@@ -78,7 +80,7 @@ def release_job(tmp_path, monkeypatch, request):
     monkeypatch.setattr(update_cmd_fleet, "_restart_systemd_gateway_units", lambda *args: None)
     monkeypatch.setattr(update_cmd_fleet, "_restart_manual_gateways", lambda *args: None)
     monkeypatch.setattr(update_cmd_fleet, "_force_kill_stuck_gateways", lambda *args: None)
-    monkeypatch.setattr(update_cmd_fleet, "_print_legacy_units_warning", lambda: None)
+    monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
     monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *args, **kw: None)
     monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda *args: [])
     monkeypatch.setattr(update_cmd._m(), "_fleet_probe_expected_runtimes", lambda *args: True)
@@ -145,7 +147,7 @@ def _assert_one_reload(job, old_pid, root):
     return row
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_release_to_release_activation_reload_once(release_job, monkeypatch):
     job = release_job
     monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)
@@ -156,12 +158,12 @@ def test_release_to_release_activation_reload_once(release_job, monkeypatch):
     outcome = update_cmd._restart_gateway_fleet_after_update(
         None, False, acknowledged_release_root=job.b)
     update_cmd._verify_fleet_after_update(outcome, _pre_update_plan=None,
-        _windows_gateway_resume=None, node_failures=[], update_complete=True,
+        _windows_gateway_resume=None, update_complete=True,
         expected_sha=job.b.name, expected_root=job.b)
     _assert_one_reload(job, job.initial["pid"], job.b)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_historical_ack_cannot_credit_dead_gateway(release_job, monkeypatch):
     job = release_job
     monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)
@@ -180,7 +182,7 @@ def test_historical_ack_cannot_credit_dead_gateway(release_job, monkeypatch):
     assert attempted and not credited and failed == [job.label]
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_acknowledged_release_catchup_verifies_without_second_relaunch(release_job, monkeypatch):
     job = release_job
     monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)
@@ -193,7 +195,7 @@ def test_acknowledged_release_catchup_verifies_without_second_relaunch(release_j
     _assert_one_reload(job, job.initial["pid"], job.b)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_stale_credited_gateway_gets_one_relaunch(release_job, monkeypatch):
     job = release_job
     monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)
@@ -221,7 +223,7 @@ def test_stale_credited_gateway_gets_one_relaunch(release_job, monkeypatch):
     assert update_receipt.read_latest_receipt()["outcome"] == "success"
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_release_to_release_rollback_reload_once(release_job):
     job = release_job
     releases.promote(job.home, job.b)
@@ -234,7 +236,7 @@ def test_release_to_release_rollback_reload_once(release_job):
     _assert_one_reload(job, prior["pid"], job.a)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_pending_then_acknowledged_recovery_does_not_relaunch(release_job, monkeypatch):
     job = release_job
     monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)
@@ -251,6 +253,6 @@ def test_pending_then_acknowledged_recovery_does_not_relaunch(release_job, monke
     outcome = update_cmd._restart_gateway_fleet_after_update(
         None, False, acknowledged_release_root=job.b)
     update_cmd._verify_fleet_after_update(outcome, _pre_update_plan=None,
-        _windows_gateway_resume=None, node_failures=[], update_complete=True,
+        _windows_gateway_resume=None, update_complete=True,
         expected_sha=job.b.name, expected_root=job.b)
     _assert_one_reload(job, job.initial["pid"], job.b)

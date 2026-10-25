@@ -36,7 +36,7 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     # get_hermes_home() prefers the context-local override over the env
     # var, so a set_hermes_home_override() leaked by ANY earlier test in
-    # this xdist worker would silently point the goals DB at a dead tmp
+    # this process would silently point the goals DB at a dead tmp
     # dir and make resume enqueue nothing (CI-only flake). Pin the
     # override to THIS home so the fixture is immune to leaks.
     from hermes_constants import (
@@ -188,6 +188,9 @@ class TestGatewayResumeRestartsWork:
             "— otherwise the goal sits idle until the next real user message"
         )
         assert pending.text.startswith("[Continuing toward your standing goal]")
+        # A resumed continuation is gateway-authored: a no-change tick may end silently.
+        assert pending.reply_expected is False
+        assert pending.metadata.get("goal_continuation") is True
         # The pause/clear stale-work guard must recognize the queued turn as
         # a synthetic goal continuation so it can be cleaned up on /goal pause.
         assert GatewayRunner._is_goal_continuation_event(pending)

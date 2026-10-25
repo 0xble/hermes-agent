@@ -344,10 +344,21 @@ async def test_flood_wait_retries_once_without_a_second_final(tmp_path):
     try:
         result = await adapter.send("chat", "final")
         assert result.success and result.deferred
-        await asyncio.sleep(0.1)
+        store = Outbox(tmp_path)
+
+        async def wait_for_delivery():
+            # The retry and its SQLite receipt run asynchronously; elapsed wall
+            # time alone does not prove that either has completed.
+            while True:
+                rows = await asyncio.to_thread(store.all_rows)
+                if rows and rows[0].state == "delivered":
+                    return rows
+                await asyncio.sleep(0.01)
+
+        rows = await asyncio.wait_for(wait_for_delivery(), timeout=10)
         assert sends == ["final", "final"]
-        assert [r.state for r in Outbox(tmp_path).all_rows()] == ["delivered"]
-        assert await recover(Outbox(tmp_path), adapter) == (0, 0)
+        assert [r.state for r in rows] == ["delivered"]
+        assert await recover(store, adapter) == (0, 0)
         assert len(sends) == 2
     finally:
         clear_turn()
@@ -395,6 +406,16 @@ async def test_non_json_metadata_is_defensively_stored(tmp_path):
         assert Outbox(tmp_path).all_rows()[0].state == "delivered"
     finally:
         clear_turn()
+
+
+def test_status_excludes_legacy_synthetic_rows(tmp_path):
+    store = Outbox(tmp_path)
+    with sqlite3.connect(store.path) as db:
+        db.execute("INSERT INTO outbox (turn_id, sequence, type, idempotency_key, payload, owner_epoch, state, created_at, send_status) "
+                   "VALUES ('legacy', 1, 'send', 'legacy-key', '{}', 1, 'pending', 1, 'synthetic')")
+        db.execute("INSERT INTO outbox (turn_id, sequence, type, idempotency_key, payload, owner_epoch, state, created_at) "
+                   "VALUES ('real', 1, 'send', 'real-key', '{}', 1, 'pending', 2)")
+    assert [row["turn_id"] for row in store.status()] == ["real"]
 
 
 def test_ambiguous_expires_without_replay_and_is_visible(tmp_path):
@@ -507,6 +528,56 @@ def _final_fixture(home, sends):
 def _final_event():
     return MessageEvent(text="hello", message_type=MessageType.TEXT, message_id="original",
                         source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat", user_id="user"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_result", [None, "scheduled"])
+async def test_native_same_event_replay_retains_admission_without_transport_redelivery(tmp_path, first_result):
+    sends, calls, tasks = [], [], []
+    adapter = _final_fixture(tmp_path, sends)
+    runner = adapter.gateway_runner
+    async def handler(event):
+        admitted = await runner._hm_admit_event(event)
+        if not admitted or getattr(event, "_outbox_duplicate", False):
+            return None
+        calls.append(event._outbox_turn_id)
+        return first_result if len(calls) == 1 else "executed"
+    runner._handle_admitted_message = handler
+    adapter._finish_session_task = lambda key, guard: adapter._active_sessions.pop(key, None)
+    def start(event, key):
+        tasks.append(asyncio.create_task(adapter._process_message_background(event, key)))
+        return True
+    adapter._start_session_processing = start
+    event = _final_event()
+    await adapter.handle_message(event)
+    await tasks[-1]
+    await adapter.handle_message(event)
+    if len(tasks) > 1:
+        await tasks[-1]
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert sends == (["scheduled"] if first_result else []) + ["executed"]
+    before = len(tasks)
+    await adapter.handle_message(_final_event())  # Another object is a transport redelivery.
+    assert len(tasks) == before
+    rows = Outbox(tmp_path).all_rows()
+    assert len(rows) == len(sends) and {row.turn_id for row in rows} == {calls[0]}
+
+
+@pytest.mark.asyncio
+async def test_local_replay_cannot_reuse_another_profiles_outbox_turn(tmp_path):
+    homes = {"default": tmp_path / "a", "work": tmp_path / "b"}
+    adapter = _final_fixture(homes["default"], [])
+    runner = adapter.gateway_runner
+    runner._resolve_profile_home_for_source = lambda source: homes[source.profile or "default"]
+    event = _final_event()
+    assert await runner._handle_message(event) == "answer"
+    first_turn = event._outbox_turn_id
+    event.source.profile = "work"
+    assert await runner._handle_message(event) == "answer"
+    assert event._outbox_turn_id != first_turn and event._outbox_home == homes["work"]
+    event.source.profile = "default"
+    assert await runner._handle_message(event) is None
+    assert event._outbox_duplicate and event._outbox_home == homes["default"]
 
 
 @pytest.mark.asyncio

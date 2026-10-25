@@ -5,13 +5,23 @@ import atexit
 import json
 import os
 import subprocess
+import shutil
 from pathlib import Path
 
 import psutil
 
-_PREFIXES = ("ai.hermes.s2spike.", "ai.hermes.s2migration.", "ai.hermes.s2crash.",
-             "ai.hermes.p3test-")
+_PREFIXES = ("ai.hermes.s2spike.", "ai.hermes.s2migration.", "ai.hermes.s2crash.")
 _REGISTRY = "immutable-launchd-labels.jsonl"
+
+
+def install_probe_process_dependency(venv: Path) -> None:
+    """Give disposable minimal interpreters the same process observer used by the runtime."""
+    python = venv / "bin/python"
+    result = subprocess.run(
+        [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        check=True, capture_output=True, text=True, encoding="utf-8", timeout=10,
+    )
+    shutil.copytree(Path(psutil.__file__).parent, Path(result.stdout.strip()) / "psutil")
 
 
 def _sweep(registry: Path) -> None:

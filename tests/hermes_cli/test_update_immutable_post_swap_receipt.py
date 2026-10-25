@@ -13,6 +13,7 @@ import pytest
 
 from hermes_cli import main, update_cmd, update_cmd_maint, update_receipt
 from hermes_cli.immutable_releases import ReleasePaths
+from hermes_cli.immutable_update_handoff import detach_update_receipt
 
 
 @pytest.fixture
@@ -29,7 +30,7 @@ def post_swap_candidate(tmp_path, monkeypatch):
     paths.current.symlink_to(previous)
     monkeypatch.setattr(main, "PROJECT_ROOT", candidate)
     monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda args, gateway_mode: update_cmd._UpdateOptions(
-        active_lazy_features=None, active_tool_dependencies=None, pre_update_version="new",
+        pre_update_version="new",
         gw_input_fn=None, assume_yes=True, keep_stash=False, switch_branch=False,
         discard_local_changes=False, no_gateway_restart=True,
     ))
@@ -39,12 +40,12 @@ def post_swap_candidate(tmp_path, monkeypatch):
         "swap": "immutable", "release": str(candidate), "candidate_sha": candidate.name,
         "source": str(tmp_path / "source"), "source_python": str(tmp_path / "source" / ".venv" / "bin" / "python"),
         "pre_update_version": "old", "pre_update_snapshot_id": "snapshot-1",
-        "receipt": update_receipt.detach_update_receipt(),
+        "receipt": detach_update_receipt(),
     }
     handoff = tmp_path / "post_swap.json"
     handoff.write_text(json.dumps(payload), encoding="utf-8")
     yield home, paths, previous, candidate, handoff
-    update_receipt._current = None
+    update_receipt._current.set(None)
 
 
 def _latest(home):
@@ -53,7 +54,7 @@ def _latest(home):
     persisted = json.loads(receipts[0].read_text(encoding="utf-8"))
     assert persisted == update_receipt.read_latest_receipt()
     assert persisted["steps"][0]["name"] == "pre_update_backup"
-    assert not update_receipt._current
+    assert not update_receipt.has_active_update_receipt()
     return persisted
 
 
@@ -69,7 +70,6 @@ def test_immutable_post_swap_maintains_before_activation_and_receipts_success(po
     def post_update(**kwargs):
         assert kwargs["pre_update_snapshot_id"] == "snapshot-1"
         assert kwargs["pre_update_version"] == "old"
-        assert kwargs["node_failures"] == [] and kwargs["desktop_build_ok"] is True
         events.append("post_update")
         return True
 

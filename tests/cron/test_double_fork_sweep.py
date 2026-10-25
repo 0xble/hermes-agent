@@ -11,7 +11,7 @@ import psutil
 import pytest
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.live_system_guard_bypass
 def test_hard_wall_sweeps_double_forked_orphan(tmp_path):
     from cron.executions import _process_start_time
@@ -51,7 +51,7 @@ def test_hard_wall_sweeps_double_forked_orphan(tmp_path):
                 pass
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.live_system_guard_bypass
 def test_script_timeout_spares_unrelated_worker_child(monkeypatch, tmp_path):
     from cron import scheduler as sched
@@ -97,7 +97,7 @@ def test_script_timeout_spares_unrelated_worker_child(monkeypatch, tmp_path):
                 except ProcessLookupError:
                     pass
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.live_system_guard_bypass
 def test_script_cancel_sweeps_reparented_child(monkeypatch, tmp_path):
     from cron.scheduler_script import _run_job_script

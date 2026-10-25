@@ -110,3 +110,83 @@ def test_stale_monitor_force_finalize_updates_origin_profile_ledger(tmp_path, mo
         # The real runner can return after the forced stall; _finalize must then
         # be a no-op for the already-terminal record.
         gate.set()
+
+
+def test_pending_admission_uses_queued_profile_context(tmp_path, monkeypatch):
+    """A completion in profile A must admit and persist profile B's queued unit in B."""
+    launch_home = tmp_path / "launch"
+    profile_a = launch_home / "profiles" / "a"
+    profile_b = launch_home / "profiles" / "b"
+    profile_a.mkdir(parents=True)
+    profile_b.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    release = threading.Event()
+    started_b = threading.Event()
+
+    token = set_hermes_home_override(profile_a)
+    try:
+        first = ad.dispatch_async_delegation(
+            goal="profile A occupier", context=None, toolsets=None, role="leaf", model="m",
+            session_key="a", runner=lambda: (release.wait(10), {"status": "completed"})[1],
+            max_async_children=1,
+        )
+    finally:
+        reset_hermes_home_override(token)
+    token = set_hermes_home_override(profile_b)
+    try:
+        queued = ad.dispatch_async_delegation(
+            goal="profile B queued", context=None, toolsets=None, role="leaf", model="m",
+            session_key="b", runner=lambda: (started_b.set(), {"status": "completed"})[1],
+            max_async_children=1, max_queued_delegations=1,
+        )
+    finally:
+        reset_hermes_home_override(token)
+    assert first["status"] == "dispatched"
+    assert queued["status"] == "queued"
+    release.set()
+    assert started_b.wait(5)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _delegation_state(profile_b / "state.db", queued["delegation_id"]) != "completed":
+        time.sleep(0.02)
+    assert _delegation_state(profile_b / "state.db", queued["delegation_id"]) == "completed"
+    assert _delegation_state(profile_a / "state.db", queued["delegation_id"]) is None
+
+
+def test_interrupt_all_finalizes_queued_unit_in_owner_profile(tmp_path, monkeypatch):
+    """Queued cancellation from profile A must persist profile B's terminal row in B."""
+    launch_home = tmp_path / "launch"
+    profile_a = launch_home / "profiles" / "a"
+    profile_b = launch_home / "profiles" / "b"
+    profile_a.mkdir(parents=True)
+    profile_b.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    release = threading.Event()
+
+    token = set_hermes_home_override(profile_a)
+    try:
+        first = ad.dispatch_async_delegation(
+            goal="profile A occupier", context=None, toolsets=None, role="leaf", model="m",
+            session_key="a", runner=lambda: (release.wait(10), {"status": "completed"})[1],
+            max_async_children=1,
+        )
+    finally:
+        reset_hermes_home_override(token)
+    token = set_hermes_home_override(profile_b)
+    try:
+        queued = ad.dispatch_async_delegation(
+            goal="profile B queued", context=None, toolsets=None, role="leaf", model="m",
+            session_key="b", runner=lambda: {"status": "completed"},
+            max_async_children=1, max_queued_delegations=1,
+        )
+    finally:
+        reset_hermes_home_override(token)
+    assert first["status"] == "dispatched"
+    assert queued["status"] == "queued"
+    token = set_hermes_home_override(profile_a)
+    try:
+        assert ad.interrupt_all("profile A shutdown") == 1
+    finally:
+        reset_hermes_home_override(token)
+    assert _delegation_state(profile_b / "state.db", queued["delegation_id"]) == "interrupted"
+    assert _delegation_state(profile_a / "state.db", queued["delegation_id"]) is None
+    release.set()

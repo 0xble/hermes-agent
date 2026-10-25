@@ -15,10 +15,22 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli import _git_process_scope as scopeprobe
 from hermes_cli.gitlock import (
     STALE_TMP_PACK_MIN_AGE_SECONDS,
     clear_stale_tmp_packs,
 )
+
+
+@pytest.fixture(autouse=True)
+def _use_legacy_global_guard(monkeypatch):
+    """Keep this legacy suite on its pre-Linux holder-scope contract.
+
+    Linux holder-scoped behavior is covered by test_gitlock_process_scope.py and
+    test_gitlock_pack_holders.py. These fixtures intentionally exercise the
+    non-Linux fallback while preserving their existing _git_proc_running mocks.
+    """
+    monkeypatch.setattr(scopeprobe, "_linux_process_scope", False)
 
 
 def _mkrepo(tmp_path: Path) -> Path:
@@ -102,7 +114,7 @@ def test_no_git_dir_is_a_noop(tmp_path):
 
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_windows_readonly_debris_is_cleared(tmp_path, monkeypatch):
     """git renames its transfer temps into place read-only, and Windows refuses to unlink a
     read-only file with EACCES — the exact rule that let aborted-fetch debris survive this

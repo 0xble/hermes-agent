@@ -55,3 +55,43 @@ def test_interpreter_kill_rejection_names_the_owned_process_route(tmp_path, monk
     # Absence on the wrong side: a plain foreground `hermes gateway run` carries no launch marker.
     monkeypatch.delenv("HERMES_SUPERVISED_CHILD")
     assert run("pkill -9 python3") is None
+
+
+def test_local_ci_gate_missing_relative_references_do_not_spend_remote_budget(tmp_path, monkeypatch):
+    """A local ci-gate-like wrapper may mention missing relative scripts while inspecting a tree.
+
+    Those misses are local filesystem results, not remote backend reads. They must not exhaust the
+    remote-read budget and turn an otherwise benign gate into a lifecycle-guard refusal.
+    """
+    from tools import process_registry
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    wrapper = tmp_path / "ci-gate-like"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        + " && ".join(f"bash missing-{index}.sh" for index in range(70))
+        + "\n",
+        encoding="utf-8",
+    )
+    calls = []
+    env = object.__new__(LocalEnvironment)
+    env.cwd = str(tmp_path)
+
+    def _execute(command):
+        calls.append(command)
+        return {"returncode": 1, "output": ""}
+
+    monkeypatch.setattr(env, "execute", _execute)
+
+    blocked = gateway_lifecycle_block(
+        command=f"{wrapper} expected-sha >| {tmp_path / 'gate.log'} 2>&1",
+        env=env,
+        env_type="local",
+        cwd=str(tmp_path),
+        workdir=None,
+        session_key="local-ci-gate-regression",
+    )
+
+    assert blocked is None
+    assert calls == []

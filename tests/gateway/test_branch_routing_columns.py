@@ -46,8 +46,8 @@ def store(tmp_path, monkeypatch):
 def _make_source() -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
-        user_id="170829464",
-        chat_id="170829464",
+        user_id="17082946",
+        chat_id="17082946",
         chat_type="dm",
         thread_id="544520",
     )
@@ -101,14 +101,14 @@ class TestBranchRoutingColumns:
         captured_new_session_id = {}
         real_switch_session = store.switch_session
 
-        def _crash_before_switch(session_key, target_session_id):
+        def _crash_before_switch(session_key, target_session_id, **kwargs):
             # Simulate the process dying right here — before routing gets
             # backfilled — by capturing the id and raising instead of
             # forwarding to the real switch_session().
             captured_new_session_id["id"] = target_session_id
             raise RuntimeError("simulated crash before switch_session")
 
-        import unittest.mock as mock
+        from unittest import mock
 
         with mock.patch.object(store, "switch_session", side_effect=_crash_before_switch):
             with pytest.raises(RuntimeError, match="simulated crash"):
@@ -122,7 +122,7 @@ class TestBranchRoutingColumns:
         # THIS is the bug: without the fix, these are all None, because
         # create_session() at branch time never received them — only the
         # (now-crashed) switch_session() call would have backfilled them.
-        assert row["chat_id"] == "170829464", (
+        assert row["chat_id"] == "17082946", (
             "branched session lost chat_id — unroutable if a crash lands "
             "between create_session() and switch_session()"
         )
@@ -130,7 +130,7 @@ class TestBranchRoutingColumns:
         assert row["thread_id"] == "544520"
         # user_id and session_key are also required for the fallback lookup
         # path (hermes_state.py:1994-2009) when session_key-based lookup fails
-        assert row["user_id"] == "170829464", (
+        assert row["user_id"] == "17082946", (
             "branched session lost user_id — fallback peer-tuple lookup "
             "in find_latest_gateway_session_for_peer can never match"
         )
@@ -148,8 +148,33 @@ class TestBranchRoutingColumns:
         import json as _json
 
         origin = _json.loads(row["origin_json"])
-        assert origin.get("chat_id") == "170829464"
+        assert origin.get("chat_id") == "17082946"
         assert origin.get("thread_id") == "544520"
 
         _ = real_switch_session  # silence unused
+
+
+class TestBranchSystemPrompt:
+    @pytest.mark.asyncio
+    async def test_branched_session_carries_parent_system_prompt(self, store):
+        """A /branch child row carries the parent's system prompt."""
+        source = _make_source()
+        parent_entry = store.get_or_create_session(source)
+        store._db.update_system_prompt(parent_entry.session_id, "PARENT PROMPT")
+        store._db.append_message(parent_entry.session_id, role="user", content="hello")
+        store._db.append_message(parent_entry.session_id, role="assistant", content="world")
+
+        runner = _make_branch_runner(store)
+        await runner._handle_branch_command(_make_event("/branch"))
+
+        new_entry = store.get_or_create_session(source)
+        assert new_entry.session_id != parent_entry.session_id
+
+        row = store._db.get_session(new_entry.session_id)
+        assert row is not None
+        assert row["system_prompt"] == "PARENT PROMPT", (
+            "branched session lost the parent's system prompt — its first "
+            "turn will re-probe the workspace and forfeit the warm cache "
+            "the copied transcript buys"
+        )
 

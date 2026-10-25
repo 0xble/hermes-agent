@@ -9,7 +9,7 @@ import pytest
 from tests.hermes_cli.immutable_launchd_cleanup import _sweep_missing_plists
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_missing_pytest_plist_reaps_only_disposable_job(tmp_path, monkeypatch):
     base = tmp_path / "hermes-pytest"
     session = base / "r-gone" / "pytest-of-user" / "pytest-0" / "case"

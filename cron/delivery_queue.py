@@ -2,9 +2,10 @@
 
 A restart-safe cron worker executes outside the gateway cgroup.  It cannot own
 relay/E2EE adapter objects, so it queues the final send here.  A gateway claims
-each row at most once.  If that gateway dies after claiming, the outcome is
-marked unknown and never retried: losing a delivery is safer than duplicating a
-possibly-completed send.
+each row at most once.  Reviewed rows use ``reviewing`` until the final send
+starts, so a restart can replay the side-effect-free review instead of losing
+the report.  If the gateway dies after the final send begins, the outcome is
+marked unknown and never retried.
 """
 
 from __future__ import annotations
@@ -59,7 +60,8 @@ def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
                (execution_id, terminal_status, finished_at, projected)
                SELECT execution_id, status, finished_at, projected FROM deliveries
                WHERE status IN ('delivered','failed','unknown','suppressed')
-               ORDER BY finished_at, created_at, execution_id
+               ORDER BY julianday(finished_at), finished_at,
+                        julianday(created_at), created_at, execution_id
                LIMIT ?""",
             (excess,),
         )
@@ -67,7 +69,8 @@ def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
             """DELETE FROM deliveries WHERE execution_id IN (
                  SELECT execution_id FROM deliveries
                  WHERE status IN ('delivered','failed','unknown','suppressed')
-                 ORDER BY finished_at, created_at, execution_id
+                 ORDER BY julianday(finished_at), finished_at,
+                          julianday(created_at), created_at, execution_id
                  LIMIT ?
                )""",
             (excess,),
@@ -90,14 +93,21 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     from hermes_cli.sqlite_util import add_column_if_missing
 
     # SQLite cannot widen a CHECK in place. Preserve all old rows atomically,
-    # including claimed sends, while admitting a distinct never-sent disposition.
+    # including claimed sends, while admitting the replayable review disposition
+    # and the distinct never-sent disposition.
     for table in ("deliveries", "delivery_tombstones"):
         row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
-        if row and "'suppressed'" not in row[0]:
+        required = "'reviewing'" if table == "deliveries" else "'suppressed'"
+        if row and required not in row[0]:
             conn.execute("SAVEPOINT notification_disposition")
             try:
                 conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
-                conn.execute(row[0].replace("'unknown'", "'unknown','suppressed'"))
+                sql = row[0]
+                missing = [state for state in ("suppressed", "reviewing")
+                           if f"'{state}'" not in sql
+                           and (state != "reviewing" or table == "deliveries")]
+                sql = sql.replace("'unknown'", "'unknown'" + "".join(f",'{state}'" for state in missing))
+                conn.execute(sql)
                 conn.execute(f"INSERT INTO {table} SELECT * FROM {table}_old")
                 conn.execute(f"DROP TABLE {table}_old")
                 conn.execute("RELEASE notification_disposition")
@@ -113,7 +123,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              content TEXT NOT NULL,
              for_failure INTEGER NOT NULL DEFAULT 0,
              status TEXT NOT NULL CHECK(status IN
-               ('pending','delivering','delivered','failed','unknown','suppressed')),
+               ('pending','reviewing','delivering','delivered','failed','unknown','suppressed')),
              owner_process_id TEXT,
              owner_pid INTEGER,
              owner_started_at INTEGER,
@@ -314,7 +324,7 @@ def enqueue(
                 "SELECT * FROM deliveries WHERE execution_id=?", (str(execution_id),)
             ).fetchone()
             result = dict(row)
-    _reflect_execution_delivery(str(execution_id), result["status"])
+    _reflect_execution_delivery(str(execution_id), "pending" if result["status"] == "reviewing" else result["status"])
     return result
 
 
@@ -346,9 +356,13 @@ def claim_next() -> Optional[dict]:
     started = _process_start_time(pid)
     with _transaction() as conn:
         rows = conn.execute(
-            "SELECT execution_id, for_failure, terminal_gate, created_at FROM deliveries WHERE status='pending' "
-            "ORDER BY created_at, execution_id"
+            "SELECT execution_id, job_json, for_failure, terminal_gate, created_at FROM deliveries WHERE status='pending' "
+            "ORDER BY julianday(created_at), created_at, execution_id"
         ).fetchall()
+        from cron.scheduler_review import reviews_stopped
+        if reviews_stopped():
+            # A stopping gateway leaves held reports pending for the next gateway.
+            rows = [candidate for candidate in rows if not _is_review_row(candidate)]
         row = None
         suppressed_missing = False
         # Read all gated executions from one ledger connection rather than opening
@@ -412,11 +426,12 @@ def claim_next() -> Optional[dict]:
             _prune_terminal_unlocked(conn)
         if row is None:
             return None
+        status = "reviewing" if _is_review_row(row) else "delivering"
         cur = conn.execute(
-            """UPDATE deliveries SET status='delivering', owner_process_id=?,
+            """UPDATE deliveries SET status=?, owner_process_id=?,
                owner_pid=?, owner_started_at=?
                WHERE execution_id=? AND status='pending'""",
-            (_PROCESS_ID, pid, started, row["execution_id"]),
+            (status, _PROCESS_ID, pid, started, row["execution_id"]),
         )
         if cur.rowcount != 1:
             return None
@@ -429,6 +444,41 @@ def claim_next() -> Optional[dict]:
     return result
 
 
+def _is_review_row(row) -> bool:
+    return not row["for_failure"] and bool(json.loads(row["job_json"]).get("review"))
+
+
+def record_review_progress(execution_id: str, owner_process_id: str, **fields) -> bool:
+    """Persist review progress so a replay never repeats a decided review or a rerun."""
+    with _transaction() as conn:
+        row = conn.execute(
+            """SELECT job_json FROM deliveries WHERE execution_id=? AND status='reviewing'
+                 AND owner_process_id=? AND owner_pid=?""",
+            (str(execution_id), owner_process_id, os.getpid()),
+        ).fetchone()
+        if row is None:
+            return False
+        job = json.loads(row["job_json"])
+        job.update(fields)
+        conn.execute(
+            "UPDATE deliveries SET job_json=? WHERE execution_id=?",
+            (json.dumps(job, ensure_ascii=False, sort_keys=True), str(execution_id)),
+        )
+    return True
+
+
+def begin_final_delivery(execution_id: str, owner_process_id: str) -> bool:
+    """Claim a reviewed row for the only phase whose outcome may be unknown."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE deliveries SET status='delivering'
+               WHERE execution_id=? AND status='reviewing'
+                 AND owner_process_id=? AND owner_pid=?""",
+            (str(execution_id), owner_process_id, os.getpid()),
+        )
+    return cur.rowcount == 1
+
+
 def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False) -> bool:
     status = "failed" if error else "suppressed" if suppressed else "delivered"
     safe_error = (
@@ -439,7 +489,7 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE deliveries SET status=?, finished_at=?, error=?
-               WHERE execution_id=? AND status='delivering'
+               WHERE execution_id=? AND status IN ('reviewing','delivering')
                  AND owner_process_id=? AND owner_pid=?""",
             (
                 status,
@@ -458,13 +508,14 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
 
 
 def recover_abandoned() -> int:
-    """Fence dead delivery owners as unknown; never replay uncertain sends."""
+    """Replay abandoned reviews, but never replay uncertain final sends."""
     changed = 0
     terminal_ids: list[str] = []
+    unknown_receipts: list[dict] = []
     with _transaction() as conn:
         rows = conn.execute(
-            "SELECT execution_id, owner_process_id, owner_pid, owner_started_at "
-            "FROM deliveries WHERE status='delivering'"
+            "SELECT execution_id, job_json, status, owner_process_id, owner_pid, owner_started_at "
+            "FROM deliveries WHERE status IN ('reviewing','delivering')"
         ).fetchall()
         for row in rows:
             same_process = row["owner_process_id"] == _PROCESS_ID
@@ -473,6 +524,15 @@ def recover_abandoned() -> int:
                     if row["execution_id"] in _ACTIVE_DELIVERIES:
                         continue
             elif _owner_is_live(int(row["owner_pid"]), row["owner_started_at"]):
+                continue
+            if row["status"] == "reviewing":
+                cur = conn.execute(
+                    """UPDATE deliveries SET status='pending', owner_process_id=NULL,
+                           owner_pid=NULL, owner_started_at=NULL
+                       WHERE execution_id=? AND status='reviewing'""",
+                    (row["execution_id"],),
+                )
+                changed += cur.rowcount
                 continue
             error = (
                 "Gateway finished delivery but could not persist its outcome; "
@@ -490,12 +550,42 @@ def recover_abandoned() -> int:
                 ),
             )
             changed += cur.rowcount
-            if cur.rowcount:
+            if cur.rowcount == 1:
                 terminal_ids.append(row["execution_id"])
+                job = json.loads(row["job_json"])
+                if job.get("review"):
+                    unknown_receipts.append({
+                        "job_id": job.get("id"), "run_id": row["execution_id"],
+                        "subject": job["review"].get("subject"), "decision": "DELIVERY_UNKNOWN",
+                        "candidates": [], "text_sent": None, "message_id": None, "error": error})
         _prune_terminal_unlocked(conn)
     _reflect_terminal_deliveries(terminal_ids, "unknown")
     _mark_terminal_projected(terminal_ids)
+    # The receipt file is an audit trail; a failed write must never stall the queue drain.
+    for receipt in unknown_receipts:
+        try:
+            from cron.review import append_receipt
+            append_receipt(receipt)
+        except Exception:
+            logger.exception("Cron review receipt for %s could not be written", receipt["run_id"])
     return changed
+
+
+def _send_claimed(row, send):
+    try:
+        try:
+            error = send(row["job"], row["content"], bool(row["for_failure"]))
+        except BaseException as exc:
+            from cron.scheduler_review import ReviewAbandoned
+            if isinstance(exc, ReviewAbandoned):
+                return  # Keep the original and admission deadline for the next gateway.
+            logger.exception("Cron delivery failed for %s", row["execution_id"])
+            error = f"{type(exc).__name__}: {exc}"
+        _finish(row["execution_id"], error=error,
+                suppressed=bool(row["job"].get("_notification_all_targets_suppressed")))
+    finally:
+        with _lock:
+            _ACTIVE_DELIVERIES.discard(row["execution_id"])
 
 
 def drain(
@@ -511,18 +601,16 @@ def drain(
             break
         with _lock:
             _ACTIVE_DELIVERIES.add(row["execution_id"])
-        try:
-            try:
-                error = send(
-                    row["job"], row["content"], bool(row["for_failure"])
-                )
-            except BaseException as exc:
-                error = f"{type(exc).__name__}: {exc}"
-            _finish(row["execution_id"], error=error,
-                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")))
-        finally:
-            with _lock:
-                _ACTIVE_DELIVERIES.discard(row["execution_id"])
+        if row["job"].get("review") and not row["for_failure"]:
+            row["job"]["_review_queue_claim"] = (row["execution_id"], row["owner_process_id"])
+            # A held report uses delivery capacity, never one of the four cron run slots,
+            # and never blocks the drain of unrelated notices. Profile context follows it.
+            import contextvars
+            context = contextvars.copy_context()
+            threading.Thread(target=context.run, args=(_send_claimed, row, send),
+                             name="cron-review-delivery", daemon=True).start()
+        else:
+            _send_claimed(row, send)
         processed += 1
     return processed
 
@@ -530,7 +618,7 @@ def drain(
 def _terminalize_wait_timeout(execution_id: str) -> str:
     """Fence a delivery whose worker can no longer wait for confirmation.
 
-    A row still ``pending`` was provably never attempted, so it is left queued
+    A row still ``pending`` or ``reviewing`` has no outbound effects, so it is left queued
     for whichever gateway comes up next (a restart that includes an update can
     easily exceed the worker's wait budget).  That is a deferral, not a
     failure: report success so the job is not recorded ``delivery_failed`` for
@@ -547,7 +635,7 @@ def _terminalize_wait_timeout(execution_id: str) -> str:
             "SELECT status FROM deliveries WHERE execution_id=?",
             (str(execution_id),),
         ).fetchone()
-        if row is not None and row["status"] == "pending":
+        if row is not None and row["status"] in ("pending", "reviewing"):
             logger.warning(
                 "Cron delivery %s: no live gateway within the wait budget; "
                 "left queued for the next gateway",

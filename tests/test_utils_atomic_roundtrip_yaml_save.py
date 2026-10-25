@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 
 class TestAtomicRoundtripYamlSave:
@@ -25,6 +25,30 @@ class TestAtomicRoundtripYamlSave:
 
         assert config_path.exists()
         assert yaml.safe_load(config_path.read_text())["model"]["default"] == "test-model"
+
+    @pytest.mark.parametrize("full_state", [False, True], ids=["key-update", "full-state"])
+    def test_deletion_preserves_next_sibling_comment(self, config_path, full_state):
+        from utils import atomic_roundtrip_yaml_save, atomic_roundtrip_yaml_update
+
+        config_path.write_text(
+            "model:\n"
+            "  model_preset: fast  # Obsolete reference.\n"
+            "  # Keep my slot policy.\n"
+            "  model_slots:\n"
+            "    fast: 'off'\n",
+            encoding="utf-8",
+        )
+        if full_state:
+            atomic_roundtrip_yaml_save(config_path, {"model": {"model_slots": {"fast": "off"}}})
+        else:
+            atomic_roundtrip_yaml_update(config_path, "model.model_preset", None)
+
+        text = config_path.read_text(encoding="utf-8")
+        assert "model_preset" not in text
+        assert "Obsolete reference." not in text
+        assert "  # Keep my slot policy.\n  model_slots:" in text
+        assert "fast: 'off'" in text
+        assert yaml.safe_load(text) == {"model": {"model_slots": {"fast": "off"}}}
 
     def test_preserves_top_level_key_order(self, config_path):
         """Existing top-level keys keep their author-intended ordering."""

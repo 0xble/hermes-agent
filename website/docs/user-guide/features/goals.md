@@ -58,6 +58,7 @@ What you'll see:
 | Command | What it does |
 |---|---|
 | `/goal <text>` | Set (or replace) the standing goal. Kicks off the first turn immediately so you don't need to send a separate message. |
+| `/goal -- <text>` | Set goal text that starts with a control word (`/goal -- pause the nightly cron`). Without `--`, `resume`/`continue`/`unpause`/`pause`/`status`/`show`/`unwait` followed by words run the control command and ignore the rest. |
 | `/goal draft <text>` | Draft a structured completion contract from a plain-language objective, then set it. See [Completion contracts](#completion-contracts). |
 | `/goal show` | Print the active goal's completion contract. |
 | `/goal` or `/goal status` | Show the current goal, its status, and turns used. |
@@ -216,7 +217,7 @@ If the judge errors (network blip, malformed response, unavailable aux client), 
 
 ### Turn budget
 
-Default is 20 continuation turns (`goals.max_turns` in `config.yaml`). When the budget is hit, Hermes auto-pauses and tells you exactly how to proceed:
+Default is 20 continuation turns (`goals.max_turns` in `config.yaml`). Set `goals.max_turns: 0` for a genuinely unlimited goal; zero is preserved in the goal record and disables only the budget pause. Done, blocked, judge-failure, dispute, wait, user pause, and clear controls still behave normally. For finite positive values, when the budget is hit Hermes auto-pauses and tells you exactly how to proceed:
 
 ```
 ⏸ Goal paused — 20/20 turns used. Use /goal resume to keep going, or /goal clear to stop.
@@ -227,6 +228,10 @@ Default is 20 continuation turns (`goals.max_turns` in `config.yaml`). When the 
 ### User messages always preempt
 
 Any real message you send while a goal is active takes priority over the continuation loop. On the CLI your message lands in `_pending_input` ahead of the queued continuation; on the gateway it goes through the adapter FIFO the same way. The judge runs again after your turn — so if your message happens to complete the goal, the judge will catch it and stop.
+
+### Pacing between automatic turns (gateway)
+
+On the gateway, a continuation that follows another automatic turn (a previous continuation, a `/loop` tick, a heartbeat) waits until `goals.min_continuation_gap_seconds` (default 900, 15 minutes) have passed since the last automatic continuation. Your own messages and the results of background processes or delegations the agent started are new evidence, so they continue the goal immediately. The hold is a silent timed wait that survives restarts. `/goal status` shows it, and `/goal unwait` ends it early. Set the value to `0` to disable pacing. Values above 1800 (the longest goal wait) are capped at 1800.
 
 ### Answering a blocked goal
 
@@ -260,6 +265,9 @@ goals:
   # /goal resume. Default 20. Lower this if you want tighter loops;
   # raise it for long-running refactors.
   max_turns: 20
+  # Gateway only: minimum seconds between automatic continuation turns.
+  # User messages and background results continue at once. 0 disables.
+  min_continuation_gap_seconds: 900
 ```
 
 ### Choosing the judge model

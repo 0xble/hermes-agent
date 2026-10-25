@@ -26,6 +26,7 @@ import {
   renderRpcResult,
   SessionRecoveryAborted,
   shouldInterruptBeforeRewind,
+  shouldUseSlashCommandShortcut,
   slashStatusText,
   SUBMIT_IN_FLIGHT_TTL_MS,
   visibleUserIndexAtOrdinal,
@@ -36,6 +37,19 @@ import {
 afterEach(() => {
   clearSessionRecentlyInterrupted()
   clearSubmitInFlight()
+})
+
+describe('slash-command submit shortcut', () => {
+  it('does not re-dispatch a token-bearing deferred /moa payload', () => {
+    expect(shouldUseSlashCommandShortcut('/moa !inspect', { hasAttachments: false })).toBe(true)
+    expect(shouldUseSlashCommandShortcut('/moa !inspect', { hasAttachments: false, moaToken: 'queued-moa-1' })).toBe(
+      false
+    )
+  })
+
+  it('keeps attachment submits on the ordinary prompt path', () => {
+    expect(shouldUseSlashCommandShortcut('/status', { hasAttachments: true })).toBe(false)
+  })
 })
 
 describe('recent interrupt cooldown', () => {

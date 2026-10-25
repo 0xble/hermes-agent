@@ -20,8 +20,8 @@ from agent.context_compressor import (
     _MERGED_SUMMARY_DELIMITER,
     _SUMMARY_END_MARKER,
 )
-import agent.skill_commands as skill_commands
-import tools.skills_tool as skills_tool
+from agent import skill_commands
+from tools import skills_tool
 from hermes_state import SessionDB
 
 SKILL_BODY = (
@@ -45,8 +45,7 @@ def _install_skill(tmp_path, monkeypatch, name="work", body=SKILL_BODY):
         f"---\nname: {name}\ndescription: Description for {name}\n---\n\n# {name}\n\n{body}\n"
     )
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_dir)
-    monkeypatch.setattr(skill_commands, "_skill_commands", {})
-    monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
+    monkeypatch.setattr(skill_commands, "_skill_commands_by_key", {})
     skill_commands.scan_skill_commands()
     return skills_dir
 
@@ -210,5 +209,96 @@ class TestSkillScaffoldedSessionLookup:
         for i in range(3):
             _seed(db, f"s{i}", message, title=f"Title {i}")
         assert len(db.list_skill_scaffolded_sessions(limit=2)) == 2
+
+    def test_finds_gateway_auto_load_sessions(self, db, tmp_path, monkeypatch):
+        """#48359: a session whose first turn is a gateway auto-load scaffold (channel-bound
+        skill, '[IMPORTANT: The "X" skill is auto-loaded. …]') has the same retitle need —
+        its title describes the skill, not the request."""
+        _install_skill(tmp_path, monkeypatch)
+        loaded = skill_commands._load_skill_payload("work")
+        payload = skill_commands._build_skill_message(
+            loaded[0], loaded[1],
+            '[IMPORTANT: The "work" skill is auto-loaded. '
+            "Follow its instructions for this session.]",
+        )
+        message = f"{payload}\n\nwhy is my deploy timing out?"
+        _seed(db, "auto", message, title="Example Skill Instructions")
+        _seed(db, "plain", "why is my deploy timing out?", title="Deploy Timeout")
+
+        rows = db.list_skill_scaffolded_sessions()
+        assert [row["id"] for row in rows] == ["auto"]
+        # The caller re-derives the typed request through the describer.
+        from agent.skill_commands import describe_skill_invocation
+        assert describe_skill_invocation(rows[0]["content"]) == "why is my deploy timing out?"
+
+
+def _record_preview_normalization(db):
+    """Instrument SQLite's actual scalar call, not the query text or the Python shaper."""
+    sizes = []
+
+    def replace(text, old, new):
+        if text is None or old is None or new is None:
+            return None
+        def as_text(value):
+            return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+        text, old, new = map(as_text, (text, old, new))
+        sizes.append(len(text))
+        return text.replace(old, new)
+
+    with db._read_ctx() as conn:
+        conn.create_function("replace", 3, replace, deterministic=True)
+    return sizes
+
+
+@pytest.mark.parametrize("blob", [False, True])
+def test_plain_preview_normalizes_only_its_character_window(db, blob):
+    message = "é" * 199 + "\r\n" + "界text\n" * 10000
+    _seed(db, "s1", message.encode("utf-8") if blob else message)
+    sizes = _record_preview_normalization(db)
+    (row,) = db.list_sessions_rich(limit=1, compact_rows=True)
+    assert row["preview"] == "é" * 60 + "..."
+    assert sizes
+    assert max(sizes) <= 200, "preview normalized the complete stored message"
+
+
+@pytest.mark.parametrize("auto_load", [False, True])
+@pytest.mark.parametrize("long", [False, True])
+def test_skill_preview_normalization_is_bounded(db, tmp_path, monkeypatch, auto_load, long):
+    _install_skill(tmp_path, monkeypatch, body="é\r\n" * 10000 if long else "short")
+    if auto_load:
+        loaded = skill_commands._load_skill_payload("work")
+        message = skill_commands._build_skill_message(
+            loaded[0], loaded[1], '[IMPORTANT: The "work" skill is auto-loaded. '
+            "Follow its instructions for this session.]",
+        ) + "\n\nwhy is my deploy timing out?"
+        expected = "why is my deploy timing out?"
+    else:
+        message = skill_commands.build_skill_invocation_message(
+            "/work", user_instruction="fix the title leak")
+        expected = "/work — fix the title leak"
+    _seed(db, "s1", message)
+    sizes = _record_preview_normalization(db)
+    (row,) = db.list_sessions_rich(limit=1, compact_rows=True)
+    assert row["preview"] == expected
+    assert sizes
+    assert max(sizes) <= 800
+
+
+def test_recent_listing_projects_previews_only_for_the_selected_page(db):
+    for i in range(20):
+        _seed(db, f"s{i:02}", f"request {i}\n" + "context\n" * 1000)
+        db._write_sql(
+            "UPDATE sessions SET started_at = ?, last_activity_at = ? WHERE id = ?",
+            (1800000000 + i, 1800000000 + i, f"s{i:02}"),
+        )
+    sizes = _record_preview_normalization(db)
+    rows = db.list_sessions_rich(limit=2, offset=1, order_by_last_active=True, compact_rows=True)
+    assert [row["id"] for row in rows] == ["s18", "s17"]
+    assert [row["preview"] for row in rows] == [
+        "request 18 context context context context context context c...",
+        "request 17 context context context context context context c...",
+    ]
+    assert len(sizes) == 4, "discarded sort candidates had their transcripts projected"
 
 

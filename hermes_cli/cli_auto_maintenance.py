@@ -23,6 +23,7 @@ def _run_state_db_auto_maintenance(session_db) -> None:
         _hermes_home_maint = _get_hermes_home()
 
         # One-time repairs, each latched in state_meta once it has run.
+        from hermes_cli.maintenance_window import deletion_window_open
         for meta_key, repair, done_msg, skip_msg in (
             (
                 "ghost_session_prune_v1",
@@ -35,6 +36,8 @@ def _run_state_db_auto_maintenance(session_db) -> None:
                 "Finalized %d orphaned compression sessions", "Orphan compression finalize skipped: %s",
             ),
         ):
+            if meta_key == "ghost_session_prune_v1" and not deletion_window_open():
+                continue
             try:
                 if not session_db.get_meta(meta_key):
                     count = repair()
@@ -55,6 +58,11 @@ def _run_state_db_auto_maintenance(session_db) -> None:
 
         if not cfg.get("auto_prune", False):
             return
+        # Do not spend the 24-hour prune throttle during the day.  The next startup/tick
+        # inside the configured deletion window will run the still-due maintenance.
+        from hermes_cli.maintenance_window import deletion_window_open
+        if not deletion_window_open():
+            return
         session_db.maybe_auto_prune_and_vacuum(
             retention_days=int(cfg.get("retention_days", 90)),
             min_interval_hours=int(cfg.get("min_interval_hours", 24)),
@@ -70,5 +78,5 @@ def _run_checkpoint_auto_maintenance() -> None:
     """Checkpoint store retention on a daemon thread: its ``git gc`` can block for tens of seconds
     on a large store, which used to stall the prompt once a day. ``auto_prune_from_config`` owns the
     config gate and the 24h marker and never raises."""
-    from tools.checkpoint_manager import auto_prune_from_config
+    from tools.checkpoint_maintenance import auto_prune_from_config
     threading.Thread(target=auto_prune_from_config, name="checkpoint-auto-prune", daemon=True).start()

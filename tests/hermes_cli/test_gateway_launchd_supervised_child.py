@@ -58,7 +58,7 @@ def test_gateway_descendants_tolerates_vanished_wrapper(monkeypatch):
     assert gateway._gateway_descendants_of(501) == set()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_systemd_service_pid_includes_recursive_gateway_descendant(monkeypatch):
     monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
     monkeypatch.setattr(gateway, "get_service_name", lambda: "hermes-gateway.service")
@@ -75,7 +75,7 @@ def test_systemd_service_pid_includes_recursive_gateway_descendant(monkeypatch):
     assert gateway._get_service_pids() == {501, 503}
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_launchd_default_scope_includes_recursive_gateway_descendant(monkeypatch):
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway.default")
     monkeypatch.setattr(gateway, "_locate_launchd_gateway_service", lambda label: ("gui/501", 501))
@@ -84,7 +84,7 @@ def test_launchd_default_scope_includes_recursive_gateway_descendant(monkeypatch
     assert gateway._get_service_pids() == {501, 503}
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_launchd_fleet_prefix_scan_expands_each_unmapped_wrapper(monkeypatch):
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway.default")
     monkeypatch.setattr(gateway, "launchd_gateway_labels_for_install", lambda: [])
@@ -114,7 +114,7 @@ def test_wrapped_service_gateway_is_excluded_from_manual_sweep(monkeypatch):
     ) == [700]
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_launchd_exclusion_protects_real_wrapped_process(tmp_path, monkeypatch):
     """Service lookup is simulated, but ancestry and argv come from real child processes."""
     import json

@@ -6,7 +6,7 @@ description: "Re-run a prompt on a recurring interval inside your session — He
 
 # Recurring Loops (`/loop`)
 
-`/loop` re-runs a prompt (or a slash command) on a recurring cadence **inside your current session**. Each wakeup is a real agent turn: Hermes reads the current state fresh — the latest CI result, the newest queue depth, the file as it is now — does the work, reports back, and goes quiet until the next tick.
+`/loop` re-runs a prompt (or a slash command) on a recurring cadence **inside your current session**. Each wakeup is a real agent turn: Hermes reads the current state fresh — the latest CI result, the newest queue depth, the file as it is now — does the work, and speaks up only when something new needs you. When nothing new and material happened (including a plain acknowledgement or a "still waiting" check), the wakeup prompt asks for a bare `[SILENT]`; a reply that does have news, including the one that ends the loop with `LOOP_COMPLETE`, is one or two short lines: that tick shows nothing in the CLI, TUI, Desktop or messaging chat (the turn stays in the transcript), and a `--until` loop skips the judge call for it.
 
 It's Hermes' take on **Claude Code's `/loop`** (and its `/proactive` alias, which works here too). Where [`/goal`](./goals.md) is judge-driven — "keep working until this objective is achieved" — `/loop` is timer-driven: "do this again every N minutes (or whenever it makes sense) until something says stop."
 
@@ -85,9 +85,11 @@ Examples:
 
 Works on the CLI, the TUI (`hermes --tui`), the web dashboard chat, the desktop app, and every gateway platform (Telegram, Discord, Slack, WhatsApp, …). On messaging platforms the gateway fires wakeups even between your messages — the loop belongs to the chat's session, and its results arrive as ordinary replies — also when that session is open in the TUI / Desktop app, which leaves the routed wakeup to the gateway.
 
+In the desktop app and dashboard chat, the backend keeps firing an active loop after you close the window or the app disconnects: a session with an active `/loop` (or `/heartbeat`) is exempt from the disconnected-session reaper, so the wakeups and their results are waiting when you reopen it. The exemption ends when the loop stops, pauses, or reaches its tick budget, and the session is then collected normally. The backend process itself must keep running: if it exits with the app, nothing fires until it is back. For unattended loops, run the session on a long-lived backend (a remote `hermes serve`, or the dashboard).
+
 ## Mixing with `/goal`
 
-Both features inject synthetic turns at idle boundaries, so they follow one rule: **an active goal owns the session.** While a `/goal` is actively driving (judge saying "continue"), loop wakeups defer. The loop resumes using idle time as soon as the goal finishes, pauses, or parks itself on a wait barrier (`/goal wait`, or the judge's automatic WAIT verdict). A parked goal plus a `/loop` is a natural combo: the goal waits on the big async thing while the loop keeps a heartbeat on something else.
+Both features inject synthetic turns at idle boundaries, so **only an active, non-waiting goal defers loop wakeups.** While a `/goal` is actively driving (judge saying "continue"), loop wakeups defer. Parked/waiting, paused, and done goals do not block loop ticks. The loop resumes using idle time as soon as the goal finishes, pauses, or parks itself on a wait barrier (`/goal wait`, or the judge's automatic WAIT verdict). The overlap warning appears only when the goal currently blocks loop ticks, not merely because a goal exists. A parked goal plus a `/loop` is a natural combo: the goal waits on the big async thing while the loop keeps a heartbeat on something else.
 
 A real user message always wins over both — wakeups only fire while the session is idle and nothing of yours is queued.
 
@@ -107,8 +109,10 @@ loops:
   min_interval_seconds: 30       # floor for fixed intervals
   max_ticks: 100                 # backstop budget (0 = unlimited)
   self_paced_floor_seconds: 60   # self-paced starting cadence
-  self_paced_ceiling_seconds: 900  # self-paced max backoff
+  self_paced_ceiling_seconds: 86400  # self-paced max backoff (default: 24h; overrides still apply)
 ```
+
+Self-paced unchanged replies use the same quiet backoff ladder as goals: 15m, 1h, 4h, then 24h. A changed reply or trusted external event resets the loop to its configured floor.
 
 The `--until` judge routes through the `goal_judge` auxiliary task, so `auxiliary.goal_judge.*` routing overrides (provider, model) apply to loop conditions too.
 

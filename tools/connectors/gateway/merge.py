@@ -5,6 +5,7 @@ Correlate all remote results by original call position, never wire ``index``.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -16,11 +17,15 @@ __all__ = [
     "Partition",
     "PlannedCall",
     "assemble_results",
+    "batch_entry_error",
     "fill_remote_failure",
     "partition_calls",
     "render_remote_entry",
     "splice_remote_results",
 ]
+
+# Codes the user resolves by connecting the app; both carry the card or link.
+_CONNECTION_CODES = frozenset({"CONNECTION_REQUIRED", "CONNECTION_EXPIRED"})
 
 
 @dataclass(frozen=True)
@@ -70,7 +75,7 @@ def partition_calls(calls: Sequence[Any]) -> Partition:
                     code="TOOL_NOT_FOUND",
                     message=(
                         "Malformed connector tool name; expected "
-                        "connectors__<connector>__<tool>."
+                        "connectors__<connector>__{tool}."
                     ),
                 )
             )
@@ -80,22 +85,31 @@ def partition_calls(calls: Sequence[Any]) -> Partition:
 
 
 def render_remote_entry(planned: PlannedCall, remote: Mapping[str, Any]) -> dict[str, Any]:
-    """Use the shared CONNECTION_REQUIRED shape so links render consistently."""
+    """Use the shared connection shape so links render consistently.
+
+    The model sees code, message, connector and the gateway's hint, plus ``family`` when the gateway
+    classified the failure. Transport details (status, request id) stay in the logs."""
     error = remote.get("error") if isinstance(remote, Mapping) else None
+    account = _opt_str(remote.get("account")) if isinstance(remote, Mapping) else None
     if not isinstance(error, Mapping):
         data = remote.get("data") if isinstance(remote, Mapping) else None
-        return {"index": planned.position, "name": planned.name, "response": data}
+        return _with_account({"index": planned.position, "name": planned.name, "response": data}, account)
 
     code = str(error.get("code") or "PROVIDER_ERROR")
     message = str(error.get("message") or "The gateway reported an error.")
-    if code == "CONNECTION_REQUIRED":
+    if code in _CONNECTION_CODES:
         payload = render_connection_required(
             connector=_opt_str(error.get("connector")) or planned.connector,
             message=message,
             connect_url=_opt_str(error.get("connect_url")),
             hint=_opt_str(error.get("hint")),
             surface=connection_surface(),
+            code=code,
         )
+        # The account the link repairs or waits on; with no connect_url the user already holds its link.
+        connection_id = _opt_str(error.get("connection_id"))
+        if connection_id:
+            payload["connection_id"] = connection_id
     else:
         payload = {"code": code, "message": message}
         connector = _opt_str(error.get("connector"))
@@ -104,7 +118,16 @@ def render_remote_entry(planned: PlannedCall, remote: Mapping[str, Any]) -> dict
         hint = _opt_str(error.get("hint"))
         if hint:
             payload["hint"] = hint
-    return {"index": planned.position, "name": planned.name, "error": payload}
+    family = _opt_str(error.get("family"))
+    if family:
+        payload["family"] = family
+    return _with_account({"index": planned.position, "name": planned.name, "error": payload}, account)
+
+
+def _with_account(entry: dict[str, Any], account: Optional[str]) -> dict[str, Any]:
+    if account:
+        entry["account"] = account
+    return entry
 
 
 def splice_remote_results(
@@ -175,6 +198,24 @@ def assemble_results(
         "error_count": error_count,
         "total_count": len(merged),
     }
+
+
+def batch_entry_error(value: Any) -> Optional[dict[str, Any]]:
+    """The one failure predicate for per-entry batch results (local and connector).
+
+    A result fails only when it carries a truthy ``error`` and does not claim
+    ``success: true``; successful payloads such as ``{"success": true, "error": null}``
+    pass through unchanged. Returns the error normalized to ``{code, message}``, else None.
+    """
+    if not isinstance(value, Mapping) or value.get("success") is True:
+        return None
+    error = value.get("error")
+    if not error:
+        return None
+    if isinstance(error, Mapping) and {"code", "message"} <= error.keys():
+        return dict(error)
+    return {"code": "TOOL_ERROR",
+            "message": error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)}
 
 
 def _error_entry(position: int, name: str, *, code: str, message: str) -> dict[str, Any]:

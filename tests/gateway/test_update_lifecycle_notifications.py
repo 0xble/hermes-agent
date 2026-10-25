@@ -11,7 +11,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.update_launcher import launch_native_update
-from gateway.update_notifications import final_outcome, read_pending
+from gateway.update_notifications import final_outcome, read_pending, same_update
 from tests.gateway.test_update_command import _make_runner
 from tests.gateway.update_fixtures import finalize_update
 
@@ -34,6 +34,47 @@ def test_native_wrapper_records_real_process_exit_only_after_termination(tmp_pat
     assert not pre_restart_exit.exists()
 
 
+@pytest.mark.live_system_guard_bypass  # Fixed python -c only: no updater, git, service or runtime access.
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX detached wrapper")
+def test_native_wrapper_never_exposes_incomplete_process_exit_marker(tmp_path):
+    """Watchers poll for the marker's existence, so it must appear only once it holds the code.
+    A shell function shadowing ``printf`` observes the marker at the moment the code is written:
+    a direct ``> marker`` redirect has already created it empty by then."""
+    import subprocess
+    from gateway.slash_commands import _spawn_detached_update
+    final_exit = tmp_path / ".update_process_exit_code"
+    with patch("gateway.slash_commands._systemd_scope_wrap_if_supervised", side_effect=lambda argv: (argv, None)), \
+            patch("subprocess.Popen") as popen:
+        _spawn_detached_update([sys.executable, "-c", "raise SystemExit(7)"],
+                               tmp_path / ".update_output.txt", tmp_path / ".update_exit_code")
+    update_cmd = popen.call_args.args[0][-1]
+    probe = (f"printf() {{ if [ -e '{final_exit}' ]; then echo early > '{tmp_path}/visible'; fi; "
+             'builtin printf "$@"; }; ')
+    subprocess.run(["bash", "-c", probe + update_cmd], check=True, timeout=30)
+    assert not (tmp_path / "visible").exists()
+    assert final_exit.read_text() == "7"
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_windows_helper_publishes_process_exit_marker_atomically(tmp_path):
+    from gateway.slash_commands import _WINDOWS_UPDATE_HELPER
+    output, final_exit = tmp_path / "out.txt", tmp_path / ".update_process_exit_code"
+    replaced = []
+    import os
+    real_replace = os.replace
+
+    def spy(src, dst):
+        replaced.append((src, dst, final_exit.exists()))
+        real_replace(src, dst)
+
+    with patch("subprocess.Popen") as popen, patch("os.replace", side_effect=spy):
+        popen.return_value.wait.return_value = 7
+        with patch.object(sys, "argv", ["-c", str(output), str(final_exit), "hermes"]):
+            exec(compile(_WINDOWS_UPDATE_HELPER, "<helper>", "exec"), {"__name__": "__main__"})
+    assert replaced == [(str(final_exit) + ".tmp", str(final_exit), False)]
+    assert final_exit.read_text(encoding="utf-8") == "7"
+
+
 def pending(home, *, reason=True):
     data = {"platform": "telegram", "chat_id": "42", "thread_id": "77", "chat_type": "dm",
             "session_key": "agent:main:telegram:dm:42:thread:77",
@@ -42,6 +83,14 @@ def pending(home, *, reason=True):
         data["reason"] = "Activating the delegation-label fix."
     launch_native_update(home=home, hermes_cmd=["hermes"], pending=data, spawn=Mock())
     return read_pending(home)[1]
+
+
+def test_same_update_accepts_bom_prefixed_marker(tmp_path):
+    pending = {"request_id": "request-1", "reason": "Apply the update"}
+    marker = tmp_path / ".update_pending.json"
+    marker.write_bytes(b"\xef\xbb\xbf" + json.dumps(pending).encode("utf-8"))
+
+    assert same_update(marker, pending)
 
 
 @pytest.mark.asyncio
@@ -121,6 +170,9 @@ async def test_reason_progress_and_final_survive_restart_and_delivery_failure(tm
         assert read_pending(tmp_path)[1]["reason"] == reason
         adapter.send.side_effect = None
         adapter.send.return_value = SimpleNamespace(success=True)
+        marker, record = read_pending(tmp_path)
+        record["notice_retry_at"] = 0  # advance beyond the persisted backoff
+        marker.write_text(json.dumps(record), encoding="utf-8")
         results = await asyncio.gather(second._send_update_notification(), second._send_update_notification())
         assert results.count(True) == 1
         assert read_pending(tmp_path) is None
@@ -159,7 +211,13 @@ async def test_stream_retry_only_sends_unsent_chunk(tmp_path):
         watcher = asyncio.create_task(runner._watch_update_progress(
             poll_interval=.01, stream_interval=.01, timeout=10))
         try:
+            retry_advanced = False
             for _ in range(300):
+                if failed and not retry_advanced:
+                    marker, record = read_pending(tmp_path)
+                    record["notice_retry_at"] = 0
+                    marker.write_text(json.dumps(record), encoding="utf-8")
+                    retry_advanced = True
                 if failed and read_pending(tmp_path)[1].get("output_offset") == output.stat().st_size:
                     break
                 await asyncio.sleep(.01)
@@ -196,6 +254,9 @@ async def test_final_retry_only_sends_unsent_chunk_and_then_final(tmp_path):
         assert await runner._send_update_notification() is False
         assert read_pending(tmp_path)[1]["output_offset"] == 3500
         assert not any(text.startswith("✅") for text in calls)
+        marker, record = read_pending(tmp_path)
+        record["notice_retry_at"] = 0
+        marker.write_text(json.dumps(record), encoding="utf-8")
         assert await runner._send_update_notification() is True
     chunks = [text for text in calls if text.startswith("```")]
     assert sum("A" in text for text in chunks) == 1
@@ -323,6 +384,185 @@ async def test_failed_legacy_update_output_never_claims_success(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_housekeeping_retries_undelivered_notice_after_watcher_deadline(tmp_path):
+    from gateway.run import _start_gateway_housekeeping
+    pending(tmp_path)
+    finalize_update(tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    # A completed watcher has stopped trying; the regular tick must recover it.
+    runner._update_notification_task = asyncio.get_running_loop().create_future()
+    runner._update_notification_task.set_result(None)
+    stop = __import__("threading").Event()
+    loop = asyncio.get_running_loop()
+
+    def tick(*_args):
+        stop.set()
+
+    with patch("gateway.run._hermes_home", tmp_path), \
+         patch("gateway.run._write_runtime_status_quiet"), \
+         patch("gateway.run._housekeeping_chore", side_effect=lambda label, fn: fn() if label == "Update notice retry" else None), \
+         patch("gateway.run_delivery_queue_watch.wait_for_next_tick", side_effect=tick):
+        await asyncio.to_thread(_start_gateway_housekeeping, stop, loop=loop, runner=runner)
+        for _ in range(100):
+            if read_pending(tmp_path) is None:
+                break
+            await asyncio.sleep(.01)
+    assert read_pending(tmp_path) is None
+    assert any("Update Complete" in call.args[1] for call in adapter.send.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_superseded_watcher_cannot_clear_new_marker(tmp_path):
+    data = pending(tmp_path)
+    finalize_update(tmp_path)
+    runner = _make_runner()
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=False, error="flood_control:120")))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    from gateway.update_launcher import launch_native_update
+    with patch("gateway.run._hermes_home", tmp_path):
+        old = asyncio.create_task(runner._watch_update_progress(poll_interval=.01, stream_interval=.01, timeout=1))
+        for _ in range(100):
+            if read_pending(tmp_path)[1].get("notice_retry_at"):
+                break
+            await asyncio.sleep(.01)
+        assert read_pending(tmp_path)[1].get("notice_retry_at")
+        assert launch_native_update(home=tmp_path, hermes_cmd=["hermes"],
+                                    pending={**data, "reason": "second request"}, spawn=Mock())["started"]
+        await asyncio.wait_for(old, 2)
+    current = read_pending(tmp_path)
+    assert current is not None and current[1]["reason"] == "second request"
+
+
+@pytest.mark.asyncio
+async def test_notice_retry_honors_flood_delay_and_prior_result(tmp_path):
+    from gateway.update_notifications import save_pending
+    data = pending(tmp_path)
+    marker, data = read_pending(tmp_path)
+    data["previous_outcome"] = {"reason": "Earlier change", "success": True,
+                                "detail": "Verified earlier revision"}
+    save_pending(marker, data)
+    finalize_update(tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(
+        success=False, error="flood_control:7200")))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert not await runner._send_update_notification()
+        marker, deferred = read_pending(tmp_path)
+        assert deferred["notice_retry_at"] - datetime.now(timezone.utc).timestamp() > 7100
+        before = adapter.send.call_count
+        runner._retry_update_notice_if_due()
+        await asyncio.sleep(0)
+        assert adapter.send.call_count == before
+        deferred["notice_retry_at"] = 0
+        save_pending(marker, deferred)
+        adapter.send.return_value = SimpleNamespace(success=True)
+        runner._retry_update_notice_if_due()
+        await runner._update_notice_retry_task
+    assert read_pending(tmp_path) is None
+    text = adapter.send.call_args_list[-1].args[1]
+    assert "Earlier change" in text and "Verified earlier revision" in text
+
+
+@pytest.mark.asyncio
+async def test_legacy_nested_previous_outcomes_are_bounded_in_rendered_notice(tmp_path):
+    from gateway.update_notifications import save_pending
+
+    pending(tmp_path)
+    marker, record = read_pending(tmp_path)
+    previous = None
+    for index in range(50):
+        previous = {
+            "reason": f"prior reason {index} " + "R" * 2000,
+            "success": index % 2 == 0,
+            "detail": f"prior detail {index} " + "D" * 5000,
+            "previous_outcome": previous,
+        }
+    record["previous_outcome"] = previous
+    save_pending(marker, record)
+    finalize_update(tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert await runner._send_update_notification() is True
+
+    text = adapter.send.call_args_list[-1].args[1]
+    assert len(text) <= 4096
+    assert text.count("Previous update ") <= 8
+    assert read_pending(tmp_path) is None
+
+
+def test_bounded_previous_outcome_history_keeps_new_marker_small(tmp_path):
+    data = pending(tmp_path)
+    for index in range(50):
+        finalize_update(tmp_path)
+        result = launch_native_update(
+            home=tmp_path, hermes_cmd=["hermes"],
+            pending={**data, "reason": f"update {index}"}, spawn=Mock(),
+        )
+        assert result["started"] is True
+        data = read_pending(tmp_path)[1]
+
+    previous = data["previous_outcome"]
+    assert isinstance(previous, dict)
+    assert "previous_outcome" not in previous
+    assert data["previous_outcome_older_count"] == 49
+    assert len(previous["detail"]) <= 240
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_path", ["final_notice", "final_output", "phase_ack"])
+@pytest.mark.parametrize("error", [TimeoutError("transport timed out"), Exception("transport unavailable")])
+async def test_post_deadline_delivery_exception_persists_retry_backoff(tmp_path, send_path, error):
+    pending(tmp_path)
+    marker, record = read_pending(tmp_path)
+    if send_path != "phase_ack":
+        record["updating_notified"] = True
+    marker.write_text(json.dumps(record), encoding="utf-8")
+    if send_path == "final_output":
+        (tmp_path / ".update_output.txt").write_text("native output\n", encoding="utf-8")
+    finalize_update(tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(side_effect=error))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    # A completed watcher cannot retry; only the housekeeping tick remains.
+    runner._update_notification_task = asyncio.get_running_loop().create_future()
+    runner._update_notification_task.set_result(None)
+
+    class Clock(datetime):
+        instant = datetime.now(timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.instant.astimezone(tz) if tz else cls.instant.replace(tzinfo=None)
+
+    with patch("gateway.run._hermes_home", tmp_path), patch("gateway.run_notifications.datetime", Clock):
+        runner._retry_update_notice_if_due()
+        await runner._update_notice_retry_task
+        first = read_pending(tmp_path)[1]
+        assert adapter.send.call_count == 1
+        assert first["notice_attempts"] == 1
+        assert first["notice_retry_at"] > Clock.now(timezone.utc).timestamp()
+        assert first.get("output_offset", 0) == 0
+        for _ in range(3):
+            runner._retry_update_notice_if_due()
+            await asyncio.sleep(0)
+        assert adapter.send.call_count == 1
+        Clock.instant = datetime.fromtimestamp(first["notice_retry_at"] + 1, timezone.utc)
+        runner._retry_update_notice_if_due()
+        await runner._update_notice_retry_task
+        second = read_pending(tmp_path)[1]
+        assert adapter.send.call_count == 2
+        assert second["notice_attempts"] == 2
+        assert second["notice_retry_at"] - Clock.now(timezone.utc).timestamp() >= 120
+        assert second.get("output_offset", 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_missing_adapter_retries_then_expires_without_success_claim(tmp_path, caplog):
     runner = _make_runner()
     runner.adapters = {}
@@ -392,3 +632,120 @@ async def test_whitespace_only_trailing_output_does_not_hold_the_final_notice(tm
     assert messages[-1].startswith("✅ Update Complete")
     assert not any("timed out" in m.lower() or "still running" in m.lower() for m in messages)
     assert read_pending(tmp_path) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_path", ["final_notice", "final_output", "phase", "watcher_output"])
+async def test_inflight_old_notice_cannot_mutate_superseding_request(tmp_path, send_path):
+    old = pending(tmp_path)
+    if send_path != "phase":
+        marker, record = read_pending(tmp_path)
+        record["updating_notified"] = True
+        marker.write_text(json.dumps(record), encoding="utf-8")
+    if send_path in {"final_output", "watcher_output"}:
+        (tmp_path / ".update_output.txt").write_text("A" * 3500 + "B")
+    finalize_update(tmp_path)
+    messages = []
+
+    async def send(_chat, text, **_kwargs):
+        messages.append(text)
+        if len(messages) == 1:
+            result = launch_native_update(
+                home=tmp_path, hermes_cmd=["hermes"],
+                pending={**old, "reason": "second request",
+                         "timestamp": datetime.now(timezone.utc).isoformat()}, spawn=Mock(),
+            )
+            assert result["started"] is True
+        return SimpleNamespace(success=True)
+
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(send=send)}
+    with patch("gateway.run._hermes_home", tmp_path):
+        if send_path in {"final_notice", "final_output"}:
+            assert await runner._send_update_notification() is False
+        elif send_path == "phase":
+            assert await runner._send_update_phase("updating") is False
+        else:
+            await asyncio.wait_for(runner._watch_update_progress(
+                poll_interval=.01, stream_interval=0, timeout=.1), 2)
+    current = read_pending(tmp_path)
+    assert current is not None
+    assert current[1]["reason"] == "second request"
+    assert current[1]["request_id"] != old["request_id"]
+    assert current[1]["previous_outcome"]["reason"] == old["reason"]
+    assert not current[1].get("updating_notified")
+    assert not current[1].get("output_offset")
+    assert not current[1].get("notice_retry_at")
+    assert len(messages) == 1
+
+
+def _overwrite_latest_with_pm_sync(home):
+    """``pm`` sync finishes after the update and replaces the shared ``latest.json`` pointer."""
+    path = home / "logs" / "update_receipts" / "latest.json"
+    path.write_text(json.dumps({
+        "schema": 1, "kind": "sync", "outcome": "ok", "update_id": None,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }))
+
+
+def test_final_outcome_reads_the_update_receipt_after_a_pm_sync_overwrites_latest(tmp_path):
+    data = pending(tmp_path)
+    finalize_update(tmp_path)
+    _overwrite_latest_with_pm_sync(tmp_path)
+    with patch("gateway.status.live_gateway_pid_for_home", return_value=1234):
+        result = final_outcome(tmp_path, data)
+    assert result is not None and result[0] is True, result
+
+
+def _unroutable_pending(home):
+    """A request_update from cron or the CLI has no chat to report back to."""
+    launch_native_update(home=home, hermes_cmd=["hermes"], spawn=Mock(), pending={
+        "reason": "Promote the merged fix.", "timestamp": datetime.now(timezone.utc).isoformat()})
+    return read_pending(home)[1]
+
+
+@pytest.mark.asyncio
+async def test_unroutable_marker_waits_for_the_outcome_then_clears(tmp_path):
+    _unroutable_pending(tmp_path)
+    runner = _make_runner()
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert await runner._send_update_notification() is False
+        assert read_pending(tmp_path) is not None, "an unfinished update must keep its admission"
+        finalize_update(tmp_path)
+        with patch("gateway.status.live_gateway_pid_for_home", return_value=1234):
+            assert await runner._send_update_notification() is True
+    assert read_pending(tmp_path) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("process_exited", [False, True])
+async def test_unroutable_marker_timeout_releases_only_after_the_updater_exits(tmp_path, process_exited):
+    """A watcher deadline must not free the admission of an update that is still running."""
+    _unroutable_pending(tmp_path)
+    if process_exited:
+        # Exited cleanly but left no receipt for this request, so the outcome stays unknown.
+        (tmp_path / ".update_process_exit_code").write_text("0")
+    runner = _make_runner()
+    with patch("gateway.run._hermes_home", tmp_path):
+        released = await runner._send_update_notification(timed_out=True)
+    assert released is process_exited
+    assert (read_pending(tmp_path) is None) is process_exited
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("process_exited", [False, True])
+async def test_legacy_unroutable_marker_waits_for_the_real_process_exit(tmp_path, process_exited):
+    """A pre-v2 marker's ``.update_exit_code`` lands before the gateway restart, while the updater
+    may still be running, so it must not release the admission on its own."""
+    marker = tmp_path / ".update_pending.json"
+    marker.write_text(json.dumps({"reason": "Legacy CLI update.",
+                                  "timestamp": datetime.now(timezone.utc).isoformat()}))
+    (tmp_path / ".update_exit_code").write_text("0")
+    if process_exited:
+        (tmp_path / ".update_process_exit_code").write_text("0")
+    runner = _make_runner()
+    with patch("gateway.run._hermes_home", tmp_path):
+        released = await runner._send_update_notification()
+    assert released is process_exited
+    assert marker.exists() is not process_exited

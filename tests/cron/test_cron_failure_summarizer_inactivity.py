@@ -20,7 +20,7 @@ via get_cron_fallback_chain() and reports "No backup provider is configured" whe
 it's empty.
 """
 
-import cron.scheduler as scheduler
+from cron import scheduler
 from cron.scheduler import _summarize_cron_failure_for_delivery
 
 

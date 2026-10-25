@@ -30,6 +30,29 @@ _KANBAN_RE = re.compile(r"^t_[0-9a-f]+$")
 # lane, not merged scratch; checking it is expensive and it stays preserved.
 _MAX_CHERRY_AHEAD = 50
 
+# Directories a tool regenerates from tracked sources. They are removed with the tree instead of
+# archived: copying them out (often over half a tree) moved bytes instead of freeing them. Exact
+# names only, matched against directory components, so a file or an unlisted directory is still
+# archived.
+_REGENERABLE_DIRS = frozenset({
+    ".venv", "node_modules", "__pycache__", ".pytest_cache", ".pytest-cache", ".ruff_cache",
+    ".mypy_cache", ".direnv",
+})
+# Generic build-output names, trusted only when an ignore rule matches the directory itself
+# (git then reports it as one ``!! dir/`` entry): an untracked ``build/`` could be hand-made, and
+# a tracked source folder such as ``scripts/build/`` can hold an ignored ``.env``. ``.ci`` is the
+# local CI state and caches.
+_IGNORED_BUILD_DIRS = frozenset({".ci", "build", "dist", "target", ".next", ".turbo"})
+
+
+def _regenerable(path: str, ignored: bool) -> bool:
+    """True when porcelain *path* lies inside (or is) a regenerable directory."""
+    is_dir = path.endswith("/")
+    parts = path.rstrip("/").split("/")
+    if any(part in _REGENERABLE_DIRS for part in (parts if is_dir else parts[:-1])):
+        return True
+    return ignored and is_dir and parts[-1] in _IGNORED_BUILD_DIRS
+
 
 @dataclass
 class TreeRecord:
@@ -40,7 +63,8 @@ class TreeRecord:
     size_mb: Optional[int]
     verdict: str          # reap | reap-archive | keep
     reason: str
-    untracked: List[str] = field(default_factory=list)
+    untracked: list[str] = field(default_factory=list)
+    archive_mb: Optional[int] = None  # size of ``untracked`` (copied out, not freed); with sizes only
 
 
 @dataclass
@@ -50,9 +74,11 @@ class BranchRecord:
     reason: str
 
 
-def _run(cmd: list, timeout: int, cwd: Optional[str] = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          timeout=timeout, cwd=cwd)
+def _run(cmd: list, timeout: int, cwd: Optional[str] = None,
+         env: Optional[dict[str, str]] = None, binary: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=not binary,
+                          encoding=None if binary else "utf-8",
+                          errors=None if binary else "replace", timeout=timeout, cwd=cwd, env=env, stdin=subprocess.DEVNULL, check=False)
 
 
 @dataclass
@@ -67,15 +93,29 @@ class ExternalTreeRecord:
     missing: bool         # registered but the directory no longer exists
 
 
-def _git(args: list, cwd: str, timeout: int = 15) -> subprocess.CompletedProcess:
-    """Run git, translating timeouts into returncode 124. Every verdict fails safe toward "keep"
-    on nonzero, so a slow ``git cherry`` on a huge repo degrades to keep instead of aborting the
-    audit mid-list."""
+def _git(args: list, cwd: str, timeout: int = 15, *, binary: bool = False) -> subprocess.CompletedProcess:
+    """Run git with host-wide config and excludes disabled; timeouts become returncode 124.
+
+    Worktree cleanup must see files that a user's global ignore rules hide; local
+    repository excludes still apply, because they are part of the repository's
+    own policy and ``--ignored`` below makes those files visible to the safety
+    check as well. Every verdict fails safe toward "keep" on nonzero, so a slow
+    ``git cherry`` on a huge repo degrades to keep instead of aborting the audit
+    mid-list. Uses :func:`noninteractive_repo_git_env` (which also drops global and
+    system config) because ``status`` executes the repo's ``core.fsmonitor`` and clean
+    filters (GHSA-7x36-8jrh-v4pw).
+    """
+    from hermes_cli._subprocess_compat import FILTER_DISCOVERY_FAILED, noninteractive_repo_git_env
+    argv = ["git", "-c", "core.excludesFile=", *args]
+    env = noninteractive_repo_git_env(cwd)
+    if env is None:
+        return subprocess.CompletedProcess(args=argv, returncode=1, stdout=b"" if binary else "",
+                                           stderr=FILTER_DISCOVERY_FAILED)
     try:
-        return _run(["git", *args], timeout, cwd)
+        return _run(argv, timeout, cwd, env=env, binary=binary)
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(args=["git", *args], returncode=124, stdout="",
-                                           stderr=f"timeout after {timeout}s")
+        return subprocess.CompletedProcess(args=argv, returncode=124,
+                                           stdout=b"" if binary else "", stderr=f"timeout after {timeout}s")
 
 
 def _tree_size_mb(path: Path, timeout: int = 30) -> Optional[int]:
@@ -87,20 +127,63 @@ def _tree_size_mb(path: Path, timeout: int = 30) -> Optional[int]:
         return None
 
 
-def _dirty_split(path: str) -> tuple[bool, List[str]]:
-    """(has_tracked_modifications, untracked_paths) — tracked = real work, untracked = archivable."""
+def _raise(error: OSError) -> None:
+    raise error
+
+
+def _paths_size_mb(tree: Path, rels: List[str]) -> Optional[int]:
+    """Bytes (MiB, rounded up) the archive would copy for *rels*; None when unreadable."""
+    total = 0
     try:
-        result = _git(["status", "--porcelain"], cwd=path, timeout=10)
-        if result.returncode != 0:
+        for rel in rels:
+            src = tree / rel
+            if src.is_symlink() or not src.is_dir():
+                total += src.lstat().st_size
+                continue
+            for root, _dirs, files in os.walk(src, onerror=_raise):
+                total += sum(os.lstat(os.path.join(root, name)).st_size for name in files)
+    except OSError:
+        return None
+    return -(-total // (1024 * 1024))
+
+
+def _dirty_split(path: str) -> tuple[bool, list[str]]:
+    """(has_tracked_modifications, untracked_paths) — tracked = real work, untracked = archivable.
+
+    Ignored-but-present files are included intentionally: cleanup cannot safely
+    delete a worktree merely because repository or host policy hides a file
+    (local env files, notes, scratch output). Regenerable directories
+    (:func:`_regenerable`) are the exception: they are left out and go with the tree.
+    """
+    try:
+        result = _git([
+            "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching",
+        ], cwd=path, timeout=10, binary=True)
+        if result.returncode != 0 or (result.stdout and not result.stdout.endswith(b"\0")):
             return True, []  # fail safe: treat as real work
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
-        untracked = [line[3:].strip() for line in lines if line.startswith("??")]
-        return len(untracked) != len(lines), untracked
+        fields = iter(result.stdout.split(b"\0")[:-1])
+        untracked = []
+        tracked = False
+        for field in fields:
+            if len(field) < 4 or field[2:3] != b" ":
+                return True, []
+            status = field[:2]
+            if status in (b"??", b"!!"):
+                rel = os.fsdecode(field[3:])
+                if not _regenerable(rel, ignored=status == b"!!"):
+                    untracked.append(rel)
+            else:
+                tracked = True
+                # Porcelain v1 -z adds an extra NUL-delimited *source* for renames/copies.
+                if b"R" in status or b"C" in status:
+                    if next(fields, None) is None:
+                        return True, []
+        return tracked, untracked
     except Exception:
         return True, []
 
 
-def _archive_untracked(tree: Path, untracked: List[str]) -> Optional[Path]:
+def _archive_untracked(tree: Path, untracked: list[str]) -> Optional[Path]:
     """Copy untracked files out of a doomed tree; None on any failure (caller must then keep)."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
     from hermes_constants import get_hermes_home
@@ -108,20 +191,24 @@ def _archive_untracked(tree: Path, untracked: List[str]) -> Optional[Path]:
     try:
         for rel in untracked:
             src = tree / rel
-            if not src.exists() or src.is_symlink():
-                continue
+            # lexists: a dangling link is still a listed path that must be preserved.
+            if not os.path.lexists(src):
+                logger.warning("Could not archive untracked path %s", src)
+                return None
             (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-            if src.is_dir():
-                shutil.copytree(src, dest / rel, dirs_exist_ok=True)
+            if src.is_symlink():
+                os.symlink(os.readlink(src), dest / rel, target_is_directory=src.is_dir())
+            elif src.is_dir():
+                shutil.copytree(src, dest / rel, symlinks=True, dirs_exist_ok=True)
             else:
-                shutil.copy2(src, dest / rel)
+                shutil.copy2(src, dest / rel, follow_symlinks=False)
         return dest if dest.exists() else None
     except Exception as exc:
         logger.warning("Could not archive untracked files from %s: %s", tree, exc)
         return None
 
 
-def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads) -> tuple[str, str, List[str]]:
+def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads) -> tuple[str, str, list[str]]:
     """Return (verdict, reason, untracked) for one tree under ``.worktrees/``."""
     path = str(entry)
     if _KANBAN_RE.match(entry.name):
@@ -147,7 +234,16 @@ def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads)
     return "reap", "clean and fully merged/pushed", []
 
 
-def audit_external_trees(repo_root: str) -> List[ExternalTreeRecord]:
+def _worktree_porcelain(repo_root: str) -> Optional[List[List[str]]]:
+    """Read worktree records without quoting or splitting paths containing newlines."""
+    result = _git(["worktree", "list", "--porcelain", "-z"], cwd=repo_root, timeout=10, binary=True)
+    if result.returncode != 0 or not result.stdout.endswith(b"\0\0"):
+        return None
+    return [[os.fsdecode(field) for field in block.split(b"\0")]
+            for block in result.stdout[:-2].split(b"\0\0")]
+
+
+def audit_external_trees(repo_root: str) -> list[ExternalTreeRecord]:
     """List linked worktrees registered OUTSIDE ``.worktrees/``.
 
     ``hermes -w`` scratch trees all live under ``<repo>/.worktrees/``, but
@@ -158,14 +254,14 @@ def audit_external_trees(repo_root: str) -> List[ExternalTreeRecord]:
     flag registrations whose directory has vanished (safe to
     ``git worktree prune``).
     """
-    result = _git(["worktree", "list", "--porcelain"], cwd=repo_root, timeout=10)
-    if result.returncode != 0:
+    worktrees = _worktree_porcelain(repo_root)
+    if worktrees is None:
         return []
 
     managed_root = os.path.realpath(str(Path(repo_root) / ".worktrees"))
     main_root = os.path.realpath(repo_root)
 
-    records: List[ExternalTreeRecord] = []
+    records: list[ExternalTreeRecord] = []
     current: dict = {}
 
     def _flush():
@@ -187,25 +283,22 @@ def audit_external_trees(repo_root: str) -> List[ExternalTreeRecord]:
             missing=not os.path.exists(path),
         ))
 
-    for line in result.stdout.splitlines():
-        line = line.rstrip()
-        if not line:
-            _flush()
-            current = {}
-            continue
-        if line.startswith("worktree "):
-            current["path"] = line[len("worktree "):]
-        elif line.startswith("branch refs/heads/"):
-            current["branch"] = line[len("branch refs/heads/"):]
-        elif line.startswith("HEAD "):
-            current["head"] = line[len("HEAD "):]
-        elif line == "locked" or line.startswith("locked "):
-            current["locked"] = True
-    _flush()
+    for fields in worktrees:
+        current = {}
+        for line in fields:
+            if line.startswith("worktree "):
+                current["path"] = line[len("worktree "):]
+            elif line.startswith("branch refs/heads/"):
+                current["branch"] = line[len("branch refs/heads/"):]
+            elif line.startswith("HEAD "):
+                current["head"] = line[len("HEAD "):]
+            elif line == "locked" or line.startswith("locked "):
+                current["locked"] = True
+        _flush()
     return records
 
 
-def prune_missing_registrations(repo_root: str, *, dry_run: bool = False) -> List[str]:
+def prune_missing_registrations(repo_root: str, *, dry_run: bool = False) -> list[str]:
     """Drop registrations whose directory no longer exists (any location).
 
     The equivalent of a targeted ``git worktree prune``: purely
@@ -224,7 +317,7 @@ def prune_missing_registrations(repo_root: str, *, dry_run: bool = False) -> Lis
 
 
 def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
-                    older_than_days: Optional[float] = None) -> List[TreeRecord]:
+                    older_than_days: Optional[float] = None) -> list[TreeRecord]:
     """Classify every tree under ``.worktrees/`` without mutating anything.
 
     ``older_than_days`` only ever RESTRICTS: a reapable tree younger than the threshold is kept
@@ -244,7 +337,7 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
     remote_heads = _ops._fetch_remote_branch_heads(repo_root)
 
     now = time.time()
-    records: List[TreeRecord] = []
+    records: list[TreeRecord] = []
     for entry in sorted(worktrees_dir.iterdir()):
         if not entry.is_dir():
             continue
@@ -263,7 +356,8 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
         records.append(TreeRecord(
             name=entry.name, path=str(entry), branch=branch,
             age_days=age_days, size_mb=_tree_size_mb(entry) if with_sizes else None,
-            verdict=verdict, reason=reason, untracked=untracked))
+            verdict=verdict, reason=reason, untracked=untracked,
+            archive_mb=_paths_size_mb(entry, untracked) if with_sizes else None))
 
     if len(merge_cache) != cache_size_before:
         _ops._save_worktree_merge_cache(merge_cache)
@@ -273,19 +367,28 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
 _REAP_VERDICTS = {"reap", "reap-archive", "reap-keep-branch"}
 
 
+def _size_note(record: TreeRecord) -> str:
+    if record.archive_mb is None:
+        return ""
+    if record.size_mb is None:
+        return f": archives ~{record.archive_mb}M"
+    return f": frees ~{max(record.size_mb - record.archive_mb, 0)}M, archives ~{record.archive_mb}M"
+
+
 def reclaim_worktrees(
-    repo_root: str, *, dry_run: bool = False, records: Optional[List[TreeRecord]] = None
-) -> List[str]:
+    repo_root: str, *, dry_run: bool = False, records: Optional[list[TreeRecord]] = None
+) -> list[str]:
     """Remove every reap-verdict tree from a frozen audit list — never re-globs inside the
     destructive loop, so trees created by concurrent sessions after the audit are out of scope."""
+    from hermes_cli import worktree_ops as _ops
     if records is None:
         records = audit_worktrees(repo_root, with_sizes=False)
-    actions: List[str] = []
+    actions: list[str] = []
     for record in records:
         if record.verdict not in _REAP_VERDICTS:
             continue
         if dry_run:
-            actions.append(f"would remove {record.name} ({record.reason})")
+            actions.append(f"would remove {record.name} ({record.reason}){_size_note(record)}")
             continue
 
         entry = Path(record.path)
@@ -300,7 +403,8 @@ def reclaim_worktrees(
         with contextlib.suppress(Exception):
             _git(["worktree", "unlock", record.path], cwd=repo_root, timeout=10)
         try:
-            remove_result = _git(["worktree", "remove", record.path, "--force"], cwd=repo_root, timeout=30)
+            remove_result = _git(["worktree", "remove", record.path, "--force"], cwd=repo_root,
+                                 timeout=_ops.WORKTREE_REMOVE_TIMEOUT)
             if remove_result.returncode != 0:
                 actions.append(f"failed to remove {record.name}: {remove_result.stderr.strip()}")
                 continue
@@ -319,14 +423,14 @@ def reclaim_worktrees(
     return actions
 
 
-def audit_branches(repo_root: str) -> List[BranchRecord]:
+def audit_branches(repo_root: str) -> list[BranchRecord]:
     """Classify EVERY local branch: deletable when fully merged OR every commit is patch-equivalent
     upstream (``git cherry``) and not checked out. The gate is content reachability, not name."""
     from hermes_cli import worktree_ops as _ops
     if _ops._repo_is_shallow(repo_root):
         _ops._deepen_shallow_repo(repo_root)
 
-    def _lines(result) -> List[str]:
+    def _lines(result) -> list[str]:
         return [b.strip() for b in result.stdout.splitlines() if b.strip()]
 
     # No remote at all -> the local trunk; no trunk either -> nothing can be judged, report nothing.
@@ -342,10 +446,12 @@ def audit_branches(repo_root: str) -> List[BranchRecord]:
         return []
     branches = _lines(result)
 
-    wt = _git(["worktree", "list", "--porcelain"], cwd=repo_root, timeout=10)
+    wt = _worktree_porcelain(repo_root)
+    if wt is None:
+        return []  # unknown checkout state: do not offer branch deletion
     active = {
-        line.removeprefix("branch refs/heads/").strip()
-        for line in wt.stdout.splitlines() if line.startswith("branch refs/heads/")}
+        line.removeprefix("branch refs/heads/")
+        for fields in wt for line in fields if line.startswith("branch refs/heads/")}
     merged = set(_lines(_git(["branch", "--merged", upstream, "--format=%(refname:short)"], cwd=repo_root, timeout=15)))
 
     def _classify_branch(branch: str) -> BranchRecord:
@@ -386,12 +492,12 @@ def audit_branches(repo_root: str) -> List[BranchRecord]:
 
 
 def reclaim_branches(
-    repo_root: str, *, dry_run: bool = False, records: Optional[List[BranchRecord]] = None
-) -> List[str]:
+    repo_root: str, *, dry_run: bool = False, records: Optional[list[BranchRecord]] = None
+) -> list[str]:
     """Delete every delete-verdict branch from a frozen audit list."""
     if records is None:
         records = audit_branches(repo_root)
-    actions: List[str] = []
+    actions: list[str] = []
     for record in records:
         if record.verdict != "delete":
             continue

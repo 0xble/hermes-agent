@@ -10,9 +10,10 @@ default ``busy_input_mode='interrupt'`` path — calling
 completions (terminal ``notify_on_complete``), which also re-enter as internal
 events.
 
-The fix: ``_handle_active_session_busy_message`` returns ``False`` early for any
-event with ``internal=True``, so the base adapter queues it silently (no
-interrupt, no ack) and it cascades as a new turn after the current one finishes.
+``_handle_active_session_busy_message`` admits internal completions to the
+adapter FIFO and returns ``True`` to prevent duplicate fallback admission.
+The completion stays silent (no interrupt, steering, redirect, or ack) and
+cascades as a new turn after the current one finishes.
 This preserves strict message-role alternation and the design invariant that a
 completion surfaces as a NEW turn only when idle, never spliced into a running
 turn.
@@ -44,7 +45,7 @@ from gateway.platforms.base import (
     build_session_key,
 )
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.run import GatewayRunner  # noqa: E402
+from gateway.run import GatewayRunner
 
 
 def _make_internal_event(text: str = "[async delegation completed]") -> MessageEvent:
@@ -104,7 +105,7 @@ def _make_running_parent() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_internal_event_does_not_interrupt_busy_session() -> None:
+async def test_internal_event_does_not_interrupt_busy_session(monkeypatch: pytest.MonkeyPatch) -> None:
     """The async-delegation completion must not abort the active turn."""
     runner = _make_runner()
     runner._busy_input_mode = "interrupt"  # the default that caused the bug
@@ -114,14 +115,20 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
     parent = _make_running_parent()
     runner._running_agents[sk] = parent
     runner.adapters[event.source.platform] = adapter
+    steer_or_redirect = AsyncMock()
+    monkeypatch.setattr(runner, "_resolve_busy_steer_or_redirect", steer_or_redirect)
 
     handled = await runner._handle_active_session_busy_message(event, sk)
 
-    # Returns False so the base adapter silently queues the internal event
-    # as a cascading next turn — it must NOT be handled-with-interrupt here.
-    assert handled is False
+    # FIFO admission owns the event, so the adapter must not queue it again.
+    assert handled is True
+    assert adapter._pending_messages[sk] is event
+    assert getattr(event, "_gateway_accepted", False) is True
+    assert not runner._overflow_queue(sk)
     # The active turn must survive.
+    assert runner._running_agents[sk] is parent
     parent.interrupt.assert_not_called()
+    steer_or_redirect.assert_not_called()
     # No "⚡ Interrupting current task" (or any) ack for a synthetic event.
     adapter._send_with_retry.assert_not_called()
 

@@ -145,6 +145,51 @@ def test_card_fill_scopes_low_entropy_values_but_not_pan_or_cvc(monkeypatch):
         redact.clear_vault_redaction_values()
 
 
+@pytest.mark.parametrize("stored_pan", ["4111111111111111", "4111 1111 1111 1111", "4111-1111-1111-1111"])
+def test_card_fill_redacts_pan_separator_variants(monkeypatch, stored_pan):
+    from agent import redact
+    monkeypatch.setitem(_CARD, "card_number", stored_pan)
+    try:
+        assert json.loads(_run_fill("https://shop.test/checkout")[0])["success"]
+        for displayed in ("4111111111111111", "4111 1111 1111 1111", "4111-1111-1111-1111",
+                          "4111\u00a01111\u00a01111\u00a01111", "4111 1111-1111 1111"):
+            assert redact.redact_registered_vault_values(f"pan={displayed}", tab="other") == (
+                "pan=«redacted-vault-secret»"
+            )
+    finally:
+        redact.clear_vault_redaction_values()
+
+
+@pytest.mark.parametrize("label", ["Issue date (MM/YY)", "Valid from (MM/YY)", "Start date (MM/YY)"])
+def test_card_fill_does_not_write_expiry_to_issue_dates(label):
+    from agent import redact
+    controls = [{"autocomplete": "cc-number", "index": 0, "type": "text"},
+                {"label": label, "index": 1, "type": "text"},
+                {"label": "Expiry (MM/YY)", "index": 2, "type": "text"}]
+    try:
+        raw, _, exprs = _run_fill("https://shop.test/checkout", controls=controls)
+        assert json.loads(raw)["success"]
+        assert '"index": 1' not in exprs[0]
+        assert '"index": 2' in exprs[0]
+    finally:
+        redact.clear_vault_redaction_values()
+
+
+@pytest.mark.parametrize("label", ["CVV", "CVC", "Security code"])
+def test_card_fill_fills_masked_cvv_without_autocomplete(label):
+    from agent import redact
+    controls = [{"autocomplete": "cc-number", "index": 0, "type": "text"},
+                {"label": label, "index": 1, "type": "password"},
+                {"label": "Account password", "index": 2, "type": "password"}]
+    try:
+        raw, _, exprs = _run_fill("https://shop.test/checkout", controls=controls)
+        assert json.loads(raw)["fields"] == ["cc-csc", "cc-number"]
+        assert '"index": 1' in exprs[0]
+        assert '"index": 2' not in exprs[0]
+    finally:
+        redact.clear_vault_redaction_values()
+
+
 def test_card_registrations_cannot_evict_birthday_quarantine():
     from agent import redact
     tab, origin = "mixed-vault-tab", "https://checkout.test"
@@ -273,6 +318,26 @@ def test_card_fill_that_cannot_pay_never_prompts(controls):
     out = json.loads(raw)
     assert out["success"] is False and out["error_type"] == "no_payment_fields"
     assert prompts == [] and secret_exprs == []
+
+
+def test_slow_card_confirmation_without_refresh_support_preserves_base_fill(monkeypatch):
+    from agent import redact
+    from tools import browser_vault_tool as vault
+    try:
+        clock = [1000.0]
+        monkeypatch.setattr(vault.time, "monotonic", lambda: clock[0])
+
+        def accept_after_wait(*_):
+            clock[0] += 31.0
+            return "accept"
+
+        monkeypatch.setattr(vault, "_confirm_payment_fill", accept_after_wait)
+        raw, _prompts, secret_exprs = _run_fill("https://shop.test/checkout")
+        out = json.loads(raw)
+        assert out["success"] is True
+        assert len(secret_exprs) == 1
+    finally:
+        redact.clear_vault_redaction_values()
 
 
 def test_card_fill_writes_only_targets_stamped_after_consent():

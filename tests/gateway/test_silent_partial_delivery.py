@@ -72,6 +72,7 @@ def _make_consumer(adapter=None, **overrides):
     consumer._last_sent_text = ""
     consumer._accumulated = ""
     consumer._stream_ledger = ""
+    consumer._segment_start = 0
     consumer._initial_reply_to_id = None
     consumer.metadata = None
     consumer._already_sent = True
@@ -274,10 +275,10 @@ def _make_runner(adapter):
 
 
 async def _run_turn(monkeypatch, tmp_path, *, consumer_cls=None, session_id):
-    import yaml
+    import hermes_yaml as yaml
 
     (tmp_path / "config.yaml").write_text(
-        yaml.dump(
+        yaml.safe_dump(
             {
                 "display": {"tool_progress": "off", "interim_assistant_messages": False},
                 "streaming": {
@@ -385,7 +386,7 @@ async def test_recordless_flag_with_dead_transport_leaves_normal_send(
             # fails, like a dropped Discord WebSocket.
             self.adapter.fail_edits = True
 
-    adapter, result = await _run_turn(
+    _adapter, result = await _run_turn(
         monkeypatch,
         tmp_path,
         consumer_cls=_DeadEditRecordlessConsumer,
@@ -422,7 +423,7 @@ class TestDiscordTransportClassification:
         assert not mod._is_discord_transport_error(
             RuntimeError("error code: 50013: Missing Permissions")
         )
-        assert not mod._is_discord_transport_error(asyncio.TimeoutError())
+        assert not mod._is_discord_transport_error(TimeoutError())
 
     @pytest.mark.asyncio
     async def test_send_without_client_reports_send_path_degraded(self):

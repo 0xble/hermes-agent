@@ -36,7 +36,12 @@ def _lease_event_payload(profile_key: str, lease) -> dict:
 
 
 def _watched_lease_homes() -> list[Path]:
-    return [Path(_hermes_home), *_served_profile_homes]
+    from hermes_constants import hermes_home_key
+
+    watched: dict[str, Path] = {}
+    for home in (Path(_hermes_home), *_served_profile_homes):
+        watched.setdefault(hermes_home_key(home), home)
+    return list(watched.values())
 
 
 def _mtime(path: Path):
@@ -44,6 +49,38 @@ def _mtime(path: Path):
         return path.stat().st_mtime_ns
     except OSError:
         return None
+
+
+def _notify_agents_of_screen_change(profile_key: str, payload: dict) -> None:
+    """Stage the Bot Screen line as a per-turn note on that profile's live agents (#125830).
+
+    The system prompt is byte-stable and only rebuilt at compaction, so a screen started or
+    stopped mid-session would otherwise stay unknown to the model until then. The note rides
+    the one-shot user-message channel (``_gateway_turn_context_notes``, consumed by
+    ``agent/turn_context.py``), landing behind the cached prefix. Sessions may hold a fresh
+    agent per turn, so the note is staged on every live session of the profile, not just one.
+    ``payload`` is the just-broadcast display.status snapshot (``running``/``display`` and the
+    lease's public view), already read under the profile's home override."""
+    from hermes_constants import hermes_home_key
+    try:
+        from agent.prompt_builder import bot_screen_note
+        lease_view = payload.get("lease") if isinstance(payload.get("lease"), dict) else {}
+        line = bot_screen_note(bool(payload.get("running")), payload.get("display"),
+                               str(lease_view.get("holder") or ""))
+    except Exception:
+        return
+    if not line:
+        return
+    with _sessions_lock:
+        sids = [sid for sid, sess in _sessions.items() if isinstance(sess, dict) and sess.get("agent") is not None
+                and hermes_home_key(sess.get("profile_home") or get_process_hermes_home()) == profile_key]
+    for sid in sids:
+        agent = _sessions[sid]["agent"]
+        try:
+            prior = getattr(agent, "_gateway_turn_context_notes", "") or ""
+            agent._gateway_turn_context_notes = f"{prior}\n\n{line}" if prior else line
+        except Exception:
+            logger.debug("could not stage Bot Screen note on session %s", sid, exc_info=True)
 
 
 def _poll_runtime_files() -> None:
@@ -68,6 +105,7 @@ def _poll_runtime_files() -> None:
         finally:
             reset_hermes_home_override(token)
         _broadcast_global_event("display.status", payload)
+        _notify_agents_of_screen_change(key, payload)
 
 
 _IDLE_CHECK_S = 30.0
@@ -135,7 +173,7 @@ def _ensure_lease_watcher() -> None:
                 _poll_lease_files()
                 _poll_idle_screens()
                 _poll_runtime_files()
-            except Exception:  # noqa: BLE001 - a torn read must not kill the watcher
+            except Exception:
                 logger.debug("lease watcher poll failed", exc_info=True)
             time.sleep(_LEASE_POLL_S)
     threading.Thread(target=_loop, name="hermes-lease-watcher", daemon=True).start()

@@ -73,7 +73,7 @@ The `.env` keys above supply **credentials only**. The active cloud browser is c
 
 Browser Use mode uses the [Browser Use CLI 3.0](https://github.com/browser-use/browser-use) instead of the built-in browser tools. The agent writes and executes Python in the browser to click, type, drag, scrape, and interact with webpages.
 
-**This is the default browser mode**: when `browser.backend` is unset and the `browser-use` CLI is runnable (installed, or available through `uvx`), the agent gets the single `browser_exec` tool. If the CLI can't run, Hermes falls back to the built-in browser tools automatically.
+**This is the default browser mode**: when `browser.backend` is unset, the agent gets the single `browser_exec` tool. Its engine is browser-harness (the Browser Use CLI is a thin wrapper around it), a regular Python dependency of Hermes, so every install ships it, including the Desktop app, with no separate download. If it is ever missing from Hermes's environment, Hermes falls back to the built-in browser tools and `hermes update` restores it.
 
 The mode is a **driver** that composes with your configured browser backend: it drives Hermes' own headless Chromium, a Nous-subscription cloud browser, Browserbase, Firecrawl, or Browser Use cloud browsers — whichever browser source is selected in `hermes tools` → Browser Automation. The one exception is Camofox, which has no CDP endpoint for the harness to attach to; Camofox setups automatically keep the built-in browser tools.
 
@@ -91,7 +91,7 @@ browser:
 
 (`backend: "browser-use"` remains valid to force the mode explicitly.)
 
-Browser Use's own cloud browsers need `browser-use auth login` or `BROWSER_USE_API_KEY`; other browser sources use their existing credentials unchanged.
+Browser Use's own cloud browsers need `BROWSER_USE_API_KEY`; other browser sources use their existing credentials unchanged.
 
 :::note
 Because Browser Use mode executes model-written Python on your machine, the
@@ -444,11 +444,23 @@ browser_navigate(url="https://example.com", account="lpg")
 ```
 
 The selected alias is bound to the task on its first navigation. A task cannot
-switch aliases after its browser tab exists, and the `personal` alias is not
-accepted. Each alias maps to a separate stable, profile-scoped Camofox identity;
-the underlying `userId` is never exposed to the model. Ending a named-account
-task drops Hermes' local handle and does not delete the Camofox profile, so its
-cookies remain available to a later task using the same alias.
+switch aliases within a turn after its browser tab exists; a later turn may pick
+another alias. The `personal` alias is not accepted. Each alias maps to a separate
+stable, profile-scoped Camofox identity; the underlying `userId` is never exposed
+to the model. Ending a named-account task drops Hermes' local handle and does not
+delete the Camofox profile, so its cookies remain available to a later task using
+the same alias. The tab itself is not guaranteed to survive turn cleanup: page state
+that is not stored in cookies (such as the DOM, in-memory app state, scroll position,
+or unsaved form contents) is lost unless the tab is explicitly handed off or kept.
+
+With a named account or `managed_persistence: true`, a conversation does not
+automatically keep its tab across turns under Camofox. A tab explicitly handed off
+with `browser_handoff` can remain available until the handoff is released, but ordinary
+per-turn cleanup may close it. When a task has no tab yet (a new conversation or a
+gateway restart), Hermes reuses an existing tab of the same identity before opening
+one: a tab on the requested site first, otherwise the newest eligible handoff tab.
+It never takes a tab another live task holds, a tab with protected vault data, or a
+tab the server reported closed.
 
 Account selection is advertised only when Camofox is the active browser backend.
 The aliases are intentionally separate from vault credentials. A vault item can
@@ -465,7 +477,7 @@ Three knobs control the behavior:
 |---------|---------|--------|
 | `browser.camofox.user_id` | `CAMOFOX_USER_ID` | Camofox `userId` Hermes uses when creating tabs. Setting this opts the session into "externally managed" mode. |
 | `browser.camofox.session_key` | `CAMOFOX_SESSION_KEY` | `sessionKey` (a.k.a. `listItemId`) sent on tab creation. Used to match an existing tab during adoption. Defaults to a per-task value if unset. |
-| `browser.camofox.adopt_existing_tab` | `CAMOFOX_ADOPT_EXISTING_TAB` | When true, Hermes calls `GET /tabs?userId=<user_id>` on first use and reuses an existing tab before creating a new one. |
+| `browser.camofox.adopt_existing_tab` | `CAMOFOX_ADOPT_EXISTING_TAB` | When true, Hermes calls `GET /tabs?userId=<user_id>` when it needs a tab and reuses an existing one before creating a new one. Hermes-managed identities (named accounts, `managed_persistence`) always reuse their own tabs; this setting only governs an external `user_id`. |
 
 Env vars take precedence over `config.yaml`. Either form works:
 
@@ -490,12 +502,12 @@ CAMOFOX_ADOPT_EXISTING_TAB=true
 
 **How tab adoption works (when `adopt_existing_tab: true`):**
 
-1. On the first browser tool call after a process start, Hermes issues `GET /tabs?userId=<user_id>` (5-second timeout).
-2. If any tab in the response has `listItemId == session_key`, Hermes adopts the most recently created one in that group.
-3. Otherwise, Hermes adopts the most recently created tab for the user (any `listItemId`).
-4. If no tabs exist or the request fails, Hermes falls back to creating a new tab on the next operation.
+1. When a browser tool call needs a tab and the task has none, Hermes issues `GET /tabs?userId=<user_id>` (5-second timeout).
+2. It skips tabs another live Hermes task holds, tabs quarantined for protected vault data, and tabs the server reported closed.
+3. It prefers a tab already on the navigation target's origin, then the newest tab in the shared identity group (`__shared_identity__`), then the newest tab with `listItemId == session_key`, then the newest remaining tab.
+4. If no tab qualifies or the request fails, Hermes creates a new tab.
 
-Adoption only fires until `tab_id` is populated for the session. If the external app closes the adopted tab mid-run, the next browser tool call will surface a Camofox error — Hermes does not re-poll for a fresh tab on every call.
+The task keeps the adopted tab across turns. If the external app closes it, the next page action reports that the tab is gone, and the next `browser_navigate` adopts or creates a replacement.
 
 **Picking `session_key`:** if you want Hermes to reliably attach to a *specific* existing tab, set `session_key` to the `listItemId` the external app used when creating it. If you leave `session_key` unset and only set `user_id`, Hermes generates a per-task `session_key` (`task_<id>`) — Hermes will share cookies and the profile with the external app, but will open its own tab alongside instead of reusing one.
 
@@ -651,13 +663,19 @@ AGENT_BROWSER_ARGS=--no-sandbox
 
 ### Install agent-browser CLI
 
-You don't need to install anything — `agent-browser` resolves automatically via
-`npx agent-browser` on first browser-tool use. To avoid the one-time npx fetch,
-you can install it globally ahead of time (optional):
+The installers and `hermes update` install `agent-browser` and its pinned
+Chromium through Hermes's package manager by default. If you installed with
+`--skip-browser` / `-SkipBrowser`, or the download failed, install them with:
 
 ```bash
-npm install -g agent-browser
+hermes pm install agent-browser
 ```
+
+This also undoes an earlier `--skip-browser` choice, so updates keep the
+browser tools current. An `agent-browser` already on your `PATH` also works.
+On Linux, Chromium may also need system libraries
+(`npx playwright install-deps chromium`). On Android/Termux, run
+`npm install -g agent-browser && agent-browser install` instead.
 
 :::info
 The `browser` toolset must be included in your config's `toolsets` list or enabled via `hermes config set toolsets '["hermes-cli", "browser"]'`.
@@ -893,10 +911,12 @@ browser:
 
 Or via environment variable: `AGENT_BROWSER_HEADED=1`.
 
-Headed mode does two things:
+Headed mode launches Chromium with a visible window (passes `--headed` to
+agent-browser in local mode), so you can watch the agent work and intervene
+manually for sign-in challenges or CAPTCHAs. Local agent-browser headed sessions skip
+per-turn cleanup, so their window can remain open between turns.
 
-1. **Launches Chromium with a visible window** (passes `--headed` to agent-browser in local mode).
-2. **Keeps the window open between turns.** Normally the browser session is cleaned up after every agent reply; in headed mode the per-turn cleanup is skipped so you can watch the agent work, intervene manually (sign-in challenges, CAPTCHAs), and keep login state warm across the conversation.
+The visible window does not change Camofox's lifecycle rules: Hermes still performs per-turn cleanup and does not guarantee that a tab remains open between turns. Cookies and other profile-backed state can survive; page state not stored in cookies is lost unless the tab is explicitly handed off or kept.
 
 Idle sessions are still reaped after `browser.inactivity_timeout` (default 120s of no browser activity), and all sessions are closed on shutdown. Headed mode only affects the local browser — cloud sessions (Browserbase) are unaffected.
 

@@ -11,7 +11,7 @@ Every later tick logged "already running — skipping" and the job never fired
 again until the whole gateway process was restarted days later.
 
 These tests prove ``run_job`` now bounds the SessionDB init with its own
-timeout (HERMES_CRON_SESSION_DB_TIMEOUT, default 10s) so a hang there can
+timeout (HERMES_CRON_SESSION_DB_TIMEOUT, default 10s per attempt) so a hang there can
 never again wedge the job past that bound, and — end to end — that the
 dispatch guard is released and the job becomes dispatchable again afterward.
 
@@ -122,7 +122,7 @@ class TestSessionDbInitTimeout:
         assert observed_homes == [profile_home]
 
     def test_run_job_does_not_hang_when_sessiondb_init_wedges(self, tmp_path, monkeypatch):
-        """run_job proceeds without a session store when SessionDB init times out."""
+        """run_job fails before agent construction after 3 bounded init attempts."""
         monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.2")
         job = {"id": "wedged-sessiondb", "name": "test", "prompt": "hello"}
         timeouts: list = []
@@ -145,20 +145,21 @@ class TestSessionDbInitTimeout:
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            success, output, final_response, error = run_job(job)
+            success, _output, final_response, error = run_job(job)
 
         # Env-resolved bound was passed to Future.result — not the 10s default,
         # and not an unbounded call.
-        assert timeouts == [0.2]
-        assert success is True
-        assert final_response == "ok"
-        assert mock_agent_cls.call_args.kwargs["session_db"] is None
+        assert timeouts == [0.2] * 3
+        assert success is False
+        assert final_response == ""
+        assert "session store unavailable; run not started" in error
+        mock_agent_cls.assert_not_called()
 
 
     def test_timeout_resolved_from_config_yaml(self, tmp_path, monkeypatch):
         """cron.session_db_timeout_seconds in config.yaml is respected when
         the env var is not set — the canonical config-first resolution path."""
-        import yaml
+        import hermes_yaml as yaml
 
         monkeypatch.delenv("HERMES_CRON_SESSION_DB_TIMEOUT", raising=False)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -186,12 +187,11 @@ class TestSessionDbInitTimeout:
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            success, output, final_response, error = run_job(job)
-
-        # Config value was passed through — not the 10s default.
-        assert timeouts == [0.2]
-        assert success is True
-        assert mock_agent_cls.call_args.kwargs["session_db"] is None
+            success, _output, _final_response, error = run_job(job)
+        assert timeouts == [0.2] * 3
+        assert success is False
+        assert "session store unavailable; run not started" in error
+        mock_agent_cls.assert_not_called()
 
 
 class TestDispatchGuardReleasedAfterHang:
@@ -210,7 +210,7 @@ class TestDispatchGuardReleasedAfterHang:
             "id": "guard-sessiondb-hang",
             "name": "guard-sessiondb-hang",
             "prompt": "hello",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -243,7 +243,7 @@ class TestDispatchGuardReleasedAfterHang:
 
                 n = sched.tick(verbose=False)  # sync=True by default: waits for the job
                 assert n == 1
-                assert timeouts == [0.2]
+                assert timeouts == [0.2] * 3
 
                 # Without the fix this would still contain the job ID forever.
                 assert "guard-sessiondb-hang" not in sched.get_running_job_ids()
@@ -301,37 +301,34 @@ class TestLateSessionDbClosedAfterTimeout:
                 mock_agent.run_conversation.return_value = {"final_response": "ok"}
                 mock_agent_cls.return_value = mock_agent
 
-                success, output, final_response, error = run_job(job)
-                # run_job returned promptly after the timeout; session_db is None
-                assert success is True
+                success, _output, _final_response, _error = run_job(job)
+                # run_job returned promptly without constructing a sessionless agent.
+                assert success is False
+                mock_agent_cls.assert_not_called()
 
                 # Release the hanging init so the abandoned worker completes.
                 never_set.set()
                 # Wait for the done-callback to fire and close the late result.
                 for _ in range(50):
-                    if late_db_holder and late_db_holder[0].close.called:
+                    if len(late_db_holder) == 3 and all(db.close.called for db in late_db_holder):
                         break
                     time.sleep(0.1)
         finally:
             never_set.set()
 
-        assert len(late_db_holder) == 1, "SessionDB() should have completed once"
-        late_db_holder[0].close.assert_called_once(), (
-            "The SessionDB that completed after the timeout must be closed by "
-            "the done-callback — otherwise its SQLite FDs leak until process exit (#72782)"
-        )
+        assert len(late_db_holder) == 3
+        for db in late_db_holder:
+            db.close.assert_called_once()
 
 
 # ===========================================================================
-# #96290: gated runs must not open the session store at all
+# Gated runs must release the store acquired before their acknowledgement
 # ===========================================================================
 
-class TestSessionDbInitAfterEarlyReturns:
-    """SessionDB init moved AFTER the wake-gate / prompt-validation early
-    returns (#96290): a run that never reaches the agent must never open
-    state.db, so there is no handle for a gated return path to abandon."""
+class TestSessionDbEarlyReturnCleanup:
+    """Acquisition before gates is safe because every early return releases its handle."""
 
-    def test_wake_gate_false_never_opens_session_db(self, tmp_path, monkeypatch):
+    def test_wake_gate_false_releases_session_db(self, tmp_path, monkeypatch):
         monkeypatch.delenv("HERMES_CRON_SESSION_DB_TIMEOUT", raising=False)
         job = {
             "id": "gated-no-db",
@@ -350,8 +347,9 @@ class TestSessionDbInitAfterEarlyReturns:
                  return_value=(True, '{"wakeAgent": false}'),
              ), \
              patch("run_agent.AIAgent") as mock_agent_cls:
-            success, output, final_response, error = run_job(job)
+            success, _output, _final_response, _error = run_job(job)
 
         assert success is True
-        mock_db_cls.assert_not_called()
+        mock_db_cls.assert_called_once()
+        mock_db_cls.return_value.close.assert_called_once()
         mock_agent_cls.assert_not_called()

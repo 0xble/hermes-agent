@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
+from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
 from hermes_state import SessionDB
 from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_VERSION
 from hermes_state_repair import _db_opens_cleanly
@@ -34,12 +35,36 @@ def _init_delivery_ledger_schema(conn: sqlite3.Connection) -> None:
     _initialize_schema(conn)
 
 
+def _init_async_delegation_events_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS async_delegation_events (
+            event_id TEXT PRIMARY KEY,
+            delegation_id TEXT NOT NULL,
+            event_kind TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            result_json TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            delivery_state TEXT NOT NULL DEFAULT 'pending',
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            delivered_at REAL,
+            delivery_claim TEXT,
+            delivery_claimed_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_async_delegation_events_delivery
+            ON async_delegation_events(delivery_state, updated_at);
+        """
+    )
+
+
 # state.db tables created lazily by a gateway module (base ``SessionDB`` never creates them on a fresh
 # destination) -> the initializer owning their DDL. Recovery creates them before copying so owed rows
 # don't silently vanish from a "complete" salvage. Register new lazy tables HERE, not as ``if table ==``.
 # See #100313, #86236.
 _AUXILIARY_TABLE_SCHEMAS: dict[str, Callable[[sqlite3.Connection], None]] = {
     "delivery_obligations": _init_delivery_ledger_schema,
+    "async_delegation_events": _init_async_delegation_events_schema,
 }
 _AUXILIARY_TABLES = tuple(_AUXILIARY_TABLE_SCHEMAS)
 _INVENTORY_TABLES = (*_CANONICAL_TABLES, "state_meta", *_TOPIC_TABLES, *_AUXILIARY_TABLES)
@@ -941,9 +966,47 @@ def _sanitize_session_model_config(destination: sqlite3.Connection) -> int:
         )
 
 
+def _repair_out_of_window_timestamps(destination: sqlite3.Connection) -> int:
+    """Rewrite ``messages``/``sessions`` timestamp cells outside the ``coerce_epoch`` window; returns the count.
+
+    A damaged cell can decode as a valid-looking garbage double (``5.49e+246``) that the salvage copies
+    verbatim, and one such row pins the session's recency and breaks every renderer that turns it into
+    a date (#91536). A message takes its nearest valid neighbour's time in the same session (keeps the
+    order), then its session's start, then now; ``started_at`` takes the earliest valid message; the
+    nullable ``ended_at``/``last_activity_at`` become NULL.
+    """
+    message_columns, session_columns = _table_columns(destination, "messages"), _table_columns(destination, "sessions")
+    ok = f"BETWEEN {EPOCH_MIN!r} AND {EPOCH_MAX!r}"
+    now = "CAST(strftime('%s', 'now') AS REAL)"
+    repaired = 0
+    with _immediate_transaction(destination):
+        if "timestamp" in message_columns:
+            repaired += _reconcile(
+                destination, "messages", f"NOT (timestamp {ok})",
+                "UPDATE messages SET timestamp = COALESCE("
+                f"(SELECT p.timestamp FROM messages p WHERE p.session_id = messages.session_id AND p.id < messages.id"
+                f" AND p.timestamp {ok} ORDER BY p.id DESC LIMIT 1),"
+                f"(SELECT n.timestamp FROM messages n WHERE n.session_id = messages.session_id AND n.id > messages.id"
+                f" AND n.timestamp {ok} ORDER BY n.id LIMIT 1),"
+                f"(SELECT s.started_at FROM sessions s WHERE s.id = messages.session_id AND s.started_at {ok}), {now})",
+            )
+        if "started_at" in session_columns:
+            repaired += _reconcile(
+                destination, "sessions", f"NOT (started_at {ok})",
+                "UPDATE sessions SET started_at = COALESCE((SELECT MIN(m.timestamp) FROM messages m"
+                f" WHERE m.session_id = sessions.id AND m.timestamp {ok}), {now})",
+            )
+        for column in ("ended_at", "last_activity_at"):
+            if column in session_columns:
+                repaired += _reconcile(
+                    destination, "sessions", f"NOT ({column} {ok})", f"UPDATE sessions SET {column} = NULL")
+    return repaired
+
+
 def _finalize_derived_metadata(destination: sqlite3.Connection) -> dict[str, Any]:
-    """Sanitize copied JSON columns and stamp metadata the new destination actually owns."""
+    """Sanitize copied JSON columns and timestamps, and stamp metadata the new destination actually owns."""
     model_config_reset = _sanitize_session_model_config(destination)
+    timestamps_repaired = _repair_out_of_window_timestamps(destination)
     fts_tables = {
         str(row[0])
         for row in destination.execute(
@@ -951,7 +1014,8 @@ def _finalize_derived_metadata(destination: sqlite3.Connection) -> dict[str, Any
         ).fetchall()
     }
     result: dict[str, Any] = {
-        "fts_tables": sorted(fts_tables), "finalized": False, "model_config_reset": model_config_reset}
+        "fts_tables": sorted(fts_tables), "finalized": False, "model_config_reset": model_config_reset,
+        "timestamps_repaired": timestamps_repaired}
     if fts_tables != {"messages_fts", "messages_fts_trigram"}:
         result["error"] = "fresh destination is missing required FTS tables"
         return result

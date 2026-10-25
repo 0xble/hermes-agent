@@ -169,6 +169,22 @@ def test_private_probe_optional_snapshot_and_vault(server, monkeypatch):
     assert len(calls) == 1
 
 
+def test_stale_adopted_tab_releases_its_lease(server, monkeypatch):
+    from tools import browser_camofox_leases as leases
+
+    monkeypatch.setattr(cf, "get_camofox_url", lambda: "http://localhost:9377")
+    session = cf._get_session("adopted")
+    session["tab_id"] = "adopted-tab"
+    user_id = session["user_id"]
+    assert leases.claim("http://localhost:9377", user_id, "adopted-tab")
+    response = requests.Response()
+    response.status_code = 410
+    error = requests.HTTPError("tab gone", response=response)
+
+    assert cf._clear_stale_tab(session, error)
+    assert ("http://localhost:9377", user_id, "adopted-tab") not in leases._handles
+
+
 def test_new_tabs_open_without_url_so_the_target_loads_once(server):
     calls, failures = server
     _open()

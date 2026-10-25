@@ -1,10 +1,13 @@
 """Tests for gateway service management helpers."""
 
+import json
 import os
 import plistlib
 import re
 import shlex
+import signal
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +18,7 @@ pwd = pytest.importorskip("pwd")
 grp = pytest.importorskip("grp")
 
 import hermes_cli.gateway as gateway_cli
+from hermes_cli.gateway_launchd import launchd_program_arguments
 from gateway import status
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
@@ -27,13 +31,12 @@ from gateway.restart import (
 
 
 def _osascript_exec_argv(program_args: list[str]) -> list[str]:
-    """The argv a launchd ``ProgramArguments`` of ``/usr/bin/osascript -e <script>`` hands to ``exec`` —
-    undoing the AppleScript string escaping, then POSIX shell quoting, the way osascript and /bin/sh will."""
-    assert program_args[:2] == ["/usr/bin/osascript", "-e"] and len(program_args) == 3, program_args
-    script = program_args[2]
-    prefix, suffix = 'do shell script "', '"'
-    assert script.startswith(prefix) and script.endswith(suffix), script
-    shell = re.sub(r"\\(.)", r"\1", script[len(prefix):-len(suffix)])
+    """The argv the launchd JXA wrapper's libc ``system()`` hands to ``exec``."""
+    assert program_args[:4] == ["/usr/bin/osascript", "-l", "JavaScript", "-e"], program_args
+    assert len(program_args) == 5, program_args
+    script = program_args[4]
+    start = script.index("$.system(") + len("$.system(")
+    shell, _ = json.JSONDecoder().raw_decode(script, start)
     exec_, *argv = shlex.split(shell)
     assert exec_ == "exec", shell
     return argv
@@ -155,24 +158,6 @@ class TestSystemdServiceRefresh:
         ), "daemon-reload must not run when write was refused"
 
 
-class TestTempHomeServiceDefinitionGuard:
-    """_temp_home_in_service_definition() — structural temp-dir detection."""
-
-    def test_detects_tmp_home_in_systemd_unit(self):
-        unit = '[Service]\nEnvironment="HERMES_HOME=/tmp/hermes-e2e-41264"\n'
-        assert (
-            gateway_cli._temp_home_in_service_definition(unit)
-            == "/tmp/hermes-e2e-41264"
-        )
-
-    def test_detects_tempdir_env_home(self, monkeypatch, tmp_path):
-        import tempfile as _tempfile
-
-        monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmp_path))
-        unit = f'[Service]\nEnvironment="HERMES_HOME={tmp_path}/hermes-home"\n'
-        assert gateway_cli._temp_home_in_service_definition(unit) is not None
-
-
 class TestRequireServiceInstalled:
     def test_exits_with_install_hint_when_unit_missing(self, tmp_path, monkeypatch, capsys):
         unit_path = tmp_path / "hermes-gateway.service"
@@ -194,6 +179,7 @@ class TestRequireServiceInstalled:
         gateway_cli._require_service_installed("start")
 
 
+@pytest.mark.platforms("linux")
 class TestServiceIdentityForForeignHome:
     """A HERMES_HOME that is neither ``~/.hermes`` nor ``~/.hermes/profiles/<name>`` must never resolve to
     the default profile's ``hermes-gateway`` unit (a temp-home harness uninstalled the production gateway)."""
@@ -203,6 +189,10 @@ class TestServiceIdentityForForeignHome:
         home = tmp_path / "home"
         home.mkdir()
         monkeypatch.setattr(Path, "home", lambda: home)
+        # The user unit dir follows the ACCOUNT home (#98699), which is read from the environment.
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
         return home
 
     def test_foreign_home_gets_its_own_unit(self, machine_home, tmp_path, monkeypatch):
@@ -264,7 +254,7 @@ class TestUninstallRefusesForeignUnit:
 class TestGetCronDrainTimeout:
     def test_missing_config_falls_back_to_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_CRON_DRAIN_TIMEOUT", raising=False)
-        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
+        monkeypatch.setattr(gateway_cli, "read_raw_config", dict)
         assert (
             gateway_cli._get_cron_drain_timeout() == DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
         )
@@ -371,6 +361,31 @@ class TestGeneratedSystemdUnits:
         unit = gateway_cli.generate_systemd_unit(system=False)
         assert "TimeoutStopSec=60" in unit
 
+    @pytest.mark.parametrize(
+        ("agent_config", "expected"),
+        [
+            ("restart_drain_timeout: .inf", "TimeoutStopSec=infinity"),
+            ("cron_drain_timeout: .inf", "TimeoutStopSec=infinity"),
+            ("restart_drain_timeout: 180\n  cron_drain_timeout: 0",
+             f"TimeoutStopSec={resolve_systemd_timeout_stop_sec(180, 0)}"),
+        ],
+    )
+    def test_unbounded_stop_budget_is_spelled_the_way_systemd_parses_it(
+        self, monkeypatch, agent_config, expected
+    ):
+        """systemd accepts ``infinity`` but rejects ``inf`` (Python's str(math.inf)), so an
+        unlimited drain config must not write an invalid unit; finite budgets stay integers."""
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_CRON_DRAIN_TIMEOUT", raising=False)
+        (hermes_constants.get_hermes_home() / "config.yaml").write_text(
+            f"agent:\n  {agent_config}\n", encoding="utf-8"
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+        timeout_lines = [line for line in unit.splitlines() if line.startswith("TimeoutStopSec=")]
+        assert timeout_lines == [expected]
+        assert not re.search(r"=inf\b", unit)
+
     def test_restart_exit_code_is_also_declared_a_success_status(self):
         """#104251: a planned restart (gateway/restart.py's exit 75) is force-restarted
         via RestartForceExitStatus, but without SuccessExitStatus=75 too, systemd still
@@ -402,53 +417,11 @@ class TestGeneratedSystemdUnits:
         assert "LD_LIBRARY_PATH" not in gateway_cli.generate_systemd_unit(system=False)
 
 
-    def test_user_unit_does_not_leak_profile_node_symlink_target(self, tmp_path, monkeypatch):
-        # Regression for the multi-profile gateway restart-loop flap (#48700):
-        # ~/.local/bin/node is often a symlink into a *specific* profile's node
-        # install. The generated unit's PATH must contain the symlink's own
-        # directory (~/.local/bin), NOT the resolved profile target — otherwise
-        # one profile's node path leaks into every profile's unit, making
-        # systemd_unit_is_current() perpetually false and forcing a
-        # daemon-reload restart loop on every boot.
-        local_bin = tmp_path / ".local" / "bin"
-        profile_node_bin = tmp_path / ".hermes" / "profiles" / "jarvis" / "node" / "bin"
-        local_bin.mkdir(parents=True)
-        profile_node_bin.mkdir(parents=True)
-        real_node = profile_node_bin / "node"
-        real_node.write_text("#!/bin/sh\n")
-        link_node = local_bin / "node"
-        link_node.symlink_to(real_node)
-
-        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: str(link_node) if cmd == "node" else None)
-
-        unit = gateway_cli.generate_systemd_unit(system=False)
-
-        assert str(local_bin) in unit
-        assert str(profile_node_bin) not in unit
-
-    def test_launchd_plist_does_not_leak_profile_node_symlink_target(self, tmp_path, monkeypatch):
-        # Same #48700 regression for the macOS twin generate_launchd_plist().
-        local_bin = tmp_path / ".local" / "bin"
-        profile_node_bin = tmp_path / ".hermes" / "profiles" / "jarvis" / "node" / "bin"
-        local_bin.mkdir(parents=True)
-        profile_node_bin.mkdir(parents=True)
-        real_node = profile_node_bin / "node"
-        real_node.write_text("#!/bin/sh\n")
-        link_node = local_bin / "node"
-        link_node.symlink_to(real_node)
-
-        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: str(link_node) if cmd == "node" else None)
-
-        plist = gateway_cli.generate_launchd_plist()
-
-        assert str(local_bin) in plist
-        assert str(profile_node_bin) not in plist
-
     def test_launchd_plist_persists_configured_nofile_soft_limit(self, monkeypatch):
         """The generated plist must carry SoftResourceLimits/NumberOfFiles so a
         plist rewrite by `hermes gateway start` cannot strip the FD floor and
         reintroduce EMFILE crashes (launchd default soft limit is 256)."""
-        import hermes_cli.resource_limits as resource_limits
+        from hermes_cli import resource_limits
 
         monkeypatch.setattr(
             resource_limits, "configured_nofile_soft_limit", lambda config=None: 65536
@@ -460,10 +433,19 @@ class TestGeneratedSystemdUnits:
         assert "<key>NumberOfFiles</key>" in plist
         assert "<integer>65536</integer>" in plist
 
+    def test_launchd_plist_runs_gateway_as_interactive(self):
+        """launchd's default for an agent with no ProcessType is UTILITY QoS,
+        which starves the gateway behind ordinary terminal workloads."""
+        import plistlib
+
+        body = plistlib.loads(gateway_cli.generate_launchd_plist().encode())
+
+        assert body["ProcessType"] == "Interactive"
+
     def test_launchd_plist_omits_nofile_block_when_disabled(self, monkeypatch):
         """runtime.nofile_soft_limit: 0/false/null disables the adjustment; the
         plist must then not contain a SoftResourceLimits block at all."""
-        import hermes_cli.resource_limits as resource_limits
+        from hermes_cli import resource_limits
 
         monkeypatch.setattr(
             resource_limits, "configured_nofile_soft_limit", lambda config=None: None
@@ -474,8 +456,78 @@ class TestGeneratedSystemdUnits:
         assert "SoftResourceLimits" not in plist
 
 
+class TestWslInteropPaths:
+    """_build_wsl_interop_paths() — only Windows-interop tool dirs belong in the unit's PATH.
+
+    #73163: scraping every ``/mnt/`` entry from the shell PATH persisted heavy
+    Desktop-app/git/node dirs into the gateway unit's Environment=PATH, and the
+    Plan 9 interop (9p) connections those dirs force at gateway start can
+    exhaust the 9p server connection limit. which()-resolved tool dirs and the
+    hardcoded System32 set already cover interop.
+    """
+
+    def test_arbitrary_mount_entries_are_not_scraped_from_shell_path(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join(
+                [
+                    "/usr/local/bin",
+                    "/mnt/d/heavy-app/bin",
+                    "/mnt/d/tools/git/cmd",
+                    "/mnt/c/Users/me/AppData/Local/Programs/desktop/bin",
+                ]
+            ),
+        )
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: None)
+        # The hardcoded candidates (System32…) don't exist on this macOS host, so the
+        # expected result is empty — no /mnt/ entry survives.
+        monkeypatch.setattr(Path, "exists", lambda self: False)
+
+        result = gateway_cli._build_wsl_interop_paths([])
+
+        assert result == []
+
+    def test_which_resolved_tool_dirs_and_system32_set_are_included(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
+        monkeypatch.setenv(
+            "PATH",
+            "/usr/local/bin:/mnt/d/heavy-app/bin:/mnt/c/WINDOWS/system32",
+        )
+
+        def fake_which(name):
+            resolved = {
+                "powershell.exe": "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe",
+                "cmd.exe": "/mnt/c/WINDOWS/system32/cmd.exe",
+                "explorer.exe": "/mnt/c/WINDOWS/explorer.exe",
+                "wsl.exe": "/mnt/c/Windows/System32/wsl.exe",
+            }
+            return resolved.get(name)
+
+        monkeypatch.setattr(gateway_cli.shutil, "which", fake_which)
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+
+        result = gateway_cli._build_wsl_interop_paths(["/mnt/d/heavy-app/bin"])
+
+        # which()-resolved dirs land even when absent from the caller's PATH entry list.
+        assert "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0" in result
+        assert "/mnt/c/WINDOWS/system32" in result
+        # Hardcoded System32 family, gated on existence like on a real install.
+        assert "/mnt/c/WINDOWS" in result
+        assert "/mnt/c/WINDOWS/System32/Wbem" in result
+        # Heavy shell-PATH /mnt/ entries never enter, and dedupe keeps out the
+        # entry the caller already has.
+        assert "/mnt/d/heavy-app/bin" not in result
+
+    def test_outside_wsl_nothing_is_added(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
+        monkeypatch.setenv("PATH", "/usr/local/bin:/mnt/c/WINDOWS/system32")
+
+        assert gateway_cli._build_wsl_interop_paths([]) == []
+
+
 class TestGatewayStopCleanup:
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_stop_only_kills_current_profile_by_default(self, tmp_path, monkeypatch):
         """Without --all, stop uses systemd (if available) and does NOT call
         the global kill_gateway_processes().
@@ -488,7 +540,6 @@ class TestGatewayStopCleanup:
         unit_path.write_text("unit\n", encoding="utf-8")
 
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
-        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
 
         service_calls = []
@@ -776,7 +827,6 @@ class TestLaunchdServiceRecovery:
         # _launchd_domain() must return user/<uid>.
         gateway_cli._resolved_launchd_domain = None
         monkeypatch.setattr(os, "getuid", lambda: 501)
-        label = gateway_cli.get_launchd_label()
 
         def fake_run(cmd, check=False, **kwargs):
             if "print" in cmd and "gui/" in " ".join(cmd):
@@ -916,14 +966,12 @@ class TestLaunchdUnsupportedFallbackPolicy:
 class TestGatewayServiceDetection:
     def test_supports_systemd_services_requires_systemctl_binary(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
-        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: None)
 
         assert gateway_cli.supports_systemd_services() is False
 
     def test_supports_systemd_services_on_host_with_systemctl_present(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
-        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_container", lambda: False)
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "/usr/bin/systemctl")
@@ -935,7 +983,6 @@ class TestGatewayServiceDetection:
         system_unit = SimpleNamespace(exists=lambda: True)
 
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
-        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
         monkeypatch.setattr(
             gateway_cli,
@@ -1296,7 +1343,7 @@ class TestGatewaySystemServiceRouting:
         assert "did not revive" in out
         assert "✓ Service restarted" in out
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_gateway_restart_does_not_fallback_to_foreground_when_launchd_restart_fails(self, tmp_path, monkeypatch):
         """macOS-gated: the branch under test is ``elif is_macos() and
         get_launchd_plist_path().exists()``. Faking the platform flags on Linux
@@ -1330,49 +1377,93 @@ class TestGatewaySystemServiceRouting:
         assert run_calls == []
 
 
-class TestDetectVenvDir:
-    """Tests for _detect_venv_dir() virtualenv detection."""
+def _seed_pm_environment(tmp_path, monkeypatch, with_venv_fact=True):
+    """Commit a pm environment the way ``pm sync`` records it: an install-keyed
+    facts.json whose venv fact names a committed environment generation under
+    the install state (pyvenv.cfg included). Returns
+    ``(project_root, environment_dir)``."""
+    from pm.environments import install_state_dir
 
-    def test_detects_active_virtualenv_via_sys_prefix(self, tmp_path, monkeypatch):
-        venv_path = tmp_path / "my-custom-venv"
-        venv_path.mkdir()
-        monkeypatch.setattr("sys.prefix", str(venv_path))
-        monkeypatch.setattr("sys.base_prefix", "/usr")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # installs_root() under the test root
+    project_root = tmp_path / "payload" / "hermes-agent"
+    project_root.mkdir(parents=True)
+    state = install_state_dir(project_root)
+    environment = state / "environments" / "gen-1"
+    environment.mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("", encoding="utf-8")
+    packages = (
+        {"venv": {"stamp": "abc", "extras": [], "environment": str(environment)}}
+        if with_venv_fact
+        else {}
+    )
+    (state / "facts.json").write_text(
+        json.dumps({"schema": 1, "packages": packages}), encoding="utf-8"
+    )
+    return project_root, environment
 
-        result = gateway_cli._detect_venv_dir()
-        assert result == venv_path
 
-    def test_falls_back_to_dot_venv_directory(self, tmp_path, monkeypatch):
-        # Not inside a virtualenv
+class TestServicePathDirsPmVenv:
+    """Service PATH cannot retain a garbage-collectable dependency generation."""
+
+    def test_does_not_persist_disposable_generation_bin(self, tmp_path, monkeypatch):
         monkeypatch.setattr("sys.prefix", "/usr")
         monkeypatch.setattr("sys.base_prefix", "/usr")
         monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", tmp_path)
+        monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
 
-        dot_venv = tmp_path / ".venv"
-        dot_venv.mkdir()
+        project_root, environment = _seed_pm_environment(tmp_path, monkeypatch)
+        venv_bin = environment / "bin"
+        venv_bin.mkdir()
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", project_root)
 
-        result = gateway_cli._detect_venv_dir()
-        assert result == dot_venv
+        dirs = gateway_cli._build_service_path_dirs(project_root=project_root)
 
-    def test_returns_none_when_no_virtualenv(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("sys.prefix", "/usr")
-        monkeypatch.setattr("sys.base_prefix", "/usr")
-        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", tmp_path)
+        assert str(venv_bin) not in dirs
 
-        result = gateway_cli._detect_venv_dir()
-        assert result is None
+
+def _seed_pm_node_facts(hermes_root):
+    """Write a pm installed-state file recording node/npm store entries.
+
+    _append_node_dir_for_service() resolves managed Node through pm's
+    installed-state (facts.json env PATH entries with ``{{store}}`` templates
+    resolved against the target home's store), so tests seed the record the
+    way a real `pm install` writes it — via the same Facts schema, read back
+    through Facts.env_for().
+    """
+    store_root = hermes_root / "tools"
+    node_dir = store_root / "node-v22.0.0"
+    npm_dir = store_root / "npm-9.0.0" / "bin"
+    node_dir.mkdir(parents=True)
+    npm_dir.mkdir(parents=True)
+    facts = {
+        "schema": 1,
+        "packages": {
+            "node": {
+                "entry": "node-v22.0.0",
+                "version": "22.0.0",
+                "env": {"PATH": ["{{store}}/node-v22.0.0"]},
+            },
+            "npm": {
+                "entry": "npm-9.0.0",
+                "version": "9.0.0",
+                "env": {"PATH": ["{{store}}/npm-9.0.0/bin"]},
+            },
+        },
+    }
+    import json as _json
+
+    (store_root / "facts.json").write_text(_json.dumps(facts), encoding="utf-8")
+    return [str(npm_dir), str(node_dir)]
 
 
 class TestSystemUnitHermesHome:
     """HERMES_HOME in system units must reference the target user, not root."""
 
-    def test_empty_managed_node_dir_uses_only_ambient_fallback(
+    def test_no_pm_node_never_bakes_the_invokers_path_node(
         self, monkeypatch, tmp_path
     ):
-        managed_bin = tmp_path / ".hermes" / "node" / "bin"
-        managed_bin.mkdir(parents=True)
+        """Hermes runs only its PM-managed Node: a PATH node is never written into a unit."""
+        (tmp_path / ".hermes" / "tools").mkdir(parents=True)
         monkeypatch.setattr(
             gateway_cli.shutil, "which", lambda name: "/opt/external-node/bin/node"
         )
@@ -1380,24 +1471,25 @@ class TestSystemUnitHermesHome:
 
         gateway_cli._append_node_dir_for_service(entries, tmp_path / ".hermes")
 
-        assert entries == ["/opt/external-node/bin"]
+        assert entries == []
 
-    def test_non_executable_managed_node_uses_only_ambient_fallback(
+    def test_stale_pm_facts_without_dirs_contribute_nothing(
         self, monkeypatch, tmp_path
     ):
-        managed_bin = tmp_path / ".hermes" / "node" / "bin"
-        managed_bin.mkdir(parents=True)
-        node = managed_bin / "node"
-        node.write_text("#!/bin/sh\n")
-        node.chmod(0o644)
+        """Recorded entries whose store dirs are gone contribute nothing, and no PATH node replaces them."""
+        import shutil as _shutil
+
+        hermes_root = tmp_path / ".hermes"
+        for entry in _seed_pm_node_facts(hermes_root):
+            _shutil.rmtree(entry)
         monkeypatch.setattr(
             gateway_cli.shutil, "which", lambda name: "/opt/external-node/bin/node"
         )
         entries: list[str] = []
 
-        gateway_cli._append_node_dir_for_service(entries, tmp_path / ".hermes")
+        gateway_cli._append_node_dir_for_service(entries, hermes_root)
 
-        assert entries == ["/opt/external-node/bin"]
+        assert entries == []
 
     def test_managed_node_makes_system_unit_independent_of_callers_path(
         self, monkeypatch, tmp_path
@@ -1407,11 +1499,7 @@ class TestSystemUnitHermesHome:
         target_hermes = target_home / ".hermes"
         root_home = tmp_path / "root"
         root_hermes = root_home / ".hermes"
-        managed_bin = target_hermes / "node" / "bin"
-        managed_bin.mkdir(parents=True)
-        node = managed_bin / "node"
-        node.write_text("#!/bin/sh\n")
-        node.chmod(0o755)
+        managed_dirs = _seed_pm_node_facts(target_hermes)
         root_hermes.mkdir(parents=True)
 
         monkeypatch.setattr(Path, "home", staticmethod(lambda: root_home))
@@ -1422,7 +1510,7 @@ class TestSystemUnitHermesHome:
             lambda run_as_user=None: ("alice", "alice", str(target_home), 1001),
         )
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: root_hermes)
-        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
+        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", list)
 
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "/root/bin/node")
         root_unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
@@ -1431,28 +1519,9 @@ class TestSystemUnitHermesHome:
         user_unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
         assert root_unit == user_unit
-        assert str(managed_bin) in root_unit
+        for managed_dir in managed_dirs:
+            assert managed_dir in root_unit
         assert "/root/bin" not in root_unit
-
-    def test_node_path_lookup_remains_fallback_without_managed_node(
-        self, monkeypatch, tmp_path
-    ):
-        """External Node installs still work when the managed tree is absent."""
-        monkeypatch.setattr(
-            "hermes_constants.iter_hermes_node_dirs", lambda root=None: []
-        )
-        monkeypatch.setattr(
-            "hermes_constants.hermes_managed_node_tree_present",
-            lambda root=None: False,
-        )
-        monkeypatch.setattr(
-            gateway_cli.shutil, "which", lambda name: "/opt/external-node/bin/node"
-        )
-        entries: list[str] = []
-
-        gateway_cli._append_node_dir_for_service(entries, tmp_path / ".hermes")
-
-        assert entries == ["/opt/external-node/bin"]
 
     def test_system_unit_orders_after_target_user_manager(self, monkeypatch, tmp_path):
         """#104893: restart-safe workers need user@<uid>.service; the system unit must not race it at boot."""
@@ -1462,7 +1531,7 @@ class TestSystemUnitHermesHome:
             gateway_cli, "_system_service_identity",
             lambda run_as_user=None: ("alice", "alice", str(tmp_path), 1001),
         )
-        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
+        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", list)
 
         system_unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
         user_unit = gateway_cli.generate_systemd_unit(system=False)
@@ -1496,7 +1565,7 @@ class TestSystemUnitHermesHome:
             gateway_cli, "_system_service_identity",
             lambda run_as_user=None: ("alice", "alice", str(target_home), 1001),
         )
-        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
+        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", list)
         monkeypatch.setenv("LD_LIBRARY_PATH", f"{caller_home}/cuda/lib:/opt/cuda/lib64")
 
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
@@ -1504,8 +1573,10 @@ class TestSystemUnitHermesHome:
         assert f'Environment="LD_LIBRARY_PATH={target_home}/cuda/lib:/opt/cuda/lib64"' in unit
 
     def test_system_unit_uses_target_user_home_not_calling_user(self, monkeypatch, tmp_path):
-        # Simulate sudo with both homes in a disposable tree, never /root/.hermes.
-        caller_home, target_home = tmp_path / "root", tmp_path / "alice"
+        caller_home = tmp_path / "root"
+        target_home = tmp_path / "alice"
+        caller_home.mkdir()
+        target_home.mkdir()
         monkeypatch.setattr(Path, "home", staticmethod(lambda: caller_home))
         monkeypatch.setenv("HERMES_HOME", str(caller_home / ".hermes"))
         monkeypatch.setattr(
@@ -1519,7 +1590,7 @@ class TestSystemUnitHermesHome:
 
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
-        assert f'HERMES_HOME={target_home}/.hermes' in unit
+        assert f'HERMES_HOME={target_home / ".hermes"}' in unit
         assert str(caller_home / ".hermes") not in unit
 
     def test_user_unit_unaffected_by_change(self):
@@ -1589,21 +1660,20 @@ class TestHermesHomeForTargetUser:
         assert result == "/home/alice/.hermes"
 
 
-class TestGeneratedUnitUsesDetectedVenv:
-    def test_systemd_unit_uses_dot_venv_when_detected(self, tmp_path, monkeypatch):
-        dot_venv = tmp_path / ".venv"
-        dot_venv.mkdir()
-        (dot_venv / "bin").mkdir()
+class TestGeneratedUnitIncludesLocalBin:
+    """~/.local/bin must be in PATH so uvx/pipx tools are discoverable."""
 
-        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: dot_venv)
-        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(dot_venv / "bin" / "python"))
-
-        unit = gateway_cli.generate_systemd_unit(system=False)
-
-        assert f"VIRTUAL_ENV={dot_venv}" in unit
-        assert f"{dot_venv}/bin" in unit
-        # Must NOT contain a hardcoded /venv/ path
-        assert "/venv/" not in unit or "/.venv/" in unit
+    def test_system_unit_includes_local_bin_in_path(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(gateway_cli, "_system_service_identity",
+                            lambda run_as_user=None: ("alice", "alice", str(tmp_path), 1001))
+        monkeypatch.setattr(
+            gateway_cli,
+            "_build_user_local_paths",
+            lambda home_path, existing: [str(home_path / ".local" / "bin")],
+        )
+        unit = gateway_cli.generate_systemd_unit(system=True)
+        # System unit uses the resolved home dir from _system_service_identity
+        assert "/.local/bin" in unit
 
 
 class TestSystemServiceIdentityRootHandling:
@@ -1623,9 +1693,8 @@ class TestSystemServiceIdentityRootHandling:
         """When root is explicitly passed via --run-as-user root, allow it."""
 
         root_info = pwd.getpwnam("root")
-        root_group = grp.getgrgid(root_info.pw_gid).gr_name
 
-        username, group, home, _uid = gateway_cli._system_service_identity(run_as_user="root")
+        username, _group, home, _uid = gateway_cli._system_service_identity(run_as_user="root")
         assert username == "root"
         assert home == root_info.pw_dir
 
@@ -1746,7 +1815,10 @@ class TestProfileArg:
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
         assert "ExecStart=" in unit
-        assert "--profile mybot gateway run" in unit
+        import shlex
+        command = shlex.split(next(line.split("=", 1)[1] for line in unit.splitlines()
+                                   if line.startswith("ExecStart=")))
+        assert command[-4:] == ["--profile", "mybot", "gateway", "run"]
         assert f'HERMES_HOME={target_home / ".hermes" / "profiles" / "mybot"}' in unit
 
     def test_launchd_plist_wraps_gateway_stderr_with_timestamps(self, tmp_path, monkeypatch):
@@ -1761,30 +1833,22 @@ class TestProfileArg:
         program_args = plistlib.loads(plist.encode("utf-8"))["ProgramArguments"]
 
         # The job is launched through osascript so macOS Local Network Privacy attributes the
-        # gateway's sockets to a platform binary (#71206); the real command is the exec'd child.
-        assert _osascript_exec_argv(program_args) == [
-            "/usr/bin/python3",
-            "-m",
-            "hermes_cli.stderr_timestamp",
-            "--error-log",
-            str(profile_dir / "logs" / "gateway.error.log"),
-            "--",
-            "/usr/bin/python3",
-            "-m",
-            "hermes_cli.main",
-            "--profile",
-            "mybot",
-            "gateway",
-            "run",
-            "--external-supervisor",
-            ">>",
-            str(profile_dir / "logs" / "gateway.log"),
-            "2>>",
-            str(profile_dir / "logs" / "gateway.error.log"),
-        ]
+        # gateway's sockets to a platform binary (#71206); JXA system() waits without the
+        # Standard Additions user-cancel polling loop. The real command is the exec'd child,
+        # whose python runs through the PM installation launcher (-I -c bootstrap ...).
+        exec_argv = _osascript_exec_argv(program_args)
+        assert exec_argv[-4:] == [">>", str(profile_dir / "logs" / "gateway.log"),
+                                  "2>>", str(profile_dir / "logs" / "gateway.error.log")]
+        program_args = exec_argv[:-4]
+        assert program_args[0] == "/usr/bin/python3"
+        assert program_args[-5:] == ["--profile", "mybot", "gateway", "run", "--external-supervisor"]
+        separator = program_args.index("--")
+
+        assert program_args[separator - 2:separator] == ["--error-log", str(profile_dir / "logs" / "gateway.error.log")]
+        assert "--replace" not in program_args
 
     def test_launchd_osascript_wrapper_round_trips_shell_hostile_paths(self, tmp_path, monkeypatch):
-        """A home with spaces, quotes and a backslash survives shlex + AppleScript + plist quoting."""
+        """A home with spaces, quotes and a backslash survives shlex + JXA + plist quoting."""
         profile_dir = tmp_path / 'my "odd" dir \\ here' / ".hermes"
         profile_dir.mkdir(parents=True)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -1799,6 +1863,61 @@ class TestProfileArg:
         assert argv[-3:] == [str(profile_dir / "logs" / "gateway.log"), "2>>", str(profile_dir / "logs" / "gateway.error.log")]
         # The wrapper's own ps line must never be taken for the gateway (stop/status would signal osascript).
         assert status.looks_like_gateway_command_line(" ".join(program_args)) is False
+
+    @pytest.mark.platforms("macos")
+    def test_launchd_osascript_wrapper_preserves_process_group_and_exit_status(self, tmp_path):
+        """The non-polling JXA wait keeps lifecycle signals and KeepAlive failure semantics intact."""
+        stdout_log = tmp_path / "stdout.log"
+        stderr_log = tmp_path / "stderr.log"
+        command = [
+            sys.executable,
+            "-c",
+            "import os, sys; print(os.getpgrp()); sys.exit(23)",
+        ]
+
+        # A fresh session makes the wrapper its own group leader (as launchd does), so the child
+        # staying in the wrapper's group is observable rather than inherited from the runner.
+        wrapper = subprocess.Popen(
+            launchd_program_arguments(command, stdout_log, stderr_log), start_new_session=True
+        )
+
+        try:
+            returncode = wrapper.wait(timeout=10)
+        finally:
+            if wrapper.poll() is None:
+                os.killpg(wrapper.pid, signal.SIGKILL)
+                wrapper.wait()
+
+        assert returncode == 23
+        assert int(stdout_log.read_text()) == wrapper.pid
+        assert stderr_log.read_text() == ""
+
+    @pytest.mark.platforms("macos")
+    def test_launchd_command_path_timestamps_gateway_stdout(self, tmp_path):
+        """gateway.log is also the logging handler's file: a raw print() through the plist's
+        osascript + stderr_timestamp chain must arrive stamped or ``--since`` cannot filter it."""
+        stdout_log = tmp_path / "gateway.log"
+        stderr_log = tmp_path / "gateway.error.log"
+        command = [
+            sys.executable, "-m", "hermes_cli.stderr_timestamp", "--error-log", str(stderr_log), "--",
+            sys.executable, "-c", "print('[whatsapp] Bridge started on port 3000')",
+        ]
+
+        wrapper = subprocess.Popen(
+            launchd_program_arguments(command, stdout_log, stderr_log), start_new_session=True
+        )
+        try:
+            returncode = wrapper.wait(timeout=30)
+        finally:
+            if wrapper.poll() is None:
+                os.killpg(wrapper.pid, signal.SIGKILL)
+                wrapper.wait()
+
+        assert returncode == 0
+        assert re.fullmatch(
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[whatsapp\] Bridge started on port 3000\n",
+            stdout_log.read_text(encoding="utf-8"),
+        )
 
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"
@@ -1816,6 +1935,90 @@ class TestProfileArg:
         plist_path = gateway_cli.get_launchd_plist_path()
 
         assert plist_path == machine_home / "Library" / "LaunchAgents" / "ai.hermes.gateway-orcha.plist"
+
+    def test_launchd_plist_path_falls_back_to_home_when_uid_lookup_fails(self, tmp_path, monkeypatch):
+        """Sandboxed macOS shells can expose a UID that pwd cannot resolve (#57292)."""
+        profile_dir = tmp_path / ".hermes" / "profiles" / "mybot"
+        profile_dir.mkdir(parents=True)
+        machine_home = tmp_path / "Users" / "example"
+        machine_home.mkdir(parents=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(machine_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
+
+        def raise_key_error(uid):
+            raise KeyError(f"getpwuid(): uid not found: {uid}")
+
+        monkeypatch.setattr(pwd, "getpwuid", raise_key_error)
+
+        plist_path = gateway_cli.get_launchd_plist_path()
+
+        assert plist_path == machine_home / "Library" / "LaunchAgents" / "ai.hermes.gateway-mybot.plist"
+
+    def test_launchd_plist_path_prefers_hermes_real_home_when_uid_lookup_fails(self, tmp_path, monkeypatch):
+        """HERMES_REAL_HOME is the explicit operator override for unresolvable UIDs (#57292)."""
+        profile_dir = tmp_path / ".hermes" / "profiles" / "mybot"
+        profile_dir.mkdir(parents=True)
+        real_home = tmp_path / "real-home"
+        other_home = tmp_path / "other-home"
+        real_home.mkdir(parents=True)
+        other_home.mkdir(parents=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(real_home))
+        monkeypatch.setenv("HOME", str(other_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
+
+        def raise_key_error(uid):
+            raise KeyError(f"getpwuid(): uid not found: {uid}")
+
+        monkeypatch.setattr(pwd, "getpwuid", raise_key_error)
+
+        plist_path = gateway_cli.get_launchd_plist_path()
+
+        assert plist_path == real_home / "Library" / "LaunchAgents" / "ai.hermes.gateway-mybot.plist"
+
+    def test_launchd_plist_path_fallback_never_returns_profile_home(self, tmp_path, monkeypatch):
+        """When pwd fails and HOME IS the profile home, the fallback must skip it (#57292)."""
+        profile_dir = tmp_path / ".hermes" / "profiles" / "mybot"
+        profile_dir.mkdir(parents=True)
+        profile_home = profile_dir / "home"
+        profile_home.mkdir(parents=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(profile_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
+
+        def raise_key_error(uid):
+            raise KeyError(f"getpwuid(): uid not found: {uid}")
+
+        monkeypatch.setattr(pwd, "getpwuid", raise_key_error)
+
+        plist_path = gateway_cli.get_launchd_plist_path()
+
+        assert profile_home not in plist_path.parents
+        assert profile_dir not in plist_path.parents
+
+    def test_installed_service_kind_returns_none_when_uid_unresolvable(self, tmp_path, monkeypatch):
+        """`gateway restart`/`status` degrade to "not installed" instead of crashing (#57292)."""
+        machine_home = tmp_path / "Users" / "example"
+        machine_home.mkdir(parents=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(machine_home))
+
+        def raise_key_error(uid):
+            raise KeyError(f"getpwuid(): uid not found: {uid}")
+
+        monkeypatch.setattr(pwd, "getpwuid", raise_key_error)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_systemd_unit_installed", lambda: False)
+
+        assert gateway_cli._installed_service_kind_for(lambda: False) is None
 
 
 class TestRemapPathForUser:
@@ -1849,7 +2052,7 @@ class TestSystemUnitPathRemapping:
         monkeypatch.setenv("HERMES_HOME", str(root_home / ".hermes"))
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: root_home / ".hermes")
         monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", project)
-        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: project / "venv")
+
         monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(venv_bin / "python"))
         monkeypatch.setattr(
             gateway_cli, "_system_service_identity",
@@ -1893,7 +2096,6 @@ class TestDockerAwareGateway:
         import pytest
 
         monkeypatch.setattr(gateway_cli, "is_managed", lambda: False)
-        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
@@ -2024,8 +2226,7 @@ class TestLegacyHermesUnitDetection:
             "ExecStart=/venv/bin/python /opt/hermes/gateway/run.py",
         ]
         for i, execstart in enumerate(variants):
-            name = "hermes.service" if i == 0 else "hermes.service"  # same name
-            # Test each variant fresh
+            # Test each variant fresh (every variant ships the same unit name)
             (user_dir / "hermes.service").write_text(
                 f"[Unit]\nDescription=Old Hermes\n[Service]\n{execstart}\n",
                 encoding="utf-8",
@@ -2346,7 +2547,6 @@ class TestGatewayCommandCatchesSystemScopeError:
         )
         monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 1000)
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
-        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "kill_gateway_processes", lambda **kw: 0)
 
         args = SimpleNamespace(gateway_command="start", system=True, all=False)
@@ -2495,6 +2695,43 @@ class TestLaunchctlBootstrapEioRetry:
         with pytest.raises(subprocess.CalledProcessError) as excinfo:
             gateway_cli._launchctl_bootstrap(self.DOMAIN, self.PLIST, self.LABEL)
         assert excinfo.value.returncode == 5
+
+    def test_stale_label_recovery_shares_one_timeout_budget(self, monkeypatch):
+        # The guardian's rollback passes its remaining deadline as ``timeout``. The EIO bootout and
+        # retry must spend what is left of that one budget, not a fresh ``timeout`` each, or a stale
+        # registration can overrun the bounded rollback by up to 3x.
+        clock = {"now": 1000.0}
+        timeouts = []
+        monkeypatch.setattr(gateway_cli.time, "monotonic", lambda: clock["now"])
+
+        def fake_run(cmd, check=True, timeout=None, **kwargs):
+            timeouts.append((cmd[1], timeout))
+            clock["now"] += 4.0
+            if cmd[1] == "bootstrap" and len([t for t in timeouts if t[0] == "bootstrap"]) == 1:
+                raise subprocess.CalledProcessError(5, cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli._launchctl_bootstrap(self.DOMAIN, self.PLIST, self.LABEL, timeout=10)
+
+        assert timeouts == [("bootstrap", 10.0), ("bootout", 6.0), ("bootstrap", 2.0)]
+
+    def test_exhausted_budget_raises_timeout_instead_of_starting_another_call(self, monkeypatch):
+        clock = {"now": 1000.0}
+        calls = []
+        monkeypatch.setattr(gateway_cli.time, "monotonic", lambda: clock["now"])
+
+        def fake_run(cmd, check=True, timeout=None, **kwargs):
+            calls.append(cmd[1])
+            clock["now"] += 10.0
+            raise subprocess.CalledProcessError(5, cmd)
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            gateway_cli._launchctl_bootstrap(self.DOMAIN, self.PLIST, self.LABEL, timeout=10)
+        assert calls == ["bootstrap"]
 
 
 class TestLaunchdUnloadedJobStderrStaysOffTerminal:
@@ -2723,12 +2960,12 @@ class TestUnitAnchoredServiceIdentity:
     """The installed ``hermes-gateway.service`` owns the bare name: under ``sudo`` the naming basis moves
     mid-command when ``_sync_hermes_home_from_systemd_unit()`` adopts the unit's HERMES_HOME (#108674).
 
-    ``linux_only`` because ``_bare_unit_pinned_home()`` is Linux- and root-gated on purpose: a systemd unit
+    ``platforms("linux")`` because ``_bare_unit_pinned_home()`` is Linux- and root-gated on purpose: a systemd unit
     is not an identity authority for launchd labels, Windows tasks, or s6 slots, which share the same
     resolver, and only an elevated process operates the system unit.
     """
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_home_not_pinned_by_unit_keeps_its_suffix(self, tmp_path, monkeypatch):
         alice_home = tmp_path / "alice" / ".hermes"
         alice_home.mkdir(parents=True)
@@ -2748,7 +2985,7 @@ class TestUnitAnchoredServiceIdentity:
         assert name != gateway_cli._SERVICE_BASE
         assert name.startswith(gateway_cli._SERVICE_BASE + "-")
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_unprivileged_profile_command_ignores_the_system_unit(self, tmp_path, monkeypatch):
         """A bare system unit pinning ``profiles/<name>`` must not alias that profile onto the user's
         default unit when an unprivileged user-scope command resolves the name."""
@@ -2765,7 +3002,7 @@ class TestUnitAnchoredServiceIdentity:
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
         assert gateway_cli.get_service_name() == "hermes-gateway-kimi"
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_bare_unit_pinning_a_named_profile_home_keeps_the_bare_name(self, tmp_path, monkeypatch):
         """``sudo ... install --system`` names the unit from root's default but pins the invoking user's
         remapped home, so the BARE unit legitimately carries a ``profiles/<name>`` home. The unit-pinned
@@ -2788,7 +3025,7 @@ class TestUnitAnchoredServiceIdentity:
         # with the readable suffix -- which is why the unit-pinned check has to be evaluated first.
         assert gateway_cli._profile_name_from_home(profile_home, profile_home.parent.parent) == profile_home.name
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_real_unit_sync_keeps_the_name_it_validated(self, tmp_path, monkeypatch):
         """Drive the production sync instead of simulating the adoption with setenv: the name resolved
         before ``_sync_hermes_home_from_systemd_unit()`` must survive the mutation it performs."""
@@ -2811,3 +3048,17 @@ class TestUnitAnchoredServiceIdentity:
 
         assert os.environ["HERMES_HOME"] == str(alice_home)  # the sync really ran
         assert gateway_cli.get_service_name() == pre_sync_name
+
+
+@pytest.mark.platforms("macos")
+def test_launchd_account_identity_survives_profile_home_override(tmp_path, monkeypatch):
+    """A fake HOME cannot resolve a throwaway gateway to the real bare service."""
+    account = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — native macOS invariant
+    monkeypatch.delenv("HERMES_DATA_DIR_SUFFIX", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    isolated_label = gateway_cli.get_launchd_label()
+    assert isolated_label != "ai.hermes.gateway"
+    assert gateway_cli.get_launchd_plist_path() == account / "Library" / "LaunchAgents" / f"{isolated_label}.plist"
+    monkeypatch.setenv("HERMES_HOME", str(account / ".hermes"))
+    assert gateway_cli.get_launchd_label() == "ai.hermes.gateway"

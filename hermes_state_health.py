@@ -39,7 +39,7 @@ STORAGE_OK = "ok"
 STORAGE_CORRUPT = "corrupt"
 
 _lock = threading.Lock()
-_corrupt: Dict[str, str] = {}  # resolved db path -> first error text (log only, never served)
+_corrupt: dict[str, str] = {}  # resolved db path -> first error text (log only, never served)
 
 
 def _key(db_path) -> str:
@@ -82,8 +82,13 @@ def note_storage_error(db_path, exc: BaseException) -> bool:
 
 def storage_state(db_path) -> str:
     """``"corrupt"`` once this process has seen structural corruption on *db_path*, else ``"ok"``."""
+    if not _corrupt:
+        # Every SessionDB write asks; a healthy process must not resolve the path (realpath
+        # syscalls) under this process-wide lock for each one.
+        return STORAGE_OK
+    key = _key(db_path)
     with _lock:
-        return STORAGE_CORRUPT if _key(db_path) in _corrupt else STORAGE_OK
+        return STORAGE_CORRUPT if key in _corrupt else STORAGE_OK
 
 
 def storage_corrupt_reason(db_path) -> Optional[str]:

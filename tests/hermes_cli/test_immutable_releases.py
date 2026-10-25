@@ -4,14 +4,29 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import immutable_releases as releases
+
+
+def _await_ready(process: subprocess.Popen, expected: str) -> None:
+    """Wait for the child's pipe acknowledgement, not a guessed startup delay."""
+    ready = queue.Queue()
+    stdout = process.stdout
+    assert stdout is not None
+    threading.Thread(target=lambda: ready.put(stdout.readline()), daemon=True).start()
+    try:
+        line = ready.get(timeout=20)
+    except queue.Empty as exc:
+        raise AssertionError(f"child {process.pid} did not acknowledge readiness") from exc
+    assert line.strip() == expected, f"child exited {process.poll()} before {expected}"
 
 
 def test_archive_fallback_rejects_unsafe_members(tmp_path, monkeypatch):
@@ -38,25 +53,68 @@ def test_archive_fallback_rejects_unsafe_members(tmp_path, monkeypatch):
     assert (tmp_path / "stage" / "safe" / "file").is_file()
 
 
-def test_release_plist_matches_normal_command_except_release_paths(tmp_path, monkeypatch):
-    from hermes_cli import gateway
+@pytest.mark.platforms("macos")
+def test_release_plist_executes_selected_release_with_managed_source_launcher(tmp_path, monkeypatch):
+    import plistlib
+    import shlex
+    import shutil
+    import venv
+    from hermes_cli import gateway, stderr_timestamp
+    from hermes_cli._launchers import resolve_store_python
+    from pm.environments import store_root
+
     home = tmp_path / "profile"
-    candidate = home / "releases" / "B"
-    _fake_release(candidate, "B")
+    source = tmp_path / "source"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "tools"))
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(gateway, "get_python_path", lambda: str(tmp_path / "source" / "venv/bin/python"))
-    normal = __import__("plistlib").loads(gateway.generate_launchd_plist().encode())
-    release = __import__("plistlib").loads(gateway.generate_launchd_plist(release_target=candidate).encode())
-    source_python = str(tmp_path / "source" / "venv/bin/python")
-    release_python = str(home / "current/.venv/bin/python")
-    assert normal["ProgramArguments"] != release["ProgramArguments"]
-    assert str(normal["ProgramArguments"]).replace(source_python, release_python) == str(release["ProgramArguments"])
-    assert normal["WorkingDirectory"] != release["WorkingDirectory"]
-    assert normal["EnvironmentVariables"]["VIRTUAL_ENV"] != release["EnvironmentVariables"]["VIRTUAL_ENV"]
-    assert {key: value for key, value in normal.items() if key not in ("ProgramArguments", "WorkingDirectory", "EnvironmentVariables")} == {
-        key: value for key, value in release.items() if key not in ("ProgramArguments", "WorkingDirectory", "EnvironmentVariables")}
-    assert {key: value for key, value in normal["EnvironmentVariables"].items() if key not in ("VIRTUAL_ENV", "PATH")} == {
-        key: value for key, value in release["EnvironmentVariables"].items() if key not in ("VIRTUAL_ENV", "PATH")}
+    monkeypatch.setattr(gateway, "PROJECT_ROOT", source)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: sys.executable)
+    runtime = store_root(source)
+    tool = runtime / "python-test" / "bin" / "python3"
+    tool.parent.mkdir(parents=True)
+    tool.symlink_to(sys.executable)
+    (runtime / "facts.json").write_text(json.dumps({"packages": {"python": {"entry": "python-test"}}}), encoding="utf-8")
+    assert resolve_store_python(source) == tool
+    launcher = source / ".hermes" / "bin" / "hermes"
+    launcher.parent.mkdir(parents=True)
+    output = home / "observed.json"
+    source_probe = f"import pathlib; pathlib.Path({str(output)!r}).write_text('source', encoding='utf-8')"
+    launcher.write_text("#!/bin/sh\nexec " + shlex.join([sys.executable, "-I", "-c", source_probe]) + "\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    normal = plistlib.loads(gateway.generate_launchd_plist().encode())
+    subprocess.run(normal["ProgramArguments"], check=True, timeout=30)
+    assert output.read_text(encoding="utf-8") == "source"
+
+    for marker in ("A", "B"):
+        root = home / "releases" / marker
+        _fake_release(root, marker)
+        (root / ".venv" / "bin" / "python").unlink()
+        venv.EnvBuilder(with_pip=False).create(root / ".venv")
+        package = root / "hermes_cli"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        shutil.copy2(stderr_timestamp.__file__, package / "stderr_timestamp.py")
+        (root / "hermes_bootstrap.py").write_text(
+            "import os,pathlib\n"
+            "pathlib.Path(os.environ['HERMES_HOME'], 'bootstrap-root').write_text(str(pathlib.Path(__file__).parent), encoding='utf-8')\n", encoding="utf-8")
+        (package / "main.py").write_text(
+            "import json,os,pathlib,sys\n"
+            "pathlib.Path(os.environ['HERMES_HOME'], 'observed.json').write_text(json.dumps({'root':str(pathlib.Path(__file__).parent.parent), 'python':sys.executable, 'argv':sys.argv[1:]}), encoding='utf-8')\n", encoding="utf-8")
+
+    for marker in ("A", "B", "A"):
+        candidate = home / "releases" / marker
+        releases.promote(home, candidate)
+        release = plistlib.loads(gateway.generate_launchd_plist(release_target=candidate).encode())
+        subprocess.run(release["ProgramArguments"], cwd=release["WorkingDirectory"],
+                       env={**os.environ, **release["EnvironmentVariables"]}, check=True, timeout=30)
+        observed = json.loads(output.read_text(encoding="utf-8"))
+        assert observed == {"root": str(candidate), "python": str(home / "current/.venv/bin/python"),
+                            "argv": ["gateway", "run", "--external-supervisor"]}
+        assert (home / "bootstrap-root").read_text(encoding="utf-8") == str(candidate)
+        assert release["EnvironmentVariables"]["PATH"].split(":")[0] == str(home / "current/.venv/bin")
+        unchanged_keys = normal.keys() - {"ProgramArguments", "WorkingDirectory", "EnvironmentVariables"}
+        assert {key: normal[key] for key in unchanged_keys} == {key: release[key] for key in unchanged_keys}
 
 
 def _fake_release(path: Path, marker: str, *, lock: str = "same") -> None:
@@ -77,9 +135,9 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     source = tmp_path / "source"
     module = source / "hermes_cli"
     module.mkdir(parents=True)
-    from hermes_cli import build_info
+    from hermes_cli import version_info
     import shutil
-    shutil.copy2(Path(build_info.__file__), module / "build_info.py")
+    shutil.copy2(Path(version_info.__file__), module / "version_info.py")
     (module / "__init__.py").write_text("")
     (module / "main.py").write_text("print(__file__)\n")
     (module / "immutable_releases.py").write_text("# staging capability probe\n")
@@ -105,8 +163,8 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     assert not (release / ".worktrees").exists()
     assert not (release / ".git").exists()
     assert not (release / "hermes_cli" / "web_dist" / "index.html").exists()  # never copy A's untracked assets
-    code = "import importlib.util, pathlib, sys; p=pathlib.Path(sys.argv[1]); s=importlib.util.spec_from_file_location('staged_build_info',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.get_code_identity(refresh=True)['sha'])"
-    result = subprocess.run([sys.executable, "-c", code, str(release / "hermes_cli" / "build_info.py")],
+    code = "import importlib.util, pathlib, sys; p=pathlib.Path(sys.argv[1]); s=importlib.util.spec_from_file_location('staged_version_info',p); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); m._resolve_stamp_file=lambda:p.parent.parent/'install-stamp.json'; print(m.get_code_identity(refresh=True)['sha'])"
+    result = subprocess.run([sys.executable, "-c", code, str(release / "hermes_cli" / "version_info.py")],
                             check=True, capture_output=True, text=True)
     assert result.stdout.strip() == sha
     assert releases.stage_release(source, home)[1] == "existing"
@@ -294,7 +352,7 @@ def test_untracked_source_web_assets_are_not_copied_into_release(tmp_path, monke
     assert (home / "releases" / releases.release_sha(source)).exists()
 
 
-def test_active_locked_extra_is_passed_to_frozen_uv_sync(tmp_path, monkeypatch):
+def test_active_locked_extra_is_passed_to_frozen_pm_build(tmp_path, monkeypatch):
     project = tmp_path / "candidate"
     project.mkdir()
     (project / "pyproject.toml").write_text(
@@ -307,11 +365,29 @@ def test_active_locked_extra_is_passed_to_frozen_uv_sync(tmp_path, monkeypatch):
     extras = releases._active_locked_extras(Path(sys.executable), project)
     assert extras == ["messaging"]
     calls = []
-    monkeypatch.setattr(releases.subprocess, "run", lambda argv, **kwargs: calls.append(argv))
+    monkeypatch.setattr("pm.build_environment", lambda **kwargs: calls.append(kwargs))
     releases._build_venv(project, extras=extras, python=Path(sys.executable))
-    assert calls[0][-2:] == ["--extra", "messaging"]
-    assert calls[0][calls[0].index("--python") + 1] == sys.executable
-    assert "--frozen" in calls[0]
+    assert calls[0]["extras"] == ["messaging"]
+    assert calls[0]["source"] == project
+    assert calls[0]["out"] == project / ".venv"
+    assert calls[0]["frozen"] and calls[0]["explicit"]
+    assert "python" not in calls[0]  # PM selects the candidate ABI, not the old interpreter.
+
+
+def test_orphan_transitive_package_does_not_enable_another_feature(tmp_path, monkeypatch):
+    project = tmp_path / "candidate"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[project]\nname='hermes-agent'\n[project.optional-dependencies]\n"
+        "sdk=['sdk-client==1.0']\nembedded=['embedded-server==1.0']\n", encoding="utf-8")
+    (project / "uv.lock").write_text(
+        '[[package]]\nname="sdk-client"\nversion="1.0"\n'
+        '[[package]]\nname="embedded-server"\nversion="1.0"\n'
+        'dependencies=[{name="old-transitive"}]\n'
+        '[[package]]\nname="old-transitive"\nversion="1.0"\n', encoding="utf-8")
+    monkeypatch.setattr(releases, "_active_distributions",
+                        lambda _: {"sdk-client": "1.0", "old-transitive": "1.0"})
+    assert releases._active_locked_extras(Path(sys.executable), project) == ["sdk"]
 
 
 def test_missing_locked_extra_fails_closed(tmp_path, monkeypatch):
@@ -321,6 +397,9 @@ def test_missing_locked_extra_fails_closed(tmp_path, monkeypatch):
     for root in (source, candidate):
         venv.EnvBuilder(with_pip=False).create(root / ".venv")
     (candidate / "uv.lock").write_text('[[package]]\nname = "locked-extra"\nversion = "1.0"\n', encoding="utf-8")
+    (candidate / "pyproject.toml").write_text(
+        "[project]\nname='hermes-agent'\n[project.optional-dependencies]\n"
+        "feature=['locked-extra==1.0']\n", encoding="utf-8")
     wheel = tmp_path / "locked_extra-1.0-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr("locked_extra/__init__.py", "")
@@ -372,7 +451,7 @@ def test_normal_update_without_layout_opt_in_does_not_touch_release_or_plist(tmp
     assert plist.read_bytes() == b"original"
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_deferred_update_stages_without_promoting_or_reloading(tmp_path, monkeypatch):
     from hermes_cli import update_cmd, gateway
     home = tmp_path / "profile"
@@ -391,7 +470,7 @@ def test_deferred_update_stages_without_promoting_or_reloading(tmp_path, monkeyp
     assert not (home / "previous").exists()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("first_stage_fails", [False, True])
 def test_outstanding_release_is_promoted_before_catchup_restart(tmp_path, monkeypatch, first_stage_fails):
     from hermes_cli import update_cmd
@@ -427,7 +506,7 @@ def test_outstanding_release_is_promoted_before_catchup_restart(tmp_path, monkey
     assert attempted
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_noop_update_promotes_before_pending_restart(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import update_cmd
@@ -442,20 +521,14 @@ def test_noop_update_promotes_before_pending_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "stage_release", lambda *args, **kw: (b, "existing"))
     monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
     monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
-    monkeypatch.setattr(update_cmd, "_repair_current_checkout", lambda **kw: True)
     monkeypatch.setattr(update_cmd, "_resume_windows_gateways_and_merge_outcome", lambda *a: None)
     def restart(*, defer, checkout_complete):
         assert defer is False
         assert checkout_complete is True
         assert (home / "current").resolve() == b
     monkeypatch.setattr(update_cmd, "_apply_pending_fleet_restart_catchup", restart)
-    plan = SimpleNamespace(auto_stash_ref=None, parked_branch_switched=False,
-                           upstream_checked=True)
-    update_cmd._finish_already_up_to_date(None, "main", "main", plan,
-        assume_yes=True, gateway_mode=False, gw_input_fn=None,
-        pre_update_snapshot_id=None, had_desktop_app_before_update=False,
-        active_lazy_features=[], active_tool_dependencies=[],
-        _windows_gateway_resume=None)
+    update_cmd._catch_up_immutable_release(defer=False)
+    update_cmd._apply_pending_fleet_restart_catchup(defer=False, checkout_complete=True)
     assert (home / "previous").resolve() == a
 
 
@@ -475,7 +548,7 @@ def test_true_noop_release_does_not_stage_or_rebuild(tmp_path, monkeypatch):
     assert not (home / "previous").exists()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_repeated_rollback_is_noop_without_fleet_relaunch(tmp_path, monkeypatch, capsys):
     from types import SimpleNamespace
     from hermes_cli import gateway, update_cmd
@@ -500,7 +573,7 @@ def test_repeated_rollback_is_noop_without_fleet_relaunch(tmp_path, monkeypatch,
 
 
 @pytest.mark.parametrize("pointer", [
-    pytest.param("dangling", marks=pytest.mark.macos_only),
+    pytest.param("dangling", marks=pytest.mark.platforms("macos")),
     "outside", "unready", "missing_python",
 ])
 def test_gateway_interpreter_refuses_broken_immutable_current(tmp_path, monkeypatch, pointer):
@@ -523,7 +596,7 @@ def test_gateway_interpreter_refuses_broken_immutable_current(tmp_path, monkeypa
         gateway.get_python_path()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_gateway_interpreter_honors_managed_immutable_opt_in(tmp_path, monkeypatch):
     from hermes_cli import gateway
     home = tmp_path / "profile"
@@ -537,7 +610,55 @@ def test_gateway_interpreter_honors_managed_immutable_opt_in(tmp_path, monkeypat
     with pytest.raises(RuntimeError, match="Invalid immutable release current pointer"):
         gateway.get_python_path()
 
-@pytest.mark.macos_only
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("damage", [None, "source_changed", "dangling_current", "dangling_previous", "unfinished"])
+def test_gateway_source_interpreter_after_migration_rollback(tmp_path, monkeypatch, damage):
+    from hermes_cli import gateway
+
+    source, home = tmp_path / "source", tmp_path / "profile"
+    (source / "hermes_cli").mkdir(parents=True)
+    (source / "hermes_cli/__init__.py").write_text("")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    commit = ["git", "-C", str(source), "-c", "user.email=test@example.com",
+              "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "source"]
+    subprocess.run(commit, check=True)
+    sha = releases.release_sha(source)
+    release = home / "releases" / sha
+    _fake_release(release, sha)
+    (home / "current").symlink_to(release)
+    (home / "previous").symlink_to(source)
+    journal = home / "release-layout.json"
+    record = {"source": str(source), "source_sha": sha, "source_python": sys.executable,
+              "state": "done", "plist": None}
+    journal.write_text(json.dumps(record))
+    releases.restore_source_layout(home)
+    assert not (home / "current").is_symlink() and not (home / "previous").is_symlink()
+    assert json.loads(journal.read_text())["state"] == "rolled-back"
+    (home / "config.yaml").write_text("updates:\n  immutable_releases: true\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    if damage == "source_changed":
+        (source / "version.txt").write_text("changed")
+        subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+        subprocess.run(commit, check=True)
+    elif damage in {"dangling_current", "dangling_previous"}:
+        (home / damage.removeprefix("dangling_")).symlink_to(home / "absent")
+    elif damage == "unfinished":
+        record["state"] = "in-progress"
+        journal.write_text(json.dumps(record))
+    if damage:
+        with pytest.raises(RuntimeError, match="Invalid immutable release current pointer"):
+            gateway.get_python_path()
+    else:
+        assert gateway.get_python_path() == sys.executable
+        plist = __import__("plistlib").loads(gateway.generate_launchd_plist().encode())
+        # Plist rendering may wrap Python in macOS's Local Network identity.
+        assert sys.executable in str(plist["ProgramArguments"])
+
+@pytest.mark.platforms("macos")
 def test_gateway_interpreter_existing_current_does_not_read_config(tmp_path, monkeypatch):
     from hermes_cli import gateway, config_effective
     home = tmp_path / "profile"
@@ -551,20 +672,19 @@ def test_gateway_interpreter_existing_current_does_not_read_config(tmp_path, mon
     assert gateway.get_python_path() == str(home / "current/.venv/bin/python")
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_gateway_interpreter_ignores_unsupported_dangling_pointer(tmp_path, monkeypatch):
     from hermes_cli import gateway
     home = tmp_path / "profile"
     home.mkdir()
     (home / "current").symlink_to(home / "missing")
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(gateway, "_detect_venv_dir", lambda: None)
     assert gateway.get_python_path() == gateway.sys.executable
 
 
 def test_incomplete_checkout_never_receipts_success_during_acknowledged_catchup(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
+    from hermes_cli import update_cmd, update_cmd_fleet, update_cmd_fleet_verify, update_receipt
     home = tmp_path / "profile"
     root = home / "releases" / ("a" * 40)
     _fake_release(root, root.name)
@@ -573,20 +693,13 @@ def test_incomplete_checkout_never_receipts_success_during_acknowledged_catchup(
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd_fleet, "_pending_fleet_restart_needed", lambda: True)
     monkeypatch.setattr(update_cmd_fleet, "_acknowledged_release_launchd_label", lambda *a: "test.label")
-    monkeypatch.setattr(update_cmd, "_repair_current_checkout", lambda **kw: False)
     monkeypatch.setattr(update_cmd, "_resume_windows_gateways_and_merge_outcome", lambda *a: None)
     monkeypatch.setattr(update_cmd, "_catch_up_immutable_release", lambda **kw: None)
     monkeypatch.setattr(update_cmd, "_restart_gateway_fleet_after_update", lambda *a, **kw: SimpleNamespace(incomplete=False))
     monkeypatch.setattr(update_cmd, "_verify_fleet_after_update", lambda _outcome, **kw:
                         update_receipt.finalize_update_receipt("success" if kw["update_complete"] else "partial"))
     update_receipt.begin_update_receipt()
-    plan = SimpleNamespace(auto_stash_ref=None, parked_branch_switched=False, upstream_checked=True)
-    with pytest.raises(SystemExit) as exited:
-        update_cmd._finish_already_up_to_date(None, "main", "main", plan,
-            assume_yes=True, gateway_mode=False, gw_input_fn=None,
-            pre_update_snapshot_id=None, had_desktop_app_before_update=False,
-            active_lazy_features=[], active_tool_dependencies=[], _windows_gateway_resume=None)
-    assert exited.value.code == 1
+    update_cmd._apply_pending_fleet_restart_catchup(checkout_complete=False)
     assert update_receipt.read_latest_receipt()["outcome"] == "partial"
 
 
@@ -699,17 +812,19 @@ def test_unreadable_process_identity_scopes_retention(tmp_path, monkeypatch, own
 
 def test_retention_prunes_excess_without_uncertain_processes(tmp_path, monkeypatch):
     home = tmp_path / "profile"
-    paths = [home / "releases" / str(i) for i in range(7)]
+    paths = [home / "releases" / str(i) for i in range(9)]
     for i, path in enumerate(paths):
         _fake_release(path, str(i))
         os.utime(path, (i, i))
     releases.promote(home, paths[-1])
     releases.promote(home, paths[-2])
+    receipts = home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True)
+    (receipts / "recovery.json").write_text(json.dumps({"release_path": str(paths[1])}))
     monkeypatch.setattr(releases, "_live_process_pins", lambda _: {paths[0].resolve()})
     removed = releases.retain(home)
-    assert paths[0].exists()
-    assert len(removed) == 1
-    assert removed == [paths[1]]
+    assert {path.name for path in paths if path.exists()} == {"0", "1", "4", "5", "6", "7", "8"}
+    assert {path.name for path in removed} == {"2", "3"}
 
 
 def test_sigkill_stage_and_flip_converge_with_complete_current(tmp_path):
@@ -724,28 +839,25 @@ def test_sigkill_stage_and_flip_converge_with_complete_current(tmp_path):
     _fake_release(a, "A")
     releases.promote(home, a)
     script = """
-import os, pathlib, signal, sys, time
+import pathlib, sys
 from hermes_cli import immutable_releases as r
-source, home, checkpoint, boundary = map(pathlib.Path, sys.argv[1:])
+source, home = map(pathlib.Path, sys.argv[1:3])
+boundary = sys.argv[3]
 r._build_venv = lambda *args, **kwargs: None
 r.smoke_plugins = lambda *args, **kwargs: None
 candidate, _ = r.stage_release(source, home, sha='B')
 def pause():
-    checkpoint.write_text(str(os.getpid()), encoding='utf-8')
-    while True: time.sleep(.1)
-if boundary.name == 'stage': pause()
+    print(boundary, flush=True)
+    sys.stdin.read()
+if boundary == 'stage': pause()
 r.promote(home, candidate, before_flip=pause)
 """
     for boundary in ("stage", "flip"):
-        checkpoint = tmp_path / f"{boundary}.ready"
-        child = subprocess.Popen([sys.executable, "-c", script, str(source), str(home),
-                                  str(checkpoint), boundary], cwd=Path(__file__).resolve().parents[2])
+        child = subprocess.Popen([sys.executable, "-c", script, str(source), str(home), boundary],
+                                 cwd=Path(__file__).resolve().parents[2],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         try:
-            import time
-            deadline = time.monotonic() + 20
-            while not checkpoint.exists() and child.poll() is None and time.monotonic() < deadline:
-                time.sleep(.05)
-            assert checkpoint.exists(), f"updater exited {child.poll()} before {boundary}"
+            _await_ready(child, boundary)
             child.kill()  # SIGKILL, no Python finally or cleanup handlers
             assert child.wait(timeout=5) < 0
             assert (home / "current").resolve() == a
@@ -766,8 +878,11 @@ r.promote(home, candidate, before_flip=pause)
             if child.poll() is None:
                 child.kill()
                 child.wait(timeout=5)
+            for pipe in (child.stdin, child.stdout):
+                if pipe is not None:
+                    pipe.close()
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_existing_pointer_stale_plist_failure_restores_and_retry_repairs(tmp_path, monkeypatch):
     """A failed reload leaves a durable roll-forward transaction for retry."""
     from hermes_cli import gateway, gateway_launchd, update_cmd
@@ -876,34 +991,24 @@ def test_retention_protects_real_process_cwd_and_receipt(tmp_path, monkeypatch):
     receipts = home / "logs" / "update_receipts"
     receipts.mkdir(parents=True)
     (receipts / "recovery.json").write_text(json.dumps({"release_path": str(release_paths[1])}))
-    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=release_paths[0])
+    worker = subprocess.Popen([sys.executable, "-c",
+                               "import os,sys; print(os.getcwd(), flush=True); sys.stdin.read()"],
+                              cwd=release_paths[0], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
-        import psutil
-        import time
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                if Path(psutil.Process(worker.pid).cwd()).resolve() == release_paths[0].resolve():
-                    break
-            except psutil.Error:
-                pass
-            time.sleep(.02)
-        else:
-            pytest.fail("worker did not publish its release cwd before retention")
-        # Test this owned worker's real identity. Unrelated unreadable processes
-        # correctly pin every release, covered by the separate fail-closed test.
-        process_iter = psutil.process_iter
-        monkeypatch.setattr(psutil, "process_iter", lambda attrs: (
-            proc for proc in process_iter(attrs) if proc.pid == worker.pid))
+        _await_ready(worker, str(release_paths[0].resolve()))
         assert release_paths[0].resolve() in releases._live_process_pins(home)
         removed = releases.retain(home)
-        assert release_paths[0].exists() and release_paths[1].exists()
-        assert release_paths[8].exists() and release_paths[7].exists()
-        assert {path.name for path in release_paths if path.exists()} == {"0", "1", "4", "5", "6", "7", "8"}
-        assert {path.name for path in removed} == {"2", "3"}
+        # Unreadable host process metadata intentionally pins every release.
+        # Exact pruning belongs to the controlled-process test above.
+        protected = {"0", "1", "4", "5", "6", "7", "8"}
+        assert protected <= {path.name for path in release_paths if path.exists()}
+        assert protected.isdisjoint(path.name for path in removed)
     finally:
         worker.terminate()
         worker.wait(timeout=5)
+        for pipe in (worker.stdin, worker.stdout):
+            if pipe is not None:
+                pipe.close()
 
 
 def test_successful_receipt_history_does_not_pin_every_old_release(tmp_path):
@@ -921,16 +1026,16 @@ def test_successful_receipt_history_does_not_pin_every_old_release(tmp_path):
 
 
 def test_retention_failure_is_advisory_after_verified_update(tmp_path, monkeypatch):
-    from hermes_cli import immutable_releases, update_cmd, update_cmd_fleet, update_receipt
+    from hermes_cli import immutable_releases, update_cmd, update_cmd_fleet, update_cmd_fleet_verify, update_receipt
     from hermes_cli.update_cmd_fleet import _GatewayRestartOutcome
     home = tmp_path / "profile"
     release = home / "releases" / "current"
     _fake_release(release, "current")
     releases.promote(home, release)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(update_cmd_fleet, "_print_legacy_units_warning", lambda: None)
+    monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
     monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **kw: None)
-    monkeypatch.setattr(update_cmd_fleet, "_collect_fleet_snapshot", lambda *a, **kw: [])
+    monkeypatch.setattr(update_cmd_fleet_verify, "_collect_fleet_snapshot", lambda *a, **kw: [])
     monkeypatch.setattr(update_cmd_fleet, "_clear_fleet_restart_pending_marker", lambda: None)
     monkeypatch.setattr(update_cmd_fleet, "_fleet_probe_expected_runtimes", lambda *a, **kw: False)
     monkeypatch.setattr(update_cmd._m(), "_fleet_probe_expected_runtimes", lambda *a, **kw: False)
@@ -940,8 +1045,8 @@ def test_retention_failure_is_advisory_after_verified_update(tmp_path, monkeypat
         restarted_services=[], failed_or_stale_units=[], relaunched_profiles=[],
         externally_supervised_profiles=[], killed_pids=set())
     update_receipt.begin_update_receipt()
-    update_cmd_fleet._verify_fleet_after_update(restart, _pre_update_plan=None,
-        _windows_gateway_resume=None, node_failures=[], update_complete=True, rollback=True)
+    update_cmd_fleet_verify._verify_fleet_after_update(restart, _pre_update_plan=None,
+        _windows_gateway_resume=None, update_complete=True, rollback=True)
     receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
     assert receipt["outcome"] == "success"
     assert any(s["name"] == "release_retention" and not s["ok"] and
@@ -949,7 +1054,7 @@ def test_retention_failure_is_advisory_after_verified_update(tmp_path, monkeypat
 
 
 def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monkeypatch):
-    from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
+    from hermes_cli import update_cmd, update_cmd_fleet, update_cmd_fleet_verify, update_receipt
     from hermes_cli.update_cmd_fleet import _GatewayRestartOutcome
     home = tmp_path / "profile"
     releases_for_test = [home / "releases" / str(i) for i in range(7)]
@@ -958,13 +1063,15 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
         os.utime(release, (i, i))
     releases.promote(home, releases_for_test[-1])
     releases.promote(home, releases_for_test[-2])
-    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
-                              cwd=releases_for_test[0])
+    worker = subprocess.Popen([sys.executable, "-c",
+                               "import os,sys; print(os.getcwd(), flush=True); sys.stdin.read()"],
+                              cwd=releases_for_test[0], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
+        _await_ready(worker, str(releases_for_test[0].resolve()))
         monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setattr(update_cmd_fleet, "_print_legacy_units_warning", lambda: None)
+        monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
         monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **kw: None)
-        monkeypatch.setattr(update_cmd_fleet, "_collect_fleet_snapshot", lambda *a, **kw: [])
+        monkeypatch.setattr(update_cmd_fleet_verify, "_collect_fleet_snapshot", lambda *a, **kw: [])
         monkeypatch.setattr(update_cmd_fleet, "_clear_fleet_restart_pending_marker", lambda: None)
         monkeypatch.setattr(update_cmd._m(), "_fleet_probe_expected_runtimes", lambda *a, **kw: False)
         monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda *a: [])
@@ -972,8 +1079,8 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
             restarted_services=[], failed_or_stale_units=[], relaunched_profiles=[],
             externally_supervised_profiles=[], killed_pids=set())
         update_receipt.begin_update_receipt()
-        update_cmd_fleet._verify_fleet_after_update(restart, _pre_update_plan=None,
-            _windows_gateway_resume=None, node_failures=[], update_complete=True, rollback=False)
+        update_cmd_fleet_verify._verify_fleet_after_update(restart, _pre_update_plan=None,
+            _windows_gateway_resume=None, update_complete=True, rollback=False)
         receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
         assert receipt["outcome"] == "success"
         assert releases_for_test[0].exists()
@@ -983,29 +1090,45 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
     finally:
         worker.terminate()
         worker.wait(timeout=5)
+        for pipe in (worker.stdin, worker.stdout):
+            if pipe is not None:
+                pipe.close()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(tmp_path, monkeypatch):
-    """Build one real checkout candidate; each plugin kind must fail its import probe before promotion."""
+    """Probe real archived code and Python; dependency/web builds have separate coverage."""
+    import sysconfig
+    import venv
     from hermes_cli import update_cmd, update_receipt
 
-    remote = Path(__file__).resolve().parents[2]
-    source = tmp_path / "hermes-agent"
-    subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout",
-                    str(remote), str(source)], check=True)
-    sha = subprocess.check_output(["git", "-C", str(remote), "rev-parse", "HEAD"], text=True).strip()
-    subprocess.run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha], check=True)
-    # This fixture validates plugin import failure, not dependency synchronization.
-    monkeypatch.setattr(releases, "restore_active_distributions", lambda *a, **kw: None)
+    # Archive the owned checkout directly: no second working-tree checkout is
+    # needed to exercise candidate staging or its real import subprocesses.
+    source = Path(__file__).resolve().parents[2]
+    sha = releases.release_sha(source)
+    # Keep real candidate Python and archived imports, but reuse installed test
+    # dependencies without running PM or provisioning Node/npm over the network.
+    def prepare_test_venv(release, *args, **kwargs):
+        environment = release / ".venv"
+        venv.EnvBuilder(with_pip=False).create(environment)
+        site_packages = Path(subprocess.check_output(
+            [str(releases._release_python(release)), "-c",
+             "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True).strip())
+        (site_packages / "test-dependencies.pth").write_text(
+            sysconfig.get_path("purelib") + "\n", encoding="utf-8")
+        return environment, "built"
+
+    monkeypatch.setattr(releases, "prepare_venv", prepare_test_venv)
+    # Real archived-revision web packaging remains covered in
+    # test_immutable_candidate_web_real.py.
+    monkeypatch.setattr(releases, "_build_candidate_web", lambda _staging: None)
     home = tmp_path / "profile"
     home.mkdir()
     a = home / "releases" / "A"
     _fake_release(a, "A")
     releases.promote(home, a)
-    # Stage the complete checkout and real candidate venv once. Reusing this
-    # immutable candidate exercises the production 'existing' smoke path for
-    # each kind without rebuilding npm and uv five times in one test file.
+    # Archive and stage once, then exercise the production 'existing' smoke
+    # subprocess for every plugin kind before any pointer can advance.
     candidate, action = releases.stage_release(source, home)
     assert action == "staged" and candidate == home / "releases" / sha
     plugin = home / "plugins" / "candidate-test"
@@ -1166,7 +1289,7 @@ def test_promote_and_rollback_refuse_mismatched_build_stamp(tmp_path):
 
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_update_stages_before_transaction_without_advancing_checkout(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway, update_cmd
@@ -1194,10 +1317,14 @@ def test_update_stages_before_transaction_without_advancing_checkout(tmp_path, m
     monkeypatch.setattr(update_cmd._m(), "_pause_windows_gateways_for_update", lambda: None)
     monkeypatch.setattr(update_cmd._m(), "_resolve_update_branch", lambda *args: "main")
     monkeypatch.setattr(update_cmd._m(), "_warn_orphaned_update_autostashes", lambda *args: None)
-    monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *args: SimpleNamespace(gw_input_fn=None, assume_yes=True, switch_branch=False))
+    monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *args: SimpleNamespace(
+        gw_input_fn=None, assume_yes=True, switch_branch=False, pre_update_version="old",
+        no_gateway_restart=False))
     monkeypatch.setattr(update_cmd, "_begin_update_receipt_and_plan", lambda *args: None)
-    monkeypatch.setattr(update_cmd, "_desktop_app_present", lambda *args: False)
-    monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda: (False, ["git"], False))
+    monkeypatch.setattr(update_cmd._m(), "_desktop_packaged_executable", lambda *args: None)
+    monkeypatch.setattr(update_cmd._m(), "_desktop_dist_exists", lambda *args: False)
+    monkeypatch.setattr(update_cmd._m(), "_installed_desktop_apps", lambda *args: [])
+    monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda **_: (False, ["git"], False))
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
     def inspect_before_stage(*args, **kwargs):
         assert not (home / "release-layout.json").exists()
@@ -1227,7 +1354,7 @@ def test_update_stages_before_transaction_without_advancing_checkout(tmp_path, m
     assert releases.release_sha(source) == sha_a
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_rollback_to_source_then_reactivate_records_source_sha(tmp_path, monkeypatch):
     from hermes_cli import gateway, update_cmd, update_receipt
 
@@ -1264,7 +1391,7 @@ def test_rollback_to_source_then_reactivate_records_source_sha(tmp_path, monkeyp
     assert (home / "current").resolve() == release
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("marker_valid", [True, False])
 def test_promotion_receipt_uses_build_marker_or_explains_unknown_identity(tmp_path, monkeypatch, marker_valid):
     from hermes_cli import gateway, update_cmd, update_receipt
@@ -1346,3 +1473,86 @@ def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profil
     (plugin / "__init__.py").write_text("def register(ctx):\n    pass\n")
     releases.smoke_plugins(source, home)
     assert not (home / "logs").exists()
+
+
+def test_candidate_import_smoke_accepts_enabled_portable_plugin(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "portable-test"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [portable-test]\n", encoding="utf-8")
+    (plugin / "plugin.json").write_text(json.dumps({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": "portable-test",
+    }), encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    releases.smoke_plugins(source, home)
+
+
+def test_candidate_import_smoke_accepts_enabled_manifest_only_language_pack(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "language-pack"
+    (plugin / "locales").mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [language-pack]\n", encoding="utf-8")
+    (plugin / "plugin.yaml").write_text(
+        "name: language-pack\nversion: '1.0'\nprovides_locales: [pl]\n", encoding="utf-8"
+    )
+    (plugin / "locales" / "pl.yaml").write_text("name: Polski\n", encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    releases.smoke_plugins(source, home)
+
+
+def test_candidate_import_smoke_rejects_enabled_portable_plugin_load_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "portable-test"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [portable-test]\n", encoding="utf-8")
+    (plugin / "plugin.json").write_text(json.dumps({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": "portable-test",
+        "extensions": {"com.nousresearch.hermes": {"servers": {"worker": {}}}},
+    }), encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    with pytest.raises(RuntimeError, match="no matching mcp.json server"):
+        releases.smoke_plugins(source, home)
+
+
+def test_candidate_import_smoke_rejects_disabled_enabled_portable_plugin(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "portable-test"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled: [portable-test]\n  disabled: [portable-test]\n", encoding="utf-8"
+    )
+    (plugin / "plugin.json").write_text(json.dumps({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": "portable-test",
+    }), encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    with pytest.raises(RuntimeError, match="disabled via config"):
+        releases.smoke_plugins(source, home)
+
+
+def test_candidate_import_smoke_rejects_disabled_enabled_manifest_only_language_pack(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "language-pack"
+    (plugin / "locales").mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled: [language-pack]\n  disabled: [language-pack]\n", encoding="utf-8"
+    )
+    (plugin / "plugin.yaml").write_text(
+        "name: language-pack\nversion: '1.0'\nprovides_locales: [pl]\n", encoding="utf-8"
+    )
+    (plugin / "locales" / "pl.yaml").write_text("name: Polski\n", encoding="utf-8")
+    source = Path(__file__).resolve().parents[2]
+
+    with pytest.raises(RuntimeError, match="disabled via config"):
+        releases.smoke_plugins(source, home)

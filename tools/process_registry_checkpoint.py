@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -11,17 +12,25 @@ logger = logging.getLogger("tools.process_registry")
 
 
 class ProcessCheckpointMixin:
+    def _detached_host_fate(self, pid: Optional[int], expected_start: Optional[int]) -> str:
+        """Subclass supplies the live PID decision. See ProcessRegistry."""
+        raise NotImplementedError
+
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None):
+    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None):
         """Write running process metadata to the checkpoint file atomically."""
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
 
         try:
             with self._lock:
                 entries = []
-                for s in self._running.values():
-                    if s.exited:
+                pending_survivors = [
+                    s for s in self._finished.values()
+                    if self._retain_survivor_completion(s)
+                ]
+                for s in (*self._running.values(), *pending_survivors):
+                    if s.exited and not s.survive_restart:
                         continue
                     # Backfill the start time so recovery can detect PID recycling
                     # even for sessions spawned before this field existed.
@@ -46,28 +55,36 @@ class ProcessCheckpointMixin:
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
         were recovered as detached sessions."""
+        survivor_pollers_stopped = getattr(self, "_survivor_pollers_stopped", None)
+        if survivor_pollers_stopped is not None:
+            survivor_pollers_stopped.clear()
         from tools.process_registry import (
             ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
             _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
         )
 
+        self._prune_delivered_survivor_runs()
         checkpoint_path = _checkpoint_path()
         if not checkpoint_path.exists():
             return 0
         try:
-            entries = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            entries = json.loads(checkpoint_path.read_text(encoding="utf-8-sig"))
         except Exception:
             return 0
         recovered = 0
-        unresolved_scope_entries: List[Dict[str, Any]] = []
+        unresolved_scope_entries: list[dict[str, Any]] = []
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
-            if not pid:
+            # A file-backed job (survive_restart, or a local persist_on_release job) has a
+            # wrapper-written exit marker and log, so its result outlives the old gateway.
+            survivor = bool(entry.get("survive_restart") or entry.get("exit_path"))
+            if not pid and not survivor:
                 continue
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
             with self._lock:
-                already_tracked = entry.get("session_id") in self._running
+                already_tracked = (entry.get("session_id") in self._running
+                                   or entry.get("session_id") in self._finished)
             if already_tracked:
                 continue
             if pid_scope != "host":  # in-sandbox PIDs mean nothing once the env handle is gone
@@ -75,16 +92,23 @@ class ProcessCheckpointMixin:
                     "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
                     entry.get("command", "unknown")[:60], pid, pid_scope)
                 continue
-            # Alive AND the same process: across a restart the kernel may have
-            # recycled the PID onto a stranger, and adopting it would let a later
-            # kill tree-kill e.g. a browser.
-            if not self._host_pid_is_ours(pid, entry.get("host_start_time")):
-                if self._is_host_pid_alive(pid):
-                    logger.info(
-                        "Not recovering session %s: pid %d is alive but its "
-                        "start time no longer matches — PID was recycled onto "
-                        "an unrelated process; refusing to adopt it.",
-                        entry.get("session_id", "?"), pid)
+            # Alive and still ours: re-attach. A start-time probe that cannot
+            # be read is not proof the PID was reused — dropping it would leave
+            # a live child unsupervised, and marking it exited would invent a
+            # completion. A positive mismatch means the number was recycled:
+            # do not adopt it and do not signal it.
+            fate = self._detached_host_fate(pid, entry.get("host_start_time")) if pid else "gone"
+            # A survivor whose PID was recycled is never adopted, supervised, or signalled
+            # either. Only a result its wrapper already recorded is reported (once, via the
+            # delivery claim); without one the stale entry is discarded like any other.
+            if fate == "reused" and not survivor:
+                logger.info(
+                    "Not recovering session %s: pid %d is alive but its "
+                    "start time no longer matches — PID was recycled onto "
+                    "an unrelated process; refusing to adopt or signal it.",
+                    entry.get("session_id", "?"), pid)
+                continue
+            if fate != "running" and not survivor:
                 systemd_unit = entry.get("systemd_unit", "")
                 if systemd_unit and not _stop_systemd_unit(systemd_unit):
                     logger.warning(
@@ -94,17 +118,41 @@ class ProcessCheckpointMixin:
                     unresolved_scope_entries.append(entry)
                 continue
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
+            recorded_exit = None
+            recorded_termination = {}
+            if survivor:
+                # A survivor's durable exit marker is authoritative even when the
+                # wrapper PID still looks alive during the restart probe. The
+                # operator-kill receipt is written before the local process tree is
+                # fully reaped, so recovery must not start a poller that downgrades
+                # that receipt to a normal exit or survivor_lost result.
+                recorded_exit = self._recorded_survivor_exit(fields.get("exit_path"))
+                recorded_termination = self._recorded_survivor_termination(fields.get("exit_path"))
+                if recorded_exit is None and recorded_termination.get("completion_reason") == "killed":
+                    recorded_exit = recorded_termination.get("exit_code", -15)
+                    if not isinstance(recorded_exit, int):
+                        recorded_exit = -15
+                if fate == "reused" and recorded_exit is None:
+                    logger.info(
+                        "Not recovering survivor %s: pid %d was recycled onto an unrelated "
+                        "process and no exit was recorded; discarding the stale entry.",
+                        entry.get("session_id", "?"), pid)
+                    self._remove_survivor_run_dir(ProcessSession(
+                        id=entry["session_id"], command="", log_path=fields.get("log_path", "")))
+                    continue
             fields.update(
                 command=entry.get("command", "unknown"),
                 owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
                 started_at=entry.get("started_at", time.time()))
             # detached: can't read output, but can report status + kill
             session = ProcessSession(id=entry["session_id"], detached=True, **fields)
+            if recorded_exit is not None:
+                session.pid = None  # a file-backed result has no signalable PID
             with self._lock:
                 self._running[session.id] = session
             recovered += 1
-            logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
-            # Re-enqueue watcher so gateway can resume notifications
+            logger.info("Recovered detached process: %s (pid=%s)", session.command[:60], pid)
+            # Restore the delivery route even when only the recorded result remains.
             if session.watcher_interval > 0:
                 self.pending_watchers.append({
                     "session_id": session.id,
@@ -114,5 +162,22 @@ class ProcessCheckpointMixin:
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
                 })
+            if not pid or recorded_exit is not None:
+                self._finish_survivor(
+                    session, recorded_exit,
+                    recorded_termination.get("completion_reason", "exited") if recorded_exit is not None else "lost",
+                    recorded_termination.get("termination_source", "") if recorded_exit is not None else "survivor_lost",
+                )
+                continue
+            if self._file_backed(session):
+                from contextvars import copy_context
+                poller = threading.Thread(
+                    target=copy_context().run,
+                    args=(self._survivor_poller_loop, session),
+                    daemon=True,
+                    name=f"proc-survivor-poller-{session.id}",
+                )
+                session._reader_thread = poller
+                poller.start()
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered

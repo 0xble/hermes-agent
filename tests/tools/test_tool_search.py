@@ -20,7 +20,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
-def _td(name: str, description: str = "", properties: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def _td(name: str, description: str = "", properties: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "type": "function",
         "function": {
@@ -118,7 +118,7 @@ class TestClassification:
         from tools.tool_search import ToolSearchConfig, assemble_tool_defs
 
         discover_builtin_tools()
-        names = {"read_window_below", "apply_layout", "project_list"}
+        names = {"read_window_below", "set_theme", "project_list"}
         assembled = assemble_tool_defs(
             [_td(name, f"GUI {name}") for name in names],
             context_length=200_000,
@@ -167,7 +167,6 @@ class TestClassification:
         assert "computer_use" not in names
 
 
-
     def test_classify_keeps_unknown_in_visible(self):
         """A tool we can't classify stays visible — never silently dropped.
 
@@ -181,6 +180,114 @@ class TestClassification:
         names = {(td.get("function") or {}).get("name") for td in visible}
         assert "xx_unknown_tool" in names
         assert deferrable == []
+
+    def test_non_string_registry_toolset_never_defers(self, monkeypatch):
+        """A malformed registry entry (non-string toolset) stays visible instead of raising."""
+        from types import SimpleNamespace
+        from tools.registry import registry
+        from tools.tool_search import classify_tools, is_deferrable_tool_name
+
+        name = "xx_malformed_toolset_tool"
+        malformed = SimpleNamespace(name=name, toolset=123, eager=False)
+        monkeypatch.setattr(registry, "get_entry", lambda tool_name, *a, **kw: malformed if tool_name == name else None)
+        assert is_deferrable_tool_name(name) is False
+        visible, deferrable = classify_tools([_td(name, "Malformed")])
+        assert [td["function"]["name"] for td in visible] == [name]
+        assert deferrable == []
+
+
+class TestPluginEagerRegistration:
+    """Plugin owners may opt a tool into the direct schema surface."""
+
+    @staticmethod
+    def _register(name: str, *, eager: bool = False):
+        from tools.registry import registry
+
+        tool_def = _td(name, f"Plugin tool {name}")
+        registry.register(
+            name=name,
+            toolset="plugin-eager-tests",
+            schema=tool_def["function"],
+            handler=lambda args, **kwargs: "{}",
+            eager=eager,
+        )
+        return tool_def
+
+    @staticmethod
+    def _cleanup(name: str):
+        from tools.registry import registry
+        registry.deregister(name)
+
+    def test_eager_plugin_tool_is_visible_and_not_deferred(self):
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs, classify_tools, is_deferrable_tool_name
+
+        name = "plugin_eager_visible"
+        tool_def = self._register(name, eager=True)
+        try:
+            visible, deferred = classify_tools([tool_def])
+            assert [td["function"]["name"] for td in visible] == [name]
+            assert deferred == []
+            assert not is_deferrable_tool_name(name)
+            result = assemble_tool_defs(
+                [tool_def], context_length=200_000,
+                config=ToolSearchConfig.from_raw({"enabled": "on"}),
+            )
+            assert not result.activated
+            assert [td["function"]["name"] for td in result.tool_defs] == [name]
+        finally:
+            self._cleanup(name)
+
+    def test_non_eager_plugin_tool_still_defers(self):
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs, classify_tools, is_deferrable_tool_name
+
+        name = "plugin_deferred_default"
+        tool_def = self._register(name)
+        try:
+            visible, deferred = classify_tools([tool_def])
+            assert visible == []
+            assert [td["function"]["name"] for td in deferred] == [name]
+            assert is_deferrable_tool_name(name)
+            result = assemble_tool_defs(
+                [tool_def], context_length=200_000,
+                config=ToolSearchConfig.from_raw({"enabled": "on"}),
+            )
+            assert result.activated
+            assert name not in {td["function"]["name"] for td in result.tool_defs}
+        finally:
+            self._cleanup(name)
+
+    def test_explicit_defer_list_overrides_eager(self):
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs, classify_tools, is_deferrable_tool_name
+
+        name = "plugin_eager_explicitly_deferred"
+        tool_def = self._register(name, eager=True)
+        try:
+            config = ToolSearchConfig.from_raw({"enabled": "on", "defer": [name]})
+            visible, deferred = classify_tools([tool_def], config.effective_defer_tools)
+            assert visible == []
+            assert [td["function"]["name"] for td in deferred] == [name]
+            assert is_deferrable_tool_name(name, config.effective_defer_tools)
+            result = assemble_tool_defs([tool_def], context_length=200_000, config=config)
+            assert result.activated
+            assert name not in {td["function"]["name"] for td in result.tool_defs}
+        finally:
+            self._cleanup(name)
+
+    def test_eager_tool_describe_and_call_require_direct_invocation(self):
+        from tools.tool_search import dispatch_tool_describe, resolve_underlying_call
+
+        name = "plugin_eager_direct_door"
+        tool_def = self._register(name, eager=True)
+        try:
+            described = json.loads(dispatch_tool_describe({"names": [name]}, current_tool_defs=[tool_def]))
+            assert described["tools"] == {}
+            assert "directly-listed" in described["errors"][name]
+            resolved, args, error = resolve_underlying_call({"name": name, "arguments": {}})
+            assert resolved is None
+            assert args == {}
+            assert "directly-listed" in error
+        finally:
+            self._cleanup(name)
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +459,7 @@ class TestBridgeDispatch:
         assert "error" in json.loads(result)
 
     def test_tool_search_rejects_empty_and_overcap_queries(self):
-        import tools.tool_search as tool_search
+        from tools import tool_search
 
         cfg = tool_search.ToolSearchConfig.from_raw({})
         assert "error" in json.loads(tool_search.dispatch_tool_search(
@@ -396,7 +503,7 @@ class TestBridgeDispatch:
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
-        name, args, err = resolve_underlying_call({
+        _name, _args, err = resolve_underlying_call({
             "name": "unknown_xxx",
             "arguments": {"foo": "bar"},
         })
@@ -407,7 +514,7 @@ class TestBridgeDispatch:
     def test_resolve_underlying_call_rejects_recursion(self):
         """tool_call cannot invoke tool_call itself."""
         from tools.tool_search import resolve_underlying_call, TOOL_CALL_NAME
-        name, args, err = resolve_underlying_call({
+        _name, _args, err = resolve_underlying_call({
             "name": TOOL_CALL_NAME,
             "arguments": {},
         })

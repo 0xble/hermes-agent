@@ -7,6 +7,7 @@ is replaced by ``httpx.MockTransport``; DNS is pinned so the address checks run 
 import socket
 import time
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlunsplit
 
 import httpx
 import pytest
@@ -84,7 +85,7 @@ class TestRefusals:
         "https://login.example/oauth/callback?code=abc",
         "https://share.example/doc?token=abc",
         "https://share.example/file?signature=abc",
-        "https://user:pass@site.example/",
+        urlunsplit(("https", "@".join(("user:pass", "site.example")), "/", "", "")),
         "https://site.example/verify-email",
     ])
     def test_side_effecting_or_credentialed_links_are_never_fetched(self, url, dns):

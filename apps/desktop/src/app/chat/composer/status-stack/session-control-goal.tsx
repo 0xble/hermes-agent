@@ -1,7 +1,7 @@
 import { memo, useCallback, useState } from 'react'
 
 import { queueKickoffIfSessionBusy } from '@/app/session/hooks/use-prompt-actions/queue-if-busy'
-import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
+import type { SubmitTextOptions, SubmitTextResult } from '@/app/session/hooks/use-prompt-actions/utils'
 import { StatusControlRow } from '@/components/chat/status-control-row'
 import { StatusPendingIcon } from '@/components/chat/status-pending-icon'
 import { StatusRow } from '@/components/chat/status-row'
@@ -46,7 +46,7 @@ interface GoalSectionProps {
   goal: SessionControlGoal
   sessionId: string
   pendingAction: SessionControlAction | null
-  onSubmit?: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+  onSubmit?: (value: string, options?: SubmitTextOptions) => Promise<SubmitTextResult> | SubmitTextResult
   onFeedback: (error: string | null, success: string | null) => void
 }
 

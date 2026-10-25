@@ -19,9 +19,9 @@ Moved bodies late-bind cli-level names via `from cli import ...` at call time, s
 handles input + autocomplete; `KawaiiSpinner` (`agent/display.py`) animates API calls and prints
 the `┊` activity feed. `load_cli_config()` in `cli.py` merges CLI defaults + user YAML.
 
-`hermes_cli/gateway.py` is the `hermes gateway` facade (process discovery, systemd backend, command
-dispatch); topical siblings re-exported by the facade: `gateway_service_unit.py` (systemd unit
-generation/refresh), `gateway_launchd.py` (macOS LaunchAgent backend), `gateway_setup_wizard.py`
+`hermes_cli/gateway.py` is the `hermes gateway` facade (process discovery, PM-aware systemd unit
+generation/refresh, command dispatch); topical siblings re-exported by the facade include
+`gateway_launchd.py` (macOS LaunchAgent backend), `gateway_setup_wizard.py`
 (`hermes gateway setup`: `_PLATFORMS` registry, status table, per-platform prompts, service offer),
 `gateway_windows*.py`, `gateway_supervised_restart.py`, `gateway_migrate*.py`, `gateway_multiplex_*.py`,
 `gateway_enroll.py`, `gateway_command_errors.py`. Sibling bodies read facade names through `_gw()`
@@ -75,23 +75,24 @@ Do not add a surface-specific goal parser. ACP has no goal command or goal loop 
 - **config.yaml option:** add to `DEFAULT_CONFIG`. Bump `_config_version` ONLY to actively
   migrate/transform existing config (rename keys, restructure); new keys deep-merge automatically.
   Top-level sections (non-exhaustive): `model, agent, terminal, compression, display, stt, tts,
-  memory, security, delegation, smart_model_routing, checkpoints, auxiliary, curator, skills,
-  gateway, logging, cron, profiles, plugins, honcho`. `auxiliary` = per-task side-LLM overrides
+memory, security, delegation, smart_model_routing, checkpoints, auxiliary, curator, skills,
+gateway, logging, cron, profiles, plugins, honcho`. `auxiliary` = per-task side-LLM overrides
   (`agent/AGENTS.md`); `curator` = `enabled, interval_hours, min_idle_hours, stale_after_days,
-  archive_after_days, backup.*`.
+archive_after_days, backup.*`.
 - **.env = SECRETS ONLY** (keys, tokens, passwords): add to `OPTIONAL_ENV_VARS` with
   `{"description", "prompt", "url", "password": True, "category": provider|tool|messaging|setting}`.
   Non-secret settings go in config.yaml; if internal code needs an env mirror, bridge it in code
   (`gateway_timeout`; `terminal.cwd` → `TERMINAL_CWD`). `MESSAGING_CWD` is removed and `TERMINAL_CWD`
   in `.env` is deprecated — the loader warns; canonical is `terminal.cwd`. `hermes config
-  set/get/unset <NAME>` route any bare name registered in `OPTIONAL_ENV_VARS` / `_EXTRA_ENV_KEYS`
+set/get/unset <NAME>` route any bare name registered in `OPTIONAL_ENV_VARS` / `_EXTRA_ENV_KEYS`
   (or carrying a `setup_hidden_env` platform suffix) to `.env` via `config_env_routing.py` — the
   file the platform setup flows write — never to the top level of config.yaml.
-- **One writer.** Every write of a `config.yaml` (main or profile) goes through
-  `hermes_cli.config.atomic_config_write` (→ `utils.atomic_roundtrip_yaml_save`, ruamel
-  round-trip merge): comments, key order, quoting and blank lines survive, absent keys are
-  deleted, and the fail-closed unreadable-file guard runs first. `save_config`, `config set/unset`,
-  migrations, plugin bookkeeping, gateway/TUI RPCs and auth resets all reach it; never call
+- **One writer seam.** Every write of a `config.yaml` (main or profile) goes through
+  `hermes_cli.config.atomic_config_write` (refuses deletion by omission) or the explicit
+  `atomic_config_replace` full-state path (→ `utils.atomic_roundtrip_yaml_save`, ruamel
+  round-trip): comments, key order, quoting and blank lines survive, and the fail-closed unreadable-file
+  guard runs first. Deliberate `pop()`/unset/migration paths use `atomic_config_replace`; additive
+  writers stay on `atomic_config_write`. Never call
   `atomic_yaml_write` / `yaml.dump` / `yaml.safe_dump` on a config path — `scripts/check_config_yaml_writers.py`
   (CI lint) rejects it, and `tests/hermes_cli/test_config_yaml_comment_preservation.py` guards each
   path (#92554). The commented example blocks are appended only when the file is created.
@@ -123,10 +124,11 @@ thinking_verbs, wings), `tool_prefix`, `tool_emojis`, `branding.*` (agent_name, 
 response_label, prompt_symbol). Consumers: `banner.py`, `display.py`, `cli.py`. Key-by-key table
 and YAML template: `website/docs/user-guide/features/skins.md`.
 
-## Update pipeline (`hermes update`) — transactional; every stage guards a real field failure
+## Update pipeline (`hermes update`)
 
-Fleet-update campaign #91277 (Aug 2026). A PR that weakens a stage must answer for the failure class
-it guards. `plan → snapshot → apply → restart-per-kind → verify → report`
+Transactional, `plan → snapshot → apply → restart-per-kind → verify → report`; every stage guards a
+real field failure (fleet campaign #91277), and a PR that weakens a stage answers for that class.
+The stage-by-stage contract: `website/docs/developer-guide/cli-internals.md` § Update pipeline.
 
 - **Plan** (`update_inventory.py`, `hermes update --plan`): read-only inventory — install kind, all
   profiles, every live gateway with supervisor + running code version. Deployment kinds are
@@ -167,13 +169,22 @@ it guards. `plan → snapshot → apply → restart-per-kind → verify → repo
   (exit 1) — automation must never treat a mixed-version fleet as healthy.
 - **Report**: every run writes a machine-readable receipt to `~/.hermes/logs/update_receipts/`
   (`latest.json` pointer; steps, skips WITH reasons, restart outcome, plan, fleet snapshot).
-  Finalization is owned by the `cmd_update` command boundary — early `sys.exit` paths (preflight
-  refusals, fetch failures) still persist a receipt with the real exit code. A begun-but-unwritten
-  receipt is a bug: refused/failed runs are the ones receipts exist for. The receipt is opened by
-  the pre-swap process and finished by the post-swap child (below): `detach_update_receipt` /
-  `resume_update_receipt` carry it across, so one run still yields exactly one receipt. A write
-  failure prints `⚠ Update receipt not written` and logs at WARNING, never debug.
+  Before a source swap, the parent captures plan/snapshots/receipt and its Windows pause token.
+  `update_completion.py` runs new-code PM preparation with site initialization disabled, then
+  selected-Python builds, maintenance, scans/restarts and verification. Git/current/ZIP share
+  this owner; never reload or purge modules to continue in the old interpreter. The parent keeps
+  the lock, waits, and accepts only a correlated terminal result. `cmd_update` still finalizes
+  early failures and missing/killed-child outcomes; PM refusal data survives the handoff.
+  See `website/docs/developer-guide/source-update-completion.md`. A begun-but-unwritten receipt is a bug.
 - **Nothing runs fetched code in the pre-fetch interpreter** (`update_handoff.py`). Legacy Git/ZIP updates replace the checkout and re-execute the post-swap tail under the updated venv, as before. In immutable mode (including first migration), fetch changes **only Git objects**, never source HEAD, working files or source venv; archive and build the exact fetched SHA beside the source, then re-execute `--post-swap` under the staged release's Python with cwd/import path pinned to that release. That child owns pointer promotion, fleet restart, verification and receipt. A release-origin `/update` may first re-enter the journal-bound source interpreter to fetch, but must not execute B code there. The old module-purge/reload workaround must not return. Mocked updater tests run the tail in-process via `_inline_post_swap_handoff` (`@pytest.mark.real_post_swap_handoff` opts out); `evals/update_pipeline/post_swap_handoff_ab.sh` covers legacy A/B.
+- **Nothing runs pulled code in the pre-pull interpreter.** This tree finishes updates through
+  `update_completion.run_completion` / `_update_takeover.py`.
+  `hermes_cli/update_handoff.py` and `hermes_cli/update_serve_obligations.py` are the
+  FROZEN COMPAT SURFACE for releases that lazily import those module
+  names from the NEW tree after the checkout swap.
+  Keep their public names importable and behavior-preserving. They call into
+  `_old_updater.stop_for_relaunch` → `_run_child`. Removing a name
+  bricks every release mid-update. see `tests/compat/old_updater_surface.json`.
 
 Process-scan coordination between updater, serve/dashboard, and gateway is being replaced by a
 gateway-owned control socket (#92091); scans are the fallback layer for old/crashed processes — read
@@ -192,8 +203,8 @@ root). Profiles are independent
 islands by design — no live config inheritance; `--clone` copies at creation, minus messaging
 channels (`profile_channels.py`: ownership-based inventory evaluated in the SOURCE's plugin scope —
 adapter-declared keys + canonical/alias prefixes + `GATEWAY_ALLOW*`/`GATEWAY_RELAY_*`; prefixes shared
-with tools (`HASS_`/`TWILIO_`/`EMAIL_`) are stripped only when the source runs that adapter; never a hand
-list). `--clone-channels` opts in and its live-multiplexer refusal lives in `create_profile` (CLI, REST
+with tools (`TWILIO_`/`EMAIL_`, plus a plugin platform's `shared_env_prefixes`) are stripped only when the source runs that adapter; never a hand
+list; a platform that left core keeps its ownership from its `LEFT_CORE` row while the plugin is absent). `--clone-channels` opts in and its live-multiplexer refusal lives in `create_profile` (CLI, REST
 and TUI all go through it). Clones are built in `profiles/.<name>.staging-<pid>` (hidden → invisible to
 `_iter_named_profile_dirs` and the hot-serve rescan) and published by one `os.rename` after the strip;
 symlinked `.env`/`config.yaml` are materialized first so a clone never writes through to its source. Multiplex
@@ -222,7 +233,7 @@ target; table-driven `_PREFLIGHT_CHECKS`; manifest `<default>/gateway_migration.
 a re-run resumes from it; a named profile's `gateway install|start|run` refuse without `--force` via
 `gateway.py::_named_profile_refused_under_multiplexer`, dashboard twin
 `web_server_gateway.py::multiplexed_profile_refusal`);
-`update_cmd_fleet._verify_fleet_after_update` calls `maybe_auto_migrate_after_update` on the success
+`update_cmd_fleet_verify._verify_fleet_after_update` calls `maybe_auto_migrate_after_update` on the success
 path only; `gateway_migrate_guards.py` holds the auto-path-only refusals (table `_AUTO_MIGRATION_GUARDS`:
 other service domain / UNIX user / HERMES_HOME outside `profiles/` — notices for the explicit command,
 blockers for the hook) and the `gateway.auto_multiplex_migration` opt-out (#109954). Blockers reuse `GatewayRunner._adapter_credential_fingerprint` and `platform_binds_port`;
@@ -234,9 +245,8 @@ supervisor (control-socket `identify` answering anything but `manual`, OR the ar
 for a fresh supervised PID, never stop + foreground `run_gateway` (that stamps the CLI's PID and wedges
 every KeepAlive respawn, #110637).
 
-Service installs are a matrix, not a unit file: `gateway_service_unit.py::generate_systemd_unit(system=,
-run_as_user=)` (systemd unit generation / `systemd_unit_is_current` / `refresh_systemd_unit_if_needed` live in that
-sibling and read facade helpers late-bound through `hermes_cli.gateway`, so patch them on the facade; user unit AND `--system` unit with `User=`; an unresolvable `User=` is a blocker,
+Service installs are a matrix, not a unit file: `gateway.py::generate_systemd_unit(system=,
+run_as_user=)` (systemd unit generation / `systemd_unit_is_current` / `refresh_systemd_unit_if_needed` are PM-aware facade owners; user unit AND `--system` unit with `User=`; an unresolvable `User=` is a blocker,
 never a dir-owner fallback), `gateway_launchd.py::generate_launchd_plist` (`gui/<uid>` then `user/<uid>` domains, never a
 `~/Library/LaunchAgents` glob; the whole launchd backend — plist refresh, `launchctl` bootstrap/kickstart,
 `launchd_start/stop/restart/status`, detached-process degrade — lives in that sibling, with the domain cache
@@ -249,29 +259,8 @@ recorded when both exist. Process liveness is `(pid, start_time)` or the canonic
 
 ## Nous free tier (`hermes_cli/anon_auth.py`)
 
-Sign-in completion is one function, `settle_after_upgrade`, called by every caller that persists an
-account over a free-tier identity (CLI `upgrade_guest`, the desktop poller): it moves a config on the
-welcome route to the account's host and the tier's recommended default
-(`models.recommended_nous_default_model`, shared with `GET /api/model/recommended-default`).
-
-The shared flow, states, and copy live in `anon_sign_in.py`; CLI rendering lives in
-`anon_sign_in_cli.py`. `anon_auth.py` keeps identity, promotion polling, and settlement, and
-re-exports the existing sign-in API. The flow resolves identity and persistence collaborators
-through `anon_auth` at call time to preserve module-attribute monkeypatch seams.
-
-The sign-in itself is one composition: `anon_auth.run_sign_in()` yields `SignInState`s (`Code`,
-`Waiting`, `Completed`, `Declined`, `Superseded`, `TimedOut`, `Retired`, `Failed`,
-`AlreadySignedIn`, `Unavailable`). It reads the current state itself, holds one absolute deadline
-across both waits, persists only after a completed promotion **and** a token grant, runs
-`settle_after_upgrade` exactly once per completion, and never lets a persist or settle failure
-escape as an exception — it becomes `Failed`. Every state carries its own `.copy` (the chat form,
-which never contains a raw exception, a URL or a `hermes` verb) and `.copy_terminal`, so no caller
-maps a reason to a string. `cancelled()` stops an attempt; `cancel_wins_after_promotion` decides
-what happens when the server had already completed the transfer — the desktop keeps `True` (a
-DELETE means "not on this machine"), the gateway passes `False` (a supersede must not discard a
-transfer the user actually approved). `scope` is entered only around the precondition and persist
-blocks, never across a `yield` or a network wait, because `run_in_executor` does not carry
-contextvars. `upgrade_guest` (`hermes auth upgrade`), the CLI `/login` handler and the desktop
-promotion poller are renderers over it; a surface that needs the cancel check and the save to be
-atomic passes `persist_guard`. The desktop's plain "connect another Nous account" device-code login
-is a separate path (`_nous_plain_poller`) and must stay one.
+`anon_auth.run_sign_in()` is the one sign-in composition: it yields `SignInState`s that carry their
+own `.copy` / `.copy_terminal`, persists only after a completed promotion AND a token grant, and runs
+`settle_after_upgrade` exactly once per completion. `hermes auth upgrade`, the CLI and gateway
+`/login` and the desktop poller are renderers over it; the desktop's plain device-code login
+(`_nous_plain_poller`) stays a separate path. Long form: `cli-internals.md` § Nous free tier sign-in.

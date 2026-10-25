@@ -7,11 +7,22 @@
 # Schema version of this file. The installers copy it to seed config.yaml, and
 # `hermes update` uses it to know which one-time migrations the file already
 # has. Hermes manages it: do not copy it into another config.
-_config_version: 46
+_config_version: 50
 
 # =============================================================================
-# Database Configuration
+# Attended model switching (optional)
 # =============================================================================
+# While a human is active in a topic, route the main gateway agent to this model/provider.
+# Omit the whole block to preserve existing model and /model behavior.
+# model:
+#   attended:
+#     model: claude-opus-5-5
+#     provider: custom:claude-proxy
+#     reasoning_effort: medium
+#     start_new_sessions: true
+#   idle_revert_minutes: 15
+#   compact_before_switch_tokens: 80000
+
 # WAL is the normal default. Hermes automatically falls back to DELETE when
 # SQLite reports that WAL is incompatible with the filesystem. Set this to
 # "delete" explicitly for deployments whose backing filesystem is not WAL
@@ -41,6 +52,21 @@ database:
 # null to disable the adjustment. Default: 4096.
 runtime:
   nofile_soft_limit: 4096
+
+# =============================================================================
+# Attachments
+# =============================================================================
+# Where the TUI/Desktop gateway stages session file attachments (file uploads and
+# pasted text). Read per profile: a session bound to profile X follows X's own
+# config.yaml, so each agent's attachments stay with its workspace.
+#   hermes-home  (default) <profile home>/attachments — the directory container
+#                 backends bind-mount, so @file: refs resolve inside the sandbox.
+#   workspace    <session workspace>/.hermes/attachments — staging lands inside
+#                 the allowed reference root, so the profile's agent can always
+#                 read its own attachments back. A remote (ssh) workspace keeps
+#                 the profile home directory either way.
+attachments:
+  storage: "hermes-home"
 
 # =============================================================================
 # Plugin Installation
@@ -447,7 +473,7 @@ terminal:
 #   cwd: "/workspace"  # Path INSIDE the container (default: /)
 #   timeout: 180
 #   lifetime_seconds: 300
-#   docker_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+#   docker_image: "nousresearch/hermes-sandbox:desktop"
 #   docker_mount_cwd_to_workspace: true   # Explicit opt-in: mount your launch cwd into /workspace
 #   # Optional: run the container as your host user's uid:gid so files written
 #   # into bind-mounted dirs are owned by you, not root. Drops SETUID/SETGID
@@ -477,7 +503,7 @@ terminal:
 #   cwd: "/workspace"  # Path INSIDE the container (default: /root)
 #   timeout: 180
 #   lifetime_seconds: 300
-#   singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"
+#   singularity_image: "docker://nousresearch/hermes-sandbox:desktop"
 
 # -----------------------------------------------------------------------------
 # OPTION 5: Modal cloud execution
@@ -489,7 +515,7 @@ terminal:
 #   cwd: "/workspace"  # Path INSIDE the sandbox (default: /root)
 #   timeout: 180
 #   lifetime_seconds: 300
-#   modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+#   modal_image: "nousresearch/hermes-sandbox:desktop"
 
 # -----------------------------------------------------------------------------
 # OPTION 6: Daytona cloud execution
@@ -502,7 +528,7 @@ terminal:
 #   cwd: "~"
 #   timeout: 180
 #   lifetime_seconds: 300
-#   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+#   daytona_image: "nousresearch/hermes-sandbox:desktop"
 #   container_disk: 10240          # Daytona max is 10GB per sandbox
 
 #
@@ -543,18 +569,9 @@ terminal:
 #   sudo_password: "your-password-here"
 
 # =============================================================================
-# Security Scanning (tirith)
+# Security
 # =============================================================================
-# Optional pre-exec command security scanning via tirith.
-# Detects homograph URLs, pipe-to-shell, terminal injection, env manipulation.
-# Install: brew install sheeki03/tap/tirith
-# Docs: https://github.com/sheeki03/tirith
-#
 # security:
-#   tirith_enabled: true        # Enable/disable tirith scanning
-#   tirith_path: "tirith"       # Path to tirith binary (supports ~ expansion)
-#   tirith_timeout: 5           # Scan timeout in seconds
-#   tirith_fail_open: true      # Allow commands if tirith unavailable
 #   approval:
 #     transport: builtin        # Or an explicitly enabled plugin transport name
 #     transport_fallback: deny  # Set builtin to opt into fallback on transport failure
@@ -564,6 +581,21 @@ terminal:
 #   # disable the gate; add fnmatch patterns on the basename to protect more files.
 #   protected_instruction_files: true
 #   protected_instruction_extra_patterns: []
+
+# =============================================================================
+# LSP Diagnostics (post-write lint for write_file / patch)
+# =============================================================================
+# lsp:
+#   enabled: true
+#   # Language servers only load code a project ships (its .venv interpreter,
+#   # node_modules TypeScript, svelte.config.js, cargo/Gradle/mix build files)
+#   # in the git worktree of the directory you launched Hermes in or opened
+#   # the session in (hermes -w, a Desktop project, terminal.cwd), or under a
+#   # directory listed here. In other checkouts, such as a repository the agent
+#   # cloned, only servers that run no project code start (pinned to
+#   # Hermes-side tools) and the npx tsc / rustfmt lint fallbacks are skipped.
+#   trusted_workspaces:
+#     - ~/code/my-app
 
 # =============================================================================
 # Browser Tool Configuration
@@ -679,12 +711,11 @@ compression:
   #   "claude-sonnet": 0.35
   #   "gpt-5": 0.30
 
-  # Absolute token cap for the compression trigger (default: 256000).
-  # Compression fires at the LOWER of the ratio-based threshold and this count,
-  # bounding large-window sessions while lower proportional triggers still win
-  # whenever they fall below the cap. The cap survives model switches and fallbacks.
-  # Set null to restore ratio-only behavior.
-  threshold_tokens: 256000
+  # Optional absolute token cap for the compression trigger (default: null = disabled).
+  # When set, compression fires at the LOWER of the ratio-based threshold and this
+  # absolute token count. Clamped to the model's context length at apply-time, so a
+  # cap above the window is a no-op. Survives model switches and fallback activations.
+  # threshold_tokens: 200000
 
   # Existing Codex gpt-5.5 behavior: raise Hermes' compaction trigger to 85%
   # for the ChatGPT Codex OAuth route. Set false to opt back down to threshold.
@@ -726,7 +757,7 @@ compression:
 
   # Native OpenAI Responses server-side compaction (default: false). When true,
   # gpt-5.6-family models on the DIRECT OpenAI API (api.openai.com) or a ChatGPT
-  # Codex subscription, plus exact gpt-6-astra on official Codex OAuth, compact
+  # Codex subscription, plus gpt-6-astra (and its -900k alias) on official Codex OAuth, compact
   # server-side: OpenAI prunes older context into an
   # encrypted checkpoint that Hermes replays on later turns. No other provider,
   # route, or model is affected. Hermes' local compression stays armed as the
@@ -776,7 +807,7 @@ compression:
   # compression instead of adopting it one turn late.
   hygiene_max_turn_hold_seconds: 10
 
-  # Proactive tool-result prune (default: 0 = disabled). Opt-in token trigger
+  # Proactive tool-result prune (default: 48000; set 0 to disable). Token trigger
   # for a deterministic, no-LLM prune of OLD tool-result payloads, run
   # independently of `threshold` above. On large-window models (512K/1M) the
   # ratio threshold rarely fires, so bulky tool outputs (terminal dumps, file
@@ -784,13 +815,13 @@ compression:
   # When re-sent history exceeds this many tokens, the prune dedupes identical
   # results, summarizes older oversized ones, and truncates large tool-call
   # arguments — protecting the most recent `protect_last_n` messages and never
-  # calling the model. Try 48000 to enable. Built-in compressor engine only;
+  # calling the model. Built-in compressor engine only;
   # other context engines inherit a safe no-op.
   # NOTE: a committed prune rewrites already-sent history, which invalidates
   # the provider's prompt-cache prefix — the min_reclaim gate below keeps
   # those cache breaks episodic (like a compression boundary) instead of
   # per-turn.
-  proactive_prune_tokens: 0
+  proactive_prune_tokens: 48000
 
   # The prune's summarize pass only touches tool results larger than this many
   # characters (clamped to >= 200 so a generated summary can't be
@@ -985,6 +1016,10 @@ memory:
   
   # User profile: preferences, communication style, expectations
   user_profile_enabled: true
+
+  # External prefetch only: opt in to head/tail previews using hooks.output_spill.
+  # Defaults to keeping the full provider-ranked recall. Restart to apply changes.
+  prefetch_spill_enabled: false
   
   # Character limits (~2.75 chars per token, model-independent)
   memory_char_limit: 2200   # ~800 tokens
@@ -993,6 +1028,17 @@ memory:
   # Periodic memory nudge: remind the agent to consider saving memories
   # every N user turns. Set to 0 to disable. Only active when memory is enabled.
   nudge_interval: 10        # Nudge every 10 user turns (0 = disabled)
+
+  # Let Hermes-generated turns (process/delegation notices, goal continuations,
+  # heartbeat and /loop wakeups, cron job runs) key the external provider's
+  # automatic recall. Off by default: text a person merged into such a turn still
+  # recalls, and explicit memory tools are unaffected.
+  recall_synthetic_turns: false
+
+  # Oldest background-recall result (seconds) the external provider may inject.
+  # Recall is computed after each human turn for the next one; generated turns in
+  # between neither use nor replace it. Older results are dropped. 0 = no limit.
+  prefetch_max_age_seconds: 1800
 
 # =============================================================================
 # Session Continuity (Messaging Platforms)
@@ -1157,9 +1203,9 @@ agent:
   # API responses.  Only fires after the agent has been idle for this duration.
   # gateway_timeout: 1800
 
-  # Maximum time an alias routing key waits for an active turn holding the same
-  # resolved session lease. On expiry Hermes rejects this inbound message and
-  # asks the user to resend rather than running it without serialization.
+  # Initial wait before an alias routing key durably queues behind an active
+  # turn holding the same resolved session lease. It continues waiting up to
+  # gateway.turn_lease_max_wait_seconds below rather than dropping the message.
   # Non-positive values fall back to the 5-second default.
   # gateway_turn_lease_timeout: 5
 
@@ -1199,23 +1245,27 @@ agent:
   # window on /restart, and keep it well under systemd's TimeoutStopSec.
   # restart_drain_timeout: 0
 
-  # Cron-only floor under the same drain (seconds). Default 30.
+  # Floor under the same drain for cron jobs and api_server (/v1) runs
+  # (seconds). Default 30.
   # restart_drain_timeout above is written for chat turns, which are cheap to
   # interrupt: the user is told the gateway is restarting and the session
   # resumes on their next message. A cron run has no such safety net — it is
   # recorded in jobs.json as a permanent failure, nobody is waiting on it, and
   # a recurring job simply skips to its next schedule. So in-flight cron work
-  # gets its own grace window instead of inheriting the 0 above.
+  # gets its own grace window instead of inheriting the 0 above, and so do
+  # api_server (/v1) runs: an interrupted /v1 run fails its waiting caller.
   # Clamped at runtime to the shutdown-watchdog leash (restart_drain_timeout
   # + 60s) minus teardown headroom, so values past ~50s need a matching
-  # TimeoutStopSec bump to take effect. Set 0 to opt out and drain cron on
-  # restart_drain_timeout like before.
+  # TimeoutStopSec bump to take effect. Set 0 to opt out and drain cron and
+  # /v1 runs on restart_drain_timeout like before.
   # cron_drain_timeout: 30
 
   # In-band restart wait (seconds) for active turns to finish BEFORE stop()
   # begins. /restart and SIGUSR1 refuse new work, then wait up to this cap for
   # in-flight agent, cron and API runs to complete so the requesting turn is
   # not cut off by restart_drain_timeout. 0 = enter stop()/drain immediately.
+  # Excluded from the wait: wedged runs, and cron runs already handed to a
+  # worker in its own restart-safe systemd scope (they outlive the restart).
   # The default (30 min) is a safety valve for wedged agents, not a target
   # latency; raise it for long unattended turns. Env: HERMES_RESTART_AFTER_TURN_TIMEOUT.
   # restart_after_turn_timeout: 1800
@@ -1305,8 +1355,12 @@ agent:
   #   "auto"        - only the first fast_auto_seconds of every turn
   #   "cold"        - that window on the first turn of a session only
   # Also: /fast normal|fast|auto|cold [--global]
+  # Messaging gateway sessions only: agent.fast_expiry_seconds is the seconds before a session
+  # fast/ultrafast override switches to normal; 0 disables. CLI/TUI sessions do not expire.
+  # Expiry changes the session to normal, even if the configured default is fast.
   service_tier: ""
   fast_auto_seconds: 60
+  fast_expiry_seconds: 0
 
   # Custom personalities (use with /personality command).
   # Built-ins (helpful, concise, technical, creative, teacher, kawaii, catgirl,
@@ -1326,6 +1380,11 @@ agent:
 # Gateway Lifecycle
 # =============================================================================
 gateway:
+  # Maximum total time a queued turn waits for its predecessor's lease (seconds).
+  # After 30 seconds, send 1 busy acknowledgement unless already acknowledged.
+  # Expiry or a failed spool asks the sender to resend. Invalid values use 1800.
+  # turn_lease_max_wait_seconds: 1800
+
   # Post-interrupt grace for running agents during an unexpected SIGTERM.
   # Adapter, bridge, and database teardown starts after this many seconds even
   # if an agent has not unwound. Keep it below the service-manager stop budget.
@@ -1385,7 +1444,6 @@ gateway:
 #   whatsapp:      hermes-whatsapp       (same as telegram)
 #   slack:         hermes-slack          (same as telegram)
 #   signal:        hermes-signal         (same as telegram)
-#   homeassistant: hermes-homeassistant  (same as telegram)
 #   qqbot:            hermes-qqbot            (same as telegram)
 #   teams:            hermes-teams            (same as telegram)
 #   google_chat:      hermes-google_chat      (same as telegram)
@@ -1397,7 +1455,6 @@ platform_toolsets:
   whatsapp: [hermes-whatsapp]
   slack: [hermes-slack]
   signal: [hermes-signal]
-  homeassistant: [hermes-homeassistant]
   qqbot: [hermes-qqbot]
   yuanbao: [hermes-yuanbao]
   teams: [hermes-teams]
@@ -1591,6 +1648,7 @@ platform_toolsets:
 #       max_rpm: 10             # max requests per minute
 #       allowed_models: []      # model whitelist (empty = all)
 #       max_tool_rounds: 5      # tool loop limit (0 = disable)
+#       expose_client_tools: false # advertise extended sampling.tools capability
 #       log_level: "info"       # audit verbosity
 
 # =============================================================================
@@ -1688,11 +1746,25 @@ stt:
     max_retries: 1             # OpenAI SDK transport retries; set 0 to disable
   # mistral:
   #   model: "voxtral-mini-latest"  # voxtral-mini-latest | voxtral-mini-2602
+  # xai:
+  #   # Sent as the multipart ``model`` field. Hermes uses 2.0 by default;
+  #   # pin 1.0 only if a rollback is needed.
+  #   model: "grok-voice-transcribe-2.0"  # or grok-voice-transcribe-1.0
+  #   # language: ""             # blank = stt.language > HERMES_LOCAL_STT_LANGUAGE > auto-detect
   # deepinfra:
   #   # Model id is discovered live from the DeepInfra catalog filtered
   #   # by the `stt` surface tag — leave `model` blank to take the first
   #   # live result. Pin only when you need a specific Whisper variant.
   #   model: ""
+  # Custom command providers (stt.providers.<name>: type: command) can
+  # normalize browser WebM/Opus and other input formats to 16 kHz mono m4a
+  # before substituting {input_path}. This is opt-in so CLIs that already
+  # accept arbitrary containers (e.g. whisper.cpp) remain unchanged.
+  # providers:
+  #   custom-asr:
+  #     type: "command"
+  #     command: "custom-asr --input {input_path} --output {output_path}"
+  #     normalize: true  # requires ffmpeg; default false
 
 # Text-to-speech. Only the deepinfra block is documented here — the
 # remaining providers (edge, openai, xai, minimax, mistral, gemini,
@@ -1781,6 +1853,7 @@ delegation:
   max_iterations: 250                         # Max tool-calling turns per child (default: 250)
   # max_concurrent_children: 10               # Max parallel child agents per batch (default: 10, floor: 1, no ceiling).
                                               # WARNING: values above 10 multiply API cost linearly.
+  # max_queued_delegations: 8                 # Bounded pending background calls while the pool is full; 0 rejects.
   # max_spawn_depth: 1                        # Delegation tree depth cap (range: 1-3, default: 1 = flat).
                                               # Raise to 2 to allow workers to spawn their own subagents.
                                               # Requires role="orchestrator" on intermediate agents.
@@ -1809,7 +1882,7 @@ delegation:
 # Builds a deeper understanding of the user across sessions and tools.
 # Runs alongside USER.md — additive, not a replacement.
 #
-# Requires: pip install honcho-ai
+# Requires: hermes plugins install honcho (Plastic Labs' plugin from the catalog)
 # Config: ~/.honcho/config.json (shared with Claude Code, Cursor, etc.)
 # API key: HONCHO_API_KEY in ~/.hermes/.env or ~/.honcho/config.json
 #
@@ -1825,13 +1898,16 @@ display:
   #   false: Full ASCII banner with tool/skill summary (default)
   compact: false
 
-  # Tool progress display level (CLI and gateway)
+  # Tool progress display level (CLI, gateway, and the TUI/Desktop tool feed)
   #   off:     Silent — no tool activity shown, just the final response
   #   new:     Show a tool indicator only when the tool changes (skip repeats)
   #   all:     Show every tool call with a short preview (default)
   #   verbose: Full args, results, and debug logs (same as /verbose)
   #   log:     Silent in chat; append every tool call to ~/.hermes/logs/tool_calls.log (gateway only)
   # Toggle at runtime with /verbose in the CLI
+  # Independent of show_reasoning: hiding reasoning never hides tool rows.
+  # Answer-only (just the final response) is show_reasoning: false plus
+  # tool_progress: off.
   # tool_progress: all
 
   # tool_progress, interim_assistant_messages, long_running_notifications,

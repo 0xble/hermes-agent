@@ -8,8 +8,9 @@ broken-trampoline stand-in (a .bat that reproduces the launcher's
 "BUG (fork bomb)" guard output and refuses to run).
 
 windows-latest ships full Git for Windows at ``C:\\Program Files\\Git`` with
-the real ``mingw64\\libexec\\git-core\\git.exe`` — exactly the layout the
-locator targets — so the swap path is exercised end to end.
+the real ``<env>\\libexec\\git-core\\git.exe`` (``ucrt64`` since Git for
+Windows v2.56.0, ``mingw64`` before), which is the layout the locator
+targets, so the swap path is exercised end to end.
 """
 
 from __future__ import annotations
@@ -20,9 +21,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    sys.platform != "win32", reason="live Windows trampoline E2E"
-)
+pytestmark = pytest.mark.platforms("windows")  # live Windows trampoline E2E
 
 _FORK_BOMB_BAT = (
     "@echo off\r\n"
@@ -44,7 +43,8 @@ class TestGitTrampolineLive:
         # Healthy PATH git on the runner: probe must report False and the
         # probe itself must actually run git (sanity: git exists here).
         version = subprocess.run(
-            ["git", "--version"], capture_output=True, text=True, timeout=30
+            ["git", "--version"], capture_output=True, text=True, timeout=30,
+            check=False,
         )
         assert version.returncode == 0, version.stderr
         assert update_cmd._git_is_trampoline(["git"]) is False
@@ -65,7 +65,8 @@ class TestGitTrampolineLive:
         assert real.exists()
         assert real.name == "git.exe"
         probe = subprocess.run(
-            [str(real), "--version"], capture_output=True, text=True, timeout=30
+            [str(real), "--version"], capture_output=True, text=True, timeout=30,
+            check=False,
         )
         assert probe.returncode == 0
         assert "git version" in probe.stdout.lower()
@@ -83,7 +84,8 @@ class TestGitTrampolineLive:
         assert real.exists() and real.name == "git.exe"
         # The healed command must actually work.
         result = subprocess.run(
-            healed[:1] + ["--version"], capture_output=True, text=True, timeout=30
+            healed[:1] + ["--version"], capture_output=True, text=True, timeout=30,
+            check=False,
         )
         assert result.returncode == 0
         assert "switching to real git" in capsys.readouterr().out

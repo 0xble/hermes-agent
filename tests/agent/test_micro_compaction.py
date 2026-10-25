@@ -28,6 +28,7 @@ from agent.context_compressor import (
     ContextCompressor,
     _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES,
 )
+import itertools
 
 
 def _compressor(summary="ROLLING SUMMARY") -> ContextCompressor:
@@ -572,7 +573,7 @@ class TestMicroCompaction:
 
         for _ in range(4):
             msgs = cc._micro_compact(msgs)
-            for a, b in zip(msgs, msgs[1:]):
+            for a, b in itertools.pairwise(msgs):
                 ra, rb = a.get("role"), b.get("role")
                 assert not (ra == rb and ra in ("user", "assistant")), (
                     f"consecutive {ra} messages after micro-compaction"
@@ -952,3 +953,46 @@ def test_a_stale_generation_aborts_leaving_the_winner_the_only_live_version(tmp_
     assert cc._micro_compact_rolling_summary == summary  # the stale summary is not carried into the next pass
     live = [m["content"] for m in db.get_messages_as_conversation("s")]
     assert live == [m["content"] for m in winner]  # exactly one live generation
+
+
+def test_defrag_of_a_gateway_loaded_history_commits_on_the_current_generation(tmp_path):
+    """The gateway hands the agent ``load_transcript`` history: no ``_row_id``s, so the commit's stale-generation
+    guard matches the active summary row by its loaded content. Defrag rewrites that marker dict in place; a
+    held snapshot aliasing the live dicts carried the NEW content, matched nothing, and every defrag of the
+    current generation was refused as stale (rolled back, one aux call burned per turn)."""
+    from hermes_state import SessionDB
+    import sqlite3
+    from agent.context_compressor import ContextCompressor as _CC
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s", source="telegram")
+        old_summary = "earlier work " * 1_000  # rehydrated rolling summary far over the defrag threshold
+        marker = {"role": "assistant", "content": _CC._render_micro_marker_content(old_summary),
+                  COMPRESSED_SUMMARY_METADATA_KEY: True}
+        db.append_messages_batch("s", [{"role": "system", "content": "system prompt"},
+                                       {"role": "user", "content": "question 0"}, marker,
+                                       *_conversation(exchanges=6)[1:]])
+        held = db.get_messages_as_conversation("s", repair_alternation=True)  # gateway load_transcript shape
+        assert all("_row_id" not in m for m in held)
+
+        cc = _compressor(summary="FRESH DEFRAGGED SUMMARY")
+        cc._session_db, cc._session_id = db, "s"
+        telemetry = []
+        cc._emit_micro_compaction_telemetry = lambda **kw: telemetry.append(kw["outcome"])
+
+        result = cc._micro_compact(held)
+
+        assert telemetry == ["defrag"]
+        assert cc._micro_compact_rolling_summary == "FRESH DEFRAGGED SUMMARY"
+        conn = sqlite3.connect(db.db_path)
+        try:
+            summaries = conn.execute(
+                "SELECT content FROM messages WHERE session_id = 's' AND active = 1 AND _compressed_summary = 1",
+            ).fetchall()
+        finally:
+            conn.close()
+        assert len(summaries) == 1 and "FRESH DEFRAGGED SUMMARY" in summaries[0][0]
+        assert [m["content"] for m in db.get_messages_as_conversation("s")] == [m["content"] for m in result]
+    finally:
+        db.close()

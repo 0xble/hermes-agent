@@ -37,6 +37,18 @@ const paint = (element: React.ReactElement): string => {
   return stripAnsi(frames.join(''))
 }
 
+it('shows unlimited turns across active, parked and paused goals', () => {
+  for (const patch of [
+    {},
+    { wait_barrier: { target: 'proc_1', type: 'session' as const } },
+    { paused_reason: 'user-paused', status: 'paused' as const }
+  ]) {
+    const line = goalLine(goal({ max_turns: 0, ...patch }))
+    expect(line?.detail).toContain('3/∞ turns')
+    expect(paint(<GoalBarView cols={58} line={line} t={DEFAULT_THEME} />)).toContain('3/∞ turns')
+  }
+})
+
 it('shows a standing goal (active, parked, paused) and hides it once done or cleared', () => {
   expect(goalLine(goal())).toMatchObject({ detail: '3/20 turns', glyph: '⊙', label: 'goal' })
   expect(

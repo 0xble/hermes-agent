@@ -60,9 +60,9 @@ def receipt_home(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.get_hermes_home", lambda: home, raising=False
     )
-    ur._current = None
+    ur._current.set(None)
     yield home
-    ur._current = None
+    ur._current.set(None)
 
 
 def _receipt_files(home):
@@ -126,7 +126,7 @@ class TestReceiptAlwaysFinalized:
         ur.record_step("git_pull", True)
         ur.record_step("pip_install", True)
         # Crash: module singleton is gone, finalize never ran.
-        ur._current = None
+        ur._current.set(None)
 
         assert _receipt_files(receipt_home) == []
         latest = ur.read_latest_receipt()
@@ -157,8 +157,8 @@ class TestSuccessImpliesAccounting:
         outcomes = match_runtime_outcomes(plan, **bookkeeping)
         incomplete = report_unaccounted_runtimes(outcomes)
         record_plan_in_receipt(plan)
-        if ur._current is not None:
-            ur._current.data["runtime_outcomes"] = outcomes
+        if ur._current.get() is not None:
+            ur._current.get().data["runtime_outcomes"] = outcomes
         # Exact outcome-selection expression from update_cmd.py ~8360.
         path = ur.finalize_update_receipt(
             "partial" if incomplete else "success"
@@ -196,7 +196,7 @@ class TestSuccessImpliesAccounting:
         receipt carries the plan + per-runtime outcomes as evidence."""
         ur.begin_update_receipt()
         plan = _plan_with_runtimes(_THREE_RUNTIMES)
-        outcomes, incomplete, path = self._drive_decision(
+        _outcomes, incomplete, path = self._drive_decision(
             plan,
             # Serve/dashboard runtimes are reconciled in their own unit
             # vocabulary and never borrow a gateway relaunch (#100479).
@@ -293,7 +293,7 @@ class TestPreUpdateBackupIsHonest:
         monkeypatch.setattr(maint, "_run_quick_snapshots", snapshot)
         ur.begin_update_receipt()
         result = maint._run_pre_update_backup(object())
-        return result, ur._current.data
+        return result, ur._current.get().data
 
     def test_failed_snapshot_records_the_real_reason(self, receipt_home, monkeypatch):
         from hermes_cli.backup import BackupInProgressError
@@ -317,7 +317,7 @@ class TestPreUpdateBackupIsHonest:
         ur.begin_update_receipt()
 
         assert maint._run_pre_update_backup(object()) is None
-        data = ur._current.data
+        data = ur._current.get().data
         assert not any(s["name"] == "pre_update_backup" for s in data["steps"])
         skip = next(s for s in data["skips"] if s["name"] == "pre_update_backup")
         assert "disabled by" in skip["reason"]
@@ -350,7 +350,7 @@ def test_full_mode_still_takes_the_zip_when_the_snapshot_fails(monkeypatch, rece
 
     assert maint._run_pre_update_backup(object()) is None
     assert ran["zip"] is True, "a failed snapshot must not cancel the full backup"
-    step = next(s for s in ur._current.data["steps"] if s["name"] == "pre_update_backup")
+    step = next(s for s in ur._current.get().data["steps"] if s["name"] == "pre_update_backup")
     assert step["ok"] is False and "OSError" in step["detail"]
 
 
@@ -378,7 +378,7 @@ def test_no_sibling_profiles_is_not_a_sibling_failure(
 
     maint._run_quick_snapshots()
 
-    recorded = [s for s in ur._current.data["steps"] if s["name"] == "sibling_profile_snapshots"]
+    recorded = [s for s in ur._current.get().data["steps"] if s["name"] == "sibling_profile_snapshots"]
     assert bool(recorded) is expect_failure_recorded
 
 
@@ -419,3 +419,78 @@ def test_a_real_backup_failure_still_reads_as_a_failure(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Backup failed" in out and "disk full" in out
     assert "no pre-update backup" not in out
+
+
+class TestFullBackupReportsWhyThereIsNoArchive:
+    """`updates.pre_update_backup: full` must say WHY there is no zip, on screen and in the receipt.
+
+    The backup layer swallowed a held slot and a failed write into the same ``None`` as an
+    empty home, so the updater's specific branches never ran: a concurrent backup and a real
+    archive failure both read as "Backup skipped", and the receipt could not tell a missing
+    rollback point from nothing to back up. Driven through the real backup module against a
+    temp home; only the archive boundary is faulted.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, home, capsys):
+        import hermes_cli.update_cmd_maint as maint
+
+        monkeypatch.setattr("hermes_cli.backup.get_default_hermes_root", lambda: home)
+        monkeypatch.setattr(maint, "_load_updates_cfg", lambda: {})
+        ur.begin_update_receipt()
+        maint._run_full_backup()
+        data = ur._current.get().data
+        steps = [s for s in data["steps"] if s["name"] == "pre_update_full_backup"]
+        skips = [s for s in data["skips"] if s["name"] == "pre_update_full_backup"]
+        return capsys.readouterr().out, steps, skips
+
+    def test_held_backup_slot_reads_as_no_rollback_point(self, receipt_home, monkeypatch, capsys):
+        from hermes_cli.backup import _backup_operation_lock
+
+        (receipt_home / "config.yaml").write_text("model: x\n")
+        with _backup_operation_lock(receipt_home):
+            out, steps, skips = self._run(monkeypatch, receipt_home, capsys)
+
+        assert "no pre-update backup" in out
+        assert "Backup skipped" not in out
+        assert not skips
+        assert [s["ok"] for s in steps] == [False]
+        assert "BackupInProgressError" in steps[0]["detail"]
+
+    def test_failed_archive_write_reads_as_a_failure(self, receipt_home, monkeypatch, capsys):
+        import hermes_cli.backup as backup
+
+        def _disk_full(*_a, **_kw):
+            raise OSError("disk full")
+
+        (receipt_home / "config.yaml").write_text("model: x\n")
+        monkeypatch.setattr(backup.zipfile, "ZipFile", _disk_full)
+        out, steps, skips = self._run(monkeypatch, receipt_home, capsys)
+
+        assert "Backup failed" in out and "disk full" in out
+        assert "Backup skipped" not in out
+        assert not skips
+        assert [s["ok"] for s in steps] == [False]
+        assert "OSError: disk full" in steps[0]["detail"]
+
+    def test_unloadable_backup_module_reads_as_a_failure(self, receipt_home, monkeypatch, capsys):
+        import sys
+
+        import hermes_cli.backup  # noqa: F401 — imported so _run can still patch it
+
+        (receipt_home / "config.yaml").write_text("model: x\n")
+        monkeypatch.setitem(sys.modules, "hermes_cli.backup", None)
+        out, steps, skips = self._run(monkeypatch, receipt_home, capsys)
+
+        assert "could not load backup module" in out and "continuing update" in out
+        assert not skips
+        assert [s["ok"] for s in steps] == [False]
+        assert "ModuleNotFoundError" in steps[0]["detail"] and "hermes_cli.backup" in steps[0]["detail"]
+
+    def test_nothing_to_back_up_is_still_a_skip(self, receipt_home, monkeypatch, capsys):
+        out, steps, skips = self._run(monkeypatch, receipt_home, capsys)
+
+        assert "Backup skipped" in out
+        assert "Backup failed" not in out and "no pre-update backup" not in out
+        assert not steps
+        assert len(skips) == 1

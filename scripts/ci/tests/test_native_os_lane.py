@@ -23,9 +23,9 @@ class NativeOsLaneTests(unittest.TestCase):
         env = {'HOME': '/isolated-home'}
         with patch.object(ci.sys, 'platform', 'darwin'), patch.object(ci, 'python', return_value='checkout-python'), patch.object(ci.subprocess, 'check_output', return_value='tests/a.py\ntests/b.py\n') as selector, patch.object(ci, 'python_tests') as tests, patch.object(ci, 'run') as installer:
             ci.native_os(env, 3)
-            self.assertEqual(selector.call_args.args[0], ['checkout-python', 'scripts/ci/list_os_marked_tests.py', 'macos_only'])
+            self.assertEqual(selector.call_args.args[0], ['checkout-python', 'scripts/ci/list_os_marked_tests.py', 'macos'])
             self.assertEqual(selector.call_args.kwargs['env'], env)
-            tests.assert_called_once_with(env, ['tests/a.py', 'tests/b.py'], 3, pytest_args=['-m', 'macos_only and not integration'])
+            tests.assert_called_once_with(env, ['tests/a.py', 'tests/b.py'], 3, pytest_args=['-m', 'platforms and not integration'])
             installer.assert_not_called()
 
     def test_empty_or_failed_selector_never_dispatches_tests(self):
@@ -41,7 +41,7 @@ class NativeOsLaneTests(unittest.TestCase):
         with patch.object(ci.sys, 'platform', 'win32'), patch.object(ci, 'python', return_value='checkout-python'), patch.object(ci.subprocess, 'check_output', return_value='tests/windows.py\n'), patch.object(ci, 'python_tests', side_effect=RuntimeError('test failure')) as tests, patch.object(ci, 'run') as installer:
             with self.assertRaisesRegex(RuntimeError, 'Native OS checks failed'):
                 ci.native_os(env, 2)
-            tests.assert_called_once_with(env, ['tests/windows.py'], 2, pytest_args=['-m', 'windows_only and not integration'])
+            tests.assert_called_once_with(env, ['tests/windows.py'], 2, pytest_args=['-m', 'platforms and not integration'])
             calls = [call.args[0] for call in installer.call_args_list]
             self.assertEqual(len(calls), 6)
             for shell in ('powershell', 'pwsh'):

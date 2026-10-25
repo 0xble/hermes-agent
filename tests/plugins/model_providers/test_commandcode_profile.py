@@ -24,7 +24,7 @@ import pytest
 @pytest.fixture
 def commandcode_profile():
     """Resolve the registered CommandCode (chat_completions) profile."""
-    import model_tools  # noqa: F401 — triggers discovery
+    import model_tools
     import providers
 
     profile = providers.get_provider_profile("commandcode")
@@ -35,7 +35,7 @@ def commandcode_profile():
 @pytest.fixture
 def commandcode_anthropic_profile():
     """Resolve the registered CommandCode Anthropic profile."""
-    import model_tools  # noqa: F401 — triggers discovery
+    import model_tools
     import providers
 
     profile = providers.get_provider_profile("commandcode-anthropic")
@@ -158,6 +158,29 @@ class TestCommandCodeFetchModelsPickerContract:
         anth = resolve_provider_full("commandcode-anthropic", {}, [])
         assert anth is not None and anth.id == "commandcode-anthropic"
         assert anth.transport == "anthropic_messages"
+
+    def test_models_dev_catalog_key_keeps_commandcode_alias(self, monkeypatch):
+        """A catalog hit must retain both the catalog and plugin credential names."""
+        from agent.models_dev import ProviderInfo
+        from hermes_cli import providers as provider_module
+
+        monkeypatch.setattr(
+            provider_module,
+            "_models_dev_info",
+            lambda canonical, allow_network=True: ProviderInfo(
+                id=canonical,
+                name="CommandCode",
+                env=("CMD_API_KEY",),
+                api="https://api.commandcode.ai/provider/v1",
+            ),
+        )
+
+        resolved = provider_module.get_provider("commandcode", allow_network=False)
+
+        assert resolved is not None
+        assert resolved.api_key_env_vars == ("CMD_API_KEY", "COMMANDCODE_API_KEY")
+        assert resolved.base_url == "https://api.commandcode.ai/provider/v1"
+        assert resolved.base_url_env_var == "COMMANDCODE_BASE_URL"
 
 
 # ── base_url endpoint override ───────────────────────────────────────────────

@@ -46,9 +46,8 @@ def _write_receipt(home: Path, proc: str, **fields) -> None:
     (directory / f"{proc}.json").write_text(json.dumps({"id": proc, **fields}), encoding="utf-8")
 
 
-def test_restart_killed_process_lifts_barrier_with_a_factual_note(hermes_home):
-    """The live case: parked on a process a restart's kill_all killed. The previous gateway's
-    registry is gone, so only the durable receipt knows what happened."""
+def test_kill_all_process_lifts_barrier_with_an_outcome_only_note(hermes_home):
+    """A legacy kill_all receipt proves an incomplete result, not who stopped it."""
     proc = "proc_d2196a6c1051"
     _write_receipt(hermes_home, proc, exit_code=-15, completion_reason="killed", termination_source="kill_all")
     mgr = _park_on_session("s-killed", proc)
@@ -56,10 +55,24 @@ def test_restart_killed_process_lifts_barrier_with_a_factual_note(hermes_home):
     prompt = mgr.lifted_barrier_prompt()
 
     assert prompt is not None and "ship the nightly check" in prompt
-    assert f"{proc} was killed by a gateway restart or shutdown" in prompt
+    assert f"{proc} stopped before it finished (exit -15)" in prompt
+    for cause in ("gateway_shutdown", "shutdown", "restart", "gateway"):
+        assert cause not in prompt.lower()
     assert "verify the real state" in prompt
     # Pure: the barrier stays until the caller's continuation was admitted.
     assert goals.load_goal("s-killed").waiting_on_session == proc
+
+
+def test_cut_pending_receipt_lifts_goal_as_unknown_not_finished(hermes_home):
+    proc = "proc_cutpending0000"
+    _write_receipt(hermes_home, proc, exit_code=None, completion_reason="cut_pending")
+    mgr = _park_on_session("s-cut-pending", proc)
+
+    prompt = mgr.lifted_barrier_prompt()
+
+    assert prompt is not None
+    assert "no longer tracked" in prompt
+    assert "finished" not in prompt
 
 
 def test_untracked_process_reports_unknown_outcome(hermes_home):
@@ -67,6 +80,9 @@ def test_untracked_process_reports_unknown_outcome(hermes_home):
     prompt = mgr.lifted_barrier_prompt()
     assert prompt is not None
     assert "no longer tracked" in prompt and "do not assume it succeeded" in prompt
+    assert "output or artifacts" in prompt and "before rerunning" in prompt
+    for cause in ("gateway_shutdown", "shutdown", "restart", "gateway"):
+        assert cause not in prompt.lower()
 
 
 def test_barrier_that_still_holds_yields_no_prompt(hermes_home, monkeypatch):
@@ -75,14 +91,77 @@ def test_barrier_that_still_holds_yields_no_prompt(hermes_home, monkeypatch):
     assert mgr.lifted_barrier_prompt() is None
 
 
-def test_age_cap_lifts_a_still_running_wait(hermes_home, monkeypatch):
-    mgr = _park_on_session("s-cap", "proc_slow0000000")
-    monkeypatch.setattr(goals, "_session_waiting", lambda sid: True)
-    mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 5
-    mgr._save()
-    monkeypatch.setattr(goals, "_process_outcome", lambda sid: {"running": True})
-    prompt = mgr.lifted_barrier_prompt()
-    assert prompt is not None and "still running" in prompt
+def test_live_async_delegation_keeps_goal_wait(hermes_home, monkeypatch):
+    """An in-flight async delegation is not an untracked process and must not lift its goal wait."""
+    from tools import async_delegation
+
+    delegation_id = "deleg_live0000"
+    record = {"delegation_id": delegation_id, "status": "running"}
+    with async_delegation._records_lock:
+        previous = async_delegation._records.get(delegation_id)
+        async_delegation._records[delegation_id] = record
+    try:
+        mgr = _park_on_session("s-delegation-live", delegation_id)
+        assert mgr.is_waiting()
+        assert mgr.lifted_barrier_prompt() is None
+
+        # Finalization publishes the event before the in-memory row becomes terminal. The durable
+        # pending delivery must keep the barrier in place during that race as well.
+        record["status"] = "completed"
+        monkeypatch.setattr(
+            async_delegation, "get_durable_delegation",
+            lambda _id: {"state": "completed", "delivery_state": "pending"},
+        )
+        assert mgr.is_waiting()
+        assert mgr.lifted_barrier_prompt() is None
+    finally:
+        with async_delegation._records_lock:
+            if previous is None:
+                async_delegation._records.pop(delegation_id, None)
+            else:
+                async_delegation._records[delegation_id] = previous
+
+
+def test_restart_recovered_pending_async_completion_keeps_goal_wait(hermes_home, monkeypatch):
+    """A durable completion still blocks after restart, when the in-memory delegation roster is empty."""
+    from tools import async_delegation
+
+    delegation_id = "deleg_restart_pending"
+    monkeypatch.setattr(
+        async_delegation, "get_durable_delegation",
+        lambda _id: {"state": "completed", "delivery_state": "pending"},
+    )
+    with async_delegation._records_lock:
+        previous = async_delegation._records.pop(delegation_id, None)
+    try:
+        mgr = _park_on_session("s-delegation-restart", delegation_id)
+        assert mgr.is_waiting()
+        assert mgr.lifted_barrier_prompt() is None
+    finally:
+        if previous is not None:
+            with async_delegation._records_lock:
+                async_delegation._records[delegation_id] = previous
+
+
+def test_terminal_async_delegation_without_pending_completion_lifts_goal_wait(hermes_home, monkeypatch):
+    """A delivered terminal delegation must not leave the goal parked forever."""
+    from tools import async_delegation
+
+    delegation_id = "deleg_terminal_delivered"
+    monkeypatch.setattr(
+        async_delegation, "get_durable_delegation",
+        lambda _id: {"state": "completed", "delivery_state": "delivered"},
+    )
+    with async_delegation._records_lock:
+        previous = async_delegation._records.pop(delegation_id, None)
+    try:
+        mgr = _park_on_session("s-delegation-delivered", delegation_id)
+        assert not mgr.is_waiting()
+        assert mgr.lifted_barrier_prompt() is not None
+    finally:
+        if previous is not None:
+            with async_delegation._records_lock:
+                async_delegation._records[delegation_id] = previous
 
 
 def test_elapsed_timed_wait_lifts_without_a_note(hermes_home):
@@ -153,6 +232,121 @@ def test_clear_lifted_wait_respects_a_newer_repark_or_pause(hermes_home, monkeyp
     assert goals.load_goal("s-race").status == "paused"
 
 
+def test_finished_session_at_wait_time_falls_back_to_automatic_floor(hermes_home, monkeypatch):
+    """A stale session target is not a fresh event wake."""
+    proc = "proc_already_finished"
+    _write_receipt(hermes_home, proc, exit_code=1, completion_reason="exited", termination_source="")
+    clock = [10_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = _park_on_session("s-stale-floor", proc)
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = clock[0]
+    mgr._save()
+
+    assert mgr.lifted_barrier_prompt() is None
+    clock[0] += 900
+    assert mgr.lifted_barrier_prompt() is not None
+
+
+def test_dead_pid_judge_wait_falls_back_to_automatic_floor(hermes_home, monkeypatch):
+    """A dead PID named by WAIT is stale state, not an immediate event wake."""
+    clock = [30_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    monkeypatch.setattr(goals, "_pid_alive", lambda _pid: False)
+    mgr = goals.GoalManager("s-dead-pid")
+    mgr.set("ship the nightly check")
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = clock[0]
+    mgr._save()
+
+    decision = mgr._apply_wait_directive(
+        {"pid": 4242}, "nightly verification running", automatic=True, min_seconds=900,
+    )
+
+    assert decision is not None and decision["verdict"] == "wait"
+    assert mgr.state is not None and mgr.state.waiting_until == clock[0] + 900
+    assert mgr.lifted_barrier_prompt() is None
+    clock[0] += 900
+    assert mgr.lifted_barrier_prompt() is not None
+
+
+def test_live_pid_finishing_after_wait_time_still_lifts_immediately(hermes_home, monkeypatch):
+    """A PID live when parked remains an immediate event wake when it exits later."""
+    live = [True]
+    monkeypatch.setattr(goals, "_pid_alive", lambda _pid: live[0])
+    mgr = goals.GoalManager("s-live-pid-then-exit")
+    mgr.set("ship the nightly check")
+    mgr.wait_on(4242, reason="nightly verification running")
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = time.time()
+    mgr._save()
+    live[0] = False
+
+    assert mgr.state.waiting_on_pid_live_at_park is True
+    assert mgr.lifted_barrier_prompt() is not None
+
+
+def test_legacy_session_wait_without_liveness_uses_automatic_floor(hermes_home, monkeypatch):
+    """Rows written before the liveness marker existed fail closed to the automatic floor."""
+    proc = "proc_legacy_finished"
+    _write_receipt(hermes_home, proc, exit_code=1, completion_reason="exited", termination_source="")
+    clock = [40_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = _park_on_session("s-legacy-floor", proc)
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = clock[0]
+    mgr._save()
+
+    db = goals._get_session_db()
+    assert db is not None
+    raw = db.get_meta(goals._meta_key("s-legacy-floor"))
+    payload = json.loads(raw)
+    payload.pop("waiting_on_session_live_at_park", None)
+    db.set_meta(goals._meta_key("s-legacy-floor"), json.dumps(payload))
+    reloaded = goals.GoalManager("s-legacy-floor")
+
+    assert reloaded.state is not None and reloaded.state.waiting_on_session_live_at_park is None
+    assert reloaded.lifted_barrier_prompt() is None
+    clock[0] += 900
+    assert reloaded.lifted_barrier_prompt() is not None
+
+
+def test_session_finishing_after_wait_time_still_lifts_immediately(hermes_home, monkeypatch):
+    """A live target that exits after parking remains an immediate event wake."""
+    live = [True]
+    monkeypatch.setattr(goals, "_session_waiting", lambda _session_id: live[0])
+    mgr = _park_on_session("s-live-then-exit", "proc_live_then_exit")
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = time.time()
+    mgr._save()
+    live[0] = False
+
+    assert mgr.lifted_barrier_prompt() is not None
+
+
+def test_reparking_on_same_finished_session_does_not_loop(hermes_home, monkeypatch):
+    """Re-parking on a finished target stays under the automatic floor."""
+    proc = "proc_repeatedly_finished"
+    _write_receipt(hermes_home, proc, exit_code=1, completion_reason="exited", termination_source="")
+    clock = [20_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = _park_on_session("s-repeated-stale", proc)
+    assert mgr.state is not None
+    mgr.state.last_automatic_continuation_at = clock[0]
+    mgr._save()
+
+    assert mgr.lifted_barrier_prompt() is None
+    clock[0] += 900
+    assert mgr.state is not None
+    since = mgr.state.waiting_since
+    assert mgr.lifted_barrier_prompt() is not None
+    assert mgr.clear_lifted_wait(since)
+    mgr.mark_automatic_continuation_dispatched(dispatched_at=clock[0])
+    mgr.wait_on_session(proc, reason="same finished target")
+
+    assert mgr.lifted_barrier_prompt() is None
+
+
 def test_competing_writer_cannot_land_inside_the_clear(hermes_home, monkeypatch):
     """Interleave a second writer exactly between the compare and the write: the clear holds the
     SQLite write lock (BEGIN IMMEDIATE), so the competitor is refused and cannot be overwritten."""
@@ -164,7 +358,7 @@ def test_competing_writer_cannot_land_inside_the_clear(hermes_home, monkeypatch)
     outcomes = []
     real_clear = goals.GoalState.clear_wait
 
-    def clear_with_competitor(self):
+    def clear_with_competitor(self, *args, **kwargs):
         other = sqlite3.connect(str(db_path), timeout=0)
         try:
             other.execute("UPDATE state_meta SET value = value WHERE key = ?", (goals._meta_key("s-lock"),))
@@ -174,7 +368,7 @@ def test_competing_writer_cannot_land_inside_the_clear(hermes_home, monkeypatch)
             outcomes.append(str(exc))
         finally:
             other.close()
-        return real_clear(self)
+        return real_clear(self, *args, **kwargs)
 
     monkeypatch.setattr(goals.GoalState, "clear_wait", clear_with_competitor)
     assert mgr.clear_lifted_wait(since) is True

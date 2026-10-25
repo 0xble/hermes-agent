@@ -19,7 +19,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -35,13 +34,11 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
         pass
     return tmp_path
 
-
 @pytest.fixture
 def sessions_dir(tmp_path):
     sdir = tmp_path / "sessions"
     sdir.mkdir(parents=True, exist_ok=True)
     return sdir
-
 
 @pytest.fixture
 def sample_sessions():
@@ -114,12 +111,10 @@ def sample_sessions():
         },
     }
 
-
 @pytest.fixture
 def populated_sessions_dir(sessions_dir, sample_sessions):
     (sessions_dir / "sessions.json").write_text(json.dumps(sample_sessions))
     return sessions_dir
-
 
 def _create_test_db(db_path, session_id, messages):
     """Create a minimal SQLite DB mimicking hermes_state schema."""
@@ -166,7 +161,6 @@ def _create_test_db(db_path, session_id, messages):
     conn.commit()
     conn.close()
 
-
 @pytest.fixture
 def mock_session_db(tmp_path, populated_sessions_dir):
     """Create a real SQLite DB with test messages and wire it up."""
@@ -206,13 +200,11 @@ def mock_session_db(tmp_path, populated_sessions_dir):
 
     return TestSessionDB()
 
-
 class _FakeTool:
     def __init__(self, fn):
         self.name = fn.__name__
         self.description = inspect.getdoc(fn) or ""
         self.fn = fn
-
 
 class _FakeToolManager:
     def __init__(self):
@@ -226,7 +218,6 @@ class _FakeToolManager:
 
     def list_tools(self):
         return list(self._tools.values())
-
 
 class _FakeMCPServer:
     """Stand-in for ``mcp.server.MCPServer`` (``FastMCP`` before mcp 2.0)."""
@@ -252,14 +243,13 @@ class _FakeMCPServer:
         """
         return await self._tool_manager.call_tool(name, args)
 
-
 @pytest.fixture
 def fake_mcp_server(populated_sessions_dir, mock_session_db, monkeypatch):
     import mcp_serve
 
     monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
     monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
-    monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+    monkeypatch.setattr(mcp_serve, "_load_channel_directory", dict)
     monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
     monkeypatch.setattr(mcp_serve, "MCPServer", _FakeMCPServer)
 
@@ -267,12 +257,9 @@ def fake_mcp_server(populated_sessions_dir, mock_session_db, monkeypatch):
     server = mcp_serve.create_mcp_server(event_bridge=bridge)
     return server, bridge
 
-
 # ---------------------------------------------------------------------------
 # 1. UNIT TESTS — helpers, extraction, attachments
 # ---------------------------------------------------------------------------
-
-
 
 class TestHelpers:
     def test_load_session_messages_closes_database_on_error(self, monkeypatch):
@@ -319,7 +306,6 @@ class TestHelpers:
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
         assert mcp_serve._load_sessions_index() == {}
 
-
 class TestContentExtraction:
     def test_text(self):
         from mcp_serve import _extract_message_content
@@ -334,12 +320,18 @@ class TestContentExtraction:
         ]}
         assert _extract_message_content(msg) == "A\nB"
 
+    def test_assistant_copy_blocks_render_inline(self):
+        from mcp_serve import _extract_message_content
+        msg = {"role": "assistant", "content": "hi\n[[copy]]\nprompt\n[[/copy]]"}
+        assert _extract_message_content(msg) == "hi\nprompt\n"
+        user = {"role": "user", "content": "[[copy]]\nliteral\n[[/copy]]"}
+        assert _extract_message_content(user) == user["content"]
+
     def test_empty(self):
         from mcp_serve import _extract_message_content
         assert _extract_message_content({"content": ""}) == ""
         assert _extract_message_content({}) == ""
         assert _extract_message_content({"content": None}) == ""
-
 
 class TestAttachmentExtraction:
     def test_image_url_block(self):
@@ -363,6 +355,12 @@ class TestAttachmentExtraction:
         msg = {"content": "MEDIA: /a.png and MEDIA: /b.mp3"}
         assert len(_extract_attachments(msg)) == 2
 
+    def test_media_line_inside_assistant_copy_block_is_literal_text(self):
+        from mcp_serve import _extract_attachments
+        msg = {"role": "assistant",
+               "content": "MEDIA: /real.png\n[[copy]]\nMEDIA:/paste/literal.txt\n[[/copy]]"}
+        assert _extract_attachments(msg) == [{"type": "media", "path": "/real.png"}]
+
     def test_no_attachments(self):
         from mcp_serve import _extract_attachments
         assert _extract_attachments({"content": "plain text"}) == []
@@ -372,7 +370,6 @@ class TestAttachmentExtraction:
         msg = {"content": [{"type": "image", "url": "http://x.com/p.png"}]}
         att = _extract_attachments(msg)
         assert att[0]["type"] == "image"
-
 
 # ---------------------------------------------------------------------------
 # 2. EVENT BRIDGE TESTS — queue, cursors, waiters, concurrency
@@ -398,8 +395,6 @@ class TestEventBridge:
         r = b.poll_events(after_cursor=3)
         assert len(r["events"]) == 2
         assert r["events"][0]["session_key"] == "s3"
-
-
 
     def test_poll_limit(self):
         from mcp_serve import EventBridge, QueueEvent
@@ -488,7 +483,6 @@ class TestEventBridge:
         r = EventBridge().respond_to_approval("nope", "deny")
         assert "error" in r
 
-
 # ---------------------------------------------------------------------------
 # 3. END-TO-END TESTS — call MCP tools through the MCP server
 # ---------------------------------------------------------------------------
@@ -499,12 +493,11 @@ def mcp_server_e2e(populated_sessions_dir, mock_session_db, monkeypatch, require
     import mcp_serve
     monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
     monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
-    monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+    monkeypatch.setattr(mcp_serve, "_load_channel_directory", dict)
 
     bridge = mcp_serve.EventBridge()
     server = mcp_serve.create_mcp_server(event_bridge=bridge)
     return server, bridge
-
 
 def _run_tool(server, name, args=None):
     """Call an MCP tool through the server's public API and return parsed JSON.
@@ -526,7 +519,6 @@ def _run_tool(server, name, args=None):
     )
     return json.loads(text) if text else result
 
-
 @pytest.fixture
 def _event_loop():
     """Ensure an event loop exists for sync tests calling async tools."""
@@ -534,7 +526,6 @@ def _event_loop():
     asyncio.set_event_loop(loop)
     yield loop
     loop.close()
-
 
 class TestE2EConversationsList:
     def test_list_all(self, mcp_server_e2e, _event_loop):
@@ -580,7 +571,6 @@ class TestE2EConversationsList:
         result = _run_tool(server, "conversations_list", {"limit": 2})
         assert result["count"] == 2
 
-
 class TestE2EConversationGet:
     def test_get_existing(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e
@@ -596,7 +586,6 @@ class TestE2EConversationGet:
         result = _run_tool(server, "conversation_get",
                           {"session_key": "nonexistent:key"})
         assert "error" in result
-
 
 class TestE2EMessagesRead:
     def test_read_messages(self, mcp_server_e2e, _event_loop):
@@ -639,7 +628,6 @@ class TestE2EMessagesRead:
                           {"session_key": "nonexistent:key"})
         assert "error" in result
 
-
 class TestE2EAttachmentsFetch:
     def test_fetch_media_from_message(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e
@@ -678,10 +666,9 @@ class TestE2EAttachmentsFetch:
         })
         assert "error" in result
 
-
 class TestE2EEventsPoll:
     def test_poll_empty(self, mcp_server_e2e, _event_loop):
-        server, bridge = mcp_server_e2e
+        server, _bridge = mcp_server_e2e
         result = _run_tool(server, "events_poll")
         assert result["events"] == []
         assert result["next_cursor"] == 0
@@ -729,7 +716,6 @@ class TestE2EEventsPoll:
                           {"session_key": "b"})
         assert len(result["events"]) == 1
 
-
 class TestE2EEventsWait:
     def test_wait_timeout(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e
@@ -746,7 +732,6 @@ class TestE2EEventsWait:
         result = _run_tool(server, "events_wait", {"timeout_ms": 100})
         assert result["event"] is not None
         assert result["event"]["content"] == "waiting for this"
-
 
 class TestMCPToolParameterCoercion:
     def test_conversations_list_coerces_string_limit(self, fake_mcp_server, _event_loop):
@@ -791,14 +776,11 @@ class TestMCPToolParameterCoercion:
         assert result["event"] is not None
         assert result["event"]["content"] == "waiting for this"
 
-
 class TestE2EMessagesSend:
     def test_send_missing_args(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e
         result = _run_tool(server, "messages_send", {"target": "", "message": "hi"})
         assert "error" in result
-
-
 
 class TestE2EChannelsList:
     def test_channels_from_sessions(self, mcp_server_e2e, _event_loop):
@@ -857,7 +839,6 @@ class TestE2EChannelsList:
         assert result["count"] == 1
         assert result["channels"][0]["target"] == "discord:789"
 
-
 class TestE2EPermissions:
     def test_list_empty(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e
@@ -908,7 +889,6 @@ class TestE2EPermissions:
                           {"id": "nope", "decision": "deny"})
         assert "error" in result
 
-
 # ---------------------------------------------------------------------------
 # 4. TOOL LISTING — verify all 10 tools are registered
 # ---------------------------------------------------------------------------
@@ -920,20 +900,17 @@ class TestToolRegistration:
         for tool in server._tool_manager.list_tools():
             assert tool.description, f"Tool {tool.name} has no description"
 
-
 # ---------------------------------------------------------------------------
 # 5. SERVER LIFECYCLE / CLI INTEGRATION
 # ---------------------------------------------------------------------------
 
 class TestServerCreation:
 
-
     def test_create_without_mcp_sdk(self, monkeypatch):
         import mcp_serve
         monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", False)
         with pytest.raises(ImportError, match="MCP server requires"):
             mcp_serve.create_mcp_server()
-
 
 class TestRunMcpServer:
     def test_run_without_mcp_exits(self, monkeypatch):
@@ -943,9 +920,7 @@ class TestRunMcpServer:
             mcp_serve.run_mcp_server()
         assert exc_info.value.code == 1
 
-
 class TestCliIntegration:
-
 
     def test_dispatcher_routes_serve(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -957,7 +932,6 @@ class TestCliIntegration:
         from hermes_cli.mcp_config import mcp_command
         mcp_command(args)
         mock_run.assert_called_once_with(verbose=True)
-
 
 # ---------------------------------------------------------------------------
 # 6. EDGE CASES
@@ -977,9 +951,6 @@ class TestEdgeCases:
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
         entries = mcp_serve._load_sessions_index()
         assert entries["agent:main:telegram:dm:111"]["platform"] == "telegram"
-
-
-
 
 # ---------------------------------------------------------------------------
 # 7. EVENT BRIDGE POLL LOOP E2E — real SQLite DB, mtime optimization
@@ -1149,11 +1120,9 @@ class TestEventBridgePollE2E:
         )
         conn.commit()
         conn.close()
-        # Explicitly advance the file clock: touching "now" can share the
-        # baseline's filesystem timestamp slot (#89921).
-        next_mtime = db_path.stat().st_mtime + 2.0
-        os.utime(db_path, (next_mtime, next_mtime))
-        assert db_path.stat().st_mtime != bridge._state_db_mtime
+        # Touch the DB file to update mtime (WAL mode may not update mtime on small writes)
+        before = db_path.stat()
+        os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
 
         # Update sessions.json updated_at to trigger re-check
         sessions_data["agent:main:telegram:dm:new"]["updated_at"] = "2026-03-29T15:00:10"
@@ -1268,10 +1237,8 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        # The fake DB change must advance its real file clock, even when the
-        # entire test runs within one filesystem timestamp slot (#89921).
-        next_mtime = db_path.stat().st_mtime + 2.0
-        os.utime(db_path, (next_mtime, next_mtime))
+        before = db_path.stat()
+        os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
         assert db_path.stat().st_mtime != bridge._state_db_mtime
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
@@ -1310,8 +1277,8 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        next_mtime = db_path.stat().st_mtime + 2.0
-        os.utime(db_path, (next_mtime, next_mtime))
+        before = db_path.stat()
+        os.utime(db_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
         assert db_path.stat().st_mtime != bridge._state_db_mtime
         bridge._poll_once(DB())
 
@@ -1319,4 +1286,3 @@ class TestEventBridgePollE2E:
         assert len(events) == 1
         assert events[0]["session_key"] == "agent:main:telegram:dm:fresh"
         assert events[0]["content"] == "hello after baseline"
-
