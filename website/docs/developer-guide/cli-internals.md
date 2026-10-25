@@ -126,10 +126,15 @@ The merge does not need a push or a published synthetic branch. In partial
 clones both sides are prefetched outside checkout-lock custody before merging.
 
 Selection unwraps our carry merges to the actual candidate instead of merging
-synthetic history back into main. An ancestor candidate, or a squash-equivalent
-candidate whose merge tree equals the target tree, needs no carry. Updates then
-return to the bare published target. An unchanged combined tree reuses the live
-release without creating another commit or retention ref.
+synthetic history back into main. An ancestor candidate needs no carry. Otherwise,
+selection requires positive unlanded evidence against both the fetched target and
+`origin/main`: every candidate commit must be unmatched by `git cherry`, and the
+combined merge-base-to-candidate patch must not match a historical patch by stable
+patch ID. A historical match returns the bare published target even if later main
+commits revert, delete or supersede the landed content. Unknown history refuses
+the update. A merge tree equal to the target is only a content no-op, not proof
+that a candidate never landed. An unchanged combined tree reuses the live release
+without creating another commit or retention ref.
 
 Install stamps retain the original source branch across carries. Older releases
 can recover it from their update receipt's argv and exact release transition,
