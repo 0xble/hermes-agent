@@ -51,12 +51,35 @@ def test_the_cache_expires_so_another_process_install_is_seen(tmp_path, monkeypa
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
     calls = _counting_compositions(monkeypatch)
     now = [1000.0]
-    monkeypatch.setattr("time.monotonic", lambda: now[0])
+    monkeypatch.setattr(pm.install, "_clock", lambda: now[0])
 
     pm.install.cached_store_path_dirs()
     now[0] += pm.install._STORE_PATH_DIRS_TTL_S
     pm.install.cached_store_path_dirs()
     assert len(calls) == 2
+
+
+def test_another_process_install_shows_on_the_next_command(tmp_path, monkeypatch):
+    """An agent's ``hermes pm install X`` runs in a child process; its next command must find X."""
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(runtime))
+    calls = _counting_compositions(monkeypatch)
+
+    pm.install.cached_store_path_dirs()
+    runtime.mkdir(parents=True, exist_ok=True)
+    (runtime / "facts.json").write_text('{"schema": 1, "packages": {}}\n')  # not a PM write here
+    pm.install.cached_store_path_dirs()
+    assert len(calls) == 2
+
+
+def test_terminal_run_envs_share_one_composition(tmp_path, monkeypatch):
+    from tools.environments.local import _user_tools_first
+
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
+    calls = _counting_compositions(monkeypatch)
+
+    assert _user_tools_first("/usr/bin") == _user_tools_first("/usr/bin")
+    assert len(calls) == 1
 
 
 def test_callers_cannot_mutate_the_cached_list(tmp_path, monkeypatch):
