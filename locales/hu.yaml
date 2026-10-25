@@ -42,6 +42,17 @@ approval:
     second_one: "{count} másodperc"
     second_other: "{count} másodperc"
 gateway:
+  attend:
+    usage: "Használat: /attend [duration], /attend off vagy /attend status. Az időtartam legyen pozitív, pl. 30m, 2h, 1h30m vagy 1d. Időtartam nélkül a rögzítés állandó."
+    disabled: "Az aktív használathoz tartozó útválasztás nincs beállítva. Először állítsd be a model.attended értékét."
+    pinned: "Az aktív használat modellje állandóan rögzítve ({model}). A /attend off feloldja. A kifejezett /model-választások továbbra is elsőbbséget élveznek."
+    pinned_timed: "Az aktív használat modellje rögzítve ({model}) {duration} időtartamra, eddig: {until}. A /attend off feloldja. A kifejezett /model-választások továbbra is elsőbbséget élveznek."
+    released: "Az aktív használat modelljének rögzítése feloldva. A {minutes} perces tétlenségi időzítő most indul."
+    status_pinned: "Aktív használat: modell állandóan rögzítve. Jelenlegi útvonal: {model}."
+    status_timed: "Aktív használat: modell még {remaining} időtartamig rögzítve, eddig: {until}. Jelenlegi útvonal: {model}."
+    status_unpinned: "Aktív használat: modell nincs rögzítve. Jelenlegi útvonal: {model}."
+    session_changed: "A munkamenet megváltozott. Futtasd újra a /attend parancsot."
+    configured_model: "beállított útvonal"
   approval_expired: "⚠️ A jóváhagyás lejárt (az ügynök már nem vár). Kérd meg az ügynököt, hogy próbálja újra."
   draining: "⏳ {count} aktív ügynök befejezésére várunk az újraindítás előtt..."
   goal_cleared: "✓ A cél törölve."
@@ -1492,6 +1503,8 @@ platform:
     prompt_other: "✏️ Egyéb (írd be a választ)"
     prompt_expired: ⌛ Ez a kérdés már nem vár válaszra. Küldd el a válaszodat normál üzenetként.
 slash:
+  attend:
+    description: "Az aktív használat modelljének állandó vagy időzített rögzítése"
   approve:
     description: "Függőben lévő veszélyes parancs jóváhagyása"
   bg:
