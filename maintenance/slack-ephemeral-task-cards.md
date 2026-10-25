@@ -10,6 +10,8 @@ The native "Hermes is working" card is transient progress. While a turn runs it 
 
 `platforms.slack.extra.native_task_cards_ephemeral: false` restores the sealed, persistent card. The default is on.
 
+Adapter discovery must remain available before the optional Slack SDK is installed. Cleanup loads the real SDK exception class only when invoked, without changing stop/delete ordering or error handling.
+
 ## Provenance and adoption
 
 - Fork patch identity: `slack-ephemeral-task-cards`.
@@ -19,5 +21,7 @@ The native "Hermes is working" card is transient progress. While a turn runs it 
 ## Verification and retirement
 
 The behavior contract is `tests/plugins/platforms/slack/test_task_card_cleanup.py`, with the native task-card cases in `tests/gateway/test_slack.py` and `tests/gateway/test_task_card_destination_preflight.py`.
+
+`tests/plugins/platforms/slack/test_optional_sdk.py` covers SDK-absent and incomplete-SDK discovery, passive availability and later lazy binding. `tests/gateway/test_slack_task_card_recovery.py` retains retry behavior and verifies exact stop/delete targets without reply send/edit fallback.
 
 Retire this patch only when upstream offers equivalent end-of-turn removal. Revert the owned files to roll back, or set the config key to `false` without a code change.
