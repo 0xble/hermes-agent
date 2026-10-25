@@ -294,6 +294,7 @@ async def _adopt_predecessor_duties(runner) -> None:
     from tools.process_registry import process_registry
     await asyncio.to_thread(process_registry.recover_from_checkpoint)
     await asyncio.to_thread(runner._recover_secondary_process_checkpoints, process_registry)
+    await runner._start_pending_process_watchers(process_registry)
     from gateway.run import _claim_host_gateway_role, _refresh_host_gateway_record
     try:
         _claim_host_gateway_role()  # on the loop thread, so its SIGTERM cleanup handler installs

@@ -5,6 +5,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -510,13 +511,14 @@ async def test_promoted_slot_adopts_host_role_and_replays_outbox_only_after_pred
     monkeypatch.setattr("tools.process_registry.process_registry.recover_from_checkpoint",
                         lambda: calls.append("processes"))
     runner = SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=True),
-                             _recover_secondary_process_checkpoints=lambda registry: calls.append("profiles"))
+                             _recover_secondary_process_checkpoints=lambda registry: calls.append("profiles"),
+                             _start_pending_process_watchers=AsyncMock(side_effect=lambda _: calls.append("watchers")))
     task = asyncio.create_task(zcs._adopt_predecessor_duties(runner))
     await asyncio.sleep(0.1)
     assert calls == []
     predecessor.close()  # slot a exits
     await asyncio.wait_for(task, 2)
-    assert calls == ["processes", "profiles", "claim", "record", "outbox"]
+    assert calls == ["processes", "profiles", "watchers", "claim", "record", "outbox"]
 
 
 @pytest.mark.asyncio
@@ -531,8 +533,9 @@ async def test_adopt_skips_outbox_replay_when_durable_outbox_is_off(monkeypatch,
                         lambda: calls.append("processes"))
     await zcs._adopt_predecessor_duties(SimpleNamespace(
         config=SimpleNamespace(durable_outbox_enabled=False),
-        _recover_secondary_process_checkpoints=lambda registry: calls.append("profiles")))
-    assert calls == ["processes", "profiles", "claim", "record"]
+        _recover_secondary_process_checkpoints=lambda registry: calls.append("profiles"),
+        _start_pending_process_watchers=AsyncMock(side_effect=lambda _: calls.append("watchers"))))
+    assert calls == ["processes", "profiles", "watchers", "claim", "record"]
 
 
 def test_clients_follow_a_promoted_b_once_a_is_gone(monkeypatch, tmp_path):

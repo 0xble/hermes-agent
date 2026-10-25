@@ -62,6 +62,13 @@ New autonomous work stays suppressed on the predecessor, while existing finite
 work and its delivery may finish without a retirement deadline. This does not
 raise a shutdown or restart drain timeout.
 
+Retirement does not mutate ambiguous sends. A cancelled send can leave a
+`pending` or `attempting` ledger row for existing dead-owner recovery. Such rows
+hold retirement only within the existing `ATTEMPT_ORDER_HOLD_SECONDS` window
+since their last progress, not their creation. Actual tracked sends and adapter
+sessions remain separate owners even after that window. Failed rows parked
+outside the runtime retry budget likewise remain intact for recovery.
+
 A session whose turn is still owned by the predecessor queues normal follow-ups
 on the successor. `/approve`, `/deny`, and `/stop` use the owning session marker
 to reach the original runner instead of joining that blocked FIFO. Telegram
@@ -76,6 +83,13 @@ owner, and completion replay excludes live owners. After the predecessor exits,
 the successor may claim its host role and recover durable outbox work through
 the existing recovery paths. No new coordinator database or turn-replay scheme
 is introduced.
+
+File-backed persistent and restart-surviving commands transfer through the
+existing checkpoint. Late recovery arms their completion watchers immediately,
+using the same detached descriptor drain as startup and post-turn wiring. A
+foreground turn is not required. Non-file-backed persistent commands, including
+PTY and sandbox pipe-backed jobs, cannot transfer durable I/O and still hold
+retirement. They are not killed or silently excluded to force a handover.
 
 Normal update/restart may return once the successor is promoted, without waiting
 for predecessor retirement. This avoids deadlocking an updater that is itself

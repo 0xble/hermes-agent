@@ -44,6 +44,38 @@ def test_retirement_counts_only_runtime_settleable_deliveries(monkeypatch, tmp_p
             state, attempts, "original reply")
 
 
+@pytest.mark.parametrize("state", ["pending", "attempting"])
+def test_orphaned_inflight_delivery_does_not_hold_retirement(monkeypatch, tmp_path, state):
+    now = time.time()
+    monkeypatch.setattr(ledger, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(ledger.time, "time", lambda: now)
+    monkeypatch.setattr(process_module, "process_registry", ProcessRegistry())
+    monkeypatch.setattr(async_delegation, "owned_pending_count", lambda: 0)
+    monkeypatch.setattr("tools.approval.pending_gateway_approval_count", lambda: 0)
+    ledger.record_obligation(obligation_id="reply", session_key="telegram:test", platform="telegram",
+                             chat_id="test", thread_id=None, content="original reply")
+    if state == "attempting":
+        ledger.mark_attempting("reply")
+    # A retry can start long after creation. Last progress, not creation age,
+    # bounds the in-flight hold, and retirement must not mutate ambiguous sends.
+    with ledger._transaction() as conn:
+        conn.execute("UPDATE delivery_obligations SET created_at=?", (now - ledger.STALE_AFTER_SECONDS - 1,))
+        original = conn.execute("SELECT * FROM delivery_obligations").fetchall()
+    runner = SimpleNamespace(_running_agent_count=lambda: 0, adapters={},
+                             _zero_cut_handover_state={"token_lock_released": True})
+    assert drain._owned_work(runner) == 1
+    assert drain._status(runner)["idle"] is False
+    now += ledger.ATTEMPT_ORDER_HOLD_SECONDS
+    assert drain._owned_work(runner) == 0, "An orphaned in-flight row must not retain its live owner forever"
+    assert drain._status(runner)["idle"] is True
+    # A genuinely active final send still owns the predecessor after this age.
+    runner.adapters = {"telegram": SimpleNamespace(platform="telegram", _active_sessions={"telegram:test": object()})}
+    assert drain._status(runner)["idle"] is False
+    runner.adapters.clear()
+    with ledger._transaction() as conn:
+        assert conn.execute("SELECT * FROM delivery_obligations").fetchall() == original
+
+
 @pytest.mark.parametrize("persistent,survivor,file_backed,expected", [
     (False, False, False, 1),
     (True, False, True, 0),
