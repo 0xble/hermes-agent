@@ -980,6 +980,45 @@ def test_prepare_venv_identical_lock_still_builds_in_place(tmp_path, monkeypatch
     assert called == [new]
 
 
+def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path, monkeypatch):
+    """An extra installed into the active release survives the next release build.
+
+    The migration-bound source interpreter never sees `hermes pm install --extra` or a lazy
+    install; only the active release's committed PM environment does. Building from the source
+    interpreter alone dropped Slack on every update.
+    """
+    from pm.environments import install_state_dir, runtime_facts_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    pyproject = ("[project]\nname='hermes-agent'\nversion='0.1.0'\n[project.optional-dependencies]\n"
+                 "slack=['slack-bolt==1.30.0']\ntelegram=['python-telegram-bot==22.8']\n")
+    previous, new = tmp_path / "releases" / "previous", tmp_path / "releases" / "new"
+    for release in (previous, new):
+        release.mkdir(parents=True)
+        (release / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    environment = install_state_dir(previous) / "environments" / "generation" / "venv"
+    (environment / "bin").mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("", encoding="utf-8")
+    (environment / "bin" / "python").symlink_to(sys.executable)
+    facts = runtime_facts_path(previous)
+    facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(environment), "extras": ["slack", "telegram"]}}}), encoding="utf-8")
+
+    def distributions(python):
+        installed = {"python-telegram-bot": "22.8"}
+        if Path(python).parent.parent == environment.resolve():
+            installed["slack-bolt"] = "1.30.0"
+        return installed
+
+    monkeypatch.setattr(releases, "_active_distributions", distributions)
+    monkeypatch.setattr(releases, "restore_active_distributions", lambda *args, **kwargs: None)
+    built = []
+    monkeypatch.setattr(releases, "_build_venv",
+                        lambda release, uv="uv", extras=(), python=None: built.append(list(extras)))
+    releases.prepare_venv(new, previous, source=tmp_path / "source", source_python=Path(sys.executable))
+    assert built == [["slack", "telegram"]]
+
+
 def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
     home = tmp_path / "profile"
     release_paths = [home / "releases" / str(i) for i in range(9)]
