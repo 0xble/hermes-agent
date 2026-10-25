@@ -766,6 +766,11 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   renamed lobby helper, with all opening-turn assertions unchanged.
   Guards: attended opening (12 passed), messaging slash FIFO (22), native arrival order (10),
   steer overwrite (2), busy anchors (13), and turn leases (12), via the canonical runner.
+- The cron isolation fixture disables optional diagnostic audits on its synthetic repository before
+  checking maintenance eligibility. Upstream's audit hook otherwise starts unrelated work while
+  the fixture is proving that maintenance uses an isolated worktree. The real subprocess and
+  maintenance assertions remain unchanged. Guard: `test_worktree_maintenance_isolation.py`
+  passed in the canonical runner (`r5-fixtures.log`, 1 passed).
 - Retire once the next release sync no longer carries these merge points.
 
 ## v0.21.6 merge integration
