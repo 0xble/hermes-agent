@@ -32,7 +32,7 @@ def make_runner(monkeypatch, *, failure_method, error):
         if method == failure_method and not failed:
             failed = True
             raise error
-        return {"ts": "stream-1", "ok": True}
+        return {"ts": "task-stream-1", "ok": True}
 
     client = SimpleNamespace(api_call=AsyncMock(side_effect=api_call))
     adapter._app = object()
@@ -40,7 +40,7 @@ def make_runner(monkeypatch, *, failure_method, error):
     adapter.send = AsyncMock()
     adapter.edit_message = AsyncMock()
     ctx = SimpleNamespace(
-        source=SimpleNamespace(chat_id="D1"), _progress_reply_to="100.1",
+        source=SimpleNamespace(chat_id="C1"), _progress_reply_to="100.1",
         _progress_metadata={"thread_id": "100.1"}, _cleanup_progress=False,
         tool_progress_enabled=False,
     )
@@ -72,7 +72,7 @@ async def test_timeout_preserves_native_lane_and_recovers(monkeypatch, caplog, f
     starts = [c for c in calls if c.args[0] == "chat.startStream"]
     assert len(starts) == (2 if failure_method == "chat.startStream" else 1)
     assert calls[-1].args == ("chat.appendStream",)
-    assert calls[-1].kwargs["json"]["ts"] == "stream-1"
+    assert calls[-1].kwargs["json"]["ts"] == "task-stream-1"
     task = calls[-1].kwargs["json"]["chunks"][-1]
     assert task["id"] == "call-1"
     assert task["status"] == "complete"
@@ -193,6 +193,11 @@ async def test_idle_consumer_retries_latest_projection_without_new_events(monkey
     task = asyncio.create_task(runner._send_native_task_card_progress(state.adapter))
     await asyncio.wait_for(task, timeout=2)
     assert [c.args[0] for c in client.api_call.await_args_list] == [
-        "chat.startStream", "chat.appendStream", "chat.appendStream", "chat.stopStream",
+        "chat.startStream", "chat.appendStream", "chat.appendStream", "chat.stopStream", "chat.delete",
+    ]
+    assert [c.kwargs["json"] for c in client.api_call.await_args_list[-2:]] == [
+        {"channel": "C1", "ts": "task-stream-1"},
+        {"channel": "C1", "ts": "task-stream-1"},
     ]
     state.adapter.send.assert_not_awaited()
+    state.adapter.edit_message.assert_not_awaited()
