@@ -11,6 +11,8 @@ reaches ``_run_agent`` is byte-identical on all three turns.
 
 from __future__ import annotations
 
+import sys
+import types
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -442,3 +444,123 @@ async def test_internal_event_never_reuses_prompt_pin_from_another_privacy_polic
 
     assert calls[0]["context_prompt"] != "UNREDACTED CONTEXT"
     assert calls[0]["channel_prompt"] == "Channel hint."
+
+
+# ---------------------------------------------------------------------------
+# #131294 — a channel_overrides model is the session's CONFIGURED model, not a
+# fallback.  The post-turn ``_run_agent_evict_on_fallback`` check baselined
+# against the global model only, so every successful turn in an overridden chat
+# evicted the cached agent (and cleared its ephemeral pin).  These drive the
+# REAL ``_run_agent`` / ``TurnRunner.run_sync`` path (only the AIAgent class and
+# config reads are substituted), not the ``_capture`` stub above.
+# ---------------------------------------------------------------------------
+
+_WELCOME = "https://welcome-api.nousresearch.com/v1"
+
+
+class _TurnAgent:
+    """AIAgent stand-in: keeps the resolved route, answers without an API call."""
+
+    instances = 0
+
+    def __init__(self, *args, **kwargs):
+        type(self).instances += 1
+        self.model = kwargs.get("model")
+        self.provider = kwargs.get("provider")
+        self.base_url = kwargs.get("base_url")
+        self.session_id = kwargs.get("session_id")
+        self.tools = []
+        self.request_overrides = dict(kwargs.get("request_overrides") or {})
+        # Mirror AIAgent.__init__: the welcome host pins its one model, and the primary
+        # route is snapshotted for the post-turn fallback classifier.
+        from hermes_cli.anon_auth import pin_model_for_route
+        self.model = pin_model_for_route(self.provider, self.base_url, self.model)
+        self._primary_runtime = {"model": self.model, "provider": self.provider, "base_url": self.base_url}
+
+    def run_conversation(self, user_message, conversation_history=None, task_id=None, **kwargs):
+        return {
+            "final_response": "ok",
+            "messages": (conversation_history or []) + [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": "ok"},
+            ],
+            "api_calls": 1,
+        }
+
+
+@pytest.mark.parametrize(
+    "runtime, global_model, expected_model",
+    [
+        ({"api_key": "fake", "provider": "openrouter"}, "default/model", "chan/model"),
+        ({"api_key": "fake", "provider": "nous", "base_url": _WELCOME}, "nous/welcome", "nous/welcome"),
+    ],
+    ids=["named-channel-model", "welcome-host-pins-over-channel-model"],
+)
+@pytest.mark.asyncio
+async def test_channel_override_turns_keep_one_cached_agent_and_the_pin(
+    monkeypatch, runtime, global_model, expected_model,
+):
+    import gateway.run as gr
+
+    config = GatewayConfig()
+    config.platforms[Platform.DISCORD] = PlatformConfig(
+        enabled=True, channel_overrides={_ORIGIN["chat_id"]: ChannelOverride(model="chan/model")},
+    )
+    monkeypatch.setattr(gr, "_load_gateway_config", lambda: {"model": {"default": global_model}})
+    monkeypatch.setattr(gr, "_resolve_gateway_model", lambda config=None: global_model)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _TurnAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    _TurnAgent.instances = 0
+
+    runner = _make_runner(monkeypatch, config)
+    monkeypatch.setattr(gr, "_resolve_runtime_agent_kwargs", lambda: dict(runtime))
+    runner.session_store._entries = {}
+
+    await _drive(runner, ((False, _human_source()), (True, _wake_source()), (False, _human_source())))
+
+    entry = runner._agent_cache.get(KEY)
+    assert entry is not None, "channel-override turn evicted the session's cached agent"
+    assert entry[0].model == expected_model
+    assert _TurnAgent.instances == 1, f"agent rebuilt {_TurnAgent.instances - 1}x across 3 turns"
+    assert runner._peek_session_state(KEY).conversation.ephemeral_pin is not None, "context pin cleared"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", ["sess-wiring", "requester-before-new"], ids=("current", "rebound"))
+async def test_strict_queued_followup_runs_only_in_its_pinned_session(monkeypatch, pinned):
+    """A strict internal event admitted before /new or /resume rebound its key must never reach
+    ``_run_agent`` under another session id from the FIFO follow-up drain."""
+    runner = _make_runner(monkeypatch)
+    calls: list[dict] = []
+    _capture(runner, calls)
+    runner._run_agent_deliver_first_response = AsyncMock()
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="requester outcome")
+    runner._session_key_for_source = lambda source: KEY
+    runner.session_store.lookup_by_session_key.return_value = runner.session_store.get_or_create_session.return_value
+
+    source = _wake_source()
+    adapter = MagicMock()
+    adapter._active_sessions = {}
+    pending_event = MessageEvent(
+        text="requester outcome", source=source, internal=True, allow_gateway_control=False,
+        metadata={
+            "hermes_plugin_id": "session-controls", "hermes_plugin_injection": True,
+            "gateway_session_key": KEY, "gateway_session_id": pinned, "gateway_session_strict": True,
+        },
+    )
+    turn_ctx = TurnContext(
+        source=source, context_prompt="ctx", channel_prompt=None, session_key=KEY,
+        session_id="sess-wiring", run_generation=1, history=[],
+    )
+    result = {"final_response": "done", "messages": []}
+
+    await runner._run_agent_queued_followup(
+        turn_ctx, adapter, "requester outcome", pending_event, "done", result, None
+    )
+
+    if pinned == "sess-wiring":
+        assert [call["session_id"] for call in calls] == ["sess-wiring"]
+    else:
+        assert calls == []

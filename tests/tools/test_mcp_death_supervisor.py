@@ -177,6 +177,7 @@ def test_refuses_to_run_inside_the_parents_own_process_group():
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
 
     assert proc.returncode == 2
@@ -707,6 +708,7 @@ def test_scoped_teardown_of_one_owner_keeps_the_other_owner_supervised(monkeypat
     a = subprocess.Popen(_VICTIM, start_new_session=True)
     b = subprocess.Popen(_VICTIM, start_new_session=True)
     try:
+        _mcp_lifecycle._remember_mcp_processes({a.pid, b.pid})
         pg_a, pg_b = os.getpgid(a.pid), os.getpgid(b.pid)
         with mcp_tool._lock:
             _mcp_lifecycle._stdio_pids[a.pid] = "profile-a"
@@ -730,7 +732,7 @@ def test_scoped_teardown_of_one_owner_keeps_the_other_owner_supervised(monkeypat
             _kill(p.pid)
             try:
                 p.wait(timeout=10)
-            except Exception:  # noqa: BLE001 - best-effort cleanup
+            except Exception:
                 pass
         with mcp_tool._lock:
             for p in (a, b):

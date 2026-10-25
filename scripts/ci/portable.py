@@ -245,19 +245,47 @@ def windows_appdata_environment(home: Path) -> dict[str, str]:
     roaming = home / 'AppData' / 'Roaming'
     local.mkdir(parents=True, exist_ok=True)
     roaming.mkdir(parents=True, exist_ok=True)
+    cache = local / 'Microsoft' / 'Windows' / 'PowerShell' / 'ModuleAnalysisCache'
+    prebuilt = os.environ.get('PSModuleAnalysisCachePath')
+    if prebuilt:
+        source = Path(prebuilt)
+        if source.is_file() and source != cache and not cache.exists():
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, cache)
+            except OSError as error:
+                print(f'portable CI: could not seed PowerShell module-analysis cache: {error}; using cold cache', file=sys.stderr)
     return {
         'LOCALAPPDATA': str(local), 'APPDATA': str(roaming),
         # Windows PowerShell can derive its cache from a missing per-user
         # special folder despite LOCALAPPDATA being set in the process env.
         # Point both powershell.exe and pwsh explicitly outside the checkout.
-        'PSModuleAnalysisCachePath': str(local / 'Microsoft' / 'Windows' / 'PowerShell' / 'ModuleAnalysisCache'),
+        'PSModuleAnalysisCachePath': str(cache),
     }
 
 
+def require_checkout_venv_isolation() -> None:
+    venv = ROOT / '.venv'
+    target = venv.resolve()
+    if venv.is_symlink() or not target.is_relative_to(ROOT.resolve()):
+        raise RuntimeError(
+            f'Checkout .venv is a symlink or resolves outside the checkout: {venv} -> {target}; '
+            "the gate could resync another checkout's environment. "
+            'Remove the symlink and run bin/ci setup.'
+        )
+
+
 def environment(home: Path) -> dict[str, str]:
+    require_checkout_venv_isolation()
     # Allowlist location variables only. No API keys, NODE_OPTIONS, pytest selectors,
     # npm user config, git credentials, or personal Hermes plugin directories.
     env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
+    if os.name == 'nt':
+        # Unset and explicitly empty differ: Windows PowerShell reconstructs
+        # the hosted machine's module search path only when this is absent.
+        # That discovery can cost ~18 s per child. An empty value still loads
+        # PowerShell's built-in modules; preserve a caller's explicit value.
+        env['PSModulePath'] = os.environ.get('PSModulePath', '')
     env.update({
         'HOME': str(home), 'USERPROFILE': str(home),
         'PATH': os.pathsep.join((str(ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')),
@@ -383,6 +411,7 @@ def require_tools(names: tuple[str, ...], env: dict[str, str]) -> None:
 
 
 def python(env: dict[str, str]) -> str:
+    require_checkout_venv_isolation()
     executable = ROOT / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     if not executable.is_file():
         raise RuntimeError('Checkout Python environment missing. Run bin/ci setup first.')
@@ -426,6 +455,7 @@ def provision_rg(env: dict[str, str]) -> None:
 
 
 def setup(env: dict[str, str]) -> None:
+    require_checkout_venv_isolation()
     require_tools(('uv', 'node'), env)
     provision_npm(env)
     # npm is created after the initial resolver pass on a fresh checkout; refresh
@@ -484,7 +514,11 @@ def static(env: dict[str, str]) -> None:
     py = python(env)
     commands = [
         [py, '-m', 'unittest', 'discover', '-s', 'scripts/ci/tests', '-p', 'test_*.py'],
-        [py, '-m', 'ruff', 'check', '.'],
+        # ``ruff.toml`` is the contributor/pre-commit ratchet and intentionally retains a
+        # large legacy backlog. The blocking gate must judge the release's CI scope instead:
+        # pyproject.toml carries the maintained rules, while evals/ is research code outside
+        # the shipped package and has its own probes.
+        [py, '-m', 'ruff', '--config', 'pyproject.toml', 'check', '.', '--exclude', 'evals'],
         [py, 'scripts/check-windows-footguns.py', '--all'],
         [py, 'scripts/check_no_tmp_literals.py'],
         [py, 'scripts/ci/check_os_marker_fakes.py'],

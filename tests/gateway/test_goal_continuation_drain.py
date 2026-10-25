@@ -18,6 +18,7 @@ silently stalling goal loops on messaging gateways.
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 import pytest
 
@@ -189,7 +190,8 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     with patch(
         "hermes_cli.goals.judge_goal",
         return_value=("continue", "still needs work", False, None, False),
-    ):
+    ), patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -231,28 +233,28 @@ async def test_gateway_goal_continuation_uses_synthetic_provenance(hermes_home):
     adapter = _DrainProbeAdapter()
     runner.adapters = {Platform.SLACK: adapter}
     GoalManager(entry.session_id).set("wait for external review", max_turns=20)
-    # Isolate the no-progress counter from the continuation gap (covered below and in
-    # tests/gateway/test_autonomous_wake_pacing.py), which would park this chain after turn 2.
-    (hermes_home / "config.yaml").write_text("goals:\n  min_continuation_gap_seconds: 0\n", encoding="utf-8")
 
     with patch(
         "hermes_cli.goals.judge_goal",
         return_value=("continue", "external review still pending", False, None, False),
     ):
-        for _ in range(3):
-            await runner._post_turn_goal_continuation(
-                session_entry=entry, source=src, final_response="nothing new",
-            )
+        await runner._post_turn_goal_continuation(
+            session_entry=entry, source=src, final_response="nothing new",
+        )
 
+    # Counted as automatic: a no-evidence CONTINUE parks on the first rung of the
+    # quiet no-progress ladder instead of chaining a continuation.
     state = GoalManager(entry.session_id).state
-    assert state is not None
-    assert state.consecutive_no_progress == 3
-    assert state.waiting_until > state.waiting_since
+    assert state is not None and state.status == "active"
+    assert state.consecutive_no_progress == 1
+    assert state.backoff_level == 1
+    assert state.waiting_until - state.waiting_since == pytest.approx(900, abs=1)
+    assert key not in adapter._pending_messages
 
 
 @pytest.mark.asyncio
-async def test_gateway_default_gap_parks_chained_continuations_before_no_progress_backstop(hermes_home):
-    """With the default gap the second automatic turn is already parked, silently."""
+async def test_gateway_chained_no_progress_continuations_park_silently_on_the_ladder(hermes_home):
+    """The first no-progress automatic turn parks silently; later wakes are held unjudged."""
     from datetime import datetime
     from unittest.mock import MagicMock, patch
     import uuid
@@ -260,7 +262,7 @@ async def test_gateway_default_gap_parks_chained_continuations_before_no_progres
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
     from gateway.session import SessionEntry
-    from hermes_cli.goals import GoalManager, is_continuation_gap_wait
+    from hermes_cli.goals import GoalManager
 
     src = _slack_thread_source()
     key = build_session_key(src)
@@ -281,13 +283,16 @@ async def test_gateway_default_gap_parks_chained_continuations_before_no_progres
     with patch(
         "hermes_cli.goals.judge_goal",
         return_value=("continue", "external review still pending", False, None, False),
-    ):
+    ) as judge:
         for _ in range(3):
             await runner._post_turn_goal_continuation(
                 session_entry=entry, source=src, final_response="nothing new",
             )
 
     state = GoalManager(entry.session_id).state
-    assert state is not None and is_continuation_gap_wait(state)
-    assert state.turns_used == 2  # the third wake is held without a judge call
-    assert not any("parked" in text for text in adapter.sent)
+    assert state is not None and state.status == "active"
+    assert state.waiting_until > state.waiting_since
+    assert state.backoff_level == 1
+    assert judge.call_count == 1 and state.turns_used == 1  # later wakes held without a judge call
+    assert key not in adapter._pending_messages
+    assert adapter.sent == []  # the ladder is quiet

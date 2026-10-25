@@ -740,6 +740,38 @@ def test_recovery_copies_delivery_obligations(tmp_path: Path) -> None:
     ]
 
 
+def test_recovery_copies_async_delegation_events(tmp_path: Path) -> None:
+    source = tmp_path / "state.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    conn = sqlite3.connect(str(source), isolation_level=None)
+    try:
+        conn.execute(
+            """INSERT INTO async_delegation_events (
+                event_id, delegation_id, event_kind, event_json, result_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("delegation-1:terminal_fallback", "delegation-1", "terminal_fallback",
+             '{"delegation_id":"delegation-1","summary":"kept"}', '{"summary":"kept"}', 1.0, 2.0),
+        )
+    finally:
+        conn.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["copy"]["async_delegation_events"]["copied_rows"] == 1
+    recovered = sqlite3.connect(str(output))
+    try:
+        assert recovered.execute(
+            "SELECT event_id, event_kind, event_json FROM async_delegation_events"
+        ).fetchone() == (
+            "delegation-1:terminal_fallback", "terminal_fallback",
+            '{"delegation_id":"delegation-1","summary":"kept"}',
+        )
+    finally:
+        recovered.close()
+
+
 def test_recovery_regenerates_rather_than_copies_derived_fts_meta(tmp_path: Path) -> None:
     """Derived FTS markers (including the retired tool high-water key) never reach the new DB."""
 

@@ -74,7 +74,7 @@ class TestCleanShutdownMarker:
             import asyncio
             asyncio.get_event_loop().run_until_complete(runner.stop())
 
-        final_cleanup.assert_awaited_once_with("final-cleanup", timeout=None)
+        final_cleanup.assert_awaited_once_with("final-cleanup", timeout=None, restart=False)
 
         assert marker.exists(), ".clean_shutdown marker should exist after graceful stop"
 

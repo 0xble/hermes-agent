@@ -18,6 +18,12 @@ commands already inside a slot (``HEAVY_SLOT_HELD``), the opt-out
 ``HERMES_HEAVY_SLOT=off``, hosts without the helper, text that only mentions a
 runner (``grep pytest``, quoted strings, comments, heredoc bodies), and
 targeted runs of 1-10 explicit test files with only single-run options.
+Foreground local commands pass ``HEAVY_SLOT_MAX_WAIT`` derived from their
+terminal timeout, so a busy queue fails before the terminal deadline; background
+commands omit it and retain the helper's unbounded wait. A single simple heavy
+command that reaches this bound can be promoted to a tracked background process
+without re-running a compound shell command. The environment-variable transport
+is backwards-compatible with helpers that predate ``--max-wait``.
 """
 
 from __future__ import annotations
@@ -42,11 +48,14 @@ _KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "ti
 # External prefix utilities: they exec their argument, so the dispatcher goes before them.
 _EXEC_PREFIXES = {"env", "nice", "timeout", "gtimeout", "nohup"}
 # Cheap prefilter: every heavy form contains one of these, so most commands skip parsing.
-_CANDIDATE = re.compile(r"test|jest|bin/ci|tox|nox")
+_CANDIDATE = re.compile(
+    r"test|jest|bin/ci|tox|nox|check|lint|sync|install|evals|compileall|build|tsc|"
+    r"npm|pnpm|yarn|bun|turbo|nx|lerna|uv|poetry|pipenv|hatch|pdm|rye"
+)
 _SHELLS = {"bash", "sh", "zsh"}
 _PY_RUNNERS = {"pytest", "py.test"}
 _JS_RUNNERS = {"vitest", "jest"}
-# Package-script runners: `test` / `test:*` scripts are heavy, package management is not.
+# Package scripts and dependency installation can both fan out expensive work.
 _PACKAGE_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
 _PACKAGE_VALUE_OPTIONS = {"--filter", "-F", "--dir", "-C", "--prefix", "--cwd", "--workspace", "-w"}
 # Subcommands whose positional words are package names, never script names.
@@ -59,6 +68,8 @@ _EXEC_RUNNERS = {"npx", "bunx", "uvx", "pnpx"}
 _SUITE_RUNNERS = {"tox", "nox"}
 # Repository CI profiles that only run fast local checks (mirrors ~/.config/shell/heavy-slot.sh).
 _LIGHT_CI_PROFILES = {"preflight", "install-hooks", "list", "-h", "--help"}
+_INFO_FLAGS = {"--version", "--help", "-h"}
+_WATCH_FLAGS = {"--watch", "--watch=true", "--watchAll", "--watchAll=true"}
 # Options a targeted run may carry and still count as light. This is an allowlist on
 # purpose: any other option (pytest -n/--dist, jest --maxWorkers, vitest --pool, a
 # runner's own --workers or --jobs) may fan out, so it falls back to the slot.
@@ -129,21 +140,96 @@ def _first_positional(args: list[str], value_options: Collection[str] = ()) -> t
     return None, []
 
 
-def _is_test_script(word: Optional[str]) -> bool:
-    return word is not None and (word == "test" or word.startswith("test:"))
+def _script_label(word: str) -> Optional[str]:
+    prefix = word.split(":", 1)[0]
+    return prefix if prefix in {"test", "build", "check", "lint", "typecheck"} else None
 
 
-def _has_test_script(args: list[str]) -> bool:
-    """Whether any positional word (not an option or its value) is a `test` / `test:*` script."""
+def _is_watch_script(word: str) -> bool:
+    return word == "watch" or word.endswith(":watch")
+
+
+def _heavy_script(args: list[str]) -> Optional[str]:
+    """Ignore package names and watch modes when finding a heavy package script."""
+    if any(arg in _WATCH_FLAGS for arg in args):
+        return None
     skip = False
     for arg in args:
         if skip:
             skip = False
         elif arg in _PACKAGE_VALUE_OPTIONS:
             skip = True  # `pnpm --filter test build`: `test` names a package
-        elif not arg.startswith("-") and _is_test_script(arg):
-            return True
-    return False
+        elif not arg.startswith("-"):
+            if _is_watch_script(arg):
+                return None
+            if label := _script_label(arg):
+                return label
+    return None
+
+
+def _classify_python(args: list[str]) -> Optional[str]:
+    if args[:1] == ["-m"] and len(args) > 1:
+        module, rest = args[1], args[2:]
+        if module in _PY_RUNNERS:
+            return None if _is_targeted(rest) else "pytest"
+        if module in {"unittest", "compileall", "build"}:
+            return module
+        if module == "pip" and rest[:1] == ["install"]:
+            return "pip-install"
+    if args and _basename(args[0]) == "run_tests_parallel.py":
+        return "run_tests"
+    if args and args[0].endswith("pm/launch.py") and args[1:2] == ["install"]:
+        return "pm-install"
+    return None
+
+
+def _classify_launchers(executable: str, args: list[str]) -> Optional[str]:
+    name = _basename(executable)
+    if name.startswith("python"):
+        return _classify_python(args)
+    if name in {"node", "nodejs"} and args:
+        return {"run-workspace-checks.mjs": "workspace-checks", "check.js": "check",
+                "check.mjs": "check"}.get(_basename(args[0]))
+    if name == "agentkit" and args[:1] == ["evals"] and args[1:2] in (["run"], ["admit"]):
+        return f"evals-{args[1]}"
+    if name == "go" and args[:1] in (["test"], ["build"]):
+        return f"go-{args[0]}"
+    if name == "check" and executable.endswith("bin/check"):
+        return None if args[:1] in (["--help"], ["-h"], ["--list"]) else "check"
+    if name in {"eslint", "tsc"}:
+        return name
+    if name in {"pip", "pip3"} and args[:1] == ["install"]:
+        return "pip-install"
+    if name == "playwright" and args[:1] in (["test"], ["install"]):
+        return "playwright"
+    return None
+
+
+def _classify_package(args: list[str]) -> Optional[str]:
+    sub, rest = _first_positional(args, _PACKAGE_VALUE_OPTIONS)
+    management = next((word for word in [sub, *rest][:3] if word in _PACKAGE_MANAGEMENT), None)
+    if management:
+        return "install" if management in {"add", "install", "i", "update", "up", "upgrade"} else None
+    if sub == "ci":
+        return "install"
+    if sub in {"exec", "dlx"}:
+        inner, inner_rest = _first_positional(rest)
+        return classify_words([inner, *inner_rest]) if inner else None
+    return _heavy_script(args)
+
+
+def _classify_environment(name: str, args: list[str]) -> Optional[str]:
+    sub, rest = _first_positional(args, {"--project", "--directory", "--python", "-p", "--with", "--group",
+                                        "--extra", "--package", "--env", "-e"})
+    if sub == "run":
+        inner, inner_rest = _first_positional(rest, {"--with", "--group", "--extra", "--package", "--python",
+                                                   "-p", "--env", "-e", "--directory", "--project"})
+        return classify_words([inner, *inner_rest]) if inner else None
+    if sub in {"sync", "install", "add"}:
+        return f"{name}-{sub}"
+    if name == "uv" and sub == "pip" and rest[:1] in (["install"], ["sync"]):
+        return "uv-install"
+    return None
 
 
 def classify_words(words: list[str]) -> Optional[str]:
@@ -152,6 +238,12 @@ def classify_words(words: list[str]) -> Optional[str]:
         return None
     executable, args = words[0], words[1:]
     name = _basename(executable)
+    if any(arg in _INFO_FLAGS for arg in args):
+        return None
+    if name in {"tsc", "vitest", "jest"} and any(
+        arg in _WATCH_FLAGS or (arg == "-w" and name in {"tsc", "vitest"}) for arg in args
+    ):
+        return None
 
     if name in _SHELLS and args:
         if args[0].startswith("-") and "c" in args[0] and len(args) > 1:
@@ -161,38 +253,25 @@ def classify_words(words: list[str]) -> Optional[str]:
         return None
     if name in _PY_RUNNERS:
         return None if _is_targeted(args) else "pytest"
-    if name.startswith("python") and len(args) >= 2 and args[0] == "-m" and args[1] in _PY_RUNNERS:
-        return None if _is_targeted(args[2:]) else "pytest"
+    launcher = _classify_launchers(executable, args)
+    if launcher:
+        return launcher
     if name in _JS_RUNNERS:
         rest = args[1:] if args[:1] in (["run"], ["related"]) else args
         return None if _is_targeted(rest) else name
     if name == "run_tests.sh":
-        return None if _is_targeted(args) else "run_tests"
+        return "run_tests"  # always compiles the whole checkout, even with one test file
     if name in _SUITE_RUNNERS:
         return name
     if name in _ENV_RUNNERS:
-        sub, rest = _first_positional(args, {"--project", "--directory", "--python", "-p", "--with", "--group",
-                                              "--extra", "--package", "--env", "-e"})
-        if sub == "run":
-            inner, inner_rest = _first_positional(rest, {"--with", "--group", "--extra", "--package", "--python",
-                                                         "-p", "--env", "-e", "--directory", "--project"})
-            return classify_words([inner, *inner_rest]) if inner else None
-        return None
+        return _classify_environment(name, args)
     if name in _EXEC_RUNNERS:
         inner, rest = _first_positional(args, {"--package", "-p", "--from", "--with"})
         return classify_words([inner, *rest]) if inner else None
     if name in _PACKAGE_MANAGERS:
-        sub, rest = _first_positional(args, _PACKAGE_VALUE_OPTIONS)
-        if any(word in _PACKAGE_MANAGEMENT for word in [sub, *rest][:3] if word):
-            return None  # `pnpm add -D vitest`, `yarn workspace app add test`: the words name packages
-        if sub in {"exec", "dlx"}:
-            inner, inner_rest = _first_positional(rest)
-            return classify_words([inner, *inner_rest]) if inner else None
-        # Script runs in every spelling (`pnpm test`, `npm run test`, `yarn workspace app test`,
-        # `yarn workspaces foreach run test`, `pnpm -r test:unit`): any positional test script.
-        return "test" if _has_test_script(args) else None
+        return _classify_package(args)
     if name in _MONOREPO_RUNNERS:
-        return "test" if _has_test_script(args) else None
+        return _heavy_script(args)
     if executable.endswith("bin/ci") and _basename(executable) == "ci":
         profile = args[0] if args else "full"
         return None if profile in _LIGHT_CI_PROFILES else f"ci-{profile}"
@@ -271,6 +350,24 @@ def _heavy_positions(command: str) -> list[tuple[int, str]]:
     return found
 
 
+def can_promote_expired_wait(
+    command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Whether an expired foreground wait can be safely resumed in the background.
+
+    Re-running a compound shell command could repeat earlier side effects. Restrict
+    promotion to one top-level simple command with one recognized heavy process;
+    callers with chains keep the existing not-started result and explicit retry
+    guidance instead.
+    """
+    if env_type != "local" or not command:
+        return False
+    effective = dict(os.environ)
+    if environment:
+        effective.update(environment)
+    return heavy_slot_enabled(effective) and len(_simple_commands(command)) == 1 and len(_heavy_positions(command)) == 1
+
+
 def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
     """The host helper: the terminal's PATH first, then ``~/.local/bin`` (absent from minimal service PATHs)."""
     from hermes_platform.resolver.core import LookupContext, locate_command
@@ -280,18 +377,23 @@ def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
     return found.command[0] if found.command else None
 
 
-def wrap_heavy_command(command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None) -> str:
-    """Prefix each heavy simple command in a local terminal command with ``heavy-slot``."""
+def wrap_heavy_command(
+    command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None,
+    max_wait_seconds: Optional[int] = None,
+) -> str:
+    """Prefix heavy local commands with ``heavy-slot`` and optionally bound its queue wait."""
     if env_type != "local" or not command:
         return command
     try:
-        return _wrap_local(command, environment)
+        return _wrap_local(command, environment, max_wait_seconds=max_wait_seconds)
     except Exception:  # throttling is best-effort and must never break the terminal
         logger.debug("heavy-slot wrapping failed; running the command unwrapped", exc_info=True)
         return command
 
 
-def _wrap_local(command: str, environment: Optional[Mapping[str, str]]) -> str:
+def _wrap_local(
+    command: str, environment: Optional[Mapping[str, str]], *, max_wait_seconds: Optional[int],
+) -> str:
     effective = dict(os.environ)
     if environment:
         effective.update(environment)
@@ -306,10 +408,10 @@ def _wrap_local(command: str, environment: Optional[Mapping[str, str]]) -> str:
     rewritten = command
     for offset, label in reversed(positions):
         rewritten = rewritten[:offset] + f"{_DISPATCH} {shlex.quote('hermes ' + label)} " + rewritten[offset:]
-    return _dispatcher(executable) + rewritten
+    return _dispatcher(executable, max_wait_seconds=max_wait_seconds) + rewritten
 
 
-def _dispatcher(executable: str) -> str:
+def _dispatcher(executable: str, *, max_wait_seconds: Optional[int] = None) -> str:
     """Shell function the rewritten commands call.
 
     A name the session shell resolves itself (alias, function, builtin) runs exactly as
@@ -320,6 +422,9 @@ def _dispatcher(executable: str) -> str:
     resolve = '$(type -t -- "$1" 2>/dev/null || whence -w -- "$1" 2>/dev/null)'  # bash, then zsh
     shell_owned = 'alias|function|builtin|keyword|*": alias"|*": function"|*": builtin"|*": reserved"'
     run_in_shell = '_hermes_hs_name=$1; shift; eval "$_hermes_hs_name \\"\\$@\\""'
-    run_in_slot = f'{shlex.quote(executable)} --label "$_hermes_hs_label (in $PWD)" -- "$@"'
+    wait_env = ""
+    if max_wait_seconds is not None:
+        wait_env = f"HEAVY_SLOT_MAX_WAIT={shlex.quote(str(max_wait_seconds))} "
+    run_in_slot = f'{wait_env}{shlex.quote(executable)} --label "$_hermes_hs_label (in $PWD)" -- "$@"'
     return (f'{_DISPATCH}() {{ _hermes_hs_label=$1; shift; case "{resolve}" in '
             f'{shell_owned}) {run_in_shell} ;; *) {run_in_slot} ;; esac; }}\n')

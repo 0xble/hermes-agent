@@ -117,6 +117,8 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
             state = asdict(state)
             for key in ('created_at', 'updated_at', 'waiting_since', 'mutation_id'):
                 state.pop(key, None)
+            for revision in state.get('revisions') or []:
+                revision.pop('at', None)
         snapshots.append(state)
     assert snapshots[0] == snapshots[1]
 
@@ -151,4 +153,56 @@ def test_drafts_start_work_but_inspection_and_literal_prefixes_do_not_draft(
     execute('drafting docs')
     assert goals.load_goal(mgr.session_id).goal == 'drafting docs'
     assert calls == ['build it']
-    assert prompts[-1] == 'drafting docs'
+    # Bare /goal replacement is in place and does not enqueue a kickoff.
+    assert prompts == ['build it']
+
+
+def _dispatch(mgr, arg):
+    from hermes_cli.goal_command import dispatch_goal_command
+    return dispatch_goal_command(mgr, arg, authorize_gate=lambda: None)
+
+
+@pytest.mark.parametrize("bad", [
+    "Ship it " * 130,
+    "Ship it\nverify: PR #551 is merged",
+    "Delete the obsolete topic\nconstraints: read-only; no changes",
+    "Ship it\nverify: 1. Run tests\n2. Read logs\n3. Review output",
+])
+def test_goal_command_warns_without_blocking_authoring_findings(bad):
+    mgr = goals.GoalManager("goal-authoring-warning")
+    result = _dispatch(mgr, bad)
+    assert result.error is False
+    assert "Goal authoring warning" in result.output
+
+
+@pytest.mark.parametrize('command, paused, status', [
+    ('resume last goal', False, 'active'), ('continue the work', True, 'active'),
+    ('pause for now', False, 'paused'), ('status please', False, 'active'),
+])
+def test_control_verb_with_trailing_words_never_replaces_the_goal(command, paused, status):
+    goals._DB_CACHE.clear()
+    mgr = goals.GoalManager(session_id='verb-wins-' + command.replace(' ', '-'))
+    mgr.set('original objective')
+    if paused:
+        mgr.pause(reason='user-paused')
+    from hermes_cli.goal_command import is_goal_control
+    assert is_goal_control(command)  # gateway busy path dispatches instead of rejecting
+    result = _dispatch(mgr, command)
+    state = goals.load_goal(mgr.session_id)
+    assert (state.goal, state.status) == ('original objective', status)
+    assert f"(ignored {command.split(' ', 1)[1]!r}" in result.output
+
+
+
+def test_double_dash_sets_control_word_goal_and_announces_the_replace():
+    goals._DB_CACHE.clear()
+    mgr = goals.GoalManager(session_id='verb-escape')
+    mgr.set('original objective')
+    result = _dispatch(mgr, '-- pause the nightly cron')
+    assert goals.load_goal(mgr.session_id).goal == 'pause the nightly cron'
+    assert 'was: original objective' in result.output
+    mgr.clear()
+    fresh = goals.GoalManager(session_id=mgr.session_id)  # gateway/TUI reload per command
+    assert 'replaced' not in _dispatch(fresh, 'fresh objective').output
+    _dispatch(fresh, '--dry-run the migration')
+    assert goals.load_goal(mgr.session_id).goal == '--dry-run the migration'

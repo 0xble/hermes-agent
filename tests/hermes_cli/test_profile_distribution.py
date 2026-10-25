@@ -15,7 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,6 +86,35 @@ def _symlink_file_or_skip(link: Path, target: Path) -> None:
         link.symlink_to(target)
     except OSError as exc:
         pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+
+@pytest.mark.parametrize("local_value, authored_value", [(None, True), (True, False), (False, True)])
+def test_distribution_preserves_authored_pinned_lane(profile_env, local_value, authored_value):
+    """Installed definitions own lane protection, not the target's scheduler state."""
+    from cron.jobs import get_job, list_jobs, update_job, use_cron_store
+
+    staged = _make_staging_dir(profile_env, "pinned_lane")
+    with use_cron_store(staged):
+        shipped = list_jobs()[0]
+        update_job(shipped["id"], {"keep_pinned_lane": authored_value})
+
+    plan = install_distribution(str(staged), name="pinned_lane")
+    with use_cron_store(plan.target_dir):
+        installed = get_job(shipped["id"])
+        assert installed is not None
+        if local_value is not None:
+            update_job(shipped["id"], {"keep_pinned_lane": local_value})
+    if local_value is not None:
+        update_distribution("pinned_lane")
+
+    with use_cron_store(plan.target_dir):
+        updated = get_job(shipped["id"])
+        assert updated is not None
+        assert updated["keep_pinned_lane"] is authored_value
+        assert updated["state"] == installed["state"] == "paused"
+        assert updated["enabled"] is False
+        assert updated["paused_reason"] == installed["paused_reason"]
+        assert updated["next_run_at"] == installed["next_run_at"]
 
 
 # ===========================================================================
@@ -375,7 +404,7 @@ class TestInstall:
         with use_cron_store(staged):
             shipped = list_jobs(include_disabled=True)[0]
             update_job(shipped["id"], {
-                "next_run_at": (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+                "next_run_at": (datetime.now(UTC) - timedelta(days=2)).isoformat()
             })
         (staged / "cron" / "future-runtime.bin").write_text("runtime", encoding="utf-8")
         (staged / "skills" / ".future-runtime").write_text("runtime", encoding="utf-8")
@@ -830,7 +859,7 @@ class TestInstalledAtStamp:
         class _FakeDT(_dt.datetime):
             @classmethod
             def now(cls, tz=None):
-                return _dt.datetime(2099, 1, 1, 0, 0, 0, tzinfo=tz or _dt.timezone.utc)
+                return _dt.datetime(2099, 1, 1, 0, 0, 0, tzinfo=tz or _dt.UTC)
         monkeypatch.setattr(
             "hermes_cli.profile_distribution.datetime", _FakeDT, raising=True
         )

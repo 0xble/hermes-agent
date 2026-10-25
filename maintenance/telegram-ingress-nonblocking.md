@@ -76,14 +76,15 @@ outbound queue.
 
 ## 2026-10-08 Dispatcher-stall diagnostics
 
-When the once-per-stall healthy-but-deaf warning fires, the adapter also emits one bounded
+When the once-per-stall healthy-but-deaf stall is detected, the adapter emits one bounded
 `[Telegram] deaf-dispatcher diagnostics:` warning. It includes the PTB update queue depth, the
 concurrency and semaphore state when available, the time since the last dispatched update, and the
 await chain of up to five PTB fetcher or update-processing tasks. `Task.get_stack()` stops at the
 task's own coroutine, so the adapter follows `cr_await` down to the frame that is actually blocked,
 which is usually a handler nested under PTB's fetcher and wrapper coroutines. Frames are rendered as
-`func@file.py:line`. Collection is best-effort and cannot alter recovery, user-visible Telegram
-behavior or pacing.
+`func@file.py:line`. Since v0.21.6 the stall hands the adapter to the supervisor for a rebuild, so
+the diagnostics are logged first, while the wedged tasks still exist. Collection is best-effort and
+cannot alter recovery, user-visible Telegram behavior or pacing.
 
 **Regression:** `tests/gateway/test_telegram_ingress_delivery_gap.py` covers a handler blocked two
 awaits below a PTB-named processing task, which must appear in order in the logged chain. It also

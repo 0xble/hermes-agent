@@ -848,6 +848,37 @@ class TestClarifyEagerReseed:
         assert consumer.final_response_sent is False
         assert consumer._native_stream_opened is False
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
+    async def test_marker_after_segment_break_and_clarify_never_streams(self, marker):
+        """A tool boundary moves the marker-check offset to the end of the cumulative
+        preamble. The clarify boundary then clears the buffer, so the offset must reset
+        with it, or the next bare marker slices to nothing and streams as a native frame."""
+        adapter = _make_native_streaming_adapter()
+        cfg = StreamConsumerConfig(
+            chat_type="dm", cursor="", edit_interval=0.01, buffer_threshold=5,
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
+        task = asyncio.create_task(consumer.run())
+        await self._drain(consumer, 0.03)
+
+        consumer.on_delta("Checking the brief.")
+        await self._drain(consumer, 0.05)
+        consumer.on_segment_break()
+        await self._drain(consumer, 0.05)
+        boundary = consumer.close_for_approval_prompt(reason="Clarify", reopen=True)
+        fut = boundary[0] if isinstance(boundary, tuple) else boundary
+        await asyncio.wait_for(fut, timeout=1.0)
+        assert consumer._segment_start == 0
+
+        consumer.on_delta(marker)
+        await self._drain(consumer, 0.1)
+        consumer.finish()
+        await task
+
+        assert not any(marker in f["text"] for f in adapter.frames), adapter.frames
+        assert consumer.final_content_delivered is False
+
     # === ROUND 2, POINT 1: 降级后 post-answer 内容落地为单气泡（补强 Point 5）===
 
     @pytest.mark.asyncio
@@ -1103,3 +1134,31 @@ class TestNativeCommentaryPreservesAccumulated:
             f"pre-commentary prefix lost (the bug): {final_text!r}"
         )
         assert "finished (exit 0)." in final_text
+
+
+# === EDGE SILENCE MARKERS ===
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_text", [None, "Pre-tool.\nNO_REPLY\n\nPost-tool.", "NO_REPLY\n\nPost-tool."])
+async def test_native_stream_later_segment_leading_marker_never_reaches_a_frame(final_text):
+    """A marker opening a later segment of a cumulative native stream is control text."""
+
+    adapter = _make_native_streaming_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+    )
+    runner = asyncio.create_task(consumer.run())
+    consumer.on_delta("Pre-tool.\n")
+    await asyncio.sleep(0.1)
+    consumer.on_segment_break()
+    await asyncio.sleep(0.1)
+    consumer.on_delta("NO_REPLY\n\nPost-tool.")
+    await asyncio.sleep(0.1)
+    consumer.finish(final_text)
+    await runner
+
+    texts = [f["text"] for f in adapter.frames]
+    assert all("NO_REPLY" not in t for t in texts), texts
+    finals = [f["text"] for f in adapter.frames if f["finalize"]]
+    assert finals and "Pre-tool." in finals[-1] and "Post-tool." in finals[-1], adapter.frames

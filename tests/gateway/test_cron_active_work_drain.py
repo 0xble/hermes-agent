@@ -86,7 +86,7 @@ class TestKillToolSubprocessesMarksCronInterrupted:
         import cron.scheduler as sched
         import tools.process_registry as _pr
         import tools.terminal_tool as _tt
-        import tools.terminal_tool_lifecycle as terminal_tool_lifecycle
+        from tools import terminal_tool_lifecycle
 
         runner, adapter = make_restart_runner()
         runner._restart_drain_timeout = 0.01  # force the timeout path
@@ -124,6 +124,10 @@ class TestKillToolSubprocessesMarksCronInterrupted:
 
         assert marked_calls, "mark_running_jobs_interrupted was never called during shutdown"
         assert any(result == ["job-1"] for _reason, result in marked_calls)
+        for reason, _result in marked_calls:
+            assert "stopped before finishing" in reason
+            for cause in ("restart", "shutdown", "killed"):
+                assert cause not in reason.lower()
 
 
 
@@ -138,7 +142,8 @@ def test_degraded_external_worker_remains_active_during_shutdown():
     try:
         assert sched.get_running_job_ids() == frozenset({"degraded-worker"})
         assert sched.get_running_job_details() == [
-            {"job_id": "degraded-worker", "elapsed_s": None, "worker_pid": 4321}
+            {"job_id": "degraded-worker", "elapsed_s": None, "worker_pid": 4321,
+             "restart_safe": False}
         ]
     finally:
         with sched._running_lock:
@@ -159,7 +164,8 @@ def test_acknowledged_restart_safe_worker_remains_in_ids_and_details():
     try:
         assert sched.get_running_job_ids() == frozenset({"restart-safe"})
         assert sched.get_running_job_details() == [
-            {"job_id": "restart-safe", "elapsed_s": None, "worker_pid": 4321}
+            {"job_id": "restart-safe", "elapsed_s": None, "worker_pid": 4321,
+             "restart_safe": False}
         ]
     finally:
         with sched._running_lock:

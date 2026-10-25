@@ -26,16 +26,8 @@ from typing import Optional
 
 from agent.memory_provider import is_trivial_prompt
 from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
-from hermes_cli.goals import (
-    CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE,
-    CONTINUATION_PROMPT_TEMPLATE,
-    CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
-    CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE,
-    CONTINUATION_REVISIONS_TEMPLATE,
-    GOAL_WAIT_LIFTED_NOTE_OPEN,
-    KANBAN_GOAL_CONTINUATION_TEMPLATE,
-    KANBAN_GOAL_FINALIZE_TEMPLATE,
-)
+from hermes_cli.goals import KANBAN_GOAL_CONTINUATION_TEMPLATE, KANBAN_GOAL_FINALIZE_TEMPLATE
+from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
 from hermes_cli.heartbeat import HEARTBEAT_PROMPT_TEMPLATE, _PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE
 from hermes_cli.loops import (
     WAKEUP_PROMPT_TEMPLATE,
@@ -120,41 +112,53 @@ class _TemplateMatcher:
         return -1 if last < 0 else last + len(self.terminal)
 
 
-# Match complete generated prompts from their defining templates. The formatter literals make this
-# stricter than a loose prefix while the fields absorb any copied formatter prose inside untrusted
-# payloads and leave only the final generated boundary.
-_INJECTED_TURN_PATTERNS = tuple((kind, template, _TemplateMatcher(template)) for kind, template in (
-    ("goal", CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE),
-    ("goal", CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE),
-    ("goal", CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE),
-    ("goal", CONTINUATION_PROMPT_TEMPLATE),
-    ("kanban", KANBAN_GOAL_CONTINUATION_TEMPLATE),
-    ("kanban", KANBAN_GOAL_FINALIZE_TEMPLATE),
-    ("heartbeat", HEARTBEAT_PROMPT_TEMPLATE),
-    ("loop", WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
-    ("loop", WAKEUP_PROMPT_TEMPLATE),
-    # Stored rows rendered with earlier wording keep it; legacy rows carry no display_kind, so
-    # only these literals keep them out of memory recall and retention.
-    ("heartbeat", _PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE),
-    ("loop", _PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
-    ("loop", _PREVIOUS_WAKEUP_PROMPT_TEMPLATE),
-    ("loop", _SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
-    ("loop", _SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE),
-    ("loop", _GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
-    ("loop", _GOAL_RULES_WAKEUP_PROMPT_TEMPLATE),
-    ("loop", _ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
-    ("loop", _ORIGINAL_WAKEUP_PROMPT_TEMPLATE),
-))
-# Opens the revision history GoalManager appends after a revised goal's continuation. Its lines
+# Match complete generated prompts from every defining goal formatter wording ever shipped. The
+# registry is generated from origin/main and this branch, so persisted rows from old releases remain
+# synthetic even after a formatter wording changes.
+_GOAL_PROMPT_PATTERNS = tuple(
+    ("goal", str(row["template"]), _TemplateMatcher(str(row["template"])))
+    for row in GOAL_PROMPT_REGISTRY
+    if row["formatter"] in {"autonomy", "plain", "contract", "subgoals", "gate_failed"}
+)
+_INJECTED_TURN_PATTERNS = (
+    *_GOAL_PROMPT_PATTERNS,
+    ("kanban", KANBAN_GOAL_CONTINUATION_TEMPLATE, _TemplateMatcher(KANBAN_GOAL_CONTINUATION_TEMPLATE)),
+    ("kanban", KANBAN_GOAL_FINALIZE_TEMPLATE, _TemplateMatcher(KANBAN_GOAL_FINALIZE_TEMPLATE)),
+    ("heartbeat", HEARTBEAT_PROMPT_TEMPLATE, _TemplateMatcher(HEARTBEAT_PROMPT_TEMPLATE)),
+    ("loop", WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _TemplateMatcher(WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", WAKEUP_PROMPT_TEMPLATE, _TemplateMatcher(WAKEUP_PROMPT_TEMPLATE)),
+    ("heartbeat", _PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE, _TemplateMatcher(_PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE)),
+    ("loop", _PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _TemplateMatcher(_PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", _PREVIOUS_WAKEUP_PROMPT_TEMPLATE, _TemplateMatcher(_PREVIOUS_WAKEUP_PROMPT_TEMPLATE)),
+    ("loop", _SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _TemplateMatcher(_SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", _SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE, _TemplateMatcher(_SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE)),
+    ("loop", _GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _TemplateMatcher(_GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", _GOAL_RULES_WAKEUP_PROMPT_TEMPLATE, _TemplateMatcher(_GOAL_RULES_WAKEUP_PROMPT_TEMPLATE)),
+    ("loop", _ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _TemplateMatcher(_ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", _ORIGINAL_WAKEUP_PROMPT_TEMPLATE, _TemplateMatcher(_ORIGINAL_WAKEUP_PROMPT_TEMPLATE)),
+)
+# Opens the revision history older GoalManagers appended after a revised goal's continuation. Its lines
 # carry earlier goal text, revision reasons and quoted user messages, any of which may span lines
 # or paragraphs, and it has no closing marker, so no text after it can be proven human.
-_REVISION_BLOCK_OPEN = CONTINUATION_REVISIONS_TEMPLATE.split("{revision_lines}", 1)[0]
-# GoalManager appends the block directly to a continuation's terminal literal, so a revised
+_REVISION_BLOCK_OPENS = tuple(
+    str(row["template"]).split("{revision_lines}", 1)[0]
+    for row in GOAL_PROMPT_REGISTRY if row["formatter"] == "revisions"
+)
+_GOAL_WAIT_LIFTED_NOTE_OPENS = tuple(
+    str(row["template"])
+    for row in GOAL_PROMPT_REGISTRY if row["formatter"] == "barrier_lift"
+)
+_GOAL_WAIT_LIFTED_NOTE_MATCHERS = tuple(
+    _TemplateMatcher(str(row["template"]))
+    for row in GOAL_PROMPT_REGISTRY if row["formatter"] == "barrier_lift_note"
+)
+# GoalManager appended the block directly to a continuation's terminal literal, so a revised
 # continuation always contains terminal + block opening verbatim. Anchoring on that pair keeps a
 # human suffix that merely quotes the revision header from being dropped as generated.
 _REVISED_CONTINUATION_SEAMS = tuple(
-    matcher.terminal + _REVISION_BLOCK_OPEN
+    matcher.terminal + opening
     for kind, _template, matcher in _INJECTED_TURN_PATTERNS if kind == "goal"
+    for opening in _REVISION_BLOCK_OPENS
 )
 
 
@@ -198,8 +202,13 @@ def _user_after_injected_turn(content: str) -> str | None:
     if not suffix.startswith("\n"):
         return None
     suffix = suffix.strip()
-    if match_kind == "goal" and suffix.startswith(GOAL_WAIT_LIFTED_NOTE_OPEN):
+    if match_kind == "goal" and (
+        suffix.startswith(_GOAL_WAIT_LIFTED_NOTE_OPENS)
+        or any(matcher.match_end(suffix) >= 0 for matcher in _GOAL_WAIT_LIFTED_NOTE_MATCHERS)
+    ):
         # GoalManager appends one generated single-line barrier-lift note to an idle-woken continuation.
+        # Exact historical notes are registered as templates; retain the existing opening fallback
+        # for runtime outcome text that cannot be reconstructed from a transcript.
         note, _newline, rest = suffix.partition("\n")
         if not note.endswith("]"):
             return None
@@ -274,6 +283,115 @@ def human_prompt_text(
     return text or None
 
 
+# GatewayInboundMixin._enrich_message_with_vision and the CLI vision enrichment emit this
+# *pair* of notes. Use the second note as the boundary: descriptions can contain paragraphs,
+# quoted brackets and even unbalanced brackets. Splitting on the first `]` loses human text.
+# VisionMessagePrepMixin's no-advice data-URL note is deliberately absent: it rewrites only a
+# deep copy of the API messages, and automatic recall reads the stored user message instead, whose
+# multimodal parts flatten to the caption alone.
+_IMAGE_RECALL_PREFIX = re.compile(
+    r"\[The user (?:sent an image~ Here's what I can see:|"
+    r"attached an image\. Here's what it contains:)\n(?P<description>.*?)\]\n"
+    r"\[If you need a closer look, use vision_analyze with image_url: [^\n]+\](?=\n|$)",
+    re.DOTALL,
+)
+# Names and paths can contain `] `; no producer puts human text on a note's own line, so a
+# single-line note ends at its line's last `]`.
+_IMAGE_REFERENCE_RECALL_PREFIX = re.compile(
+    r"\[The user attached an image: [^\n]*\]\n"
+    r"\[Examine it with the vision_analyze tool using image_url: [^\n]*\](?=\n|$)",
+)
+# Only known, single-line attachment metadata emitted by gateway/CLI producers, never arbitrary
+# bracketed human prose. Speech-to-text's quoted transcript is intentionally NOT a metadata note.
+_ATTACHMENT_RECALL_NOTE = re.compile(
+    r"\[(?:User sent (?:an image|audio|a video|a file): "
+    r"|The user sent (?:a (?:text )?document: '|an audio file attachment: '|a video attachment: '"
+    r"|a voice message: |a voice message but it came through empty or inaudible "
+    r"|an image but I couldn't quite see it this time "
+    r"|an image but something went wrong when I tried to look at it)"
+    r"|The user attached an image but (?:it couldn't be analyzed\. |analysis failed \()"
+    r"|voice message could not be transcribed automatically; the audio is available at: )"
+    r"[^\n]*\](?=\n|$)"
+    # Bare fallback the gateway emits when the transcription module itself is missing.
+    r"|\[voice message could not be transcribed\](?=\n|$)"
+)
+
+
+# Reply/trigger context is added outside media enrichment by
+# GatewayInboundMixin._prepend_inbound_reply_context. It must be peeled before the
+# attachment notes, or a reply caption still lands beyond the provider's query cap.
+_REPLY_RECALL_PREFIX = re.compile(
+    r'\[Replying to(?: your previous message)?: '
+    r'"(?:\\.|[^"\\])*"\]\n\n',
+)
+_TRIGGER_RECALL_PREFIX = re.compile(
+    r"\[Triggering message id: `[^\n]+` — use as `message_id` for reply/react/pin "
+    r"via the discord tools\.\]\n\n",
+)
+_RECALL_CONTEXT_PREFIXES = (
+    _TRIGGER_RECALL_PREFIX, _REPLY_RECALL_PREFIX, _IMAGE_RECALL_PREFIX,
+    _IMAGE_REFERENCE_RECALL_PREFIX, _ATTACHMENT_RECALL_NOTE,
+)
+
+
+def _strip_recall_context(text: str) -> tuple[str, list[str]]:
+    """Remove producer-owned attachment/reply scaffolding wherever it occurs in a turn.
+
+    Synthetic recall deliberately keeps generated text, so it cannot use ``human_prompt_text``
+    as a boundary first. Search rather than only matching at offset 0 because a generated notice
+    may wrap the attachment enrichment. The meaningful image descriptions are retained separately
+    for the image-only fallback.
+    """
+    descriptions: list[str] = []
+    while text:
+        matches = [match for pattern in _RECALL_CONTEXT_PREFIXES
+                   if (match := pattern.search(text))]
+        if not matches:
+            break
+        prefix = min(matches, key=lambda match: match.start())
+        if "description" in prefix.re.groupindex:
+            description = prefix.group("description").strip()
+            if description:
+                descriptions.append(description)
+        text = (text[:prefix.start()] + text[prefix.end():]).strip()
+    return text, descriptions
+
+
+def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None:
+    """Prefer the request over prepended attachment context, with an image-only fallback.
+
+    This affects recall only, not human_prompt_text (retention) or the model's original prompt.
+    Attachment scaffolding is removed independently of synthetic-turn filtering, so enabling
+    synthetic recall cannot move a human caption beyond the provider's query budget.
+    """
+    descriptions: list[str] = []
+    while text:
+        if not include_synthetic:
+            human = human_prompt_text(text)
+            if not human:
+                # A generated suffix after an image description is not a human query. An
+                # actually image-only turn has no suffix and may use the description fallback.
+                return None if text else human_prompt_text("\n\n".join(descriptions))
+            text = human
+        stripped, found = _strip_recall_context(text)
+        descriptions.extend(found)
+        if stripped == text:
+            break
+        text = stripped
+    if include_synthetic:
+        human = human_prompt_text(text)
+        if human and human != text:
+            # Keep the generated text in the query, but put the actual human request first so
+            # the provider's bounded input cannot discard it behind a long runtime notice.
+            # The request already ends the text, so move it rather than repeat it.
+            rest = text[:-len(human)].rstrip() if text.endswith(human) else text
+            return f"{human}\n\n{rest}" if rest else human
+    if text:
+        return text
+    fallback = "\n\n".join(descriptions)
+    return fallback if include_synthetic else human_prompt_text(fallback)
+
+
 def auto_recall_query(
     content: Optional[str], *, display_kind: Optional[str] = None, platform: Optional[str] = None,
     include_synthetic: bool = False,
@@ -282,8 +400,12 @@ def auto_recall_query(
 
     Synthetic turns recall nothing by default (``memory.recall_synthetic_turns``): their generated
     text is a poor semantic query and repeats verbatim across turns. A human suffix merged into one
-    still recalls, keyed on that suffix alone. Explicit memory tools are unaffected.
+    still recalls, keyed on that suffix alone. Attachment descriptions/path advice do not precede
+    the human request in the query; meaningful image-only descriptions remain a fallback. Explicit
+    memory tools, retained content and the model's prompt are unaffected.
     """
     text = (content or "").strip()
     query = text if include_synthetic else human_prompt_text(text, display_kind=display_kind, platform=platform)
+    if query:
+        query = _attachment_recall_text(query, include_synthetic=include_synthetic)
     return "" if not query or is_trivial_prompt(query) else query

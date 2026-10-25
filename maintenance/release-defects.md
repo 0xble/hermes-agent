@@ -8,7 +8,8 @@ snapshot pin, memory-provider config cloning, `/update` reporting, deferred slas
 commands, portable CI and its source guards, launchd test scoping, desktop E2E
 wiring, Telegram media and album flood control, the delivery ledger, the Hindsight
 session lifecycle, the alias-cache isolation guard, gateway orphan-reaper
-home scoping, and per-run cron terminal isolation.
+home scoping, per-run cron terminal isolation, gateway subcommand exit codes, and
+the `v0.21.6` merge integration.
 
 Each section is a narrow fix for a defect found while syncing to upstream
 `v2026.9.24`, either shipped by upstream or exposed in fork code by that sync, and
@@ -17,6 +18,14 @@ drop each once upstream carries an equivalent fix. Append new defects as section
 here; move a section into a behavior-specific unit when that unit starts owning it.
 
 `production-unused-imports` is a mechanical fork-only hygiene patch. Ruff's `F401` check is the guard for the four removed imports in `agent/agent_init.py`, `agent/codex_runtime.py`, and `agent/memory_manager.py`; retire this record if the imports return or upstream carries the equivalent cleanup.
+
+## Billing outage persistence and provider-wide classification
+
+- Fork patch identity: `billing-outage-recovery`.
+- A provider/account billing or rate-limit failure must retain the failed user turn, avoid the context-overflow auto-reset path, and classify provider-wide proxy `auth_unavailable` envelopes into the existing shared cooldown/fallback route. Explicit 5xx overload/529 signals arm the same breaker before local backoff. Generic server faults and request-specific validation/context failures do not create shared outages.
+- Both persistence layers share `is_context_overflow_reason`: known classifications are authoritative; only missing/unknown classifications may use the legacy large-400 growth guard. Proxy upstream text is considered only within a 5xx `auth_unavailable` envelope's `last upstream error:` suffix, before generic provider-profile status verdicts.
+- Guard: run `scripts/run_tests.sh` one file at a time for `tests/gateway/test_billing_failure_transcript.py`, `tests/agent/test_billing_proxy_error_classification.py`, and `tests/agent/test_billing_outage_shared_cooldown.py`. The latter drives two separate `AIAgent.run_conversation` processes against a loopback provider with the same `HERMES_HOME`; agent B makes no primary call after A records billing 400, proxy billing/rate-limit 503, or explicit overload. Also run the existing classifier, shared-primary-cooldown, fallback-exhaustion, and transient-transcript tests.
+- Retire only when the released upstream passes these regressions without this patch. Roll back the code and focused tests together; no state migration or alternate cooldown store is introduced.
 
 ## Production-only unused imports
 
@@ -53,6 +62,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   parked marker and still shows a running gateway.
 - Guard: `tests/hermes_cli/test_gateway_multiplex_lifecycle.py`
   (`test_parked_status_still_reports_a_forced_gateway`).
+- **Status:** Upstream-main comparison at
+  `f974222e69278b856b1b75053774e10014c4797b` is source-equivalent and contains
+  the same runtime-snapshot guard and forced-gateway regression. This is not a
+  released-upstream retirement proof, so the fork patch remains active.
+- **Retirement:** Retire only after the selected released upstream contains the
+  equivalent behavior and the regression passes there without the local implementation.
 
 ## Stale Bot Desktop lease survives a rename
 
@@ -101,6 +116,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   restart path.
 - Guard: `tests/hermes_cli/test_gateway_multiplex_lifecycle.py`
   (`test_restart_after_stop_unparks_and_serves_the_profile`).
+- **Status:** Upstream-main comparison at
+  `f974222e69278b856b1b75053774e10014c4797b` is source-equivalent and contains
+  the same parked-profile restart path and regression. This is not a
+  released-upstream retirement proof, so the fork patch remains active.
+- **Retirement:** Retire only after the selected released upstream contains the
+  equivalent behavior and the regression passes there without the local implementation.
 
 ## Launchd restart tests depend on the host gateway
 
@@ -206,6 +227,19 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Guards: `scripts/ci/tests/test_portable.py`
   (`test_every_reusable_only_workflow_has_a_caller`,
   `test_every_local_action_reference_resolves`).
+
+## DMG install proof accepted an unrelated app
+
+- Fork patch identity: `dmg-install-proof-provenance`.
+- The macOS DMG driver treated any `/Applications/Hermes.app` as proof that
+  the selected checkout's bootstrap had installed its desktop app. The proof
+  now stays under `INSTALL_DIR` and requires the minimum app-bundle shape,
+  while the desktop E2E caller uses the same scoped admission.
+- Guard: `tests/scripts/install/test_dmg_install_driver.py` and `bash -n` on
+  both macOS install drivers.
+- Upstream status: the scoped test-driver fix is fork-local. Upstream has an
+  open macOS installer/product-app ownership issue tracked in #125245; that
+  runtime packaging change is separate from this proof-boundary repair.
 
 ## Media send checks flood cooldown after chat lock acquisition
 
@@ -377,7 +411,7 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   as completion, so the recall-visibility barrier passed early. Each op now keeps the bank it was
   retained to.
 - Regression coverage: `test_hindsight_provider.py` (`test_pending_ops_are_polled_against_their_own_bank`,
-  `TestPrefetchSupersession::test_superseded_slow_worker_cannot_overwrite_newer_result`).
+  `TestPrefetchSupersession::test_query_queued_during_slow_recall_wins_over_it`).
 
 ## Hindsight self-parent lineage tag re-consolidated whole sessions
 
@@ -683,3 +717,173 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Fork patch identity: `pm-shipped-extras`.
 - When a release payload had shipped optional dependencies but PM had no facts or frozen feature inventory yet, the first on-demand extra sync selected only the requested extra and replaced the payload environment. Infer concrete shipped extras from the payload's site-packages before creating the first PM generation, while excluding umbrella aliases that share anchors with their member extras.
 - Guard: `tests/pm/test_environment_build.py` (`test_first_on_demand_extra_preserves_payload_extras`).
+
+## v0.21.6 merge integration
+
+- Fork patch identity: `v0216-merge-integration`.
+- Merging upstream `v0.21.6` into fork main lost three fork-side bindings that
+  Git merged cleanly or resolved mechanically. `recover_pending_to_db` dropped the
+  fork's `deferred_followup` passthrough while `gateway/run_pending_recovery.py`
+  still passes it, so every startup pending-spool replay raised `TypeError`.
+  `[tool.hermes.extras-platforms]` kept a `mem0` gate after upstream removed the
+  `mem0` extra (moved to the plugin catalog). The merged `uv.lock` carried two
+  `mem0ai` entries and did not parse. The lock is regenerated with
+  `hermes pm lock` from fork main's lock, so it differs only by the catalog-moved
+  providers' packages.
+- Guard: `scripts/run_tests.sh tests/gateway/test_multiplex_pending_recovery.py tests/pm/test_extras.py tests/gateway/test_cron_active_work_drain.py` and `uv lock --check`.
+- Retire once the next release sync no longer carries these merge points.
+- The same merge left `cron/scheduler.py`'s `__main__` external-worker entry calling
+  `finish_worker_boot()` without importing it, so every restart-safe cron worker died
+  with `NameError` before its acknowledgement. Guard:
+  `scripts/run_tests.sh tests/cron/test_restart_safe_worker.py`.
+- Review of the merged candidate found three more `v0.21.6` integration defects.
+  `MemoryStore.compare_and_restore` (fork `memory-transaction-observers`) still called
+  `_error` without upstream's new required `failure_class`, so invalid-target and stale
+  restores raised `TypeError`. Batch memory operations persisted the `new_text` alias
+  without scanning it. The restart-wait warning in `gateway/run_shutdown.py` passed
+  upstream's wedged and restart-safe counts to the fork's message, which had no
+  placeholders for them, so every no-budget restart raised inside logging. Guards:
+  `scripts/run_tests.sh tests/tools/test_memory_transactions.py tests/tools/test_memory_tool.py tests/gateway/test_restart_drain.py`.
+- A static undefined-name and import-resolution sweep of the merged tree, compared
+  against both parents, found seven more clean-merge losses: the `tui_gateway.checkpoints`
+  import in `tui_gateway/server.py`, `platform_ssl_context` in the Telegram adapter,
+  `blocked_sessions` threading in `gateway/shutdown_flush.py`, the free-tier cooldown
+  block (`attempts_made`) in `agent/turn_api_error.py`, the moved retry-after helper,
+  `_hermes_user_agent` in `hermes_cli/models_pricing.py`, and `resumed` plus
+  `_FLEET_PROBE_SETTLE_TIMEOUT_SECONDS` in `hermes_cli/update_cmd_fleet.py`. Skill Sync
+  housekeeping rows were dropped because upstream removed Skill Sync. Guard: a
+  `ruff check --select F821` and lazy-import resolution diff against both merge parents
+  reports no new entries.
+- Upstream-added `tests/ci` files that only check upstream's hosted workflows or
+  `scripts/ci/classify_changes.py`, which the fork deleted in #62, stay deleted with them.
+- Fork patch identity for the hosted-CI repair of the merged candidate (PR #396): `release-sync`.
+- In that repair, each test that failed only on the candidate passed on the parent
+  that owns it, so each fix restores that parent's lost lines and keeps the other's
+  additions: memory prefetch fan-out redaction, the cron `progress_at` column
+  (additive, column-guarded `ALTER TABLE`) and live-owner stale read, the primary's
+  reasoning override through `reinstall_primary_runtime`, interrupted tool-tail
+  closure, host-cancelled compression accounting, restart-wait budgets and logs,
+  bounded shutdown-spool recovery, the session `/yolo` routing-index flag, launchd
+  account-home resolution for an unknown uid, quick-snapshot digest checks before
+  restore, the update body's start-of-run steps, `worktree_gc` git isolation, the
+  desktop frozen-transport, slash-attachment and Quick Entry bindings, the
+  rejected-thinking carry to a compression child, the finalized-row reopen before an
+  isolated compute-host dispatch, and the fork's release-aware fleet verification
+  (target release probe, post-verify release retention, no migration on rollback)
+  ported into v0.21.6's `update_cmd_fleet_verify`. Fork-only cases that exercised only
+  the `honcho` or `openviking` providers upstream removed are dropped; their retaindb,
+  Hindsight and other consumer cases stay. Fork tests whose doubles or synchronization
+  predated v0.21.6 (the Relay monitor-first race, now held before the first provider
+  chunk, and the deferred-ack launchd probe) follow the new seams. Four new upstream
+  tests assumed a host the fork's CI is not: the media-permission tests now pin the
+  not-container branch, the launch-repair and zip-update probes avoid an interpreter
+  with another checkout installed, and the incremental multi-pack-index case skips on
+  a git too old to write one. Guard: `scripts/run_tests.sh` on the hosted-failing
+  files, with `tests/hermes_cli/test_update_head_moved_gate.py` failing on both
+  parents.
+- The follow-on merge of fork main keeps the upstream pause-stop checkpoint and
+  bounded pending-spool replay alongside fork planned-restart markers and full
+  media/reply-context recovery. Both `start_chat` and `telegram_topic` remain in
+  the shared-metrics toolset enum. Config keys are combined except the four
+  intentionally retired `security.tirith_*` defaults: v0.21.6 config migration
+  50 removes them and its regression requires they stay absent; no bundled
+  scanner is resurrected. The auto-merged legacy handoff keeps upstream's root
+  receipt directory while adding fork main's `handoff_path()` discovery helper.
+- The merge verification caught schema drift outside the conflict hunk: the v3
+  efficiency toolset enum omitted `setup`, and v4 omitted `telegram_topic` plus
+  fork browser/setup tools from unavailable-tool counters. Both shipped schemas
+  now agree with the current contract for efficiency and unavailable-tool
+  dimensions; the regression checks both versions. The fork release-owner test
+  also follows upstream's renamed `read_config_version_stamp()` export without
+  weakening its migration and write-refusal assertions.
+- The sync also dropped upstream's per-turn `_voice_turn_pending = ctx.voice_turn`
+  assignment in `gateway/run_turn_runner.py`. Restore it unconditionally so voice
+  turns use `auxiliary.voice_chat` and a reused agent resets the flag on typed
+  turns. Guard: `scripts/run_tests.sh tests/gateway/test_display_null_turn_wiring.py tests/agent/test_voice_turn_route.py`.
+- Restore upstream's `already_restarted()["pids"]` exclusion in the manual/stuck
+  gateway sweep: POSIX gateways resumed by this update are healthy successors,
+  not stale manual PIDs. Keep the fork's external-supervisor protection and
+  cover both mapped and unmapped resumed gateways. Guard:
+  `scripts/run_tests.sh tests/hermes_cli/test_update_external_supervisor_sweep.py tests/hermes_cli/test_update_outgoing_gateway_identity.py`.
+  The outgoing-identity test's service-PID double returns a set, matching the
+  production helper and upstream's set-union contract.
+- The sync kept upstream's `enabled_toolsets` normalizer in the cron create map
+  but dropped it from `_UPDATE_FIELD_NORMALIZERS`, so `update_job` stored a
+  string, dict or int as a job's tool allowlist. Restore the update entry: a
+  non-list raises `ValueError` before storing, a list is trimmed, and `[]` stays
+  an explicit zero-tool allowlist. Guard:
+  `scripts/run_tests.sh tests/cron/test_cron_explicit_empty_toolsets.py`.
+
+- The sync retained upstream's `pm/install_states.py` orphan collector after the fork relocated
+  install locks into `.locks/<name>.lock` plus `.recovery.lock`. Its `_held` checked only the
+  deleted state's legacy `.install.lock`, so startup provisioning could delete an in-use state.
+  The collector now fences both fork locks non-blocking through `install_state_lock` and
+  `install_recovery_lock_path` while preserving the legacy lock check and holding that fence
+  through deletion. Guard: `scripts/run_tests.sh tests/pm/test_install_states_gc.py`.
+
+## Gateway Subcommand Exit Codes
+
+- Fork patch identity: `gateway-cli-exit-code`.
+- `gateway_command` returns the subcommand handler's result, and the fork's `gateway update` and `gateway guardian` handlers report failure as a non-zero int, but `cmd_gateway` discarded it. A rejected update reason or a failed guardian run therefore exited 0, so shell callers, cron and launchd saw success. `cmd_gateway` now returns the result to `main()`, which exits with a non-zero int and treats `None` or 0 as success.
+- Upstream status: `upstream/main` drops the result the same way, but none of its gateway handlers return an int, so the defect is only observable through the fork's subcommands.
+- Guard: `tests/hermes_cli/test_gateway_exit_code.py`.
+
+## Agent update from a served profile dialed a nonexistent socket
+
+- Fork patch identity: `update-lifecycle`.
+- Terminal subprocesses inherit the routed profile's `HERMES_HOME`, but a multiplexer owns
+  only the control socket at its launch home. `gateway update` used the routed home and
+  returned "gateway update handoff unavailable" for a healthy served named profile.
+- The CLI now reuses `host_multiplexer_serving()` (verified owner identity and same-tenant
+  filtering), addresses that owner's home, and falls back to the caller's home without an
+  owner. Cross-home handoffs identify the requesting profile; the owner validates it against
+  its live served-home map, scopes the SQLite lineage lookup, and retains that profile in
+  its own update marker. Root-home requests keep their original socket and payload.
+- Guards: `tests/hermes_cli/test_gateway_agent_update_owner.py` uses a real isolated owner
+  socket and rendezvous record; its named-profile case fails on the base while the root
+  control passes. `tests/gateway/test_agent_update_profile_scope.py` restores
+  `hermes_state.DEFAULT_DB_PATH` to its import-time sentinel after proving call-time
+  resolution remains inside the sandbox, then distinguishes identical session IDs in two
+  real profile databases and rejects unserved/traversal profile names.
+- Retire with `update-lifecycle` only when a released upstream provides equivalent
+  owner-routed, profile-scoped agent handoff and reason-bearing update notifications.
+
+## Container-Key Active Process Reaping
+
+- Fork patch identity: `active-processes-container-key`.
+- Upstream's `has_active_processes` regression matched only the raw spawning
+  owner, but the terminal idle-environment reaper queries by collapsed container
+  key. A delegate-owned background process therefore failed the liveness check,
+  and its still-needed environment could be torn down. The query now matches
+  either the container key or raw owner, preserving both callers' semantics.
+- Guard: `tests/tools/test_process_registry_owner_chain.py`
+  (`test_has_active_processes_matches_container_key_and_raw_owner`) and
+  `tests/tools/test_terminal_tool_lifecycle.py`
+  (`test_cleanup_inactive_env_keeps_container_with_owner_spawned_process`).
+- Retire when upstream's process liveness query matches both the container key
+  and raw spawning owner, with equivalent idle-reaper coverage.
+
+## Shared-metrics install receipt aging clock
+
+- Fork patch identity: `install-run-clock`.
+- `hermes_cli/observability/shared_metrics_install_run.py::_stale` aged receipts
+  against wall time while consent-day selection and recording used
+  `shared_metrics._utc_now`. The consent-day regression pinned the store to
+  2026-10-06, so it began deleting a still-pending receipt after wall time crossed
+  the seven-day cutoff on 2026-10-13. Use the store clock throughout; preserve
+  the seven-day cap, consent gate, opt-out purge and unreadable-receipt deletion.
+- Upstream already carries the same production fix in
+  [`10a877bc9e5f6ecd1c32da0fa93af25b1dd1e60e`](https://github.com/NousResearch/hermes-agent/commit/10a877bc9e5f6ecd1c32da0fa93af25b1dd1e60e).
+  Adapt only that fix to the accepted fork baseline, not moving upstream main.
+  Its test-date-only predecessor PR #137741 does not protect clock consistency.
+  Fork #549 pinned the module's `time` attribute in the consent-day test; that
+  test now relies on the single store clock instead, since `time` is gone.
+- Guard: `tests/hermes_cli/test_shared_metrics_install_run.py`, especially
+  `test_receipt_age_uses_the_store_clock_when_wall_time_disagrees`: pin the store
+  years before and after wall time, keep a six-day-old pending receipt, then
+  delete it unreported at eight days. Keep
+  `test_unreadable_and_week_old_receipts_are_deleted_unreported` unchanged.
+- **Retirement:** Retire the production patch when an accepted upstream release contains the
+  clock fix. Preserve equivalent past/future-clock coverage during that sync.
+- **Rollback:** Revert the commits carrying `Fork-Patch: install-run-clock`; keep the
+  wall-clock-disagreement regression with the active patch.

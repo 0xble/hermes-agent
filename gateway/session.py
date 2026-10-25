@@ -12,13 +12,16 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Any
 
+from hermes_loop_guard import LoopGuardedLock
+
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
 from gateway.session_identity import transport_profile_of
+from gateway.session_attended import SessionAttendedMixin
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pin
 from gateway.session_recovery import SessionRecoveryMixin
-from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
+from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _local_iso, _local_naive, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
 
 logger = logging.getLogger(__name__)
@@ -128,7 +131,7 @@ class SessionSource:
     _OPTIONAL_POST_SCOPE = ("parent_chat_id", "message_id", "profile")
     _OPTIONAL_TAIL = ("auto_thread_initial_name", "prospective_thread_id")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         d = {"platform": self.platform.value}
         d.update((name, getattr(self, name)) for name in self._ALWAYS_FIELDS)
 
@@ -147,7 +150,7 @@ class SessionSource:
         return d
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SessionSource":
+    def from_dict(cls, data: dict[str, Any]) -> "SessionSource":
         plain = {
             name: data.get(name)
             for name in cls._ALWAYS_FIELDS[1:] + cls._OPTIONAL_PRE_SCOPE + cls._OPTIONAL_POST_SCOPE + cls._OPTIONAL_TAIL
@@ -165,15 +168,15 @@ class SessionSource:
 class SessionContext:
     """Full session context for dynamic system prompt injection."""
     source: SessionSource
-    connected_platforms: List[Platform]
-    home_channels: Dict[Platform, HomeChannel]
+    connected_platforms: list[Platform]
+    home_channels: dict[Platform, HomeChannel]
     shared_multi_user_session: bool = False
     session_key: str = ""
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "source": self.source.to_dict(),
             "connected_platforms": [p.value for p in self.connected_platforms],
@@ -304,7 +307,7 @@ _SLACK_NO_TOOLS_NOTE = (
 )
 
 
-def _slack_platform_notes(context: SessionContext) -> List[str]:
+def _slack_platform_notes(context: SessionContext) -> list[str]:
     # Capability note only when Slack tools are loaded; otherwise an honest disclaimer.
     lines = ["", _SLACK_TOOLS_NOTE if _slack_tools_loaded() else _SLACK_NO_TOOLS_NOTE]
     if context.shared_multi_user_session:
@@ -316,7 +319,7 @@ def _slack_platform_notes(context: SessionContext) -> List[str]:
     return lines
 
 
-def _discord_platform_notes(context: SessionContext) -> List[str]:
+def _discord_platform_notes(context: SessionContext) -> list[str]:
     if _discord_tools_loaded():
         src = context.source
         lines = ["", "**Discord IDs (for the `discord` / `discord_admin` tools):**"]
@@ -327,13 +330,13 @@ def _discord_platform_notes(context: SessionContext) -> List[str]:
             lines.append(f"  - Thread: `{src.thread_id}` (use as `channel_id` for fetch_messages etc.)")
         else:
             lines.append(f"  - Channel: `{src.chat_id}`")
-        if src.message_id:
-            # The volatile per-turn message id must stay OUT of this cached block (it would bust the
-            # agent-cache signature every message); run.py injects it into the user message instead.
-            lines.append(
-                "  - Triggering message: provided per-turn in the incoming user message (use it as "
-                "`message_id` for reply/react/pin)"
-            )
+        # Neither the volatile id nor its presence belongs in this pinned block: slash and voice
+        # turns have no triggering message, so a presence-gated line flips the prompt between them
+        # and typed turns. run.py injects the real id into the user message when there is one.
+        lines.append(
+            "  - Triggering message: when available, its ID is provided per-turn in the incoming "
+            "user message (use it as `message_id` for reply/react/pin)"
+        )
     else:
         lines = ["", (
             "**Platform notes:** You are running inside Discord. You do NOT have access to "
@@ -467,7 +470,7 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 
 
-def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict[str, str]]:
     """Copy of *override* with only persistable, non-secret keys, or ``None`` when empty."""
     if not isinstance(override, dict):
         return None
@@ -475,6 +478,10 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         k: str(v) for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    from gateway.model_pick import model_pick_deadline
+    deadline = model_pick_deadline(override)
+    if cleaned and deadline:
+        cleaned["expires_at"] = str(deadline)
     return cleaned or None
 
 
@@ -499,7 +506,7 @@ class SessionEntry:
     platform: Optional[Platform] = None
     chat_type: str = "dm"
     # Small, JSON-serializable per-entry state (e.g. Slack thread watermarks).
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     # Token tracking
     input_tokens: int = 0
     output_tokens: int = 0
@@ -550,7 +557,10 @@ class SessionEntry:
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
     active_turn_human: bool = True
-    # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
+    # Zero-cut handover ownership; omitted from legacy JSON when unset so flag-off routing stays byte-identical.
+    active_turn_owner_pid: Optional[int] = None
+    active_turn_owner_slot: Optional[str] = None
+    # Session-scoped /model override (route and optional expiry, never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[Dict[str, str]] = None
     # Session-scoped /reasoning pick, persisted like model_override so a restart keeps the effort.
@@ -561,7 +571,26 @@ class SessionEntry:
     transport_profile: Optional[str] = None
     # Exact session-context/channel inputs from the last human turn. Append-only dataclass field so
     # older positional construction of transport_profile keeps its meaning.
-    prompt_pin: Optional[Dict[str, Any]] = None
+    prompt_pin: Optional[dict[str, Any]] = None
+    # Gateway ``/yolo`` bypass for this lane, mirrored from ``tools.approval``'s in-memory set so a restart
+    # keeps it; cleared with it at every conversation boundary (``_clear_session_boundary_security_state``).
+    yolo: bool = False
+    # When a resumed successor is interrupted before its predecessor preview can be re-keyed,
+    # retain the predecessor token so recovery can adopt only that exact chained row. Appended to
+    # preserve older positional SessionEntry construction.
+    resume_predecessor_turn_id: Optional[str] = None
+    # Durable clock for attended-model activity.  Internal/relay events deliberately do not update it.
+    last_user_activity_at: Optional[datetime] = None
+    # Explicit picks are pinned by --session; plain picks become temporary only when attended switching
+    # is configured.  Existing rows omit these keys and retain the historical session-scoped behavior.
+    model_override_scope: str = "session"
+    reasoning_override_scope: str = "session"
+    # Route the last API call committed to: True attended, False idle/explicit, None never committed.
+    # Process memory loses the attended decision on restart; this keeps the idle switch-back card.
+    attended_route_active: Optional[bool] = None
+    model_role: Optional[str] = None
+    attended_pinned: bool = False
+    attended_pin_until: Optional[float] = None
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -569,18 +598,20 @@ class SessionEntry:
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
         "expiry_finalized", "suspended", "resume_pending", "resume_reason", "resume_marker_token",
-        "resume_turn_id", "resume_human", "restart_note_message_id", "restart_note_marker_token",
+        "resume_turn_id", "resume_predecessor_turn_id", "resume_human", "restart_note_message_id",
+        "restart_note_marker_token",
         "restart_note_turn_id", "restart_note_reconcile_attempts", "restart_notes", "active_turn_human",
+        "yolo",
     )
     _RESET_FIELDS = (
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",
         "prev_session_id",
     )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         result = {
             "session_key": self.session_key, "session_id": self.session_id,
-            "created_at": self.created_at.isoformat(), "updated_at": self.updated_at.isoformat(),
+            "created_at": self.created_at.isoformat(), "updated_at": _local_iso(self.updated_at),
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type, "metadata": self.metadata,
@@ -599,12 +630,29 @@ class SessionEntry:
         result["last_resume_marked_at"] = _iso(self.last_resume_marked_at)
         result["active_turn_token"] = self.active_turn_token
         result["active_turn_started_at"] = _iso(self.active_turn_started_at)
+        if self.last_user_activity_at is not None:
+            result["last_user_activity_at"] = _local_iso(self.last_user_activity_at)
+        if self.attended_route_active is not None:
+            result["attended_route_active"] = self.attended_route_active
+        if self.model_role:
+            result["model_role"] = self.model_role
+        if self.attended_pinned:
+            result["attended_pinned"] = True
+            if self.attended_pin_until is not None:
+                result["attended_pin_until"] = self.attended_pin_until
+        if self.active_turn_token and self.active_turn_owner_pid and self.active_turn_owner_slot:
+            result["active_turn_owner_pid"] = self.active_turn_owner_pid
+            result["active_turn_owner_slot"] = self.active_turn_owner_slot
         result.update((name, getattr(self, name)) for name in self._RESET_FIELDS)
         if self.model_override:
             # Defence-in-depth against an unsanitized dict stored directly.
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.reasoning_override:
             result["reasoning_override"] = sanitize_reasoning_override(self.reasoning_override)
+        if self.model_override and self.model_override_scope != "session":
+            result["model_override_scope"] = self.model_override_scope
+        if self.reasoning_override and self.reasoning_override_scope != "session":
+            result["reasoning_override_scope"] = self.reasoning_override_scope
         if self.prompt_pin:
             # Same defence-in-depth: routing JSON must never preserve malformed pin state.
             if pin := sanitize_prompt_pin(self.prompt_pin):
@@ -616,7 +664,7 @@ class SessionEntry:
         return result
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SessionEntry":
+    def from_dict(cls, data: dict[str, Any]) -> "SessionEntry":
         origin = data.get("origin")
         origin = SessionSource.from_dict(origin) if isinstance(origin, dict) else None
         platform = None
@@ -662,24 +710,42 @@ class SessionEntry:
                 "message_id": data.get("restart_note_message_id"),
             }]
         transport_profile = data.get("transport_profile")
+        owner_pid = data.get("active_turn_owner_pid")
+        if not isinstance(owner_pid, int) or owner_pid <= 0:
+            owner_pid = None
+        owner_slot = data.get("active_turn_owner_slot")
+        if not isinstance(owner_slot, str) or not owner_slot:
+            owner_slot = None
+        activity = _parse_iso(data.get("last_user_activity_at"))
         return cls(
             session_key=session_key, session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]), origin=origin,
+            updated_at=_local_naive(datetime.fromisoformat(data["updated_at"])), origin=origin,
             display_name=data.get("display_name"), platform=platform,
             chat_type=data.get("chat_type", "dm"), metadata=dict(data.get("metadata") or {}),
             restart_note_marked_at=_parse_iso(data.get("restart_note_marked_at")),
             last_resume_marked_at=_parse_iso(data.get("last_resume_marked_at")),
             active_turn_token=token, active_turn_started_at=started_at,
+            active_turn_owner_pid=owner_pid, active_turn_owner_slot=owner_slot,
             model_override=sanitize_model_override(data.get("model_override")),
             reasoning_override=sanitize_reasoning_override(data.get("reasoning_override")),
+            last_user_activity_at=_local_naive(activity) if activity is not None else None,
+            attended_route_active=data.get("attended_route_active")
+            if isinstance(data.get("attended_route_active"), bool) else None,
+            model_role=str(data.get("model_role")).strip().lower() if data.get("model_role") else None,
+            attended_pinned=data.get("attended_pinned") is True,
+            attended_pin_until=data.get("attended_pin_until"),
+            model_override_scope=data.get("model_override_scope", "session")
+            if data.get("model_override_scope") in ("session", "temporary", "once") else "session",
+            reasoning_override_scope=data.get("reasoning_override_scope", "session")
+            if data.get("reasoning_override_scope") in ("session", "temporary") else "session",
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
             **plain,
         )
 
 
-def build_channel_continuity_note(entry: "SessionEntry", source: SessionSource) -> Optional[str]:
+def build_channel_continuity_note(entry: SessionEntry, source: SessionSource) -> Optional[str]:
     """One-line continuity hint for long-lived Slack/Discord channels/threads.
 
     After an auto-reset the agent could bind a new request to an unrelated recent session; this
@@ -787,7 +853,7 @@ def build_session_key(
 class _SessionFlight:
     def __init__(self) -> None:
         self.event = threading.Event()
-        self.result: Optional["SessionEntry"] = None
+        self.result: Optional[SessionEntry] = None
         self.error: Optional[BaseException] = None
 
 
@@ -803,7 +869,7 @@ class _RouteChecks:
 @dataclass
 class _RouteDecision:
     """What the locked apply-phase decided for one routing transition."""
-    entry: Optional["SessionEntry"] = None
+    entry: Optional[SessionEntry] = None
     needs_save: bool = False
     # Healthy-path saves take the single-row UPSERT fast path; structural
     # transitions (recover/create) keep the full rewrite.
@@ -815,7 +881,7 @@ class _RouteDecision:
     reset_had_activity: bool = False
     prev_session_id: Optional[str] = None
 
-    def schedule_reset(self, reason: str, ended: "SessionEntry", had_activity: bool) -> None:
+    def schedule_reset(self, reason: str, ended: SessionEntry, had_activity: bool) -> None:
         """Record that *ended* is auto-reset for *reason* (ends its row, seeds the successor)."""
         self.reset_reason = reason
         self.reset_had_activity = had_activity
@@ -841,27 +907,29 @@ class AsyncSessionStore:
 
 class SessionStore(
     SessionPersistenceMixin, SessionRecoveryMixin, SessionLifecycleMixin, SessionTranscriptMixin,
-    SessionPromptPinMixin,
+    SessionPromptPinMixin, SessionAttendedMixin,
 ):
     """Session routing index + transcripts: SQLite (SessionDB), legacy JSONL fallback."""
 
     def __init__(self, sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=None):
         self.sessions_dir = sessions_dir
         self.config = config
-        self._entries: Dict[str, SessionEntry] = {}
+        self._entries: dict[str, SessionEntry] = {}
         self._loaded = False
         # A fallback-only initial load is reconciled with state.db once the handle recovers.
         self._routing_db_loaded = False
         self._routing_fallback_baseline: Optional[Dict[str, Any]] = None
-        self._lock = threading.Lock()  # guards _entries / _loaded only
+        # Guards _entries / _loaded, and is held across the state.db write of a turn marker or
+        # routing save, so the event loop must never wait on it (see hermes_loop_guard).
+        self._lock = LoopGuardedLock("session-store lock")
         self._save_lock = threading.Lock()  # whole-index persistence, never held with _lock
         # Fast (single-entry) and full saves share one generation counter so they are totally
         # ordered; _fast_persisted_entries: key -> (revision, entry_json) since the last rewrite.
         self._routing_generation = 0
         self._persisted_routing_generation = 0
-        self._fast_persisted_entries: Dict[str, tuple[int, str]] = {}
+        self._fast_persisted_entries: dict[str, tuple[int, str]] = {}
         self._inflight_lock = threading.Lock()
-        self._inflight_sessions: Dict[str, _SessionFlight] = {}
+        self._inflight_sessions: dict[str, _SessionFlight] = {}
         # An unscoped legacy Slack key is claimed once per process (two workspaces must not both
         # revive one session).
         self._legacy_slack_claim_lock = threading.Lock()
@@ -869,9 +937,9 @@ class SessionStore(
         self._transcript_retry_lock = threading.Lock()
         # One transcript drainer at a time: parent->child queue migration stays linearizable.
         self._transcript_drain_lock = threading.RLock()
-        self._transcript_reroutes: Dict[str, str] = {}
-        self._dirty_transcripts: Dict[str, List[Dict[str, Any]]] = {}
-        self._transcript_append_failures: Dict[str, int] = {}
+        self._transcript_reroutes: dict[str, str] = {}
+        self._dirty_transcripts: dict[str, list[dict[str, Any]]] = {}
+        self._transcript_append_failures: dict[str, int] = {}
         # Monotonic timestamp of the last FTS5 rebuild attempt, or None before any attempt; see
         # SessionTranscriptMixin._rebuild_fts_once for the cooldown this gates.
         self._fts_rebuild_last_attempt_at: Optional[float] = None
@@ -882,12 +950,12 @@ class SessionStore(
         # stale-row recovery, archive/prune and VACUUM remain demand-time/off-loop; AsyncSessionStore and
         # startup recovery offload those operations before admitting restored turns.
         self._db_pinned = _DB_UNPINNED
-        self._db_handles: Dict[Path, Any] = {}
+        self._db_handles: dict[Path, Any] = {}
         self._db_handles_lock = threading.Lock()
-        self._profile_home_cache: Dict[str, Optional[Path]] = {}  # profile -> HERMES_HOME (hits)
+        self._profile_home_cache: dict[str, Optional[Path]] = {}  # profile -> HERMES_HOME (hits)
         # session_id -> owning key for ids proven but not yet published in ``_entries`` (a
         # compression child row is written before its reroute is published).
-        self._session_owner_hints: Dict[str, str] = {}
+        self._session_owner_hints: dict[str, str] = {}
         from gateway.session_db_recovery import RecoverableHandleCache
 
         self._db_handle_cache = RecoverableHandleCache(
@@ -929,9 +997,63 @@ class SessionStore(
 
 
 
+    def override_session_keys(self) -> set[str]:
+        """Return every routing key with a persisted model or reasoning pick."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return {
+                key for key, entry in self._entries.items()
+                if entry.model_override is not None or entry.reasoning_override is not None
+            }
+
+    def role_session_keys(self) -> set[str]:
+        """Return every routing key holding a model role."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return {key for key, entry in self._entries.items() if entry.model_role}
+
+    def get_model_role(self, session_key: str) -> Optional[str]:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return entry.model_role if entry else None
+
+    def set_model_role(self, session_key: str, role: Optional[str], *, clear_overrides: bool = False) -> None:
+        self.set_model_roles([session_key], role, clear_overrides=clear_overrides)
+
+    def set_model_roles(self, session_keys, role: Optional[str], *, clear_overrides: bool = False) -> list[str]:
+        """Set one role on many sessions in a single routing snapshot and persist.
+
+        Returns the keys that existed and were updated. A missing key is skipped,
+        matching ``set_model_role``.
+        """
+        from dataclasses import replace
+        normalized = str(role).strip().lower() if role else None
+        updated_keys: list[str] = []
+        replacements = {}
+        with self._lock:
+            self._ensure_loaded_locked()
+            data, generation = self._snapshot_routing_locked()
+            for session_key in session_keys:
+                entry = self._entries.get(session_key)
+                if entry is None:
+                    continue
+                updated = replace(entry, model_role=normalized)
+                if clear_overrides:
+                    updated = replace(updated, model_override=None, reasoning_override=None,
+                                      model_override_scope="session", reasoning_override_scope="session")
+                if updated == entry:
+                    continue
+                data[session_key] = updated.to_dict()
+                replacements[session_key] = updated
+                updated_keys.append(session_key)
+            if updated_keys:
+                # Keep live and durable routing on the old snapshot if both writers fail.
+                self._persist_routing_data(data, generation)
+                self._entries.update(replacements)
+        return updated_keys
+
     def has_any_sessions(self) -> bool:
-        """Whether any session has ever been created. SQLite is the source of truth (ended sessions
-        count); the current session is already in the DB when this runs, hence ``> 1``."""
+        """Whether any session has ever been created. SQLite is the source of truth."""
         if self._db:
             try:
                 return self._db.session_count_ge(2)
@@ -1088,7 +1210,7 @@ class SessionStore(
     def _route_create(
         self, decision: _RouteDecision, session_key: str, source: SessionSource, now: datetime,
         force_new: bool, observed: Optional[SessionEntry],
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Create a candidate outside the lock and publish it only if the key is still vacant;
         returns ``create_session`` kwargs when the candidate won."""
         session_id = _new_session_id(now)
@@ -1114,7 +1236,7 @@ class SessionStore(
         )
 
     def update_session(
-        self, session_key: str, last_prompt_tokens: int = None, touch_activity: bool = True,
+        self, session_key: str, last_prompt_tokens: int | None = None, touch_activity: bool = True,
     ) -> None:
         """Update lightweight session metadata after an interaction; internal turns pass
         ``touch_activity=False`` so the reset-policy clock does not advance."""
@@ -1149,50 +1271,150 @@ class SessionStore(
         """
         return self._update_entry(session_key, lambda e: e.metadata.__setitem__(key, value))
 
-    def set_model_override(self, session_key: str, override: Optional[Dict[str, Any]]) -> None:
+    def set_model_override(
+        self, session_key: str, override: Optional[dict[str, Any]], *, scope: Optional[str] = None,
+    ) -> None:
         """Persist (or clear, with ``None``) the /model override; non-secret keys only."""
         from dataclasses import replace
 
         cleaned = sanitize_model_override(override)
+        resolved_scope = scope if scope in ("session", "temporary", "once") else "session"
 
         with self._lock:
             entry = self._entry_locked(session_key)
-            if entry is None or entry.model_override == cleaned:
+            if entry is None or (
+                entry.model_override == cleaned and
+                (cleaned is None or entry.model_override_scope == resolved_scope)
+            ):
                 return
             # Publish only after persistence so a failed clear remains retryable.
             data, generation = self._snapshot_routing_locked()
             # Snapshot reconciliation may replace the entry after database recovery.
             entry = self._entries[session_key]
-            data[session_key] = replace(entry, model_override=cleaned).to_dict()
+            data[session_key] = replace(
+                entry, model_override=cleaned,
+                model_override_scope=resolved_scope if cleaned else "session",
+            ).to_dict()
             self._persist_routing_data(data, generation)
             entry.model_override = cleaned
+            entry.model_override_scope = resolved_scope if cleaned else "session"
 
-    def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
+    def set_session_yolo(self, session_key: str, enabled: bool) -> bool:
+        """Persist the lane's ``/yolo`` bypass; False when the key has no entry yet or it is unchanged."""
+        def _apply(entry: SessionEntry):
+            if entry.yolo is enabled:
+                return False
+            entry.yolo = enabled
+        return self._update_entry(session_key, _apply)
+
+    def get_model_override(self, session_key: str) -> Optional[dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""
         with self._lock:
             entry = self._entry_locked(session_key)
             return dict(entry.model_override) if entry and entry.model_override else None
 
-    def set_reasoning_override(self, session_key: str, override: Optional[Dict[str, Any]]) -> None:
+    def get_model_override_scope(self, session_key: str) -> str:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return getattr(entry, "model_override_scope", "session") if entry else "session"
+
+    def set_reasoning_override(
+        self, session_key: str, override: Optional[Dict[str, Any]], *, scope: Optional[str] = None,
+    ) -> None:
         """Persist (or clear, with ``None``) the session's /reasoning pick."""
         from dataclasses import replace
 
         cleaned = sanitize_reasoning_override(override)
+        resolved_scope = scope if scope in ("session", "temporary") else "session"
         with self._lock:
             entry = self._entry_locked(session_key)
-            if entry is None or entry.reasoning_override == cleaned:
+            if entry is None or (
+                entry.reasoning_override == cleaned and
+                (cleaned is None or entry.reasoning_override_scope == resolved_scope)
+            ):
                 return
             data, generation = self._snapshot_routing_locked()
             entry = self._entries[session_key]
-            data[session_key] = replace(entry, reasoning_override=cleaned).to_dict()
+            data[session_key] = replace(
+                entry, reasoning_override=cleaned,
+                reasoning_override_scope=resolved_scope if cleaned else "session",
+            ).to_dict()
             self._persist_routing_data(data, generation)
             entry.reasoning_override = cleaned
+            entry.reasoning_override_scope = resolved_scope if cleaned else "session"
 
     def get_reasoning_override(self, session_key: str) -> Optional[Dict[str, Any]]:
         """Return the persisted /reasoning pick for *session_key*, if any."""
         with self._lock:
             entry = self._entry_locked(session_key)
             return dict(entry.reasoning_override) if entry and entry.reasoning_override else None
+
+    def get_reasoning_override_scope(self, session_key: str) -> str:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return getattr(entry, "reasoning_override_scope", "session") if entry else "session"
+
+    def get_last_user_activity_at(self, session_key: str, *, refresh: bool = False) -> Optional[datetime]:
+        # A successor gateway can receive replies while this process still owns the turn.
+        # Read outside the store lock, then recheck the live session and activity below.
+        durable = None
+        if refresh:
+            try:
+                loader = self._routing_db_method("load_gateway_routing_entry")
+                payload = loader(session_key, scope=self._routing_scope()) if loader else None
+                durable = self._routing_entry_from_json(session_key, payload) if payload else None
+            except Exception:
+                logger.debug("attended activity refresh failed for %s", session_key, exc_info=True)
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if (
+                entry is not None and durable is not None and durable.session_id == entry.session_id
+                and durable.last_user_activity_at is not None
+                and (entry.last_user_activity_at is None
+                     or durable.last_user_activity_at.timestamp() > entry.last_user_activity_at.timestamp())
+            ):
+                entry.last_user_activity_at = durable.last_user_activity_at
+            if entry is not None and durable is not None and durable.session_id == entry.session_id:
+                entry.attended_pinned = durable.attended_pinned
+                entry.attended_pin_until = durable.attended_pin_until
+            return getattr(entry, "last_user_activity_at", None) if entry else None
+
+    def mark_user_activity(self, session_key: str, when: Optional[datetime] = None) -> bool:
+        """Persist the last genuine user message without treating relays/wakeups as activity."""
+        stamp = _local_naive(when) if when is not None else _now()
+
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            if (
+                entry.last_user_activity_at is not None
+                and stamp.timestamp() <= entry.last_user_activity_at.timestamp()
+            ):
+                return False
+            candidate = entry.to_dict()
+            candidate["last_user_activity_at"] = _local_iso(stamp)
+            candidate["updated_at"] = _local_iso(stamp)
+            # A failed save must leave the receipt eligible for its retry.
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            entry.last_user_activity_at = stamp
+            entry.updated_at = stamp
+            return True
+
+    def get_attended_route_active(self, session_key: str) -> Optional[bool]:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return getattr(entry, "attended_route_active", None) if entry else None
+
+    def mark_attended_route_active(self, session_key: str, active: bool) -> bool:
+        """Persist which route the session's latest API call committed to (attended or not)."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or entry.attended_route_active is bool(active):
+                return False
+            entry.attended_route_active = bool(active)
+            self._save_entry(session_key, entry_data=entry.to_dict(), lock_held=True)
+            return True
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
@@ -1277,6 +1499,19 @@ class SessionStore(
                 self._save()
         return len(dropped)
 
+    def unbind_session(self, session_key: str, expected_session_id: str) -> bool:
+        """Remove 1 routing identity without deleting its session or other routes."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return True
+            if entry.session_id != expected_session_id:
+                return False
+            self._entries.pop(session_key)
+            self._save()
+            return True
+
     def remove_by_session_id(self, session_id: str) -> int:
         """Drop every routing entry pointing at *session_id* (hard delete) and persist the drop.
 
@@ -1308,7 +1543,7 @@ class SessionStore(
     # restart-resume freshness gate (#85709).
     def switch_session(
         self, session_key: str, target_session_id: str, *, expected_session_id: Optional[str] = None,
-        preserve_prompt_pin: bool = True,
+        preserve_prompt_pin: bool = True, preserve_attended_pin: bool = True,
     ) -> Optional[SessionEntry]:
         """Point a session key at an existing session ID (``/resume``): ends the current row and
         reopens the target so resume matches the CLI.
@@ -1317,7 +1552,8 @@ class SessionStore(
         the key no longer points at that session, so a caller that resolved against a snapshot
         across an await (async-delegation re-pin) cannot overwrite a concurrent /new or /resume.
         Prompt pins follow non-boundary repoints by default; /resume opts out explicitly because it
-        starts a different conversation on the same routing key.
+        starts a different conversation on the same routing key. Attended pins also follow
+        non-boundary repoints; /resume and /branch explicitly drop them.
         """
         with self._lock:
             old_entry = self._entry_locked(session_key)
@@ -1334,7 +1570,14 @@ class SessionStore(
             new_entry = self._replace_route_locked(
                 session_key, old_entry, target_session_id, _now(),
                 display_name=old_entry.display_name, model_override=old_entry.model_override,
+                yolo=old_entry.yolo,
                 reasoning_override=old_entry.reasoning_override,
+                # The user's activity belongs to the route, not the session row it points at.
+                last_user_activity_at=old_entry.last_user_activity_at,
+                attended_route_active=old_entry.attended_route_active,
+                attended_pinned=old_entry.attended_pinned if preserve_attended_pin else False,
+                attended_pin_until=old_entry.attended_pin_until if preserve_attended_pin else None,
+                model_role=old_entry.model_role,
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
                     if preserve_prompt_pin and old_entry.prompt_pin is not None else None
@@ -1347,6 +1590,9 @@ class SessionStore(
                 log=lambda e: logger.debug("Session DB end_session failed: %s", e),
             )
         if self._db_for_key(session_key):
+            # An explicit /resume/handoff/branch repoint is real user activity: the row is
+            # reopened (a repoint onto a finalized row must resume it, not write into a dead row).
+            # Mount-time reads (TUI session.resume) no longer reopen (#85303) — only this path does.
             self._reopen_session_row(
                 session_key, target_session_id, log_prefix="Session DB reopen_session failed"
             )
@@ -1357,7 +1603,7 @@ class SessionStore(
             )
         return new_entry
 
-    def list_sessions(self, active_minutes: Optional[int] = None) -> List[SessionEntry]:
+    def list_sessions(self, active_minutes: Optional[int] = None) -> list[SessionEntry]:
         """List all sessions, optionally filtered by activity."""
         with self._lock:
             self._ensure_loaded_locked()

@@ -44,6 +44,46 @@ def test_required_maintenance_seeds_catalog_skills_and_migrates_each_home(homes,
     assert model_catalog._read_disk_cache()[0] is not None
 
 
+@pytest.mark.parametrize("failure", ["catalog", "skills", "skills-update"])
+def test_required_maintenance_blocks_real_filesystem_failures(homes, tmp_path, monkeypatch, failure):
+    from hermes_cli.profiles import seed_profile_skills
+
+    root, _sibling = homes
+    for home in homes:
+        (home / "config.yaml").write_text("model:\n  default: test-model\n", encoding="utf-8")
+
+    if failure == "catalog":
+        # The cache parent is a file, so the atomic catalog write has a real
+        # filesystem failure rather than a mocked helper result.
+        (root / "cache").write_text("not-a-directory", encoding="utf-8")
+    elif failure == "skills":
+        # Per-skill copy errors must survive the profile helper's subprocess.
+        (root / "skills").mkdir()
+        (root / "skills" / "apple").write_text("not-a-directory", encoding="utf-8")
+    else:
+        # Seed a pristine skill, change the bundle, then obstruct its backup
+        # path with a file: replacing the real destination directory must fail.
+        bundled = tmp_path / "bundled"
+        skill = bundled / "category" / "example"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: example\n---\nold\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(bundled))
+        seeded = seed_profile_skills(root, quiet=True)
+        assert seeded is not None and seeded["copied"] == ["example"]
+        (skill / "SKILL.md").write_text("---\nname: example\n---\nnew\n", encoding="utf-8")
+        (root / "skills" / "category" / "example.bak").write_text("not-a-directory", encoding="utf-8")
+
+    reason = "catalog" if failure == "catalog" else "bundled skills"
+    with pytest.raises(RuntimeError, match=reason):
+        update_cmd_maint.strict_immutable_maintenance(Path(__file__).parents[2])
+    if failure == "catalog":
+        assert not (root / "cache" / "model_catalog.json").exists()
+    elif failure == "skills":
+        assert not (root / "skills" / "apple" / "apple-notes" / "SKILL.md").exists()
+    else:
+        assert (root / "skills" / "category" / "example" / "SKILL.md").read_text().endswith("old\n")
+
+
 @pytest.mark.parametrize("failure", ["catalog", "skills", "config", "migration"])
 def test_required_maintenance_propagates_failure(homes, monkeypatch, failure):
     from hermes_cli import config, model_catalog, profiles
@@ -53,7 +93,7 @@ def test_required_maintenance_propagates_failure(homes, monkeypatch, failure):
     for home in homes:
         (home / "config.yaml").write_text(original, encoding="utf-8")
     monkeypatch.setattr(profiles, "list_profiles", lambda **kw: [SimpleNamespace(path=root, name="default")])
-    monkeypatch.setattr(model_catalog, "seed_cache_from_checkout", lambda root: failure != "catalog")
+    monkeypatch.setattr(model_catalog, "seed_cache_from_checkout", lambda root, **kw: failure != "catalog")
     monkeypatch.setattr(profiles, "seed_profile_skills", lambda *a, **kw: None if failure == "skills" else {"copied": [], "total_bundled": 1})
     if failure == "migration":
         def fail_migration(*, interactive, quiet):

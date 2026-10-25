@@ -22,18 +22,19 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from agent.i18n import t
 from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import canonicalize_replay_history
+from gateway.attended_model import (
+    format_attended_switch_back_notice, format_attended_switch_notice, parse_attended_config,
+)
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
-from gateway.session import SessionSource
-from gateway.session_identity import replace_source
-from gateway.turn_context import TurnContext
+from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
-    from gateway.run import GatewayRunner  # noqa: F401
+    from gateway.run import GatewayRunner
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -78,11 +79,12 @@ class _ExecApprovalDeclined(RuntimeError):
 
 
 class TurnRunner:
-    """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
+    """Per-turn callbacks, with routing assignment supplied by gateway turn assembly."""
 
-    def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
+    def __init__(self, runner: GatewayRunner, ctx: TurnContext, *, model_assignment: Optional[dict] = None) -> None:
         self._runner = runner
         self._ctx = ctx
+        self._model_assignment = model_assignment
         from gateway.status_delivery import StatusDelivery
         self._status_delivery = StatusDelivery(ctx, lambda: runner._delivery_adapter_for(ctx.source))
         ctx._status_delivery = self._status_delivery
@@ -129,7 +131,7 @@ class TurnRunner:
 
     # ── progress_callback (agent thread → progress queue) ───────────────────────────────────
 
-    def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+    def progress_callback(self, event_type: str, tool_name: str | None = None, preview: str | None = None, args: dict | None = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
@@ -348,8 +350,8 @@ class TurnRunner:
     class _TaskCardState:
         """Task-card rail state for ``_send_native_task_card_progress``."""
         adapter: Any
-        tasks: Dict[str, Dict[str, str]] = dataclasses.field(default_factory=dict)
-        task_order: List[str] = dataclasses.field(default_factory=list)
+        tasks: dict[str, dict[str, str]] = dataclasses.field(default_factory=dict)
+        task_order: list[str] = dataclasses.field(default_factory=list)
         fallback_msg_id: Optional[str] = None
         native_failed: bool = False
         # TERMINAL for the turn, distinct from native_failed: no later publication
@@ -366,7 +368,7 @@ class TurnRunner:
             text = re.sub(r"\s+", " ", str(value or "")).strip()
             return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
-        def visible_tasks(self) -> List[Dict[str, str]]:
+        def visible_tasks(self) -> list[dict[str, str]]:
             return [self.tasks[task_id] for task_id in self.task_order[-8:]]
 
         def fallback_text(self) -> str:
@@ -377,7 +379,7 @@ class TurnRunner:
                      for task in self.visible_tasks()]
             return t("gateway.progress.task_card_title") + "\n" + "\n".join(lines)
 
-        def _upsert(self, call_id: str, title: str) -> Dict[str, str]:
+        def _upsert(self, call_id: str, title: str) -> dict[str, str]:
             if call_id not in self.tasks:
                 self.task_order.append(call_id)
             self.tasks[call_id] = {"id": call_id, "title": self._compact(title), "status": "in_progress"}
@@ -586,7 +588,7 @@ class TurnRunner:
             value = 0.0
         return max(cls._PROGRESS_EDIT_INTERVAL, value)
 
-    def _progress_edit_state(self, adapter) -> "TurnRunner._ProgressEditState":
+    def _progress_edit_state(self, adapter) -> TurnRunner._ProgressEditState:
         ctx = self._ctx
         len_fn = adapter.message_len_fn if isinstance(adapter, BasePlatformAdapter) else len
         try:
@@ -960,31 +962,8 @@ class TurnRunner:
                 "Gateway auto-title failure suppressed (not user-visible): %s: %s", task, exc,
             )
             session_id = getattr(agent, "session_id", None)
-            source = ctx.source
             runner = self._runner
-            # Native Discord only stamps auto-thread markers on the opening parent-channel event. A
-            # title retry arrives as an ordinary in-thread event; when the agent was rebuilt, there
-            # is no first-turn callback left to rename it. Recover only those immutable markers from
-            # this same thread's persisted origin, while keeping the live source's transport owner.
-            if (
-                getattr(source, "platform", None) == Platform.DISCORD
-                and getattr(source, "chat_type", None) == "thread"
-                and getattr(source, "thread_id", None)
-                and getattr(source, "delivered_via_upstream_relay", False) is not True
-                and not runner._is_discord_auto_thread_lane(source)
-            ):
-                with suppress(Exception):
-                    row = agent._session_db.get_session(session_id)
-                    origin = SessionSource.from_dict(json.loads((row or {}).get("origin_json") or "{}"))
-                    if (
-                        runner._is_discord_auto_thread_lane(origin)
-                        and str(origin.thread_id) == str(source.thread_id)
-                    ):
-                        source = replace_source(
-                            source,
-                            auto_thread_created=True,
-                            auto_thread_initial_name=origin.auto_thread_initial_name,
-                        )
+            source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
             # Both lanes spend a rate-limited platform call per title, so they use the model's title
             # only (TitleCallback); renaming twice burns Discord's 2-per-10-min budget on a throwaway.
             # Relay Discord predicate is shape-only: whether the connector auto-threaded our reply is
@@ -1014,9 +993,30 @@ class TurnRunner:
                 )
             else:
                 return
-            
+
+
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
+
+    def _emit_persistent_attended_notice(self, message: str) -> None:
+        """Deliver an attended route card outside the temporary status-bubble rail."""
+        from gateway.warning_notifications import render_notification
+        ctx = self._ctx
+        if ctx.mute_notification_reply or not self._status_live():
+            return
+
+        def present() -> None:
+            self._schedule(
+                self._runner._deliver_platform_notice(ctx.source, message),
+                "attended notice delivery scheduling error",
+            )
+
+        render_notification(
+            present,
+            platform=ctx.source.platform,
+            user_config=ctx.user_config,
+            diagnostic=True,
+        )
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
@@ -1043,6 +1043,7 @@ class TurnRunner:
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
     def _setup_stream_consumer(self, platform_key):
+        from gateway.stream_recovery import preview_recorder, restore_preview
         ctx = self._ctx
         if ctx.mute_notification_reply:
             return None, None, None, False
@@ -1083,7 +1084,13 @@ class TurnRunner:
                         ),
                         on_before_finalize=pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
+                        on_preview=preview_recorder(self._runner, ctx),
                     )
+                    try:
+                        restore_preview(self._runner, ctx, stream_consumer,
+                                        policy=self._resume_restart_policy())
+                    except Exception as err:  # recovery is best-effort; never block the turn
+                        logger.warning("Streamed preview restore failed: %s", err)
                     ctx.stream_consumer_holder[0] = stream_consumer
                     # #105341: a consumer created only for interim commentary (text streaming off)
                     # is never fed the final reply's deltas — mark it so the duplicate-risk
@@ -1187,7 +1194,11 @@ class TurnRunner:
             return out
         with cache_lock:
             cached = cache.get(ctx.session_key)
-            if not (cached and cached[1] == sig):
+            if not cached:
+                return out
+            if cached[1] != sig:
+                # Overwriting the slot would orphan the old instance's memory workers.
+                out.evicted = self._pop_cached_agent_for_eviction()
                 return out
             # cached[2] = message_count at cache time (stale when a second process appended rows);
             # cached[3] = the session_id the snapshot was taken for.
@@ -1228,10 +1239,12 @@ class TurnRunner:
         return out
 
     def _release_evicted_agent(self, agent) -> None:
-        """Off-lock soft release on a daemon thread so teardown never blocks the gateway loop."""
+        """Off-lock soft release on a daemon thread so teardown never blocks the gateway loop. The same
+        session continues on the fresh agent, so no session-end commit (base behavior)."""
         self._runner._spawn_release_thread(
-            self._runner._release_evicted_agent_soft, (agent,), f"agent-xproc-evict-{str(self._ctx.session_key)[:24]}",
-            inline_fallback=True,
+            self._runner._release_evicted_agent_soft, (agent,),
+            f"agent-xproc-evict-{str(self._ctx.session_key)[:24]}",
+            inline_fallback=True, session_key=self._ctx.session_key,
         )
 
     def _build_fresh_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations,
@@ -1379,10 +1392,172 @@ class TurnRunner:
         agent.request_overrides = overrides
         agent._gateway_turn_request_overrides = turn_overrides
 
+    def _apply_attended_before_api_call(self, agent, loop_state=None, *, commit=True):
+        """Apply a changed desired route at the real request boundary, never on fallback retries."""
+        runner = self._runner
+        ctx = self._ctx
+        if getattr(agent, "is_subagent", False) or getattr(agent, "_is_auxiliary", False):
+            return
+        if ctx.session_key in (getattr(runner, "_bulk_reset_pending_sessions", set()) or set()):
+            return
+        def _handoff(*, conversation=None, runner_state=None):
+            handoff = getattr(runner, "_handoff_attended_state", None)
+            if callable(handoff):
+                handoff(ctx.session_key, conversation=conversation, runner=runner_state)
+            elif ctx.session_key and conversation:
+                state = runner._session_state(ctx.session_key)
+                for name, value in conversation.items():
+                    setattr(state.conversation, name, value)
+            if runner_state:
+                for name, value in runner_state.items():
+                    setattr(runner, name, value)
+
+        try:
+            from gateway.run import _load_gateway_config
+            profile_home = (runner._resolve_profile_home_for_source(ctx.source)
+                            if getattr(getattr(runner, "config", None), "multiplex_profiles", False) else None)
+            boundary_config = _load_gateway_config(profile_home / "config.yaml") if profile_home else _load_gateway_config()
+            assignment = getattr(self, "_model_assignment", None)
+            decision = runner._attended_resolution_for_session(
+                source=ctx.source, session_key=ctx.session_key, user_config=boundary_config,
+                override=(runner._session_model_override(ctx.session_key) if ctx.session_key else None),
+                allow_switch_back=commit, assignment=assignment,
+            )
+            if decision is None:
+                return
+            previous_decision = getattr(agent, "_gateway_attended_decision", None)
+            previous_key = getattr(agent, "_gateway_attended_decision_key", None)
+            # The pre-preflight callback resolves and applies active/explicit route changes so
+            # request assembly and the first preflight gate see the destination model. The resolver
+            # suppresses idle switch-back when ``allow_switch_back`` is false; only the post-preflight
+            # callback may commit that boundary-only transition.
+            if commit and ctx.session_key:
+                _handoff(conversation={"last_api_call_at": time.time()})
+            agent._gateway_attended_decision = decision
+            desired_key = decision.decision_key
+
+            def _persist_committed_route_marker():
+                if not commit or not ctx.session_key:
+                    return
+                store = getattr(runner, "session_store", None)
+                mark_route = getattr(store, "mark_attended_route_active", None)
+                if callable(mark_route):
+                    mark_route(ctx.session_key, decision.reason == "attended")
+
+            if getattr(agent, "_fallback_activated", False) or getattr(agent, "_provider_fallback_active", False):
+                agent._gateway_attended_decision_key = desired_key
+                return
+            if desired_key == previous_key:
+                _persist_committed_route_marker()
+                return
+
+            if decision.switched_back:
+                snapshot = getattr(runner, "_snapshot_session_runtime_state", None)
+                if callable(snapshot):
+                    _override, _last_model, _ = snapshot(ctx.session_key)
+                    _override = (assignment or {}).get("override", _override)
+                    model, runtime, _notice, _cache_model = runner._load_session_agent_runtime(
+                        source=ctx.source, skey=ctx.session_key, user_config=boundary_config,
+                        config=getattr(runner, "config", None), override=_override,
+                        last_model=_last_model, attended_route=None,
+                    )
+                else:
+                    model, runtime = runner._resolve_session_agent_runtime(
+                        source=ctx.source, session_key=ctx.session_key, user_config=boundary_config,
+                        assignment=assignment,
+                    )
+            else:
+                model, runtime = runner._resolve_session_agent_runtime(
+                    source=ctx.source, session_key=ctx.session_key, user_config=boundary_config,
+                    assignment=assignment,
+                )
+            from gateway.attended_model import attended_request_context_too_large
+            if commit and decision.switched_back and attended_request_context_too_large(
+                agent, loop_state, model=model, runtime=runtime,
+            ):
+                log_decision = getattr(runner, "_log_attended_decision", None)
+                if callable(log_decision):
+                    log_decision(
+                        ctx.session_key, ctx.source, action="keep", reason="context_too_large",
+                    )
+                else:
+                    logger.info(
+                        "attended decision: session=%s origin=%s action=keep reason=context_too_large",
+                        ctx.session_key,
+                        "automation" if str(getattr(getattr(ctx.source, "platform", None), "value", "")).lower()
+                        in {"automation", "cron", "goal_wakeup", "kanban", "subagent", "system"}
+                        else "user",
+                    )
+                agent._gateway_attended_decision = previous_decision
+                _handoff(conversation={"last_attended_decision": previous_decision})
+                return
+            if commit and decision.switched_back:
+                log_decision = getattr(runner, "_log_attended_decision", None)
+                if callable(log_decision):
+                    log_decision(
+                        ctx.session_key, ctx.source, action="switch", reason="idle",
+                        effort=decision.reasoning_effort or "none",
+                    )
+                _handoff(
+                    conversation={"last_attended_decision": decision},
+                    runner_state={"_last_attended_decision": decision},
+                )
+            current_route = (
+                getattr(agent, "model", ""), getattr(agent, "provider", ""), getattr(agent, "api_mode", ""),
+            )
+            destination_route = (model, runtime.get("provider", ""), runtime.get("api_mode", ""))
+            unavailable_emitted = False
+            if decision.reason == "attended" and destination_route == current_route:
+                consume_notice = getattr(runner, "_consume_pre_agent_fallback_notice", None)
+                unavailable = consume_notice(ctx.session_key) if callable(consume_notice) else None
+                emit_status = getattr(agent, "_emit_diagnostic_status", None)
+                if unavailable and callable(emit_status):
+                    emit_status(unavailable)
+                    unavailable_emitted = True
+            if destination_route != current_route:
+                from agent.agent_runtime_helpers import switch_model
+                switch_model(
+                    agent, model, runtime.get("provider", agent.provider), runtime.get("api_key", ""),
+                    runtime.get("base_url", ""), runtime.get("api_mode", ""), runtime.get("capabilities"),
+                )
+            if decision.reasoning_effort:
+                # The committed decision already carries the destination effort. Re-resolving here
+                # would read session state whose handoff to the gateway loop may not have landed yet,
+                # and could pair the default model with the attended route's effort.
+                from hermes_constants import parse_reasoning_effort
+                agent.reasoning_config = parse_reasoning_effort(decision.reasoning_effort)
+            else:
+                agent.reasoning_config = runner._resolve_session_reasoning_config(
+                    source=ctx.source, session_key=ctx.session_key, model=model,
+                    user_config=boundary_config, assignment=assignment,
+                )
+            _persist_committed_route_marker()
+            agent._gateway_attended_decision_key = desired_key
+            if ctx.session_key:
+                _handoff(conversation={"last_resolved_model": model})
+            if decision.switched_back and not unavailable_emitted:
+                self._emit_persistent_attended_notice(format_attended_switch_back_notice(
+                    model, parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
+                ))
+            elif (
+                decision.reason == "attended"
+                and not decision.new_session
+                and not unavailable_emitted
+                and not (previous_key and previous_key[-1])
+            ):
+                effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
+                self._emit_persistent_attended_notice(format_attended_switch_notice(
+                    model, effort, idle_model=decision.idle_model,
+                    idle_minutes=parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
+                ))
+            if ctx.session_key:
+                _handoff(conversation={"pending_attended_notice": None})
+        except Exception:
+            logger.warning("attended model refresh before API call failed; keeping current route", exc_info=True)
+
     def _wire_turn_agent_callbacks(self, agent, turn_route, reasoning_config,
                                    stream_delta_cb, interim_assistant_cb, want_interim_messages):
-        """Per-message state — callbacks and reasoning config change every turn, so they aren't
-        baked into the cached agent."""
+        """Per-message state (callbacks, reasoning, voice route) — never baked into the cached agent."""
         ctx = self._ctx
         runner = self._runner
         agent._notification_config = ctx.user_config
@@ -1404,6 +1579,7 @@ class TurnRunner:
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
+        agent._voice_turn_pending = ctx.voice_turn  # auxiliary.voice_chat route
         agent.reasoning_override = runner._session_reasoning_override(ctx.session_key)
         expiry_loader = getattr(runner, "_session_service_tier_expiry", None)
         try:
@@ -1414,6 +1590,19 @@ class TurnRunner:
         set_gateway_fast_expiry_state(agent, expiry_at, runner._service_tier)
         agent._pre_fallback_reasoning_override = None  # a live pick supersedes a set-aside one
         self._merge_turn_request_overrides(agent, turn_route)
+        agent._gateway_before_api_call = lambda loop_state: self._apply_attended_before_api_call(
+            agent, loop_state, commit=False,
+        )
+        agent._gateway_after_preflight = lambda loop_state: self._apply_attended_before_api_call(
+            agent, loop_state, commit=True,
+        )
+        agent._gateway_attended_decision = getattr(
+            getattr(runner._peek_session_state(ctx.session_key) if ctx.session_key else None, "conversation", None),
+            "last_attended_decision", None,
+        )
+        agent._gateway_attended_decision_key = getattr(
+            getattr(agent, "_gateway_attended_decision", None), "decision_key", None,
+        )
         # Must-deliver notes for THIS turn ride the current user message (api_content sidecar), never
         # the system prompt. Assigned unconditionally so a reused agent never replays a stale note.
         agent._gateway_turn_context_notes = "\n\n".join(runner._consume_pending_turn_sidecar_notes(ctx.session_key))
@@ -1492,8 +1681,8 @@ class TurnRunner:
         last question — between two cards it only opens a bubble the next boundary closes."""
         from gateway.run_turn_runner_clarify_delivery import UNDELIVERED, UNDELIVERED_DECLINED, UNDELIVERED_NO_SURFACE
         from tools.clarify_gateway import CANCELLED, SKIPPED
-        answers: Dict[str, Any] = {}
-        reply: Dict[str, Any] = {"answers": answers, "outcome": "submitted"}
+        answers: dict[str, Any] = {}
+        reply: dict[str, Any] = {"answers": answers, "outcome": "submitted"}
         last = len(questions) - 1
         for index, entry in enumerate(questions):
             question = f"{entry['question']}\n{t('gateway.clarify.skip_hint')}"
@@ -1605,8 +1794,7 @@ class TurnRunner:
         # in approve/deny.
         adapter.pause_typing_for_chat(ctx._status_chat_id)
         self._close_native_stream_boundary("Approval")
-        # Redact credentials before display: Tirith's findings are already redacted, but the raw
-        # command string still leaks secrets. Both the button and plain-text paths use this value.
+        # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
         desc = approval_data.get("description") or ea_default_reason_text()
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
@@ -1677,7 +1865,8 @@ class TurnRunner:
         # in Slack threads and reserved by Matrix clients.
         msg = _format_exec_approval_fallback(cmd, desc, getattr(adapter, "typed_command_prefix", "/"), **flags)
         try:
-            # Mark as approval prompt so WeCom routes through the control lane.
+            # Mark as approval prompt: WeCom routes it through the control lane and Telegram pushes it
+            # in "important" mode (#132516). Never ``notify`` — A2A reads that as the turn-final reply.
             metadata = {**(ctx._status_thread_metadata or {}), "is_approval_prompt": True}
             fut = self._schedule(
                 adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata)), "Approval text-send scheduling error",
@@ -1839,6 +2028,9 @@ class TurnRunner:
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
+            # Turn provenance is already task-local in HERMES_TURN_ORIGIN. Do not add it to
+            # run_conversation's call shape, because gateway test doubles and provider adapters
+            # intentionally implement the older stable signature.
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
             if _accepts_keyword(agent.run_conversation, "turn_author"):
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
@@ -1860,12 +2052,14 @@ class TurnRunner:
                 kwargs["moa_config"] = ctx.moa_config
             if persist_user_timestamp_override is not None:
                 kwargs["persist_user_timestamp"] = persist_user_timestamp_override
-            # The RAW inbound id (not event_message_id, the reply anchor) rides the persisted user
-            # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
-            if ctx.inbound_message_id is not None:
-                kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            # The raw inbound id (not event_message_id, the reply anchor) rides the persisted user
+            # turn. Recovered internal follow-ups use a dedicated recovery key here; it must never
+            # become event.message_id/source.message_id or reach transport routing.
+            persist_id = ctx.inbound_message_id or ctx.recovery_id
+            if persist_id is not None:
+                kwargs["persist_user_platform_id"] = str(persist_id)
             from agent.notification_presentation import notification_turn
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx):
                 return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)
@@ -1884,9 +2078,12 @@ class TurnRunner:
             result["final_response"] = repair_explicit_computer_use_media_paths(
                 result["final_response"], result.get("messages", []), history_offset=len(agent_history),
             )
+        from gateway.stream_recovery import mark_recovered_reply
+        # A marked delivered copy: the agent's own result (and its messages) stay unlabelled.
+        result = mark_recovered_reply(result, stream_consumer)
         ctx.result_holder[0] = result
         if stream_consumer is None:
-            return
+            return result
         # Pass final_response as the authoritative finalize payload: it includes post-stream
         # augmentation (verifier footer, explainer) the accumulator never saw. Adopt ONLY a genuinely
         # completed final: interrupt paths return {interrupted: True, completed: False} with a
@@ -1902,12 +2099,13 @@ class TurnRunner:
                 _final_for_stream = fr
         if _final_for_stream is None:
             stream_consumer.finish()
-            return
+            return result
         # Duck-type safe: test doubles / older consumers may expose a zero-arg finish().
         try:
             stream_consumer.finish(_final_for_stream)
         except TypeError:
             stream_consumer.finish()
+        return result
 
     def _restore_telegram_thread_id_after_split(self, agent_session_id) -> None:
         """Telegram DM whose source.thread_id was lost in the session split (synthetic/recovered
@@ -2033,7 +2231,7 @@ class TurnRunner:
         every rebind. session_key propagates via contextvars (_set_session_env / set_current_session_key)
         — never os.environ["HERMES_SESSION_KEY"], which would misroute approvals across sessions.
         """
-        from gateway.run import _current_max_iterations, _normalize_empty_agent_response, _sanitize_gateway_final_response
+        from gateway.run import _current_max_iterations
         ctx = self._ctx
         runner = self._runner
         # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
@@ -2056,8 +2254,12 @@ class TurnRunner:
             )
             # Stashed by _resolve_session_agent_runtime when the primary's credentials failed and a
             # fallback was resolved before any agent exists (#74349); one-shot per turn.
-            pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)
-            runner._pre_agent_fallback_notice = None
+            consume_notice = getattr(runner, "_consume_pre_agent_fallback_notice", None)
+            if callable(consume_notice) and getattr(consume_notice, "__self__", None) is runner:
+                pending_fallback_notice = consume_notice(ctx.session_key)
+            else:
+                pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)
+                runner._pre_agent_fallback_notice = None
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
@@ -2088,14 +2290,21 @@ class TurnRunner:
         if pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
+        state = runner._session_state(ctx.session_key) if ctx.session_key else None
+        attended_notice = getattr(getattr(state, "conversation", None), "pending_attended_notice", None)
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        if attended_notice:
+            self._emit_persistent_attended_notice(attended_notice)
+            if state is not None:
+                state.conversation.pending_attended_notice = None
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
-        self._finish_stream_consumer(result, agent_history, stream_consumer)
-        # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
-        # returns, so early run_sync returns are also finalised.
-        # See the outer finally/completion section below. See #60671.
+        from hermes_cli.goal_turn_outcome import model_final_response
+        # Judge goals on the model's own text, before stream finish may add a recovery marker.
+        model_response = model_final_response(result)
+        # The hook returns the (possibly marked) result; hooks that only mutate in place return None.
+        result = self._finish_stream_consumer(result, agent_history, stream_consumer) or result
         final_response = result.get("final_response")
         # Actual token counts from the agent instance used for this run.
         agent = ctx.agent_holder[0]
@@ -2109,11 +2318,8 @@ class TurnRunner:
             "context_length": (getattr(comp, "context_length", 0) or 0) if has_comp else 0,
         }
         compacted_in_place, effective_session_id, history_offset = self._sync_session_after_run(agent_history)
-        # failure_reason must survive the empty-response path too (TUI billing, transient-failure
-        # persistence). compression_deferred (soft lock-contention defer) is distinct from
-        # compression_exhausted so the gateway never auto-resets a session a concurrent compressor is
-        # about to shrink.
         common = {
+            "_model_final_response": model_response,
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
@@ -2121,23 +2327,27 @@ class TurnRunner:
             "error": result.get("error"),
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
+            "recovered_reply": result.get("recovered_reply", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
             **usage,
         }
         if not final_response:
-            final_response = _normalize_empty_agent_response(result, final_response or "", history_len=len(agent_history))
-            final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
-            if not final_response:
-                final_response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
+            # Keep the model copy raw for evaluation, but retain the finalized display copy here.
+            # Some queued/direct delivery paths consume this result without the outer shape step.
+            from gateway.run import _normalize_empty_agent_response, _sanitize_gateway_final_response
+            display_response = _normalize_empty_agent_response(
+                result, final_response or "", history_len=len(agent_history),
+            )
+            display_response = _sanitize_gateway_final_response(ctx.source.platform, display_response)
+            if not display_response:
+                display_response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
             # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
             # defaults agent_persisted differently when the key is absent.
-            return {"final_response": final_response, **common}
+            return {"final_response": final_response or "", "delivery_text": display_response, **common}
         final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
-        # Auto-titling runs at TURN START (agent/turn_context.py) from the user's message alone, so a
-        # failed/interrupted turn is still titled.
         return {
-            "final_response": final_response, "last_reasoning": result.get("last_reasoning"), **common,
+            "final_response": final_response, "delivery_text": final_response, "last_reasoning": result.get("last_reasoning"), **common,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
             # Lets the persistence block tell whether the codex app-server path self-persisted (it

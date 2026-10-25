@@ -98,7 +98,7 @@ class TestAgentConfigSignature:
                 },
             },
         )
-        monkeypatch.setattr(runtime_provider, "_get_model_config", lambda: {})
+        monkeypatch.setattr(runtime_provider, "_get_model_config", dict)
 
         runtime = _resolve_runtime_agent_kwargs()
 
@@ -156,7 +156,7 @@ class TestExtractCacheBustingConfig:
 
         default_cap = DEFAULT_CONFIG["compression"]["threshold_tokens"]
         other_cap = (default_cap or 0) + 100_000
-        sig = lambda cfg: GatewayRunner._extract_cache_busting_config(cfg)["compression.threshold_tokens"]  # noqa: E731
+        sig = lambda cfg: GatewayRunner._extract_cache_busting_config(cfg)["compression.threshold_tokens"]
         assert sig({}) == sig({"compression": {"threshold_tokens": default_cap}}) == default_cap
         assert sig({"compression": {"threshold_tokens": other_cap}}) == other_cap != sig({})
 
@@ -332,8 +332,6 @@ class TestAgentCacheBoundedGrowth:
 
         commit_calls: list = []
         release_calls: list = []
-        runner._release_evicted_agent_soft = lambda agent: release_calls.append(agent)
-
         runner.session_store = MagicMock()
         runner.session_store._entries = {"old": MagicMock(), "new": MagicMock()}
 
@@ -341,6 +339,9 @@ class TestAgentCacheBoundedGrowth:
         old_agent._memory_manager = MagicMock()  # has an external provider
         old_agent._session_messages = [{"role": "user", "content": "hi"}]
         old_agent.commit_memory_session = lambda msgs=None: commit_calls.append(msgs)
+        # Commit now runs inside the soft release's handoff-lock section, so observe the client release
+        # rather than stubbing out the whole soft release.
+        old_agent.release_clients = lambda: release_calls.append(old_agent)
         new_agent = self._fake_agent()
 
         with runner._agent_cache_lock:

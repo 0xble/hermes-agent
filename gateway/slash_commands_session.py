@@ -129,7 +129,7 @@ class GatewaySessionCommandsMixin:
             await asyncio.wait_for(
                 self._run_housekeeping_in_executor(self._cleanup_agent_resources, _old_agent),
                 timeout=_RESET_CLEANUP_TIMEOUT_S)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "Agent resource cleanup for session %s exceeded %ss during /new reset; proceeding with "
                 "reset (the worker thread is left to finish on its own). (#35994)",
@@ -145,14 +145,15 @@ class GatewaySessionCommandsMixin:
         arbitrarily), then session:end and session:reset."""
         platform_value = source.platform.value if source.platform else ""
         with contextlib.suppress(Exception):
-            await self._finalize_session_off_loop(
+            messages = await self._finalize_session_off_loop(
                 session_id=old_sid, platform=platform_value, reason="new_session",
                 old_session_id=old_sid, new_session_id=new_sid)
+            await self._deliver_session_end_messages(messages, source=source, session_key=session_key)
         hook_payload = {"platform": platform_value, "user_id": source.user_id, "session_key": session_key}
         await self.hooks.emit("session:end", dict(hook_payload))
         await self.hooks.emit("session:reset", dict(hook_payload))
 
-    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+    async def _handle_reset_command(self, event: MessageEvent) -> str | EphemeralReply:
         """Handle /new or /reset command."""
         source = event.source
         session_key = self._session_key_for_source(source)
@@ -167,20 +168,41 @@ class GatewaySessionCommandsMixin:
         # keeps the slot from becoming a zombie that silently drops all later messages (#28686). Idempotent,
         # so the run's finally calling it again is harmless.
         old_entry = self.session_store._entries.get(session_key)
+        old_session_id = getattr(old_entry, "session_id", None) if old_entry else None
+        # /new is an explicit user boundary: retire conversation-scoped standing
+        # responsibility before the first await. Compression is the only existing
+        # migration path and remains separate.
+        if old_session_id:
+            async def _retire_old_controls():
+                def retire():
+                    from hermes_cli.goals import GoalManager
+                    from hermes_cli.loops import LoopManager
+
+                    for kind, manager in (("loop", LoopManager), ("goal", GoalManager)):
+                        try:
+                            manager(session_id=old_session_id).clear()
+                        except Exception:
+                            logger.warning(
+                                "/new: failed to retire %s for session %s", kind, old_session_id,
+                                exc_info=True,
+                            )
+                await self._run_in_executor_with_context(retire)
+            await _retire_old_controls()
         await self._cleanup_old_agent_for_reset(session_key)
         self._evict_cached_agent(session_key)
         # Conversation boundary: ALL conversation-scoped per-session state + security state in one
         # funnel call (see _CONVERSATION_SCOPED_STATE in gateway/run.py).
-        self._clear_conversation_scope(session_key, reason="session_reset")
-        # In-flight async delegations end WITH the conversation: once the id rotates their
-        # completions have no live owner. Expire by durable id, routing key as legacy fallback.
-        with contextlib.suppress(Exception):
-            from tools.async_delegation import interrupt_for_session
-            interrupt_for_session(session_key=session_key, reason="session_reset",
-                                  parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
-        _reset_process_scoped_tool_state()
+        async with self._session_model_override_lock(session_key):
+            await self._clear_conversation_scope_locked_async(session_key, reason="session_reset")
+            # In-flight async delegations end WITH the conversation: once the id rotates their
+            # completions have no live owner. Expire by durable id, routing key as legacy fallback.
+            with contextlib.suppress(Exception):
+                from tools.async_delegation import interrupt_for_session
+                interrupt_for_session(session_key=session_key, reason="session_reset",
+                                      parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
+            _reset_process_scoped_tool_state()
 
-        new_entry = await self.async_session_store.reset_session(session_key)
+            new_entry = await self.async_session_store.reset_session(session_key)
         _old_sid = old_entry.session_id if old_entry else None
         await self._fire_session_reset_hooks(source, session_key, _old_sid,
                                              new_entry.session_id if new_entry else None)
@@ -383,8 +405,9 @@ class GatewaySessionCommandsMixin:
         # The canonical projection skips bookkeeping rows (role=user + display_kind) and pure
         # handoffs while still recognizing a real ask embedded in a compaction carrier.
         from agent.context_compressor import (
-            history_before_user_originated_turn, retryable_user_text, split_user_originated_turn,
+            history_before_user_originated_turn, split_user_originated_turn,
             user_originated_turn_view)
+        from agent.context_compressor_retry import retryable_user_text
 
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
@@ -474,11 +497,13 @@ class GatewaySessionCommandsMixin:
         """Profile-scoping wrapper around manual /compress: multiplexed gateways resolve credentials
         through the fail-closed per-profile secret scope, which slash dispatch (unlike ``_run_agent``)
         does not install — unscoped, /compress would raise ``UnscopedSecretError``."""
+        profile_home = None
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._handle_compress_command_inner(event)
+        profile_home = self._resolve_profile_home_for_source(event.source)
         from gateway.run import _profile_runtime_scope
-        with _profile_runtime_scope(self._resolve_profile_home_for_source(event.source)):
-            return await self._handle_compress_command_inner(event)
+        with _profile_runtime_scope(profile_home):
+            return await self._handle_compress_command_inner(event, profile_home=profile_home)
 
     async def _compress_codex_app_server_session(self, session_key: str, session_id: str) -> str:
         """Manual /compress for codex_app_server sessions: compacts the LIVE cached agent's
@@ -503,7 +528,7 @@ class GatewaySessionCommandsMixin:
             return t("gateway.compress.codex_compacted")
         return t("gateway.compress.codex_incomplete")
 
-    async def _handle_compress_command_inner(self, event: MessageEvent) -> str:
+    async def _handle_compress_command_inner(self, event: MessageEvent, *, profile_home=None) -> str:
         """Handle /compress -- manually compress conversation context; ``/compress <focus>`` tells
         the summariser what to preserve. Flags/positional forms are parsed by the shared core."""
         from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
@@ -524,12 +549,16 @@ class GatewaySessionCommandsMixin:
             return _compress_preview_reply(history, request.partial, request.keep_last, request.focus_topic, _agg_note,
                                            request.level)
         try:
-            return await self._run_manual_compression(source, session_entry, history, request)
+            return await self._run_manual_compression(
+                source, session_entry, history, request, profile_home=profile_home,
+            )
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
 
-    async def _run_manual_compression(self, source, session_entry, history: list, request) -> str:
+    async def _run_manual_compression(
+        self, source, session_entry, history: list, request, *, profile_home=None,
+    ) -> str:
         """Build a temporary agent, run the shared compress core, persist, and describe the outcome."""
         from agent.conversation_compression import finalize_context_engine_compression_notification
         from agent.conversation_compression_manual import compress_now, render_compress_result
@@ -539,7 +568,7 @@ class GatewaySessionCommandsMixin:
         # Platform + stable gateway session key bind this agent (for external context engines) to
         # the original conversation, not a default "cli" host.
         platform_key = _platform_config_key(source.platform) if source.platform else None
-        model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, session_key=session_key)
+        model, runtime_kwargs = await self._resolve_session_agent_runtime_async(source=source, session_key=session_key)
         if str(runtime_kwargs.get("api_mode") or "").lower() == "codex_app_server":
             # Context lives in the server-side thread of the LIVE cached agent; a temporary agent
             # has none (and finally-eviction would destroy the real context).
@@ -556,7 +585,9 @@ class GatewaySessionCommandsMixin:
         runtime_kwargs["gateway_session_key"] = session_key
         # Same reasoning setting as a live turn (session ``/reasoning`` > per-model > global): without it
         # the transport applies its default effort — a 400 on non-reasoning models.
-        runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(source=source, model=model)
+        runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(
+            source=source, model=model, profile_home=profile_home,
+        )
 
         tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
         try:
@@ -622,15 +653,16 @@ class GatewaySessionCommandsMixin:
 
     async def _persist_manual_compression(self, tmp_agent, session_entry, source, compressed) -> None:
         """Commit a manual /compress result to the session store.  Rotation (new continuation id)
-        writes the compressed messages into the NEW session so the original stays searchable;
+        makes the NEW session durable (already published, else rewritten) so the original stays searchable;
         persist BEFORE repointing so a failed write is fatal and old history stays reachable.
         In-place compaction already archived + inserted rows, and a rewrite would DELETE the
         archive; an unchanged id without in-place means rotation FAILED."""
         new_session_id = tmp_agent.session_id
         if new_session_id != session_entry.session_id:
-            if not await self.async_session_store.rewrite_transcript(new_session_id, compressed):
-                raise RuntimeError(
-                    f"failed to persist compressed transcript for session {new_session_id}")
+            # Published child is already durable; a rewrite would drop rows cloned at publish.
+            if not await self.async_session_store.persist_rotated_compression_child(
+                    session_entry.session_id, new_session_id, compressed):
+                raise RuntimeError(f"failed to persist compressed transcript for session {new_session_id}")
             session_entry.session_id = new_session_id
             await self.async_session_store._save()
             await asyncio.to_thread(self._sync_telegram_topic_binding, source, session_entry,
@@ -766,8 +798,7 @@ class GatewaySessionCommandsMixin:
         """Handle /save — export the current session and send it as a document."""
         import tempfile
         from hermes_cli.session_export import (
-            SAVE_TRANSCRIPT_FORMATS, SAVE_USAGE, default_save_filename, normalize_save_format,
-            render_session_for_save)
+            SAVE_USAGE, default_save_filename, load_save_snapshot, normalize_save_format, render_session_for_save)
 
         parts = event.get_command_args().split()
         redact = bool(parts) and parts[-1].lower() in ("redact", "--redact")
@@ -788,7 +819,12 @@ class GatewaySessionCommandsMixin:
         # Never trust path separators from chat input; the filename is only echoed to the platform.
         filename = parts[1] if len(parts) > 1 else default_save_filename(session_id, fmt)
         filename = os.path.basename(filename) or default_save_filename(session_id, fmt)
-        export_data = await self._session_db.export_session(session_id, include_compacted=fmt in SAVE_TRANSCRIPT_FORMATS)
+        from hermes_state import SessionExportTooLargeError
+        try:
+            # One off-loop hop for the cap check + read; the helper is shared with the CLI and TUI /save.
+            export_data = await asyncio.to_thread(load_save_snapshot, self._session_db._db, session_id, fmt)
+        except SessionExportTooLargeError as e:
+            return str(e)
         if not export_data:
             return t("gateway.save.no_messages", session_id=session_id)
         if redact:
@@ -850,7 +886,7 @@ class GatewaySessionCommandsMixin:
             return t("gateway.shared.warn_passthrough", error=e)
         if not sanitized:
             return t("gateway.title.empty_after_clean")
-        topic_lane = self._is_telegram_topic_lane(source)
+        topic_lane = await asyncio.to_thread(self._is_telegram_topic_lane, source)
         try:
             if topic_lane and hasattr(self._session_db, "set_session_title_in_lineage"):
                 stored_title = await self._session_db.set_session_title_in_lineage(session_id, sanitized)
@@ -966,20 +1002,21 @@ class GatewaySessionCommandsMixin:
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
         self._release_running_agent_state(session_key)
-        new_entry = await self.async_session_store.switch_session(
-            session_key, target_id, preserve_prompt_pin=False,
-        )
-        if not new_entry:
-            return t("gateway.resume.switch_failed")
-        # Conversation boundary: all conversation-scoped state + security state in one funnel call.
-        # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
-        # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
-        # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
-        self._clear_conversation_scope(session_key, reason="resume")
-        # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
-        # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
-        # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
-        await self.async_session_store.set_model_override(session_key, None)
+        async with self._session_model_override_lock(session_key):
+            new_entry = await self.async_session_store.switch_session(
+                session_key, target_id, preserve_prompt_pin=False, preserve_attended_pin=False,
+            )
+            if not new_entry:
+                return t("gateway.resume.switch_failed")
+            # Conversation boundary: all conversation-scoped state + security state in one funnel call.
+            # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
+            # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
+            # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
+            await self._clear_conversation_scope_locked_async(session_key, reason="resume")
+            # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
+            # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
+            # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
+            await self._persist_session_model_override_locked(session_key, None)
         await self.async_session_store.set_reasoning_override(session_key, None)
         # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
         # provider cached _session_id at initialize() and would keep writing to the wrong session.
@@ -1149,7 +1186,9 @@ class GatewaySessionCommandsMixin:
             # Materialize the thread's own entry, then point IT at the clone; ``session_key`` (this
             # chat) is never touched, so the original conversation stays live here.
             await self.async_session_store.get_or_create_session(dest_source)
-        new_entry = await self.async_session_store.switch_session(dest_key, new_session_id)
+        new_entry = await self.async_session_store.switch_session(
+            dest_key, new_session_id, preserve_attended_pin=False,
+        )
         if not new_entry:
             return t("gateway.branch.switch_failed")
         self._clear_session_boundary_security_state(dest_key)

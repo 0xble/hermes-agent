@@ -368,7 +368,7 @@ def schedule_env(monkeypatch, marker_home):
     monkeypatch.setattr(server.threading, "Thread", _InlineThread)
     monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
     monkeypatch.setattr(server, "_wait_agent", lambda session, rid, timeout=30.0: None)
-    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_load_cfg", dict)
     submitted: list = []
     monkeypatch.setattr(
         server,
@@ -389,7 +389,8 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
     assert session["running"] is True
     assert session["_auto_continue_attempt"] == 1
     (text, kwargs), = schedule_env
-    assert text.startswith("[System note: Your previous turn was interrupted")
+    assert text.startswith("[System note: Your previous turn did not finish.")
+    assert "interrupted" not in text and "stopped" not in text and "restart" not in text
     assert "fix the flaky test" in text
     assert kwargs["display_kind"] == "auto_continue"
     assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]

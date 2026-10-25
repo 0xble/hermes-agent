@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -111,15 +113,15 @@ async def test_prepare_route_identity_check_keeps_event_loop_responsive(monkeypa
     monkeypatch.setattr("gateway.run._load_gateway_config", lambda: cfg)
     monkeypatch.setattr(
         runner,
-        "_resolve_session_agent_runtime",
-        lambda **_kwargs: (
+        "_resolve_session_agent_runtime_async",
+        AsyncMock(return_value=(
             "test-model",
             {
                 "provider": "test-provider",
                 "base_url": "https://example.invalid/v1",
                 "api_key": "",
             },
-        ),
+        )),
     )
 
     def blocking_route_identity_check(*_args):

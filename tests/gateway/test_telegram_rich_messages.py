@@ -174,6 +174,29 @@ def test_adjacent_footnote_refs_get_a_superscript_separator():
     assert normalize_footnotes(result) == result
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Inline $[^2][^3]$ math",
+        "Inline $x_{[^2][^3]}$ math, then prose.",
+        "See <code>[^2][^3]</code> here",
+        "Keys <kbd>[^1][^2]</kbd> and <CODE class=\"x\">a[^1][^2]</CODE> stay",
+    ],
+)
+def test_adjacent_footnote_refs_in_inline_math_and_html_code_stay_literal(content):
+    """TeX math and inline HTML code are literal for Telegram, so no separator is injected there."""
+    from plugins.platforms.telegram.rich_markdown import normalize_footnotes
+
+    assert normalize_footnotes(content) == content
+    # Prose around them is still separated, and currency dollars do not open math.
+    for prose, expected in (
+        (f"{content} then refs[^1][^2]", f"{content} then refs[^1]<sup>,</sup>[^2]"),
+        ("Costs $5 and refs[^1][^2] then $6", "Costs $5 and refs[^1]<sup>,</sup>[^2] then $6"),
+        ("<b>Bold[^1][^2]</b>", "<b>Bold[^1]<sup>,</sup>[^2]</b>"),
+    ):
+        assert normalize_footnotes(prose) == expected
+
+
 def test_footnote_defs_after_a_list_get_a_spacer():
     from plugins.platforms.telegram.rich_markdown import normalize_footnotes
 
@@ -189,6 +212,75 @@ def test_footnote_defs_after_a_list_get_a_spacer():
         "```\n- a\n[^1]: x\n```",
     ):
         assert normalize_footnotes(unchanged) == unchanged
+
+
+def test_expandable_blockquote_renders_nested_markdown_as_html():
+    """Telegram does not parse Markdown nested inside an HTML blockquote."""
+    adapter = _make_adapter({"rich_messages": "always"})
+    content = (
+        "<blockquote expandable>\n"
+        "**What started it:** Brian asked why `slack` failed.\n\n"
+        "See [the issue](https://example.com) and ~~the old path~~.\n"
+        "</blockquote>"
+    )
+
+    markdown = adapter._rich_message_payload(content)["markdown"]
+
+    assert "<blockquote expandable>" in markdown
+    assert "<b>What started it:</b> Brian asked why <code>slack</code> failed." in markdown
+    assert '<a href="https://example.com">the issue</a>' in markdown
+    assert "<s>the old path</s>" in markdown
+    assert "**What started it:**" not in markdown
+    assert "`slack`" not in markdown
+    assert "<br><br>" in markdown
+
+
+def test_blockquote_markdown_normalization_does_not_touch_code_examples():
+    from plugins.platforms.telegram.rich_markdown import normalize_blockquote_markdown
+
+    fenced = "```html\n<blockquote expandable>\n**literal**\n</blockquote>\n```"
+    inline = "Use `<blockquote expandable>**literal**</blockquote>` as an example."
+
+    assert normalize_blockquote_markdown(fenced) == fenced
+    assert normalize_blockquote_markdown(inline) == inline
+
+
+def test_expandable_blockquote_preserves_code_regions_while_rendering_prose():
+    from plugins.platforms.telegram.rich_markdown import normalize_blockquote_markdown
+
+    content = (
+        "<blockquote expandable>\n"
+        "**Heading** and `**inline**`.\n"
+        "```python\n"
+        "**literal**\n"
+        "```\n"
+        "Raw <code>literal **HTML**</code>.\n"
+        "</blockquote>"
+    )
+
+    rendered = normalize_blockquote_markdown(content)
+
+    assert "<b>Heading</b>" in rendered
+    assert "<code>**inline**</code>" in rendered
+    assert "<b>**literal**</b>" not in rendered
+    assert "<code>literal <b>HTML</b></code>" not in rendered
+    assert "<code>literal **HTML**</code>" in rendered
+
+
+def test_expandable_blockquote_preserves_unfinished_code_fences():
+    from plugins.platforms.telegram.rich_markdown import normalize_blockquote_markdown
+
+    content = (
+        "<blockquote expandable>\n"
+        "```python\n"
+        "**literal**\n"
+        "</blockquote>"
+    )
+
+    rendered = normalize_blockquote_markdown(content)
+
+    assert "```python\n**literal**\n" in rendered
+    assert "<b>**literal**</b>" not in rendered
 
 
 @pytest.mark.asyncio
@@ -432,7 +524,7 @@ async def test_transient_rich_error_does_not_legacy_resend(exc):
 
 @pytest.mark.asyncio
 async def test_rich_transport_error_redacts_bot_token_even_when_redaction_disabled(monkeypatch):
-    import agent.redact as redact
+    from agent import redact
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
     token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
@@ -454,7 +546,7 @@ async def test_rich_transport_error_redacts_bot_token_even_when_redaction_disabl
 
 @pytest.mark.asyncio
 async def test_legacy_send_error_redacts_bot_token_without_traceback(monkeypatch, caplog):
-    import agent.redact as redact
+    from agent import redact
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
     token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
@@ -859,7 +951,7 @@ async def test_finalize_edit_cjk_rich_content_can_be_opted_in():
 
 @pytest.mark.asyncio
 async def test_legacy_edit_error_logs_redacted_bot_token_without_traceback(monkeypatch, caplog):
-    import agent.redact as redact
+    from agent import redact
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
     token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"

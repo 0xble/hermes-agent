@@ -149,7 +149,7 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["exit_code"], 0)
         self.assertFalse(result["stdout_truncated"])
-        self.assertEqual(result["stdout_bytes_total"], len("hello\n".encode("utf-8")))
+        self.assertEqual(result["stdout_bytes_total"], len(b"hello\n"))
         # The session-kernel path runs first and fails open on this fake env
         # (no PID from nohup), so search for the per-call sandbox commands
         # rather than pinning positions.
@@ -283,13 +283,13 @@ class TestRemoteSharedHostLockdown(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         local = root + sandbox
         sh = lambda c: subprocess.run(["bash", "-c", c.replace(sandbox, local)],
-                                      capture_output=True, text=True)
+                                      capture_output=True, text=True, check=False)
         self.assertEqual(sh(mkdir_cmd).returncode, 0)
         for d in (local, f"{local}/rpc"):
             self.assertEqual(os.stat(d).st_mode & 0o777, 0o700, d)
-        with open(f"{local}/sandbox.env", "w") as fh:
+        with open(f"{local}/sandbox.env", "w", encoding="utf-8") as fh:
             fh.write(env_ship.args[2])
-        with open(f"{local}/script.py", "w") as fh:
+        with open(f"{local}/script.py", "w", encoding="utf-8") as fh:
             fh.write("import os, sys\nprint(os.environ['HERMES_RPC_TOKEN'])\nsys.exit(7)\n")
         # The env reaches the child, its exit code is the command's, and the
         # token never leaks into the outer shell (the backend's session
@@ -481,7 +481,7 @@ class TestStubSchemaDrift(unittest.TestCase):
     # Parameters that are internal (injected by the handler, not user-facing)
     _INTERNAL_PARAMS = {"task_id", "user_task"}
     # Parameters intentionally blocked in the sandbox
-    _BLOCKED_TERMINAL_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release"}
+    _BLOCKED_TERMINAL_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release", "survive_restart"}
 
     def test_stubs_cover_all_schema_params(self):
         """Every user-facing parameter in the real schema must appear in the
@@ -491,8 +491,8 @@ class TestStubSchemaDrift(unittest.TestCase):
 
         # Import the registry and trigger tool registration
         from tools.registry import registry
-        import tools.file_tools  # noqa: F401 - registers read_file, write_file, patch, search_files
-        import tools.web_tools  # noqa: F401 - registers web_search, web_extract
+        import tools.file_tools
+        import tools.web_tools
 
         for tool_name, (sig, doc, args_expr) in _TOOL_STUBS.items():
             entry = registry._tools.get(tool_name)
@@ -863,7 +863,7 @@ class TestHeadTailTruncation(unittest.TestCase):
         self.assertIn("execute_code stdout was truncated", result["warning"])
         self.assertIn("read_file", result["warning"])
         self.assertIn("stdout_spill_path", result)
-        with open(result["stdout_spill_path"], encoding="utf-8") as f:
+        with open(result["stdout_spill_path"], encoding="utf-8-sig") as f:
             body = f.read()
         self.assertIn("HEAD", body)
         self.assertIn("TAIL", body)
@@ -917,7 +917,7 @@ class TestRpcTokenAuthorization(unittest.TestCase):
 
             def accept(self):
                 if self._served:
-                    raise socket.timeout()
+                    raise TimeoutError()
                 self._served = True
                 return self._conn, ("peer", 0)
 

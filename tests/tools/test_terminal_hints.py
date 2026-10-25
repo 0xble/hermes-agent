@@ -1,5 +1,6 @@
 """Tests for tools/terminal_hints.py — output-pattern failure hints."""
 
+import shlex
 from unittest.mock import patch as mock_patch
 
 
@@ -17,6 +18,17 @@ class TestAnnotateFailureBasics:
 
     def test_unknown_failure_returns_none(self):
         assert annotate_failure("./x", 1, "some unrecognized error") is None
+
+    def test_heavy_slot_wait_explains_command_did_not_run(self):
+        out = "heavy-slot: not started after 10s; queue position 3 of 5 (holders: pytest)"
+        hint = annotate_failure("pytest tests", 75, out)
+        assert hint is not None
+        assert "did not run" in hint
+        assert "background=true" in hint
+        assert "notify_on_complete=true" in hint
+
+    def test_unrelated_exit_75_has_no_heavy_slot_hint(self):
+        assert annotate_failure("./x", 75, "some unrelated failure") is None
 
     def test_only_first_matching_hint(self):
         out = 'CONFLICT (content): Merge conflict in a.py\npython: command not found'
@@ -62,8 +74,82 @@ class TestModuleNotFound:
         assert "hermes_cli" in hint
 
 
-class TestGitShapes:
+class TestPytestMissing:
+    @staticmethod
+    def _output(shape="quoted"):
+        if shape == "command-not-found":
+            return "bash: pytest: command not found"
+        if shape == "bare":
+            return "ModuleNotFoundError: No module named pytest"
+        return "ModuleNotFoundError: No module named 'pytest'"
 
+    def test_repo_runner_hint_uses_scripts_runner(self, tmp_path):
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").touch()
+
+        hint = annotate_failure("python -m pytest tests/test_x.py", 1, self._output(), str(tmp_path))
+
+        assert hint is not None
+        assert "Interpreter used lacks pytest" in hint
+        assert "use the repo's own runner" in hint
+        assert "scripts/run_tests.sh <files>" in hint
+
+    def test_repo_runner_hint_uses_git_toplevel_venv(self, tmp_path):
+        repo = tmp_path / "repo"
+        cwd = repo / "tests"
+        (repo / ".git").mkdir(parents=True)
+        cwd.mkdir()
+        (repo / ".venv" / "bin").mkdir(parents=True)
+        (repo / ".venv" / "bin" / "python").touch()
+
+        hint = annotate_failure("python -m pytest", 1, self._output("bare"), str(cwd))
+
+        assert hint is not None
+        # The runner lives at the toplevel, so the hint must resolve from tests/.
+        assert f"{shlex.quote(str(repo.resolve()))}/.venv/bin/python -m pytest" in hint
+
+    def test_toplevel_runner_path_with_spaces_is_shell_quoted(self, tmp_path):
+        repo = tmp_path / "my repo"
+        cwd = repo / "tests"
+        (repo / ".git").mkdir(parents=True)
+        cwd.mkdir()
+        (repo / "scripts").mkdir()
+        (repo / "scripts" / "run_tests.sh").touch()
+
+        hint = annotate_failure("python -m pytest", 1, self._output("bare"), str(cwd))
+
+        assert hint is not None
+        assert f"'{repo.resolve()}'/scripts/run_tests.sh <files>" in hint
+
+    def test_plugin_missing_is_not_pytest_missing(self, tmp_path):
+        out = "ModuleNotFoundError: No module named 'pytest_asyncio'"
+
+        hint = annotate_failure("python -m pytest", 1, out, str(tmp_path))
+
+        assert hint is None or "lacks pytest" not in hint
+
+    def test_repo_runner_hint_uses_uv_lock(self, tmp_path):
+        (tmp_path / "pyproject.toml").touch()
+        (tmp_path / "uv.lock").touch()
+
+        hint = annotate_failure("pytest", 127, self._output("command-not-found"), str(tmp_path))
+
+        assert hint is not None
+        assert "uv run pytest" in hint
+
+    def test_repo_runner_hint_falls_back_to_project_virtualenv(self, tmp_path):
+        hint = annotate_failure("pytest", 127, self._output("command-not-found"), str(tmp_path))
+
+        assert hint is not None
+        assert "use the project's virtualenv" in hint
+
+    def test_unrelated_failure_gets_no_pytest_hint(self):
+        hint = annotate_failure("python x.py", 1, "Permission denied")
+
+        assert hint is None or "pytest" not in hint
+
+
+class TestGitShapes:
     def test_branch_already_exists(self):
         out = "fatal: a branch named 'fix/x' already exists"
         hint = annotate_failure("git checkout -b fix/x", 128, out)

@@ -19,9 +19,9 @@ import socket
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from gateway.config import PlatformConfig  # noqa: E402
-from plugins.platforms.telegram import adapter as tg  # noqa: E402
-from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from gateway.config import PlatformConfig
+from plugins.platforms.telegram import adapter as tg
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 @pytest.fixture
@@ -60,7 +60,7 @@ def _stub_download(monkeypatch, size: int):
         async def get(self, url):
             return _Resp()
 
-    import tools.url_safety as url_safety
+    from tools import url_safety
 
     monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", lambda **kw: _Client())
 

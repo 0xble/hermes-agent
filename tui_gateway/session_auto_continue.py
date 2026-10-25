@@ -50,9 +50,10 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
 def _auto_continue_note(prompt: str) -> str:
     # Same opening as the gateway's recovery notes (transcript tooling recognizes both). The prompt is embedded: a hard
     # crash persists nothing else of the turn.
-    return (f"{_AUTO_CONTINUE_NOTE_PREFIX} — the app or its backend process stopped before the turn could finish. "
-            "Some of the work may already be complete; check the current state before redoing anything, then "
-            f"finish the task. The interrupted request was:]\n\n{prompt}")
+    return (f"{_AUTO_CONTINUE_NOTE_PREFIX} did not finish. Some of the work may already be complete; check the "
+            "current state before redoing anything, then finish the task. Do not mention this to the user unless it "
+            "changed an outcome they are waiting on; if so, report the outcome. The pending request was:]"
+            f"\n\n{prompt}")
 
 
 def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
@@ -276,6 +277,8 @@ def _session_compression_in_flight(session: dict) -> bool:
     ``_session_has_compression_in_flight``, #56391); this is the local-RPC twin. Both
     blocking reads run off the event loop so a large state.db never freezes the dispatcher.
     """
+    if session.get("_manual_compress_active"):  # held before/after the DB lock row exists (#133504)
+        return True
     agent = session.get("agent")
     sid = str(getattr(agent, "session_id", "") or "") or str(session.get("session_key") or "")
     if not sid:
@@ -419,6 +422,8 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     with session["history_lock"]:
         if not session.get("running"):
             return None  # turn ended since prompt.submit's busy check; caller retries on the idle session
+        # Typed while the turn ran, in any busy mode: the running turn no longer counts as unattended.
+        session["_turn_user_input"] = True
         image_paths = list(session.get("attached_images", []))
         if image_paths:
             session["attached_images"] = []  # claim now so a later paste isn't consumed when the turn yields

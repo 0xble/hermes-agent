@@ -14,6 +14,14 @@ def _wait(predicate, timeout=5.0):
         time.sleep(0.05)
 
 
+def test_cut_pending_status_is_not_done():
+    from hermes_cli import cli_process_dock
+
+    assert cli_process_dock.process_status({
+        "status": "exited", "completion_reason": "cut_pending", "exit_code": None,
+    }) == "running"
+
+
 def test_dock_paints_processes_under_agents_and_retires_finished_rows(monkeypatch):
     from hermes_cli import cli_process_dock
     from hermes_cli.cli_subagent_monitor import SubagentMonitor

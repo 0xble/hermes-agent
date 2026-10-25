@@ -106,7 +106,7 @@ class LoopCapConfig:
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> LoopCapConfig:
         """Build config from the ``tool_loop_guardrails.loop_caps`` section."""
         if not isinstance(data, Mapping):
             return cls()
@@ -134,7 +134,7 @@ class ToolCallGuardrailConfig:
     @classmethod
     def from_mapping(
         cls, data: Mapping[str, Any] | None, *, platform: str | None = None,
-    ) -> "ToolCallGuardrailConfig":
+    ) -> ToolCallGuardrailConfig:
         """Build config from `tool_loop_guardrails`; nested ``warn_after`` / ``hard_stop_after`` win over flat legacy keys."""
         if not isinstance(data, Mapping):
             data = {}
@@ -170,7 +170,7 @@ class ToolCallSignature:
     args_hash: str
 
     @classmethod
-    def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> "ToolCallSignature":
+    def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> ToolCallSignature:
         return cls(tool_name=tool_name, args_hash=_sha256(canonical_tool_args(args or {})))
 
     def to_metadata(self) -> dict[str, str]:
@@ -337,6 +337,36 @@ class ToolCallGuardrailController:
         self._persisted_result_paths: dict[str, str] = {}
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+
+    def reset_idempotent_read_progress(self) -> None:
+        """Forget success-repeat state for reads whose earlier results left the context.
+
+        Content-loss boundaries invalidate only the evidence used by successful-read loop detectors.
+        Failed-call counters, mutation progress, and per-turn loop caps remain intact.
+        """
+        for signature in tuple(self._no_progress):
+            if self._is_idempotent(signature.tool_name):
+                self._no_progress.pop(signature, None)
+
+        streak_signature = self._identical_streak_sig
+        affected_streak = streak_signature is not None and self._is_idempotent(streak_signature.tool_name)
+        if affected_streak:
+            self._identical_streak_sig = None
+            self._identical_streak_result_hash = ""
+            self._identical_streak_count = 0
+            self._identical_streak_first_call_id = ""
+
+        if any(self._is_idempotent(signature.tool_name) for signature, _result_hash, _repeatable in self._call_history):
+            self._call_history.clear()
+
+        decision = self._halt_decision
+        if (
+            decision is not None
+            and decision.signature is not None
+            and self._is_idempotent(decision.signature.tool_name)
+            and decision.code in {"idempotent_no_progress_block", "identical_call_streak_halt", "identical_cycle_halt"}
+        ):
+            self._halt_decision = None
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:

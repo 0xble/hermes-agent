@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import inspect
 import json
 import logging
 import sqlite3
@@ -39,7 +40,7 @@ from contextlib import closing
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from plugins.platforms.telegram.daily_quota import OUTBOUND_PROGRESS, DailyQuota
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
@@ -272,9 +273,14 @@ class MeteredBot:
         endpoint = "doApiRequest" if name == "do_api_request" else _camel_endpoint(name)
 
         async def metered(*args: Any, **kwargs: Any) -> Any:
+            # Raw Bot API calls carry routing inside api_kwargs, not at the
+            # top level. Rich standalone sends must spend the same chat budget.
+            raw_request = name == "do_api_request"
+            request_endpoint = (args[0] if args else kwargs.get("endpoint", endpoint)) if raw_request else endpoint
+            data = kwargs.get("api_kwargs", {}) if raw_request else kwargs
             return await limiter.process_request(
-                callback=lambda: attr(*args, **kwargs), args=(), kwargs={}, endpoint=endpoint,
-                data=kwargs, rate_limit_args=None)
+                callback=lambda: attr(*args, **kwargs), args=(), kwargs={}, endpoint=request_endpoint,
+                data=data, rate_limit_args=None)
 
         return metered
 
@@ -336,6 +342,12 @@ class ChatBudgetRateLimiter:
                 return True  # sendChatAction and draft endpoints return a bare boolean
         else:
             await self.budget.take(key)
+            # A penalty can be recorded while this request waits for the chat slot.
+            # Recheck after the wait so it cannot reach Telegram during that window.
+            if self._penalty_remaining is not None:
+                remaining = self._penalty_remaining(key)
+                if remaining:
+                    raise _penalty_refusal(float(remaining))
         if self.daily is not None:
             self.daily.record(key, endpoint, data)
         try:
@@ -384,7 +396,7 @@ _TRIGGER_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("[relay", "relay"),
     ("[IMPORTANT: Background process", "process"),
     ("[ASYNC DELEGATION", "delegation"),
-    ("[System note: The previous turn was interrupted", "restart"),
+    ("[System note: Resume the pending turn.", "restart"),  # gateway.run.RESUME_NOTE_PREFIX
 )
 _TRIGGER_FRAGMENTS: Tuple[Tuple[str, str], ...] = (
     ("background process", "process"),
@@ -429,6 +441,26 @@ def reset_trigger(token) -> None:
 
 def current_trigger() -> str:
     return _TRIGGER.get()
+
+
+def keep_trigger(callback: Callable[[], Any]) -> Callable[[], Awaitable[None]]:
+    """Run a deferred callback under the trigger current now, not the one current when it fires.
+
+    An in-band drain relabels the task for the follow-up turn before the previous turn's
+    post-delivery callbacks run, so without this they would be counted (and judged) as the follow-up.
+    """
+    trigger = _TRIGGER.get()
+
+    async def run() -> None:
+        token = _TRIGGER.set(trigger)
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+        finally:
+            _TRIGGER.reset(token)
+
+    return run
 
 
 class DailyCallCounter:

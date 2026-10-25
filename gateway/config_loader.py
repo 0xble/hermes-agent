@@ -91,10 +91,11 @@ _TOPLEVEL_BRIDGE: tuple = (
     ("multiplex_profiles", "multiplex_profiles", "gwdata", None, None),
     *_presence("room_link_url"),
     ("profile_routes", "profile_routes", "none", lambda v: isinstance(v, list), None),
-    *_presence("max_concurrent_sessions"),
+    *_presence("max_concurrent_sessions", "restart_replay_concurrency"),
     ("systemd_watchdog_seconds", "systemd_watchdog_seconds", "nested", None, None),
     ("streaming", "streaming", "dict", None, None),
     ("durable_outbox", "durable_outbox", "presence", None, None),
+    ("zero_cut_handover", "zero_cut_handover", "presence", lambda v: isinstance(v, dict), None),
     *_presence(
         "reset_triggers", "always_log_local", "write_sessions_json", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s", "loop_watchdog_max_strikes",
@@ -137,7 +138,7 @@ def bridge_toplevel_keys(yaml_cfg: dict, gateway_section: Any, gw_data: dict) ->
 
 # --- platform sections -----------------------------------------------------------
 
-def merge_platform_sections(yaml_cfg: dict, gateway_cfg: Any, gw_data: dict) -> dict:
+def merge_platform_sections(yaml_cfg: dict, gateway_cfg: Any, gw_data: dict, *, also: frozenset = frozenset()) -> dict:
     """Merge every place a platform block may live into ``gw_data["platforms"]`` and return it.
 
     Order (later wins on shared keys, ``extra`` deep-merged so gateway.json defaults survive):
@@ -145,7 +146,8 @@ def merge_platform_sections(yaml_cfg: dict, gateway_cfg: Any, gw_data: dict) -> 
     first so top-level config keeps precedence, matching the gateway.streaming fallback). An
     ``enabled`` key in any block sets the ``_enabled_explicit`` marker consumed by the env pass.
     Top-level adapter keys (``gateway.api_server.port: 8642``) reach ``extra`` in
-    ``PlatformConfig.from_dict``.
+    ``PlatformConfig.from_dict``. *also* names platforms whose ``gateway.<platform>`` shorthand counts
+    even while no adapter is registered (a platform that left core, read before its plugin loads).
     """
     platforms_data = _dict_slot(gw_data, "platforms")
 
@@ -168,7 +170,8 @@ def merge_platform_sections(yaml_cfg: dict, gateway_cfg: Any, gw_data: dict) -> 
     nested_gateway = gateway_cfg if isinstance(gateway_cfg, dict) else {}
     merge(nested_gateway.get("platforms"))
     merge(yaml_cfg.get("platforms"))
-    merge({k: v for k, v in nested_gateway.items() if k != "platforms" and isinstance(v, dict) and _is_platform_name(k)})
+    merge({k: v for k, v in nested_gateway.items()
+           if k != "platforms" and isinstance(v, dict) and (k in also or _is_platform_name(k))})
     return platforms_data
 
 

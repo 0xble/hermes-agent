@@ -12,6 +12,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from agent.message_metadata import append_message
+from agent.reasoning_promotion import answer_in_reasoning_capability
 from agent.reasoning_summaries import is_responses_reasoning_summary
 from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
 from agent.turn_failure_copy import stamp_failure
@@ -28,7 +29,7 @@ logger = logging.getLogger("agent.conversation_loop")
 
 
 def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
-    """Drop a trailing standalone silence marker from an interactive reply.
+    """Drop standalone silence-marker lines opening or ending an interactive reply.
 
     Decide on the visible text (inline think blocks removed), because a reply that is
     only reasoning plus a marker is intended silence: stripping the marker from the raw
@@ -37,12 +38,12 @@ def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
     """
     if not isinstance(text, str) or str(getattr(agent, "platform", "") or "").lower() in {"cron", "webhook"}:
         return text
-    from gateway.response_filters import is_intentional_silence_response, strip_trailing_silence_marker
+    from gateway.response_filters import is_intentional_silence_response, strip_edge_silence_markers
     try:
         visible = agent._strip_think_blocks(text)
     except Exception:
         visible = text
-    visible_result = strip_trailing_silence_marker(visible)
+    visible_result = strip_edge_silence_markers(visible)
     if is_intentional_silence_response(visible_result):
         # Bare marker (with or without reasoning) stays as-is for the silence path; a
         # marker-only run collapses to one marker.
@@ -51,8 +52,12 @@ def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
         return text
     # The visible text proved the trailing marker lines are top-level. A fence opened inside
     # a think block must not hide them in the raw text, so strip the raw text fence-blind.
-    raw_result = strip_trailing_silence_marker(text, respect_fences=False)
-    return raw_result if raw_result != text else visible_result
+    # Keep the raw form (reasoning intact) only when it removed every marker the visible
+    # pass did; a think block opening the raw text hides a leading marker from the raw pass.
+    raw_result = strip_edge_silence_markers(text, respect_fences=False)
+    # ``visible == text`` covers both "no think block" and "stripping raised above".
+    raw_visible = raw_result if visible == text else agent._strip_think_blocks(raw_result)
+    return raw_result if raw_result != text and raw_visible.strip() == visible_result.strip() else visible_result
 
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
@@ -78,7 +83,7 @@ class FinalResponseVerdict:
     _pending_verification_response: Any
     _pending_verification_response_previewed: Any
     api_call_count: int
-    result: Optional[Dict[str, Any]] = None
+    result: Optional[dict[str, Any]] = None
 
 
 def finish_text_response(
@@ -99,7 +104,7 @@ def finish_text_response(
         _join_truncated_parts
     )
 
-    def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> FinalResponseVerdict:
+    def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> FinalResponseVerdict:
         return FinalResponseVerdict(
             action=action, active_system_prompt=active_system_prompt, final_response=final_response,
             _turn_exit_reason=_turn_exit_reason,
@@ -113,17 +118,18 @@ def finish_text_response(
             result=result,
         )
 
-    # Reasoning-only clean stop: some reasoning parsers (vLLM nemotron_v3 past ~500K
-    # prompt tokens) file the whole answer as reasoning when the model omits the closing
-    # delimiter. ``finish_reason == "stop"`` means the provider considers generation
-    # complete, so the empty-response ladder would only re-bill the same input to arrive
-    # at a truncated preview of this text; promote the reasoning to the visible answer
-    # BEFORE the ladder. ``length`` (cut off mid-thought) stays on the continuation path.
+    # Reasoning-only clean stop on a trusted route (elsewhere reasoning is private and takes the
+    # ladder): some parsers (vLLM nemotron_v3 past ~500K prompt tokens) file the whole answer as
+    # reasoning when the closing delimiter is missing; ``stop`` means generation is complete, so
+    # promote it BEFORE the ladder. ``length`` (cut off mid-thought) stays on the continuation path.
     # The promoted text is RETURNED as the answer but never written into the assistant
     # row's ``content``: chain-of-thought stored as ordinary content is indistinguishable
     # from a real reply on every history surface (#111761). The row keeps ``content``
     # empty with the text in its reasoning fields and carries the promoted text as the
     # ``api_content`` sidecar, so the next turn still replays it byte-identically.
+    # Anthropic thinking (signed ``thinking`` block, or a plugin's ``*.native_assistant`` carrier
+    # of native Claude turns) is a summary written by a separate model, never the answer: it
+    # takes the empty-response continuation below instead.
     _content = assistant_message.content
     _promoted = None
     # Responses/Codex reasoning is a provider-generated summary, not the assistant's visible
@@ -136,7 +142,18 @@ def finish_text_response(
         and not assistant_message.tool_calls
         and (_content is None or (isinstance(_content, str) and not _content.strip()))
     )
-    if _contentless_stop and not _responses_reasoning_summary:
+    if (
+        _contentless_stop
+        and not _responses_reasoning_summary
+        and not any(
+            isinstance(d, dict) and (
+                (d.get("type") in ("thinking", "redacted_thinking") and (d.get("signature") or d.get("data")))
+                or str(d.get("type") or "").endswith(".native_assistant")
+            )
+            for d in getattr(assistant_message, "reasoning_details", None) or ()
+        )
+        and answer_in_reasoning_capability(agent)
+    ):
         _promoted = agent._extract_reasoning(assistant_message) or None
         if _promoted:
             # WARNING, not INFO: a model that keeps ending turns this way is stalled

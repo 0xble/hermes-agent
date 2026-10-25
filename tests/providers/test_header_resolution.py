@@ -54,8 +54,7 @@ elif sys.argv[1] == 'request-metadata':
                  'hermes_cli.model_catalog', 'hermes_cli.models',
                  'hermes_cli.doctor_connectivity', 'hermes_cli.models_pricing',
                  'hermes_cli.models_local', 'hermes_cli.models_reasoning_caps',
-                 'hermes_cli.web_server_messaging', 'plugins.memory.openviking',
-                 'plugins.platforms.slack.adapter', 'plugins.web.perplexity.provider'):
+                 'hermes_cli.web_server_messaging', 'plugins.platforms.slack.adapter', 'plugins.web.perplexity.provider'):
         importlib.import_module(name)
 elif sys.argv[1] == 'nonvision-metadata':
     import builtins
@@ -293,24 +292,6 @@ def _check_telegram_onboarding(monkeypatch, module, expected):
     assert observed[0]["authorization"] == "Bearer probe-key"
 
 
-def _check_openviking(monkeypatch, module, expected):
-    import httpx
-
-    observed = _capture_sync_requests(monkeypatch, SimpleNamespace(httpx=httpx), {"status": "ok"})
-    client = module._VikingClient("https://viking.invalid", api_key="probe-key", account="account", user="user", agent="agent")
-    assert client.get("/probe") == {"status": "ok"}
-    assert observed[0]["user-agent"] == expected
-    assert observed[0]["x-openviking-actor-peer"] == "agent"
-    assert observed[0]["authorization"] == "Bearer probe-key"
-    assert observed[0]["x-api-key"] == "probe-key"
-    assert "x-openviking-account" not in observed[0]
-    trusted = module._VikingClient("https://viking.invalid", account="account", user="user", agent="agent")
-    assert trusted.get("/probe") == {"status": "ok"}
-    assert observed[-1]["user-agent"] == expected
-    assert observed[-1]["x-openviking-account"] == "account"
-    assert observed[-1]["x-openviking-user"] == "user"
-
-
 def _check_slack(monkeypatch, module, expected):
     pytest.importorskip("slack_sdk.web.async_client")
     pytest.importorskip("slack_bolt.async_app")
@@ -348,7 +329,6 @@ _REQUEST_CONSUMERS = {
     "manifest": ("hermes_cli.model_catalog", "hermes-cli", _check_manifest),
     "cli-catalogs": ("hermes_cli.models", "hermes-cli", _check_cli_catalogs),
     "telegram-onboarding": ("hermes_cli.web_server_messaging", "HermesDashboard", _check_telegram_onboarding),
-    "openviking": ("plugins.memory.openviking", "openviking-memory-hermes", _check_openviking),
     "slack": ("plugins.platforms.slack.adapter", "HermesAgent", _check_slack),
     "perplexity": ("plugins.web.perplexity.provider", "HermesAgent", _check_perplexity),
 }

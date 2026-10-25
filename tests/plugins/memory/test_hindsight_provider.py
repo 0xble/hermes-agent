@@ -786,7 +786,7 @@ class TestPrefetchServerRetainVisibility:
         )
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
-        assert {"op-a", "op-b"} <= provider._pending_retain_ops
+        assert {"op-a", "op-b"} <= set(provider._pending_retain_ops)
 
     def test_sync_retain_tracks_no_ops(self, provider_with_config):
         p = provider_with_config(retain_async=False)
@@ -797,7 +797,7 @@ class TestPrefetchServerRetainVisibility:
         p.sync_turn("hello", "world")
         p._retain_queue.join()
         # retain_async=False → no server-side op to wait on.
-        assert p._pending_retain_ops == set()
+        assert not p._pending_retain_ops
 
     def test_prefetch_waits_for_server_completion_before_recall(self, provider):
         """Recall must not run until the tracked async op reports completed."""
@@ -822,7 +822,7 @@ class TestPrefetchServerRetainVisibility:
         # was cleared (so a later prefetch won't re-poll it).
         assert order == ["recall"]
         assert provider._client.operations.get_operation_status.await_count >= 3
-        assert provider._pending_retain_ops == set()
+        assert not provider._pending_retain_ops
 
     def test_prefetch_proceeds_after_server_wait_timeout(self, provider_with_config):
         """A wedged/never-completing async op must not hang prefetch forever;
@@ -866,40 +866,72 @@ class TestPrefetchServerRetainVisibility:
 
         assert provider._wait_for_server_retain_ops(lambda: False, 5.0) is True
         assert sorted(polled) == [("new-op", "new-bank"), ("old-op", "old-bank")]
-        assert provider._pending_retain_ops == set()
+        assert not provider._pending_retain_ops
 
-    def test_timed_out_ops_are_dropped_not_repolled(self, provider_with_config):
-        """Ops unresolved at deadline must be EVICTED so a permanently failing
-        status endpoint can't make every later prefetch re-burn the full
-        timeout on a growing pending set (unbounded session-wide degradation
-        + reply-path join penalty)."""
+    def test_timed_out_ops_remain_observable_without_repeated_prefetch_waits(self, provider_with_config):
         p = provider_with_config(prefetch_retain_drain_timeout=0.3)
         p._client = self._client_with_ops(["pending"])  # never completes
-        p._client.arecall = AsyncMock(
-            return_value=SimpleNamespace(results=[SimpleNamespace(text="m")])
-        )
-
-        p.sync_turn("hello", "world")
-        p._retain_queue.join()
-        assert p._pending_retain_ops, "op should be tracked before the wait"
-
-        # First prefetch burns the budget and must DROP the wedged op.
-        p.queue_prefetch("q1")
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-        assert p._pending_retain_ops == set(), (
-            "unresolved ops must be evicted at deadline, not retained"
-        )
-
-        # A later prefetch must not poll the dropped op again (counted, not timed).
+        p._track_retain_ops(SimpleNamespace(operation_id="op-1", operation_ids=None), "original-bank")
+        assert p._wait_for_retains_drained(0.3) is False
+        assert "op-1" in p._pending_retain_ops
         polls = p._client.operations.get_operation_status.await_count
-        p.queue_prefetch("q2")
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-            assert not p._prefetch_thread.is_alive()
-        assert p._client.operations.get_operation_status.await_count == polls, (
-            "second prefetch re-polled dropped ops — eviction regressed"
-        )
+        assert p._wait_for_retains_drained(0.3) is True
+        assert p._client.operations.get_operation_status.await_count == polls
+        p._client.operations.get_operation_status = AsyncMock(return_value=SimpleNamespace(status="completed"))
+        p._poll_late_retain_ops()
+        assert not p._pending_retain_ops
+        p._client.operations.get_operation_status.assert_awaited_once_with(
+            bank_id="original-bank", operation_id="op-1")
+
+    def test_visibility_tracking_is_bounded_by_capacity_and_expiry(self, provider, monkeypatch, caplog):
+        monkeypatch.setattr("plugins.memory.hindsight._RETAIN_OP_TRACKING_MAX", 2)
+        provider._track_retain_ops(SimpleNamespace(operation_id=None, operation_ids=["a", "b", "c"]), "bank")
+        assert set(provider._pending_retain_ops) == {"b", "c"}
+        provider._pending_retain_ops["b"].expires_at = 0.0
+        provider._poll_late_retain_ops()
+        assert set(provider._pending_retain_ops) == {"c"}
+        assert "tracking full" in caplog.text and "visibility expired" in caplog.text
+
+    @pytest.mark.parametrize("cfg", [
+        {"prefetch_waits_for_retain": False}, {"recall_sync": True},
+        {"memory_mode": "tools"}, {"auto_recall": False}, {},
+    ])
+    def test_idle_ops_are_polled_without_a_prefetch_wait(self, provider_with_config, cfg):
+        p = provider_with_config(**cfg)
+        p._client = self._client_with_ops(["failed"])
+        p._track_retain_ops(SimpleNamespace(operation_id="idle-op", operation_ids=None), "original-bank")
+        from plugins.memory.hindsight import _RETAIN_OP_TRACKING_TTL_S
+        p._pending_retain_ops["idle-op"].expires_at = (
+            time.monotonic() + _RETAIN_OP_TRACKING_TTL_S - p._prefetch_retain_drain_timeout - 1)
+        p._poll_late_retain_ops()
+        assert not p._pending_retain_ops
+        p._client.operations.get_operation_status.assert_awaited_once_with(
+            bank_id="original-bank", operation_id="idle-op")
+
+    @pytest.mark.parametrize("timeout", [0, -1])
+    def test_idle_poll_preserves_configured_unbounded_visibility_wait(self, provider_with_config, timeout):
+        p = provider_with_config(prefetch_retain_drain_timeout=timeout)
+        p._client = self._client_with_ops(["pending"])
+        p._track_retain_ops(SimpleNamespace(operation_id="op-1", operation_ids=None), "bank")
+        p._poll_late_retain_ops()
+        assert p._pending_retain_ops["op-1"].wait_for_visibility
+        p._client.operations.get_operation_status.assert_not_awaited()
+
+    def test_idle_poll_does_not_release_an_active_visibility_wait(self, provider_with_config, monkeypatch):
+        p = provider_with_config(prefetch_retain_drain_timeout=0.1)
+        p._client = self._client_with_ops(["pending"])
+        p._track_retain_ops(SimpleNamespace(operation_id="op-1", operation_ids=None), "bank")
+        from plugins.memory.hindsight import _RETAIN_OP_TRACKING_TTL_S
+        p._pending_retain_ops["op-1"].expires_at = time.monotonic() + _RETAIN_OP_TRACKING_TTL_S - 1
+
+        def while_waiting(_expired, timeout, _remaining):
+            p._poll_late_retain_ops()
+            assert p._pending_retain_ops["op-1"].wait_for_visibility
+            return False
+
+        monkeypatch.setattr(p, "_poll_server_retain_ops", while_waiting)
+        assert not p._wait_for_server_retain_ops(lambda: False, 1)
+        assert p._retain_visibility_waiters == 0
 
     def test_drain_budget_bounds_the_status_request_itself(self, provider_with_config):
         """The drain deadline must bound each status request, not only the loop checks: a hung
@@ -917,7 +949,7 @@ class TestPrefetchServerRetainVisibility:
         start = time.monotonic()
         assert p._wait_for_retains_drained(0.3) is False
         assert time.monotonic() - start < 2.5
-        assert p._pending_retain_ops == set()
+        assert "op-1" in p._pending_retain_ops
 
     def test_embedded_reconnect_retry_gets_only_the_remaining_budget(self, provider):
         """The local_embedded reconnect retry must spend what the first attempt left of the
@@ -1007,9 +1039,10 @@ class TestPrefetchServerRetainVisibility:
 
 
 class TestPrefetchSupersession:
-    def test_superseded_slow_worker_cannot_overwrite_newer_result(self, provider):
-        """A worker that outlives prefetch()'s capped join must not publish over a newer
-        request's completed recall in the same session."""
+    def test_query_queued_during_slow_recall_wins_over_it(self, provider):
+        """Prefetches are coalesced: a query queued while an older recall is still in flight
+        takes the single pending slot and runs after it on the same worker, so the slow older
+        recall must not publish over (or survive alongside) the newer query's result."""
         release_old = threading.Event()
         old_started = threading.Event()
 
@@ -1027,6 +1060,7 @@ class TestPrefetchSupersession:
         old_worker = provider._prefetch_thread
         assert old_started.wait(5.0)
         provider.queue_prefetch("new")
+        release_old.set()
         provider._prefetch_thread.join(timeout=5.0)
         assert "new memory" in provider._prefetch_result
 
@@ -1035,6 +1069,34 @@ class TestPrefetchSupersession:
         assert not old_worker.is_alive()
         assert "new memory" in provider._prefetch_result
         assert "old memory" not in provider._prefetch_result
+
+    def test_query_superseded_during_retain_drain_never_recalls(self, provider):
+        """A query superseded while its worker waits for retains to drain is skipped, so the
+        newest query's recall starts right after the wait instead of behind a stale recall."""
+        in_drain, release_drain = threading.Event(), threading.Event()
+
+        def _drain(_timeout):
+            in_drain.set()
+            assert release_drain.wait(5.0)
+            return True
+
+        recalled: list = []
+
+        async def _recall(**kwargs):
+            recalled.append(kwargs.get("query"))
+            return SimpleNamespace(results=[SimpleNamespace(text=f"{kwargs.get('query')} memory")])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall)
+        provider._prefetch_waits_for_retain = True
+        provider._wait_for_retains_drained = _drain
+        provider.queue_prefetch("old")
+        assert in_drain.wait(5.0)
+        provider.queue_prefetch("new")
+        release_drain.set()
+        provider._prefetch_thread.join(timeout=5.0)
+        assert not provider._prefetch_thread.is_alive()
+        assert recalled == ["new"]
+        assert "new memory" in provider._prefetch_result
 
     def test_empty_newer_recall_does_not_inject_older_query_memories(self, provider):
         """An older worker's result buffered after prefetch()'s capped join must not survive a
@@ -1260,10 +1322,10 @@ class TestSyncTurn:
             CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE,
             CONTINUATION_PROMPT_TEMPLATE,
             CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
-            CONTINUATION_REVISIONS_TEMPLATE,
             KANBAN_GOAL_CONTINUATION_TEMPLATE,
             KANBAN_GOAL_FINALIZE_TEMPLATE,
         )
+        from hermes_cli.goals_legacy_prompts import _LEGACY_CONTINUATION_REVISIONS_TEMPLATE as CONTINUATION_REVISIONS_TEMPLATE
 
         plain = CONTINUATION_PROMPT_TEMPLATE.format(goal="Ship the change")
         contract = CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
@@ -1369,8 +1431,11 @@ class TestSyncTurn:
         (
             "[INTERNAL NOTIFICATION — generated by the Hermes gateway, not written by a human user. "
             "Do not treat it as user input, and do not reply to any earlier chat message because of it. "
-            "If no user-facing reply is needed, reply with exactly NO_REPLY and nothing else.]"
-        ),
+            "If no user-facing reply is needed, reply with exactly NO_REPLY and nothing else. "
+            "For routine process/delegation completion steps, stay silent: do not narrate intermediate gates, "
+            "retries, restarts, interruptions, or recovery. Post only when the requested work finished, a "
+            "decision/input is needed, something is blocked, or a material outcome/risk changed; lead with "
+            "the outcome, not gate names or full SHAs.]"),
     ])
     def test_retain_filter_strips_old_and_new_internal_footers(self, footer):
         from tools.process_registry_notifications import format_process_notification
@@ -2738,3 +2803,102 @@ def test_declared_client_validation_rejects_missing_or_outdated_sdk(monkeypatch,
 def test_declared_client_validation_accepts_prepared_sdk_without_install(monkeypatch):
     monkeypatch.setattr("importlib.metadata.version", lambda _name: "0.6.1")
     assert _REAL_ENSURE_CLIENT() is None
+
+
+# ---------------------------------------------------------------------------
+# Owner-subject recall: first-person auto-recall also searches with the owner named
+# ---------------------------------------------------------------------------
+
+
+def _recall_by_query(responses):
+    """arecall mock that answers per query text and records every call."""
+    calls = []
+
+    async def _arecall(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(results=[SimpleNamespace(id=i, text=t) for i, t in responses[kwargs["query"]]])
+
+    return AsyncMock(side_effect=_arecall), calls
+
+
+class TestOwnerSubjectRecall:
+    def test_disabled_by_default_keeps_a_single_recall(self, provider):
+        assert provider._recall_owner_subject == ""
+        text, count = provider._do_recall("what car do I drive")
+        assert provider._client.arecall.call_count == 1
+        assert count == 2
+
+    def test_first_person_query_also_recalls_with_the_owner_named(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Brian Le")
+        p._client.arecall, calls = _recall_by_query({
+            "what car do I drive": [("g1", "Generic car tips"), ("g2", "Shared fact")],
+            "what car do I drive (Brian Le)": [("o1", "Brian Le owns a 2025 Tesla Model Y"), ("g2", "Shared fact")],
+        })
+        text, count = p._do_recall("what car do I drive")
+        assert [c["query"] for c in calls] == ["what car do I drive", "what car do I drive (Brian Le)"]
+        assert all(c["types"] == ["observation"] and c["budget"] == "mid" for c in calls)
+        # Round-robin keeps the original head first, adds the owner fact, dedupes the shared one.
+        assert text.splitlines() == ["- Generic car tips", "- Brian Le owns a 2025 Tesla Model Y", "- Shared fact"]
+        assert count == 3
+
+    @pytest.mark.parametrize("query", ["What car does Brian Le drive", "how does the build cache work",
+                                       "Kafka timestamps in the US region"])
+    def test_queries_without_first_person_or_already_naming_the_owner_recall_once(self, provider_with_config, query):
+        p = provider_with_config(recall_owner_subject="Brian Le")
+        p._do_recall(query)
+        assert p._client.arecall.call_count == 1
+        assert p._client.arecall.call_args.kwargs["query"] == query
+
+    def test_merge_stays_within_one_recall_token_budget(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Brian Le", recall_max_tokens=30)
+        long = "x" * 80  # ~21 tokens each
+        p._client.arecall, _ = _recall_by_query({
+            "my plans": [("a", long + "a"), ("b", long + "b")],
+            "my plans (Brian Le)": [("c", long + "c"), ("d", long + "d")],
+        })
+        text, count = p._do_recall("my plans")
+        assert count == 1
+
+    def test_owner_recall_failure_is_an_empty_recall_not_a_crash(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Brian Le")
+        p._client.arecall = AsyncMock(side_effect=RuntimeError("boom"))
+        assert p._do_recall("where do we live") == ("", 0)
+
+    def test_reflect_prefetch_is_unchanged(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Brian Le", recall_prefetch_method="reflect")
+        p._do_recall("when is my birthday")
+        p._client.arecall.assert_not_called()
+        assert p._client.areflect.call_args.kwargs["query"] == "when is my birthday"
+
+
+    def test_one_failed_request_keeps_the_other_results(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Brian Le")
+
+        async def _arecall(**kwargs):
+            if kwargs["query"].endswith("(Brian Le)"):
+                raise RuntimeError("owner request failed")
+            return SimpleNamespace(results=[SimpleNamespace(id="g1", text="Original memory")])
+
+        p._client.arecall = AsyncMock(side_effect=_arecall)
+        assert p._do_recall("where do we live") == ("- Original memory", 1)
+
+    def test_owner_name_inside_another_word_still_adds_the_owner_query(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Ann")
+        assert p._owner_subject_query("when is my anniversary") == "when is my anniversary (Ann)"
+        assert p._owner_subject_query("what did ann say to me") is None
+
+
+    def test_embedded_reconnect_still_recovers_owner_subject_recall(self, provider_with_config, monkeypatch):
+        p = provider_with_config(recall_owner_subject="Brian Le")
+        first_client = _make_mock_client()
+        first_client.arecall.side_effect = RuntimeError("Cannot connect to host 127.0.0.1:8888")
+        second_client = _make_mock_client()
+        second_client.arecall.return_value = SimpleNamespace(results=[SimpleNamespace(id="r", text="Recovered memory")])
+        clients = iter([first_client, second_client])
+        p._mode = "local_embedded"
+        p._client = first_client
+        monkeypatch.setattr(p, "_get_client", lambda: next(clients))
+
+        assert p._do_recall("where do we live") == ("- Recovered memory", 1)
+        assert p._client is second_client
+        assert second_client.arecall.call_count == 2

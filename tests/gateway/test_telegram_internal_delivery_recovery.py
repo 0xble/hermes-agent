@@ -98,7 +98,7 @@ async def test_polling_health_replays_only_owner_failed_rows_once():
     assert primary.send.await_count == 1
     assert primary.send.call_args.kwargs["content"].endswith("answer primary")
     assert primary.send.call_args.kwargs["content"].startswith(
-        ledger.RECONNECTED_MARKER
+        ledger.RECOVERED_MARKER
     )
     secondary.send.assert_not_awaited()
 
@@ -167,3 +167,150 @@ async def test_failure_persisted_after_recovery_sweep_is_redelivered_once():
         Platform.TELEGRAM, profile="default"
     )
     assert primary.send.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["default", "secondary"])
+@pytest.mark.parametrize("cancel_count", [1, 2])
+@pytest.mark.parametrize("phase", ["claim", "clear", "note", "send", "delivered_write", "refund_before", "refund_after"])
+async def test_cancelled_recovery_settles_or_refunds_each_claim_once(
+    monkeypatch, profile, cancel_count, phase,
+):
+    import threading
+
+    primary, secondary = _adapter("default"), _adapter("secondary")
+    runner = _runner(primary, secondary)
+    adapter, sibling = (primary, secondary) if profile == "default" else (secondary, primary)
+    _failed_row("first", profile)
+    _failed_row("second", profile)
+    _failed_row("sibling", "secondary" if profile == "default" else "default")
+    loop = asyncio.get_running_loop()
+    entered, release = asyncio.Event(), asyncio.Event()
+    thread_release = threading.Event()
+    writes = []
+
+    async def blocked(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return SendResult(success=True, message_id="sent") if phase == "send" else None
+
+    def delay_claim():
+        real_sweep = ledger.sweep_failed_for_runtime
+        def delayed_sweep(*args, **kwargs):
+            rows = real_sweep(*args, **kwargs)
+            loop.call_soon_threadsafe(entered.set)
+            assert thread_release.wait(10)
+            return rows
+        monkeypatch.setattr(ledger, "sweep_failed_for_runtime", delayed_sweep)
+    def delay_write():
+        name = "mark_delivered" if phase == "delivered_write" else "release_runtime_claim"
+        real_write = getattr(ledger, name)
+        def delayed_write(*args, **kwargs):
+            writes.append(args[0])
+            if len(writes) != 1:
+                return real_write(*args, **kwargs)
+            result = real_write(*args, **kwargs) if phase == "refund_after" else None
+            loop.call_soon_threadsafe(entered.set)
+            assert thread_release.wait(10)
+            return result if phase == "refund_after" else real_write(*args, **kwargs)
+        monkeypatch.setattr(ledger, name, delayed_write)
+        if phase.startswith("refund"):
+            runner._async_session_store.clear_resume_pending.side_effect = RuntimeError("store unavailable")
+    def delay_clear():
+        runner._async_session_store.clear_resume_pending.side_effect = blocked
+
+    def delay_note():
+        runner._redelivery_restart_note_event = blocked
+
+    def delay_send():
+        adapter.send.side_effect = blocked
+
+    {
+        "claim": delay_claim,
+        "delivered_write": delay_write,
+        "refund_before": delay_write,
+        "refund_after": delay_write,
+        "clear": delay_clear,
+        "note": delay_note,
+        "send": delay_send,
+    }[phase]()
+
+    task = asyncio.create_task(
+        runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile=profile)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        assert _state("first")[0] == ("failed" if phase == "refund_after" else "attempting")
+        for _ in range(cancel_count):
+            task.cancel()
+            await asyncio.sleep(0)
+        if phase == "refund_after":
+            # A replacement can claim the row before the older refund await returns.
+            # Repeated cancellation must not restart that refund against this claim.
+            successor = ledger.sweep_failed_for_runtime("telegram", profile=profile)
+            assert [row["obligation_id"] for row in successor] == ["first"]
+        thread_release.set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        if phase in {"send", "delivered_write"}:
+            assert _state("first") == ("delivered", 1)
+            assert adapter.send.await_count == 1
+        elif phase == "refund_after":
+            assert _state("first") == ("attempting", 1)
+            assert writes.count("first") == 1
+            adapter.send.assert_not_awaited()
+        else:
+            assert _state("first") == ("failed", 0)
+            adapter.send.assert_not_awaited()
+        assert _state("second") == _state("sibling") == ("failed", 0)
+        sibling.send.assert_not_awaited()
+    finally:
+        thread_release.set()
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["default", "secondary"])
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_sweep_failure_preserves_pending_teardown_cancellation(monkeypatch, profile, cancelled):
+    import threading
+
+    primary, secondary = _adapter("default"), _adapter("secondary")
+    runner = _runner(primary, secondary)
+    _failed_row("waiting", profile)
+    loop = asyncio.get_running_loop()
+    entered, release = asyncio.Event(), threading.Event()
+
+    def failing_sweep(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        raise RuntimeError("ledger sweep unavailable")
+
+    monkeypatch.setattr(ledger, "sweep_failed_for_runtime", failing_sweep)
+    task = asyncio.create_task(
+        runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile=profile)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        if cancelled:
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+        release.set()
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        else:
+            assert await asyncio.wait_for(task, 10) == 0
+        assert _state("waiting") == ("failed", 0)
+        primary.send.assert_not_awaited()
+        secondary.send.assert_not_awaited()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

@@ -14,8 +14,6 @@ import logging
 import os
 from typing import Optional
 
-from cron.env_settings import cron_env_setting
-
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
 
@@ -83,28 +81,23 @@ def _cron_preflight_enabled(cfg: dict) -> bool:
     return not isinstance(cron_cfg, dict) or cron_cfg.get("preflight", True) is not False
 
 
-def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
-    """READ-ONLY probe: would provider resolution fail for lack of a key? Mirrors run_job's
-    requested-provider computation. Skipped when the job has a fallback chain — auth-fallback may
-    legitimately rescue a missing primary key. A pinned job does not borrow the global chain,
-    but can use the explicitly declared cron chain (``_job_fallback_chain``)."""
-    try:
-        if _sched._job_fallback_chain(job, cfg):
-            return None
-    except Exception:
-        return None  # fail-open: never block on a preflight-internal error
+def _preflight_check_provider_key(job: dict, cfg: dict, jc=None) -> Optional[str]:
+    """Read-only credential verdict for the same resolved route and fallback chain as execution.
 
-    _cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
-    requested = (
-        job.get("provider") or str((_cron_cfg or {}).get("model_provider") or "").strip() or None)
-    model = job.get("model") or cron_env_setting("HERMES_MODEL") or ""
+    Standalone doctor/check callers resolve config-only context here. Dispatch supplies
+    its existing context, so no config or credentials are independently reinterpreted.
+    """
+    try:
+        jc = jc if jc is not None else _sched._resolve_cron_job_config(job, cfg)
+        if _sched._job_fallback_chain(job, jc.cfg, jc.route):
+            return None  # execution can rescue a missing primary credential
+        kwargs = _sched._cron_runtime_kwargs(job, jc)
+    except Exception:
+        return None  # preflight-internal errors fail open
 
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        kwargs = {"requested": requested, "target_model": model}
-        if job.get("base_url"):
-            kwargs["explicit_base_url"] = job.get("base_url")
         resolve_runtime_provider(**kwargs)
     except AuthError as exc:
         if is_rate_limited_auth_error(exc):
@@ -384,7 +377,7 @@ def _empty_requested_mcp_toolsets(job: dict, cfg: dict) -> Optional[str]:
         "the job's toolsets.")
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_job_config(job: dict, cfg: dict, jc=None) -> Optional[str]:
     """Pre-dispatch validation: return a reason (missing key, unconfigured delivery, unready skill)
     so the caller refuses BEFORE building agent machinery or burning an LLM call. Every check fails
     open — preflight blocks only on an affirmative misconfiguration verdict.
@@ -393,7 +386,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     follows the alert-once pattern from the dead-pin auto-pause (#73506).
     """
     for name, check in (
-        ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
+        ("provider_key", lambda: _preflight_check_provider_key(job, cfg, jc)),
         ("skills", lambda: _preflight_check_skills(job)),
         ("delivery", lambda: _preflight_check_delivery(job))):
         try:
@@ -408,5 +401,5 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
 
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully
 # populated before ``scheduler`` re-exports from it.
-from cron import scheduler as _sched  # noqa: E402
-from cron import scheduler_delivery as _delivery  # noqa: E402
+from cron import scheduler as _sched
+from cron import scheduler_delivery as _delivery

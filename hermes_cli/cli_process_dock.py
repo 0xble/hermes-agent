@@ -28,7 +28,7 @@ def _last_output_line(buffer: str) -> str:
 
 
 def process_status(entry: dict) -> str:
-    if entry.get("status") != "exited":
+    if entry.get("status") != "exited" or entry.get("completion_reason") == "cut_pending":
         return "running"
     reason = _STATUS_BY_REASON.get(entry.get("completion_reason") or "")
     if reason:

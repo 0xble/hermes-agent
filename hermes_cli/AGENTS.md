@@ -124,10 +124,11 @@ thinking_verbs, wings), `tool_prefix`, `tool_emojis`, `branding.*` (agent_name, 
 response_label, prompt_symbol). Consumers: `banner.py`, `display.py`, `cli.py`. Key-by-key table
 and YAML template: `website/docs/user-guide/features/skins.md`.
 
-## Update pipeline (`hermes update`) — transactional; every stage guards a real field failure
+## Update pipeline (`hermes update`)
 
-Fleet-update campaign #91277 (Aug 2026). A PR that weakens a stage must answer for the failure class
-it guards. `plan → snapshot → apply → restart-per-kind → verify → report`
+Transactional, `plan → snapshot → apply → restart-per-kind → verify → report`; every stage guards a
+real field failure (fleet campaign #91277), and a PR that weakens a stage answers for that class.
+The stage-by-stage contract: `website/docs/developer-guide/cli-internals.md` § Update pipeline.
 
 - **Plan** (`update_inventory.py`, `hermes update --plan`): read-only inventory — install kind, all
   profiles, every live gateway with supervisor + running code version. Deployment kinds are
@@ -202,8 +203,8 @@ root). Profiles are independent
 islands by design — no live config inheritance; `--clone` copies at creation, minus messaging
 channels (`profile_channels.py`: ownership-based inventory evaluated in the SOURCE's plugin scope —
 adapter-declared keys + canonical/alias prefixes + `GATEWAY_ALLOW*`/`GATEWAY_RELAY_*`; prefixes shared
-with tools (`HASS_`/`TWILIO_`/`EMAIL_`) are stripped only when the source runs that adapter; never a hand
-list). `--clone-channels` opts in and its live-multiplexer refusal lives in `create_profile` (CLI, REST
+with tools (`TWILIO_`/`EMAIL_`, plus a plugin platform's `shared_env_prefixes`) are stripped only when the source runs that adapter; never a hand
+list; a platform that left core keeps its ownership from its `LEFT_CORE` row while the plugin is absent). `--clone-channels` opts in and its live-multiplexer refusal lives in `create_profile` (CLI, REST
 and TUI all go through it). Clones are built in `profiles/.<name>.staging-<pid>` (hidden → invisible to
 `_iter_named_profile_dirs` and the hot-serve rescan) and published by one `os.rename` after the strip;
 symlinked `.env`/`config.yaml` are materialized first so a clone never writes through to its source. Multiplex
@@ -232,7 +233,7 @@ target; table-driven `_PREFLIGHT_CHECKS`; manifest `<default>/gateway_migration.
 a re-run resumes from it; a named profile's `gateway install|start|run` refuse without `--force` via
 `gateway.py::_named_profile_refused_under_multiplexer`, dashboard twin
 `web_server_gateway.py::multiplexed_profile_refusal`);
-`update_cmd_fleet._verify_fleet_after_update` calls `maybe_auto_migrate_after_update` on the success
+`update_cmd_fleet_verify._verify_fleet_after_update` calls `maybe_auto_migrate_after_update` on the success
 path only; `gateway_migrate_guards.py` holds the auto-path-only refusals (table `_AUTO_MIGRATION_GUARDS`:
 other service domain / UNIX user / HERMES_HOME outside `profiles/` — notices for the explicit command,
 blockers for the hook) and the `gateway.auto_multiplex_migration` opt-out (#109954). Blockers reuse `GatewayRunner._adapter_credential_fingerprint` and `platform_binds_port`;
@@ -258,29 +259,8 @@ recorded when both exist. Process liveness is `(pid, start_time)` or the canonic
 
 ## Nous free tier (`hermes_cli/anon_auth.py`)
 
-Sign-in completion is one function, `settle_after_upgrade`, called by every caller that persists an
-account over a free-tier identity (CLI `upgrade_guest`, the desktop poller): it moves a config on the
-welcome route to the account's host and the tier's recommended default
-(`models.recommended_nous_default_model`, shared with `GET /api/model/recommended-default`).
-
-The shared flow, states, and copy live in `anon_sign_in.py`; CLI rendering lives in
-`anon_sign_in_cli.py`. `anon_auth.py` keeps identity, promotion polling, and settlement, and
-re-exports the existing sign-in API. The flow resolves identity and persistence collaborators
-through `anon_auth` at call time to preserve module-attribute monkeypatch seams.
-
-The sign-in itself is one composition: `anon_auth.run_sign_in()` yields `SignInState`s (`Code`,
-`Waiting`, `Completed`, `Declined`, `Superseded`, `TimedOut`, `Retired`, `Failed`,
-`AlreadySignedIn`, `Unavailable`). It reads the current state itself, holds one absolute deadline
-across both waits, persists only after a completed promotion **and** a token grant, runs
-`settle_after_upgrade` exactly once per completion, and never lets a persist or settle failure
-escape as an exception — it becomes `Failed`. Every state carries its own `.copy` (the chat form,
-which never contains a raw exception, a URL or a `hermes` verb) and `.copy_terminal`, so no caller
-maps a reason to a string. `cancelled()` stops an attempt; `cancel_wins_after_promotion` decides
-what happens when the server had already completed the transfer — the desktop keeps `True` (a
-DELETE means "not on this machine"), the gateway passes `False` (a supersede must not discard a
-transfer the user actually approved). `scope` is entered only around the precondition and persist
-blocks, never across a `yield` or a network wait, because `run_in_executor` does not carry
-contextvars. `upgrade_guest` (`hermes auth upgrade`), the CLI `/login` handler and the desktop
-promotion poller are renderers over it; a surface that needs the cancel check and the save to be
-atomic passes `persist_guard`. The desktop's plain "connect another Nous account" device-code login
-is a separate path (`_nous_plain_poller`) and must stay one.
+`anon_auth.run_sign_in()` is the one sign-in composition: it yields `SignInState`s that carry their
+own `.copy` / `.copy_terminal`, persists only after a completed promotion AND a token grant, and runs
+`settle_after_upgrade` exactly once per completion. `hermes auth upgrade`, the CLI and gateway
+`/login` and the desktop poller are renderers over it; the desktop's plain device-code login
+(`_nous_plain_poller`) stays a separate path. Long form: `cli-internals.md` § Nous free tier sign-in.

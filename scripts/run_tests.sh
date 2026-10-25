@@ -11,7 +11,7 @@
 #   * Env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
-#   * The activated checkout's test environment (activates when needed)
+#   * The checkout's test environment (via scripts/run-in-hermes-env when needed)
 #
 # Usage:
 #   scripts/run_tests.sh                            # full suite
@@ -38,11 +38,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Locate python ───────────────────────────────────────────────────────────
-# The suite runs under the activated checkout's isolated test environment
-# (pm.testenv: `activate` builds it beside the checkout's install state, and CI
-# activates the same way). An inherited activation is re-checked against its
-# inputs (scripts/_activation.sh) and re-sourced when stale, so a branch switch
-# or lock edit never runs the suite against the previous dependency set.
+# The suite runs under the checkout's isolated test environment (pm.testenv),
+# and only there: unless the inherited environment is current for this
+# checkout, this script re-executes itself under scripts/run-in-hermes-env,
+# which syncs and applies it. That holds however the script is launched
+# (`scripts/run_tests.sh`, `bash scripts/run_tests.sh`, from CI or a shell), so
+# a branch switch or lock edit never runs the suite against the previous
+# dependency set.
 #
 # Without an activation, an explicit HERMES_PYTHON that has pytest is honored:
 # the Nix devShell's editable venv and CI's minimal installer lanes provide
@@ -55,22 +57,14 @@ if [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
   PYTHON="$HERMES_PYTHON"
   echo "▶ not activated — using HERMES_PYTHON: $PYTHON"
 else
-  test_stamp="${__HERMES_ACTIVATED:-}"
-  test_stamp="${test_stamp//\\//}"
-  if ! hermes_activation_current "$REPO_ROOT" ||
-     [ ! -f "${test_stamp%/*}/inputs/.test-environment" ] ||
-     ! _has_pytest "${__HERMES_TEST_PYTHON:-}"; then
-    echo "▶ activating $REPO_ROOT (environment missing or stale)" >&2
-    # activate is written for interactive shells, not errexit/nounset.
-    set +euo pipefail
-    # shellcheck source=/dev/null
-    . "$REPO_ROOT/activate" --
-    activated=$?
-    set -euo pipefail
-    if [ "$activated" != 0 ]; then
-      echo "error: activation failed (see above)" >&2
+  if ! hermes_activation_current "$REPO_ROOT"; then
+    if [ -n "${__HERMES_TESTS_REEXEC:-}" ]; then
+      echo "error: run-in-hermes-env did not produce a current environment for $REPO_ROOT" >&2
       exit 1
     fi
+    echo "▶ environment missing or stale for $REPO_ROOT — re-running under run-in-hermes-env" >&2
+    export __HERMES_TESTS_REEXEC=1
+    exec "$SCRIPT_DIR/run-in-hermes-env" "$BASH" "${BASH_SOURCE[0]}" "$@"
   fi
   PYTHON="${__HERMES_TEST_PYTHON:-}"
   if ! _has_pytest "$PYTHON"; then
@@ -99,13 +93,22 @@ fi
 # These are location variables, not
 # credentials, so forwarding them keeps the isolation intent intact. Each is
 # only forwarded when actually set, so POSIX runs are byte-for-byte unchanged.
+# Portable CI also binds PowerShell's module-analysis cache to its disposable
+# parent home; retain that exact location across the hermetic env boundary.
 WIN_ENV=()
 for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT TEMP TMP \
-    ComSpec PATHEXT PROGRAMFILES ProgramFiles PROGRAMDATA ProgramData; do
+    ComSpec PATHEXT PROGRAMFILES ProgramFiles PROGRAMDATA ProgramData PSModuleAnalysisCachePath; do
   if [ -n "${!_win_var:-}" ]; then
     WIN_ENV+=("$_win_var=${!_win_var}")
   fi
 done
+# Missing and explicitly empty differ for PowerShell command discovery. Keep
+# an explicit value (including empty); on Windows use empty when absent so a
+# hermetic child does not rebuild the hosted machine's module search path.
+# Built-in PowerShell modules remain available. This is a location, not a secret.
+if [ "${PSModulePath+x}" = x ] || [ -n "${SYSTEMROOT:-}" ]; then
+  WIN_ENV+=("PSModulePath=${PSModulePath-}")
+fi
 # Native build toolchain (Windows arm64 has no wheels for every pinned C extension, so
 # `uv sync` inside a PM test compiles ruamel-yaml-clib and friends). The MSVC developer
 # environment is exported by scripts/build/windows-deps.ps1 into the job env; without
@@ -150,6 +153,13 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 #     the real install.ps1 (it writes HKCU PATH); HERMES_E2E_MACHINE_ROOT,
 #     HERMES_E2E_PROFILES_ROOT and HERMES_E2E_ARTIFACTS place its fake machines,
 #     their user profiles and the transcripts CI uploads.
+#   * HERMES_E2E_STRICT_ACCEPTANCE makes tests/e2e/core/_pending_fixes.py's
+#     known gaps hard failures in an acceptance run (workflow dispatch input).
+#   * HERMES_TEST_SSH_HOST / _USER / _PORT / _KEY and HERMES_TEST_DOCKER_IMAGE
+#     arm the real-backend tests (tests/tools/test_ssh_environment.py,
+#     tests/tools/test_docker_backend_real.py); remote-backends.yml points them at
+#     a throwaway sshd container and a small public image. The key is a
+#     per-run throwaway, never a credential.
 #
 # These are test-infrastructure knobs, not credentials — same class as the
 # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER / HERMES_RUN_E2E opt-ins
@@ -160,11 +170,12 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # Keep this an explicit allowlist (no HERMES_TEST_* glob) so the "no
 # credential can leak" property stays auditable at a glance.
 TEST_ENV=()
-for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
+for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_PATHS \
   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
-  HERMES_TEST_SCRATCH_ROOT PLAYWRIGHT_BROWSERS_PATH SSL_CERT_FILE SSL_CERT_DIR \
-  HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
-  HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS; do
+  HERMES_TEST_SCRATCH_ROOT PLAYWRIGHT_BROWSERS_PATH SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
+  HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
+  HERMES_E2E_STRICT_ACCEPTANCE HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
+  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi
@@ -194,8 +205,16 @@ cd "$REPO_ROOT"
 # Pre-building the bytecode cache once here (instead of each subprocess
 # compiling on first import) avoids redundant work across ~2000 processes.
 # Uses git to list tracked .py files (skips venv, node_modules, etc).
-echo "▶ pre-compiling bytecode cache"
-"$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+# Whole-checkout compilation also happens on targeted runs. Keep it within the
+# same per-job budget as the file runner, including shells without host dotfiles.
+export HERMES_TEST_WORKERS="${HERMES_TEST_WORKERS:-4}"
+if [[ ! "$HERMES_TEST_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: HERMES_TEST_WORKERS must be a positive integer" >&2
+  exit 1
+fi
+TEST_ENV+=("HERMES_TEST_WORKERS=$HERMES_TEST_WORKERS")
+echo "▶ pre-compiling bytecode cache (up to $HERMES_TEST_WORKERS workers)"
+"$PYTHON" -m compileall -q -j "$HERMES_TEST_WORKERS" -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
 exec env -i \

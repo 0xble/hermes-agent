@@ -4,15 +4,24 @@ Extends the exit-code semantics table in ``terminal_tool`` with a bounded scan o
 output mapped to ONE short, actionable recovery hint. Rules: only fires on non-zero exit; first
 match wins, patterns ordered by observed production frequency; scans only the first
 ``_SCAN_CHARS`` so hints key on error headers, not deep context; hints state the *next action*
-in 1-2 sentences; pure function, no I/O or config reads.
+in 1-2 sentences. The general rules are pure; the pytest-specific runner hint performs only
+bounded local path-existence checks and never reads configuration or spawns a process.
 """
 
 from __future__ import annotations
 
 import re
+import shlex
+from pathlib import Path
 from typing import Callable, Optional
 
 _SCAN_CHARS = 4000
+
+_PYTEST_MISSING_RE = re.compile(
+    # Plugins such as `pytest_asyncio` are a different failure: pytest itself is installed.
+    r"(?:No module named ['\"]?pytest(?![\w.])['\"]?|pytest: command not found)"
+)
+_HEAVY_SLOT_NOT_STARTED_RE = re.compile(r"heavy-slot: not started after\b")
 
 
 def _regex_hint(pattern: str, message: str | Callable[[str], str], flags: int = 0) -> Callable[[str, str], Optional[str]]:
@@ -43,6 +52,55 @@ def _missing_command_hint(missing: str) -> str:
         "or use an absolute path instead of retrying the same command.")
 
 
+def _project_roots(cwd: str | None) -> tuple[Path, ...]:
+    """Return the command directory and its nearest Git toplevel, if discoverable.
+
+    This deliberately uses filesystem checks rather than spawning Git: the helper runs while
+    formatting every failed terminal result and must stay cheap and fail-open for remote paths.
+    """
+    try:
+        path = Path(cwd or ".").expanduser()
+        if not path.is_dir():
+            path = path.parent
+        path = path.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return ()
+
+    roots = [path]
+    for parent in (path, *path.parents):
+        try:
+            is_git_root = (parent / ".git").exists()
+        except OSError:
+            is_git_root = False
+        if is_git_root:
+            if parent not in roots:
+                roots.append(parent)
+            break
+    return tuple(roots)
+
+
+def _pytest_missing_hint(cwd: str | None) -> str:
+    """Choose the repository-owned pytest runner without changing or retrying the command."""
+    roots = _project_roots(cwd)
+    candidates = (
+        (("scripts", "run_tests.sh"), "scripts/run_tests.sh <files>", None),
+        ((".venv", "bin", "python"), ".venv/bin/python -m pytest", None),
+        (("uv.lock",), "uv run pytest", "pyproject.toml"),
+    )
+    for marker, runner, also_required in candidates:
+        for index, root in enumerate(roots):
+            if not root.joinpath(*marker).exists():
+                continue
+            if also_required and not (root / also_required).exists():
+                continue
+            # A runner found at the Git toplevel must still resolve from a subdirectory cwd.
+            # `uv run` already discovers the project upward, so it needs no prefix.
+            if index and also_required is None:
+                runner = f"{shlex.quote(str(root))}/{runner}"
+            return f"Interpreter used lacks pytest; use the repo's own runner: `{runner}`."
+    return "Interpreter used lacks pytest; use the project's virtualenv."
+
+
 # Ordered by production frequency — first match wins.
 _OUTPUT_HINTS: list[Callable[[str, str], Optional[str]]] = [
     # gh version drift; gh already prints the valid field list.
@@ -52,7 +110,7 @@ _OUTPUT_HINTS: list[Callable[[str, str], Optional[str]]] = [
     _regex_hint(r"^CONFLICT |Automatic merge failed|needs merge",
                 "Git merge conflict. Do not retry this command. Resolve the conflicted files "
                 "listed above (edit, then `git add`), then continue (`git rebase --continue` / "
-                "commit the merge) — or abort with `--abort`.", re.M),
+                "commit the merge) — or abort with `--abort`.", re.MULTILINE),
     _regex_hint(r"(?:bash: line \d+: |bash: |sh: \d*:? ?)?([\w.+-]+): command not found",
                 _missing_command_hint),
     # Almost always a venv-activation slip, not a missing dependency.
@@ -146,11 +204,19 @@ def annotate_masked_success(command: str, output: str) -> Optional[str]:
     return next((note for rx, note in _MASKING_SHAPES if rx.search(cmd)), None)
 
 
-def annotate_failure(command: str, exit_code: int, output: str) -> Optional[str]:
+def annotate_failure(command: str, exit_code: int, output: str, cwd: str | None = None) -> Optional[str]:
     """Return one short recovery hint for a failed command, or None (exit 0)."""
     if exit_code == 0:
         return None
     window = (output or "")[:_SCAN_CHARS]
+    if exit_code == 75 and _HEAVY_SLOT_NOT_STARTED_RE.search(window):
+        return (
+            "The command did not run because all shared test slots were busy; the output above includes "
+            "its queue position. Rerun with background=true and notify_on_complete=true instead of "
+            "retrying in the foreground."
+        )
+    if _PYTEST_MISSING_RE.search(window):
+        return _pytest_missing_hint(cwd)
     for fn in _OUTPUT_HINTS if window else ():
         try:
             if hint := fn(command or "", window):

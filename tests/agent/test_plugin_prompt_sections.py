@@ -7,6 +7,8 @@ import subprocess
 import sys
 import textwrap
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from agent.system_prompt import build_system_prompt, invalidate_system_prompt
 from hermes_cli import plugins
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -28,7 +30,7 @@ def _real_agent(*, session_id: str = "plugin-section-test") -> AIAgent:
 
 
 def _install_test_section(manager: PluginManager, content) -> None:
-    manager._discovered = True
+    mark_plugin_discovery_complete(manager)
     ctx = PluginContext(
         PluginManifest(name="example-plugin", key="example-plugin", source="user"),
         manager,
@@ -102,6 +104,7 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
         from agent.system_prompt import build_system_prompt, invalidate_system_prompt
         from hermes_cli import plugins
         from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+        from tests.plugin_helpers import mark_plugin_discovery_complete
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
@@ -122,7 +125,7 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
         )
 
         manager = PluginManager()
-        manager._discovered = True
+        mark_plugin_discovery_complete(manager)
         ctx = PluginContext(
             PluginManifest(name="example-plugin", key="example-plugin", source="user"),
             manager,

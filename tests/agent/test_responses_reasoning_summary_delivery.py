@@ -35,6 +35,9 @@ def loop_agent():
         )
         agent.client = MagicMock()
         agent.api_mode = "chat_completions"
+        # Opt the route into reasoning-only promotion, so the Responses-summary exclusion is what
+        # keeps the summary out of the reply, not the route's missing answer_in_reasoning capability.
+        agent._custom_providers = [{"base_url": agent.base_url, "capabilities": {"answer_in_reasoning": True}}]
         agent._restore_primary_runtime = lambda: None
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
@@ -119,7 +122,8 @@ def test_responses_summary_never_leaks_when_the_empty_ladder_is_exhausted(loop_a
 
 
 def test_chat_completions_inline_reasoning_promotion_is_unchanged(loop_agent):
-    """vLLM-style parsers file the whole answer as reasoning: no Responses carrier, still promoted."""
+    """vLLM-style parsers file the whole answer as reasoning: no Responses carrier, still promoted
+    on a route that opts into answer_in_reasoning."""
     answer = "The answer is 42."
     result = _run(loop_agent, [_response(reasoning=answer, codex_items=[])])
 

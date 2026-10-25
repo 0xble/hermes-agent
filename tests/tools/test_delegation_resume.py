@@ -61,6 +61,10 @@ def _dispatch_row(delegation_id="deleg_resume_1", *, goal="port the widget", con
         record["is_batch"] = True
         record["goals"] = goals or ["a", "b"]
     ad._persist_dispatch(record)
+    # These tests cover the legacy one-shot path, which now applies only to rows written before the
+    # durable retry engine existed (retry_state='none'); new rows are owned by tests/tools/test_delegation_retry.py.
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_state='none' WHERE delegation_id=?", (delegation_id,))
     return delegation_id
 
 
@@ -110,7 +114,7 @@ def test_pruning_preserves_delivered_interrupted_delegation_for_resume(monkeypat
 def test_pruning_deletes_delivered_rows_before_an_undelivered_completion(monkeypatch):
     """A pending completion is the parent's only copy of a child result: delivered
     audit rows must be pruned first, never the undelivered one."""
-    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 3)
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
     base = time.time() - 120.0
     delivered = []
     for index in range(3):
@@ -140,13 +144,16 @@ def test_pruning_deletes_delivered_rows_before_an_undelivered_completion(monkeyp
 
 
 def test_pruning_deletes_other_undelivered_rows_before_a_pending_completion(monkeypatch):
-    """With no delivered rows left to prune, a pending result still goes last."""
+    """With no delivered rows left to prune, a pending result still goes last (it never counts
+    toward the history cap at all)."""
     monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 1)
     base = time.time() - 120.0
     pending = _dispatch_row("deleg_prune_last_pending")
     _mark(pending, "completed")
     dropped = _dispatch_row("deleg_prune_last_dropped")
     _mark(dropped, "error")
+    newer_dropped = _dispatch_row("deleg_prune_last_dropped_newer")
+    _mark(newer_dropped, "error")
     with ad._DB_LOCK, ad._transaction() as conn:
         conn.execute(
             "UPDATE async_delegations SET delivery_state='pending', updated_at=? WHERE delegation_id=?",
@@ -155,6 +162,10 @@ def test_pruning_deletes_other_undelivered_rows_before_a_pending_completion(monk
         conn.execute(
             "UPDATE async_delegations SET delivery_state='dropped', updated_at=? WHERE delegation_id=?",
             (base, dropped),
+        )
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='dropped', updated_at=? WHERE delegation_id=?",
+            (base + 10.0, newer_dropped),
         )
 
     _dispatch_row("deleg_prune_last_trigger")
@@ -396,11 +407,12 @@ def test_resume_action_second_call_is_refused():
     assert "already been claimed" in second
 
 
-def test_resume_action_batch_refusal_is_truthful():
+def test_resume_action_batch_returns_unfinished_children():
     did = _dispatch_row("deleg_action_batch", is_batch=True)
     _mark(did, "unknown")
-    out = _handle_control_action("resume", did, None, _Parent())
-    assert "multi-task batch" in out
+    out = json.loads(_handle_control_action("resume", did, None, _Parent()))
+    assert out["status"] == "recovery_claimed"
+    assert [task["goal"] for task in out["tasks"]] == ["a", "b"]
 
 
 def test_resume_routes_through_delegate_task_entrypoint():

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from pathlib import Path
 from typing import Optional
 
 
@@ -63,7 +64,19 @@ def _prune(worktree_gc, repo_root: str, args) -> int:
     if not getattr(args, "branches_only", False):
         actions += worktree_gc.prune_missing_registrations(repo_root, dry_run=dry_run)
         tree_records = worktree_gc.audit_worktrees(repo_root, with_sizes=False, older_than_days=older_than)
+        reaped = [r for r in tree_records if r.verdict in worktree_gc._REAP_VERDICTS]
+        if dry_run:
+            # Size only what would be copied out, not whole trees: the rest of each tree is freed.
+            for r in reaped:
+                r.archive_mb = worktree_gc._paths_size_mb(Path(r.path), r.untracked)
         actions += worktree_gc.reclaim_worktrees(repo_root, dry_run=dry_run, records=tree_records)
+        if dry_run and reaped and not as_json:
+            from hermes_constants import display_hermes_home
+            archived = sum(r.archive_mb or 0 for r in reaped)
+            unknown = sum(r.archive_mb is None for r in reaped)
+            print(f"Would remove {len(reaped)} tree(s), archiving ~{_fmt_size(archived)} to "
+                  f"{display_hermes_home()}/archive/worktree-prune/ and freeing the rest"
+                  + (f" (archive size unknown for {unknown})" if unknown else ""))
         kept = [r for r in tree_records if r.verdict == "keep"
                 and "kanban" not in r.reason and "in use" not in r.reason]
         if kept and not as_json:

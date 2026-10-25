@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -17,7 +18,7 @@ REPO = Path(__file__).resolve().parents[2]
 
 def _other_process(home: Path, stmt: str) -> None:
     env = {**os.environ, "HERMES_HOME": str(home)}
-    subprocess.run(  # noqa: S603
+    subprocess.run(
         [sys.executable, "-c", f"import sys; sys.path.insert(0, {str(REPO)!r}); "
          f"from tools.bot_desktop import lease; {stmt}"],
         cwd=str(REPO), env=env, check=True, timeout=60, stdin=subprocess.DEVNULL)
@@ -32,14 +33,33 @@ def _wait_for(pred, timeout: float = 3.0) -> bool:
     return pred()
 
 
-def _watching(server, home: Path, monkeypatch) -> list:
+def _serialize_polls(server, monkeypatch) -> threading.Lock:
+    """Serialize manual and background watcher passes so an event claimed by the watcher is
+    broadcast before the manual poll returns. Returns the lock so a test can also hold it across
+    a multi-file write that the real runtime performs as one transition."""
+    lock = threading.Lock()
+    for name in ("_poll_lease_files", "_poll_runtime_files"):
+        def locked(real=getattr(server, name)) -> None:
+            with lock:
+                real()
+        monkeypatch.setattr(server, name, locked)
+    return lock
+
+
+def _watching_with_lock(server, home: Path, monkeypatch) -> tuple[list, threading.Lock]:
+    """Start the real watcher with serialized polls; return its events and the poll lock."""
     from hermes_constants import hermes_home_key
     events: list = []
+    lock = _serialize_polls(server, monkeypatch)
     monkeypatch.setattr(server, "_broadcast_global_event", lambda ev, payload=None: events.append((ev, payload)))
     monkeypatch.setattr(server, "_hermes_home", str(home))
     server._ensure_lease_watcher()
     assert _wait_for(lambda: hermes_home_key(home) in server._lease_epochs), "watcher never seeded the home"
-    return events
+    return events, lock
+
+
+def _watching(server, home: Path, monkeypatch) -> list:
+    return _watching_with_lock(server, home, monkeypatch)[0]
 
 
 def _lease_events(events, **want):
@@ -47,7 +67,7 @@ def _lease_events(events, **want):
 
 
 def test_takeover_in_another_process_is_broadcast(tmp_path, monkeypatch):
-    import tui_gateway.server as server
+    from tui_gateway import server
     from hermes_constants import hermes_home_key
     home = tmp_path / "home"
     home.mkdir()
@@ -61,7 +81,7 @@ def test_takeover_in_another_process_is_broadcast(tmp_path, monkeypatch):
 
 
 def test_release_in_another_process_is_broadcast_and_local_transition_not_duplicated(tmp_path, monkeypatch):
-    import tui_gateway.server as server
+    from tui_gateway import server
     from tools.bot_desktop import lease
     home = tmp_path / "home"
     home.mkdir()
@@ -100,17 +120,20 @@ def test_watched_lease_homes_deduplicates_profile_aliases(tmp_path, monkeypatch)
 def test_screen_started_or_stopped_by_another_process_is_broadcast_as_status(tmp_path, monkeypatch):
     """A start/stop made by the CLI or gateway process must reach an open Desktop: the portal's
     status was otherwise one-shot (fetched once, then only lease events)."""
-    import tui_gateway.server as server
+    from tui_gateway import server
 
     home = tmp_path / "home"
     (home / "bot-desktop").mkdir(parents=True)
-    events = _watching(server, home, monkeypatch)
+    events, poll_lock = _watching_with_lock(server, home, monkeypatch)
     server._poll_runtime_files()  # seed
     assert not [e for e in events if e[0] == "display.status"]
 
-    # what runtime.start() publishes from another process: launcher.pid then env
-    (home / "bot-desktop" / "launcher.pid").write_text("424242 1.5", encoding="utf-8")
-    (home / "bot-desktop" / "env").write_text("DISPLAY=:77\n", encoding="utf-8")
+    # what runtime.start() publishes from another process: launcher.pid then env. Hold the poll lock
+    # across both writes so a background pass cannot observe the half-written start as its own
+    # transition (one start must broadcast exactly one display.status).
+    with poll_lock:
+        (home / "bot-desktop" / "launcher.pid").write_text("424242 1.5", encoding="utf-8")
+        (home / "bot-desktop" / "env").write_text("DISPLAY=:77\n", encoding="utf-8")
     server._poll_runtime_files()
     statuses = [p for e, p in events if e == "display.status"]
     assert statuses and statuses[-1]["profile_key"] == str(home)
@@ -125,11 +148,11 @@ def test_launcher_dying_without_touching_its_files_is_broadcast_as_stopped(tmp_p
     """Xvnc/the launcher crashing leaves env and launcher.pid exactly as they were, so a watcher keyed
     on mtimes alone never told the Desktop the screen was gone. The mark must include liveness."""
     import psutil
-    import tui_gateway.server as server
+    from tui_gateway import server
 
     home = tmp_path / "home"
     (home / "bot-desktop").mkdir(parents=True)
-    launcher = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdin=subprocess.DEVNULL)  # noqa: S603
+    launcher = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdin=subprocess.DEVNULL)
     try:
         born = psutil.Process(launcher.pid).create_time()
         (home / "bot-desktop" / "launcher.pid").write_text(f"{launcher.pid} {born!r}", encoding="utf-8")
@@ -157,7 +180,7 @@ def test_screen_start_and_stop_reach_the_models_turn_notes(tmp_path, monkeypatch
     live session of THAT profile. The staged note is consumed on the next turn
     (``agent/turn_context.py``), so only its presence here is asserted."""
     import psutil
-    import tui_gateway.server as server
+    from tui_gateway import server
 
     home = tmp_path / "home"
     (home / "bot-desktop").mkdir(parents=True)
@@ -172,7 +195,7 @@ def test_screen_start_and_stop_reach_the_models_turn_notes(tmp_path, monkeypatch
     other_home.mkdir()
     server._sessions["ws-b"] = {"agent": other, "profile_home": str(other_home), "transport": server._detached_ws_transport}
     # the stub "launcher": a real live process with matching create_time, like runtime.start() records
-    launcher = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdin=subprocess.DEVNULL)  # noqa: S603
+    launcher = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdin=subprocess.DEVNULL)
     try:
         server._poll_runtime_files()  # seed: stopped
         assert not getattr(agent, "_gateway_turn_context_notes", "")

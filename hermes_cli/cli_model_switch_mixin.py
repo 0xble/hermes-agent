@@ -301,6 +301,13 @@ def _show_model_picker(cli, ctx, force_refresh: bool) -> None:
             ctx, probe_custom_providers=force_refresh,
             probe_current_custom_provider=not force_refresh,
             capabilities=True,  # the effort step hides itself on reasoning-free routes
+            # Keep providers whose pool is entirely in cooldown visible: limits are
+            # per-model for many providers, so another model may work (#103829) —
+            # same contract as the gateway picker (#66584) and aux pickers (#66624).
+            for_picker=True,
+            # Visibility only, not a faster probe: this call live-probes the current custom
+            # endpoint, which historically enjoyed the full 5s discovery budget (#103843).
+            fast_custom_probe=False,
         )["providers"]
     except Exception:
         providers = []
@@ -840,6 +847,9 @@ class CLIModelSwitchMixin:
         if request.errors:
             # CLI decoration: "  ✗ " prefix over the canonical error copy.
             _cprint(f"  ✗ {request.error_messages()[0]}")
+            return
+        if request.is_all:
+            _cprint("  ✗ /model --all is only available in the gateway.")
             return
         one_turn = request.is_once
         persist_global = resolve_persist_behavior(

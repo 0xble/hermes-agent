@@ -59,6 +59,10 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "switch to the requested branch first (auto-stashing any "
             "uncommitted changes).")
     update_parser.add_argument(
+        "--allow-drop-main", action="store_true", default=False,
+        help="Allow an intentional rollback that would drop commits already live and on origin/main; record the override in the update receipt.",
+    )
+    update_parser.add_argument(
         "--switch-branch", action="store_true", default=False,
         help="With updates.parked_branch_strategy: update_in_place configured, "
             "override it for this run: switch to the update target and update "
@@ -84,9 +88,10 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help=(
             "Persist the update channel for THIS install (recorded per "
             "install in config.yaml under update.installs). Names are resolved "
-            "from the release archive, not a built-in list. Source installs "
-            "check out the published build's exact commit; main follows the "
-            "source branch. Package channels are baked into their identities."
+            "from the release archive, not a built-in list. Official source "
+            "checkouts default to 'stable' (the latest published vX.Y.Z "
+            "release, exact commit); 'main' follows the source branch. "
+            "Package channels are baked into their identities."
         ),
     )
     update_parser.add_argument(

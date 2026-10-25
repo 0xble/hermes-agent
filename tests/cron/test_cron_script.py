@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import textwrap
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -74,7 +74,7 @@ class TestJobScriptField:
 def test_cronjob_tool_rejects_stale_past_one_shot(cron_env, monkeypatch):
     from tools.cronjob_tools import cronjob
 
-    now = datetime(2026, 3, 18, 4, 30, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 3, 18, 4, 30, 0, tzinfo=UTC)
     monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
     stale = (now - timedelta(minutes=5)).isoformat()
 
@@ -173,7 +173,7 @@ class TestRunJobScript:
 
         # sorted() so the probed var is deterministic across runs
         # (frozenset iteration order varies with PYTHONHASHSEED).
-        blocked_var = sorted(_HERMES_PROVIDER_ENV_BLOCKLIST)[0]
+        blocked_var = min(_HERMES_PROVIDER_ENV_BLOCKLIST)
         monkeypatch.setenv(blocked_var, "must_not_leak")
 
         script = cron_env / "scripts" / "env_probe.py"
@@ -190,6 +190,66 @@ class TestRunJobScript:
         success, output = _run_job_script("env_probe.py")
         assert success is True
         assert output == "ABSENT"
+
+    def test_script_subprocess_env_drops_session_identity(self, cron_env, monkeypatch):
+        """A sessionless cron worker must not pass its launcher's stale session mirror to a script."""
+        import gateway.session_context as session_context
+        from cron.scheduler_script import _run_job_script
+
+        saved_context = {var: var.get() for var in session_context._VAR_MAP.values()}
+        monkeypatch.setattr(session_context, "_session_context_engaged", False)
+        for var in session_context._VAR_MAP.values():
+            var.set(session_context._UNSET)
+        for name, value in {
+            "HERMES_SESSION_ID": "unrelated-session",
+            "HERMES_SESSION_KEY": "unrelated-key",
+            "HERMES_SESSION_CHAT_ID": "123",
+            "HERMES_UI_SESSION_ID": "unrelated-ui-session",
+            "HERMES_CRON_SESSION": "1",
+            "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "456",
+        }.items():
+            monkeypatch.setenv(name, value)
+
+        script = cron_env / "scripts" / "session_probe.py"
+        script.write_text(
+            "import json, os\n"
+            "names = [name for name in os.environ if name.startswith(\"HERMES_SESSION_\") "
+            "or name.startswith(\"HERMES_UI_SESSION_\") or name.startswith(\"HERMES_CRON_AUTO_DELIVER_\") "
+            "or name == \"HERMES_CRON_SESSION\"]\n"
+            "print(json.dumps({name: os.environ[name] for name in sorted(names)}))\n"
+        )
+
+        try:
+            success, output = _run_job_script("session_probe.py")
+        finally:
+            for var, value in saved_context.items():
+                var.set(value)
+        assert success is True
+        assert output == "{}"
+
+    def test_script_subprocess_env_uses_job_identity(self, cron_env, monkeypatch):
+        """Cron scripts get their own stable sender, not the gateway's ambient session."""
+        from cron.scheduler_script import _run_job_script
+
+        monkeypatch.setenv("HERMES_SESSION_ID", "unrelated-session")
+        monkeypatch.setenv("HERMES_SESSION_KEY", "unrelated-key")
+        script = cron_env / "scripts" / "sender_probe.py"
+        script.write_text(
+            "import json, os\n"
+            "print(json.dumps({name: os.environ.get(name) for name in "
+            "('HERMES_SESSION_ID', 'HERMES_SESSION_KEY', 'HERMES_SESSION_PROFILE', "
+            "'HERMES_CRON_SESSION')}))\n"
+        )
+
+        success, output = _run_job_script("sender_probe.py", cron_job_id="fleet-checker")
+
+        assert success is True
+        assert json.loads(output) == {
+            "HERMES_SESSION_ID": "cron_fleet-checker",
+            "HERMES_SESSION_KEY": None,
+            "HERMES_SESSION_PROFILE": "default",
+            "HERMES_CRON_SESSION": "1",
+        }
 
     @pytest.mark.platforms("windows")
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
@@ -289,7 +349,7 @@ class TestRunJobScript:
         )
         # Run the bootstrap with the current interpreter (stands in for the
         # base python.exe on Windows; the semantics are interpreter-agnostic).
-        result = subprocess.run(argv, capture_output=True, text=True)
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "42"
 
@@ -316,7 +376,7 @@ class TestRunJobScript:
         argv = _windows_cron_bootstrap_argv(
             sys.executable, {"VIRTUAL_ENV": str(venv)}, str(script)
         )
-        result = subprocess.run(argv, capture_output=True, text=True)
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "sibling ok"
 
@@ -781,7 +841,9 @@ class TestScriptTimeoutTreeKill:
         def is_live(pid):
             try:
                 process = psutil.Process(pid)
-                return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+                # 'dead' = mid-reap (exited); see test_script_termination_reaps_descendants.
+                return process.is_running() and process.status() not in (
+                    psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD)
             except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 return False
 

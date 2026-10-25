@@ -2,6 +2,11 @@
 
 Patch identity: `seamless-restart` (legacy single-gateway path).
 
+Restart and reconnect replay admission shares the existing recovery owner and
+bounded priority scheduler. Its ordering, long-turn opening window, profile scope
+and shutdown-source durability contract live in
+[Shared Replay Admission](restart-continuation.md#shared-replay-admission).
+
 ## Shutdown Notice Routing
 
 Use upstream's `_delivery_target_key` for active chats, served home channels,
@@ -72,6 +77,67 @@ Likely surfaces: `cron/executions.py`, `cron/scheduler.py`, `cron/delivery_queue
 A deliberate gateway stop writes `<HERMES_HOME>/gateway-guardian-stopped`; a start clears it before dispatch so failed start attempts do not leave false stopped intent. While the marker exists the guardian does not repair an unloaded gateway. It waits through `updates.release_acknowledgement_timeout_seconds` (default 180 seconds) before judging an unacknowledged release switch, and rejects stale runtime status. With an intact `current` release and matching launchd plist, it can bootstrap an unloaded gateway or roll back a failed switch to a verified `previous` release. It never repairs a corrupt pointer from the source checkout. A nonblocking lock and a cap of three bootstrap/rollback attempts per hour prevent a repair loop; loaded but unhealthy services are left to launchd or operator inspection rather than force-repaired.
 
 Inspect `<HERMES_HOME>/logs/guardian/` for JSON attempt, result, capped and alert receipts, plus `stdout.log` and `stderr.log`. Identical recent alerts are deduplicated and receipts older than an hour are pruned. The guardian does not retry interrupted work.
+
+## Blocking state.db work stays off the event loop
+
+Patch identity: `seamless-restart; keep gateway startup and loop off blocking state.db I/O`
+(the #345 lineage). This is core-owned: gateway admission, manager construction,
+profile scoping and platform batching cannot be repaired by a presentation plugin.
+
+The watchdog's main-thread-first dumps from 2026-10-10 showed per-turn goal
+metadata reads, completion route loading, Telegram topic-recovery lazy database
+opens and persisted model-override reads waiting behind SessionDB/SessionStore
+locks on the asyncio thread. Warming a database handle does not make subsequent
+reads nonblocking. Keep the entire sync operation (including handle acquisition,
+manager construction and metadata reads/writes) in a context-preserving worker.
+Keep profile scope entry, admission fences and adapter queue/timer mutation on
+asyncio; Telegram topic recovery must finish before batching derives its key.
+Model-override hydration and runtime-resolution commits stay on-loop, with a
+monotonic override-epoch compare-and-set so /model and conversation boundaries win.
+A loop-owned per-session async lock spans hydration's check/read/commit and every
+async model-override memory edit plus durable write (including /resume, /new and
+login clears); retain the epoch for synchronous boundaries and one-turn restores.
+Reasoning and service-tier resolvers stay synchronous on-loop: no watchdog dump
+implicated them, and offloading their live-session mutations races newer pickers.
+/stop captures and interrupts its target before the storage await; the captured
+run generation fences the delayed marker handling and cleanup from successors.
+
+Proof surface: `tests/gateway/test_turn_state_db_off_loop.py` uses an independent
+storage-controller thread and an asyncio heartbeat to pin goal/loop construction,
+user-turn revival, completion scope, model rehydration and Telegram ingress.
+A broken implementation is released after a two-second heartbeat bound, rather
+than hanging its own asyncio timeout. Retain semantic regression coverage in
+`test_goal_continuation_drain.py`, `test_goal_resume_restart.py`,
+`test_goal_parked_idle_wake.py`, `test_telegram_topic_mode.py`,
+`test_active_session_text_merge.py` and `tests/plugins/test_telegram_update_admission.py`.
+Do not weaken the liveness watchdog, bypass SQLite/FTS locks, or change typed-turn
+progress, cleanup, live status or ten-second bubble-edit behavior.
+
+## Bounded terminal shutdown
+
+Patch identity: `seamless-restart; bounded restart shutdown` (the same lineage as
+`441dcf7470e` and `384dfd2e51d`). This is a core fix: terminal-tree ownership and
+shutdown ordering cannot be enforced by an entry-point plugin.
+
+- An unreadable start-time fingerprint is not exit evidence. Bounded sweeps keep
+  detached roots and previously fingerprinted descendants tracked as survivors,
+  without signalling an unverifiable identity or publishing `killed`.
+- Active targets receive their bounded TERM/KILL sweep before synchronous cleanup
+  of gone/reused detached scopes can consume the remaining shutdown budget.
+  A sync that introduces finished-session `_scope_stop_pending` retries must put
+  those retries after active TERM, or in the asynchronous scope-stop phase.
+- Before escalation, refresh descendants while the root is alive and identifiable,
+  and merge them with the pre-TERM snapshot. The old snapshot preserves already
+  reparented children; the refresh captures new `setsid` children from TERM handlers.
+- No drain, shutdown, grace, or settle default is increased. Unbounded callers keep
+  their existing parent-first termination route. Launchd handling, upstream's
+  completion-race contract, and empty-tick heartbeat skipping are not changed.
+
+Regression: `scripts/run_tests.sh tests/tools/test_process_registry_shutdown_survivors.py`.
+The tests acknowledge real worker startup through pipes, simulate scope teardown
+spending the shared deadline with an Event, and deterministically clean up only
+spawned processes. Retire this divergence when upstream preserves all three
+ownership/ordering rules under the same finite shutdown deadline.
 
 ## Withdrawn: Overlap and Forward-Only Handover (2026-10-06)
 

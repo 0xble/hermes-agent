@@ -27,8 +27,25 @@ def _queue_usage() -> str:
     return t("cli.queue.usage")
 
 
+def _parse_queue_index(token: str) -> int | None:
+    """1-based queue index from one whitespace-free token, or None when it isn't one.
+
+    ``str.isdigit()`` alone is not enough: it accepts characters ``int()`` rejects
+    (``²``, ``②``), and ``int()`` also refuses digit strings past Python's
+    conversion limit. A ValueError here would escape the slash handler and take
+    down the prompt_toolkit app, so every queue index goes through this.
+    """
+    if not token.isdigit():
+        return None
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
 # management verb -> (handler, takes a leading item index). Verbs without an index are
-# only management when they stand alone; index verbs only when a number follows.
+# only management when they stand alone; index verbs when a number follows or when the
+# verb stands alone (the handler then prints its usage line).
 _QUEUE_VERBS: dict[str, tuple[str, bool]] = {
     "list": ("_queue_list", False), "ls": ("_queue_list", False), "show": ("_queue_list", False),
     "clear": ("_queue_clear", False),
@@ -374,7 +391,11 @@ class CLILoopsMixin:
 
     def _queue_remove(self, rest: str) -> None:
         from cli import _cprint
-        idx = int(rest)
+        bits = rest.split()
+        idx = _parse_queue_index(bits[0]) if len(bits) == 1 else None
+        if idx is None:
+            _cprint(f"  {t('cli.queue.usage_remove')}")
+            return
         removed: list = []
         before, _ = self._mutate_pending_input(
             lambda items: (removed.append(items.pop(idx - 1)) or items) if 1 <= idx <= len(items) else items)
@@ -385,11 +406,14 @@ class CLILoopsMixin:
 
     def _queue_edit(self, rest: str) -> None:
         from cli import _VoiceInputMessage, _cprint
-        idx_text, _, new_prompt = rest.partition(" ")
-        if not new_prompt.strip():
+        # Split on any whitespace, like ``_cmd_queue``'s routing check, so
+        # ``edit 1<TAB>text`` doesn't leave "1\ttext" as the index token.
+        bits = rest.split(None, 1)
+        idx = _parse_queue_index(bits[0]) if len(bits) == 2 else None
+        if idx is None:
             _cprint(f"  {t('cli.queue.usage_edit')}")
             return
-        idx = int(idx_text)
+        new_prompt = bits[1]
         new_text = self._expand_paste_references(new_prompt.strip())
 
         def _edit(items: list) -> list:
@@ -409,10 +433,10 @@ class CLILoopsMixin:
     def _queue_move(self, rest: str) -> None:
         from cli import _cprint
         bits = rest.split()
-        if len(bits) != 2 or not bits[1].isdigit():
+        src, dst = (_parse_queue_index(b) for b in bits) if len(bits) == 2 else (None, None)
+        if src is None or dst is None:
             _cprint(f"  {t('cli.queue.usage_move')}")
             return
-        src, dst = int(bits[0]), int(bits[1])
 
         def _move(items: list) -> list:
             if 1 <= src <= len(items) and 1 <= dst <= len(items):
@@ -580,15 +604,14 @@ class CLILoopsMixin:
             mgr = self._get_goal_manager()
             if mgr is None or not mgr.is_parked():
                 return
-            if notice := mgr.rearm_live_barrier():
-                from cli import _cprint
-                _cprint(f"  {notice}")
             prompt = mgr.lifted_barrier_prompt()
             if prompt:
                 from cli import _DIM, _RST, _cprint
                 _cprint(f"  {_DIM}{t('cli.goal.barrier_lifted')}{_RST}")
                 since = mgr.state.waiting_since
+                instance = mgr.state.created_at
                 self._pending_input.put(prompt)
+                mgr.mark_automatic_continuation_dispatched(expected_instance=instance)
                 mgr.clear_lifted_wait(since)
         except Exception as exc:
             logging.debug("parked-goal resume check failed: %s", exc)
@@ -697,7 +720,8 @@ class CLILoopsMixin:
                 pass
             _cprint(f"  {_DIM}{t('cli.loop.paused_interrupted')}{_RST}")
             return
-        decision = mgr.complete_tick(self._last_assistant_response_text())
+        response, successful = self._post_turn_response()
+        decision = mgr.complete_tick(response if successful else "")
         if (not _print_decision_message(decision) and decision.get("status") == "active"
                 and mgr.state is not None):
             _cprint(f"  {_DIM}{t('cli.loop.remaining', label=mgr.state.remaining_label())}{_RST}")
@@ -712,12 +736,23 @@ class CLILoopsMixin:
         if mgr is not None and mgr.resume_for_user_input():
             _cprint(f"  ▶ Goal resumed: {mgr.state.goal}")
 
+    def _post_turn_response(self) -> tuple[str, bool]:
+        """Read only the current turn result; a started turn without one is unsuccessful."""
+        from hermes_cli.goal_turn_outcome import is_successful_goal_turn
+        if getattr(self, "_last_turn_started", True) is False:
+            return "", False  # chat() returned before the model ran (credentials/setup)
+        result = getattr(self, "_last_turn_result", None)
+        if not isinstance(result, dict):
+            return "", False  # a started turn with no result cannot reuse transcript text
+        response = str(result.get("final_response") or "")
+        return response, is_successful_goal_turn(result, response)
+
     def _maybe_continue_goal_after_turn(self) -> None:
         """Post-turn hook: judge the goal and maybe re-queue a continuation. A real user
         message already queued preempts judging (re-judged after their turn). Ctrl+C
         AUTO-PAUSES instead of judging — the judge on partial output nearly always says
         "continue" and would re-queue exactly what was cancelled; pausing is recoverable
-        via ``/goal resume``. Empty-response skip mirrors ``gateway/run.py``."""
+        via ``/goal resume``. Successful empty turns still reach the evaluator."""
         from cli import _DIM, _RST, _cprint, _looks_like_slash_command
         mgr = self._get_goal_manager()
         if mgr is None:
@@ -751,10 +786,8 @@ class CLILoopsMixin:
             _cprint(f"  {_DIM}{t('cli.goal.paused_interrupted')}{_RST}")
             return
 
-        # Empty/whitespace responses are almost always transient failures (API error,
-        # empty stream): judging would say "continue" and trip the parse-failure backstop.
-        last_response = self._last_assistant_response_text()
-        if not last_response.strip():
+        last_response, successful = self._post_turn_response()
+        if not successful:
             return
         _active_deleg = 0
         try:

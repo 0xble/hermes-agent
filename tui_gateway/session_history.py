@@ -249,7 +249,7 @@ def _expand_skill_invocation_for_replay(text: str, task_id: str) -> str:
         return text
     try:
         from agent.skill_commands import build_skill_invocation_message, resolve_skill_command_key
-        cmd_key = resolve_skill_command_key(head.lstrip("/"))
+        cmd_key = resolve_skill_command_key(head.lstrip("/"), interactive=True)
         return text if cmd_key is None else (build_skill_invocation_message(cmd_key, arg.strip(), task_id=task_id) or text)
     except Exception:  # a skill that no longer resolves must not break the rewind
         logger.debug("skill re-expansion failed for replay", exc_info=True)
@@ -258,7 +258,7 @@ def _expand_skill_invocation_for_replay(text: str, task_id: str) -> str:
 
 # Opening of the crash-recovery note synthesized by _auto_continue_note; matched (not just built) for
 # rows persisted before display typing existed and for the messaging gateway's twin note.
-_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
 
 
 def _legacy_display_kind(role: str, text: str) -> str | None:
@@ -337,6 +337,11 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
         has_assistant_detail = role == "assistant" and any(m.get(key) for key in _HISTORY_ASSISTANT_DETAIL_KEYS)
         if not content_text.strip() and not has_assistant_detail:
             continue
+        if role == "assistant":
+            # Display projection only: stored context keeps its markers, the reader sees the
+            # block bodies in place, exactly as the live reply rendered them.
+            from gateway.copy_blocks import render_copy_blocks_inline
+            content_text = render_copy_blocks_inline(content_text)
         msg = {"role": role, "text": content_text}
         # Authoring time (Unix seconds) for display.timestamps; display-only.
         # Display-only: never fed back into model context. See #41531.
@@ -526,8 +531,8 @@ def _turn_failure_detail(error: Any, reason: Any = None, prompt: Any = None) -> 
     message = _strip_prompt_echo(message, prompt)
     if len(message) > _TURN_FAILURE_DETAIL_LIMIT:
         message = message[:_TURN_FAILURE_DETAIL_LIMIT] + "\u2026"
-    out = " failure_reason=%s" % " ".join(reason_text.split()) if reason_text else ""
-    return out + (" cause=%r" % message if message else "")
+    out = " failure_reason={}".format(" ".join(reason_text.split())) if reason_text else ""
+    return out + (f" cause={message!r}" if message else "")
 
 
 def register(server) -> None:

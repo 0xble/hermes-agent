@@ -69,12 +69,12 @@ def _prepare_connection_retirement():
 # at a new inode (the very replacement this probe detects) the stale fd is RETIRED, never closed
 # — closing it would cancel the live connection's locks.  Replacements are rare and halt writes.
 _HEADER_PROBE_LOCK = threading.Lock()
-_HEADER_PROBE_FDS: "dict[str, tuple[int, int, int]]" = {}  # key -> (fd, dev, ino)
-_RETIRED_HEADER_PROBE_FDS: "list[int]" = []  # intentionally never closed
+_HEADER_PROBE_FDS: dict[str, tuple[int, int, int]] = {}  # key -> (fd, dev, ino)
+_RETIRED_HEADER_PROBE_FDS: list[int] = []  # intentionally never closed
 _FTS_TABLE_NAMES = ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
 
 
-def _pread_db_range(db_path: Path, offset: int, length: int) -> "Optional[bytes]":
+def _pread_db_range(db_path: Path, offset: int, length: int) -> Optional[bytes]:
     """Lock-safe raw read of a possibly-live SQLite database: POSIX preads from a cached,
     never-closed fd (rebound when the path names a new inode); Windows reads plainly, since
     advisory-lock cancellation is a POSIX-only hazard."""
@@ -111,12 +111,12 @@ def _pread_db_range(db_path: Path, offset: int, length: int) -> "Optional[bytes]
     return None
 
 
-def _pread_db_header(db_path: Path, length: int) -> "Optional[bytes]":
+def _pread_db_header(db_path: Path, length: int) -> Optional[bytes]:
     """Lock-safe raw header read of a possibly-live SQLite database (see :func:`_pread_db_range`)."""
     return _pread_db_range(db_path, 0, length)
 
 
-def _read_sqlite_application_id(db_path: Path) -> "Optional[int]":
+def _read_sqlite_application_id(db_path: Path) -> Optional[int]:
     """application_id from the SQLite header, via the lock-safe :func:`_pread_db_header`."""
     from hermes_state_errors import _STATE_DB_APPLICATION_ID_OFFSET
     end = _STATE_DB_APPLICATION_ID_OFFSET + 4
@@ -126,14 +126,14 @@ def _read_sqlite_application_id(db_path: Path) -> "Optional[int]":
     return int(struct.unpack(">I", header[_STATE_DB_APPLICATION_ID_OFFSET:end])[0])
 
 
-def _stat_sqlite_sidecar_identity(db_path: Path) -> Dict[str, tuple]:
+def _stat_sqlite_sidecar_identity(db_path: Path) -> dict[str, tuple]:
     """Snapshot ``(st_dev, st_ino)`` for existing WAL/SHM sidecars."""
     base = os.fspath(db_path)
     idents = {suffix: _stat_db_file_identity(Path(base + suffix)) for suffix in ("-wal", "-shm")}
     return {suffix: ident for suffix, ident in idents.items() if ident is not None}
 
 
-def _watched_sqlite_sidecar_paths(db_path) -> Dict[str, str]:
+def _watched_sqlite_sidecar_paths(db_path) -> dict[str, str]:
     """Map each sidecar's canonical (/proc-comparable) form to its literal, still-named path,
     so a canonical match can be re-``stat``'d for identity rather than trusted as text."""
     literal_base = os.path.abspath(os.fspath(db_path))
@@ -156,7 +156,7 @@ def _watched_sqlite_sidecar_paths(db_path) -> Dict[str, str]:
     return watched
 
 
-def _identity_is_truly_unlinked(identity: "Tuple[int, int]", watched_path: str) -> bool:
+def _identity_is_truly_unlinked(identity: tuple[int, int], watched_path: str) -> bool:
     """The shared verdict: does ``(st_dev, st_ino)`` name a generation the watched path no longer
     holds?  See :func:`_fd_is_truly_unlinked` for why the test is identity and never link count."""
     try:
@@ -181,6 +181,15 @@ def _fd_is_truly_unlinked(fd_path: str, watched_path: str) -> bool:
     names — the guard keeps failing closed."""
     try:
         fd_stat = os.stat(fd_path)
+        identity = (fd_stat.st_dev, fd_stat.st_ino)
+        if not _identity_is_truly_unlinked(identity, watched_path):
+            return False
+        # SQLite may unlink its checkpointed -shm sidecar before closing its FD.
+        # A close or FD reuse during the path stat is no longer a live holder.
+        target = os.readlink(fd_path)
+        confirmed = os.stat(fd_path)
+        return (canonical_sqlite_path(target) == canonical_sqlite_path(watched_path)
+                and identity == (confirmed.st_dev, confirmed.st_ino))
     except OSError as exc:
         # ENOENT: the descriptor was closed after /proc was read. ESRCH: the whole
         # process exited mid-scan. Neither can keep a retired generation alive, so
@@ -188,7 +197,6 @@ def _fd_is_truly_unlinked(fd_path: str, watched_path: str) -> bool:
         if exc.errno in (errno.ENOENT, errno.ESRCH):
             return False
         return True
-    return _identity_is_truly_unlinked((fd_stat.st_dev, fd_stat.st_ino), watched_path)
 
 
 def _iter_proc_fd_targets():
@@ -220,6 +228,7 @@ def _iter_proc_fd_targets():
 _DARWIN_ALL_PIDS = 1
 _DARWIN_PIDLISTFDS = 1
 _DARWIN_PIDFDVNODEPATHINFO = 2
+_DARWIN_FDTYPE_VNODE = 1
 _DARWIN_PROC_FD_INFO_SIZE = 8  # struct proc_fdinfo { int32 proc_fd; uint32 proc_fdtype; }
 _DARWIN_FD_RECORD_SIZE = 1200  # PROC_PIDFDVNODEPATHINFO_SIZE
 # Field offsets inside that 1200-byte record.  libproc does not lay the header's structs out
@@ -231,6 +240,36 @@ _DARWIN_FD_DEV_OFFSET = 24
 _DARWIN_FD_INO_OFFSET = 32
 _DARWIN_FD_PATH_OFFSET = 176
 _DARWIN_LIBPROC = None
+
+# Wall-clock budget for one darwin holder-scan pass (#113187). A single
+# proc_pidfdinfo call can block uninterruptibly in the kernel (a process stuck
+# in uninterruptible I/O on a dead network share), so no per-iteration check
+# can bound it: the whole pass runs in a daemon thread and is abandoned on
+# expiry, failing open per the guard's contract.
+_DARWIN_FD_SCAN_TIMEOUT_SECONDS = 5.0
+_DARWIN_FD_SCAN_COOLDOWN_SECONDS = 30.0
+_DARWIN_FD_SCAN_LOCK = threading.Lock()
+_DARWIN_FD_SCAN_WORKER = None
+_DARWIN_FD_SCAN_RETRY_AT = 0.0
+
+
+class _DarwinFDScan(threading.Thread):
+    """One shared descriptor enumeration, judged while each descriptor is current."""
+
+    def __init__(self):
+        super().__init__(name="sqlite-sidecar-holder-scan", daemon=True)
+        self.targets: List[Tuple[int, str, Tuple[int, int]]] = []
+        self.error: BaseException | None = None
+        self.cursor: Tuple[int | None, int | None, str] = (None, None, "proc_listpids")
+
+    def run(self):
+        try:
+            for pid, _fd, target, identity in _iter_darwin_fd_targets():
+                if (target.casefold().endswith(("-wal", "-shm"))
+                        and _identity_is_truly_unlinked(identity, target)):
+                    self.targets.append((pid, target, identity))
+        except BaseException as exc:
+            self.error = exc
 
 
 def _darwin_libproc():
@@ -255,7 +294,7 @@ def _darwin_libproc():
     return lib
 
 
-def _darwin_all_pids(lib) -> List[int]:
+def _darwin_all_pids(lib) -> list[int]:
     """Every pid ``proc_listpids`` will name (the kernel silently omits ones we may not inspect)."""
     import ctypes
 
@@ -279,10 +318,13 @@ def _iter_darwin_fd_targets():
     import ctypes
 
     lib = _darwin_libproc()
+    scan = threading.current_thread()
     for pid in _darwin_all_pids(lib):
         size = 4096
         while True:
             listing = ctypes.create_string_buffer(size)
+            if isinstance(scan, _DarwinFDScan):
+                scan.cursor = (pid, None, "proc_pidinfo")
             used = lib.proc_pidinfo(pid, _DARWIN_PIDLISTFDS, 0, listing, size)
             if used <= 0:
                 break  # process gone, or not ours to inspect
@@ -292,8 +334,12 @@ def _iter_darwin_fd_targets():
         else:
             continue
         for offset in range(0, used - _DARWIN_PROC_FD_INFO_SIZE + 1, _DARWIN_PROC_FD_INFO_SIZE):
-            fd = struct.unpack_from("<i", listing.raw, offset)[0]
+            fd, fd_type = struct.unpack_from("<iI", listing.raw, offset)
+            if fd_type != _DARWIN_FDTYPE_VNODE:
+                continue
             record = ctypes.create_string_buffer(_DARWIN_FD_RECORD_SIZE)
+            if isinstance(scan, _DarwinFDScan):
+                scan.cursor = (pid, fd, "proc_pidfdinfo")
             if lib.proc_pidfdinfo(pid, fd, _DARWIN_PIDFDVNODEPATHINFO, record,
                                   _DARWIN_FD_RECORD_SIZE) <= 0:
                 continue
@@ -304,7 +350,33 @@ def _iter_darwin_fd_targets():
             yield pid, fd, target, identity
 
 
-def _iter_darwin_sidecar_holders(db_path) -> List[Tuple[int, str]]:
+def _darwin_self_sidecar_holders(watched: Dict[str, str]) -> List[Tuple[int, str]]:
+    """Inspect our sidecars without stat-ing every unrelated open vnode.
+
+    F_GETPATH retrieves the saved path without libproc's vn_stat of the vnode.
+    Only matching sidecars are fstat-ed, so an unrelated cloud/network file
+    cannot suppress the in-process lost-generation check during scan cooldown.
+    No descriptor is opened or closed, preserving SQLite's advisory locks.
+    """
+    import fcntl
+
+    holders = []
+    for fd_str in os.listdir("/dev/fd"):
+        with contextlib.suppress(OSError):
+            fd = int(fd_str)
+            target = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0].decode("utf-8", "replace")
+            if (literal := watched.get(target.casefold())) is not None:
+                info = os.fstat(fd)
+                confirmed_path = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0].decode("utf-8", "replace")
+                confirmed = os.fstat(fd)
+                identity = (info.st_dev, info.st_ino)
+                if (confirmed_path == target and identity == (confirmed.st_dev, confirmed.st_ino)
+                        and _identity_is_truly_unlinked(identity, literal)):
+                    holders.append((os.getpid(), target))
+    return holders
+
+
+def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
     """The macOS leg of :func:`iter_deleted_sqlite_sidecar_holders`: libproc enumeration matched
     against the watched sidecar paths, judged by identity.
 
@@ -315,15 +387,40 @@ def _iter_darwin_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     # APFS/HFS+ are case-insensitive by default and libproc reports the pathname as the opener
     # spelled it; ``os.path.normcase`` is the identity on darwin, so fold case here.
     watched = {path.casefold(): path for path in (base + "-wal", base + "-shm")}
-    holders: List[Tuple[int, str]] = []
-    for pid, _fd, target, identity in _iter_darwin_fd_targets():
-        literal = watched.get(target.casefold())
-        if literal is not None and _identity_is_truly_unlinked(identity, literal):
-            holders.append((pid, target))
-    return holders
+    if sys.platform == "darwin" and (holders := _darwin_self_sidecar_holders(watched)):
+        return holders
+    global _DARWIN_FD_SCAN_WORKER, _DARWIN_FD_SCAN_RETRY_AT
+    with _DARWIN_FD_SCAN_LOCK:
+        if time.monotonic() < _DARWIN_FD_SCAN_RETRY_AT:
+            return []
+        worker = _DARWIN_FD_SCAN_WORKER
+        if worker is None or not worker.is_alive():
+            worker = _DarwinFDScan()
+            _DARWIN_FD_SCAN_WORKER = worker
+            worker.start()
+    # A kernel-blocked descriptor read cannot be interrupted. Reuse that
+    # worker and the existing fail-open outcome rather than abandon another
+    # thread on every open. Judge identity when reading each descriptor: a
+    # healthy connection may close and unlink its sidecars before the scan ends.
+    worker.join(_DARWIN_FD_SCAN_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        with _DARWIN_FD_SCAN_LOCK:
+            _DARWIN_FD_SCAN_RETRY_AT = time.monotonic() + _DARWIN_FD_SCAN_COOLDOWN_SECONDS
+        logger.warning(
+            "deleted-WAL holder scan timed out after %.1fs for %s; continuing fail-open "
+            "(probe_pid=%s probe_fd=%s stage=%s)",
+            _DARWIN_FD_SCAN_TIMEOUT_SECONDS,
+            db_path,
+            *worker.cursor,
+        )
+        return []
+    if worker.error is not None:
+        raise worker.error
+    return [(pid, target) for pid, target, _identity in tuple(worker.targets)
+            if target.casefold() in watched]
 
 
-def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
+def iter_deleted_sqlite_sidecar_holders(db_path) -> list[tuple[int, str]]:
     """Return processes holding an unlinked ``state.db-wal`` / ``-shm`` sidecar for *db_path*.
 
     Linux enumerates ``/proc/<pid>/fd`` (using the `` (deleted)`` suffix as a cheap pre-filter);
@@ -337,7 +434,7 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     inode must not mint a replacement WAL (``_foreign_state_db_holders`` skips this PID)."""
     if sys.platform == "win32":
         return []
-    holders: List[Tuple[int, str]] = []
+    holders: list[tuple[int, str]] = []
     try:
         if sys.platform == "darwin":
             holders = _iter_darwin_sidecar_holders(db_path)
@@ -353,13 +450,63 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     return holders
 
 
+# The holder scan walks every descriptor of every process on the host (libproc on macOS; a cold
+# scan took 77 s on a loaded host). Run per open, a boot's burst of opens repeated it back to back.
+# A clean verdict is reused while BOTH sidecars keep their identity: a replacement WAL is minted
+# only when a sidecar is missing, and an inode some process still holds cannot be reused, so an
+# unchanged pair means no generation was retired since the scan. One scan per path at a time.
+_HOLDER_SCAN_CLEAN_TTL_S = 10.0
+_holder_scan_lock = threading.Lock()
+_holder_scan_clean: Dict[str, Tuple[float, Dict[str, tuple]]] = {}
+_holder_scan_path_locks: Dict[str, threading.Lock] = {}
+
+
+def _deleted_sidecar_holders_for_open(db_path) -> List[Tuple[int, str]]:
+    """:func:`iter_deleted_sqlite_sidecar_holders`, reusing a recent clean verdict for the same pair."""
+    key = os.path.abspath(os.fspath(db_path))
+
+    def _reusable_clean() -> "Tuple[bool, Dict[str, tuple]]":
+        sidecars = _stat_sqlite_sidecar_identity(Path(key))
+        clean = _holder_scan_clean.get(key)
+        hit = (len(sidecars) == 2 and clean is not None and clean[0] > time.monotonic()
+               and clean[1] == sidecars)
+        return hit, sidecars
+
+    with _holder_scan_lock:
+        hit, _ = _reusable_clean()
+        if hit:
+            return []
+        path_lock = _holder_scan_path_locks.setdefault(key, threading.Lock())
+    with path_lock:
+        with _holder_scan_lock:
+            hit, sidecars = _reusable_clean()  # a concurrent opener may have just scanned
+        if hit:
+            return []
+        started = time.monotonic()
+        holders = iter_deleted_sqlite_sidecar_holders(db_path)
+        # A scan that hit its own fail-open timeout proved nothing: never cache it.
+        if (not holders and len(sidecars) == 2
+                and time.monotonic() - started < _DARWIN_FD_SCAN_TIMEOUT_SECONDS):
+            with _holder_scan_lock:
+                _holder_scan_clean[key] = (time.monotonic() + _HOLDER_SCAN_CLEAN_TTL_S, sidecars)
+        return holders
+
+
 def refuse_deleted_wal_generation(db_path) -> None:
     """Raise if any process holds a deleted WAL/SHM generation for *db_path*; called
     *before* ``sqlite3.connect`` so a second opener cannot mint a replacement WAL inode."""
     from hermes_state import DeletedWalGenerationError
     from hermes_state_errors import _DELETED_WAL_GENERATION_MSG
-    if not iter_deleted_sqlite_sidecar_holders(db_path):
+    if not _deleted_sidecar_holders_for_open(db_path):
         return
+    if sys.platform.startswith("linux"):
+        # SQLite's normal close unlinks checkpointed sidecars before closing
+        # their descriptors. Let that short-lived holder settle before refusing
+        # a new opener, without permitting a persistent retired generation.
+        for delay in (0.01, 0.02, 0.04):
+            time.sleep(delay)
+            if not iter_deleted_sqlite_sidecar_holders(db_path):
+                return
     logger.error(_DELETED_WAL_GENERATION_MSG)
     raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
 
@@ -403,7 +550,7 @@ def _fsync_path(path: Path) -> None:
         os.close(fd)
 
 
-def _own_descriptor_for_identity(identity) -> "Optional[int]":
+def _own_descriptor_for_identity(identity) -> Optional[int]:
     """This process's open descriptor for the inode ``(st_dev, st_ino)``, or None.
 
     Exact-generation qualified: pathnames are never consulted. The descriptor stays owned by
@@ -429,7 +576,7 @@ def _own_descriptor_for_identity(identity) -> "Optional[int]":
     return None
 
 
-def _copy_range(read: Callable[[int, int], Optional[bytes]], dest: Path, *, size: int) -> Dict[str, Any]:
+def _copy_range(read: Callable[[int, int], Optional[bytes]], dest: Path, *, size: int) -> dict[str, Any]:
     """Stream ``size`` bytes via ``read(offset, length)`` into ``dest`` (temp file, fsync, rename).
 
     A short read raises ``RetiredGenerationCaptureError``: a truncated copy with a valid-looking
@@ -461,17 +608,17 @@ def _copy_range(read: Callable[[int, int], Optional[bytes]], dest: Path, *, size
     return {"file": dest.name, "bytes": offset, "sha256": digest.hexdigest()}
 
 
-def _copy_descriptor(fd: int, dest: Path, *, size: int) -> Dict[str, Any]:
+def _copy_descriptor(fd: int, dest: Path, *, size: int) -> dict[str, Any]:
     """pread ``fd`` (a descriptor SQLite owns; never closed here) into ``dest``."""
     return _copy_range(lambda offset, length: os.pread(fd, length, offset), dest, size=size)
 
 
-def _copy_main_image(db_path: Path, dest: Path, *, size: int) -> Dict[str, Any]:
+def _copy_main_image(db_path: Path, dest: Path, *, size: int) -> dict[str, Any]:
     """Copy the live main file through the lock-safe cached descriptor (see ``_pread_db_range``)."""
     return _copy_range(lambda offset, length: _pread_db_range(db_path, offset, length), dest, size=size)
 
 
-def _parse_sqlite_header(header: bytes) -> Dict[str, Any]:
+def _parse_sqlite_header(header: bytes) -> dict[str, Any]:
     if len(header) < _SQLITE_HEADER_BYTES or header[:16] != b"SQLite format 3\x00":
         return {"valid": False}
     raw_page_size = struct.unpack(">H", header[16:18])[0]
@@ -483,7 +630,7 @@ def _parse_sqlite_header(header: bytes) -> Dict[str, Any]:
 
 
 def capture_retired_wal_generation(
-    db_path, *, sidecar_identity: Dict[str, tuple], trigger: str,
+    db_path, *, sidecar_identity: dict[str, tuple], trigger: str,
 ) -> Path:
     """Durably capture the lost WAL generation this process still holds open; return the artifact dir.
 
@@ -517,7 +664,7 @@ def capture_retired_wal_generation(
     staging = final.with_name(final.name + ".partial")
     try:
         staging.mkdir(parents=True, exist_ok=False)
-        manifest: Dict[str, Any] = {
+        manifest: dict[str, Any] = {
             "version": RETIRED_GENERATION_MANIFEST_VERSION,
             "database": str(db_path),
             "trigger": trigger,
@@ -545,7 +692,7 @@ def capture_retired_wal_generation(
         if header is None:
             raise RetiredGenerationCaptureError(f"cannot read the main image header of {db_path}")
         main_size = os.stat(db_path).st_size
-        main: Dict[str, Any] = {"identity": list(_stat_db_file_identity(db_path) or ()) or None,
+        main: dict[str, Any] = {"identity": list(_stat_db_file_identity(db_path) or ()) or None,
                                 "size": main_size, "header": _parse_sqlite_header(header)}
         if main_size <= RETIRED_GENERATION_MAIN_IMAGE_MAX_BYTES:
             main.update(mode="copied", **_copy_main_image(db_path, staging / db_path.name, size=main_size))
@@ -638,12 +785,12 @@ def quarantine_cross_process_lock(path: Path, timeout: float = 5.0):
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), mode, 1)
 
-            _try_lock = lambda: _lock(msvcrt.LK_NBLCK)  # noqa: E731
-            _unlock = lambda: _lock(msvcrt.LK_UNLCK)  # noqa: E731
+            _try_lock = lambda: _lock(msvcrt.LK_NBLCK)
+            _unlock = lambda: _lock(msvcrt.LK_UNLCK)
         else:
             import fcntl
-            _try_lock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # noqa: E731
-            _unlock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # noqa: E731
+            _try_lock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _unlock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         deadline = time.monotonic() + timeout
         while not acquired:
             try:
@@ -713,7 +860,7 @@ def quarantine_invalid_state_db(path: Path, *, already_locked: bool = False) -> 
         return _do_quarantine()
 
 
-def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
+def collect_state_db_stats(db_path: Path) -> dict[str, Any]:
     """Best-effort, strictly read-only stats snapshot of a state.db file: ``mode=ro`` with a short
     timeout so it can run against a *live* database without taking a write lock.  Every field is
     collected independently (a failed pragma/SELECT yields ``None`` for it); never raises.
@@ -721,7 +868,7 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
     ``wal_size_bytes`` is 0 when the sidecar is absent; ``fts_storage_version`` None means the
     legacy inline layout; ``fts_rebuild_deferral`` is the durable blocked-repair diagnostic."""
     from hermes_state import _connect_tracked_db
-    stats: Dict[str, Any] = dict.fromkeys((
+    stats: dict[str, Any] = dict.fromkeys((
         "page_count", "page_size", "freelist_count", "logical_size_bytes", "wal_size_bytes", "journal_mode",
         "messages", "sessions", "fts_tables", "fts_storage_version", "fts_rebuild_pending",
         "fts_rebuild_high_water", "fts_rebuild_progress", "fts_rebuild_deferral"))
@@ -806,13 +953,13 @@ def count_db_holders(db_path: Path) -> Optional[int]:
 
 
 def _is_inactive_orphan_desktop_holder(*, ppid: int, age_seconds: float, min_age_seconds: float,
-                                       ephemeral_backend: bool, connection_statuses: List[str]) -> bool:
+                                       ephemeral_backend: bool, connection_statuses: list[str]) -> bool:
     """Pure safety predicate for the narrow Desktop holder reap."""
     return (ppid in (0, 1) and age_seconds >= min_age_seconds and ephemeral_backend
             and "ESTABLISHED" not in connection_statuses)
 
 
-def _concrete_state_db_holder_pids(db_path: Path, holders: List[Tuple[int, str]]) -> List[int]:
+def _concrete_state_db_holder_pids(db_path: Path, holders: list[tuple[int, str]]) -> list[int]:
     """Return unique PIDs proven to hold this DB or one of its sidecars."""
     canonical_db = os.path.normcase(os.path.abspath(os.fspath(db_path)))
     watched = {canonical_db, canonical_db + "-wal", canonical_db + "-shm"}

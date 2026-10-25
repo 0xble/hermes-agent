@@ -6,7 +6,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from typing import TYPE_CHECKING, Optional
 
 from hermes_state_ids import new_session_id
@@ -23,8 +23,18 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _local_naive(stamp: datetime) -> datetime:
+    """Match the store clock when reading or receiving an attended activity stamp."""
+    return datetime.fromtimestamp(stamp.timestamp()) if stamp.tzinfo is not None else stamp
+
+
 def _new_session_id(now: datetime) -> str:
     return new_session_id(now, hex_len=8)
+
+
+def _local_iso(stamp: datetime) -> str:
+    """Preserve the repeated local hour, which an offset-free ISO string loses."""
+    return (stamp.astimezone() if stamp.fold else stamp).isoformat()
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -127,15 +137,26 @@ class SessionLifecycleMixin:
         candidate["active_turn_token"] = token
         candidate["active_turn_started_at"] = _iso(started_at)
         candidate["active_turn_human"] = bool(human)
+        if token:
+            from gateway.config import is_zero_cut_handover_enabled
+            if is_zero_cut_handover_enabled(getattr(self, "config", None)):
+                from gateway.gateway_slot import effective_gateway_slot
+                candidate["active_turn_owner_pid"] = os.getpid()
+                candidate["active_turn_owner_slot"] = effective_gateway_slot(getattr(self, "config", None))
+        else:
+            candidate.pop("active_turn_owner_pid", None)
+            candidate.pop("active_turn_owner_slot", None)
         touched = _now() if started_at is not None else None
         if touched is not None:
             # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
             # downgrade/upgrade window.
-            candidate["updated_at"] = touched.isoformat()
+            candidate["updated_at"] = _local_iso(touched)
         self._save_entry(session_key, entry_data=candidate, lock_held=True)
         entry.active_turn_token = token
         entry.active_turn_started_at = started_at
         entry.active_turn_human = bool(human)
+        entry.active_turn_owner_pid = candidate.get("active_turn_owner_pid")
+        entry.active_turn_owner_slot = candidate.get("active_turn_owner_slot")
         if touched is not None:
             entry.updated_at = touched
 
@@ -150,7 +171,7 @@ class SessionLifecycleMixin:
                 return None
             # Aware UTC, unlike the local wall clock elsewhere: the next process compares it with
             # epoch transcript timestamps and may run in another zone (DST, container vs unit TZ).
-            self._set_turn_marker_locked(session_key, entry, token, datetime.now(timezone.utc), human=human)
+            self._set_turn_marker_locked(session_key, entry, token, datetime.now(UTC), human=human)
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:
@@ -194,6 +215,7 @@ class SessionLifecycleMixin:
                     else:
                         entry.resume_reason = "restart_interrupted"
                         entry.resume_marker_token = uuid.uuid4().hex
+                        entry.resume_predecessor_turn_id = entry.resume_turn_id
                         entry.resume_turn_id = entry.active_turn_token
                         entry.resume_human = bool(entry.active_turn_human)
                         entry.restart_note_reconcile_attempts = 0
@@ -203,6 +225,7 @@ class SessionLifecycleMixin:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.resume_marker_token = uuid.uuid4().hex
+                    entry.resume_predecessor_turn_id = None
                     entry.resume_turn_id = entry.active_turn_token
                     entry.resume_human = bool(entry.active_turn_human)
                     # Notes are append-only: a newly discovered interruption gets a new marker
@@ -212,6 +235,8 @@ class SessionLifecycleMixin:
                     promoted += 1
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+            entry.active_turn_owner_pid = None
+            entry.active_turn_owner_slot = None
             return True
 
         self._update_all_entries_locked(_promote)
@@ -224,6 +249,8 @@ class SessionLifecycleMixin:
                 return False
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+            entry.active_turn_owner_pid = None
+            entry.active_turn_owner_slot = None
             return True
         return self._update_all_entries_locked(_discard)
 
@@ -231,22 +258,64 @@ class SessionLifecycleMixin:
         self, session_key: str, reason: str = "restart_timeout", *,
         turn_id: Optional[str] = None, human: bool = True,
     ) -> bool:
-        """Mark a session resumable after a restart interruption (keeps the session_id/transcript,
-        unlike ``suspend_session``). A repeated shutdown pass for the same durable turn preserves
-        its marker token and note id so it cannot post a duplicate note."""
-        def _apply(entry: SessionEntry):
-            if entry.suspended:  # never override an explicit ``suspended`` (hard forced-wipe)
-                return False
-            same_turn = bool(turn_id and entry.resume_pending and entry.resume_turn_id == turn_id)
-            entry.resume_pending = True
-            entry.resume_reason = reason
-            entry.resume_human = bool(human)
-            if not same_turn:
-                entry.resume_marker_token = uuid.uuid4().hex
-                entry.resume_turn_id = turn_id
-                # A successor owns a new note record; predecessor records remain durable and visible.
-                entry.last_resume_marked_at = _now()
-        return self._update_entry(session_key, _apply)
+        """Mark a session resumable after an interruption; True for an eligible entry,
+        even when its exact same-turn marker was already durable."""
+        return bool(self.mark_resume_pending_many([(session_key, turn_id, human)], reason))
+
+    def mark_resume_pending_many(
+        self, markers: list[tuple[str, Optional[str], bool]], reason: str = "restart_timeout",
+    ) -> list[str]:
+        """Durably mark ``(key, turn_id, human)`` requests with one locked full save.
+
+        Return every eligible key, including unchanged same-turn markers: interruption
+        notes are owed independently of whether this pass needed to write. Tokenless
+        legacy marks still get a fresh marker, preserving their conditional-clear CAS.
+        The existing full-save path captures one generation and preserves routing-home
+        ownership, stale-writer ordering, and the state.db + sessions.json contract.
+        """
+        if not markers:
+            return []
+        marked = []
+        previous = []
+        with self._lock:
+            self._ensure_loaded_locked()
+            for session_key, turn_id, human in markers:
+                entry = self._entries.get(session_key)
+                if entry is None or entry.suspended:
+                    continue  # never override an explicit suspension (hard forced-wipe)
+                marked.append(session_key)
+                human = bool(human)
+                same_turn = bool(turn_id and entry.resume_pending and entry.resume_turn_id == turn_id)
+                previous_resume_turn_id = entry.resume_turn_id if entry.resume_pending else None
+                if same_turn and entry.resume_reason == reason and entry.resume_human == human:
+                    continue
+                previous.append((entry, (
+                    entry.resume_pending, entry.resume_reason, entry.resume_human,
+                    entry.resume_marker_token, entry.resume_turn_id,
+                    entry.resume_predecessor_turn_id, entry.last_resume_marked_at,
+                )))
+                entry.resume_pending = True
+                entry.resume_reason = reason
+                entry.resume_human = human
+                if not same_turn:
+                    entry.resume_marker_token = uuid.uuid4().hex
+                    entry.resume_predecessor_turn_id = previous_resume_turn_id
+                    entry.resume_turn_id = turn_id
+                    # A successor owns a new note; predecessor records stay durable and visible.
+                    entry.last_resume_marked_at = _now()
+            if previous:
+                try:
+                    self._save()
+                except Exception:
+                    # A failed durable write must not make the next attempt look like a no-op.
+                    for entry, state in reversed(previous):
+                        (
+                            entry.resume_pending, entry.resume_reason, entry.resume_human,
+                            entry.resume_marker_token, entry.resume_turn_id,
+                            entry.resume_predecessor_turn_id, entry.last_resume_marked_at,
+                        ) = state
+                    raise
+        return marked
 
     def get_resume_pending_marker(self, session_key: str) -> Optional[tuple]:
         """Snapshot the current marker before an interrupt can yield to a successor."""
@@ -500,6 +569,7 @@ class SessionLifecycleMixin:
             entry.resume_reason = None
             entry.resume_marker_token = None
             entry.resume_turn_id = None
+            entry.resume_predecessor_turn_id = None
             entry.resume_human = True
             entry.last_resume_marked_at = None
         return self._update_entry(session_key, _apply)

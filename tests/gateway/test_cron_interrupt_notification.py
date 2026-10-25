@@ -54,8 +54,10 @@ def _bind_notifier(runner):
 
 class TestNotifyInterruptedCronJobs:
     @pytest.mark.asyncio
-    async def test_owner_is_told_the_run_was_killed(self):
+    @pytest.mark.parametrize("restarting", [False, True])
+    async def test_owner_is_told_the_run_stopped_before_finishing(self, restarting):
         runner, adapter = make_restart_runner()
+        runner._restart_requested = restarting
         _bind_notifier(runner)
         job = _telegram_job()
 
@@ -67,6 +69,11 @@ class TestNotifyInterruptedCronJobs:
         assert sent == 1
         assert len(adapter.sent) == 1
         body = adapter.sent[0]
+        for cause in ("restart", "shutdown", "killed", "shutting down"):
+            assert cause not in body.lower()
+        assert "stopped before finishing" in body
+        assert "If it is still scheduled" in body
+        assert f"hermes cron run {job['id']}" in body
         assert "daily-digest" in body
         assert adapter.sent_calls[0][0] == "123456"
 
@@ -214,7 +221,7 @@ class TestShutdownDeliversNoticeBeforeDisconnect:
         real_send = adapter.send
 
         async def _tracking_send(chat_id, content, reply_to=None, metadata=None):
-            if "was cut short" in content:
+            if "stopped before finishing" in content:
                 events.append("cron_notice")
             return await real_send(chat_id, content, reply_to=reply_to, metadata=metadata)
 

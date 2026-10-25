@@ -118,6 +118,10 @@ def test_internal_footer_is_idempotent_for_old_and_new_contracts():
     marked = _mark_internal_notification("completion")
     assert marked.endswith(INTERNAL_NOTIFICATION_FOOTER)
     assert marked.count(INTERNAL_NOTIFICATION_FOOTER) == 1
+    assert "routine process/delegation completion steps" in INTERNAL_NOTIFICATION_FOOTER
+    assert "recurring check, monitor, poll, or watch run that finds nothing new or wrong is not news" in INTERNAL_NOTIFICATION_FOOTER
+    assert "'Requested work finished' means the user's requested outcome, not one step or check" in INTERNAL_NOTIFICATION_FOOTER
+    assert "exactly NO_REPLY and nothing else" in INTERNAL_NOTIFICATION_FOOTER
     assert _mark_internal_notification(marked) == marked
 
     old_footer = (

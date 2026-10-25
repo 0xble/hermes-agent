@@ -42,6 +42,17 @@ approval:
     second_one: "{count} seconde"
     second_other: "{count} secondes"
 gateway:
+  attend:
+    usage: "Utilisation : /attend [duration], /attend off ou /attend status. La durée doit être positive, par exemple 30m, 2h, 1h30m ou 1d. Sans durée, la fixation est permanente."
+    disabled: "Le routage en utilisation active n’est pas configuré. Définissez d’abord model.attended."
+    pinned: "Modèle d’utilisation active fixé de façon permanente ({model}). /attend off pour le libérer. Les choix explicites avec /model restent prioritaires."
+    pinned_timed: "Modèle d’utilisation active fixé ({model}) pour {duration}, jusqu’à {until}. /attend off pour le libérer. Les choix explicites avec /model restent prioritaires."
+    released: "Fixation du modèle d’utilisation active levée. Le délai d’inactivité de {minutes} minutes commence maintenant."
+    status_pinned: "Utilisation active : modèle fixé de façon permanente. Route actuelle : {model}."
+    status_timed: "Utilisation active : modèle fixé pour encore {remaining}, jusqu’à {until}. Route actuelle : {model}."
+    status_unpinned: "Utilisation active : modèle non fixé. Route actuelle : {model}."
+    session_changed: "La session a changé. Relancez /attend."
+    configured_model: "route configurée"
   approval_expired: "⚠️ Approbation expirée (l'agent n'attend plus). Demandez à l'agent de réessayer."
   draining: "⏳ Vidage de {count} agent(s) actif(s) avant redémarrage..."
   goal_cleared: "✓ Objectif effacé."
@@ -51,6 +62,11 @@ gateway:
   model:
     error_prefix: "Erreur : {error}"
     switched: "Modèle changé pour `{model}`"
+    attended_switched: "⇄ Switched to {model} while you're active."
+    attended_switched_until_idle: "⇄ Switched to {model} while you're active. Back to {idle_model} after {minutes}m idle."
+    attended_switched_back_idle: "⇄ Back to {idle_model} after {minutes}m idle."
+    pick_expires: "Expires in {hours}h, then returns to normal routing."
+    pick_expired: "⇄ Back to {model}, model pick expired."
     provider_label: "Fournisseur : {provider}"
     context_label: "Contexte : {tokens} tokens"
     max_output_label: "Sortie max. : {tokens} tokens"
@@ -66,6 +82,14 @@ gateway:
     usage_switch_model: "`/model <name>` — changer de modèle"
     usage_switch_provider: "`/model <name> --provider <slug>` — changer de fournisseur"
     usage_persist: "`/model <name> --global` — conserver"
+    reset_done: "✓ Model override reset."
+    reset_all_done: "✓ Cleared explicit model and reasoning picks for {count} sessions."
+    attended_migrated: "✓ Moved {converted} sessions to @attended. Failures: {failures}{detail}"
+    role_set: "✓ Model role set to @{role} (next turn)"
+    role_empty: "❌ Model role cannot be empty"
+    role_flags_unsupported: "❌ `/model @role` takes no flags (--global, --once, --session, --provider, --reasoning). Set the role alone, then adjust separately."
+    reset_all_usage: "Usage: `/model reset --all`"
+    reset_all_admin_only: "⛔ `/model reset --all` is restricted to gateway admins."
     err_skew: "Ce gateway exécute le code de {boot_rev}, mais le checkout sur disque est maintenant à {disk_rev}. Changer de modèle risquerait un plantage dû à des modules obsolètes — redémarrez le gateway pour charger le nouveau code : hermes gateway restart"
     err_switch_failed: "Le passage au modèle {model} a échoué ({error}) ; le modèle {current} est conservé."
     err_config_not_updated: "config.yaml non mis à jour ({error})"
@@ -208,13 +232,13 @@ gateway:
     status_normal: "normal"
     status_expiring: "\n\n⏱ Expire dans : {remaining}"
     expired: "⚡ Le mode rapide a été désactivé après {duration}."
-    picker_title: "⚡ **Priority Processing**\\n\\nMode actuel : `{mode}`\\n\\nChoisissez une option :"
+    picker_title: "⚡ **Priority Processing**\n\nMode actuel : `{mode}`\n\nChoisissez une option :"
     choice_fast: "fast — Priority Processing activé"
     choice_normal: "normal — traitement standard"
     choice_auto: "auto — rapide pendant les premières secondes de chaque tour"
     choice_cold: "cold — rapide uniquement au premier tour d'une session"
-    choice_ultrafast: "ultrafast — OpenAI Ultrafast (GPT-6 Astra, prix x6)"
-    ultrafast_not_supported: "⚡ Ultrafast n'est disponible que pour GPT-6 Astra (modèle actuel : `{model}`)."
+    choice_ultrafast: "ultrafast — OpenAI Ultrafast, prix x6"
+    ultrafast_not_supported: "⚡ Ultrafast n'est pas disponible pour `{model}` sur ce compte ou cette route."
   footer:
     status: "📎 Pied de page d'exécution : **{state}**\nChamps : `{fields}`\nPlateforme : `{platform}`"
     usage: "Usage : `/footer [on|off|status]`"
@@ -313,12 +337,13 @@ gateway:
     reset_global_unsupported: "⚠️ `/reasoning reset --global` n'est pas pris en charge. Utilisez `/reasoning <level> --global` pour modifier la valeur globale par défaut."
     reset_done: "🧠 ✓ Remplacement de raisonnement de la session effacé ; retour à la configuration globale."
     unknown_arg: "⚠️ Argument inconnu : `{arg}`\n\n**Niveaux valides :** none, minimal, low, medium, high, xhigh, max, ultra\n**Affichage :** show, hide\n**Persister :** ajoutez `--global` pour enregistrer au-delà de cette session"
-    picker_title: "🧠 **Paramètres de raisonnement**\\n\\n**Effort :** `{level}`\\n**Portée :** {scope}\\n**Affichage :** {display}\\n\\nChoisissez une option :"
+    picker_title: "🧠 **Paramètres de raisonnement**\n\n**Effort :** `{level}`\n**Portée :** {scope}\n**Affichage :** {display}\n\nChoisissez une option :"
     choice_none: "none — désactiver le raisonnement"
     choice_reset: "reset — effacer le réglage de session"
     choice_show: "afficher le raisonnement dans les réponses"
     choice_hide: "masquer le raisonnement dans les réponses"
     set_global: "🧠 ✓ Effort de raisonnement défini sur `{effort}` (enregistré dans la configuration)\n_(prend effet au prochain message)_"
+    preset_owns_effort: "Le préréglage `{preset}` fixe l'effort de la route principale à `{preset_effort}`. `{effort}` s'applique aux autres modèles."
     set_global_save_failed: "🧠 ✓ Effort de raisonnement défini sur `{effort}` (session uniquement — échec de l'enregistrement de la configuration)\n_(prend effet au prochain message)_"
     set_session: "🧠 ✓ Effort de raisonnement défini sur `{effort}` (session uniquement — ajoutez `--global` pour persister)\n_(prend effet au prochain message)_"
     quote_label_discord: "-# 💭 Raisonnement"
@@ -362,6 +387,9 @@ gateway:
     title_empty_untitled: "\n⚠️ Le titre est vide après nettoyage — session démarrée sans titre."
     tip: "\n✦ Astuce : {tip}"
   restart:
+    followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
+    followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
+    followup_possible_duplicate_notice: "A message you sent just before the restart may already have been handled. Please resend it only if it wasn't."
     in_progress: "⏳ Redémarrage du gateway déjà en cours..."
     restarting: "♻ Redémarrage du gateway. Si vous n'êtes pas notifié dans les 60 secondes, redémarrez depuis la console avec `hermes gateway restart`."
   resume:
@@ -478,7 +506,7 @@ gateway:
     last_activity: "**Dernière activité :** {timestamp}"
     model: "**Modèle :** `{model}`"
     model_provider: "**Modèle :** `{model}` ({provider})"
-    free_tier: "Nous · offre gratuite · nous/welcome · /login pour se connecter"
+    model_role: "(@{role})"
     context: "**Contexte :** {used} / {total} ({pct}%)"
     context_used: "**Contexte :** ~{used} jetons"
     tokens: "**Jetons facturés au total :** {tokens} _(pas la taille actuelle de votre contexte ; utilisez `/context`)_"
@@ -991,16 +1019,13 @@ gateway:
       Si vous gérez ce bot, ouvrez un terminal et exécutez : `{approve_cmd}`. Sinon, transmettez cette commande au propriétaire du bot. Une fois approuvé, renvoyez votre message.
     rate_limited: "Trop de demandes d'appairage pour le moment. Patientez quelques minutes, puis renvoyez votre message."
   shutdown:
-    action_shutting_down: "en cours d'arrêt"
-    action_restarting: "en cours de redémarrage"
-    cron_interrupted: "⚠️ La tâche planifiée '{job}' a été interrompue car Hermes est {action} ; aucun résultat pour cette exécution. Elle se relancera selon son planning, ou lancez-la maintenant avec `hermes cron run {job}` une fois Hermes de retour."
+    cron_stopped: "⚠️ Scheduled job '{job}' stopped before finishing; no result this run. If it is still scheduled, it will run again on schedule. To retry now, use `hermes cron run {job_id}`; reconcile any non-idempotent effects first."
     notice_shutdown: "⚠️ Hermes s'arrête — votre tâche en cours va être interrompue. Une fois de retour en ligne, envoyez n'importe quel message et j'essaierai de reprendre là où nous en étions."
     notice_restart: "⚠️ Hermes redémarre — votre tâche en cours va être interrompue. Envoyez n'importe quel message après le redémarrage et j'essaierai de reprendre là où vous en étiez."
     interrupted_turn: "↻ Interrompu parce que Hermes s'est arrêté. Je continuerai ici automatiquement dès qu'il sera de retour."
   startup:
     handoff_thread_title: "Hermes — {title}"
     restarted: "♻ Gateway redémarré avec succès. Votre session continue."
-    free_tier_line: "Inférence : offre gratuite Nous (nous/welcome). Connectez-vous pour en obtenir plus : /login"
     online: "♻️ Gateway en ligne — Hermes est de retour et prêt."
     db_corrupt: |-
       ⚠️ Corruption détectée dans la base de données des sessions. Les messages risquent de ne pas être persistés. Options de récupération :
@@ -1014,6 +1039,9 @@ gateway:
     db_fts_corrupt: "⚠️ La base de données des sessions a signalé une erreur de corruption limitée à l'index de recherche (FTS5) ; les tables de messages ne sont pas endommagées. Les messages risquent de ne pas être persistés tant qu'elle n'est pas réparée : exécutez `hermes {profile_arg}doctor --fix`, puis redémarrez le gateway. N'exécutez pas d'outils de récupération et ne restaurez pas de sauvegarde à moins que `hermes {profile_arg}doctor` ne confirme des dégâts."
     db_then_restart: "{action} Puis `hermes {profile_arg}gateway restart`."
     db_unavailable: "⚠️ Base de données des sessions indisponible — les messages risquent de ne pas être enregistrés et /resume sera vide. Cause : {cause}. {action}"
+  cron_store:
+    unwritable: "⚠️ Le stockage cron {store} n'est plus accessible en écriture ({error}) depuis {since}. Les tâches planifiées sont ignorées jusqu'à ce qu'il accepte à nouveau les écritures. Correctif : {fix}."
+    recovered: "✅ Le stockage cron {store} est de nouveau accessible en écriture ; {skipped} exécution(s) ignorée(s), chaque tâche est rattrapée une fois."
   whoami:
     scope_dm: "MP"
     scope_group: "groupe/canal"
@@ -1703,8 +1731,6 @@ platform:
   irc:
     quit_message: "Hermes Agent s'arrête"
     standalone_quit: "livré"
-  homeassistant:
-    notification_title: "Hermes Agent"
   relay:
     confirm_approve_once: "Approuver une fois"
     confirm_always_approve: "Toujours approuver"
@@ -1712,6 +1738,8 @@ platform:
     prompt_other: "✏️ Autre (saisir)"
     prompt_expired: ⌛ Cette invite n'attend plus de réponse. Envoyez votre réponse comme un message normal.
 slash:
+  attend:
+    description: "Fixer le modèle d’utilisation active de façon permanente ou pour une durée"
   approve:
     description: "Approuver une commande dangereuse en attente"
   bg:
@@ -2550,6 +2578,7 @@ cli:
     failed: "Échec de la connexion"
     authorized_no_tools: "Autorisé. Outils indisponibles."
     connected: "Connecté"
+    named_account: "Hermes a nommé ce compte {name} {alias}. Vous pouvez le renommer à tout moment."
     waiting: "En attente…"
   editor:
     only_interactive: "L'éditeur externe n'est disponible que dans la CLI interactive."
@@ -2631,6 +2660,7 @@ cli:
     removed: "Élément {index} retiré de la file : {preview}"
     item_not_found: "Élément {index} introuvable dans la file. Taille actuelle : {size}"
     usage_edit: "Usage : /queue edit <number> <new prompt>"
+    usage_remove: "Usage : /queue rm <number>"
     updated: "Élément {index} de la file mis à jour : {preview}"
     usage_move: "Usage : /queue move <from> <to>"
     move_out_of_range: "Déplacement hors limites de la file. Taille actuelle : {size}"
@@ -2669,6 +2699,7 @@ cli:
     session_not_found: "Session introuvable : {session_id}"
     compressed_into: "La session {session_id} a été compressée dans {descendant} ; reprise de la session descendante avec votre transcription."
     cannot_resume: "Impossible de reprendre la session : {error}"
+    kanban_owned: "⛔ La session {session_id} est la transcription d'un worker Kanban. La reprendre ici créerait un écrivain que le tableau Kanban ne peut ni observer ni superviser — relance ou débloque plutôt la carte sur le tableau, afin que le dispatcher possède la prochaine exécution."
     cannot_resume_prefix: "Impossible de reprendre la session :"
     resumed_session: "↻ Session reprise"
     counts_one: "({count} message utilisateur, {total} messages au total)"
@@ -2703,7 +2734,6 @@ cli:
     run_model_to_retry: "Exécutez 'hermes model' pour réessayer."
     provider_configured: "✓ Fournisseur configuré — vous pouvez commencer à discuter."
     provider_setup_incomplete: "La configuration du fournisseur n'a pas abouti. Exécutez 'hermes model' pour réessayer."
-    tirith_unavailable: "⚠ Le scanner de sécurité tirith est activé mais indisponible — l'analyse des commandes se limitera à la détection par motifs"
     unknown_toolsets: "Avertissement : ensembles d'outils inconnus : {names}"
     stdin_unusable: |2-
 
@@ -2935,7 +2965,7 @@ cli:
       feature_anthropic: "Anthropic Fast Mode"
       feature_openai: "Priority Processing"
       feature_ultrafast: "OpenAI Ultrafast"
-      ultrafast_not_supported: "(._.) Ultrafast n'est disponible que pour GPT-6 Astra (modèle actuel : {model})."
+      ultrafast_not_supported: "(._.) Ultrafast n'est pas disponible pour {model} sur ce compte ou cette route."
       usage: "Usage : /fast [normal|fast|auto|cold|ultrafast|status] [--global]"
       status: "{feature} : {status}"
       set_to: "✓ {feature} défini sur {value} {scope}"
@@ -3008,6 +3038,7 @@ cli:
       restored: "État restauré depuis : {snapshot_id}"
       restart_recommended: "Redémarrage recommandé pour que les processus gateway/dashboard prennent en compte les changements de state.db."
       not_found: "Instantané introuvable : {snapshot_id}"
+      restore_incomplete: "L'instantané {snapshot_id} n'a pas été entièrement restauré ; certains fichiers ont été refusés (voir les journaux)"
       usage_prune: "Usage : /snapshot prune [nombre-à-conserver]"
       pruned: "{deleted} ancien(s) instantané(s) supprimé(s) ({keep} conservé(s))."
     export:
@@ -3607,6 +3638,7 @@ cli:
     shallow_clone_keeping: "⚠ Clone superficiel — impossible de vérifier l'état du push, conservé : {path}"
     next_session_deepens: "La prochaine session `hermes -w` approfondira le clone et supprimera automatiquement les worktrees fusionnés."
     unpushed_keeping: "⚠ Le worktree a des commits non poussés, conservé : {path}"
+    uncommitted_keeping: "⚠ Le worktree a des modifications non commitées, conservé : {path}"
     clean_up_manually: "Pour nettoyer manuellement : git worktree remove --force {path}"
     cleaned_up: "✓ Worktree nettoyé : {path}"
 display:
@@ -3971,7 +4003,7 @@ tips:
   t167: "L'approbation des commandes dangereuses a 4 niveaux : once, session, always (liste d'autorisation permanente), deny."
   t168: "Le mode d'approbation intelligent utilise un LLM pour approuver automatiquement les commandes sûres et signaler les dangereuses."
   t169: "La protection SSRF bloque les réseaux privés, le loopback, les adresses link-local et les adresses de métadonnées cloud."
-  t170: "L'analyse pré-exécution Tirith détecte l'usurpation d'URL par homoglyphes et les schémas de type « pipe vers interpréteur »."
+  t170: "Les ID de session sont préfixés par un horodatage (20250305_091523_abcd), donc le tri fonctionne naturellement avec ls et jq."
   t171: "Les sous-processus MCP reçoivent un environnement filtré — seules les variables système sûres sont transmises."
   t172: "Les fichiers de contexte (.hermes.md, AGENTS.md) sont analysés contre les injections de prompt avant chargement."
   t173: "command_allowlist dans config.yaml approuve de façon permanente certains motifs de commandes shell."
@@ -4001,7 +4033,7 @@ tips:
   t197: "L'enregistrement des trajectoires (--save-trajectories) capture les traces complètes d'utilisation des outils pour l'entraînement de modèles."
   t198: "Trois types de plugins : généraux (outils/hooks), fournisseurs de mémoire et moteurs de contexte."
   t199: "hermes plugins install owner/repo installe des plugins directement depuis GitHub."
-  t200: "Fournisseurs de mémoire externes : Honcho, OpenViking et Mem0 intégrés ; Hindsight et d'autres via hermes plugins install."
+  t200: "Fournisseurs de mémoire externes : Honcho, Hindsight, Mem0, OpenViking et d'autres via hermes plugins install."
   t201: "Les hooks de plugin incluent pre/post_tool_call, pre/post_llm_call et transform_terminal_output pour normaliser la sortie."
   t202: "Le cache de prompt (Anthropic) réduit les coûts en réutilisant les préfixes de prompt système déjà mis en cache."
   t203: "L'agent génère les titres de session dans un thread d'arrière-plan — aucun impact sur la latence."
@@ -4176,12 +4208,9 @@ tips:
   t372: "image_gen.model dans config.yaml choisit le modèle FAL : flux-2/klein, gpt-image-2, nano-banana-pro, et d'autres."
   t373: "image_gen.provider fait passer la génération d'images par un plugin (OpenAI Images, Codex, FAL) au lieu du fournisseur par défaut."
   t374: "AUXILIARY_VISION_BASE_URL + AUXILIARY_VISION_API_KEY dirigent l'analyse d'images vers n'importe quel point de terminaison compatible OpenAI."
-  t375: "security.tirith_fail_open: false fait bloquer les commandes par Hermes quand le scanner tirith lui-même tombe en erreur."
-  t376: "La variable d'environnement TIRITH_FAIL_OPEN remplace la configuration tirith_fail_open — une bascule rapide sans modifier config.yaml."
+  t375: "API_SERVER_MODEL_NAME personnalise le nom du modèle sur /v1/models — indispensable pour les configurations Open WebUI multi-profils."
+  t376: "Les plugins du tableau de bord sont servis depuis /dashboard-plugins/<name>/ — déposez les fichiers dans ~/.hermes/dashboard-plugins/."
   t377: "Les chats --source tool sont exclus de hermes sessions list par défaut — passez --source explicitement pour les voir."
-  t378: "Les ID de session sont préfixés par un horodatage (20250305_091523_abcd), donc le tri fonctionne naturellement avec ls et jq."
-  t379: "API_SERVER_MODEL_NAME personnalise le nom du modèle sur /v1/models — indispensable pour les configurations Open WebUI multi-profils."
-  t380: "Les plugins du tableau de bord sont servis depuis /dashboard-plugins/<name>/ — déposez les fichiers dans ~/.hermes/dashboard-plugins/."
   placeholder:
     p01: "Posez une question, ou tapez / pour les commandes…"
     p02: "Résume le contenu de ce dossier"

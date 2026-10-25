@@ -106,12 +106,20 @@ click_install() {
 # shellcheck source=source-driver.sh
 source "$(dirname "${BASH_SOURCE[0]}")/source-driver.sh"
 installed_app() {
-  local cand
+  local cand executable
   for cand in \
     "$INSTALL_DIR/apps/desktop/release/mac-arm64/Hermes.app" \
-    "$INSTALL_DIR/apps/desktop/release/mac/Hermes.app" \
-    "/Applications/Hermes.app"; do
-    [ -d "$cand" ] && return 0
+    "$INSTALL_DIR/apps/desktop/release/mac/Hermes.app"; do
+    # The install proof must come from this bootstrap's checkout.  A
+    # pre-existing /Applications/Hermes.app may be unrelated, stale, or the
+    # setup app itself, so it can never satisfy this install's proof.  Require
+    # the minimum bundle shape as well as the checkout-relative path so a bare
+    # directory cannot masquerade as the installed desktop app.
+    [ -f "$cand/Contents/Info.plist" ] || continue
+    for executable in "$cand/Contents/MacOS/"*; do
+      [ -f "$executable" ] || continue
+      [ -x "$executable" ] && return 0
+    done
   done
   return 1
 }

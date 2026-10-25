@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
@@ -35,6 +36,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "--deliver). 'local' suppresses failure notices entirely; run "
             "state stays visible in `hermes cron list`. Omit = failures "
             "follow --deliver.")
+    cron_create.add_argument("--review-json", dest="review_json",
+        help="Invisible local report review JSON: {contract, subject, deadline_minutes? (10), rerun_deadline_minutes? (20), max_reruns? (0 or 1)}.")
+    _flag(cron_create, "--clear-review", dest="clear_review", help="Clear the review declaration.")
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument("--skill", dest="skills", action="append",
         help="Attach a skill. Repeat to add multiple skills.")
@@ -100,12 +104,18 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit = cron_subparsers.add_parser("edit", help="Edit an existing scheduled job")
     cron_edit.add_argument("job_id", help="Job ID to edit")
     cron_edit.add_argument("--schedule", help="New schedule")
-    cron_edit.add_argument("--prompt", help="New prompt/task instruction")
+    cron_edit.add_argument("--prompt", help="New prompt/task instruction (replaces the whole prompt)")
+    _flag(cron_edit, "--allow-shrink", dest="allow_shrink",
+        help="Accept a --prompt that looks like a placeholder (__FILE__, <prompt>, TODO, "
+            "$(cat f)) or is under 10%% of an existing prompt of 500+ chars; refused otherwise.")
     cron_edit.add_argument("--name", help="New job name")
     cron_edit.add_argument("--deliver", help="New delivery target")
     cron_edit.add_argument("--failure-deliver", dest="failure_deliver",
         help="Override target for failure notices (same grammar as --deliver; "
             "'local' suppresses; '' clears the override)")
+    cron_edit.add_argument("--review-json", dest="review_json",
+        help="Invisible local report review JSON: {contract, subject, deadline_minutes? (10), rerun_deadline_minutes? (20), max_reruns? (0 or 1)}.")
+    _flag(cron_edit, "--clear-review", dest="clear_review", help="Clear the review declaration.")
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
     cron_edit.add_argument("--skill", dest="skills", action="append",
         help="Replace the job's skills with this set. Repeat to attach multiple skills.")
@@ -161,6 +171,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--interpreter",
         help="Absolute or ~ path to a Python for a .py script / monitor script. "
             "Pass empty string to clear (back to Hermes' Python).")
+
+    for job_parser in (cron_create, cron_edit):
+        job_parser.add_argument(
+            "--keep-pinned-lane", action=argparse.BooleanOptionalAction, default=None,
+            help="Keep explicit delivery targets pinned instead of converting them to the subject lane.",
+        )
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

@@ -13,7 +13,7 @@ import time
 import zipfile
 import zlib
 from contextlib import contextmanager, suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -24,6 +24,7 @@ from hermes_constants import (
 from hermes_state_dbfile import RETIRED_GENERATION_DIR_SUFFIX
 from hermes_state_holders import read_only_db_uri
 
+from agent.provider_media import GENERATED_SUBDIR
 from hermes_cli.archive_safe import normalize_archive_parts
 from hermes_cli.backup_sqlite import _close_quietly, _safe_copy_db
 from hermes_cli.home_data_layout import PM_RUNTIME_ROOT_DIRS, profile_root_entry
@@ -40,6 +41,7 @@ from hermes_cli.backup_restore import (
     _detect_prefix,
     _extract_member_atomically,
     _import_db_member,
+    _restore_auth_json,
     _safe_restore_db,
     _validate_backup_zip,
 )
@@ -47,7 +49,7 @@ from hermes_cli.backup_restore import (
 logger = logging.getLogger(__name__)
 
 
-def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
+def _foreign_db_holder_pids(db_path: Path) -> Optional[list[int]]:
     # Shim to stop the old updater doing work until relaunch. None means unknown,
     # not permission to restore over a database whose holders we did not scan.
     return None
@@ -105,7 +107,8 @@ _EXCLUDED_BACKUP_ROOT_DIRS = frozenset({"browser_profiles"})
 # profiles with locked SQLite, tool-output spill) with durable artifacts nothing can rebuild: media
 # the gateway delivered to or received from the user (``gateway.platforms.base``'s media-delivery
 # subdirs) and the grounded-citations evidence ledger. Only these subdirs are archived.
-_KEPT_CACHE_SUBDIRS = {"images", "audio", "videos", "documents", "screenshots", "citations"}
+_KEPT_CACHE_SUBDIRS = {
+    "images", "audio", "videos", "documents", "screenshots", "citations", GENERATED_SUBDIR}
 
 
 def _in_excluded_root_dir(rel_path: Path) -> bool:
@@ -126,7 +129,7 @@ _SQLITE_SIDECAR_SUFFIXES = (".db-wal", ".db-shm", ".db-journal")
 _EXCLUDED_SUFFIXES = (".pyc", ".pyo", *_SQLITE_SIDECAR_SUFFIXES)
 
 # File names to skip (runtime state that's meaningless on another machine)
-_EXCLUDED_NAMES = {".backup.lock", "gateway.pid", "cron.pid"}
+_EXCLUDED_NAMES = {".backup.lock", "gateway.pid", "gateway.b.pid", "cron.pid"}
 
 # The desktop updater's pre-flight drops ``state.db.pre-update-emergency-<ts>.bak`` at the root
 # — a backup artifact like ``backups/``. Prefix-matched because the name carries a timestamp;
@@ -146,7 +149,7 @@ _EXCLUDED_PREFIXES = (
 # disconnected from the Nous portal); PID/lock/registry files reference source PIDs. Mirrors
 # ``container_boot._STALE_RUNTIME_FILES``; import filters too because older backups predate the
 # backup-side exclusions.
-_IMPORT_SKIP_NAMES = {"gateway_state.json", "gateway.pid", "cron.pid", "gateway.lock", "processes.json"}
+_IMPORT_SKIP_NAMES = {"gateway_state.json", "gateway_state.b.json", "gateway.pid", "gateway.b.pid", "cron.pid", "gateway.lock", "gateway.b.lock", "processes.json"}
 
 try:  # zipfile already imports lzma (free); it is absent only from Pythons built without liblzma
     import lzma
@@ -240,7 +243,7 @@ def _atomic_output_path(final_path: Path, publish_path: Optional[Callable[[], Op
         raise
 
 
-def _collect_memory_provider_external_paths() -> List[Path]:
+def _collect_memory_provider_external_paths() -> list[Path]:
     """Existing paths the active memory provider declares via ``backup_paths()``; ``[]`` on any
     provider failure (backup must never fail because of a flaky plugin)."""
     try:
@@ -256,7 +259,7 @@ def _collect_memory_provider_external_paths() -> List[Path]:
     except Exception as exc:
         logger.warning("backup_paths() failed for memory provider %r: %s", active, exc)
         return []
-    out: Dict[Path, Path] = {}  # resolved -> first declared spelling
+    out: dict[Path, Path] = {}  # resolved -> first declared spelling
     for raw in declared:
         try:
             p = Path(raw).expanduser()
@@ -272,13 +275,13 @@ def _collect_memory_provider_external_paths() -> List[Path]:
     return list(out.values())
 
 
-def _iter_external_files(base: Path) -> List[Path]:
+def _iter_external_files(base: Path) -> list[Path]:
     """Regular files under *base* (a file or a directory), skipping symlinks, caches, and pyc."""
     if base.is_file() and not base.is_symlink():
         return [base]
     if not base.is_dir():
         return []
-    files: List[Path] = []
+    files: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
         dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
         files.extend(fp for fp in (Path(dirpath) / f for f in filenames)
@@ -532,11 +535,16 @@ def _is_critical_state(rel_path: Path) -> bool:
 
     Matched on the RELATIVE path against the module's own criticality list, not on
     basename: ``plugins/x/.env`` is an ordinary file that may legitimately rotate,
-    while ``.env`` at the root is not. _QUICK_STATE_FILES entries may name a file or
+    while ``.env`` at a home root (default or ``profiles/<name>/``) is not.
+    _QUICK_STATE_FILES entries may name a file or
     a directory, so a prefix match covers ``kanban/boards`` and ``platforms/pairing``.
     _SECRET_FILE_NAMES is deliberately NOT used here: its own comment says it exists so
     restore can chmod 0600, which is a permissions question, not a criticality one.
     """
+    # Full-machine archives include named homes; match exactly one profile-root
+    # prefix, never arbitrary nested files with a critical basename.
+    if len(rel_path.parts) >= 3 and rel_path.parts[0] == "profiles":
+        rel_path = Path(*rel_path.parts[2:])
     posix = rel_path.as_posix()
     return any(posix == entry or posix.startswith(f"{entry}/") for entry in _QUICK_STATE_FILES)
 
@@ -634,7 +642,7 @@ def _write_zip_entries(
     return total_bytes
 
 
-def _print_capped(header: str, lines: List[str], indent: str) -> None:
+def _print_capped(header: str, lines: list[str], indent: str) -> None:
     """Print *header*, then at most 10 of *lines* (each prefixed by *indent*) and a "... and N more" tail."""
     print(header)
     for line in lines[:10]:
@@ -824,7 +832,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
 
 # --- Import ---
 
-def _find_corrupt_members(zf: zipfile.ZipFile, members: List[str]) -> List[str]:
+def _find_corrupt_members(zf: zipfile.ZipFile, members: list[str]) -> list[str]:
     """Return ``"<member>: <error>"`` for every member whose data does not decompress or
     fails its CRC, streaming each one in 1 MiB chunks so a multi-GB ``state.db`` is never
     held in memory.
@@ -1261,16 +1269,16 @@ def _quick_snapshot_candidates(home: Path):
 
 def _copy_quick_snapshot_files(
     home: Path, staging_dir: Path, max_file_size: Optional[int]
-) -> tuple[Dict[str, int], list[str], list[str]]:
+) -> tuple[Dict[str, int], list[str], list[str], list[str]]:
     """Copy every quick-snapshot candidate into *staging_dir*.
 
-    Returns ``(manifest {rel: size}, failed_dbs, oversized_skipped)``. The last two are snapshot
-    incompleteness (#68805): the caller must suppress pruning so the older snapshot that may hold
-    the only recoverable DB survives.
+    Returns ``(manifest {rel: size}, failed_dbs, oversized_skipped, failed_files)``.
+    Every omission must reach retention so older verified recovery copies survive.
     """
     manifest: Dict[str, int] = {}
     failed_dbs: list[str] = []
     oversized_skipped: list[str] = []
+    failed_files: list[str] = []
     for src, rel, in_dir in _quick_snapshot_candidates(home):
         if max_file_size is not None:
             try:
@@ -1310,8 +1318,10 @@ def _copy_quick_snapshot_files(
                 shutil.copy2(src, dst)
             manifest[rel] = dst.stat().st_size
         except (OSError, PermissionError) as exc:
+            failed_files.append(rel)
+            print(f"  ⚠ Snapshot: could not snapshot {rel} — file omitted: {exc}")
             logger.warning("Could not snapshot %s: %s", rel, exc)
-    return manifest, failed_dbs, oversized_skipped
+    return manifest, failed_dbs, oversized_skipped, failed_files
 
 
 def _secure_quick_snapshot_tree(root: Path, snapshot_dir: Path) -> None:
@@ -1367,7 +1377,8 @@ def _create_quick_snapshot_locked(
             logger.warning("Removed abandoned snapshot staging %s", stale.name)
     staging_dir.mkdir(mode=0o700, exist_ok=False)
     logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
-    manifest, failed_dbs, oversized_skipped = _copy_quick_snapshot_files(home, staging_dir, max_file_size)
+    manifest, failed_dbs, oversized_skipped, failed_files = _copy_quick_snapshot_files(
+        home, staging_dir, max_file_size)
     if failed_dbs:
         # Surface on stdout: a log-and-continue made a missing state.db backup look like a
         # successful pre-update snapshot (#68474).
@@ -1386,6 +1397,7 @@ def _create_quick_snapshot_locked(
         "id": snap_id, "timestamp": ts, "label": label, "file_count": len(manifest),
         "total_size": sum(manifest.values()), "files": manifest,
         "failed_dbs": failed_dbs, "oversized_skipped": oversized_skipped,
+        "failed_files": failed_files,
     }
     with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -1454,65 +1466,6 @@ def list_quick_snapshots(limit: int = 20, hermes_home: Optional[Path] = None) ->
     return results
 
 
-def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None) -> bool:
-    """Restore state from a quick snapshot."""
-    home = hermes_home or get_hermes_home()
-    root = _quick_snapshot_root(home)
-    # Reject ids with separators or traversal so ``root / snapshot_id`` stays inside root.
-    if not snapshot_id or "/" in snapshot_id or "\\" in snapshot_id or snapshot_id in (".", ".."):
-        logger.error("Invalid snapshot_id: %s", snapshot_id)
-        return False
-    snap_dir = root / snapshot_id
-    if not _is_within(snap_dir, root.resolve()):  # handles symlinks etc.
-        logger.error("Snapshot path traversal blocked for id: %s", snapshot_id)
-        return False
-    manifest_path = snap_dir / "manifest.json"
-    if not snap_dir.is_dir() or not manifest_path.exists():
-        return False
-    with open(manifest_path, encoding="utf-8-sig") as f:
-        meta = json.load(f)
-    # Validate every captured member before any destination write. A damaged
-    # versioned snapshot must not partially restore unrelated configuration.
-    if not isinstance(meta, dict) or not isinstance(meta.get("files"), dict):
-        return False
-    if meta.get("version", 1) != 1 or "sha256" in meta:
-        if not all(isinstance(rel, str) and payload_matches(snap_dir, rel, size, meta)
-                   for rel, size in meta["files"].items()):
-            logger.error("Snapshot content verification failed: %s", snapshot_id)
-            return False
-    snap_res, home_res = snap_dir.resolve(), home.resolve()
-    restored = 0
-    for rel in meta.get("files", {}):
-        src = snap_dir / rel
-        dst = home / rel
-        if not (_is_within(src, snap_res) and _is_within(dst, home_res)):
-            logger.error("Manifest path traversal blocked: %s", rel)
-            continue
-        if not src.exists():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if dst.suffix == ".db":
-                integrity = verify_sqlite_integrity(src, run_pragma=True)
-                if not integrity.get("valid"):
-                    logger.error("Refusing restore of corrupted snapshot member %s: %s",
-                                 rel, integrity.get("message"))
-                    continue
-                # Through the backup API so live connections see the restored data instead of
-                # stale pages from a replaced inode (#65942).
-                if not _safe_restore_db(src, dst):
-                    # Refused (live holder) or failed: destination untouched — a failure, not a restore.
-                    logger.error("Failed to restore %s: live-safe restore refused", rel)
-                    continue
-            else:
-                shutil.copy2(src, dst)
-            restored += 1
-        except (OSError, PermissionError) as exc:
-            logger.error("Failed to restore %s: %s", rel, exc)
-    logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
-    return restored > 0
-
-
 # Kept in sync with ``_QUICK_STATE_FILES`` and ``cron/jobs.py``'s ``JOBS_FILE``.
 _CRON_JOBS_REL = "cron/jobs.json"
 
@@ -1534,14 +1487,19 @@ def _count_cron_jobs(path: Path) -> Optional[int]:
         return None
     if isinstance(data, dict):
         data = data.get("jobs", [])
-    return len(data) if isinstance(data, list) else None
+    if not isinstance(data, list):
+        return None
+    # Count only entries the restore treats as jobs (objects with a truthy id): a malformed live
+    # entry (e.g. ``42`` or ``{}``) must not mask a missing real job by matching the snapshot.
+    return sum(1 for job in data if isinstance(job, dict) and job.get("id"))
 
 
 def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """Safety net for silent cron-job loss across ``hermes update``.
 
-    Conservative: restores only when the snapshot had MORE jobs than the live file (a user who
-    deleted jobs is never second-guessed); an unreadable live file is left so corruption surfaces.
+    Conservative: restores only snapshot jobs missing from a smaller live file and not marked as
+    deliberately removed during the snapshot window. An unreadable live file is left so corruption
+    surfaces. Existing live records are preserved rather than replaced wholesale.
 
     Config-version migrations have been observed to leave ``cron/jobs.json`` valid-but-empty after an
     update, silently dropping every scheduled job (issue #34600). The desktop scheduler can also overwrite
@@ -1560,17 +1518,81 @@ def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] =
     # (1 vs 19) — the desktop scheduler can overwrite jobs.json with its own small set.
     if not snap_count or live_count >= snap_count:  # None or 0 — nothing worth restoring
         return None
+    snap_doc = _load_cron_jobs_doc(snap_path)
+    if snap_doc is None:
+        return None
+
+    manifest_path = _quick_snapshot_root(home) / snapshot_id / "manifest.json"
+    snapshot_created_at: Optional[datetime] = None
     try:
-        live_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(snap_path, live_path)
-    except (OSError, PermissionError) as exc:
-        logger.error("Cron jobs were emptied during update but auto-restore failed: %s", exc)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(manifest, dict):
+            raise ValueError("snapshot manifest is not an object")
+        raw_created_at = manifest.get("created_at") or manifest.get("timestamp")
+        if isinstance(raw_created_at, str):
+            try:
+                snapshot_created_at = datetime.fromisoformat(raw_created_at)
+            except ValueError:
+                snapshot_created_at = datetime.strptime(raw_created_at, "%Y%m%d-%H%M%S")
+            if snapshot_created_at.tzinfo is None:
+                snapshot_created_at = snapshot_created_at.replace(tzinfo=timezone.utc)
+            snapshot_created_at = snapshot_created_at.astimezone(timezone.utc)
+            # Snapshot ids have one-second precision and the cron journal may use a clock that
+            # stepped forward/backward relative to this module. Bias the boundary backward so a
+            # delete near the snapshot is treated conservatively as deliberate.
+            snapshot_created_at -= timedelta(minutes=5)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        # An unavailable creation time makes every retained delete record
+        # conservative: it may belong to this snapshot's window.
+        snapshot_created_at = None
+
+    from cron import jobs as cron_jobs
+
+    try:
+        with cron_jobs.use_cron_store(home):
+            with cron_jobs._jobs_lock():
+                live_doc = _load_cron_jobs_doc(live_path)
+                # load_jobs() drops malformed entries; use its normalized jobs and keep only the
+                # live document's wrapper metadata, so a raw non-object entry is never written back.
+                live_jobs = cron_jobs.load_jobs()
+                live_ids = {
+                    str(job.get("id")) for job in live_jobs
+                    if isinstance(job, dict) and job.get("id")
+                }
+                removed_ids = cron_jobs.get_removed_job_ids(since=snapshot_created_at)
+                restored_jobs = []
+                for job in _cron_jobs_list(snap_doc):
+                    if not isinstance(job, dict) or not job.get("id"):
+                        continue
+                    job_id = str(job["id"])
+                    if job_id in live_ids or job_id in removed_ids:
+                        continue
+                    restored_jobs.append(job)
+                    live_ids.add(job_id)
+                if not restored_jobs:
+                    return None
+                if not live_jobs:
+                    # A total-loss restore must reproduce the snapshot document, not route it
+                    # through save_jobs(), whose normal writer adds a fresh updated_at field.
+                    if isinstance(snap_doc, dict):
+                        merged_doc = dict(snap_doc)
+                        merged_doc["jobs"] = restored_jobs
+                    else:
+                        merged_doc = restored_jobs
+                elif isinstance(live_doc, dict):
+                    merged_doc = dict(live_doc)
+                    merged_doc["jobs"] = live_jobs + restored_jobs
+                else:
+                    merged_doc = live_jobs + restored_jobs
+                cron_jobs.save_jobs_document(merged_doc)
+    except (OSError, PermissionError, RuntimeError) as exc:
+        logger.error("Cron auto-restore failed: %s", exc)
         return None
     logger.warning(
         "Restored %d cron job(s) from pre-update snapshot %s "
-        "(live file had %d job(s), snapshot had %d — jobs were lost during migration)",
-        snap_count, snapshot_id, live_count, snap_count)
-    return {"restored": True, "job_count": snap_count, "snapshot_id": snapshot_id}
+        "(live file had %d job(s), snapshot had %d — missing jobs were restored during migration)",
+        len(restored_jobs), snapshot_id, live_count, snap_count)
+    return {"restored": True, "job_count": len(restored_jobs), "snapshot_id": snapshot_id}
 
 
 def _sibling_profile_homes(invoking_home: Path) -> list[tuple[str, Path]]:
@@ -1621,12 +1643,12 @@ def create_pre_update_snapshots_all_profiles(
 # Config paths the update flow must never change (#64160): model routing and the MoA section are
 # consumed machine-wide, so an update/repair cycle that rewrites them silently redirects paid
 # inference. Dotted paths into raw config.yaml; a single-element tuple protects a whole section.
-_PROTECTED_CONFIG_PATHS: Tuple[Tuple[str, ...], ...] = (
+_PROTECTED_CONFIG_PATHS: tuple[tuple[str, ...], ...] = (
     ("model", "provider"), ("model", "default"), ("model", "base_url"), ("model", "api_key"),
     ("moa",))
 
 
-def _prune_oldest(newest_first: List[Path], keep: int, remove, what: str) -> int:
+def _prune_oldest(newest_first: list[Path], keep: int, remove, what: str) -> int:
     """``remove(path)`` every entry past the first *keep*; return how many succeeded."""
     deleted = 0
     for p in newest_first[keep:]:
@@ -1668,22 +1690,12 @@ def _prune_prefixed_zips(backup_dir: Path, prefix: str, keep: int, what: str) ->
     return deleted
 
 
-def _prune_incomplete_zips(backup_dir: Path, prefix: str, what: str) -> int:
-    """Keep only the newest ``<prefix>*.incomplete.zip`` salvage archive; return count deleted.
-
-    Salvage archives never count toward normal retention, so repeated failing runs would
-    otherwise pile up without bound.
-    """
-    salvage = _newest_first(backup_dir, lambda p: p.is_file() and p.name.startswith(prefix)
-                            and p.name.lower().endswith(_INCOMPLETE_ZIP_SUFFIX))
-    return _prune_oldest(salvage, 1, Path.unlink, f"incomplete {what}")
-
-
 def _create_prefixed_full_backup(
     hermes_home: Optional[Path], prefix: str, keep: int, what: str, prune_what: str,
-    *, outcome: Optional[dict] = None) -> Optional[Path]:
+    *, outcome: Optional[dict] = None, raise_errors: bool = False) -> Optional[Path]:
     """Write ``<HERMES_HOME>/backups/<prefix><timestamp>.zip`` and prune older same-prefix zips.
-    Returns the path, or ``None`` if nothing to back up or the write failed. Never raises."""
+    Returns the path, or ``None`` if nothing to back up or the write failed. Never raises unless
+    ``raise_errors`` (see :func:`_write_full_zip_backup`)."""
     hermes_root = hermes_home or get_default_hermes_root()
     if not hermes_root.is_dir():
         return None
@@ -1692,10 +1704,12 @@ def _create_prefixed_full_backup(
         backup_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         logger.warning("Could not create %s backup dir %s: %s", what, backup_dir, exc)
+        if raise_errors:
+            raise
         return None
     out_path = backup_dir / f"{prefix}{datetime.now().strftime('%Y-%m-%d-%H%M%S')}.zip"
     result: dict = {}
-    written_path = _write_full_zip_backup(out_path, hermes_root, outcome=result)
+    written_path = _write_full_zip_backup(out_path, hermes_root, outcome=result, raise_errors=raise_errors)
     if written_path is None:
         return None
     out_path = written_path
@@ -1716,11 +1730,15 @@ def _create_prefixed_full_backup(
 
 def create_pre_update_backup(
     hermes_home: Optional[Path] = None, keep: int = _PRE_UPDATE_DEFAULT_KEEP,
-    *, outcome: Optional[dict] = None) -> Optional[Path]:
+    *, outcome: Optional[dict] = None, raise_errors: bool = False) -> Optional[Path]:
     """Full zip backup to ``backups/pre-update-<timestamp>.zip``, auto-pruned; ``None`` if nothing
-    was found or the backup failed. Never raises — ``hermes update`` continues anyway."""
+    was found or the backup failed. Never raises — ``hermes update`` continues anyway.
+
+    ``raise_errors=True`` narrows ``None`` to "nothing to back up" and raises the reason there is
+    no archive instead (:class:`BackupInProgressError`, ``OSError``, a SQLite snapshot failure),
+    so the updater can tell its user and receipt which one it was."""
     return _create_prefixed_full_backup(hermes_home, _PRE_UPDATE_PREFIX, max(keep, 1), "pre-update",
-                                       "backup", outcome=outcome)
+                                       "backup", outcome=outcome, raise_errors=raise_errors)
 
 
 def create_pre_migration_backup(
@@ -1744,10 +1762,132 @@ def create_pre_migration_backup(
 
 
 
+def _is_trusted_root_auth_alias(path: Path, home: Path) -> bool:
+    """True only for a file symlink resolving to this restore home's default-root auth store."""
+    if not path.is_symlink():
+        return False
+    try:
+        root = get_default_hermes_root(home=home).resolve(strict=False)
+        if home.resolve(strict=False) == root:
+            return False
+        trusted = (root / "auth.json").resolve(strict=False)
+        trusted.relative_to(root)
+        return path.resolve(strict=False) == trusted
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
+def restore_quick_snapshot(
+    snapshot_id: str,
+    hermes_home: Optional[Path] = None,
+) -> bool:
+    """Restore state from a quick snapshot.
 
+    Overwrites current state files with the snapshot's copies.
+    Returns True if at least one file was restored and the listed auth.json
+    was not refused or skipped.
+    """
+    home = hermes_home or get_hermes_home()
+    root = _quick_snapshot_root(home)
 
+    # Security: reject snapshot_id values that contain path separators or
+    # traversal sequences so that `root / snapshot_id` stays inside root.
+    if not snapshot_id or "/" in snapshot_id or "\\" in snapshot_id or snapshot_id in (".", ".."):
+        logger.error("Invalid snapshot_id: %s", snapshot_id)
+        return False
+
+    snap_dir = root / snapshot_id
+
+    # Confirm the resolved path is still inside root (handles symlinks etc.)
+    try:
+        snap_dir.resolve().relative_to(root.resolve())
+    except ValueError:
+        logger.error("Snapshot path traversal blocked for id: %s", snapshot_id)
+        return False
+
+    if not snap_dir.is_dir():
+        return False
+
+    manifest_path = snap_dir / "manifest.json"
+    if not manifest_path.exists():
+        return False
+
+    with open(manifest_path, encoding="utf-8-sig") as f:
+        meta = json.load(f)
+    # Validate every captured member before any destination write. A damaged
+    # versioned snapshot must not partially restore unrelated configuration.
+    if not isinstance(meta, dict) or not isinstance(meta.get("files"), dict):
+        return False
+    if meta.get("version", 1) != 1 or "sha256" in meta:
+        if not all(isinstance(rel, str) and payload_matches(snap_dir, rel, size, meta)
+                   for rel, size in meta["files"].items()):
+            logger.error("Snapshot content verification failed: %s", snapshot_id)
+            return False
+
+    restored = 0
+    auth_restore_failed = False
+    for rel in meta.get("files", {}):
+        # Security: reject absolute paths and traversals in manifest entries
+        src = snap_dir / rel
+        try:
+            src.resolve().relative_to(snap_dir.resolve())
+        except ValueError:
+            logger.error("Manifest path traversal blocked: %s", rel)
+            if rel == "auth.json":
+                auth_restore_failed = True
+            continue
+
+        dst = home / rel
+        try:
+            dst.resolve().relative_to(home.resolve())
+        except ValueError:
+            # Named profiles may deliberately share the machine-root auth store via an
+            # auth.json symlink. Let only that exact trusted alias reach _restore_auth_json;
+            # every other manifest destination outside the profile remains a traversal.
+            if rel != "auth.json" or not _is_trusted_root_auth_alias(dst, home):
+                logger.error("Manifest path traversal blocked: %s", rel)
+                if rel == "auth.json":
+                    auth_restore_failed = True
+                continue
+
+        if not src.exists():
+            if rel == "auth.json":
+                logger.error("Snapshot auth.json listed in manifest is missing: %s", src)
+                auth_restore_failed = True
+            continue
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if dst.suffix == ".db":
+                # Restore through SQLite backup API so live connections
+                # (gateway, dashboard, another CLI session) see the
+                # restored data instead of continuing to serve stale
+                # cached pages from a replaced inode (issue #65942).
+                if not _safe_restore_db(src, dst):
+                    # Refused, failed, or source failed its integrity check:
+                    # dst left as it was. Count as a failure, not a restore.
+                    logger.error("Failed to restore %s: refused or source integrity check failed (see previous log)", rel)
+                    continue
+            elif rel == "auth.json":
+                # Refresh tokens for these OAuth providers rotate on use. A historical
+                # snapshot can therefore contain a spent pair even though the current
+                # auth.json has the live successor. Restore the historical auth state
+                # while retaining that live single-use grant under the auth-store lock.
+                if not _restore_auth_json(src, dst):
+                    logger.error("Failed to restore %s safely", rel)
+                    auth_restore_failed = True
+                    continue
+            else:
+                shutil.copy2(src, dst)
+            restored += 1
+        except (OSError, PermissionError) as exc:
+            logger.error("Failed to restore %s: %s", rel, exc)
+            if rel == "auth.json":
+                auth_restore_failed = True
+
+    logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
+    return restored > 0 and not auth_restore_failed
 
 
 def _load_cron_jobs_doc(path: Path) -> Optional[Any]:
@@ -1781,7 +1921,7 @@ def _cron_jobs_list(doc: Any) -> list[Any]:
     return []
 
 
-def _prompt_degraded(job: Dict[str, Any]) -> bool:
+def _prompt_degraded(job: dict[str, Any]) -> bool:
     """True when an agent job's prompt field is unusable: blank, missing, or
     collapsed to the job's own name (a name is not a prompt)."""
     if job.get("no_agent"):
@@ -1795,7 +1935,7 @@ def _prompt_degraded(job: Dict[str, Any]) -> bool:
 def restore_cron_prompt_fields_if_degraded(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Safety net for field-level cron-job degradation across ``hermes update``.
 
     A writer active during the update's mutation window replaced every
@@ -1843,7 +1983,7 @@ def restore_cron_prompt_fields_if_degraded(
     if snap_doc is None:
         return None
 
-    snap_by_id: Dict[str, Dict[str, Any]] = {}
+    snap_by_id: dict[str, dict[str, Any]] = {}
     for job in _cron_jobs_list(snap_doc):
         if isinstance(job, dict):
             snap_by_id[str(job.get("id", ""))] = job
@@ -1897,9 +2037,9 @@ def restore_cron_prompt_fields_if_degraded(
 
 
 def restore_cron_prompt_fields_all_profiles(
-    profile_snapshots: Dict[str, str],
+    profile_snapshots: dict[str, str],
     invoking_home: Optional[Path] = None,
-) -> list[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Run the cron prompt-field safety net for every sibling profile.
 
     Same contract as :func:`restore_cron_jobs_all_profiles`: each profile's
@@ -1907,7 +2047,7 @@ def restore_cron_prompt_fields_all_profiles(
     pre-update snapshot. Returns one result dict per restored profile, each
     with a ``profile`` key added. Never raises.
     """
-    restored: list[Dict[str, Any]] = []
+    restored: list[dict[str, Any]] = []
     if not profile_snapshots:
         return restored
     home = invoking_home or get_hermes_home()
@@ -1942,7 +2082,7 @@ def restore_cron_prompt_fields_all_profiles(
 # (gateway, cron, desktop), so an update/repair cycle that rewrites them
 # silently redirects paid inference. Each entry is a dotted path into the raw
 # config.yaml document; a single-element tuple protects the whole section.
-_PROTECTED_CONFIG_PATHS: Tuple[Tuple[str, ...], ...] = (
+_PROTECTED_CONFIG_PATHS: tuple[tuple[str, ...], ...] = (
     ("model", "provider"),
     ("model", "default"),
     ("model", "base_url"),
@@ -1951,7 +2091,7 @@ _PROTECTED_CONFIG_PATHS: Tuple[Tuple[str, ...], ...] = (
 )
 
 
-def _read_raw_yaml_dict(path: Path) -> Optional[Dict[str, Any]]:
+def _read_raw_yaml_dict(path: Path) -> Optional[dict[str, Any]]:
     """Parse ``path`` as a YAML mapping. ``None`` = missing/unreadable/non-dict."""
     if not path.is_file():
         return None
@@ -1965,7 +2105,7 @@ def _read_raw_yaml_dict(path: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-def _get_config_path_value(data: Dict[str, Any], dotted: Tuple[str, ...]) -> Any:
+def _get_config_path_value(data: dict[str, Any], dotted: tuple[str, ...]) -> Any:
     node: Any = data
     for key in dotted:
         if not isinstance(node, dict):
@@ -1974,7 +2114,7 @@ def _get_config_path_value(data: Dict[str, Any], dotted: Tuple[str, ...]) -> Any
     return node
 
 
-def _set_config_path_value(data: Dict[str, Any], dotted: Tuple[str, ...], value: Any) -> None:
+def _set_config_path_value(data: dict[str, Any], dotted: tuple[str, ...], value: Any) -> None:
     node = data
     for key in dotted[:-1]:
         child = node.get(key)
@@ -1988,7 +2128,7 @@ def _set_config_path_value(data: Dict[str, Any], dotted: Tuple[str, ...], value:
 def restore_config_model_settings_if_rewritten(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Safety net for silent config.yaml model/MoA loss across ``hermes update``.
 
     Desktop update/repair cycles have been observed to rewrite user-set
@@ -2067,9 +2207,9 @@ def restore_config_model_settings_if_rewritten(
 
 
 def restore_config_model_settings_all_profiles(
-    profile_snapshots: Dict[str, str],
+    profile_snapshots: dict[str, str],
     invoking_home: Optional[Path] = None,
-) -> list[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Run the config model-settings safety net for every sibling profile.
 
     Same contract as :func:`restore_cron_jobs_all_profiles`: each profile's
@@ -2077,7 +2217,7 @@ def restore_config_model_settings_all_profiles(
     pre-update snapshot. Returns one result dict per restored profile, each
     with a ``profile`` key added. Never raises.
     """
-    restored: list[Dict[str, Any]] = []
+    restored: list[dict[str, Any]] = []
     if not profile_snapshots:
         return restored
     home = invoking_home or get_hermes_home()
@@ -2104,9 +2244,9 @@ def restore_config_model_settings_all_profiles(
 
 
 def restore_cron_jobs_all_profiles(
-    profile_snapshots: Dict[str, str],
+    profile_snapshots: dict[str, str],
     invoking_home: Optional[Path] = None,
-) -> list[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Run the cron-jobs safety net for every sibling profile (#66140).
 
     ``profile_snapshots`` is the map returned by
@@ -2116,7 +2256,7 @@ def restore_cron_jobs_all_profiles(
     this update run). Returns one result dict per restored profile, each
     with a ``profile`` key added. Never raises.
     """
-    restored: list[Dict[str, Any]] = []
+    restored: list[dict[str, Any]] = []
     if not profile_snapshots:
         return restored
     home = invoking_home or get_hermes_home()
@@ -2177,14 +2317,15 @@ def _prune_quick_snapshots(
         files = meta["files"]
         failed = meta.get("failed_dbs") or []
         oversized = meta.get("oversized_skipped") or []
-        if not isinstance(failed, list) or not isinstance(oversized, list):
+        failed_files = meta.get("failed_files") or []
+        if not all(isinstance(paths, list) for paths in (failed, oversized, failed_files)):
             continue
-        omissions.update(rel for rel in failed + oversized if isinstance(rel, str))
+        omissions.update(rel for rel in failed + oversized + failed_files if isinstance(rel, str))
         # Prove one complete anchor, newest first. Once it exists, discarded
         # generations need no payload reads. A retained database is checked
         # only until its path has a verified anchor. Same-size corruption is
         # an omission too, but restore validates every payload independently.
-        if not found_complete and not failed and not oversized and all(
+        if not found_complete and not failed and not oversized and not failed_files and all(
                 isinstance(rel, str) and usable(directory, rel, size, meta)
                 for rel, size in files.items()):
             retained.add(directory)
@@ -2238,30 +2379,40 @@ def run_quick_backup(args) -> None:
 # ---------------------------------------------------------------------------
 
 def _write_full_zip_backup(
-        out_path: Path, hermes_root: Path, *, outcome: Optional[dict] = None) -> Optional[Path]:
+        out_path: Path, hermes_root: Path, *, outcome: Optional[dict] = None,
+        raise_errors: bool = False) -> Optional[Path]:
     """Full zip snapshot of ``hermes_root`` to ``out_path`` under the backup slot (same rules as
     :func:`run_backup`); None when nothing to back up, another backup running, or write error.
 
     ``outcome``, when given, is filled with ``selected``/``errors``/``vanished`` counts so the
     caller can tell a complete archive from one that is merely readable. Returning the path
     alone cannot carry that, and the caller rotates older archives out on the strength of it.
+
+    ``raise_errors=True`` keeps None for "nothing to back up" only and re-raises the other two
+    causes after logging them, for a caller that must report which one it was.
     """
     try:
         with _backup_operation_lock(hermes_root):
-            return _write_full_zip_backup_locked(out_path, hermes_root, outcome=outcome)
+            return _write_full_zip_backup_locked(out_path, hermes_root, outcome=outcome,
+                                                 raise_errors=raise_errors)
     except BackupInProgressError as exc:
         logger.warning("Full-zip backup skipped: %s", exc)
+        if raise_errors:
+            raise
         return None
 
 
 def _write_full_zip_backup_locked(
-        out_path: Path, hermes_root: Path, *, outcome: Optional[dict] = None) -> Optional[Path]:
+        out_path: Path, hermes_root: Path, *, outcome: Optional[dict] = None,
+        raise_errors: bool = False) -> Optional[Path]:
     scan_started = time.monotonic()
     logger.info("automatic backup phase=scan status=started")
     try:
         files_to_add = list(_iter_backup_files(hermes_root, out_path))
     except OSError as exc:
         logger.warning("Full-zip backup: walk failed: %s", exc)
+        if raise_errors:
+            raise
         return None
     if not files_to_add:
         return None
@@ -2301,8 +2452,14 @@ def _write_full_zip_backup_locked(
     except (OSError, _SQLiteSnapshotError) as exc:
         # The hidden partial is already gone; ``out_path`` may be a previous valid backup: keep it.
         logger.warning("Full-zip backup: zip write failed: %s", exc)
+        if raise_errors:
+            raise
         return None
     if published is None:
+        if raise_errors:
+            # Files were selected and none landed: a failed archive, not an empty home.
+            raise OSError(f"no file could be archived ({len(errors)} unreadable, "
+                          f"{len(vanished)} vanished of {len(files_to_add)})")
         return None
     out_path = published
     # Every failure is named, not just counted: a summary alone cannot tell an

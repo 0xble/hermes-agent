@@ -39,6 +39,9 @@ def test_fire_helper_is_observer_only_and_never_raises(monkeypatch):
         def has_hook(self, name):
             return name == "pre_command"
 
+        def iter_hook_callbacks(self, name):
+            return (lambda **_: None,) if name == "pre_command" else ()
+
         def invoke_hook(self, name, **kwargs):
             calls["name"] = name
             calls["kwargs"] = kwargs

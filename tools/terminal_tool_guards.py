@@ -41,7 +41,7 @@ def _validate_workdir(workdir: str) -> str | None:
     for ch in workdir or "":
         if not _is_safe_workdir_char(ch):
             return (
-                f"Blocked: workdir contains disallowed character {repr(ch)}. "
+                f"Blocked: workdir contains disallowed character {ch!r}. "
                 "Use a simple filesystem path without shell metacharacters."
             )
     return None
@@ -231,10 +231,22 @@ def gateway_lifecycle_block(
         mounted_host=getattr(env, "host_cwd", None),
         env=env,
     )
+    # A local backend already has the command's filesystem available to the guard. Do not
+    # turn ordinary missing local references into backend round trips: the fallback is
+    # for remote workspaces only, and each miss consumes the walk's remote-read budget.
+    # Use the environment object rather than the config label: a remote backend can be
+    # paired with a stale or mocked ``env_type`` value.
+    from tools.environments.local import LocalEnvironment
+
+    read_remote_script = None
+    if env is not None and not isinstance(env, LocalEnvironment):
+        read_remote_script = lambda p: _read_script_for_guard(
+            env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES,
+        )
     unsafe, refusal = scan_gateway_lifecycle(
         command,
         cwd=guard_cwd,
-        read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
+        read_remote_script=read_remote_script,
     )
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,

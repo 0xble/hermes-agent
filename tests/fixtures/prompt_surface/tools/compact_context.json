@@ -1,0 +1,20 @@
+{
+  "description": "Request context compaction at the next safe tool boundary. When a new user message arrives, check this BEFORE calling any other tool, including skill_view. Call compact_context first if (1) the previous sub-task just finished and its raw tool output is no longer needed verbatim, or (2) the message switches to an unrelated topic and prior task details are no longer needed verbatim. A long transcript alone is enough. Do not wait for a token count. Skip it when the new message continues the same unfinished edit or debug, because exact recent output matters there. Also skip it right after a compaction, on a short transcript, or more than once per phase. Always pass focus naming decisions, open items, file paths, and IDs to preserve.",
+  "name": "compact_context",
+  "parameters": {
+    "properties": {
+      "focus": {
+        "description": "Optional decisions, open items, paths, and IDs the summary must preserve.",
+        "type": "string"
+      },
+      "reason": {
+        "description": "Short reason this is a natural compaction boundary.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "reason"
+    ],
+    "type": "object"
+  }
+}

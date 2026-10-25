@@ -220,6 +220,36 @@ class PortableGateTests(unittest.TestCase):
             self.assertTrue(Path(result['LOCALAPPDATA']).is_dir())
             self.assertTrue(Path(result['APPDATA']).is_dir())
 
+    def test_windows_appdata_seeds_only_the_isolated_analysis_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            checkout = base / 'checkout'
+            checkout.mkdir()
+            home = base / 'isolated'
+            source = checkout / 'prebuilt-analysis.cache'
+            source.write_bytes(b'prebuilt cache')
+
+            with patch.dict(os.environ, {'PSModuleAnalysisCachePath': str(source)}):
+                result = ci.windows_appdata_environment(home)
+            cache = Path(result['PSModuleAnalysisCachePath'])
+            self.assertTrue(cache.is_relative_to(home))
+            self.assertFalse(cache.is_relative_to(checkout))
+            self.assertEqual(cache.read_bytes(), b'prebuilt cache')
+
+            cache.write_bytes(b'existing isolated cache')
+            source.write_bytes(b'changed prebuilt cache')
+            with patch.dict(os.environ, {'PSModuleAnalysisCachePath': str(source)}):
+                ci.windows_appdata_environment(home)
+            self.assertEqual(cache.read_bytes(), b'existing isolated cache')
+
+            missing = base / 'missing-analysis.cache'
+            fallback_home = base / 'fallback'
+            with patch.dict(os.environ, {'PSModuleAnalysisCachePath': str(missing)}):
+                fallback = ci.windows_appdata_environment(fallback_home)
+            fallback_cache = Path(fallback['PSModuleAnalysisCachePath'])
+            self.assertTrue(fallback_cache.is_relative_to(fallback_home))
+            self.assertFalse(fallback_cache.exists())
+
     def test_msvc_linker_environment_rejects_git_link_and_retains_sdk_libraries(self):
         with tempfile.TemporaryDirectory() as directory:
             tools = Path(directory) / 'VC/Tools/MSVC/14.51'
@@ -507,6 +537,39 @@ try {
             self.assertEqual(which.call_args_list[0].args, ('rg',))
             self.assertEqual(which.call_args_list[1].args, ('rg.exe',))
             self.assertEqual(check.call_args.args[0][0], 'D:\\checkout\\.ci\\toolchain\\bin\\rg.exe')
+
+    def test_checkout_venv_symlinks_are_rejected_before_commands_run(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory) / 'checkout'
+            root.mkdir()
+            target = Path(directory) / 'other-checkout' / '.venv'
+            target.mkdir(parents=True)
+            alias = Path(directory) / 'venv-alias'
+            try:
+                alias.symlink_to(target, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f'Directory symlinks unavailable: {error}')
+            local = root / 'local-venv'
+            local.mkdir()
+            venv = root / '.venv'
+            stack.enter_context(patch.object(ci, 'ROOT', root))
+            stack.enter_context(patch.object(ci, 'require_tools'))
+            stack.enter_context(patch.object(ci, 'provision_npm'))
+            stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
+            stack.enter_context(patch.object(ci, 'provision_rg'))
+            run = stack.enter_context(patch.object(ci, 'run'))
+            check = stack.enter_context(patch.object(ci.subprocess, 'check_output'))
+            for destination in (target, alias, target.parent / 'missing-venv', local):
+                venv.symlink_to(destination, target_is_directory=True)
+                for action in (ci.setup, ci.python, lambda env: ci.environment(root / 'home')):
+                    with self.subTest(destination=destination, action=action):
+                        with self.assertRaisesRegex(RuntimeError, r'\.venv.*symlink.*Remove the symlink.*bin/ci setup') as caught:
+                            action({})
+                        self.assertIn(str(destination.resolve()), str(caught.exception))
+                        run.assert_not_called()
+                        check.assert_not_called()
+                        self.assertTrue(venv.is_symlink())
+                venv.unlink()
 
     def test_setup_re_resolves_pinned_npm_after_provisioning(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:

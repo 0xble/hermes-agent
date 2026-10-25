@@ -33,6 +33,17 @@ def _no_real_gateway_service(monkeypatch):
     monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
 
 
+@pytest.fixture(autouse=True)
+def _restore_backup_datetime():
+    """Keep _advance_backup_clock's test shim local to one test."""
+    import datetime as _dt
+    import hermes_cli.backup as backup_mod
+
+    backup_mod.datetime = _dt.datetime
+    yield
+    backup_mod.datetime = _dt.datetime
+
+
 def _advance_backup_clock(seconds: float = 1.1) -> None:
     """Skew hermes_cli.backup's datetime forward instead of sleeping.
 
@@ -51,7 +62,7 @@ def _advance_backup_clock(seconds: float = 1.1) -> None:
             _offset = _dt.timedelta(0)
 
             @classmethod
-            def now(cls, tz=None):  # noqa: D102
+            def now(cls, tz=None):
                 return _dt.datetime.now(tz) + cls._offset
 
         _backup.datetime = _ShimDatetime
@@ -281,6 +292,8 @@ class TestIterBackupFiles:
             "cache/images/x.png": True,
             "cache/citations/ledger.json": True,
             "profiles/sage/cache/images/y.png": True,
+            "cache/generated/images/x.png": True,
+            "profiles/sage/cache/generated/videos/v.mp4": True,
             "skills/example/cache/state.db": True,
         }
         for rel in files:
@@ -1206,7 +1219,7 @@ class TestValidation:
             zf.writestr("config.yaml", "test")
         buf.seek(0)
         with zipfile.ZipFile(buf, "r") as zf:
-            ok, reason = _validate_backup_zip(zf)
+            ok, _reason = _validate_backup_zip(zf)
         assert ok
 
 
@@ -1231,6 +1244,27 @@ class TestValidation:
 # ---------------------------------------------------------------------------
 
 class TestBackupEdgeCases:
+
+    def test_negative_keep_is_rejected_by_backup_parser_and_snapshot_prune(self, capsys):
+        """A negative keep slices away the NEWEST archives/snapshots, so both the
+        ``backup --keep`` parser and ``/snapshot prune N`` refuse it."""
+        import argparse
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        from hermes_cli.subcommands.backup import build_backup_parser
+
+        parser = argparse.ArgumentParser()
+        build_backup_parser(parser.add_subparsers(dest="command"), cmd_backup=lambda args: None)
+        for bad in ("-1", "x"):
+            with pytest.raises(SystemExit) as exc:
+                parser.parse_args(["backup", "--keep", bad])
+            assert exc.value.code == 2
+        assert [parser.parse_args(["backup", *a]).keep for a in (["--keep", "0"], ["-k", "1"], [])] == [0, 1, 3]
+
+        with patch("hermes_cli.backup.prune_quick_snapshots") as prune:
+            CLICommandsMixin._snapshot_prune(object(), ["/snapshot", "prune", "-1"])
+            prune.assert_not_called()
+            CLICommandsMixin._snapshot_prune(object(), ["/snapshot", "prune", "2"])
+            prune.assert_called_once_with(keep=2)
 
     def test_incomplete_archive_is_kept_but_reported_as_failure(self, tmp_path, monkeypatch, capsys):
         """A file that cannot be read is skipped, the zip still lands, and the CLI exits 1: a
@@ -1355,8 +1389,9 @@ class TestBackupEdgeCases:
         assert "Backup incomplete" in capsys.readouterr().out
         assert good_old.exists(), "an incomplete run must not rotate the last complete backup out"
 
+    @pytest.mark.parametrize("profile_root", ["", "profiles/coder"])
     def test_a_nested_file_sharing_a_critical_basename_is_still_tolerated(
-            self, tmp_path, monkeypatch, capsys):
+            self, tmp_path, monkeypatch, capsys, profile_root):
         """Basename matching would reinstate the very bug this fixes.
 
         plugins/x/.env is an ordinary file that may rotate; only .env at the root is
@@ -1365,7 +1400,7 @@ class TestBackupEdgeCases:
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         _make_hermes_tree(hermes_home)
-        nested = hermes_home / "plugins" / "someplugin" / ".env"
+        nested = hermes_home / profile_root / "plugins" / "someplugin" / ".env"
         nested.parent.mkdir(parents=True, exist_ok=True)
         nested.write_text("PLUGIN=1\n")
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -2791,6 +2826,137 @@ class TestRestoreCronJobsIfEmptied:
         assert len(restored["jobs"]) == 3
 
 
+    def test_total_loss_preserves_snapshot_document_metadata(self, tmp_path):
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        expected = {
+            "jobs": [{"id": "a", "prompt": "report"}],
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "format": "cron-v1",
+        }
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(json.dumps(expected), encoding="utf-8")
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        jobs_path.write_text('{"jobs": []}', encoding="utf-8")
+
+        assert restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home) is not None
+        assert json.loads(jobs_path.read_text(encoding="utf-8")) == expected
+
+    def test_partial_restore_drops_malformed_live_entries(self, tmp_path):
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(json.dumps({
+            "jobs": [
+                {"id": "a", "prompt": "one"}, {"id": "b", "prompt": "two"},
+                {"id": "c", "prompt": "three"},
+            ],
+        }), encoding="utf-8")
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        jobs_path.write_text(json.dumps({
+            "jobs": [42, {"id": "a", "prompt": "one"}], "format": "cron-v1",
+        }), encoding="utf-8")
+
+        assert restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home) is not None
+        restored = json.loads(jobs_path.read_text(encoding="utf-8"))
+        assert all(isinstance(job, dict) for job in restored["jobs"])
+        assert sorted(job["id"] for job in restored["jobs"]) == ["a", "b", "c"]
+        assert restored["format"] == "cron-v1"
+
+    @pytest.mark.parametrize("malformed", [42, {}, {"id": ""}])
+    def test_equal_raw_count_with_malformed_live_entry_still_restores(self, tmp_path, malformed):
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(json.dumps({"jobs": [{"id": "a", "prompt": "one"}]}), encoding="utf-8")
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+        jobs_path.write_text(json.dumps({"jobs": [malformed]}), encoding="utf-8")
+
+        assert restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home) is not None
+        restored = json.loads(jobs_path.read_text(encoding="utf-8"))
+        assert "a" in [job.get("id") for job in restored["jobs"] if isinstance(job, dict)]
+
+    def test_restore_keeps_job_created_after_its_read(self, tmp_path, monkeypatch):
+        """A sibling create landing after restore read the live file survives the write."""
+        from cron import jobs as cron_jobs
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(json.dumps({"jobs": [
+            {"id": "a", "prompt": "one"}, {"id": "b", "prompt": "two"},
+            {"id": "c", "prompt": "three"},
+        ]}), encoding="utf-8")
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+        jobs_path.write_text(json.dumps({"jobs": [{"id": "a", "prompt": "one"}]}), encoding="utf-8")
+
+        real_load = cron_jobs.load_jobs
+
+        def load_then_sibling_create(*args, **kwargs):
+            loaded = real_load(*args, **kwargs)
+            doc = json.loads(jobs_path.read_text(encoding="utf-8"))
+            doc["jobs"].append({"id": "sibling", "prompt": "new"})
+            jobs_path.write_text(json.dumps(doc), encoding="utf-8")
+            return loaded
+
+        monkeypatch.setattr(cron_jobs, "load_jobs", load_then_sibling_create)
+
+        assert restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home) is not None
+        restored = json.loads(jobs_path.read_text(encoding="utf-8"))
+        assert sorted(job["id"] for job in restored["jobs"]) == ["a", "b", "c", "sibling"]
+
+
+    def test_non_utf8_journal_does_not_stop_restore(self, tmp_path):
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(jobs_path, [{"id": "a"}, {"id": "b"}])
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        (hermes_home / "cron" / "removed_jobs.jsonl").write_bytes(b"{\xff\n")
+        jobs_path.write_text(json.dumps({"jobs": []}))
+
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+
+        assert result is not None
+        assert result["restored"] is True
+        assert result["job_count"] == 2
+        assert {job["id"] for job in json.loads(jobs_path.read_text())["jobs"]} == {"a", "b"}
+
+
+    def test_append_after_corrupt_journal_excludes_deleted_job_from_restore(self, tmp_path):
+        from cron.jobs import remove_job, use_cron_store
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(jobs_path, [{"id": "a"}, {"id": "b"}])
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        removed_file = hermes_home / "cron" / "removed_jobs.jsonl"
+        removed_file.write_bytes(b"{\xff\n")
+        with use_cron_store(hermes_home):
+            assert remove_job("a") is True
+        jobs_path.write_text(json.dumps({"jobs": []}))
+
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+
+        assert result is not None
+        assert result["restored"] is True
+        assert result["job_count"] == 1
+        assert {job["id"] for job in json.loads(jobs_path.read_text())["jobs"]} == {"b"}
+
+
     def test_restores_when_partial_job_loss(self, tmp_path):
         """Desktop scheduler overwrites jobs.json with its own small set,
         losing tool-created crons while keeping desktop-tracked ones."""
@@ -2813,10 +2979,83 @@ class TestRestoreCronJobsIfEmptied:
         assert result["restored"] is True
         assert result["job_count"] == 19
 
-        # The live file now has all 19 jobs back.
+        # The live desktop-owned job survives, and all 19 snapshot jobs are restored.
         restored = json.loads(jobs_path.read_text())
-        assert len(restored["jobs"]) == 19
+        assert len(restored["jobs"]) == 20
+        assert "desktop-watchdog" in {job["id"] for job in restored["jobs"]}
 
+    def test_does_not_resurrect_job_removed_after_snapshot(self, tmp_path):
+        from cron.jobs import remove_job, use_cron_store
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(jobs_path, [{"id": "a"}, {"id": "b"}, {"id": "c"}])
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        with use_cron_store(hermes_home):
+            assert remove_job("a") is True
+
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+        assert result is None
+        assert {job["id"] for job in json.loads(jobs_path.read_text())["jobs"]} == {"b", "c"}
+
+    def test_restores_missing_job_without_reverting_survivor_change(self, tmp_path):
+        from cron.jobs import remove_job, use_cron_store
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(
+            jobs_path,
+            [{"id": "a", "last_run_at": None}, {"id": "b"}, {"id": "c"}],
+        )
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        with use_cron_store(hermes_home):
+            assert remove_job("c") is True
+        jobs_path.write_text(json.dumps({"jobs": [{"id": "a", "last_run_at": "new"}]}))
+
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+        assert result is not None
+        assert result["job_count"] == 1
+        restored = {job["id"]: job for job in json.loads(jobs_path.read_text())["jobs"]}
+        assert restored["a"]["last_run_at"] == "new"
+        assert set(restored) == {"a", "b"}
+
+    def test_delete_before_snapshot_outside_tolerance_does_not_block_restore(self, tmp_path):
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(jobs_path, [{"id": "a"}, {"id": "b"}])
+        (hermes_home / "cron" / "removed_jobs.jsonl").parent.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "cron" / "removed_jobs.jsonl").write_text(
+            '{"id":"a","removed_at":"2000-01-01T00:00:00+00:00"}\n')
+        snap_id = self._make_snapshot(hermes_home)
+        jobs_path.write_text(json.dumps({"jobs": []}))
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+        assert result is not None
+        assert result["job_count"] == 2
+
+    def test_manifest_without_timestamp_treats_all_deletes_as_deliberate(self, tmp_path):
+        from cron.jobs import remove_job, use_cron_store
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(jobs_path, [{"id": "a"}, {"id": "b"}])
+        snap_id = self._make_snapshot(hermes_home)
+        manifest = hermes_home / "state-snapshots" / snap_id / "manifest.json"
+        data = json.loads(manifest.read_text())
+        data.pop("timestamp", None)
+        data.pop("created_at", None)
+        manifest.write_text(json.dumps(data))
+        with use_cron_store(hermes_home):
+            assert remove_job("a") is True
+        jobs_path.write_text(json.dumps({"jobs": []}))
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+        assert result is not None
+        assert result["job_count"] == 1
+        assert {j["id"] for j in json.loads(jobs_path.read_text())["jobs"]} == {"b"}
 
 # ---------------------------------------------------------------------------
 # Cron agent-job prompt field degradation across update (issue #82990)
@@ -3397,7 +3636,7 @@ class TestImportLiveSessionDatabase:
         """A connection open across the import converges on the imported data."""
         from hermes_cli.backup import run_import
 
-        home, live_db, zip_path = self._prepare(tmp_path, monkeypatch)
+        _home, live_db, zip_path = self._prepare(tmp_path, monkeypatch)
 
         holder = sqlite3.connect(str(live_db))
         # Read first so the connection has cached pages of the pre-import file.
@@ -3422,7 +3661,7 @@ class TestImportLiveSessionDatabase:
         # hermes_cli.backup_restore and resolves _safe_restore_db there.
         import hermes_cli.backup_restore as backup_restore_mod
 
-        home, live_db, zip_path = self._prepare(tmp_path, monkeypatch)
+        _home, live_db, zip_path = self._prepare(tmp_path, monkeypatch)
         monkeypatch.setattr(backup_restore_mod, "_safe_restore_db", lambda src, dst: False)
 
         assert backup_mod.run_import(Namespace(zipfile=str(zip_path), force=True)) == 1
@@ -3443,7 +3682,7 @@ class TestImportLiveSessionDatabase:
         different image and SQLite would replay it on the next open."""
         from hermes_cli.backup import run_import
 
-        home, live_db, zip_path = self._prepare(tmp_path, monkeypatch)
+        _home, live_db, zip_path = self._prepare(tmp_path, monkeypatch)
         with zipfile.ZipFile(zip_path, "a") as zf:
             zf.writestr("state.db-wal", b"foreign-wal-from-archive")
             zf.writestr("state.db-shm", b"foreign-shm")

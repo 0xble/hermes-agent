@@ -127,7 +127,7 @@ def test_structured_provenance_is_never_overridden_by_text(build, display_kind, 
 
 
 def test_recovery_note_wrapping_a_generated_notice_is_fully_synthetic():
-    note = "[System note: The previous turn was interrupted by a gateway restart.]\n\n"
+    note = "[System note: Resume the pending turn. Any restart, update, or shutdown command has already run.]\n\n"
 
     assert human_prompt_text(note + _delegation_notice()) is None
     assert human_prompt_text(note + _delegation_notice() + "\n\n" + HUMAN) == HUMAN
@@ -137,7 +137,7 @@ def test_retention_drops_structured_synthetic_turn_without_a_known_formatter():
     prompt = "Reply with exactly HERMES_READY 1234"
 
     assert filter_retain_messages(prompt, "HERMES_READY 1234", display_kind="internal_notification") == (
-        None, "HERMES_READY 1234")
+        None, None)
     assert filter_retain_messages(prompt, "HERMES_READY 1234") == (prompt, "HERMES_READY 1234")
 
 
@@ -207,8 +207,14 @@ def _template_id(template: str) -> str:
     import hermes_cli.heartbeat as heartbeat
     import hermes_cli.loops as loops
 
-    return next(name for module in (goals, heartbeat, loops) for name, value in vars(module).items()
-                if name.endswith("_TEMPLATE") and value is template)
+    from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
+
+    for module in (goals, heartbeat, loops):
+        for name, value in vars(module).items():
+            if name.endswith("_TEMPLATE") and value == template:
+                return name
+    row = next(row for row in GOAL_PROMPT_REGISTRY if row["template"] == template)
+    return f"registry-{row['formatter']}-{row['source_commits'][0][:8]}"
 
 
 def test_review_repro_contract_continuation_nested_in_a_plain_goal_stays_generated():
@@ -252,7 +258,7 @@ def test_a_template_nested_in_another_templates_payload_never_leaks(outer, inner
 def test_revised_continuation_is_generated_through_its_end(revision_lines):
     """The revision block has no closing marker and carries multi-line goal text, so nothing after it
     can be proven human: a revised continuation is generated in full, including any merged text."""
-    from hermes_cli.goals import CONTINUATION_REVISIONS_TEMPLATE
+    from hermes_cli.goals_legacy_prompts import _LEGACY_CONTINUATION_REVISIONS_TEMPLATE as CONTINUATION_REVISIONS_TEMPLATE
 
     revised = _goal_prompt() + CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=revision_lines)
 
@@ -618,8 +624,7 @@ def test_hindsight_discard_prefetch_drops_the_buffer_and_an_in_flight_worker():
     assert provider.prefetch("new topic") == ""
 
 
-def test_retaindb_and_honcho_discard_prefetch_drop_their_buffers():
-    from plugins.memory.honcho import HonchoMemoryProvider
+def test_retaindb_discard_prefetch_drops_its_buffers():
     from plugins.memory.retaindb import RetainDBMemoryProvider
 
     retaindb = RetainDBMemoryProvider()
@@ -627,11 +632,6 @@ def test_retaindb_and_honcho_discard_prefetch_drop_their_buffers():
     retaindb._agent_model = {"memory_count": 1}
     retaindb.discard_prefetch()
     assert retaindb.prefetch("new topic") == ""
-
-    honcho = HonchoMemoryProvider()
-    honcho._prefetch_result, honcho._prefetch_result_fired_at = "old dialectic", 3
-    honcho.discard_prefetch()
-    assert honcho._consume_pending_dialectic() == ""
 
 
 def test_prefetch_generation_publishes_only_the_current_token():
@@ -697,56 +697,6 @@ def test_retaindb_current_batch_still_publishes():
         thread.join(timeout=5)
     result = provider.prefetch("next")
     assert "fresh memory" in result and "fresh synthesis" in result
-
-
-def _honcho_with_blocked_dialectic(answer):
-    import threading
-    from unittest.mock import MagicMock
-
-    from plugins.memory.honcho import HonchoMemoryProvider
-
-    provider = HonchoMemoryProvider()
-    provider._manager, provider._session_key, provider._session_initialized = MagicMock(), "s", True
-    provider._turn_count, provider._last_dialectic_turn, provider._dialectic_empty_streak = 5, 2, 3
-    entered, release = threading.Event(), threading.Event()
-
-    def dialectic_query(*_args, **_kwargs):
-        entered.set()
-        release.wait(5)
-        if isinstance(answer, BaseException):
-            raise answer
-        return answer
-
-    provider._manager.dialectic_query.side_effect = dialectic_query
-    provider._spawn_dialectic("old topic", thread_name="honcho-prefetch", fired_at=5, log_label="prefetch")
-    assert entered.wait(5)
-    return provider, release
-
-
-@pytest.mark.parametrize("answer", ["old dialectic", "", RuntimeError("timeout")],
-                         ids=["result", "empty", "failure"])
-def test_honcho_discard_prefetch_drops_a_running_dialectic_and_its_cadence_updates(answer):
-    """Review of fb3e903: a blocked dialectic released after the discard published its result. An
-    obsolete run must not touch the pending slot, ``_last_dialectic_turn`` or the empty streak."""
-    provider, release = _honcho_with_blocked_dialectic(answer)
-
-    provider.discard_prefetch()
-    release.set()
-    provider._prefetch_thread.join(timeout=5)
-
-    assert provider._consume_pending_dialectic() == ""
-    assert (provider._prefetch_result, provider._prefetch_result_fired_at) == ("", -999)
-    assert (provider._last_dialectic_turn, provider._dialectic_empty_streak) == (2, 3)
-
-
-def test_honcho_current_dialectic_still_publishes_and_advances_cadence():
-    provider, release = _honcho_with_blocked_dialectic("fresh dialectic")
-
-    release.set()
-    provider._prefetch_thread.join(timeout=5)
-
-    assert (provider._last_dialectic_turn, provider._dialectic_empty_streak) == (5, 0)
-    assert provider._consume_pending_dialectic() == "fresh dialectic"
 
 
 def test_queued_recall_still_waiting_behind_a_slow_sync_is_dropped_with_the_expired_buffer(clock):
@@ -873,7 +823,7 @@ def test_prefetch_for_the_session_just_left_never_starts_after_the_switch():
 def test_human_suffix_quoting_the_revision_header_is_kept():
     """Review of 489f721 (P2): the revised-continuation guard must anchor on the generated seam, not
     on the revision header appearing anywhere, or a quoting human suffix is dropped."""
-    from hermes_cli.goals import CONTINUATION_REVISIONS_TEMPLATE
+    from hermes_cli.goals_legacy_prompts import _LEGACY_CONTINUATION_REVISIONS_TEMPLATE as CONTINUATION_REVISIONS_TEMPLATE
 
     header = CONTINUATION_REVISIONS_TEMPLATE.split("{revision_lines}", 1)[0].strip()
     suffix = f'Why does it say "{header}"? I never revised it.'

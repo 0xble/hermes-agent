@@ -39,11 +39,14 @@ def observed_prune(repo):
 
 worktree_ops._prune_stale_worktrees = observed_prune
 scheduler._worktree_maintenance_repos = lambda: [sys.argv[1]]
+scheduler._last_worktree_maintenance_at = None  # due now, not after the boot delay
+import hermes_cli.maintenance_window as maintenance_window
+maintenance_window.deletion_window_open = lambda at=None: True  # any time of day the suite runs
 scheduler._maybe_run_worktree_maintenance()
 assert finished.wait(30), 'maintenance did not finish'
 assert not errors, errors
 assert os.environ['TERMINAL_CWD'] == before
 """
     result = subprocess.run([sys.executable, "-c", script, str(repo)], env=env,
-                            cwd=tmp_path, capture_output=True, text=True, timeout=45)
+                            cwd=tmp_path, capture_output=True, text=True, timeout=45, check=False)
     assert result.returncode == 0, result.stdout + result.stderr

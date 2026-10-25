@@ -40,7 +40,7 @@ _TRANSIENT_SQLITE_MARKERS = (
 _SQLITE_LOCK_CODES = (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
-def _sqlite_primary_code(exc_or_str) -> "int | None":
+def _sqlite_primary_code(exc_or_str) -> int | None:
     """Primary result code (extended codes keep it in the low byte); None when unknown."""
     code = getattr(exc_or_str, "sqlite_errorcode", None)
     return code & 0xFF if isinstance(code, int) else None
@@ -164,6 +164,10 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     (the compressor publishes in seconds; ``_execute_write`` waits), unlike the
     parent class's other case (a compressor whose own lease is gone: permanent,
     fail fast). Subclassing keeps every existing handler working."""
+
+
+class CompressionLeaseLostError(SessionCompressionInProgressError):
+    """This publication lost its holder. Waiting cannot revive the old snapshot."""
 
 
 class SessionTurnLeaseLostError(RuntimeError):

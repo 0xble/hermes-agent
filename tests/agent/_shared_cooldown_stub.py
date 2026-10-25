@@ -19,12 +19,24 @@ PRIMARY_MODEL = "primary-model"
 FALLBACK_MODEL = "fallback-model"
 
 
+_FAILURE_BODIES = {
+    429: {"error": {"message": "rate_limit_error: retry later", "type": "rate_limit_error"}},
+    529: {"error": {"message": "Overloaded", "type": "overloaded_error"}},
+    503: {"error": {"message": "The server is overloaded, please try again later", "type": "server_error"}},
+    500: {"error": {"message": "Internal server error", "type": "server_error"}},
+}
+
+
 class StubProvider:
-    """Serve the primary (429 with Retry-After unless available) and the fallback (200)."""
+    """Serve the primary (``failure_status`` with Retry-After unless available) and the fallback (200).
+
+    ``failure_status`` is 429 by default; 529 and 503 carry overload bodies, 500 a generic error.
+    """
 
     def __init__(self) -> None:
         self.primary_available = False
         self.retry_after: str | None = "7200"
+        self.failure_status = 429
         self.requests: list[dict] = []
         stub = self
 
@@ -43,10 +55,11 @@ class StubProvider:
                 model = body.get("model")
                 stream = bool(body.get("stream"))
                 ok = model != PRIMARY_MODEL or stub.primary_available
-                stub.requests.append({"model": model, "status": 200 if ok else 429, "stream": stream})
+                status = 200 if ok else stub.failure_status
+                stub.requests.append({"model": model, "status": status, "stream": stream})
                 if not ok:
-                    payload = json.dumps({"error": {"message": "rate_limit_error: retry later", "type": "rate_limit_error"}}).encode()
-                    self.send_response(429)
+                    payload = json.dumps(_FAILURE_BODIES[status]).encode()
+                    self.send_response(status)
                     if stub.retry_after:
                         self.send_header("Retry-After", stub.retry_after)
                     self.send_header("Content-Type", "application/json")

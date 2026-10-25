@@ -164,7 +164,7 @@ class TestHandleBtwCommand:
         store.load_transcript.return_value = [{"role": "user", "content": "fix foo.py"}]
         store._store = runner.session_store
         runner._async_session_store = store
-        runner._resolve_session_agent_runtime = MagicMock(
+        runner._resolve_session_agent_runtime_async = AsyncMock(
             return_value=("test-model", {"api_key": "k", "provider": "p"})
         )
         adapter = AsyncMock()
@@ -176,6 +176,7 @@ class TestHandleBtwCommand:
             await asyncio.gather(*runner._background_tasks)
 
         store.get_or_create_session.assert_awaited_once_with(event.source)
+        runner._resolve_session_agent_runtime_async.assert_awaited_once_with(source=event.source)
         metadata = adapter.send.await_args.kwargs["metadata"]
         assert metadata["direct_messages_topic_id"] == "42"
         assert metadata["thread_id"] == "42"
@@ -192,7 +193,7 @@ class TestHandleBtwCommand:
         ]
         store._store = runner.session_store
         runner._async_session_store = store
-        runner._resolve_session_agent_runtime = MagicMock(
+        runner._resolve_session_agent_runtime_async = AsyncMock(
             return_value=("test-model", {"api_key": "k", "provider": "p",
                                          "base_url": "u", "api_mode": "chat_completions"})
         )
@@ -212,6 +213,7 @@ class TestHandleBtwCommand:
             for task in list(runner._background_tasks):
                 await task
 
+        runner._resolve_session_agent_runtime_async.assert_awaited_once_with(source=event.source)
         # Snapshot + question reached the engine; live history untouched.
         args, kwargs = mock_answer.call_args
         assert args[0] == "which file was that?"

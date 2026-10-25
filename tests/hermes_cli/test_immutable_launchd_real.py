@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import gateway, gateway_launchd
+from hermes_cli import gateway, gateway_launchd, gateway_service_owner
 from hermes_cli.immutable_releases import promote
 from tests.hermes_cli.immutable_launchd_cleanup import (
     install_probe_process_dependency,
@@ -176,7 +176,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
         # Discover ONLY this throwaway label; the account's ai.hermes.gateway job
         # is neither enumerated nor eligible for any restart/kill helper.
         from types import SimpleNamespace
-        from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
+        from hermes_cli import update_cmd, update_cmd_fleet, update_cmd_fleet_verify, update_receipt
         monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: path)
         monkeypatch.setattr(gateway, "launchd_gateway_labels_for_install", lambda: [label])
         monkeypatch.setattr(gateway, "legacy_launchd_labels_for_install", lambda **kw: [])
@@ -187,7 +187,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
         monkeypatch.setattr(update_cmd_fleet, "_restart_systemd_gateway_units", lambda *args: None)
         monkeypatch.setattr(update_cmd_fleet, "_restart_manual_gateways", lambda *args: None)
         monkeypatch.setattr(update_cmd_fleet, "_force_kill_stuck_gateways", lambda *args: None)
-        monkeypatch.setattr(update_cmd_fleet, "_print_legacy_units_warning", lambda: None)
+        monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
         monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *args, **kw: None)
         monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda *args: [])
         monkeypatch.setattr(update_cmd._m(), "_fleet_probe_expected_runtimes", lambda *args: True)
@@ -338,7 +338,7 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
     monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda: plist_path.read_bytes() == replacement)
     monkeypatch.setattr(gateway, "_launchd_domain", lambda: domain)
     # Only the throwaway plist is in scope; preserve production's temp-home guard.
-    monkeypatch.setattr(gateway, "_refuse_temp_home_service_write", lambda *_: False)
+    monkeypatch.setattr(gateway_service_owner, "refuse_temp_home_service_write", lambda *_: False)
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)

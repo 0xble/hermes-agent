@@ -23,11 +23,11 @@ _install_lock = threading.Lock()
 # and silence install cannot each read the old stream and stack over one another.
 stdio_install_lock = _install_lock
 # Proxy installed per attribute ("stdout"/"stderr"): never double-wrap.
-_installed: dict[str, "_ThreadRoutingStream"] = {}
+_installed: dict[str, _ThreadRoutingStream] = {}
 # One process-lifetime sink per stream: global redirects that displace and
 # restore a proxy must not leak a new /dev/null descriptor each time.
 _sinks: dict[str, TextIO] = {}
-_routing_states: dict[str, "_RoutingState"] = {}
+_routing_states: dict[str, _RoutingState] = {}
 
 
 def is_stdio_wrapper(stream: object) -> bool:
@@ -187,7 +187,7 @@ def is_routing_stream(stream: object) -> bool:
     return isinstance(stream, _ThreadRoutingStream)
 
 
-def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
+def _ensure_installed(attr: str, passthrough: TextIO) -> _ThreadRoutingStream:
     """Install (idempotently) a routing proxy as ``sys.<attr>`` and return it."""
     with _install_lock:
         current = getattr(sys, attr, None)

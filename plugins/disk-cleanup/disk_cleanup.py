@@ -12,8 +12,10 @@ import contextlib
 import functools
 import json
 import logging
+import os
 import shutil
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -23,6 +25,49 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 _LARGE_FILE_BYTES = 500 * 1024 * 1024
+# Longest wait for the tracking lock while no other holder commits a tracked.json write,
+# and the hard ceiling on one acquisition however much other writers progress.
+_LOCK_STALL_SECONDS = 2.0
+_LOCK_CEILING_SECONDS = 30.0
+
+
+def _tracked_stamp() -> Optional[Tuple[int, int, int]]:
+    try:
+        st = _state_file("tracked.json").stat()
+    except OSError:
+        return None
+    return st.st_ino, st.st_mtime_ns, st.st_ctime_ns
+
+
+@contextlib.contextmanager
+def _tracking_lock():
+    """Serialize tracking transactions without holding the lock during cleanup I/O.
+
+    The lock is not fair: a busy writer can reacquire it ahead of a polling
+    waiter many times in a row. The deadline therefore bounds a stalled
+    holder, not a busy queue. Each wait window that sees another holder commit
+    tracked.json restarts it, so concurrent writers make progress instead of
+    failing with an untracked file. A window with no commit, or the overall
+    ceiling, fails loudly.
+    """
+    from hermes_cli.active_sessions import _FileLock
+    ceiling = time.monotonic() + _LOCK_CEILING_SECONDS
+    seen = _tracked_stamp()
+    while True:
+        window = min(_LOCK_STALL_SECONDS, ceiling - time.monotonic())
+        lock = _FileLock(_state_file("tracked.lock"), timeout=max(window, 0.0))
+        try:
+            lock.__enter__()
+            break
+        except RuntimeError as exc:
+            current = _tracked_stamp()
+            if current == seen or time.monotonic() >= ceiling:
+                raise RuntimeError("disk-cleanup tracking lock unavailable") from exc
+            seen = current
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
 
 
 def _state_file(name: str) -> Path:
@@ -30,13 +75,51 @@ def _state_file(name: str) -> Path:
     return get_hermes_home() / "disk-cleanup" / name
 
 
-def is_safe_path(path: Path) -> bool:
-    """Accept only paths under HERMES_HOME or ``/tmp/hermes-*`` (rejects /mnt/c etc.)."""
-    with contextlib.suppress(ValueError, OSError):
-        path.resolve().relative_to(get_hermes_home())
+def in_cleanup_scope(path: Path) -> bool:
+    """Reject unrelated argument paths before probing their filesystem."""
+    absolute = Path(os.path.abspath(path))
+    try:
+        absolute.relative_to(get_hermes_home())
         return True
-    parts = path.parts
-    return len(parts) >= 3 and parts[1] == "tmp" and parts[2].startswith("hermes-")
+    except ValueError:
+        pass
+    for root in (Path("/tmp"), Path("/private/tmp")):  # no-tmp: ok — lexical aliases only
+        try:
+            relative = absolute.relative_to(root)
+        except ValueError:
+            continue
+        if relative.parts and relative.parts[0].startswith("hermes-"):
+            return True
+    return False
+
+
+def is_safe_path(path: Path) -> bool:
+    """Accept only paths under HERMES_HOME or ``/tmp/hermes-*``.
+
+    Rejects Windows mounts (``/mnt/c`` etc.) and any system directory.
+    """
+    if not in_cleanup_scope(path):
+        return False
+    hermes_home = get_hermes_home()
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return False
+    try:
+        resolved.relative_to(hermes_home)
+        return True
+    except ValueError:
+        pass
+
+    # Allow /tmp/hermes-* explicitly. Compare resolved roots rather than raw
+    # path parts because macOS resolves /tmp to /private/tmp.
+    try:
+        # Deliberate /tmp alias detection (#98854): we resolve the POSIX root
+        # itself so the same directory matches under /private/tmp.
+        relative_tmp = resolved.relative_to(Path("/tmp").resolve())  # no-tmp: ok — alias detection, not a scratch path
+    except (ValueError, OSError):
+        return False
+    return bool(relative_tmp.parts and relative_tmp.parts[0].startswith("hermes-"))
 
 
 def _log(message: str) -> None:
@@ -44,12 +127,12 @@ def _log(message: str) -> None:
     with contextlib.suppress(OSError):
         log_file = _state_file("cleanup.log")
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {message}\n")
 
 
-def load_tracked() -> List[Dict[str, Any]]:
+def load_tracked() -> list[dict[str, Any]]:
     """Load tracked.json.  Restores from ``.bak`` on corruption."""
     tf = _state_file("tracked.json")
     tf.parent.mkdir(parents=True, exist_ok=True)
@@ -71,7 +154,7 @@ def load_tracked() -> List[Dict[str, Any]]:
         return []
 
 
-def save_tracked(tracked: List[Dict[str, Any]]) -> None:
+def save_tracked(tracked: list[dict[str, Any]]) -> None:
     """Atomic write with a backup; the shared helper allocates a unique temp file per writer."""
     tf = _state_file("tracked.json")
     tf.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +236,16 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
     if category not in ALLOWED_CATEGORIES:
         _log(f"WARN: unknown category '{category}', using 'other'")
         category = "other"
-    path = Path(path_str).resolve()
+
+    try:
+        path = Path(path_str).expanduser()
+        if not in_cleanup_scope(path):
+            return False
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        _log(f"REJECT: {path_str} (could not resolve path)")
+        return False
+
     if not path.exists():
         _log(f"SKIP: {path} (does not exist)")
         return False
@@ -161,12 +253,13 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
         _log(f"REJECT: {path} (outside HERMES_HOME)")
         return False
     size = path.stat().st_size if path.is_file() else 0
-    tracked = load_tracked()
-    if any(item["path"] == str(path) for item in tracked):
-        return False
-    tracked.append({"path": str(path), "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "category": category, "size": size})
-    save_tracked(tracked)
+    with _tracking_lock():
+        tracked = load_tracked()
+        if any(item["path"] == str(path) for item in tracked):
+            return False
+        tracked.append({"path": str(path), "timestamp": datetime.now(UTC).isoformat(),
+                        "category": category, "size": size})
+        save_tracked(tracked)
     _log(f"TRACKED: {path} ({category}, {fmt_size(size)})")
     if not silent:
         print(f"Tracked: {path} ({category}, {fmt_size(size)})")
@@ -176,16 +269,17 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
 def forget(path_str: str) -> int:
     """Remove a path from tracking without deleting the file."""
     p = Path(path_str).resolve()
-    tracked = load_tracked()
-    kept = [i for i in tracked if Path(i["path"]).resolve() != p]
-    removed = len(tracked) - len(kept)
-    if removed:
-        save_tracked(kept)
-        _log(f"FORGOT: {p} ({removed} entries)")
+    with _tracking_lock():
+        tracked = load_tracked()
+        kept = [i for i in tracked if Path(i["path"]).resolve() != p]
+        removed = len(tracked) - len(kept)
+        if removed:
+            save_tracked(kept)
+            _log(f"FORGOT: {p} ({removed} entries)")
     return removed
 
 
-def _live_items(tracked: List[Dict], now: datetime, *, log_stale: bool = False) -> Iterator[Tuple[Dict, Path, int]]:
+def _live_items(tracked: list[dict], now: datetime, *, log_stale: bool = False) -> Iterator[tuple[dict, Path, int]]:
     """Yield ``(item, path, age_days)`` for entries whose path still exists."""
     for item in tracked:
         p = Path(item["path"])
@@ -199,7 +293,7 @@ def _is_auto_delete(cat: str, age: int) -> bool:
     return cat == "test" or (cat == "temp" and age > 7) or (cat == "cron-output" and age > 14)
 
 
-def _prompt_group(item: Dict, age: int) -> Optional[str]:
+def _prompt_group(item: dict, age: int) -> Optional[str]:
     """Prompt-only bucket: ``research`` / ``chrome`` / ``large`` or None."""
     cat = item["category"]
     if cat == "research" and age > 30:
@@ -209,7 +303,7 @@ def _prompt_group(item: Dict, age: int) -> Optional[str]:
     return "large" if item["size"] > _LARGE_FILE_BYTES else None
 
 
-def _delete_item(item: Dict) -> Optional[str]:
+def _delete_item(item: dict) -> Optional[str]:
     """Delete a tracked file/dir and audit-log it. Returns an error string on OSError, else None."""
     p = Path(item["path"])
     try:
@@ -229,10 +323,10 @@ def _delete_item(item: Dict) -> Optional[str]:
 _STALE_SKIP_NOTE = {"cron-output": "", "test": " — under protected tree"}
 
 
-def dry_run() -> Tuple[List[Dict], List[Dict]]:
+def dry_run() -> tuple[list[dict], list[dict]]:
     """Return (auto_delete_list, needs_prompt_list) without touching files."""
     auto, prompt = [], []
-    for item, p, age in _live_items(load_tracked(), datetime.now(timezone.utc)):
+    for item, p, age in _live_items(load_tracked(), datetime.now(UTC)):
         cat = item["category"]
         # Stale cron-output entries and protected dirs are skipped by quick(); omit them here too.
         if (cat == "cron-output" and guess_category(p) != "cron-output") or _is_protected_dir(p):
@@ -244,12 +338,15 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
     return auto, prompt
 
 
-def quick() -> Dict[str, Any]:
+def quick() -> dict[str, Any]:
     """Safe deterministic cleanup — no prompts. Returns ``{deleted, empty_dirs, freed, errors}``."""
     deleted = freed = 0
-    new_tracked: List[Dict] = []
-    errors: List[str] = []
-    for item, p, age in _live_items(load_tracked(), datetime.now(timezone.utc), log_stale=True):
+    new_tracked: list[dict] = []
+    deleted_items: List[Dict] = []
+    errors: list[str] = []
+    with _tracking_lock():
+        snapshot = load_tracked()
+    for item, p, age in _live_items(snapshot, datetime.now(UTC), log_stale=True):
         cat = item["category"]
         if cat in _STALE_SKIP_NOTE and (re_cat := guess_category(p)) != cat:
             # Misclassified stale entry — drop it rather than delete the file.
@@ -269,16 +366,22 @@ def quick() -> Dict[str, Any]:
         if err is None:
             freed += item["size"]
             deleted += 1
+            deleted_items.append(item)
         else:
             errors.append(err)
             new_tracked.append(item)
+    # Merge only removals from this snapshot. Slow classification/deletion must
+    # not block track(), and concurrent additions or replacements must survive.
+    recreated = [item for item in deleted_items if Path(item["path"]).exists()]
+    removed = [item for item in snapshot if item not in new_tracked and item not in recreated]
+    with _tracking_lock():
+        save_tracked([item for item in load_tracked() if item not in removed])
     empty_removed = _sweep_empty_dirs(get_hermes_home())
-    save_tracked(new_tracked)
     _log(f"QUICK_SUMMARY: {deleted} files, {empty_removed} dirs, {fmt_size(freed)}")
     return {"deleted": deleted, "empty_dirs": empty_removed, "freed": freed, "errors": errors}
 
 
-def _subdirs(dirpath: Path, exclude: frozenset) -> List[Path]:
+def _subdirs(dirpath: Path, exclude: frozenset) -> list[Path]:
     try:
         return [c for c in dirpath.iterdir() if c.is_dir() and not c.is_symlink() and c.name not in exclude]
     except OSError:
@@ -290,7 +393,7 @@ def _sweep_empty_dirs(hermes_home: Path) -> int:
     rglob over a checkout+venv under HERMES_HOME can stall the gateway loop for minutes).
     Iterative post-order so parents emptied by child removal are caught."""
     removed = 0
-    stack: List[Tuple[Path, bool]] = [
+    stack: list[tuple[Path, bool]] = [
         (top, False) for top in _subdirs(hermes_home, _EMPTY_DIR_PROTECTED_TOP_LEVEL | _EMPTY_DIR_SWEEP_PRUNE_DIRS)]
     while stack:
         dirpath, visited = stack.pop()
@@ -306,10 +409,10 @@ def _sweep_empty_dirs(hermes_home: Path) -> int:
     return removed
 
 
-def status() -> Dict[str, Any]:
+def status() -> dict[str, Any]:
     """Return per-category breakdown and top 10 largest tracked files."""
     tracked = load_tracked()
-    cats: Dict[str, Dict] = {}
+    cats: dict[str, dict] = {}
     for item in tracked:
         c = cats.setdefault(item["category"], {"count": 0, "size": 0})
         c["count"] += 1
@@ -319,7 +422,7 @@ def status() -> Dict[str, Any]:
     return {"categories": cats, "top10": existing[:10], "total_tracked": len(tracked)}
 
 
-def format_status(s: Dict[str, Any]) -> str:
+def format_status(s: dict[str, Any]) -> str:
     """Human-readable status string (for slash command output)."""
     lines = [f"{'Category':<20} {'Files':>6}  {'Size':>10}", "-" * 40]
     cats = s["categories"]
@@ -372,7 +475,7 @@ def _inside_git_worktree(path: Path) -> bool:
     """
     resolved = path.resolve()
     parents = list(resolved.parents)
-    above: List[Path] = []
+    above: list[Path] = []
     with contextlib.suppress(ValueError):
         i = parents.index(get_hermes_home())
         parents, above = parents[:i], parents[i:]

@@ -30,10 +30,37 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _isolate_camofox_leases(tmp_path, monkeypatch):
+    """Keep Camofox lease files inside the per-test directory, never the host state dir."""
+    from tools import browser_camofox_leases as leases
+
+    monkeypatch.setattr(leases, "_lease_root", lambda: tmp_path / "camofox-tab-leases")
+    with leases._lock:
+        for server, user_id, tab_id in list(leases._handles):
+            leases.release(server, user_id, tab_id)
+        leases._local_claims.clear()
+    yield
+    with leases._lock:
+        for server, user_id, tab_id in list(leases._handles):
+            leases.release(server, user_id, tab_id)
+        leases._local_claims.clear()
+
+
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# Every test file runs in its own process, and in a checkout without an install stamp
+# get_version_info() shells out to git 7 times (~0.55 s per process in a large local
+# clone; a whole local suite run spent ~48 CPU-minutes there). Seed the shape a shallow
+# CI checkout resolves to; tests of version resolution call _reset_version_info_cache().
+from hermes_cli import version_info as _version_info
+
+_version_info._cached_version_info = _version_info.VersionInfo(
+    "unknown", "git.0000000", None, "0" * 40, "main", "git")
 
 
 # ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
@@ -236,7 +263,7 @@ if not HOST_LOCK_DIR_AT_CONFTEST_IMPORT:
 # non-root conftest carrying ``pytest_plugins`` after startup (e.g. ``pytest .``).
 # Fixtures imported here register exactly as if they were defined here.
 from tests._fixtures.env_filter import _HERMES_BEHAVIORAL_VARS, _looks_like_credential
-from tests._fixtures.live_system_guard import (  # noqa: F401 — _live_system_guard registers here
+from tests._fixtures.live_system_guard import (
     _GATEWAY_LOOKALIKE_MARK,
     _LIVE_SYSTEM_GUARD_BYPASS_MARK,
     _live_system_guard,
@@ -301,6 +328,17 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
         monkeypatch.setattr(_hc, "_PINNED_PROCESS_HERMES_HOME", None, raising=False)
     except Exception:
         pass
+    # The install probe looks past HERMES_HOME (other roots, gateway services, the launcher on
+    # PATH) and writes a marker at a fixed per-user path: confine it to this test's directory.
+    from hermes_cli import install_state
+
+    isolated_places = install_state.Places(markers=(tmp_path / "machine-marker",),
+                                           sources=(install_state._active_root,))
+    monkeypatch.setattr(install_state, "machine_places", lambda: isolated_places)
+    install_state.probe.cache_clear()
+    from hermes_cli import onboarding_due
+
+    onboarding_due.reset_for_tests()
     # Per-TEST host-rendezvous dir (see the session-level block at the top): the
     # host gateway/serve record is shared per OS user by design, so without this
     # one test's published owner makes the next test's lifecycle code attach to it.
@@ -311,13 +349,17 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     if not HOST_LOCK_DIR_AT_CONFTEST_IMPORT:
         monkeypatch.delenv("XDG_STATE_HOME", raising=False)
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "gateway-locks"))
-    # Relay 0.9 normally discovers the user's XDG plugins.toml. Select an empty
-    # per-test user file instead so tests cannot activate a developer's plugins,
+    # Relay normally discovers the user's XDG plugins.toml and merges the machine
+    # policy above it. Select a per-test user file with a deny-by-default dynamic
+    # plugin policy so ordinary tests do not activate ambient worker/native plugins,
     # without changing XDG_CONFIG_HOME for unrelated Hermes code under test.
     # Outside tmp_path: tests that list or git-status their tmp dir must not see it.
     relay_plugins = tmp_path_factory.getbasetemp() / "relay-plugins.toml"
     if not relay_plugins.exists():
-        relay_plugins.write_text("version = 1\n", encoding="utf-8")
+        relay_plugins.write_text(
+            "version = 1\n\n[plugins.policy.defaults]\nallowed = false\n",
+            encoding="utf-8",
+        )
     monkeypatch.setenv("HERMES_NEMO_RELAY_PLUGINS_TOML", str(relay_plugins))
     # Keep the subprocess-surviving isolation marker pointed at THIS test's
     # home (#82770): children spawned by the test inherit it by default, so
@@ -381,10 +423,6 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("AWS_METADATA_SERVICE_TIMEOUT", "1")
     monkeypatch.setenv("AWS_METADATA_SERVICE_NUM_ATTEMPTS", "1")
-    # Tirith auto-installs from GitHub when enabled and missing. Unit tests
-    # should never perform that implicit network/bootstrap path; Tirith-specific
-    # tests opt back in by patching the security config directly.
-    monkeypatch.setenv("TIRITH_ENABLED", "false")
     # On-demand extras (pm.sync_venv) install mid-test-run by design —
     # _allow_lazy_installs() fails open for users. Unit tests must never reach
     # pip/the network: with the SDK absent, any agent init whose tool checks
@@ -421,7 +459,7 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
 @pytest.fixture(autouse=True)
 def _isolate_hermes_home(_hermetic_environment):
     """Alias preserved for any test that yields this name explicitly."""
-    return None
+    return
 
 
 @pytest.fixture(autouse=True)
@@ -451,7 +489,7 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
         from hermes_cli import kanban_db_dispatch as _kbd_mod
     except Exception:
         return
-    monkeypatch.setattr(_kbd_mod, "_system_memory_sample", lambda: {}, raising=False)
+    monkeypatch.setattr(_kbd_mod, "_system_memory_sample", dict, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -593,12 +631,12 @@ def _neutralize_webbrowser(monkeypatch):
 def _neutralize_macos_keychain_creds(request, monkeypatch):
     """Default Anthropic credential resolution away from the real macOS Keychain."""
     if request.node.get_closest_marker(_ALLOW_MACOS_KEYCHAIN_MARK):
-        return None
+        return
 
     try:
         _mod = importlib.import_module("agent.anthropic_credentials")
     except Exception:
-        return None
+        return
     monkeypatch.setattr(
         _mod,
         "_read_claude_code_credentials_from_keychain",
@@ -613,7 +651,7 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
         lambda *_args, **_kwargs: None,
         raising=False,
     )
-    return None
+    return
 
 
 # ── Kanban write guard (#69283) ─────────────────────────────────────────────
@@ -1123,12 +1161,12 @@ def require_mcp_2_sdk():
         pytest.skip(f"requires mcp=={pinned} (found {found}); install the [mcp] extra")
 
 
-def pytest_unconfigure(config):  # noqa: D401 — pytest hook
+def pytest_unconfigure(config):
     _remove_relocated_basetemp(config)
 
 
 @pytest.hookimpl(trylast=True)  # after _pytest.tmpdir has built config._tmp_path_factory
-def pytest_configure(config):  # noqa: D401 — pytest hook
+def pytest_configure(config):
     """Register markers used by hermetic conftest."""
     _relocate_basetemp_outside_operator_home(config)
     config.addinivalue_line(
@@ -1247,8 +1285,29 @@ def pytest_runtest_call(item):
         wait = getattr(sys.modules.get("agent.title_generator"), "wait_for_title_upgrades", None)
         if wait is not None:
             wait()
+        _drain_shared_metrics_worker()
 
 
+def _drain_shared_metrics_worker() -> None:
+    """Finish the gateway shared-metrics worker's queued jobs before the next pytest phase.
+
+    Cron and gateway code hand each metric to one background worker
+    (``shared_metrics_gateway._submit``). Its first job lazily imports the metrics
+    runtime, and those imports register named loggers. Pytest starts every phase
+    with ``catching_logs.__enter__``, which iterates the live
+    ``logging.Logger.manager.loggerDict``. A job still running from the previous
+    phase can add a logger during that loop, which raises ``RuntimeError: dictionary
+    changed size during iteration`` (hosted job 114104725116, at teardown of
+    ``tests/cron/test_warning_execution_outcome.py``). The loop is in pytest, so the
+    suite waits for the worker at each phase boundary. A sys.modules lookup, not an
+    import: a test that never loaded the module has no worker.
+    """
+    drain = getattr(sys.modules.get("hermes_cli.observability.shared_metrics_gateway"), "drain", None)
+    if drain is not None:
+        drain()
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
 def pytest_runtest_setup(item):
     if item.get_closest_marker("require_symlinks"):
         if not _check_symlink_support():
@@ -1256,9 +1315,21 @@ def pytest_runtest_setup(item):
                 "Environment does not support symbolic links "
                 "(requires admin/developer mode on Windows)"
             )
+    try:
+        return (yield)
+    finally:
+        _drain_shared_metrics_worker()
 
 
-def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    try:
+        return (yield)
+    finally:
+        _drain_shared_metrics_worker()
+
+
+def pytest_collection_modifyitems(config, items):
     """Apply host-OS gating, then skip ``requires_wal`` where WAL is unusable.
 
     OS gating: a test marked ``platforms(...)`` runs only on hosts its
@@ -1460,11 +1531,26 @@ _REAL_HERMES_ROOT_CANDIDATES = _capture_real_hermes_root()
 # Captured before any test can patch sys.platform, HOME or XDG_*: a test that runs the real
 # GUI uninstall or update swap would otherwise delete the developer's own Hermes app. Only the
 # ones present (none on CI runners, so the guard costs nothing there), each literal and resolved.
-from hermes_cli.gui_uninstall import packaged_gui_app_paths  # noqa: E402
+from hermes_cli.gui_uninstall import packaged_gui_app_paths
 
 _REAL_INSTALLED_GUI_APPS = sorted({
     os.path.normcase(form) for app in packaged_gui_app_paths() if os.path.lexists(app)
     for form in (os.path.abspath(app), os.path.realpath(app))})
+
+# Installer destinations are account-scoped, outside HERMES_HOME. Capture both HOME and
+# the native account home before fixtures replace either, including currently absent dirs.
+_HOST_ACCOUNT_HOMES = {Path.home()}
+try:
+    import pwd
+    _HOST_ACCOUNT_HOMES.add(Path(pwd.getpwuid(os.getuid()).pw_dir))  # windows-footgun: ok — optional POSIX lookup after import pwd
+except (ImportError, KeyError, OSError):
+    pass
+_REAL_HOST_INSTALL_DIRS = sorted({
+    os.path.normcase(form)
+    for home in _HOST_ACCOUNT_HOMES
+    for directory in (home / ".local" / "bin", home / "Library" / "LaunchAgents")
+    for form in (os.path.abspath(directory), os.path.realpath(directory))
+})
 
 
 @pytest.fixture(autouse=True)
@@ -1478,7 +1564,42 @@ def _forbid_real_hermes_home_io(monkeypatch, request):
         return
     from tests.home_io_guard import HomeIOGuard
 
-    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: _REAL_INSTALLED_GUI_APPS).install(monkeypatch)
+    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: {
+        "installed Hermes desktop app": _REAL_INSTALLED_GUI_APPS,
+        "host installation directory": _REAL_HOST_INSTALL_DIRS,
+    }).install(monkeypatch)
+
+
+@pytest.fixture
+def isolated_machine_home(tmp_path_factory, monkeypatch):
+    """Machine-changing tests opt into disposable account and child paths."""
+    # Separate from tmp_path: tests that inspect their fixture directory must not see
+    # the harness's home. Shell/native children inherit the same destination.
+    home = tmp_path_factory.mktemp("installer-home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home)
+    if os.name == "nt":
+        for name, directory in (("LOCALAPPDATA", "Local"), ("APPDATA", "Roaming")):
+            target = home / "AppData" / directory
+            target.mkdir(parents=True)
+            monkeypatch.setenv(name, str(target))
+    else:
+        # launchd deliberately consults pwd before HOME so profile pinning cannot move
+        # a real user's service. Keep that production resolver intact inside the fixture.
+        import pwd
+
+        getpwuid = pwd.getpwuid
+        uid = os.getuid()  # windows-footgun: ok — POSIX-only branch
+
+        def isolated_account(account_uid):
+            record = getpwuid(account_uid)
+            if account_uid == uid:
+                record = pwd.struct_passwd((*record[:5], str(home), record[6]))
+            return record
+
+        monkeypatch.setattr(pwd, "getpwuid", isolated_account)
+    return home
 
 
 @pytest.fixture

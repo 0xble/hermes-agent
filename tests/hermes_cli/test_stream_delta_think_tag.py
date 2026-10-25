@@ -137,3 +137,19 @@ class TestFlushRecovery:
         assert not cli._in_reasoning_block
         full = "".join(cli._emitted)
         assert "Launch production" in full
+
+
+class TestCopyFilterSpansToolBoundaries:
+    def test_partial_copy_marker_across_tool_boundary_never_leaks(self):
+        from gateway.copy_blocks import CopyMarkerStreamFilter
+        cli = _make_cli_stub()
+        cli._copy_filter = CopyMarkerStreamFilter()
+        cli._emit_unheld = cli._emit_stream_text
+        cli._flush_stream = lambda *, turn_end=True: cli._emitted.append(cli._copy_filter.flush()) if turn_end else None
+        cli._reset_stream_state = lambda: setattr(cli, "_copy_filter", CopyMarkerStreamFilter())
+        for delta in ["intro\n[[co", None, "py]]\nbody\n[[/copy]]\nafter\n"]:
+            cli._stream_delta(delta)
+        cli._flush_stream()
+        out = "".join(cli._emitted)
+        assert "py]]" not in out and "[[" not in out
+        assert "intro" in out and "body" in out and "after" in out

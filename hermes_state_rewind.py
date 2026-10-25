@@ -19,19 +19,19 @@ class RewindTargetUnavailableError(ValueError):
 
 @dataclass
 class RewindOutcome:
-    prefix: List[Dict[str, Any]]  # history to install: the warm prefix when ``warm_history`` was given, else durable
-    live_view: Dict[str, Any]  # canonical live projection of the rewound turn (prefill / retry source)
+    prefix: list[dict[str, Any]]  # history to install: the warm prefix when ``warm_history`` was given, else durable
+    live_view: dict[str, Any]  # canonical live projection of the rewound turn (prefill / retry source)
     live_text: str  # lossless retry text when ``require_retryable``, else the display flattening (prefill)
     rewound_count: int
     turns_undone: int
 
 
-def _user_indices(messages: List[Dict[str, Any]]) -> List[int]:
+def _user_indices(messages: list[dict[str, Any]]) -> list[int]:
     from agent.context_compressor import user_originated_turn_view
     return [i for i, m in enumerate(messages) if user_originated_turn_view(m) is not None]
 
 
-def _comparison_content(message: Dict[str, Any]) -> Any:
+def _comparison_content(message: dict[str, Any]) -> Any:
     """Project content the way the durable row stores it (flush projection, then the read-side sanitize) so a
     warm row and its durable twin compare equal."""
     from agent.session_persistence import _durable_content
@@ -43,7 +43,7 @@ class SessionRewindMixin:
     """``SessionDB`` mixin: soft-delete from one user turn onward, validated against the warm history."""
 
     def rewind_user_turn(
-        self, session_id: str, user_ordinal: int, *, warm_history: Optional[List[Dict[str, Any]]] = None,
+        self, session_id: str, user_ordinal: int, *, warm_history: Optional[list[dict[str, Any]]] = None,
         require_retryable: bool = False, require_composite: bool = False, adopt_row_ids: bool = False,
     ) -> RewindOutcome:
         """Rewind the active transcript to just before user turn ``user_ordinal`` (0 = oldest; negative counts
@@ -56,8 +56,9 @@ class SessionRewindMixin:
         clients can address follow-ups by row; the CLI leaves its history shape alone. Out-of-range /
         wrong-shape targets raise :class:`RewindTargetUnavailableError`."""
         from agent.context_compressor import (
-            _DB_PERSISTED_MARKER, history_before_user_originated_turn, retryable_user_text,
-            split_user_originated_turn, user_originated_turn_view)
+            _DB_PERSISTED_MARKER, history_before_user_originated_turn, split_user_originated_turn,
+            user_originated_turn_view)
+        from agent.context_compressor_retry import retryable_user_text
         from agent.message_content import flatten_message_text
         from agent.message_metadata import MESSAGE_UID, message_uid_or_none
         from agent.session_persistence import _is_ephemeral_scaffolding

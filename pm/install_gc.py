@@ -20,8 +20,10 @@ from pm.environments import (
 
 _INVALID_RECORD = object()
 
-# A deleted review checkout should survive a few days of recovery/retry activity.
-ORPHAN_INSTALL_GRACE_SECONDS = 7 * 24 * 60 * 60
+# Agents create and delete a checkout (worktree) per task, each with a full install, so orphans
+# arrive by the hundred per day. Their checkout is gone; the worst case of collecting one is a
+# single rebuild if the same path comes back, so a day since its last use is enough.
+ORPHAN_INSTALL_GRACE_SECONDS = 24 * 60 * 60
 # Installations created before the sidecar was introduced have no trustworthy last-use
 # timestamp, so they are judged by tree activity instead. They are regenerable dependency
 # caches (the worst case of an early removal is one rebuild), so a few idle days is enough
@@ -31,6 +33,8 @@ LEGACY_INSTALL_GRACE_SECONDS = 3 * 24 * 60 * 60
 # A recorded install holding a generation created before leases existed cannot prove it is
 # unused: a reader may hold it without a lease. That case keeps the long, month-scale window.
 UNLEASEABLE_INSTALL_GRACE_SECONDS = 30 * 24 * 60 * 60
+# An install is renamed to this prefix (outside the 16-hex key space) before it is deleted.
+_CONDEMNED_PREFIX = ".gc-"
 
 
 def _record(state: Path):
@@ -161,14 +165,23 @@ def _eligible(state: Path, record, known_keys: set[str],
         state, now - legacy_grace_seconds)
 
 
+def _remove_condemned(path: Path) -> bool:
+    shutil.rmtree(path, ignore_errors=True)
+    return not path.exists()
+
+
 def collect_install_orphans(
     project_roots: Iterable[Path] = (),
     *,
     grace_seconds: float = ORPHAN_INSTALL_GRACE_SECONDS,
     legacy_grace_seconds: float = LEGACY_INSTALL_GRACE_SECONDS,
     now: float | None = None,
+    limit: int | None = None,
 ) -> list[Path]:
     """Remove idle install directories whose recorded checkout is gone.
+
+    *limit* bounds how many are removed in one call: each holds tens of thousands of files, and
+    deleting a large backlog at once saturates the filesystem on a nearly full volume.
 
     The candidate is rechecked while holding its per-install lock. Active generation
     leases fence deletion even after the checkout directory itself has disappeared.
@@ -194,11 +207,25 @@ def collect_install_orphans(
         if isinstance(record, tuple) and record[0].is_dir()
     )
 
-    candidates = [state for state, record in records.items()
-                  if _eligible(state, record, known_keys, now, grace_seconds, legacy_grace_seconds)]
-
     removed: list[Path] = []
-    for state in candidates:
+
+    def full() -> bool:
+        return limit is not None and len(removed) >= limit
+
+    # A pass killed mid-delete (gateway exit) leaves a condemned tree: finish it first.
+    for condemned in sorted(root.glob(f"{_CONDEMNED_PREFIX}*")):
+        if full():
+            return removed
+        if _remove_condemned(condemned):
+            removed.append(condemned)
+
+    # Lazily, recorded installs first: judging a legacy install walks its whole tree, and a
+    # limited pass should not pay that for candidates it will never reach.
+    for state in sorted(states, key=lambda state: records[state] is None):
+        if full():
+            break
+        if not _eligible(state, records[state], known_keys, now, grace_seconds, legacy_grace_seconds):
+            continue
         try:
             with _install_lock(state) as held:
                 if not held:
@@ -208,10 +235,15 @@ def collect_install_orphans(
                     continue
                 if _leases_held(state):
                     continue
-                if state.exists() and not state.is_symlink():
-                    shutil.rmtree(state)
-                    removed.append(state)
+                if not state.exists() or state.is_symlink():
+                    continue
+                # One atomic rename condemns the whole install, so an interrupted delete can never
+                # leave a recordless or lease-less remnant that looks live or legacy.
+                condemned = root / f"{_CONDEMNED_PREFIX}{state.name}-{os.getpid()}"
+                state.rename(condemned)
         except (OSError, ValueError):
             # Maintenance is best effort; an install that changes under us is kept.
             continue
+        _remove_condemned(condemned)
+        removed.append(state)
     return removed

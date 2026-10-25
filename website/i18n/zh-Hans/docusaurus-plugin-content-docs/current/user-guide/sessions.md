@@ -65,7 +65,7 @@ Hermes 存储 session 历史以便恢复对话，但不会在每次对话时重�
 | `weixin` | 微信（个人版） |
 | `bluebubbles` | 通过 BlueBubbles macOS 服务器的 Apple iMessage |
 | `qqbot` | QQ Bot（腾讯 QQ）通过官方 API v2 |
-| `homeassistant` | Home Assistant 对话 |
+| `homeassistant` | Home Assistant 事件（插件） |
 | `webhook` | 传入 webhook |
 | `api-server` | API 服务器请求 |
 | `acp` | ACP 编辑器集成 |
@@ -301,7 +301,7 @@ hermes sessions export session.jsonl --session-id 20250305_091523_a1b2c3d4
 hermes sessions export backup.jsonl --redact
 ```
 
-导出文件每行包含一个 JSON 对象，包含完整的 session 元数据和所有消息。
+导出文件每行包含一个 JSON 对象，包含完整的 session 元数据和每一条已存储的消息，每条都带有 `active`/`compacted` 标记。其中包括原地压缩归档的轮次，以及被 rewind 或编辑移除的消息。导入该文件（dashboard 的 session 导入）时，这些行会恢复为已归档的历史，而不会成为活跃的模型上下文。CLI 和消息平台的 `/save json` 快照同样如此。请把备份视为包含该 session 曾经有过的全部内容；要分享对话，请用 `--redact` 导出显示格式（`--format md` 或 `html`，只包含 session 显示的历史）。每个 session 的备份在内存中构建，因此已存储行数超过 `sessions.max_export_messages` 的 session 会被拒绝。
 
 #### HTML
 
@@ -495,7 +495,7 @@ session_search()
 
 ### 可选参数
 
-- `sort` — `newest` 或 `oldest`，在 FTS5 排名之上排序。省略则仅按相关性排序（默认；适合探索性召回）。对于"我们在哪里停下了 X"的问题使用 `newest`，对于"X 是怎么开始的"的问题使用 `oldest`。
+- `sort` — `newest` 或 `oldest`，始终先按 BM25 相关性排序，再仅使用 session 时间和消息 ID 作为确定性的并列打破规则。省略则仅按相关性排序（默认，适合探索性召回）。当多个结果相关性相同时，需要偏向较新的或较旧的结果时使用。要限制时间范围，请使用 `after` 或 `before`。
 - `role_filter` — 逗号分隔的角色列表。发现模式默认为 `user,assistant`（工具输出通常是噪音）。传入 `user,assistant,tool` 以包含工具输出（调试工具行为），或传入 `tool` 仅搜索工具输出。
 
 ### 使用时机

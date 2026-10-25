@@ -15,10 +15,22 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli import _git_process_scope as scopeprobe
 from hermes_cli.gitlock import (
     STALE_TMP_PACK_MIN_AGE_SECONDS,
     clear_stale_tmp_packs,
 )
+
+
+@pytest.fixture(autouse=True)
+def _use_legacy_global_guard(monkeypatch):
+    """Keep this legacy suite on its pre-Linux holder-scope contract.
+
+    Linux holder-scoped behavior is covered by test_gitlock_process_scope.py and
+    test_gitlock_pack_holders.py. These fixtures intentionally exercise the
+    non-Linux fallback while preserving their existing _git_proc_running mocks.
+    """
+    monkeypatch.setattr(scopeprobe, "_linux_process_scope", False)
 
 
 def _mkrepo(tmp_path: Path) -> Path:

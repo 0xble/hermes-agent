@@ -38,7 +38,7 @@ class CLIProcessNotificationsMixin:
         from tools.async_delegation import claim_event_delivery, complete_event_delivery
         from tools.process_registry_notifications import (
             HEARTBEAT_DISPLAY_KIND, ProcessNotificationBatch, TimelineNotification, group_process_notifications,
-            heartbeat_display_text)
+            acknowledge_survivor_notifications, heartbeat_display_text)
 
         claimed = []
         for event, text in process_registry.drain_notifications(
@@ -50,6 +50,8 @@ class CLIProcessNotificationsMixin:
             claimed.append((event, text))
             complete_event_delivery(event, claim)
         if self._background_notifications_suppressed():
+            # Deliberate process suppression consumes the claimed survivor, not its artifacts.
+            acknowledge_survivor_notifications(process_registry, claimed)
             # Subagent results are not process notifications: they still land.
             claimed = [(event, text) for event, text in claimed if event.get("type") == "async_delegation"]
         for notifications in group_process_notifications(claimed):
@@ -71,9 +73,12 @@ class CLIProcessNotificationsMixin:
         from cli import _VoiceInputMessage, _SeededQueryMessage
         from tools.process_registry import process_registry
         from tools.process_registry_notifications import (
-            PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch, TimelineNotification)
+            PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch, TimelineNotification,
+            acknowledge_survivor_notifications)
         if isinstance(user_input, ProcessNotificationBatch):
             rendered = user_input.render(process_registry)
+            if rendered:
+                acknowledge_survivor_notifications(process_registry, user_input.notifications)
             user_input = rendered and TimelineNotification(
                 rendered, user_input.display_text(process_registry), PROCESS_COMPLETE_DISPLAY_KIND)
         # Voice-transcribed messages arrive wrapped in a sentinel so only genuine STT output gets the voice

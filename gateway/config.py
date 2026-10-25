@@ -9,7 +9,7 @@ import os
 import re
 from pathlib import Path
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Mapping
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
@@ -67,7 +67,7 @@ def normalize_telegram_rich_messages(value: Any) -> str:
     )
 
 
-def _env_multiplex_profiles_override() -> "bool | None":
+def _env_multiplex_profiles_override() -> bool | None:
     """GATEWAY_MULTIPLEX_PROFILES operator override: True/False for a recognized token.
 
     ``None`` when unset, blank, or unrecognized so the caller keeps the config.yaml
@@ -92,7 +92,7 @@ def _env_multiplex_profiles_override() -> "bool | None":
 ON_ALL_ADAPTERS_DOWN_POLICIES = ("exit", "stay_alive")
 
 
-def _env_on_all_adapters_down_override() -> "str | None":
+def _env_on_all_adapters_down_override() -> str | None:
     """GATEWAY_ON_ALL_ADAPTERS_DOWN operator override: 'exit'/'stay_alive' for a recognized token.
 
     ``None`` when unset, blank, or unrecognized so the caller keeps the config.yaml value
@@ -180,7 +180,7 @@ def coerce_systemd_watchdog_seconds(
     return parsed
 
 
-def _coerce_dict(value: Any) -> Dict[str, Any]:
+def _coerce_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
@@ -269,7 +269,6 @@ class Platform(Enum):
     SIGNAL = "signal"
     MATTERMOST = "mattermost"
     MATRIX = "matrix"
-    HOMEASSISTANT = "homeassistant"
     EMAIL = "email"
     SMS = "sms"
     DINGTALK = "dingtalk"
@@ -320,7 +319,7 @@ class Platform(Enum):
         return pseudo
 
     @classmethod
-    def _scan_bundled_plugin_platforms(cls) -> "tuple[set, dict]":
+    def _scan_bundled_plugin_platforms(cls) -> tuple[set, dict]:
         """Directory names of bundled platform plugins under ``plugins/platforms/``, plus a map of
         manifest ``name:`` keys that differ from their directory (alias -> directory name). Aliases
         never shadow a directory name, so the directory stays the canonical platform value."""
@@ -398,12 +397,12 @@ class HomeChannel:
         if self.platform == Platform.DISCORD and isinstance(self.chat_id, str):
             self.chat_id = discord_channel_id_from_link(self.chat_id.strip()) or self.chat_id
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         optional = {k: v for k in ("thread_id", "user_id", "scope_id") if (v := getattr(self, k))}
         return {"platform": self.platform.value, "chat_id": self.chat_id, "name": self.name, **optional}
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "HomeChannel":
+    def from_dict(cls, data: dict[str, Any]) -> "HomeChannel":
         optional = {k: str(data[k]) if data.get(k) else None for k in ("thread_id", "user_id", "scope_id")}
         return cls(platform=Platform(data["platform"]), chat_id=str(data["chat_id"]), name=data.get("name", "Home"), **optional)
 
@@ -426,11 +425,11 @@ class ChannelOverride:
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ChannelOverride":
+    def from_dict(cls, data: dict[str, Any]) -> "ChannelOverride":
         return cls(**{f.name: data.get(f.name) for f in fields(cls)}) if data else cls()
 
 
@@ -439,7 +438,7 @@ class ChannelOverride:
 # authenticate another way and must never be skipped for a missing token.
 # Platforms absent from this map authenticate some other way (session files, port-bound webhooks,
 # api_key-only) and must never be skipped for a missing token. See #64674.
-PLATFORM_TOKEN_ENV_NAMES: dict["Platform", str] = {
+PLATFORM_TOKEN_ENV_NAMES: dict[Platform, str] = {
     Platform.TELEGRAM: "TELEGRAM_BOT_TOKEN",
     Platform.DISCORD: "DISCORD_BOT_TOKEN",
     Platform.SLACK: "SLACK_BOT_TOKEN",
@@ -461,10 +460,10 @@ class PlatformConfig:
     typing_indicator: bool = True  # drives _keep_typing; False where unwanted (Slack setStatus blocks compose)
     # Working-state text for text-rendering indicators (Slack status, Google Chat marker); None = platform default.
     typing_status_text: Optional[str] = None
-    channel_overrides: Dict[str, ChannelOverride] = field(default_factory=dict)
-    extra: Dict[str, Any] = field(default_factory=dict)  # Platform-specific settings
+    channel_overrides: dict[str, ChannelOverride] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)  # Platform-specific settings
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         result = {
             "enabled": self.enabled, "extra": self.extra, "reply_to_mode": self.reply_to_mode,
             "gateway_restart_notification": self.gateway_restart_notification,
@@ -486,7 +485,7 @@ class PlatformConfig:
     })
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PlatformConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "PlatformConfig":
         data = _coerce_dict(data)
         home = data.get("home_channel")
         # Adapters read their settings from ``extra`` (``config.extra.get("port")``), but users
@@ -558,11 +557,11 @@ class StreamingConfig:
         """
         return self.globally_enabled and (platform_override is None or bool(platform_override))
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "StreamingConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "StreamingConfig":
         if not isinstance(data, dict) or not data:
             return cls()
 
@@ -628,9 +627,9 @@ _TOPLEVEL_BOOL_DEFAULTS = {
 @dataclass
 class GatewayConfig:
     """Main gateway configuration: platform connections, session policies, delivery settings."""
-    platforms: Dict[Platform, PlatformConfig] = field(default_factory=dict)
-    reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
-    quick_commands: Dict[str, Any] = field(default_factory=dict)  # slash commands that bypass the agent loop
+    platforms: dict[Platform, PlatformConfig] = field(default_factory=dict)
+    reset_triggers: list[str] = field(default_factory=lambda: ["/new", "/reset"])
+    quick_commands: dict[str, Any] = field(default_factory=dict)  # slash commands that bypass the agent loop
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
     # Legacy sessions.json mirror of the routing index (primary: state.db) for external tooling / downgrades.
     # The primary copy lives in state.db (gateway_routing table, #9006). Default True for backward
@@ -638,8 +637,8 @@ class GatewayConfig:
     # config.yaml to stop producing the file.
     write_sessions_json: bool = True
     always_log_local: bool = True  # Always save cron outputs to local files
-    # Empty-message restart recovery policy for interactive adapters: ``ask`` reports the restore
-    # and waits, ``continue`` finishes the interrupted work. None keeps each adapter's native
+    # Empty-message resume policy for interactive adapters: ``ask`` waits for the user before
+    # running tools (asking in one line whether to carry on), ``continue`` finishes the pending work. None keeps each adapter's native
     # default (interactive asks, event platforms continue). Per-platform
     # ``extra.restart_resume_policy`` wins over this global value.
     restart_resume_policy: Optional[str] = None
@@ -654,6 +653,7 @@ class GatewayConfig:
     group_sessions_per_user: bool = True  # Isolate group sessions per participant when user IDs exist
     thread_sessions_per_user: bool = False  # False = threads shared across participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active sessions
+    restart_replay_concurrency: int = 2  # Gateway-wide cap for restart/reconnect replay admission
     # The default profile's gateway serves every profile on the host (profiles stamped into session
     # keys, per-profile adapters/credentials). On by default (DEFAULT_CONFIG), but UNSET here is
     # ``None``: a request the gateway settles at boot, not a verdict. ``hermes_cli.gateway_multiplex_mode
@@ -695,12 +695,13 @@ class GatewayConfig:
     profile_routes: list = field(default_factory=list)  # gateway/profile_routing.py
     durable_outbox_enabled: bool = False  # gateway.durable_outbox.enabled, opt-in
     durable_outbox_retention_days: int = 7
+    zero_cut_handover_enabled: bool = False  # gateway.zero_cut_handover.enabled, opt-in
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
         "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
-        "max_concurrent_sessions", "multiplex_profiles",
+        "max_concurrent_sessions", "restart_replay_concurrency", "multiplex_profiles",
         "on_all_adapters_down",
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
@@ -719,7 +720,7 @@ class GatewayConfig:
                     key=f"platforms.{platform.value}.extra.restart_resume_policy")
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(self.systemd_watchdog_seconds)
 
-    def get_connected_platforms(self) -> List[Platform]:
+    def get_connected_platforms(self) -> list[Platform]:
         """Enabled + configured platforms, sorted by value so the rendered "Connected
         Platforms" prompt block is byte-stable (a reorder busts the prompt cache)."""
         connected = [p for p, c in self.platforms.items() if c.enabled and self._is_platform_connected(p, c)]
@@ -767,7 +768,7 @@ class GatewayConfig:
     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
         return self.platforms[platform].home_channel if self.platforms.get(platform) else None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "platforms": {p.value: c.to_dict() for p, c in self.platforms.items()},
             "reset_triggers": self.reset_triggers,
@@ -778,6 +779,7 @@ class GatewayConfig:
             "session_store_max_age_days": self.session_store_max_age_days,
             "durable_outbox": {"enabled": self.durable_outbox_enabled,
                                "retention_days": self.durable_outbox_retention_days},
+            "zero_cut_handover": {"enabled": self.zero_cut_handover_enabled},
             "profile_routes": [
                 {k: v for k, v in asdict(r).items() if k != "user_id" or v is not None}
                 if is_dataclass(r) and not isinstance(r, type) else r
@@ -786,7 +788,7 @@ class GatewayConfig:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "GatewayConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "GatewayConfig":
         data = _coerce_dict(data)
         nested_gateway = _coerce_dict(data.get("gateway"))
 
@@ -848,6 +850,13 @@ class GatewayConfig:
         max_concurrent_sessions = _coerce_optional_positive_int(
             pick("max_concurrent_sessions"), key_label("max_concurrent_sessions")
         )
+        restart_replay_concurrency = _coerce_int(pick("restart_replay_concurrency"), 2)
+        if isinstance(pick("restart_replay_concurrency"), bool) or restart_replay_concurrency < 1:
+            logger.warning(
+                "Ignoring invalid %s (expected a positive integer); using 2",
+                key_label("restart_replay_concurrency"),
+            )
+            restart_replay_concurrency = 2
 
         try:
             session_store_max_age_days = max(int(data.get("session_store_max_age_days", 90)), 0)
@@ -863,6 +872,7 @@ class GatewayConfig:
         if type(outbox.get("enabled", False)) is not bool:
             raise ValueError("gateway.durable_outbox.enabled must be a boolean")
         retention = validate_outbox_retention_days(outbox.get("retention_days", 7))
+        zero_cut_handover = _coerce_dict(pick("zero_cut_handover"))
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
@@ -881,6 +891,7 @@ class GatewayConfig:
             loop_watchdog_max_strikes=max_strikes,
             on_all_adapters_down=on_all_adapters_down,
             max_concurrent_sessions=max_concurrent_sessions,
+            restart_replay_concurrency=restart_replay_concurrency,
             unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), UNAUTHORIZED_DM_BEHAVIORS, "pair"),
             restart_resume_policy=pick("restart_resume_policy"),
             auto_resume_on_boot=_coerce_bool(pick("auto_resume_on_boot"), True),
@@ -890,6 +901,7 @@ class GatewayConfig:
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
             durable_outbox_enabled=outbox.get("enabled", False),
             durable_outbox_retention_days=retention,
+            zero_cut_handover_enabled=_coerce_bool(zero_cut_handover.get("enabled"), False),
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:
@@ -911,6 +923,19 @@ class GatewayConfig:
         """Effective notice-delivery mode ("public"/"private") for a platform."""
         choice = self._extra_choice(platform, "notice_delivery", {"public", "private"}, "public")
         return "public" if choice is None else choice
+
+
+def is_zero_cut_handover_enabled(config: "GatewayConfig | Mapping[str, Any] | None") -> bool:
+    """Return the opt-in zero-cut handover flag from an effective gateway config."""
+    if isinstance(config, GatewayConfig):
+        return bool(config.zero_cut_handover_enabled)
+    if not isinstance(config, Mapping):
+        return False
+    gateway = config.get("gateway", config)
+    if not isinstance(gateway, Mapping):
+        return False
+    setting = gateway.get("zero_cut_handover", {})
+    return _coerce_bool(setting.get("enabled"), False) if isinstance(setting, Mapping) else False
 
 
 def validate_outbox_retention_days(value: Any) -> int:
@@ -948,7 +973,7 @@ def load_gateway_config() -> GatewayConfig:
     return config
 
 
-def _validate_gateway_config(config: "GatewayConfig") -> None:
+def _validate_gateway_config(config: GatewayConfig) -> None:
     """Validate and sanitize a loaded GatewayConfig in place (after all sources are merged)."""
     try:
         # Reject known-weak placeholder tokens. Ported from openclaw/openclaw#64586: users who copy

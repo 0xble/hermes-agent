@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli.update_cmd_common import _best_effort
+from datetime import UTC
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("hermes_cli.update_cmd")
@@ -155,7 +156,7 @@ def _print_fts_optimize_available_notice() -> None:
             "SELECT sql FROM sqlite_master "
             "WHERE type = 'table' AND name = 'messages_fts'"
         ).fetchone()
-        needs_upgrade = bool(row) and getattr(db, "_db_needs_fts_storage_upgrade")(db._conn)
+        needs_upgrade = bool(row) and db._db_needs_fts_storage_upgrade(db._conn)
         # Interrupted optimize-storage: v23 table shape but backfill markers / trash
         # tables remain. Re-running resumes it, so offer the command again.
         interrupted = bool(
@@ -251,10 +252,10 @@ def _format_time_ago(iso_ts: str) -> str:
     """Render an ISO timestamp as `Xh ago` / `Xd ago` / `Xm ago`. Best effort."""
     try:
         from datetime import datetime, timezone
-        ts = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        ts = datetime.fromisoformat(iso_ts)
         if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        secs = int((datetime.now(timezone.utc) - ts).total_seconds())
+            ts = ts.replace(tzinfo=UTC)
+        secs = int((datetime.now(UTC) - ts).total_seconds())
         if secs < 60:
             return "just now"
         if secs < 3600:
@@ -273,7 +274,7 @@ def _reload_process_scan_modules() -> None:
 
 
 def _finish_dashboard_update_cleanup(
-    node_failures: list[str], already_restarted_units: "set[str] | None" = None
+    node_failures: list[str], already_restarted_units: set[str] | None = None
 ) -> None:
     """Historical updater hook; do not continue a pre-PM update after the swap."""
     from hermes_cli._old_updater import stop_for_relaunch
@@ -302,7 +303,7 @@ def _refresh_dashboard_after_update(*, already_restarted_units: set[str] | None 
         # Isolated like every sibling post-update step: a failure here (#112604) used to abort
         # the fleet matrix, reconciliation and the inner receipt finalize that follow it. A
         # dashboard/serve left on pre-update code is still caught by the survivor probe →
-        # reconciliation (exit 1).
+        # reconciliation (an owed gateway_restart follow-up).
         logger.warning("Post-update dashboard cleanup failed: %s", exc)
         _record_update_step("dashboard_cleanup", False, f"{type(exc).__name__}: {exc}")
         print()
@@ -596,6 +597,7 @@ def _ensure_fhs_path_guard() -> None:
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=10,
+            check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return  # no bash or probe hung — don't block update on this
@@ -736,7 +738,7 @@ def _run_quick_snapshots() -> Optional[str]:
             # pointing the other way.
             _record_update_step("sibling_profile_snapshots", False, "no sibling snapshot was taken")
         if _sibling_snaps:
-            print(f"◆ Sibling profile snapshot(s): " + ", ".join(sorted(_sibling_snaps)))
+            print("◆ Sibling profile snapshot(s): " + ", ".join(sorted(_sibling_snaps)))
             _record_update_step(
                 "sibling_profile_snapshots",
                 True,
@@ -750,9 +752,12 @@ def _run_quick_snapshots() -> Optional[str]:
 
 def _run_full_backup() -> None:
     """Zip HERMES_HOME under ``backups/`` (restorable via ``hermes import``). Never raises."""
+    from hermes_cli.update_cmd import _record_update_skip, _record_update_step
+
     try:
         from hermes_cli.backup import BackupInProgressError, create_pre_update_backup
     except Exception as exc:
+        _record_update_step("pre_update_full_backup", False, f"{type(exc).__name__}: {exc}")
         print(f"⚠ Pre-update backup: could not load backup module ({exc}); continuing update.")
         print()
         return
@@ -766,8 +771,9 @@ def _run_full_backup() -> None:
     t0 = _time.monotonic()
     outcome: dict = {}
     try:
-        out_path = create_pre_update_backup(keep=int(_keep), outcome=outcome)
-    except BackupInProgressError:
+        out_path = create_pre_update_backup(keep=int(_keep), outcome=outcome, raise_errors=True)
+    except BackupInProgressError as exc:
+        _record_update_step("pre_update_full_backup", False, f"{type(exc).__name__}: {exc}")
         # Not a fault, and not worth waiting out: the backup slot is a cross-process lock held
         # for as long as a full archive takes (tens of minutes), against a 0.25s acquire timeout.
         # Blocking the update on it would be worse than proceeding. What matters is that the
@@ -779,7 +785,8 @@ def _run_full_backup() -> None:
         print("    To get one: wait for the running backup to finish, then update again.")
         print()
         return
-    except Exception as exc:  # defensive — helper already swallows, but just in case
+    except Exception as exc:  # noqa: BLE001 — a failed archive must never kill an update
+        _record_update_step("pre_update_full_backup", False, f"{type(exc).__name__}: {exc}")
         print(f"  ⚠ Backup failed: {exc}")
         print("  Continuing with update.")
         print()
@@ -787,9 +794,13 @@ def _run_full_backup() -> None:
     elapsed = _time.monotonic() - t0
 
     if out_path is None:
-        print("  ⚠ Backup skipped (no files found or write failed); continuing update.")
+        _record_update_skip("pre_update_full_backup", "nothing to back up")
+        print("  ⚠ Backup skipped (no files to back up); continuing update.")
         print()
         return
+    _record_update_step(
+        "pre_update_full_backup", True,
+        f"archive={out_path.name}" + (" incomplete" if outcome.get("incomplete") else ""))
 
     if outcome.get("incomplete"):
         # The archive is kept and is still the best rollback point available, but calling it
@@ -891,14 +902,26 @@ def _run_pre_update_backup(args) -> Optional[str]:
 
 def _sweep_bytecode_after_update(branch: str) -> None:
     """Clear stale ``__pycache__`` (else gateway restart ImportErrors on names absent from old
-    bytecode), re-stamp the fingerprint, refresh the bootstrap cache scripts."""
+    bytecode), re-stamp the fingerprint, refresh the bootstrap cache scripts.
+
+    Never fails the committed update: a failed sweep is a ``bytecode_sweep`` follow-up and the
+    fingerprint stays un-stamped, so the launch-time sweep (fingerprint mismatch) retries it.
+    """
     from hermes_cli.update_cmd import _m
+    from hermes_cli.update_receipt import record_followup
     # Timestamp-based .pyc validation can accept old bytecode after the source swap.
-    removed = _m()._clear_bytecode_cache(_m().PROJECT_ROOT)
-    if removed:
-        print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
-    _m()._record_bytecode_fingerprint()
-    _m()._refresh_bootstrap_cache_scripts(branch)
+    try:
+        removed = _m()._clear_bytecode_cache(_m().PROJECT_ROOT)
+        if removed:
+            print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
+        _m()._record_bytecode_fingerprint()
+    except Exception as exc:  # health: allow BLE001 -- owed to the next launch's fingerprint sweep
+        record_followup("bytecode_sweep", str(exc) or type(exc).__name__)
+    try:
+        _m()._refresh_bootstrap_cache_scripts(branch)
+    except Exception as exc:  # health: allow BLE001 -- refreshed again by the next update
+        record_followup("bootstrap_scripts", str(exc) or type(exc).__name__,
+                        retry="the next `hermes update` refreshes them")
 
 
 def _profile_skill_sync_status(r) -> str:
@@ -1061,7 +1084,11 @@ def strict_immutable_maintenance(project_root: Path) -> bool:
     from hermes_cli.profiles import list_profiles, seed_profile_skills
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    if not seed_cache_from_checkout(Path(project_root)):
+    try:
+        seeded = seed_cache_from_checkout(Path(project_root), raise_errors=True)
+    except OSError as exc:
+        raise RuntimeError(f"immutable maintenance: model catalog seed failed: {exc}") from exc
+    if not seeded:
         raise RuntimeError("immutable maintenance: model catalog seed failed")
 
     profile_list = list_profiles(lazy_skill_count=True)
@@ -1074,6 +1101,11 @@ def strict_immutable_maintenance(project_root: Path) -> bool:
         if (not isinstance(result, dict) or "copied" not in result or
                 not (result.get("total_bundled", 0) or result.get("skipped_opt_out"))):
             raise RuntimeError(f"immutable maintenance: bundled skills sync failed for {profile.name}")
+        if result.get("failed"):
+            raise RuntimeError(
+                f"immutable maintenance: bundled skills sync failed for {profile.name}: "
+                + "; ".join(result["failed"])
+            )
         token = set_hermes_home_override(profile.path)
         try:
             current, latest = check_config_version(raise_on_parse_error=True)
@@ -1093,12 +1125,28 @@ def strict_immutable_maintenance(project_root: Path) -> bool:
 
 def _run_post_update_maintenance(
     *, assume_yes, gateway_mode, pre_update_snapshot_id, had_desktop_app_before_update,
-    pre_update_version, completion_message=None,
+    pre_update_version, completion_message=None, followups=None,
 ) -> bool:
     """Post-build housekeeping and completion, returning the SQLite runtime verdict.
 
-    Ancillary repairs and notices are best-effort; an unsafe runtime withholds success.
+    Ancillary repairs and notices are best-effort. The profile sync and the config migration run
+    after a failed build too and never fail the committed update. A config-migration failure is
+    printed as ``⚠``, recorded as a receipt follow-up and appended to ``followups`` so the tail
+    stays owed. Profile sync is best-effort per profile (``_sync_profiles_after_update`` prints
+    that profile's error and carries on); only a sync that escapes the step is owed. An unsafe
+    runtime withholds success (and is reported) but is not tail work.
     """
+    from hermes_cli.update_receipt import record_followup
+
+    def owed_step(name, run):
+        try:
+            run()
+        except (Exception, SystemExit) as exc:  # health: allow BLE001 -- the code is committed; retry later
+            reason = str(exc) or type(exc).__name__
+            record_followup(name, reason)
+            if followups is not None:
+                followups.append((name, reason))
+
     from hermes_cli.update_cmd import _check_and_apply_config_migration, _m
     # macOS TCC: Desktop bundles are re-signed each update, so old grants can go stale
     # (toggle ON, yet macOS re-prompts with no Allow button). Tell users how to re-grant.
@@ -1156,11 +1204,11 @@ def _run_post_update_maintenance(
         print("→ Syncing bundled skills...")
         _print_bundled_skills_sync_report()
 
-    _sync_profiles_after_update()
+    owed_step("profile_sync", _sync_profiles_after_update)
 
-    _check_and_apply_config_migration(
+    owed_step("config_migration", lambda: _check_and_apply_config_migration(
         assume_yes=assume_yes, gateway_mode=gateway_mode, pre_update_snapshot_id=pre_update_snapshot_id,
-    )
+    ))
 
     print()
     update_complete = _print_verified_update_completion(completion_message or _update_complete_message(pre_update_version))
@@ -1171,5 +1219,11 @@ def _run_post_update_maintenance(
         for line in [*consume_rewritten_notice(), *recorded_standalone_warning_lines()]:
             print(line)
 
-    _print_post_update_notices_and_self_heals()
+    with _best_effort('Post-update notices failed: %s'):
+        _print_post_update_notices_and_self_heals()
+    # A non-✓ completion message (parked local changes) withholds success on its own; only a
+    # ✓ message that still came back False is the SQLite verdict.
+    if not update_complete and (completion_message or "✓").startswith("✓"):
+        record_followup("sqlite_runtime", "the selected Python links an unsafe SQLite runtime",
+                        retry="run the installer again")
     return update_complete

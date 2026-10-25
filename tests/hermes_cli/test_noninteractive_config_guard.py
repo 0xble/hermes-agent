@@ -67,7 +67,7 @@ def test_prepare_rejects_bad_config_before_plugin_discovery(monkeypatch, tmp_pat
         sys.modules,
         "hermes_cli.plugins",
         types.SimpleNamespace(
-            discover_plugins=lambda: discovery_calls.append("plugins")
+            discover_plugins=lambda *a, **k: discovery_calls.append("plugins")
         ),
     )
 

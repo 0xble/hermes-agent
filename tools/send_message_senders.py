@@ -3,6 +3,7 @@
 from pm import install_hint
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import re
@@ -131,7 +132,7 @@ def _standalone_telegram_rate_limiter():
 
     from plugins.platforms.telegram.daily_quota import DailyQuota
     # One-shot lane: persist every call so the gateway's daily ledger sees this lane's volume.
-    daily = DailyQuota(soft_ceiling=None, profile_dir=profile_dir, flush_interval=0.0)
+    daily = DailyQuota(soft_ceiling=None, call_soft_ceiling=None, profile_dir=profile_dir, flush_interval=0.0)
     return ChatBudgetRateLimiter(ChatOutboundBudget(), penalty_remaining=penalty_remaining,
                                  on_retry_after=on_retry_after, daily=daily)
 
@@ -253,7 +254,7 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
                 if thumb_path:
                     media_kwargs["thumbnail"] = thumb_path
     try:
-        with open(media_path, "rb") as f:
+        with open(media_path, "rb") as f:  # noqa: ASYNC230 -- file handle is streamed to the upload; a local open() is non-blocking in practice
             try:
                 return await _telegram_send_media(bot, chat_id, f, ext, is_voice, force_document, **media_kwargs)
             except Exception as media_err:
@@ -290,18 +291,122 @@ def _telegram_format(message):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
-    """One-shot Telegram Bot API send; parse failures fall back to plain text."""
+async def _send_telegram_copy_document(token, chat_id, message, thread_id=None):
+    """Send an oversized copy block as one UTF-8 ``copy.txt`` document."""
+    import io
+    from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+    bot = _telegram_bot(token)
+    doc = io.BytesIO(message.encode("utf-8"))
+    doc.name = "copy.txt"
+    msg = await bot.send_document(
+        chat_id=normalize_telegram_chat_id(chat_id), document=doc, filename="copy.txt",
+        **_telegram_thread_kwargs(thread_id))
+    return _success("telegram", chat_id, [], message_id=str(getattr(msg, "message_id", "")))
+
+
+def _telegram_rich_adapter(message, bot, rich_messages, allow_cjk_rich_messages=False):
+    """Return a lightweight adapter carrying the live rich eligibility rules."""
     try:
-        formatted, send_parse_mode, _has_html = _telegram_format(message)
+        from gateway.config import _coerce_bool, normalize_telegram_rich_messages
+        mode = normalize_telegram_rich_messages(rich_messages)
+        if mode == "never" or not inspect.iscoroutinefunction(getattr(bot, "do_api_request", None)):
+            return None
+        from plugins.platforms.telegram.adapter import TelegramAdapter, _normalize_dollar_entities
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter._rich_message_mode = mode
+        adapter._rich_messages_enabled = True
+        adapter._allow_cjk_rich_messages = _coerce_bool(allow_cjk_rich_messages, default=False)
+        adapter._rich_send_disabled = False
+        adapter._bot = bot
+        return adapter if adapter._should_attempt_rich(_normalize_dollar_entities(message)) else None
+    except Exception as error:  # health: allow BLE001 -- Optional rich setup has not sent anything; legacy delivery remains safe.
+        logger.warning("Telegram rich adapter unavailable, falling back to legacy: %s", _sanitize_error_text(error))
+        return None
+
+
+async def _send_telegram_rich(bot, chat_id, message, thread_kwargs, *, disable_link_previews, adapter):
+    """Send one Rich Message, or return ``None`` for a safe legacy fallback.
+
+    A thread-not-found response is a permanent routing failure, so it mirrors
+    the legacy sender by retrying once without ``message_thread_id``. Unknown or
+    transient failures return an error without a second legacy send: the rich
+    request may already have reached Telegram.
+    """
+    adapter._disable_link_previews = disable_link_previews
+    payload = {**adapter._rich_payload_base(chat_id, message), **thread_kwargs}
+    flood_retried = False
+
+    while True:
+        try:
+            response = await bot.do_api_request("sendRichMessage", api_kwargs=dict(payload))
+            break
+        except Exception as error:  # health: allow BLE001 -- Bot API boundary returns sanitized errors; only definite rejection permits resend.
+            if not flood_retried and getattr(error, "retry_after", None) is not None:
+                delay = _telegram_retry_delay(error, 0)
+                if delay is not None:
+                    flood_retried = True
+                    logger.warning("Telegram rich send rate-limited, retrying once in %.1fs: %s",
+                                   delay, _sanitize_error_text(error))
+                    await asyncio.sleep(delay)
+                    continue
+            if _is_telegram_thread_not_found(error) and payload.get("message_thread_id") is not None:
+                logger.warning("Thread %s not found in rich Telegram send, retrying without message_thread_id",
+                               payload.pop("message_thread_id"))
+                thread_kwargs.pop("message_thread_id", None)
+                continue
+            if adapter._is_rich_fallback_error(error):
+                logger.warning("Telegram rich send rejected, falling back to legacy: %s", _sanitize_error_text(error))
+                return None
+            logger.warning("Telegram rich send failed (no legacy resend): %s", _sanitize_error_text(error))
+            return _error(f"Telegram rich send failed: {error}")
+
+    if isinstance(response, dict):
+        message_id = response.get("message_id")
+        if message_id is None:
+            message_id = (response.get("result") or {}).get("message_id")
+    else:
+        message_id = getattr(response, "message_id", None)
+    return _success("telegram", chat_id, [], message_id=str(message_id) if message_id is not None else None)
+
+
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False,
+                   copy_block=False, rich_messages=None, allow_cjk_rich_messages=False):
+    """One-shot Telegram Bot API send; Rich Messages precede the legacy text path."""
+    try:
+        media_files = media_files or []
+        if copy_block:
+            from gateway.platforms.base import utf16_len
+            if utf16_len(message) > 4096 and not media_files:
+                # One paste-ready body never splits: send it intact as a .txt document,
+                # matching the live adapter.
+                return await _send_telegram_copy_document(token, chat_id, message, thread_id)
         bot = _telegram_bot(token)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
         from gateway.platforms.base import BasePlatformAdapter, utf16_len
         # Telegram accepts a numeric chat_id OR an @username string; never force-int.
         # See #13206.
         int_chat_id = normalize_telegram_chat_id(chat_id)
-        media_files = media_files or []
         thread_kwargs = _telegram_thread_kwargs(thread_id)
+
+        # Rich Messages are text-only. Eligibility, normalization, and the 32,768-character
+        # cap intentionally mirror TelegramAdapter._should_attempt_rich().
+        if not media_files and not copy_block:
+            rich_adapter = _telegram_rich_adapter(
+                message, bot, rich_messages, allow_cjk_rich_messages=allow_cjk_rich_messages)
+            if rich_adapter is not None:
+                from plugins.platforms.telegram.adapter import _normalize_dollar_entities
+                rich_content = _normalize_dollar_entities(message)
+                rich_result = await _send_telegram_rich(
+                    bot, chat_id, rich_content, thread_kwargs,
+                    disable_link_previews=disable_link_previews, adapter=rich_adapter)
+                if rich_result is not None:
+                    return rich_result
+                # Permanent/capability rejection leaves the existing MarkdownV2 path in charge.
+
+        if copy_block:
+            formatted, send_parse_mode, _has_html = message, None, False
+        else:
+            formatted, send_parse_mode, _has_html = _telegram_format(message)
         # disable_web_page_preview is only valid for send_message, not media sends.
         text_kwargs = {**thread_kwargs, **({"disable_web_page_preview": True} if disable_link_previews else {})}
         last_msg, warnings, _tg_caption = None, [], None
@@ -311,7 +416,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if _cap is not None and utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
         # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
-        chunks = BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else []
+        # HTML keeps raw suffixes; MarkdownV2 adds 2 escapes and a possible fence-lift newline.
+        chunks = BasePlatformAdapter.truncate_message(
+            formatted, 4096, len_fn=utf16_len,
+            indicator_overhead=0 if _has_html else 3) if formatted.strip() else []
         if len(chunks) > 1 and not _has_html:
             # truncate_message appends a raw " (1/2)" suffix after format_message escaped the text;
             # escape the MarkdownV2-special parentheses, as the live adapter does (#74004).
@@ -660,8 +768,153 @@ async def _send_bluebubbles(extra, chat_id, message):
         return _error(f"BlueBubbles send failed: {e}")
 
 
-async def _send_qqbot(pconfig, chat_id, message):
-    """Send via the QQ Bot Open Platform REST API (no WebSocket needed)."""
+def _qqbot_media_file_type(media_path: str, is_voice: bool) -> int:
+    """Map a local path / voice flag to QQ Bot ``file_type`` constants."""
+    from gateway.platforms.qqbot.constants import (
+        MEDIA_TYPE_FILE, MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, MEDIA_TYPE_VOICE)
+
+    ext = os.path.splitext(media_path)[1].lower()
+    if is_voice or ext in _VOICE_EXTS:
+        return MEDIA_TYPE_VOICE
+    if ext in _IMAGE_EXTS:
+        return MEDIA_TYPE_IMAGE
+    if ext in _VIDEO_EXTS:
+        return MEDIA_TYPE_VIDEO
+    if ext in _AUDIO_EXTS:
+        return MEDIA_TYPE_VOICE
+    return MEDIA_TYPE_FILE
+
+
+async def _qqbot_api_json(client, headers: dict, method: str, path: str,
+                          body: dict | None = None, *, timeout: float = 30.0) -> dict:
+    """POST/GET JSON against ``api.sgroup.qq.com``; raise RuntimeError on failure."""
+    from gateway.platforms.qqbot.constants import API_BASE
+
+    resp = await client.request(method, f"{API_BASE}{path}", json=body, headers=headers, timeout=timeout)
+    try:
+        data = resp.json() if resp.content else {}
+    except Exception:
+        data = {}
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"QQ Bot API error [{resp.status_code}] {path}: "
+            f"{data.get('message', data) or resp.text[:200]}")
+    return data if isinstance(data, dict) else {}
+
+
+async def _qqbot_upload_local_file(client, headers, chat_type, chat_id, media_path, file_type) -> dict:
+    """Chunked-upload a local file; returns the ``/files`` complete response."""
+    from pathlib import Path as _Path
+    from gateway.platforms.qqbot.chunked_upload import ChunkedUploader
+    from gateway.platforms.qqbot.constants import FILE_UPLOAD_TIMEOUT
+
+    local_path = _Path(media_path).expanduser()
+    if not local_path.is_absolute():
+        local_path = (_Path.cwd() / local_path).resolve()
+    if not local_path.exists() or not local_path.is_file():
+        raise FileNotFoundError(f"Media file not found: {local_path}")
+
+    async def _api_request(method, path, body=None, timeout=FILE_UPLOAD_TIMEOUT):
+        return await _qqbot_api_json(client, headers, method, path, body, timeout=timeout)
+
+    uploader = ChunkedUploader(api_request=_api_request, http_put=client.put, log_tag="send_message.qqbot")
+    return await uploader.upload(
+        chat_type=chat_type, target_id=chat_id, file_path=str(local_path),
+        file_type=file_type, file_name=local_path.name)
+
+
+async def _qqbot_upload_url(client, headers, chat_type, chat_id, url, file_type,
+                            file_name=None) -> dict:
+    """Ask QQ to fetch ``url`` into the media store; returns upload JSON."""
+    from gateway.platforms.qqbot.constants import FILE_UPLOAD_TIMEOUT, MEDIA_TYPE_FILE
+
+    path = f"/v2/users/{chat_id}/files" if chat_type == "c2c" else f"/v2/groups/{chat_id}/files"
+    body = {"file_type": file_type, "srv_send_msg": False, "url": url}
+    if file_type == MEDIA_TYPE_FILE and file_name:
+        body["file_name"] = file_name
+    return await _qqbot_api_json(client, headers, "POST", path, body, timeout=FILE_UPLOAD_TIMEOUT)
+
+
+def _qqbot_extract_file_info(upload: dict):
+    if not isinstance(upload, dict):
+        return None
+    file_info = upload.get("file_info") or (upload.get("data") or {}).get("file_info")
+    return file_info if file_info else None
+
+
+async def _qqbot_send_media_message(client, headers, chat_type, chat_id, file_info,
+                                    caption=None) -> dict:
+    """POST a RichMedia message referencing an uploaded ``file_info``."""
+    from gateway.platforms.qqbot.constants import MAX_MESSAGE_LENGTH, MSG_TYPE_MEDIA
+
+    path = f"/v2/users/{chat_id}/messages" if chat_type == "c2c" else f"/v2/groups/{chat_id}/messages"
+    body = {"msg_type": MSG_TYPE_MEDIA, "media": {"file_info": file_info},
+            "msg_seq": int(time.time() * 1000) % 1_000_000_000}
+    if caption and caption.strip():
+        body["content"] = caption.strip()[:MAX_MESSAGE_LENGTH]
+    return await _qqbot_api_json(client, headers, "POST", path, body)
+
+
+async def _qqbot_send_text_message(client, headers, chat_id, message: str) -> dict:
+    """Try channel → C2C → group text endpoints (pre-media standalone behavior)."""
+    payload = {"content": (message or "")[:4000], "msg_type": 0}
+    endpoints = (("channel", f"https://api.sgroup.qq.com/channels/{chat_id}/messages"),
+                 ("c2c", f"https://api.sgroup.qq.com/v2/users/{chat_id}/messages"),
+                 ("group", f"https://api.sgroup.qq.com/v2/groups/{chat_id}/messages"))
+    statuses = []
+    for kind, url in endpoints:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code in {200, 201}:
+            return _success("qqbot", chat_id, message_id=resp.json().get("id"))
+        statuses.append(f"{kind}={resp.status_code}")
+    return _error(f"QQBot send failed: {' '.join(statuses)}")
+
+
+async def _qqbot_deliver_one_media(client, headers, chat_id, media_path, is_voice,
+                                   caption=None) -> dict:
+    """Upload one attachment and send it, trying C2C then group (no guild)."""
+    from pathlib import Path as _Path
+    from urllib.parse import urlparse
+
+    file_type = _qqbot_media_file_type(media_path, is_voice)
+    is_url = urlparse(str(media_path)).scheme in {"http", "https"}
+    errors: list[str] = []
+
+    for chat_type in ("c2c", "group"):
+        try:
+            if is_url:
+                upload = await _qqbot_upload_url(
+                    client, headers, chat_type, chat_id, media_path, file_type,
+                    file_name=_Path(urlparse(media_path).path).name or "media")
+            else:
+                upload = await _qqbot_upload_local_file(
+                    client, headers, chat_type, chat_id, media_path, file_type)
+            file_info = _qqbot_extract_file_info(upload)
+            if not file_info:
+                errors.append(f"{chat_type}: upload returned no file_info: {upload}")
+                continue
+            send_data = await _qqbot_send_media_message(
+                client, headers, chat_type, chat_id, file_info, caption=caption)
+            return _success("qqbot", chat_id, message_id=send_data.get("id"), chat_type=chat_type)
+        except Exception as exc:
+            errors.append(f"{chat_type}: {exc}")
+            continue
+
+    return _error(
+        "QQBot media send failed (guild/channel native media is unsupported; "
+        f"tried c2c and group): {'; '.join(errors)}")
+
+
+async def _send_qqbot(pconfig, chat_id, message, media_files=None, caption=None):
+    """Send via the QQ Bot Open Platform REST API (no WebSocket needed).
+
+    Guild channels, C2C (private) chats and groups are tried in order for text.
+    When ``media_files`` is provided, each attachment is uploaded (C2C then
+    group — guild has no native media upload path) and sent as a
+    ``msg_type=MEDIA`` RichMedia message (#37315). Optional ``caption`` rides on
+    the first media bubble; non-empty ``message`` is sent as a separate text
+    message before the media.
+    """
     try:
         import httpx
     except ImportError:
@@ -669,13 +922,19 @@ async def _send_qqbot(pconfig, chat_id, message):
 
     # Profile-scoped lookup so a multiplex profile never borrows another's QQ credentials.
     from gateway.config import _getenv
+    from gateway.platforms.qqbot.constants import FILE_UPLOAD_TIMEOUT
     extra = pconfig.extra or {}
     appid = extra.get("app_id") or _getenv("QQ_APP_ID", "")
     secret = pconfig.token or extra.get("client_secret") or _getenv("QQ_CLIENT_SECRET", "")
     if not appid or not secret:
         return _error("QQBot: QQ_APP_ID / QQ_CLIENT_SECRET not configured.")
+
+    media_files = media_files or []
+    # Longer timeout when uploading; text-only stays snappy.
+    client_timeout = FILE_UPLOAD_TIMEOUT if media_files else 15.0
+
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=client_timeout) as client:
             token_resp = await client.post("https://bots.qq.com/app/getAppAccessToken",
                                            json={"appId": str(appid), "clientSecret": str(secret)})
             if token_resp.status_code != 200:
@@ -684,19 +943,59 @@ async def _send_qqbot(pconfig, chat_id, message):
             if not access_token:
                 return _error("QQBot: no access_token in response")
 
-            # Separate endpoints for guild channels, C2C (private) and groups; first 2xx wins.
             headers = {"Authorization": f"QQBot {access_token}", "Content-Type": "application/json"}
-            payload = {"content": message[:4000], "msg_type": 0}
-            endpoints = (("channel", f"https://api.sgroup.qq.com/channels/{chat_id}/messages"),
-                         ("c2c", f"https://api.sgroup.qq.com/v2/users/{chat_id}/messages"),
-                         ("group", f"https://api.sgroup.qq.com/v2/groups/{chat_id}/messages"))
-            statuses = []
-            for kind, url in endpoints:
-                resp = await client.post(url, json=payload, headers=headers)
-                if resp.status_code in {200, 201}:
-                    return _success("qqbot", chat_id, message_id=resp.json().get("id"))
-                statuses.append(f"{kind}={resp.status_code}")
-            return _error(f"QQBot send failed: {' '.join(statuses)}")
+
+            # --- Media path (#37315) ---
+            if media_files:
+                last_result = None
+                text = (message or "").strip()
+                warnings: list[str] = []
+                if text and not (caption and caption.strip()):
+                    text_result = await _qqbot_send_text_message(client, headers, chat_id, text)
+                    if isinstance(text_result, dict) and text_result.get("error"):
+                        return text_result
+                    last_result = text_result
+
+                for index, (media_path, is_voice) in enumerate(media_files):
+                    if not media_path:
+                        continue
+                    # Caption applies to the first bubble only (single-file
+                    # caption split already enforced by the caller).
+                    media_caption = caption if index == 0 else None
+                    if not os.path.exists(media_path):
+                        from urllib.parse import urlparse as _urlparse
+                        if _urlparse(str(media_path)).scheme not in {"http", "https"}:
+                            warnings.append(f"QQBot media file not found, skipping: {media_path}")
+                            logger.warning(warnings[-1])
+                            continue
+                    result = await _qqbot_deliver_one_media(
+                        client, headers, chat_id, media_path, bool(is_voice), caption=media_caption)
+                    if isinstance(result, dict) and result.get("error"):
+                        # Media failure must not discard the send (main degraded to text +
+                        # omission warning): collect it and keep delivering.
+                        warnings.append(result["error"])
+                        logger.warning("QQBot media delivery failed, omitting attachment: %s",
+                                       result["error"])
+                        continue
+                    last_result = result
+
+                if last_result is None:
+                    # Nothing was deliverable (caption rides the media, which all failed):
+                    # degrade to the text alone, as the pre-media generic path did.
+                    fallback_text = text or (caption or "").strip()
+                    if not fallback_text:
+                        return {"error": "QQBot: no deliverable media attachments",
+                                **({"warnings": warnings} if warnings else {})}
+                    text_result = await _qqbot_send_text_message(client, headers, chat_id, fallback_text)
+                    if isinstance(text_result, dict) and text_result.get("error"):
+                        return {**text_result, **({"warnings": warnings} if warnings else {})}
+                    last_result = text_result
+                if warnings and isinstance(last_result, dict):
+                    last_result["warnings"] = [*last_result.get("warnings", []), *warnings]
+                return last_result
+
+            # --- Text-only path: first 2xx wins (pre-media behavior) ---
+            return await _qqbot_send_text_message(client, headers, chat_id, message or "")
     except Exception as e:
         return _error(f"QQBot send failed: {e}")
 

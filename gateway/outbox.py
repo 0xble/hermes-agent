@@ -117,6 +117,9 @@ def active_turn():
 
 
 def transport_id(event) -> str | None:
+    admission_id = getattr(event, "_outbox_admission_id", None)
+    if admission_id is not None:
+        return str(admission_id)
     update_id = getattr(event, "platform_update_id", None)
     if update_id is not None:
         return f"update:{update_id}"
@@ -580,6 +583,25 @@ def _retention_days(home: Path) -> int:
     except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
         logger.warning("Invalid outbox retention for %s; using %s days: %s", home, default, exc)
         return default
+
+
+async def recover_gateway_destinations(runner) -> None:
+    """Replay each served home's durable outbox through its Telegram adapter (at boot, and on a
+    promoted zero-cut standby once its predecessor has exited and can no longer be mid-send)."""
+    from gateway.config import Platform
+    from gateway.run import _multiplex_profile_homes
+    from hermes_constants import get_hermes_home
+
+    destinations = [(get_hermes_home(), runner.adapters.get(Platform.TELEGRAM))]
+    for profile_name, profile_home in _multiplex_profile_homes(runner.config):
+        if profile_name != "default":
+            adapters = (getattr(runner, "_profile_adapters", None) or {}).get(profile_name, {})
+            destinations.append((Path(profile_home), adapters.get(Platform.TELEGRAM)))
+    for home, adapter in destinations:
+        if adapter is not None:
+            sent, held = await recover(await open_outbox(home), adapter)
+            if sent or held:
+                logger.info("Gateway outbox recovery for %s: sent=%s held=%s", home, sent, held)
 
 
 async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[int, int]:

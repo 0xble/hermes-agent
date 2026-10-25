@@ -22,7 +22,10 @@ visible blank row. Headings, lists, blockquotes, fenced code, tables,
 `<details>`, and display math keep their raw boundaries. The normalized payload,
 not the source, is counted against the rich character limit. Runs of three or
 more newlines collapse to the same single spacer, and normalization is
-idempotent.
+idempotent. A pipe table also gets a blank line, not a hard break, on any side
+where a single newline separates it from other content: Telegram cannot open a
+table inside a caption's open paragraph, and GFM continues a table through prose
+directly below it as one more row.
 
 Rich Message prose treats a pair of literal `$` on one line as inline LaTeX, so
 two currency amounts in a sentence render as an unwrapped italic formula with
@@ -70,17 +73,77 @@ adjacent references, which joins the same run as "2,3" with each number still
 tappable, and puts an empty `<!-- -->` line before definitions that follow a
 list, which ends the list without rendering a block. `markdown-it-py` (already a
 dependency) finds both: block tokens locate code and lists, and a custom inline
-rule marks only references it reaches as prose, so code, TeX math, link
-destinations, autolinks, inline HTML and escapes stay literal. It runs on send, finalized edit,
+rule marks only references it reaches as prose, so code, TeX math (including
+closed single-dollar `$…$`, recognized with the same currency guard as the
+adapter), link destinations, autolinks, inline HTML and the contents of literal
+inline HTML containers (`<code>`, `<kbd>`, `<samp>`, `<pre>`) and escapes stay
+literal. It runs on send, finalized edit,
 and draft, and is idempotent. Verified against live `sendRichMessage` output on
 2026-09-30.
 
+## Standalone CLI and cron delivery
+
+Fork patch identity: `telegram-standalone-rich`.
+
+Based on fork `main` `487aa7910ec01764310411ca0fb3d6feeac35375`.
+
+`hermes send` and `send_message`'s standalone Telegram route receive the resolved
+platform's `extra.rich_messages` and `allow_cjk_rich_messages`. Text without
+media or `copy_block` uses the adapter's `_should_attempt_rich` policy, raw-Markdown
+`_rich_payload_base`, and shared `rich_delivery.py` shaping/classification. Thus
+`always` sends every safe eligible message; `auto` selects tables, tasks,
+`<details>`, or display math, not ordinary headings or prose. Raw and normalized
+payload limits, Desktop guards, General-topic mapping, and link-preview settings
+remain unchanged. Oversized messages, media, and paste-ready copy blocks stay on
+their previous legacy paths.
+
+A permanent/capability refusal falls back to MarkdownV2. A transient or unknown
+failure returns an error without legacy-resending, because acceptance is
+ambiguous. Thread-not-found retries rich once without `message_thread_id`; any
+subsequent legacy fallback also keeps that stale routing removed. The sender
+preserves the existing success/error receipt shape and chat-id spelling.
+
+`MeteredBot` unwraps the raw endpoint and `api_kwargs` before passing a
+`do_api_request` through the existing chat budget. Rich attempts, stale-thread
+retries, and MarkdownV2 fallback all spend the same slots (45/min private,
+15/min group per process, including other metered traffic). There is no new
+limiter or producer cadence; the only retry addition is a single bounded inline
+retry after a short `RetryAfter`. Durable penalty deadlines remain shared across
+processes; the slot clock itself remains process-local, an existing limitation.
+A usual brief now spends one rich request instead of multiple chunk requests.
+Flood refusals spend no fallback request.
+
+**Verification:** `tests/tools/test_send_message_tool.py::TestStandaloneTelegramRichMessages`
+drives the resolved-config dispatcher and standalone Bot API boundary with
+mocked bots only. It covers all three modes, permanent versus ambiguous errors,
+length and Desktop guards, topic routing, preview policy, media and copy blocks.
+`test_standalone_rich_send_spends_chat_budget_and_honors_flood_penalty` in
+`tests/gateway/test_telegram_chat_outbound_budget.py` drives a real `MeteredBot`
+with mocked Telegram I/O for both private and group IDs. The dispatcher rich
+regression fails on the base (a legacy receipt instead of a rich receipt).
+
+**Upstream design preflight:** inspected upstream `main`
+`4e745c539893422cc5509b167350049702e948ee`, its guidance, sender, and rich
+adapter. Related [upstream PR 45327](https://github.com/NousResearch/hermes-agent/pull/45327)
+is open and only preserves table source during legacy formatting; closed
+duplicate [45387](https://github.com/NousResearch/hermes-agent/pull/45387)
+uses the same approach. Neither calls `sendRichMessage` in the standalone lane,
+so neither satisfies this delivery contract. The selected correction reuses the
+native policy and payload, not a new flag or renderer. No new upstream PR was
+opened; this is an upstreamable, fork-first consumer fix.
+
+**Retirement:** remove the adaptation when a released upstream standalone sender
+passes the same mode, routing, no-duplicate, and budget regressions.
+**Rollback:** revert this patch; no config or data migration is required.
+
 ## Provenance and adoption
 
-Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
+Fork patch identities: `telegram-rendering`, `telegram-rich-modes`,
+  `telegram-paragraph-spacing`,
   `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`,
   `telegram-ordered-list-separation`, `telegram-footnote-refs`,
-  `telegram-progress-literal`.
+  `telegram-progress-literal`, `telegram-table-boundaries`,
+  `telegram-chunk-indicator-budget`.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
@@ -126,6 +189,16 @@ touches the same function but only stops hard-break markers next to block lines.
 The paragraph still absorbs a list not starting at 1, so it does not replace
 this patch.
 
+Table boundaries: ported from open [upstream PR 102929](https://github.com/NousResearch/hermes-agent/pull/102929)
+by i-Hun, head `89a57e4f8a11ec7a623b15eb8b19b722fed3d69f`, adopted 2026-10-11
+with authorship kept. The fork's `_rich_normalize_linebreaks` had diverged
+(paragraph materialization, ordered-list separation), so the boundary promotion
+was re-applied to the fork's region loop; the PR's regression file is carried
+unchanged. Prose under a table joining it as a row was reproduced locally with
+markdown-it; the caption-above-table failure rests on the PR's
+`sendRichMessage` echo evidence and was not reproduced locally. Retire when a
+released upstream version carries equivalent behavior and regressions.
+
 Telegram unsupported link targets: adopted from the archived fork's HERMES-065
 implementation (commits `8c4f3b73129d` and `326aed0f3d21`, scoped citation brackets)
 and its focused regressions. The behavior corresponds to upstream issue #97497 and
@@ -145,7 +218,8 @@ is not proof that the configured behavior survives an update.
 `555ccdf1052d644bc1f44b3957e36fe77a813919`. Not upstreamed.
 
 **Behavior:** Tool-progress lines name MCP and connector tools by their friendly
-label (`🔌 Paper · get guide`, from `tools.tool_labels.label_for_tool_name`) and
+label (`🔌 paper · get_guide`, from `tools.tool_labels.label_for_tool_name`,
+with the app lowercased to match the raw built-in tool names beside it) and
 show every interpolated tool label, argument preview, and verbose args dump
 verbatim on Telegram. Terminal commands keep their fenced blocks. A compact
 preview that is an http(s) URL stays plain text so auto-linking keeps it
@@ -166,7 +240,10 @@ tappable, and Discord/Slack keep their own `format_tool_preview` overrides.
   `_progress_code_span` (CommonMark code span whose backtick run is longer than
   any run inside, space-padded when the text starts or ends with a backtick).
   `format_message` converts multi-backtick spans to MarkdownV2 single-backtick
-  code with `` ` `` and `\` escaped, and its bracket safety net skips escaped
+  code with `` ` `` and `\` escaped. The inline and fenced passes share
+  `_MDV2_FENCE_RE` (the v0.21.6 fence matcher), preserving every backtick inside
+  list-nested and lead-in-prose fences and closing only on an own-line fence.
+  Its bracket safety net skips escaped
   backticks inside a span. `_RICH_PROTECTED_REGION_RE` opens a fence only at
   line start with a backtick-free info string, so an inline triple-backtick
   span no longer swallows the lines up to a later terminal fence.
@@ -215,7 +292,7 @@ with other work, remove `format_progress_literal` and `_BARE_HTTP_URL_RE` from
 `get_tool_emoji` and raw `tool_name`/preview/args in `_progress_build_message`,
 delete `progress_tool_label`, and in the Telegram adapter delete
 `format_progress_literal`, `_progress_code_span`, `_MULTI_TICK_CODE_SPAN_RE`,
-`_LINE_START_FENCE_RE`, `_BACKTICK_RUN_RE`, the step-1a block in
+`_BACKTICK_RUN_RE`, the step-1a block in
 `format_message`, the bracket-split regex change, and the line-start fence
 anchor in `_RICH_PROTECTED_REGION_RE`. Delete the focused test file. No state,
 schema, or configuration migration.
@@ -298,6 +375,38 @@ the first definition after a list: resend the probes from the footnote
 regressions through raw `sendRichMessage` without `normalize_footnotes` and
 check the returned blocks. Rollback removes that function and its call in
 `_rich_message_payload`.
+
+Long split replies derive their indicator reserve from the source codepoint
+length: every iteration consumes at least one codepoint, so neither the chunk
+index nor total can exceed that bound. The shared splitter measures its raw
+suffix through the caller's length function. Telegram explicitly supplies
+`indicator_overhead=3` for both MarkdownV2 parenthesis escapes and a conservative
+fence-separation newline, including standalone MarkdownV2 sends. HTML sends and
+other platforms retain the neutral default of zero. The final-chunk budget
+reserves fence closure only for a reopened fence that remains open, not plain
+text. Tiny limits retain monotonic progress even when a single codepoint or the
+required wrappers cannot fit.
+
+Upstream PR #126100 supplies the static three-digit fix (12 units), not this
+arbitrary-width protection: four-digit counts still reached 4,097–4,098 UTF-16
+units on that candidate. The dynamic bound is fork-owned under the existing
+`telegram-chunk-indicator-budget` identity until an upstream equivalent covers
+the full behavior. `tests/gateway/test_telegram_chunk_indicator_budget.py` checks
+actual mocked outbound payloads at 99/100, 999/1000, and higher counts, including
+astral characters, exact indices/totals, and balanced fences. Its cheap helper
+cases opt into Telegram's adapter overhead and cover arbitrary budgets/count
+widths and final reopened-fence closure. Slack's full send path keeps 77,965 and
+77,968 characters in 2 complete posts, and Discord's 15,850-character send fits
+its 8-message cap without substituting a truncation notice. These boundaries
+also protect against reserving an unnecessary final closing fence.
+
+The transport-isolation repair changes no producer, limiter, concurrency, or
+Telegram chunk boundary. Slack posts decrease from 3 to 2 at the regression
+boundary. Discord needs 8 rather than 9 pre-cap chunks, delivering 8 either way.
+No conversation's request rate or duration allowance increases.
+
+Retire only when a released upstream splitter passes these regressions unchanged;
+an open PR or static reserve increase alone does not qualify.
 
 To disable rich rendering, use the supported config command to set this mode to
 `never` and restart the gateway. Before rolling back to a boolean-only release,

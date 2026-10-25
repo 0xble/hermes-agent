@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 if TYPE_CHECKING:
-    from cron.scheduler import _CancelEventLike
+    from cron.scheduler_cancel import _CancelEventLike
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
@@ -444,6 +444,7 @@ def _script_argv(
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    cron_job_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -464,7 +465,7 @@ def _run_job_script(
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
             return False, err
-        from tools.environments.local import build_subprocess_env
+        from tools.environments.local import build_subprocess_env, strip_session_context_env
         # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
         # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
         # ``errors=`` must not stay 'strict': one stray non-UTF-8 byte in the script's stdout
@@ -492,6 +493,17 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        strip_session_context_env(env)
+        if cron_job_id:
+            env["HERMES_SESSION_ID"] = f"cron_{cron_job_id}"
+            # The known job is cron even on no_agent's early path, before
+            # _CronRunScope binds the marker in the caller's ContextVars.
+            env["HERMES_CRON_SESSION"] = "1"
+            try:
+                from hermes_cli.profiles import current_profile_name
+                env["HERMES_SESSION_PROFILE"] = current_profile_name("default") or "default"
+            except Exception:
+                env["HERMES_SESSION_PROFILE"] = "default"
         # The worker's exact execution marker is an ownership fence for
         # double-forked descendants that escape the original process tree.
         if os.environ.get("_HERMES_CRON_EXTERNAL_WORKER"):
@@ -578,7 +590,7 @@ def _run_job_script_with_claim_heartbeat(
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"), cron_job_id=str(job.get("id") or ""))
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")
@@ -614,4 +626,4 @@ def _run_job_script_with_claim_heartbeat(
 
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully
 # populated before ``scheduler`` re-exports from it.
-from cron import scheduler as _sched  # noqa: E402
+from cron import scheduler as _sched

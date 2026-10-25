@@ -61,9 +61,9 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     try:
         from tools.env_passthrough import is_env_passthrough, resolve_passthrough_value, scoped_passthrough_additions
     except Exception:
-        is_env_passthrough = lambda _: False  # noqa: E731
-        resolve_passthrough_value = lambda _name, _fallback: None  # noqa: E731
-        scoped_passthrough_additions = lambda _present: {}  # noqa: E731
+        is_env_passthrough = lambda _: False
+        resolve_passthrough_value = lambda _name, _fallback: None
+        scoped_passthrough_additions = lambda _present: {}
     if is_passthrough is None:
         is_passthrough = is_env_passthrough
     if is_windows is None:
@@ -101,20 +101,24 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     # a process boundary: strip dispatcher-owned Kanban vars AFTER the scrub so an explicit
     # passthrough cannot re-grant a delegated child the parent's board mutation capability.
     from agent.delegation_context import (
-        DELEGATED_CHILD_ENV_MARKER, delegated_child_subprocess_env,
+        DELEGATED_CHILD_ENV_MARKER, DELEGATED_PARENT_SESSION_ENV, delegated_child_subprocess_env,
     )
+    from agent.relay_guard import RELAY_PARENT_ADDRESS_ENV
     scoped = delegated_child_subprocess_env(source_env)
     # Preserve location only when carrying the descendant fence, not for arbitrary
     # non-allowlisted HERMES_* values in otherwise ordinary execution environments.
     if scoped.get(DELEGATED_CHILD_ENV_MARKER):
-        for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        # The parent identity rides with the fence so the sandbox's own `relay send`
+        # to its parent is refused by relay (relay C27).
+        for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+                    DELEGATED_PARENT_SESSION_ENV, RELAY_PARENT_ADDRESS_ENV):
             if key in scoped:
                 scrubbed[key] = scoped[key]
     return delegated_child_subprocess_env(scrubbed)
 
 
 def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
-                     child_python: str) -> Dict[str, str]:
+                     child_python: str) -> dict[str, str]:
     """Build the scrubbed child environment both execution paths share."""
     from hermes_constants import apply_scratch_tmp_env, apply_subprocess_home_env, get_hermes_home_override
     child_env = _scrub_child_env(os.environ)
@@ -211,6 +215,7 @@ def _probe_python(python_path: str, code: str, *, text: bool = False):
             [python_path, "-c", code], timeout=5, capture_output=True, text=text,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
             stdin=subprocess.DEVNULL, env=delegated_child_subprocess_env(),
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
         return None

@@ -22,7 +22,7 @@ from tools.registry import tool_error
 logger = logging.getLogger("tools.code_execution_tool")
 
 # Terminal parameters that must not be used from ephemeral sandbox scripts.
-_TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release"}
+_TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release", "survive_restart"}
 
 
 def nested_tool_call_id(task_id) -> str:
@@ -98,6 +98,15 @@ def _rpc_token_ok(request: dict, rpc_token: str) -> bool:
     )
 
 
+def _dispatch_sandbox_read(dispatch, tool_name: str, tool_args: dict):
+    """Dispatch nested tools with a real read for sandbox read_file calls."""
+    if tool_name != "read_file":
+        return dispatch(tool_name, tool_args)
+    from tools.file_tools import sandbox_read_context
+    with sandbox_read_context():
+        return dispatch(tool_name, tool_args)
+
+
 def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_counter: list,
                         max_tool_calls: int, dispatch, tool_call_log: list, call_start: float,
                         where: str) -> str:
@@ -117,7 +126,7 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
     # Silence handler status prints so they don't leak into the CLI spinner.
     try:
         with thread_scoped_silence():
-            result = dispatch(tool_name, tool_args)
+            result = _dispatch_sandbox_read(dispatch, tool_name, tool_args)
     except Exception as exc:
         logger.error("Tool call failed in %s: %s", where, exc, exc_info=True)
         result = tool_error(str(exc))
@@ -167,7 +176,7 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
             try:
                 conn, _ = server_sock.accept()
                 break
-            except socket.timeout:
+            except TimeoutError:
                 continue
         if conn is None:
             return
@@ -176,7 +185,7 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
         while True:
             try:
                 chunk = conn.recv(65536)
-            except socket.timeout:
+            except TimeoutError:
                 break
             if not chunk:
                 break
@@ -198,7 +207,7 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
                         call_start=call_start, where="sandbox",
                     ) if _rpc_token_ok(request, rpc_token) else tool_error("Unauthorized RPC request")
                 conn.sendall((resp + "\n").encode())
-    except socket.timeout:
+    except TimeoutError:
         logger.debug("RPC listener socket timeout")
     except OSError as e:
         logger.debug("RPC listener socket error: %s", e, exc_info=True)

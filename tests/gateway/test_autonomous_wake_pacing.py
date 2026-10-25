@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, build_session_key
 from hermes_cli import goals
@@ -104,9 +104,20 @@ def _goal_runner():
     return runner, adapter, entry, src
 
 
-def _turn_event(src, text, *, internal, origin=None):
+def _turn_event(src, text, *, internal, origin=None, loop_wake=False, terminal_identity=None, goal_instance=None):
     metadata = {"notification_origin": origin} if origin else {}
-    return MessageEvent(text=text, message_type=MessageType.TEXT, source=src, internal=internal, metadata=metadata)
+    if loop_wake:
+        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+        metadata[LOOP_WAKE_METADATA_KEY] = True
+    if goals.is_goal_continuation_text(text):
+        # The gateway marks the continuations it enqueues; classification reads that provenance.
+        metadata[GOAL_CONTINUATION_METADATA_KEY] = True
+        if goal_instance is not None:
+            metadata["goal_continuation_instance"] = goal_instance
+    event = MessageEvent(text=text, message_type=MessageType.TEXT, source=src, internal=internal, metadata=metadata)
+    if terminal_identity is not None:
+        event._post_turn_goal_identity = terminal_identity
+    return event
 
 
 def _queued_continuations(adapter) -> int:
@@ -125,8 +136,8 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
     runner, adapter, entry, src = _goal_runner()
     clock = [10_000.0]
     monkeypatch.setattr(goals.time, "time", lambda: clock[0])
-    # Each turn here does real work; the no-progress backoff (#302) has its own coverage.
-    monkeypatch.setattr(goals, "_evidence_only_read_only_status", lambda evidence: False)
+    # No turn here leaves non-read-only tool evidence, so every automatic CONTINUE parks on the
+    # quiet no-progress ladder; user turns and delivered results pierce it.
     mgr = goals.GoalManager(entry.session_id)
     mgr.set("ship the release")
     continuation = mgr.next_continuation_prompt()
@@ -137,15 +148,15 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
         assert _queued_continuations(adapter) == 1
         adapter._pending_messages.clear()
 
-        # The continuation turn itself is autonomous → held, silently, for the gap.
+        # The continuation turn itself is autonomous with no progress → held, silently, on the ladder.
         clock[0] += 20
         await _after_turn(runner, src, continuation, internal=False)
         assert _queued_continuations(adapter) == 0
-        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(10_000.0 + 900)
+        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 900)
 
-        # A /loop tick (internal, no completion origin) is paced too.
+        # A /loop tick (gateway-stamped loop wake, no completion origin) is paced too.
         clock[0] += 20
-        await _after_turn(runner, src, "loop tick", internal=True)
+        await _after_turn(runner, src, "loop tick", internal=True, loop_wake=True)
         assert _queued_continuations(adapter) == 0
 
         # A completion result injected by the process path is fresh evidence: continue now.
@@ -155,14 +166,18 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
         assert goals.load_goal(entry.session_id).waiting_until == 0
         adapter._pending_messages.clear()
 
-        # Paced again after that continuation...
+        # Paced again after that continuation (the result reset the ladder to its first rung)...
         clock[0] += 20
         await _after_turn(runner, src, continuation, internal=False)
         assert _queued_continuations(adapter) == 0
+        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 900)
         # ...but a completion drained behind a continuation head (the follow-up chain copies its
         # origin onto the head event, which is not internal) still counts as fresh evidence.
         clock[0] += 20
-        await _after_turn(runner, src, continuation, internal=False, origin="process_registry_synthetic")
+        await _after_turn(
+            runner, src, continuation, internal=False, origin="process_registry_synthetic",
+            terminal_identity={"user_turn": False, "goal_instance": None, "loop_tick": None},
+        )
         assert _queued_continuations(adapter) == 1
 
     # Nothing about the routine pacing hold reached the chat; only the first continue notice.
@@ -171,8 +186,141 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
 
 
 @pytest.mark.asyncio
-async def test_idle_ticker_releases_gap_hold_once_and_silently(hermes_home, monkeypatch):
+async def test_successive_automatic_continuations_obey_hard_gap_floor(hermes_home, monkeypatch):
+    """A new result must not turn the goal into a sub-minute automatic poller."""
     runner, adapter, entry, src = _goal_runner()
+    clock = [30_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = goals.GoalManager(entry.session_id)
+    mgr.set("ship the release")
+    continuation = mgr.next_continuation_prompt()
+    progress = iter(["evidence-1", "evidence-2"])
+
+    with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)), \
+            patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", side_effect=lambda _e: next(progress)):
+        await _after_turn(runner, src, "please ship it", internal=False)
+        adapter._pending_messages.clear()
+
+        # The user turn admitted the first automatic continuation at t=30_000. A fresh-but-routine
+        # automatic result 20s later must be held for the remaining floor.
+        clock[0] += 20
+        await _after_turn(runner, src, continuation, internal=False)
+        assert _queued_continuations(adapter) == 0
+        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 880)
+
+
+@pytest.mark.asyncio
+async def test_event_woken_continuation_does_not_reclassify_chain_tail_as_new_event(hermes_home, monkeypatch):
+    """The event that pierced a wait may anchor one immediate continuation only."""
+    runner, adapter, entry, src = _goal_runner()
+    clock = [35_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = goals.GoalManager(entry.session_id, min_continuation_gap_seconds=900)
+    mgr.set("ship the release")
+    continuation = mgr.next_continuation_prompt()
+
+    with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)), \
+            patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", return_value="new-evidence"):
+        await _after_turn(runner, src, "please ship it", internal=False)
+        adapter._pending_messages.clear()
+
+        # A real event may pierce the floor and dispatch exactly one immediate continuation.
+        clock[0] += 20
+        await _after_turn(
+            runner, src, "[delegation done]", internal=True, origin="delegation_result",
+        )
+        assert _queued_continuations(adapter) == 1
+        adapter._pending_messages.clear()
+
+        # A continuation-chain tail may still carry the event origin on its head metadata, but it
+        # did not receive a new event. It must wait for the remaining floor.
+        clock[0] += 20
+        await _after_turn(
+            runner, src, continuation, internal=False, origin="delegation_result",
+            goal_instance=mgr.state.created_at,
+        )
+        assert _queued_continuations(adapter) == 0
+        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 900)
+
+
+@pytest.mark.asyncio
+async def test_timed_wait_lift_after_external_event_still_obeys_gap_floor(hermes_home, monkeypatch):
+    """A short judge timer from an external wake cannot bypass the automatic floor."""
+    runner, adapter, entry, src = _goal_runner()
+    clock = [40_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = goals.GoalManager(entry.session_id, min_continuation_gap_seconds=900)
+    mgr.set("ship the release")
+
+    with patch.object(
+        goals, "judge_goal",
+        side_effect=[
+            ("continue", "more work", False, None, False),
+            ("wait", "cooldown", False, {"seconds": 60}, False),
+        ],
+    ), patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", side_effect=["evidence-1", "evidence-2"]):
+        # The first user turn anchors the automatic chain immediately.
+        await _after_turn(runner, src, "please ship it", internal=False)
+        adapter._pending_messages.clear()
+
+        # An external wake is allowed to judge immediately, and its short timer is accepted as
+        # requested. The timer's later idle-watcher lift must still wait for the floor.
+        clock[0] += 20
+        await _after_turn(
+            runner, src, "[proc done]", internal=True,
+            origin="process_registry_synthetic",
+        )
+        assert _queued_continuations(adapter) == 0
+        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 60)
+
+        clock[0] += 60
+        await runner._goal_wakeup_fire_one(entry.session_id)
+
+    assert adapter.handled == []
+    state = goals.load_goal(entry.session_id)
+    assert state.waiting_until == pytest.approx(40_080.0)
+
+
+@pytest.mark.asyncio
+async def test_process_exit_lift_pierces_gap_floor(hermes_home, monkeypatch):
+    """A completed process is a real event wake and dispatches without waiting for the floor."""
+    runner, adapter, entry, src = _goal_runner()
+    clock = [50_000.0]
+    process_alive = [True]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    monkeypatch.setattr(goals, "_pid_alive", lambda _pid: process_alive[0])
+    mgr = goals.GoalManager(entry.session_id, min_continuation_gap_seconds=900)
+    mgr.set("ship the release")
+
+    with patch.object(
+        goals, "judge_goal",
+        side_effect=[
+            ("continue", "more work", False, None, False),
+            ("wait", "job", False, {"pid": 4242}, False),
+        ],
+    ), patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", side_effect=["evidence-1", "evidence-2"]):
+        await _after_turn(runner, src, "please ship it", internal=False)
+        adapter._pending_messages.clear()
+
+        clock[0] += 20
+        await _after_turn(
+            runner, src, "job started", internal=True,
+            origin="process_registry_synthetic",
+        )
+        process_alive[0] = False
+        await runner._goal_wakeup_fire_one(entry.session_id)
+
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].text.startswith("[Continuing toward your standing goal]")
+
+
+@pytest.mark.asyncio
+async def test_idle_ticker_releases_ladder_hold_once_and_silently(hermes_home, monkeypatch):
+    runner, adapter, entry, _src = _goal_runner()
     clock = [20_000.0]
     monkeypatch.setattr(goals.time, "time", lambda: clock[0])
     mgr = goals.GoalManager(entry.session_id, min_continuation_gap_seconds=900)
@@ -183,13 +331,14 @@ async def test_idle_ticker_releases_gap_hold_once_and_silently(hermes_home, monk
         mgr.evaluate_after_turn("second", user_initiated=False)
 
     await runner._goal_wakeup_fire_one(entry.session_id)
-    assert adapter.handled == []  # still inside the gap
+    assert adapter.handled == []  # still inside the first 900s ladder rung
 
-    clock[0] = 20_000.0 + 901
+    clock[0] = 20_030.0 + 901  # past the 900s rung parked by the automatic turn at 20_030
     await runner._goal_wakeup_fire_one(entry.session_id)
     assert len(adapter.handled) == 1 and adapter.handled[0].text.startswith("[Continuing toward your standing goal]")
     state = goals.load_goal(entry.session_id)
-    assert state.waiting_until == 0 and state.last_continuation_at == pytest.approx(clock[0])
+    assert state.status == "active" and state.waiting_until == 0
+    assert state.last_automatic_continuation_at == pytest.approx(clock[0])
     assert adapter.sends == []  # no "wait ended" notice for routine pacing
 
     await runner._goal_wakeup_fire_one(entry.session_id)
@@ -232,6 +381,9 @@ def _fan_in_runner(*, window=300.0, last_turn_age=10.0):
     runner._completion_delivery_retention = 2048
     runner._background_tasks = set()
     runner._completion_notification_batch_window = window
+    # Production __init__ creates the batch maps. The watcher creates them lazily only after
+    # sending the receipt, so a test reading them right after the receipt would race on a slow runner.
+    runner._ensure_completion_batch_state()
     runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value={"ended_at": None}))
     if last_turn_age is not None:
         runner._session_state(ROUTE["session_key"]).conversation.last_turn_started_at = time.time() - last_turn_age

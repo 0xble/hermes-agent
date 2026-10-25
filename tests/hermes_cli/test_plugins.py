@@ -135,7 +135,7 @@ class TestPluginDiscovery:
             "_collect_directory_manifests",
             lambda: [manifest],
         )
-        monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+        monkeypatch.setattr(manager, "_scan_entry_points", list)
         monkeypatch.setattr(
             plugins_mod,
             "_get_enabled_plugins",
@@ -481,7 +481,7 @@ class TestPluginDiscovery:
         assert len(register_calls) == 1
         assert entry.module is fake_module
 
-    def test_force_rediscover_clears_all_plugin_registries(self, monkeypatch):
+    def test_force_rediscover_clears_all_plugin_registries(self, monkeypatch, completed_plugin_registry):
         """force=True must clear every plugin-populated registry.
 
         Regression: ``_plugin_platform_names`` was populated by
@@ -507,7 +507,7 @@ class TestPluginDiscovery:
         mgr._plugin_skills["p:skill"] = {}
         mgr._aux_tasks["task"] = {"plugin": "p"}
         mgr._slack_action_handlers.append(("aid", lambda **_: None, "p"))
-        mgr._discovered = True
+        completed_plugin_registry(mgr)
 
         monkeypatch.setattr(PluginManager, "_discover_and_load_inner", lambda self_inner: None)
         mgr.discover_and_load(force=True)
@@ -1133,7 +1133,7 @@ class TestForceReloadSymmetry:
         mgr.discover_and_load(force=True)
         assert mgr._discovered is True
 
-    def test_unload_all_sweeps_preledger_tool_names(self, monkeypatch):
+    def test_unload_all_sweeps_preledger_tool_names(self, monkeypatch, completed_plugin_registry):
         """Tool names without ledger entries are deregistered globally (#60050)."""
         deregistered = []
         import tools.registry as tools_registry_mod
@@ -1147,7 +1147,7 @@ class TestForceReloadSymmetry:
         mgr = PluginManager()
         # Pre-ledger state: name tracked manager-locally, no ledger handle.
         mgr._plugin_tool_names.add("zombie_tool")
-        mgr._discovered = True
+        completed_plugin_registry(mgr)
 
         mgr.unload()
         assert deregistered == ["zombie_tool"]
@@ -1511,7 +1511,6 @@ class TestForceReloadSymmetry:
             starts.append(1)
             if len(starts) == 1:
                 hold.wait(timeout=10.0)  # the first fire hangs for good
-            return None  # later fires decide: allow
 
         mgr = PluginManager()
         mgr._hook_timeout_suppression_seconds = 0.2
@@ -1579,7 +1578,6 @@ class TestForceReloadSymmetry:
 
         def hung_policy(**_kwargs):
             hold.wait(timeout=10.0)
-            return None
 
         mgr = PluginManager()
         mgr._hooks["pre_tool_call"] = [hung_policy]
@@ -1614,7 +1612,6 @@ class TestForceReloadSymmetry:
 
         def policy(**_kwargs):
             calls.append(1)
-            return None
 
         real_start = threading.Thread.start
         attempts = 0
@@ -1651,7 +1648,6 @@ class TestForceReloadSymmetry:
 
         def hung_policy(**_kwargs):
             hold.wait(timeout=10.0)
-            return None
 
         mgr = PluginManager()
         mgr._hooks["pre_tool_call"] = [hung_policy]
@@ -1942,7 +1938,7 @@ class TestPreToolCallModify:
                 {"action": "modify", "args": {"path": "/second"}},
             ],
         )
-        block_msg, modified = _dispatch_pre_tool_call_hooks(
+        _block_msg, modified = _dispatch_pre_tool_call_hooks(
             "write_file", {"path": "/original"}
         )
         assert modified == {"path": "/second"}
@@ -2011,7 +2007,7 @@ class TestPreToolCallModify:
                 {"action": "modify", "args": {"path": "/real"}},
             ],
         )
-        block_msg, modified = _dispatch_pre_tool_call_hooks(
+        _block_msg, modified = _dispatch_pre_tool_call_hooks(
             "write_file", {"path": "/original"}
         )
         assert modified == {"path": "/real"}

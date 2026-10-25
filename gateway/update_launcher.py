@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from uuid import uuid4
@@ -204,16 +205,27 @@ def make_agent_update_handler(
             return {"accepted": False, "error": str(exc)}
         if not hermes_cmd:
             return {"accepted": False, "error": "update requires a git checkout"}
+        profile_home = None
+        if "profile" in payload:
+            profile = payload["profile"]
+            served = getattr(runner, "_served_profile_homes", None) or {}
+            if not isinstance(profile, str) or profile not in served:
+                return {"accepted": False, "error": "profile is not served by this gateway"}
+            profile_home = served[profile]
+        from gateway.run import GatewayRunner, _profile_runtime_scope
         try:
-            db = runner._session_db._db
-            resolved = _route_from_session_lineage(db, session_id)
+            # Socket executor threads carry the owner's scope, not the requesting turn's.
+            scope = (_profile_runtime_scope(profile_home, hydrate_secrets=False)
+                     if profile_home is not None else contextlib.nullcontext())
+            with scope:
+                db = runner._session_db._db
+                resolved = _route_from_session_lineage(db, session_id)
         except Exception:
             resolved = None
         if resolved is None:
             return {"accepted": False, "error": "no deliverable messaging session route"}
         parent_session_id, route = resolved
         from gateway.config import Platform
-        from gateway.run import GatewayRunner
         platform = Platform(route["source"])
         if platform not in GatewayRunner._UPDATE_ALLOWED_PLATFORMS:
             from gateway.platform_registry import platform_registry
@@ -227,6 +239,8 @@ def make_agent_update_handler(
             "timestamp": datetime.now(timezone.utc).isoformat(), "reason": reason,
             "parent_session_id": parent_session_id, "parent_route": route,
         }
+        if profile_home is not None:
+            pending["profile"] = payload["profile"]
         try:
             result = launch_native_update(home=home, hermes_cmd=hermes_cmd, pending=pending, spawn=spawn)
         except Exception:

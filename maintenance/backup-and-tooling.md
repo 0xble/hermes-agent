@@ -35,7 +35,11 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   canonical row counts, metadata, and fork-only rows. Search changes from the upstream
   FTS v2-to-v3 migration require independent canonical-projection and rank-1 index
   integrity checks. Unexpected differences and query errors fail the rehearsal.
-  A successful open alone is insufficient.
+  A successful open alone is insufficient. Candidate homes must be fresh and resolve under
+  the temporary root or `$HERMES_HOME/cache/scratch`. When Hermes sets `TMPDIR` inside its
+  home, that resolved temporary subtree is allowed too. The live home, any ancestor, and
+  live-home descendants outside those scratch roots are refused before candidate startup.
+  Path resolution includes symlink aliases; an existing `state.db` is never unlinked.
 - `scripts/sync_fork_candidate.py` builds candidates only; `scripts/check_fork_patches.py`
   proves trailers, unit ownership, extension registration, config keys, and the native
   update receipt; with immutable releases, compare receipt and live gateway to the
@@ -67,7 +71,8 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `cron-profile-timezone-reanchor`,
   `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
   `full-zip-failure-accounting`, `config-backup-content`, `sqlite-backup-wal-snapshot`,
-  `sqlite-close-guard-upstream`,
+  `sqlite-close-guard-upstream`, `update-backup-outcome`,
+  `cron-restore-respects-deletes`,
   `evidence` (records, not patches), `candidate-tooling` (candidate sync/check scripts and
   their review fallback), `slice-14-request-update` (the parent-only native update request).
   `maintenance-contract` is owned by the root contract.
@@ -94,6 +99,14 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   failed backup. Only the `full` pre-update mode reaches it; `quick` (this install's
   setting) has its own message on the snapshot path. Retire it if the two stop sharing
   one cross-process slot, which is the fix the message exists to compensate for.
+- `update-backup-outcome`: `create_pre_update_backup(raise_errors=True)`, used only by
+  `_run_full_backup`, keeps `None` for "nothing to back up" and raises the held slot or the
+  archive failure, so the `HERMES-123` message and "Backup failed" are reachable and the
+  receipt records `pre_update_full_backup` as a step (created or failed) or a skip (empty
+  home). Other callers keep the swallowing default. Verify with
+  `scripts/run_tests.sh tests/hermes_cli/test_update_receipt_truthfulness.py -k FullBackup`.
+  Retire when upstream reports why there is no pre-update archive. Rollback restores the
+  generic "Backup skipped" for all three causes.
 - `sqlite-close-guard-upstream`: exact upstream commits `87bb0d3827a0` and
   `c451cd1bba80`, from merged
   [PR #121433](https://github.com/NousResearch/hermes-agent/pull/121433), preserve
@@ -176,6 +189,11 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   11-file home as a mass disappearance, which after (b) costs that install four of its five
   rollback points. A floor can only relax the verdict on churn, never on critical state, which
   `_is_critical_state` routes to `on_error` before the vanished branch is reached.
+  Criticality is relative to both the default home and each `profiles/<name>/` home.
+  A named-profile config/auth/cron or pairing file disappearing must not be
+  routine churn: it makes the archive incomplete and preserves prior complete ZIPs.
+  Nested plugin `.env` files remain churn. Proof: real scan-then-unlink cases in
+  `test_backup_all_profiles.py` cover manual, pre-update, and pre-migration retention.
   (e) `status=` and `coverage=` are separate fields on both log lines. One word carrying both
   facts made the log contradict the console twice, in opposite directions: first always
   `complete`, then `incomplete` while the console said complete on a vanished-only run.

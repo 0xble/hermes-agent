@@ -360,3 +360,52 @@ def test_lock_timeout_reader_is_fenced_from_install_gc(monkeypatch, tmp_path):
     activate_dependencies(checkout)
     assert not collector_done.is_set()
     assert state.is_dir()
+
+
+def test_limit_bounds_removals_per_pass(monkeypatch, tmp_path):
+    import time
+
+    home = _setup(monkeypatch, tmp_path)
+    states = []
+    for name in ("one", "two", "three"):
+        checkout = tmp_path / name
+        checkout.mkdir()
+        record_install_use(checkout)
+        state = home / "installs" / install_key(checkout)
+        _age(state / "install.json", time.time() - 8 * 24 * 60 * 60)
+        checkout.rmdir()
+        states.append(state)
+
+    first = collect_install_orphans(now=time.time(), limit=2)
+    second = collect_install_orphans(now=time.time(), limit=2)
+
+    assert len(first) == 2
+    assert sorted(first + second) == sorted(states)
+
+
+def test_interrupted_removal_is_finished_by_the_next_pass(monkeypatch, tmp_path):
+    import time
+
+    import pm.install_gc as install_gc
+
+    home = _setup(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    record_install_use(checkout)
+    state = home / "installs" / install_key(checkout)
+    generation = state / "environments" / "generation"
+    (generation / "venv").mkdir(parents=True)
+    (generation / ".lease-managed").touch()
+    _age(state / "install.json", time.time() - 8 * 24 * 60 * 60)
+    checkout.rmdir()
+    # The gateway exits between the condemning rename and the delete.
+    remove = install_gc._remove_condemned
+    monkeypatch.setattr(install_gc, "_remove_condemned", lambda path: False)
+
+    assert collect_install_orphans(now=time.time()) == [state]
+    assert not state.exists()
+    (leftover,) = (home / "installs").glob(".gc-*")
+
+    monkeypatch.setattr(install_gc, "_remove_condemned", remove)
+    assert collect_install_orphans(now=time.time()) == [leftover]
+    assert not leftover.exists()

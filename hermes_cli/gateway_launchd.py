@@ -21,6 +21,10 @@ from gateway.restart import LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S
 # Minimum seconds launchd waits between KeepAlive relaunches; written into the generated plist.
 LAUNCHD_THROTTLE_INTERVAL_S = 30
 
+from datetime import UTC
+
+from hermes_cli import gateway_service_owner
+
 
 def _gw():
     from hermes_cli import gateway  # late: the facade imports this module
@@ -31,6 +35,17 @@ def get_launchd_label() -> str:
     """Return the launchd service label, scoped per profile."""
     suffix = _gw()._profile_suffix()
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+
+
+def get_launchd_slot_labels() -> tuple[str, str]:
+    """Return the fixed active/standby launchd labels for the resolved Hermes home.
+
+    The first label reuses the existing per-home/per-profile convention; the
+    standby slot is its stable ``.b`` sibling. No generation is encoded in either
+    label, so launchd supervision remains stable across releases.
+    """
+    active = get_launchd_label()
+    return active, f"{active}.b"
 
 
 def _probe_launchd_domain_for_label(label: str, *, budget=None) -> str:
@@ -53,7 +68,7 @@ def _probe_launchd_domain_for_label(label: str, *, budget=None) -> str:
     # Not loaded anywhere: Aqua → gui/<uid>; anything else (Background, loginwindow) → user/<uid>,
     # the pre-probing default and the recommended domain on macOS 26+.
     try:
-        result = subprocess.run(["launchctl", "managername"], timeout=budget(5), **_gw()._CAPTURE_TEXT)
+        result = subprocess.run(["launchctl", "managername"], timeout=budget(5), **_gw()._CAPTURE_TEXT, check=False)
         if "Aqua" in (result.stdout or ""):
             return gui_domain
     except launchctl_errors:
@@ -225,7 +240,7 @@ def _write_launchd_unsupported_marker() -> None:
     """Persist that launchd cannot supervise the gateway on this host."""
     from datetime import datetime, timezone
     payload = {
-        "written_at": datetime.now(timezone.utc).isoformat(),
+        "written_at": datetime.now(UTC).isoformat(),
         "reason": "launchd domain unsupported (exit 5/125)",
     }
     with contextlib.suppress(OSError):
@@ -389,11 +404,13 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
-def generate_launchd_plist(release_target: Path | None = None) -> str:
+def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a") -> str:
     """Render a candidate definition without moving ``current`` first.
 
     The release updater must persist these exact bytes in its write-ahead record
     before changing pointers. Normal callers retain the existing service output.
+    ``slot="b"`` renders the zero-cut standby job: the ``.b`` label plus ``HERMES_GATEWAY_SLOT=b``;
+    the default active slot is byte-identical to the historical output.
     """
     from html import escape
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
@@ -401,7 +418,8 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
     hermes_home = str(_gw().get_hermes_home().resolve())
     log_dir = _gw().get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    label = _gw().get_launchd_label()
+    label = get_launchd_slot_labels()[1] if slot == "b" else _gw().get_launchd_label()
+    slot_env = "\n        <key>HERMES_GATEWAY_SLOT</key>\n        <string>b</string>" if slot == "b" else ""
     # launchd's default PATH misses Homebrew, nvm, cargo…; prepend venv/bin + node dirs (as in the
     # systemd unit) so node stays resolvable even if the shell PATH changes, then the shell PATH.
     priority_dirs = _gw()._build_service_path_dirs()
@@ -466,7 +484,7 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
         <key>HERMES_SUPERVISED_CHILD</key>
-        <string>1</string>
+        <string>1</string>{slot_env}
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -474,6 +492,13 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
         <string>Aqua</string>
         <string>Background</string>
     </array>
+
+    <!-- Without a ProcessType, launchd starts the agent at UTILITY QoS, which
+         every child inherits: the gateway then loses CPU and I/O to any
+         terminal-launched test run (USER_INTERACTIVE) and its replies stall
+         under load. Interactive starts it at DEFAULT QoS, as apps run. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -540,8 +565,9 @@ def _spawn_deferred_launchd_reload(
     *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int
 ) -> bool:
     """Hand the bootout/bootstrap cycle to a transient ``launchctl submit`` job; True if spawned. The
-    helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then retries bootstrap
-    until ``launchctl list`` shows a positive PID or the drain budget elapses."""
+    helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then probes label
+    unload and retries every bootstrap failure with growing backoff until the separate reload
+    deadline. A successful bootstrap waits for a positive PID while the label remains registered."""
     reload_log_path = _launchd_reload_log_path()
     with contextlib.suppress(OSError):
         reload_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -555,7 +581,7 @@ def _spawn_deferred_launchd_reload(
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
     # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
     # definition, and a crashed job reports `"PID" = -1` (mirrors _parse_launchd_pid_from_list_output).
-    listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [0-9]+;'"
+    listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [1-9][0-9]*;'"
     # Unique per reload so concurrent/repeated reloads never collide.
     submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
     reload_script = (
@@ -566,14 +592,34 @@ def _spawn_deferred_launchd_reload(
         f"while kill -0 {gateway_pid} 2>/dev/null; do   if [ $(date +%s) -ge $_wait_deadline ]; then "
         f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_exit_budget}s drain wait — bootstrapping anyway\" >> {q_log}; "
         f"    break;   fi;   sleep 1; done; "
-        # Let launchd finish unregistering the label after the process exits.
-        f"sleep 1; _deadline=$(($(date +%s) + {_reload_budget})); while :; do "
-        f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
-        f"  if {listed}; then break; fi; "
-        f"  echo \"[{stamp}] bootstrap not yet registered for {q_target} — retrying\" >> {q_log}; "
-        f"  if [ $(date +%s) -ge $_deadline ]; then break; fi;   sleep 2; done; "
-        f"if ! {listed}; then "
-        f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — service NOT registered after {_reload_budget}s of retries\" >> {q_log}; "
+        # Probe unregister completion, rather than delaying every already-unloaded job.
+        # The probe is best-effort: it fails on macOS-26 per-user domains and degrades to this retry path.
+        # The shared reload deadline bounds every bootstrap failure. Backoff is in tenths so Bash needs no float math.
+        f"_deadline=$(($(date +%s) + {_reload_budget})); _unloaded=1; _supervised=0; "
+        f"_rc=not-attempted; _reason='label never unloaded'; "
+        f"while launchctl print {q_target} >/dev/null 2>&1; do "
+        f"  if [ $(date +%s) -ge $_deadline ]; then _unloaded=0; break; fi; sleep 0.2; done; "
+        f"if [ $_unloaded -eq 1 ]; then _backoff=2; "
+        f"  _reason='bootstrap failures exhausted reload budget'; "
+        f"  while :; do "
+        f"    launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; _rc=$?; "
+        f"    if [ $_rc -eq 0 ]; then _supervised=1; _reason='bootstrapped with no positive PID'; "
+        # Successful registration may not yet have a PID. Wait for supervision only while the label remains registered;
+        # macOS can report a successful bootstrap without registering the label at all.
+        f"      while :; do if {listed}; then break; fi; "
+        f"        if ! launchctl list {q_label} >/dev/null 2>&1; then "
+        f"          _supervised=0; _rc=not-registered; _reason='bootstrap returned 0 but label was not registered'; break; fi; "
+        f"        if [ $(date +%s) -ge $_deadline ]; then _supervised=0; break; fi; sleep 0.2; done; "
+        f"      if [ $_supervised -eq 1 ]; then break; fi; "
+        f"    fi; "
+        f"    _remaining=$((_deadline - $(date +%s))); if [ $_remaining -le 0 ]; then break; fi; "
+        f"    echo \"[{stamp}] bootstrap failure ($_rc) for {q_target} — retrying\" >> {q_log}; "
+        # Clip the growing delay to the remaining budget, then make one final attempt after that sleep.
+        f"    _delay=$_backoff; if [ $_delay -gt $((_remaining * 10)) ]; then _delay=$((_remaining * 10)); fi; "
+        f"    sleep $(printf '%d.%d' $((_delay / 10)) $((_delay % 10))); "
+        f"    _backoff=$((_backoff * 2)); if [ $_backoff -gt 20 ]; then _backoff=20; fi; done; fi; "
+        f"if [ $_supervised -eq 0 ]; then "
+        f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — $_reason (bootstrap rc=$_rc; reload budget {_reload_budget}s)\" >> {q_log}; "
         f"fi; "
         # Submitted jobs stay registered after the script exits; removing our own label ends the one-shot job.
         f"launchctl remove {shlex.quote(submit_label)} 2>/dev/null"
@@ -611,9 +657,13 @@ def refresh_launchd_plist_if_needed() -> bool | str:
     plist_path = _gw().get_launchd_plist_path()
     if not plist_path.exists() or _gw().launchd_plist_is_current():
         return False
+    # Runs on every gateway start/restart: a plist pinning another home is another install's gateway.
+    from hermes_cli.gateway_service_owner import definition_belongs_to_home
+    if not definition_belongs_to_home(plist_path, _gw().get_hermes_home(), "rewrite"):
+        return False
 
     new_plist = _gw().generate_launchd_plist()
-    if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
+    if gateway_service_owner.refuse_temp_home_service_write(new_plist, "launchd plist"):
         return False
 
     _gw()._prepare_service_launcher()
@@ -677,17 +727,21 @@ def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
     return True
 
 
-def launchd_install(force: bool = False, *, start_now: bool = True):
+def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_path: bool = False):
     if start_now:
         from hermes_cli.gateway_guardian import set_intent
         set_intent(_gw().get_hermes_home(), stopped=False)
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
+    # A plist pinning another home is another install's gateway, --force included; --force-unit-path repoints.
+    from hermes_cli.gateway_service_owner import definition_belongs_to_home
+    if not force_unit_path and not definition_belongs_to_home(plist_path, _gw().get_hermes_home(), "overwrite"):
+        sys.exit(1)
     # Loading the plist starts the gateway (RunAtLoad), so a no-start install writes it without
     # loading it. A gateway that launchd already runs is still reloaded; this install did not start it.
     load = start_now or _gw()._launchctl_label_supervising_process(label)
 
-    if plist_path.exists() and not force:
+    if plist_path.exists() and not (force or force_unit_path):
         if _gw().launchd_plist_is_current():
             print(f"Service already installed at: {plist_path}")
             print("Use --force to reinstall")
@@ -709,7 +763,7 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
 
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     new_plist = _gw().generate_launchd_plist()
-    if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
+    if gateway_service_owner.refuse_temp_home_service_write(new_plist, "launchd plist"):
         return
     print(f"Installing launchd service to: {plist_path}")
     _gw()._prepare_service_launcher()
@@ -768,7 +822,7 @@ def launchd_start():
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
         new_plist = _gw().generate_launchd_plist()
-        if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
+        if gateway_service_owner.refuse_temp_home_service_write(new_plist, "launchd plist"):
             sys.exit(1)
         print("↻ launchd plist missing; regenerating service definition")
         plist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1010,7 +1064,7 @@ def launchd_status(deep: bool = False):
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
     try:
-        result = subprocess.run(["launchctl", "list", label], timeout=10, **_gw()._CAPTURE_TEXT)
+        result = subprocess.run(["launchctl", "list", label], timeout=10, **_gw()._CAPTURE_TEXT, check=False)
         service_listed = result.returncode == 0
         list_output = result.stdout
     except subprocess.TimeoutExpired:
@@ -1068,4 +1122,25 @@ def launchd_status(deep: bool = False):
         if log_file.exists():
             print()
             print("Recent logs:")
-            subprocess.run(["tail", "-20", str(log_file)], timeout=10)
+            subprocess.run(["tail", "-20", str(log_file)], timeout=10, check=False)
+
+
+# Explicit-label primitives used by zero-cut handover. The command runner is
+# injectable so tests never execute launchctl.
+def _default_launchd_gui_domain() -> str:
+    uid = getattr(os, "getuid", None)
+    if uid is None:
+        raise RuntimeError("launchd is unavailable on this platform")
+    return f"gui/{uid()}"
+
+
+def bootstrap_launchd_label(label: str, plist_path: Path, *, domain: str | None = None, runner=None) -> None:
+    """Bootstrap exactly ``label`` from ``plist_path`` into one launchd domain."""
+    runner = runner or (lambda argv: subprocess.run(["launchctl", *argv], check=True, timeout=30))
+    runner(["bootstrap", domain or _default_launchd_gui_domain(), str(plist_path)])
+
+
+def bootout_launchd_label(label: str, *, domain: str | None = None, runner=None) -> None:
+    """Boot out exactly ``label`` from one launchd domain."""
+    runner = runner or (lambda argv: subprocess.run(["launchctl", *argv], check=True, timeout=30))
+    runner(["bootout", f"{domain or _default_launchd_gui_domain()}/{label}"])

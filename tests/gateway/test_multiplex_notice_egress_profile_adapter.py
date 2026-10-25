@@ -28,6 +28,7 @@ class _Adapter:
 
     async def handle_message(self, event):
         self.handled.append(event.text)
+        event._gateway_accepted = True  # the admission receipt a real adapter returns
 
 
 def _runner():
@@ -65,7 +66,7 @@ async def test_restart_marker_from_secondary_session_notifies_via_its_own_bot(tm
     r = _runner()
     src = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42", profile="sec")
     event = MessageEvent(text="/restart", message_type=MessageType.TEXT, source=src, message_id="7")
-    (tmp_path / ".restart_notify.json").write_text(json.dumps(_restart_notify_payload(event)))
+    (tmp_path / ".restart_notify.json").write_text(json.dumps(_restart_notify_payload(event)), encoding="utf-8")
 
     assert await r._send_restart_notification() == ("telegram", "42", None)
     assert r._profile_adapters["sec"][Platform.TELEGRAM].sent == ["42"]
@@ -74,10 +75,13 @@ async def test_restart_marker_from_secondary_session_notifies_via_its_own_bot(tm
 
 @pytest.mark.asyncio
 async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkeypatch):
+    from agent import estop
     from hermes_cli import loops
 
+    fired = []
+
     class _Mgr:
-        state = SimpleNamespace(ticks_fired=1)
+        state = SimpleNamespace(ticks_fired=1, created_at=1.0, control_generation=0)
 
         def __init__(self, session_id=None):
             pass
@@ -85,7 +89,11 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
         def is_due(self, now):
             return True
 
-        def fire_tick(self):
+        def fire_tick(self, run_generation=0, *, can_claim=None):
+            # Mirrors LoopManager.fire_tick: admission claims only while the gateway still owns the run.
+            if can_claim is not None and not can_claim():
+                return None
+            fired.append(1)
             return "tick"
 
         def complete_tick(self, *_):
@@ -93,16 +101,29 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
 
     monkeypatch.setattr(loops, "LoopManager", _Mgr)
     monkeypatch.setattr(loops, "goal_blocks_loop_tick", lambda sid: False)
+    # The fake manager stores no loop row; this test covers bot routing, not the tick fence.
+    from hermes_cli import session_controls
+    monkeypatch.setattr(session_controls, "loop_wake_is_current", lambda *_a, **_k: True)
     r = _runner()
     r._running = True
     route = {"platform": "telegram", "chat_id": "42", "chat_type": "dm", "user_id": "42", "profile": "sec"}
     state = SimpleNamespace(awaiting_response=False, next_due_at=0, route=route)
+
+    # `hermes pause`: loop wakeups are internal events that bypass the inbound estop gate, so the
+    # watcher itself must hold the tick — unclaimed (fire_tick never runs), so it stays due for resume.
+    estop.engage(reason="maintenance")
+    try:
+        await r._loop_wakeup_fire_one("sid", state, 1e12, set())
+        assert (fired, r._profile_adapters["sec"][Platform.TELEGRAM].handled) == ([], [])
+    finally:
+        estop.disengage()
 
     await r._loop_wakeup_fire_one("sid", state, 1e12, set())
     await r._loop_wakeup_fire_one("sid2", SimpleNamespace(**{**vars(state), "route": {**route, "profile": "nobot"}}), 1e12, set())
 
     assert r._profile_adapters["sec"][Platform.TELEGRAM].handled == ["tick"]
     assert r.adapters[Platform.TELEGRAM].handled == []
+    assert fired == [1]  # resume: the held tick fires once; the bot-less route never claims one
 
 
 def _home_config(platform: Platform, chat_id: str, *, notify: bool = True) -> GatewayConfig:
@@ -129,7 +150,7 @@ async def test_shutdown_notice_reaches_every_served_profiles_home_channel(monkey
     }
     r._profile_adapters = {"sec": {Platform.TELEGRAM: _Adapter()}, "quiet": {Platform.DISCORD: _Adapter()}}
     r._served_profile_homes = {}
-    r._snapshot_running_agents = lambda: []
+    r._snapshot_running_agents = list
 
     await r._notify_active_sessions_of_shutdown()
 

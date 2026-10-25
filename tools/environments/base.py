@@ -56,7 +56,7 @@ _activity_callback_local = threading.local()
 # Foreground commands in flight in THIS process, across every environment. Each runs in its
 # own session/process group, so a host that exits mid-command (TUI client gone, SIGTERM) would
 # orphan the whole tree; the process-exit funnel ``cleanup_all_environments`` kills them.
-_live_foreground: dict[int, tuple["BaseEnvironment", "ProcessHandle"]] = {}
+_live_foreground: "dict[int, tuple[BaseEnvironment, ProcessHandle]]" = {}
 # Reentrant, and the hard-exit path only ever takes it with a timeout: a signal handler can run
 # on a thread that already holds it.
 _live_foreground_cond = threading.Condition(threading.RLock())
@@ -64,6 +64,11 @@ _exit_fenced = False  # one-way, set by the hard-exit kill: no foreground comman
 _cleanup_fences = 0  # temporary, per graceful cleanup; overlapping callers release only their own fence
 _spawns_in_flight = 0  # past the fence check, child maybe alive, not yet in _live_foreground
 _HARD_KILL_BUDGET_S = 0.5  # also bounds the graceful spawn-publication wait; SDK spawn may stall
+_HOST_EXITING_OUTPUT = (
+    "[host is exiting: command not started]\n"
+    "Hermes is restarting or shutting down; the command was NOT run. "
+    "This turn's work will resume after restart. Do not retry this command in this turn."
+)
 
 
 def _enter_foreground_spawn() -> bool:
@@ -253,6 +258,9 @@ class BaseEnvironment(ABC):
     # Snapshot creation timeout (override for slow cold-starts).
     _snapshot_timeout: int = 30
 
+    # Re-dump exported env into the snapshot after each command (see __init__).
+    _persist_env: bool = True
+
     # Opt in only when a timed-out probe can kill its command without tearing
     # down the whole backend. SDK adapters cancel by stopping the sandbox.
     _sudo_nopasswd_probe_supported: bool = False
@@ -270,10 +278,13 @@ class BaseEnvironment(ABC):
         """
         return "/tmp"  # no-tmp: ok — sandbox-side (remote container) temp dir, not the host
 
-    def __init__(self, cwd: str, timeout: int, env: dict = None):
+    def __init__(self, cwd: str, timeout: int, env: dict | None = None, persist_env: bool = True):
         self.cwd = cwd
         self.timeout = timeout
         self.env = env or {}
+        # False: each command sources only the login-time snapshot, so exported vars do not
+        # carry over (terminal.persistent_shell / TERMINAL_LOCAL_PERSISTENT). CWD still does.
+        self._persist_env = persist_env
 
         self._session_id = uuid.uuid4().hex[:12]
         temp_dir = self.get_temp_dir().rstrip("/") or "/"
@@ -429,10 +440,13 @@ class BaseEnvironment(ABC):
 
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
+        from agent.delegation_context import in_process_child_relay_parent_address
         return _wrap_command_script(
             command,
             passthrough_names=self._snapshot_excluded_passthrough_names(),
             snapshot_ready=self._snapshot_ready,
+            relay_parent_address=in_process_child_relay_parent_address(),
+            persist_env=self._persist_env,
             **self._snapshot_script_kwargs(cwd))
 
     @staticmethod
@@ -602,7 +616,6 @@ class BaseEnvironment(ABC):
     def _before_execute(self) -> None:
         """Hook before each command. Remote backends (SSH, Modal, Daytona)
         trigger their FileSyncManager here; bind-mount backends and Local don't."""
-        pass
 
     def _mark_recreated(self) -> None:
         """Flag that the live container/sandbox was replaced while serving the
@@ -669,7 +682,7 @@ class BaseEnvironment(ABC):
             if parent_activity_cb is not None:
                 set_activity_callback(parent_activity_cb)
             if not _enter_foreground_spawn():
-                return {"output": "[host is exiting: command not started]", "returncode": 130}
+                return {"output": _HOST_EXITING_OUTPUT, "returncode": 130}
             spawned = None
             try:
                 spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
@@ -753,9 +766,18 @@ class BaseEnvironment(ABC):
             pass
 
     def _prepare_command(self, command: str) -> tuple[str, str | None]:
-        """Rewrite sudo for a piped password, or leave it alone when this backend has NOPASSWD."""
+        """Rewrite sudo for a piped password, or leave it alone when this backend has NOPASSWD.
+
+        Also applies the macOS ``open`` frontmost raise-ladder (a pure string
+        rewrite, no-op on non-Darwin) so files opened via tool calls are
+        brought to the front instead of landing behind the Hermes window.
+        """
+        from tools.terminal_tool_macos_open import _transform_macos_open_command
         from tools.terminal_tool_sudo import _transform_sudo_command
-        return _transform_sudo_command(command, sudo_nopasswd_check=self._sudo_nopasswd_works)
+        return _transform_sudo_command(
+            _transform_macos_open_command(command),
+            sudo_nopasswd_check=self._sudo_nopasswd_works,
+        )
 
     _SUDO_PROBE_TIMEOUT_S = 3
 

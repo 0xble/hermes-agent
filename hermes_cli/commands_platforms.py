@@ -232,7 +232,7 @@ def _iter_gateway_skills(platform: str):
 
 def _collect_gateway_skill_entries(
     platform: str, max_slots: int | None, reserved_names: set[str], desc_limit: int = 100,
-    sanitize_name: "Callable[[str], str] | None" = None,
+    sanitize_name: Callable[[str], str] | None = None,
 ) -> tuple[list[tuple[str, str, str, str]], int]:
     """Collect plugin + skill entries for a gateway platform.
 
@@ -367,7 +367,7 @@ def discord_skill_commands_by_category(
 
 # Slack slash names: lowercase a-z, 0-9, hyphens, underscores, max 32 chars; an app manifest
 # accepts up to 50 slash commands. Reserved = Slack built-ins apps cannot register
-# (https://slack.com/help/articles/201259356-Use-built-in-slash-commands).
+# (https://docs.slack.dev/interactivity/implementing-slash-commands/).
 _SLACK_MAX_SLASH_COMMANDS = 50
 _SLACK_NAME_LIMIT = 32
 _SLACK_INVALID_CHARS = re.compile(r"[^a-z0-9_\-]")
@@ -383,7 +383,7 @@ _SLACK_RESERVED_COMMANDS = frozenset({
 # parity test reads this set. Aliases are never pinned ahead of canonicals.
 _SLACK_VIA_HERMES_ONLY = frozenset({
     "topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat",
-    "refine", "review", "pause", "whoami", "platform", "insights", "login"})
+    "refine", "review", "pause", "whoami", "platform", "profile", "insights", "login", "retire"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

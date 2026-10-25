@@ -16,6 +16,7 @@ import pytest
 import hermes_state
 import hermes_state_wal
 import hermes_state_common
+import hermes_state_schema
 from agent.session_activity import ActivityProvenance, build_activity_snapshot
 from hermes_state import SessionDB
 from hermes_state_common import FTS_SQL, FTS_STORAGE_VERSION, SCHEMA_SQL, SCHEMA_VERSION
@@ -306,6 +307,37 @@ class TestConnectionLifecycle:
             for sql in executed
         )
 
+    def test_warm_writable_open_skips_generation_checkpoint(self, tmp_path, monkeypatch):
+        """A settled generation stamp must not checkpoint a large state.db on every open."""
+        db_path = tmp_path / "state.db"
+        statements = []
+        real_connect = hermes_state._connect_tracked_db
+
+        def tracing_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        monkeypatch.setattr(hermes_state, "_connect_tracked_db", tracing_connect)
+
+        first = SessionDB(db_path=db_path)
+        first.close()
+        first_count = len(statements)
+        assert any(
+            "pragma wal_checkpoint(passive)" == " ".join(sql.lower().split())
+            for sql in statements[:first_count]
+        )
+
+        warm = SessionDB(db_path=db_path)
+        warm_statements = statements[first_count:]
+        try:
+            assert not any(
+                "pragma wal_checkpoint(passive)" == " ".join(sql.lower().split())
+                for sql in warm_statements
+            )
+        finally:
+            warm.close()
+
     def test_read_only_connection_keeps_fts_search_available(self, tmp_path):
         db_path = tmp_path / "state.db"
         writable = SessionDB(db_path=db_path)
@@ -422,7 +454,7 @@ class TestConnectionLifecycle:
         read_only = SessionDB(db_path=db_path, read_only=True)
         try:
             assert read_only._fts_enabled is True
-            matches = read_only.search_messages("wal-race")
+            read_only.search_messages("wal-race")
         finally:
             read_only.close()
 
@@ -728,7 +760,7 @@ class TestMessageStorage:
             conn = real_connect(*args, **kwargs)
             conn.set_trace_callback(
                 lambda stmt: writes.append(stmt)
-                if re.match(r"\s*(INSERT|UPDATE|DELETE|REPLACE|ALTER|DROP\s+TRIGGER)\b", stmt, re.I) and "temp." not in stmt
+                if re.match(r"\s*(INSERT|UPDATE|DELETE|REPLACE|ALTER|DROP\s+TRIGGER)\b", stmt, re.IGNORECASE) and "temp." not in stmt
                 else None
             )
             return conn
@@ -1352,6 +1384,108 @@ class TestPruneSessions:
         assert session["id"] == "new"
 
 
+    def test_prune_batches_write_transactions_and_yields(self, db, monkeypatch):
+        import hermes_state_maintenance
+
+        old = time.time() - 200 * 86400
+        for index in range(51):
+            sid = f"old-{index}"
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (old, sid))
+        db._conn.commit()
+
+        pauses = []
+        monkeypatch.setattr(hermes_state_maintenance.time, "sleep", pauses.append)
+        assert db.prune_sessions(older_than_days=90) == 51
+        assert db._read_one("SELECT COUNT(*) FROM sessions WHERE id LIKE 'old-%'")[0] == 0
+        # 51 victims => 25 + 25 + 1, with a release/yield between each transaction.
+        assert pauses == [0.01, 0.01]
+
+
+    def test_prune_preserves_guarded_compression_lineage_across_batches(self, db, monkeypatch):
+        root = "lineage-root"
+        db.create_session(root, source="cli")
+        db.end_session(root, end_reason="compression")
+        for index in range(24):
+            sid = f"filler-{index}"
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+        child = "lineage-child"
+        db.create_session(child, source="cli", parent_session_id=root)
+        db.end_session(child, end_reason="done")
+        old = time.time() - 200 * 86400
+        db._conn.execute("UPDATE sessions SET started_at = ?", (old,))
+        db._conn.commit()
+        # A real live lease, so both the victim recheck and the read-only descendant probe see it.
+        assert db.try_acquire_session_turn_lease(child, "host:pid=%d:turn" % os.getpid(), ttl_seconds=300)
+
+        assert db.prune_sessions(older_than_days=90, exclude_active_write_guards=True) == 24
+        assert db.get_session(root) is not None
+        assert db.get_session(child) is not None
+
+
+    def test_prune_guard_walk_terminates_on_parent_cycle(self, db):
+        for sid in ("cycle-a", "cycle-b"):
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+        db._conn.execute("UPDATE sessions SET parent_session_id = 'cycle-b' WHERE id = 'cycle-a'")
+        db._conn.execute("UPDATE sessions SET parent_session_id = 'cycle-a' WHERE id = 'cycle-b'")
+        db._conn.execute("UPDATE sessions SET started_at = ?", (time.time() - 200 * 86400,))
+        db._conn.commit()
+
+        assert db.prune_sessions(older_than_days=90, exclude_active_write_guards=True) == 2
+        assert db.get_session("cycle-a") is None
+        assert db.get_session("cycle-b") is None
+
+    def test_prune_keeps_expired_guards_of_live_descendant_outside_batch(self, db):
+        parent, child = "guard-parent", "guard-child"
+        db.create_session(parent, source="cli")
+        db.end_session(parent, end_reason="done")
+        db.create_session(child, source="cli", parent_session_id=parent)
+        holder = "host:pid=%d:turn" % os.getpid()
+        assert db.try_acquire_session_turn_lease(child, holder, ttl_seconds=60)
+        assert db.try_acquire_compression_lock(child, holder, ttl_seconds=60)
+        expired = time.time() - 60
+        db._conn.execute("UPDATE session_turn_leases SET expires_at = ?", (expired,))
+        db._conn.execute("UPDATE compression_locks SET expires_at = ?", (expired,))
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (time.time() - 200 * 86400, parent))
+        db._conn.commit()
+
+        assert db.prune_sessions(older_than_days=90, exclude_active_write_guards=True) == 0
+        assert db.get_session(parent) is not None
+        assert db._read_one("SELECT COUNT(*) FROM session_turn_leases")[0] == 1
+        assert db._read_one("SELECT COUNT(*) FROM compression_locks")[0] == 1
+
+    def test_prune_deletes_continuation_before_its_ancestor(self, db, monkeypatch):
+        root, child = "order-root", "order-child"
+        db.create_session(root, source="cli")
+        db.end_session(root, end_reason="compression")
+        for index in range(25):
+            sid = f"order-filler-{index}"
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+        db.create_session(child, source="cli", parent_session_id=root)
+        db.end_session(child, end_reason="done")
+        base = time.time() - 200 * 86400
+        db._conn.execute("UPDATE sessions SET started_at = ?", (base,))
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (base - 10, root))
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (base + 10, child))
+        db._conn.commit()
+
+        deleted_order = []
+        original = db._execute_write
+
+        def recording(fn, *args, **kwargs):
+            result = original(fn, *args, **kwargs)
+            if isinstance(result, list):
+                deleted_order.extend(result)
+            return result
+
+        monkeypatch.setattr(db, "_execute_write", recording)
+        assert db.prune_sessions(older_than_days=90, exclude_active_write_guards=True) == 27
+        assert deleted_order.index(child) < deleted_order.index(root)
+
     def test_prune_skips_active_sessions(self, db):
         db.create_session(session_id="active", source="cli")
         # Backdate but don't end
@@ -1758,7 +1892,36 @@ class TestSessionTitle:
         session = db.get_session("s1")
         assert session["title"] is None
 
-
+    @pytest.mark.parametrize("holder_has_message,holder_hidden,holder_ended,yields", [
+        (False, False, True, True),    # ended empty visible ghost yields its title (#81888)
+        (False, False, False, False),  # live empty session (/title before its first turn) keeps it
+        (False, True, True, False),    # hidden empty row (fresh canonical Bot Chat) keeps it
+        (True, False, True, False),    # a real conversation keeps it
+    ])
+    def test_title_conflict_yields_only_to_ended_empty_visible_holder(self, db, holder_has_message, holder_hidden,
+                                                                      holder_ended, yields):
+        """A title holder yields only when it is ended, empty, visible and unarchived (#81888);
+        every other holder still conflicts. The ghost stays writable afterwards (no partial
+        unique index to trip on its first append_message)."""
+        db.create_session("ghost", "desktop")
+        db.set_session_title("ghost", "Canada")
+        if holder_has_message:
+            db.append_message("ghost", "user", "m0")
+        db.set_session_hidden("ghost", holder_hidden)
+        if holder_ended:
+            db.end_session("ghost", "user_exit")
+        db.create_session("real", "desktop")
+        db.append_message("real", "user", "Hello")
+        if not yields:
+            with pytest.raises(ValueError, match="already in use"):
+                db.set_session_title("real", "Canada")
+            assert db.get_session("ghost")["title"] == "Canada"
+            return
+        assert db.set_session_title("real", "Canada")
+        assert db.get_session("ghost")["title"] is None
+        assert db.resolve_session_by_title("Canada") == "real"
+        db.append_message("ghost", "user", "late first message")
+        assert db.get_session("ghost")["message_count"] == 1
 
 
 class TestSessionTitleIndexRepair:
@@ -1800,8 +1963,11 @@ class TestSessionTitleIndexRepair:
                 ).fetchall()
             }
             assert set(rows) == {"older", "newer", "unique"}
-            assert rows["older"]["title"] is None
-            assert rows["newer"]["title"] == "shared-title"
+            # NULL title_source ranks as user: neither is dropped; the newer gets "#2" so the
+            # "#N"-preferring title lookup still opens the newest session.
+            assert rows["older"]["title"] == "shared-title"
+            assert rows["newer"]["title"] == "shared-title #2"
+            assert reopened.resolve_session_by_title("shared-title") == "newer"
             assert rows["unique"]["title"] == "unique-title"
             assert reopened.get_messages("older")[0]["content"] == "keep older message"
             assert reopened.get_messages("newer")[0]["content"] == "keep newer message"
@@ -1810,6 +1976,39 @@ class TestSessionTitleIndexRepair:
                 "WHERE type = 'index' AND name = 'idx_sessions_title_unique'"
             ).fetchone()
             assert index is not None
+        finally:
+            reopened.close()
+
+    @pytest.mark.parametrize("broken_rename", [False, True])
+    def test_repair_keeps_highest_ranked_newest_title(self, tmp_path, monkeypatch, broken_rename):
+        # #126764: rank (user > llm > derived) beats recency; within an auto rank the newest
+        # started_at wins even when it has the lower rowid; user rows are renamed oldest-first.
+        # broken_rename: the index still fails after rows were cleared -> the repair is rolled
+        # back whole (no half-repaired store committed without the index).
+        db_path = tmp_path / "ranked_titles.db"
+        db = SessionDB(db_path=db_path)
+        for sid in "abcde":
+            db.create_session(sid, "cli")
+        db.close()
+        seed = {"a": ("Trip", "user", 100), "b": ("Trip", "llm", 300), "c": ("Note", "derived", 200),
+                "d": ("Note", "derived", 100), "e": ("Trip", "user", 200)}
+        with contextlib.closing(sqlite3.connect(db_path)) as conn, conn:
+            conn.execute("DROP INDEX idx_sessions_title_unique")
+            conn.executemany(
+                "UPDATE sessions SET title = ?, title_source = ?, started_at = ? WHERE id = ?",
+                [(*row, sid) for sid, row in seed.items()],
+            )
+        if broken_rename:
+            monkeypatch.setattr(hermes_state_schema, "next_title_in_lineage", lambda conn, title: title)
+        reopened = SessionDB(db_path=db_path)
+        try:
+            titles = dict(reopened._conn.execute("SELECT id, title FROM sessions").fetchall())
+            expected = ({sid: row[0] for sid, row in seed.items()} if broken_rename else
+                        {"a": "Trip", "b": None, "c": "Note", "d": None, "e": "Trip #2"})
+            assert titles == expected
+            assert bool(reopened._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'idx_sessions_title_unique'"
+            ).fetchone()) is not broken_rename
         finally:
             reopened.close()
 
@@ -1955,7 +2154,7 @@ class TestSchemaInit:
         assert binding["user_id"] == "208214988"
         assert binding["session_key"] == "telegram:dm:208214988:thread:17585"
         assert binding["session_id"] == "topic-session"
-        assert db.get_meta("telegram_dm_topic_schema_version") == "3"
+        assert db.get_meta("telegram_dm_topic_schema_version") == "4"
         db.close()
 
     def test_telegram_topic_claim_if_unbound_keeps_the_existing_owner(self, tmp_path):
@@ -2060,6 +2259,16 @@ class TestAsyncDelegationsSchemaAgreement:
             "auto_resume_state",
             "auto_resume_claim",
             "auto_resume_claimed_at",
+            "retry_state",
+            "retry_reason",
+            "retry_due_at",
+            "retry_notices",
+            "retry_claim",
+            "retry_claimed_at",
+            "retry_root",
+            "retry_attempt",
+            "retry_root_started_at",
+            "retry_replacement",
         ):
             legacy_sql = re.sub(rf"^ +{column} [^\n]*\n", "", legacy_sql, flags=re.M)
         legacy_sql = legacy_sql.replace(
@@ -3859,11 +4068,14 @@ class TestOptimizeFts:
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="bounded merge")
         statements = []
-        db._conn.set_trace_callback(statements.append)
+        # The merge runs on the maintenance connection, off the writer lock.
+        with db._maintenance_conn() as maintenance:
+            maintenance.set_trace_callback(statements.append)
         try:
             executed = db._merge_fts_incrementally(max_pages=37)
         finally:
-            db._conn.set_trace_callback(None)
+            with db._maintenance_conn() as maintenance:
+                maintenance.set_trace_callback(None)
 
         # At least one merge command per present FTS index, and never more
         # than the per-pass command cap per index.
@@ -3916,6 +4128,30 @@ class TestOptimizeFts:
 
 
 class TestAutoMaintenance:
+    def test_auto_maintenance_outside_window_leaves_throttle_unspent(self, db, monkeypatch):
+        import hermes_cli.maintenance_window
+        import hermes_state_repair
+
+        prune_calls = []
+        acquire_calls = []
+        set_meta_calls = []
+        monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: False)
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: prune_calls.append(True))
+        monkeypatch.setattr(
+            hermes_state_repair,
+            "_try_acquire_auto_maintenance_lock",
+            lambda _db_path: acquire_calls.append(True),
+        )
+        monkeypatch.setattr(db, "set_meta", lambda *args: set_meta_calls.append(args))
+
+        result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+
+        assert result == {"skipped": True, "pruned": 0, "closed": 0, "vacuumed": False}
+        assert acquire_calls == []
+        assert prune_calls == []
+        assert set_meta_calls == []
+        assert db.get_meta("last_auto_prune") is None
+
     def _make_old_ended(self, db, sid: str, days_old: int = 100):
         """Create a session that is ended and was started `days_old` days ago."""
         db.create_session(session_id=sid, source="cli")

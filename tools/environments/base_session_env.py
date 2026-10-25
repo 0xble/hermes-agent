@@ -28,7 +28,8 @@ from typing import Iterable
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT|"
+    "HERMES_CRON_SESSION|HERMES_TURN_ORIGIN|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT|"
+    "HERMES_DELEGATED_PARENT_SESSION_ID|RELAY_PARENT_ADDRESS|"
     "HERMES_RPC_|HERMES_KERNEL_DIR)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -76,7 +77,10 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # Scope markers stamped onto a delegate_task child's / cron run's subprocess
         # env; a snapshot taken inside that window would re-assert them on every
         # later ``source`` and fence the PARENT session's kanban CLI (#90782).
-        "HERMES_DELEGATED_CHILD_CONTEXT HERMES_CRON_SESSION "
+        "HERMES_DELEGATED_CHILD_CONTEXT HERMES_CRON_SESSION HERMES_TURN_ORIGIN "
+        # A child's parent identity: persisted, it would refuse a later
+        # top-level session's relay sends to that parent.
+        "HERMES_DELEGATED_PARENT_SESSION_ID RELAY_PARENT_ADDRESS "
         # Remote code-execution channel vars (RPC token, kernel/rpc dirs): a
         # leaked token in the snapshot would re-export into every later command
         # on the backend and outlive the private dir it protects.
@@ -143,8 +147,11 @@ def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str
 
 def _wrap_command_script(
     command: str, *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str,
-    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str) -> str:
+    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str,
+    relay_parent_address: str = "", persist_env: bool = True) -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
+    ``persist_env=False`` skips the re-dump, so every command starts from the login-time
+    snapshot and exports from one command never reach the next (the CWD marker still runs).
     ``source`` stdout goes to /dev/null because macOS bash 3.2 / some Homebrew builds echo
     ``declare -x`` lines when sourcing. AI_AGENT/HERMES_AGENT advertise the harness to remote
     backends (whose env is not inherited); ``${VAR:-default}`` never clobbers an outer harness.
@@ -153,7 +160,9 @@ def _wrap_command_script(
     same mktemp+mv atomic publish, and chains ``mv`` on the dump succeeding so a failed dump never
     replaces a good snapshot. ``umask 077`` is applied after
     the user's command so snapshot files (which may carry secrets) are private without
-    changing the command's umask.
+    changing the command's umask. ``relay_parent_address`` (a delegated child's parent) is
+    exported after the snapshot is sourced, so every backend's command sees it, including remote
+    ones whose process env is not inherited; the re-dump unsets it, so it never persists.
     """
     escaped = command.replace("'", "'\\''")
     save, restore = _passthrough_save_restore(passthrough_names)
@@ -161,6 +170,8 @@ def _wrap_command_script(
     if snapshot_ready:
         parts.append(f"source {quoted_snap} >/dev/null 2>&1 || true")
     parts += restore
+    if relay_parent_address:
+        parts.append(relay_parent_export_line(relay_parent_address))
     parts += [
         'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',
         'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"',
@@ -169,7 +180,7 @@ def _wrap_command_script(
         f"eval '{escaped}'",
         "__hermes_ec=$?",
         "umask 077"]
-    if snapshot_ready:
+    if snapshot_ready and persist_env:
         parts.append(
             f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) && "
             f"{{ {_shell_state_dump(_SNAP_TMP, passthrough_names)} "
@@ -177,6 +188,11 @@ def _wrap_command_script(
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
     parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec"]
     return "\n".join(parts)
+
+
+def relay_parent_export_line(address: str) -> str:
+    """Shell line exporting a delegated child's parent relay address (relay refuses sends to it)."""
+    return f"export RELAY_PARENT_ADDRESS={shlex.quote(address)}"
 
 
 def _split_cwd_marker(output: str, marker: str) -> tuple[str | None, str] | None:

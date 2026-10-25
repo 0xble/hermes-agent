@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- this PR must retain the cross-session command admission and strict wake-fence paths in this facade; the moved helper boundary is tracked for follow-up extraction.
 """Base platform adapter interface; every platform adapter inherits from BasePlatformAdapter."""
 
 import asyncio
@@ -24,18 +25,10 @@ from utils import normalize_proxy_url
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
+from gateway.copy_blocks import (
+    protect_inline_copy_bodies, restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
 
 logger = logging.getLogger(__name__)
-
-
-def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
-    """Done-callback for a detached fatal-error handler task (carrier cancelled in
-    ``_notify_fatal_error``): retrieve its exception so asyncio never logs "never retrieved"."""
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        logger.error("Detached fatal-error handler task failed: %s", exc, exc_info=exc)
 
 
 # Audio exts for native audio delivery; Telegram's narrower sets stay separate (.m2a is audio to
@@ -53,7 +46,7 @@ _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 
 
 def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
-                          output_path: "str | None" = None) -> "str | None":
+                          output_path: str | None = None) -> str | None:
     """Best-effort ffmpeg transcode to Ogg/Opus (voip-tuned) for native voice bubbles: the written
     ``.ogg`` path (a NEW temp file unless ``output_path`` is given; caller cleans up), or None when
     ffmpeg is missing/fails. ``output_path`` may equal ``path`` (in-place container repair) — the
@@ -74,7 +67,7 @@ def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
             [ffmpeg, "-v", "error", "-y", "-i", str(path),
              "-acodec", "libopus", "-ac", "1", "-b:a", bitrate, "-vbr", "on",
              "-application", "voip", "-compression_level", "10", "-f", "ogg", work_path],
-            capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+            capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL, check=False)
         if result.returncode == 0 and os.path.getsize(work_path) > 0:
             if in_place:
                 os.replace(work_path, ogg_path)
@@ -199,7 +192,7 @@ def _reply_anchor_for_event(event) -> str | None:
 _MEDIA_KIND_KEYS = frozenset({"audio", "video", "file", "image"})
 
 
-def _media_failure_text(kind: str, file_name: "str | None" = None) -> str:
+def _media_failure_text(kind: str, file_name: str | None = None) -> str:
     """User-facing "couldn't deliver" notice; ``file_name`` is the only name ever shown."""
     kind_label = t(f"gateway.notify.media_kind.{kind}") if kind in _MEDIA_KIND_KEYS else kind
     if file_name:
@@ -290,7 +283,7 @@ def is_network_accessible(host: str) -> bool:
 # goes out on a stale answer fails and is retried, which is the same outcome as any transient proxy error.
 # No lock: a race costs one extra fork and both answers are equally current.
 _MACOS_PROXY_TTL_SECONDS = 60.0
-_macos_proxy_cache: "tuple[float, str | None] | None" = None
+_macos_proxy_cache: tuple[float, str | None] | None = None
 
 
 def _detect_macos_system_proxy() -> str | None:
@@ -442,7 +435,7 @@ import contextvars as _contextvars
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.helpers import fence_state_after
+from gateway.platforms.helpers import consume_detached_handler_exception, fence_state_after
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
@@ -451,7 +444,8 @@ from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from gateway.session import SessionSource, build_session_key
 from gateway.session_transcript import TranscriptReadError
-from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
+from hermes_constants import CONNECTOR_DOWNLOADS_SUBDIR, get_default_hermes_root, get_hermes_dir, get_hermes_home
+from agent.provider_media import GENERATED_SUBDIR, MEDIA_CACHE_MAX_AGE_HOURS
 
 if TYPE_CHECKING:
     from agent.display import ToolPreview
@@ -606,7 +600,7 @@ async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytes:
 def _cache_dir_accessors(kind: str, constant_name: str, new_subpath: str, old_name: str):
     """``(get_<kind>_cache_dir, cleanup_<kind>_cache)`` pair. The getter resolves fresh via
     get_hermes_dir (active profile) unless a test monkeypatched the module constant away from
-    its import-time default, and creates the directory; ``cleanup(max_age_hours=24)`` deletes
+    its import-time default, and creates the directory; ``cleanup(max_age_hours=MEDIA_CACHE_MAX_AGE_HOURS)`` deletes
     older files and returns the count."""
     def get_dir() -> Path:
         d = get_hermes_dir(new_subpath, old_name)
@@ -614,10 +608,10 @@ def _cache_dir_accessors(kind: str, constant_name: str, new_subpath: str, old_na
         default = _CACHE_DIR_IMPORT_DEFAULTS.get(constant_name)
         if current is not None and default is not None and current != default:
             d = Path(current)
-        d.mkdir(parents=True, exist_ok=True)
+        _secure_media_cache_dir(d)
         return d
 
-    def cleanup(max_age_hours: int = 24) -> int:
+    def cleanup(max_age_hours: int = MEDIA_CACHE_MAX_AGE_HOURS) -> int:
         return _cleanup_cache_dir(get_dir(), max_age_hours)
     get_dir.__name__ = get_dir.__qualname__ = f"get_{kind}_cache_dir"
     cleanup.__name__ = cleanup.__qualname__ = f"cleanup_{kind}_cache"
@@ -635,10 +629,60 @@ def _looks_like_image(data: bytes) -> bool:
                or (data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP"))
 
 
+def _secure_media_cache_dir(cache_dir: Path) -> None:
+    """Create/reconcile a gateway media-cache dir owner-only (0700), except managed.
+
+    Inbound media (photos, voice notes, documents a user sent through a
+    messaging platform) is user content, not regenerable cache: the
+    umask-derived 0755 these dirs inherited made them readable by every other
+    local account whenever ``HERMES_HOME`` is traversable — the documented
+    ``HERMES_HOME_MODE=0701`` web-server hatch. The mode is passed to ``mkdir``
+    so it is set at creation, then reconciled by the house policy helper
+    ``hermes_cli.config._secure_dir`` (managed/NixOS installs keep their
+    group-share design: these lazily-created dirs are not covered by the
+    module's ``systemd.tmpfiles`` rules, so the mode is left to the
+    configured umask/setgid). Best-effort: never fails a media write.
+    """
+    try:
+        managed = False
+        try:
+            from hermes_cli.config import is_managed
+
+            managed = bool(is_managed())
+        except Exception:  # pragma: no cover - defensive
+            pass
+        if managed:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            from hermes_cli.config import _secure_dir
+
+            _secure_dir(cache_dir)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("media cache dir chmod skipped: %s", exc)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("media cache dir creation failed for %s: %s", cache_dir, exc)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+
 def _write_cache_file(cache_dir: Path, prefix: str, ext: str, data: bytes) -> str:
-    """Write ``data`` to ``<cache_dir>/<prefix>_<uuid12><ext>``; return the path string."""
+    """Write ``data`` to ``<cache_dir>/<prefix>_<uuid12><ext>``; return the path string.
+
+    The file is written owner-only (0600) — inbound media is private user
+    content and the cache dir is hardened to 0700 by ``_secure_media_cache_dir``;
+    one directory should not carry two file-mode conventions. Best-effort on
+    platforms where POSIX mode bits are advisory (Windows): falls back to a
+    plain write rather than failing the media write.
+    """
     filepath = cache_dir / f"{prefix}_{uuid.uuid4().hex[:12]}{ext}"
-    filepath.write_bytes(data)
+    try:
+        fd = os.open(str(filepath), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError:
+        filepath.write_bytes(data)
+        return str(filepath)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
     return str(filepath)
 
 
@@ -647,9 +691,26 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     ValueError when *data* isn't an image (e.g. an upstream HTML error page)."""
     validate_inbound_media_size(len(data), media_type="image")
     if not _looks_like_image(data):
-        snippet = data[:80].decode("utf-8", errors="replace")
-        raise ValueError(f"Refusing to cache non-image data as {ext} (starts with: {snippet!r})")
+        # iPhone and macOS screenshots arrive as HEIC, Chromium ones as AVIF. Store them as PNG so
+        # every consumer (vision tools, re-sends, model input) gets a format it can read.
+        png = _transcode_raster_to_png(data)
+        if png is None:
+            snippet = data[:80].decode("utf-8", errors="replace")
+            raise ValueError(f"Refusing to cache non-image data as {ext} (starts with: {snippet!r})")
+        validate_inbound_media_size(len(png), media_type="image")  # PNG can be several times larger
+        data, ext = png, ".png"
     return _write_cache_file(get_image_cache_dir(), "img", ext, data)
+
+
+def _transcode_raster_to_png(data: bytes) -> Optional[bytes]:
+    """PNG bytes for a recognised raster image outside ``_looks_like_image`` (HEIC/HEIF, AVIF,
+    TIFF, ICO), else None. SVG and unrecognised bytes stay refused."""
+    from agent.image_routing import _sniff_mime_from_bytes, _transcode_to_png
+
+    mime = _sniff_mime_from_bytes(data)
+    if mime is None or mime == "image/svg+xml":
+        return None
+    return _transcode_to_png(data)
 
 
 async def cache_image_from_bytes_async(data: bytes, ext: str = ".jpg") -> str:
@@ -778,7 +839,8 @@ MEDIA_DELIVERY_TRUST_RECENT_SECONDS_ENV = "HERMES_MEDIA_TRUST_RECENT_SECONDS"
 # credential / system paths). Set true on public-facing gateways.
 MEDIA_DELIVERY_STRICT_ENV = "HERMES_MEDIA_DELIVERY_STRICT"
 # Canonical cache subdirs of deliverable artifacts; also enumerates per-profile cache roots.
-_MEDIA_DELIVERY_CACHE_SUBDIRS = ("images", "audio", "videos", "documents", "screenshots")
+_MEDIA_DELIVERY_CACHE_SUBDIRS = (
+    "images", "audio", "videos", "documents", "screenshots", GENERATED_SUBDIR)
 MEDIA_DELIVERY_SAFE_ROOTS = (
     IMAGE_CACHE_DIR, AUDIO_CACHE_DIR, VIDEO_CACHE_DIR, DOCUMENT_CACHE_DIR, SCREENSHOT_CACHE_DIR,
     *(_HERMES_HOME / d for d in (
@@ -820,20 +882,17 @@ _ROOT_CREDENTIAL_PATHS = (
     "sessions", "browser-profile", *_sqlite_files("state.db"), *_sqlite_files("kanban.db"))
 
 
-def _profile_cache_roots() -> List[Path]:
-    """Per-profile cache roots ``<root>/profiles/<name>/cache/{images,...}`` (the static safe
-    roots cover only the active HERMES_HOME). Enumerated at check time so profiles created after
-    startup count and are allowlisted BEFORE the ``/root`` denylist (HERMES_HOME symlinked).
-
-    ``HERMES_HOME=/opt/data``) while the model emits a profile-scoped path silently fails delivery.
-    Enumerated dynamically at check time so profiles created after startup are covered, and so the resolved
-    profile path is allowlisted *before* the ``/root`` system denylist is consulted (which otherwise wins
-    when HERMES_HOME is symlinked under a denied prefix and $HOME is not that prefix). See issue #31733.
+def _profile_cache_roots() -> list[Path]:
+    """Per-profile cache roots ``<root>/profiles/<name>/cache/{images,...}`` and every home's connector
+    downloads dir (the static safe roots cover only the launch HERMES_HOME). Enumerated at check
+    time so profiles created after startup count, and allowlisted BEFORE the ``/root`` denylist,
+    which otherwise wins when HERMES_HOME is symlinked under a denied prefix (#31733).
     """
-    return [p / "cache" / subdir for p in _profile_dirs() for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS]
+    return [*(p / "cache" / subdir for p in _profile_dirs() for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS),
+            *(p / CONNECTOR_DOWNLOADS_SUBDIR for p in (get_hermes_home(), *_profile_dirs()))]
 
 
-def _profile_dirs() -> List[Path]:
+def _profile_dirs() -> list[Path]:
     """Every ``<root>/profiles/<name>`` directory, read at check time."""
     try:
         return [p for p in (_HERMES_ROOT / "profiles").iterdir() if p.is_dir()]
@@ -841,7 +900,7 @@ def _profile_dirs() -> List[Path]:
         return []
 
 
-def _credential_home_roots() -> List[Path]:
+def _credential_home_roots() -> list[Path]:
     """Every Hermes home whose credential stores the denylist must cover: the ACTIVE home
     (the per-turn HERMES_HOME override under ``gateway.multiplex_profiles``), the shared root
     and every ``<root>/profiles/*``. Enumerated at check time like ``_profile_cache_roots`` on
@@ -855,7 +914,7 @@ def _kanban_root() -> Path:
     return Path(os.environ.get("HERMES_KANBAN_HOME", "").strip() or _HERMES_ROOT).expanduser()
 
 
-def _kanban_board_dirs() -> List[Path]:
+def _kanban_board_dirs() -> list[Path]:
     """Every directory under ``<root>/kanban/boards`` (lax on purpose: the DENY side must catch a
     board whatever its name; the allow side filters further)."""
     with contextlib.suppress(OSError):
@@ -863,7 +922,7 @@ def _kanban_board_dirs() -> List[Path]:
     return []
 
 
-def _kanban_attachment_roots() -> List[Path]:
+def _kanban_attachment_roots() -> list[Path]:
     """Return durable Kanban attachment roots without importing kanban_db."""
     override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
     if override:
@@ -875,7 +934,7 @@ def _kanban_attachment_roots() -> List[Path]:
     return roots
 
 
-def _media_delivery_allowed_roots() -> List[Path]:
+def _media_delivery_allowed_roots() -> list[Path]:
     """Return roots from which model-emitted local media may be delivered."""
     from gateway.media_policy import media_delivery_allow_dirs
     operator_roots = (
@@ -896,13 +955,13 @@ def _media_delivery_recency_seconds() -> float:
     return _or_default(lambda: max(0.0, float(custom)) if custom else default, default)
 
 
-def _kanban_board_db_paths() -> List[Path]:
+def _kanban_board_db_paths() -> list[Path]:
     """Named-board ``kanban.db`` stores (+ sidecars): they sit beside the ATTACHMENTS dir
     ``_kanban_attachment_roots`` allowlists and hold every task, comment and run transcript."""
     return [board / name for board in _kanban_board_dirs() for name in _sqlite_files("kanban.db")]
 
 
-def _media_delivery_denied_paths() -> List[Path]:
+def _media_delivery_denied_paths() -> list[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     home = Path(os.path.expanduser("~"))
     return [*map(Path, _MEDIA_DELIVERY_DENIED_PREFIXES),
@@ -965,7 +1024,7 @@ def _tenv(name: str, default: str = "") -> str:
     return terminal_env(name, default)
 
 
-def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
+def _parse_docker_volume_mounts() -> list[tuple[Path, Path]]:
     """Parse ``TERMINAL_DOCKER_VOLUMES`` (JSON list of ``host:container[:mode]``) into
     ``(host_path, container_path)``; named volumes / non-absolute hosts can't resolve here."""
     raw = _tenv("TERMINAL_DOCKER_VOLUMES", "").strip()
@@ -974,7 +1033,7 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
         parsed = _json.loads(raw) if raw else []
     except Exception:
         return []
-    mounts: List[Tuple[Path, Path]] = []
+    mounts: list[tuple[Path, Path]] = []
     for entry in parsed if isinstance(parsed, list) else ():
         spec = entry.strip() if isinstance(entry, str) else ""
         # Prefer the first ':/' so absolute container paths are unambiguous.
@@ -992,7 +1051,7 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
     return mounts
 
 
-def _docker_sandbox_dir_candidates(session_key: str = "") -> List[str]:
+def _docker_sandbox_dir_candidates(session_key: str = "") -> list[str]:
     """Candidate host sandbox dir names for the delivering session, best first. Mirrors
     ``_resolve_container_task_id`` (tools/terminal_tool.py): containers are PROFILE-scoped
     (``default``, else ``profile:<name>``); legacy ``session:<key>`` sandboxes stay as a fallback.
@@ -1011,7 +1070,7 @@ def _docker_sandbox_dir_candidates(session_key: str = "") -> List[str]:
         profile = get_active_profile_name() or "default"
     except Exception:
         profile = "default"
-    candidates: List[str] = []
+    candidates: list[str] = []
     # Explicit trusted-profiles opt-in: one shared container identity.
     if shared := _tenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip():
         candidates.append(sanitize_task_id_for_path(f"shared:{shared}"))
@@ -1035,7 +1094,7 @@ def _docker_persistent_active() -> bool:
     return _docker_env_active() and _tenv("TERMINAL_CONTAINER_PERSISTENT", "true").strip().lower() in _TRUTHY
 
 
-def _docker_persistent_sandbox_roots(session_key: str, leaf: str) -> List[Path]:
+def _docker_persistent_sandbox_roots(session_key: str, leaf: str) -> list[Path]:
     """Existing ``<sandbox>/docker/<candidate>/<leaf>`` host dirs in candidate order;
     the translator tries each until the file resolves. Empty unless Docker + persistent."""
     if not _docker_persistent_active():
@@ -1049,7 +1108,7 @@ def _docker_persistent_sandbox_roots(session_key: str, leaf: str) -> List[Path]:
         return []
 
 
-def _default_docker_workspace_host_roots(session_key: str = "") -> List[Path]:
+def _default_docker_workspace_host_roots(session_key: str = "") -> list[Path]:
     """Existing host candidates for ``/workspace``: the explicit cwd mount
     (``TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE``) if set, else the persistent sandbox layouts."""
     if not _docker_persistent_active():
@@ -1064,7 +1123,7 @@ def _default_docker_workspace_host_roots(session_key: str = "") -> List[Path]:
     return _docker_persistent_sandbox_roots(session_key, "workspace")
 
 
-def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
+def _cache_dir_container_mounts() -> list[tuple[Path, Path]]:
     """(host, container) pairs for the auto-mounted Hermes cache dirs (``/root/.hermes/...`` in
     MEDIA tags); longer prefixes than the ``/root`` home mount, so longest-prefix match wins."""
     if not _docker_env_active():
@@ -1181,7 +1240,7 @@ def _log_safe_path(path: str) -> str:
 
 
 def _validated_delivery_path(raw_path, session_key: str, label: str,
-                             dropped: Optional[List[dict]] = None) -> Optional[str]:
+                             dropped: Optional[list[dict]] = None) -> Optional[str]:
     """``validate_media_delivery_path`` plus the shared "Skipping unsafe ..." warning. A path the
     host cannot see is retried against the active remote sandbox (ssh/modal/...; #466). When
     ``dropped`` is a list, a rejected path is appended as ``{"path", "reason"}`` so the caller can
@@ -1252,7 +1311,7 @@ SUPPORTED_IMAGE_DOCUMENT_TYPES = {
 # images (inline), video (inline where supported), audio (voice/audio), documents/spreadsheets/presentations
 # (send_document), archives, and rendered web output. The dispatch partition (image vs video vs document)
 # lives in ``gateway/run.py``. ---------------------------------------------------------------------------
-MEDIA_DELIVERY_EXTS: Tuple[str, ...] = (
+MEDIA_DELIVERY_EXTS: tuple[str, ...] = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg",  # images (embed inline)
     ".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp",  # video (embed inline where supported)
     ".mp3", ".m2a", ".wav", ".ogg", ".opus", ".m4a", ".flac",  # audio (voice/audio where supported)
@@ -1328,7 +1387,7 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
     re.IGNORECASE)
 
 
-def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tuple[str, int]]:
+def _match_extensionless_path(scan_text: str, match: re.Match) -> Optional[tuple[str, int]]:
     """Extensionless MEDIA tag match -> validated on-disk ``(safe_path, end_offset)`` or None: the
     captured path first, then extended across single spaces (max 8 tokens, never past a newline
     or the next ``MEDIA:``).
@@ -1534,7 +1593,7 @@ class CachedMedia:
 
 # MIME -> extension reverse lookup; FIRST match across image, video, document tables wins
 # (built in reverse so the earliest extension is the one that survives).
-_MIME_TO_EXT: Dict[str, str] = {
+_MIME_TO_EXT: dict[str, str] = {
     mime: ext
     for table in (SUPPORTED_DOCUMENT_TYPES, SUPPORTED_VIDEO_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES)
     for ext, mime in reversed(table.items())}
@@ -1602,7 +1661,7 @@ class TextDebounceState:
     first_ts: float
     last_ts: float
 
-    def cancel_timer(self, *, unless: "asyncio.Task | None" = None) -> None:
+    def cancel_timer(self, *, unless: asyncio.Task | None = None) -> None:
         """Cancel the pending flush timer (if live and not ``unless``)."""
         if self.task is not None and self.task is not unless and not self.task.done():
             self.task.cancel()
@@ -1622,6 +1681,7 @@ class _ExtractedResponse:
     local_files: list
     force_document_attachments: bool
     pre_extract: str
+    copy_blocks: list[str] = field(default_factory=list)
 
 
 _PLAINTEXT_GATEWAY_RESTART_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -1630,7 +1690,7 @@ _PLAINTEXT_GATEWAY_RESTART_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:please\s+)?restart\s+hermes[.!?\s]*$", re.IGNORECASE))
 
 
-def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
+def coerce_plaintext_gateway_command(event: MessageEvent) -> None:
     """Rewrite a tiny set of DM plaintext admin phrases (exact matches only) into slash commands so
     ``restart gateway`` never reaches the LLM/tool path (a self-restart from inside the running
     agent leaves the gateway stuck in ``draining`` waiting on that agent)."""
@@ -1656,14 +1716,14 @@ class ExecApprovalPrompt:
     chat_id: str
     session_key: str
     text: str
-    actions: List[Tuple[str, str, str]]
+    actions: list[tuple[str, str, str]]
     command: str
     description: str
     smart_denied: bool
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[dict[str, Any]] = None
 
     @property
-    def choices(self) -> List[str]:
+    def choices(self) -> list[str]:
         return [choice for _, choice, _ in self.actions]
 
 
@@ -1672,6 +1732,13 @@ class ExecApprovalPrompt:
 # that batch drains). Ingress handlers check it so they never await outbound pacing on that task.
 _INGRESS_CONSUMER: "_contextvars.ContextVar[Optional[asyncio.Task]]" = _contextvars.ContextVar(
     "gateway_ingress_consumer", default=None)
+
+
+# (obligation id, event, adapter) while send_final_ledgered awaits the send. Task-local, because
+# one adapter serves many sessions at once: the send's finally reads only its own turn's entry if
+# a cancel is delivered at the return, before the ledger write.
+_PENDING_LEDGER_SETTLEMENT: "_contextvars.ContextVar[Optional[tuple]]" = _contextvars.ContextVar(
+    "gateway_pending_ledger_settlement", default=None)
 
 
 def ingress_consumer_scope() -> "_contextvars.Token":
@@ -1776,7 +1843,7 @@ def _any_in(blob: str, *needles: str) -> bool:
 
 
 # Ordered (kind, predicate) table for classify_send_error — first match wins.
-_SEND_ERROR_CLASSIFIERS: Tuple[Tuple[str, Callable[[str], bool]], ...] = (
+_SEND_ERROR_CLASSIFIERS: tuple[tuple[str, Callable[[str], bool]], ...] = (
     ("too_long", lambda b: _any_in(b, "message_too_long", "too long", "message is too long")),
     ("bad_format", lambda b: (
         _any_in(b, "can't parse entities", "cant parse entities", "can't find end", "unsupported start tag")
@@ -1835,7 +1902,34 @@ class EphemeralReply(CommandReply):
         return str.__str__(self)
 
 
-def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], session_key: str,
+def _task_event_covers_recovered_event(task_event, event) -> bool:
+    """Return whether a completed session task actually consumed the recovered event."""
+    return task_event is event or any(
+        absorbed is event for absorbed in getattr(task_event, "_hermes_absorbed_events", ())
+    )
+
+
+def _record_absorbed_pending_event(existing: MessageEvent, event: MessageEvent) -> None:
+    """Keep a transitive identity trail when a pending slot merges another event."""
+    absorbed = getattr(existing, "_hermes_absorbed_events", None)
+    if not isinstance(absorbed, list):
+        absorbed = []
+        setattr(existing, "_hermes_absorbed_events", absorbed)
+    for candidate in (event, *getattr(event, "_hermes_absorbed_events", ())):
+        if candidate is not existing and not any(item is candidate for item in absorbed):
+            absorbed.append(candidate)
+        if candidate is not existing:
+            # Recovery may be watching an absorbed event while the successor persists the
+            # merged slot. Keep the live successor reachable for its durability probe.
+            setattr(candidate, "_hermes_absorbed_into", existing)
+    recovery_id = getattr(event, "_hermes_recovery_id", None)
+    if recovery_id is not None and getattr(existing, "_hermes_recovery_id", None) is None:
+        # A recovered event may be consumed by this pending successor. Carry only the
+        # persistence/durability key; event.message_id and source.message_id remain transport ids.
+        setattr(existing, "_hermes_recovery_id", recovery_id)
+
+
+def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
                                 event: MessageEvent, *, merge_text: bool = False) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
     turn sees the whole burst; with ``merge_text`` rapid TEXT follow-ups append instead of
@@ -1848,10 +1942,10 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
         both_photo = existing_is_photo and incoming_is_photo
         incoming_has_media = bool(event.media_urls)
 
-        def _padded_inline_flags(msg: MessageEvent) -> List[Optional[bool]]:
+        def _padded_inline_flags(msg: MessageEvent) -> list[Optional[bool]]:
             flags = list(getattr(msg, "media_text_inlined", []) or [])
             return flags + [None] * (len(msg.media_urls) - len(flags))
-        incoming_inline_flags: List[Optional[bool]] = []
+        incoming_inline_flags: list[Optional[bool]] = []
         if incoming_has_media:
             existing.media_text_inlined = _padded_inline_flags(existing)
             incoming_inline_flags = _padded_inline_flags(event)
@@ -1865,6 +1959,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             existing.absorb_reply_expected(event)
+            _record_absorbed_pending_event(existing, event)
             if existing_is_photo or incoming_is_photo:
                 existing.message_type = MessageType.PHOTO
             elif existing_type == MessageType.TEXT and event.message_type != MessageType.TEXT:
@@ -1880,6 +1975,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_reply_expected(event)
+            _record_absorbed_pending_event(existing, event)
             return
     pending_messages[session_key] = event
 
@@ -1915,23 +2011,22 @@ def resolve_channel_skills(
     bindings = config_extra.get("channel_skill_bindings") or []
     if not isinstance(bindings, list) or not bindings:
         return None
-    ids_to_check = {str(key) for key in (channel_id, parent_id) if key}
-    if not ids_to_check:
-        return None
-    for entry in bindings:
-        if not isinstance(entry, dict) or str(entry.get("id", "")) not in ids_to_check:
-            continue
-        skills = entry.get("skills") or entry.get("skill")
-        if isinstance(skills, str):
-            return [skills.strip()] if skills.strip() else None
-        if isinstance(skills, list) and skills:
-            seen = dict.fromkeys(
-                nm for name in skills if isinstance(name, str) and (nm := name.strip()))
-            return list(seen) or None
+    # One pass per id, not one pass matching either: the parent's entry may be listed first.
+    for wanted in (str(key) for key in (channel_id, parent_id) if key):
+        for entry in bindings:
+            if not isinstance(entry, dict) or str(entry.get("id", "")) != wanted:
+                continue
+            skills = entry.get("skills") or entry.get("skill")
+            if isinstance(skills, str):
+                return [skills.strip()] if skills.strip() else None
+            if isinstance(skills, list) and skills:
+                seen = dict.fromkeys(
+                    nm for name in skills if isinstance(name, str) and (nm := name.strip()))
+                return list(seen) or None
     return None
 
 
-def _split_post_delivery_entry(entry: Any) -> Tuple[Optional[int], Any]:
+def _split_post_delivery_entry(entry: Any) -> tuple[Optional[int], Any]:
     """``(generation, callback)`` from a post-delivery slot; legacy bare callbacks have no
     generation."""
     return entry if isinstance(entry, tuple) and len(entry) == 2 else (None, entry)
@@ -1958,6 +2053,9 @@ class BasePlatformAdapter(ABC):
     supports_code_blocks: bool = False
     # Typing indicator renders TEXT (status line); the gateway then feeds set_status_text().
     supports_status_text: bool = False
+    # Platform adapters may override the regular typing heartbeat cadence. Telegram narrows this
+    # from its own Bot API expiry window; every other adapter keeps the historical 2s default.
+    typing_refresh_interval: float = 2.0
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat. In-memory only: the
@@ -2004,15 +2102,15 @@ class BasePlatformAdapter(ABC):
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
         self._no_message_handler_logged: bool = False
-        self._reaction_handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+        self._reaction_handler: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None
         # Runner-owned boundary for normalized events: auth/profile state never lives in an adapter.
-        self._platform_event_handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]] = None
+        self._platform_event_handler: Optional[Callable[[dict[str, Any], Any], Awaitable[None]]] = None
         # Rewrites ``event.source.thread_id`` before session keying (Telegram DM topics).
         self._topic_recovery_fn: Optional[Callable[[Any], Optional[str]]] = None
         self._running, self._fatal_error_retryable = False, True
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
-        self._fatal_error_handler: Optional[Callable[["BasePlatformAdapter"], Awaitable[None] | None]] = None
+        self._fatal_error_handler: Optional[Callable[[BasePlatformAdapter], Awaitable[None] | None]] = None
         # Strong refs to shielded fatal-error handler tasks that outlive their carrier task
         # (asyncio keeps only weak refs); without them the loop can GC the detached handler
         # mid-flight — the "handler killed mid-flight" class (#81335).
@@ -2022,8 +2120,8 @@ class BasePlatformAdapter(ABC):
         self._platform_lock_takeover_allowed = self._platform_lock_takeover_attempted = False
         # Per-session interrupt Event + owner Task: without the owner map an old task's finally
         # could drop a newer guard.
-        self._active_sessions: Dict[str, asyncio.Event] = {}
-        self._pending_messages: Dict[str, MessageEvent] = {}
+        self._active_sessions: dict[str, asyncio.Event] = {}
+        self._pending_messages: dict[str, MessageEvent] = {}
         # Commands accepted while a turn is active but requiring a committed session boundary.
         # Kept separate from ordinary follow-up text so a deferred mutation cannot be merged into
         # or displaced by the one-slot prompt queue.
@@ -2035,10 +2133,10 @@ class BasePlatformAdapter(ABC):
 
         # Consecutive in-band drains per session of the just-dispatched event bouncing straight
         # back into the queue (session busy elsewhere); drives the drain back-off (#123229).
-        self._requeue_counts: Dict[str, int] = {}
-        self._pending_text_batches: Dict[str, MessageEvent] = {}
-        self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
-        self._session_tasks: Dict[str, asyncio.Task] = {}
+        self._requeue_counts: dict[str, int] = {}
+        self._pending_text_batches: dict[str, MessageEvent] = {}
+        self._pending_text_batch_tasks: dict[str, asyncio.Task] = {}
+        self._session_tasks: dict[str, asyncio.Task] = {}
         # Busy-text policy is a per-profile config decision the runner installs after construction
         # (``_wire_adapter_handlers``); a constructor-time process-env read would freeze the launch
         # profile's values into every profile's adapter under multiplexing (#116893). Defaults here
@@ -2054,7 +2152,7 @@ class BasePlatformAdapter(ABC):
         self._background_tasks: set[asyncio.Task] = set()
         # Post-delivery one-shots per session_key: bare callback (legacy) or ``(generation,
         # callback)`` so a stale run can't clear a fresher run's callback.
-        self._post_delivery_callbacks: Dict[str, Any] = {}
+        self._post_delivery_callbacks: dict[str, Any] = {}
         self._post_delivery_callbacks_by_generation: Dict[Tuple[str, int], Callable] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
@@ -2076,7 +2174,7 @@ class BasePlatformAdapter(ABC):
         # Chats whose typing indicator is paused (approval waits); _keep_typing skips them.
         self._typing_paused: set = set()
         # Per-chat status phrase; the regular _keep_typing refresh renders it (no extra API calls).
-        self._status_text: Dict[str, str] = {}
+        self._status_text: dict[str, str] = {}
 
     _MAX_DEFERRED_COMMANDS_PER_SESSION = 8
 
@@ -2193,14 +2291,14 @@ class BasePlatformAdapter(ABC):
         return False
 
     def supports_draft_streaming(
-        self, chat_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+        self, chat_type: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
         chat_id: Optional[str] = None) -> bool:
         """Whether native streaming-draft updates (``send_draft``) work for this chat type;
         ``chat_id`` lets the relay adapter answer per negotiated capabilities. Consumers
         fall back to ``send`` + ``edit_message`` when False or ``send_draft`` raises."""
         return False
 
-    def prefers_fresh_final_streaming(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
+    def prefers_fresh_final_streaming(self, content: str, metadata: Optional[dict[str, Any]] = None) -> bool:
         """Whether the stream consumer should finalize with a *fresh* final message (best-effort
         deleting the preview) instead of final-editing it (Telegram: keeps rich rendering)."""
         return False
@@ -2212,7 +2310,7 @@ class BasePlatformAdapter(ABC):
         return None
 
     async def send_draft(self, chat_id: str, draft_id: int, content: str,
-                         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+                         metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send or update an animated streaming-draft preview. Reuse one non-zero ``draft_id``
         across a response so the platform animates (different responses need different ids). Drafts
         have no message_id (no edit/reply/delete) — the final answer goes out as a regular ``send``.
@@ -2292,7 +2390,7 @@ class BasePlatformAdapter(ABC):
         return chat_id in self._auto_tts_enabled_chats or (
             chat_id not in self._auto_tts_disabled_chats and bool(self._auto_tts_default))
 
-    def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
+    def set_fatal_error_handler(self, handler: "Callable[[BasePlatformAdapter], Awaitable[None] | None]") -> None:
         self._fatal_error_handler = handler
 
     #: Published when an adapter is installed and running but its receive
@@ -2385,7 +2483,7 @@ class BasePlatformAdapter(ABC):
             except asyncio.CancelledError:
                 # Carrier cancelled (our own teardown inside the handler): let it finish detached.
                 if not task.done():
-                    task.add_done_callback(_consume_detached_handler_exception)
+                    task.add_done_callback(consume_detached_handler_exception)
                 raise
 
     def _acquire_platform_lock(self, scope: str, identity: str, resource_desc: str) -> bool:
@@ -2394,8 +2492,8 @@ class BasePlatformAdapter(ABC):
         ``--replace`` connect (the status module validates ownership and terminates)."""
         from gateway.status import (
             acquire_scoped_lock, scoped_lock_owner_label, take_over_scoped_lock_holder)
-        self._platform_lock_scope, self._platform_lock_identity = scope, identity
-        lock_meta = {"platform": self.platform.value}
+        self._platform_lock_scope, self._platform_lock_identity, self._platform_lock_nonce = scope, identity, uuid.uuid4().hex
+        lock_meta = {"platform": self.platform.value, "nonce": self._platform_lock_nonce}  # nonce: per-acquire owner
         acquired, existing = acquire_scoped_lock(scope, identity, metadata=lock_meta)
         if acquired:
             return True
@@ -2498,7 +2596,7 @@ class BasePlatformAdapter(ABC):
         self._message_handler = handler
 
     def set_platform_event_handler(
-        self, handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]]) -> None:
+        self, handler: Optional[Callable[[dict[str, Any], Any], Awaitable[None]]]) -> None:
         """Install the gateway-owned normalized platform-event boundary (stable dicts + internal
         ``SessionSource``); the runner owns authorization and plugin dispatch: no callback = fail
         closed."""
@@ -2533,7 +2631,7 @@ class BasePlatformAdapter(ABC):
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
 
-    def set_reaction_handler(self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]) -> None:
+    def set_reaction_handler(self, handler: Optional[Callable[[dict[str, Any]], Awaitable[None]]]) -> None:
         """Set the handler for platform-native emoji-reaction events: a normalised dict
         (``platform``, ``event_name`` "reaction:added"/"reaction:removed", ``reaction``,
         ``user_id``, ``item_user_id``, ``channel_id``, ``message_ts``, ``event_ts``, ``raw_event``)
@@ -2555,7 +2653,7 @@ class BasePlatformAdapter(ABC):
         non-boolean is "unknown", never an authorization that gates a credentialed side effect."""
         if not user_id or self._authorization_check is None:
             return None
-        extra: Dict[str, Any] = {}
+        extra: dict[str, Any] = {}
         if is_bot:
             extra["is_bot"] = True
         if thread_id is not None:
@@ -2588,7 +2686,7 @@ class BasePlatformAdapter(ABC):
         owner = getattr(self, "_owner_profile", None)
         return owner if isinstance(owner, str) and owner.strip() else None
 
-    def _canonicalize(self, source: Optional["SessionSource"]):
+    def _canonicalize(self, source: Optional[SessionSource]):
         """Pin the source's :class:`RoutingIdentity` before anything derives a key from it. Every
         ingress path (fresh event, batch merge, busy path, control command, callback) calls this
         FIRST. Returns the identity, or ``None`` when it cannot be resolved (a rejected route under
@@ -2612,7 +2710,7 @@ class BasePlatformAdapter(ABC):
             logger.debug("[%s] identity resolution failed; using legacy key readers", self.name, exc_info=True)
             return None
 
-    def _drop_unresolved(self, event: "MessageEvent") -> bool:
+    def _drop_unresolved(self, event: MessageEvent) -> bool:
         """True when *event* must be dropped: its identity could not be resolved because the route
         targets an unserved profile. Same disposition as the runner's ingress gate — one WARNING,
         never a fall-through to ``agent:main``."""
@@ -2691,11 +2789,11 @@ class BasePlatformAdapter(ABC):
             "text_batch_split_delay_seconds", self._TEXT_BATCH_DEFAULT_SPLIT_DELAY_S,
             min_value=self._text_batch_delay_seconds, max_value=self._TEXT_BATCH_MAX_SPLIT_DELAY_S)
 
-    def _event_session_key(self, event: "MessageEvent") -> str:
+    def _event_session_key(self, event: MessageEvent) -> str:
         """Adapter-level session key for ``event``, profile-namespaced like the agent run."""
         return self._source_session_key(event.source)
 
-    def _source_session_key(self, source: "SessionSource") -> str:
+    def _source_session_key(self, source: SessionSource) -> str:
         self._canonicalize(source)  # identity FIRST; no key derivation before it
         extra = self.config.extra
         return build_session_key(
@@ -2703,11 +2801,11 @@ class BasePlatformAdapter(ABC):
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(source))
 
-    def _text_batch_key(self, event: "MessageEvent") -> str:
+    def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event)
 
-    def _enqueue_text_event(self, event: "MessageEvent") -> None:
+    def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
         if self._drop_unresolved(event):
             return
@@ -2728,16 +2826,16 @@ class BasePlatformAdapter(ABC):
             prior_task.cancel()
         self._pending_text_batch_tasks[key] = asyncio.create_task(self._flush_text_batch(key))
 
-    def _text_batch_delay_for(self, pending: Optional["MessageEvent"]) -> float:
+    def _text_batch_delay_for(self, pending: Optional[MessageEvent]) -> float:
         """Quiet period before ``pending`` is dispatched; near-split chunks wait longer."""
         last_len = getattr(pending, "_last_chunk_len", 0) if pending is not None else 0
         return self._text_batch_split_delay_seconds if last_len >= self._SPLIT_THRESHOLD else self._text_batch_delay_seconds
 
-    def _pop_text_batch(self, key: str) -> Optional["MessageEvent"]:
+    def _pop_text_batch(self, key: str) -> Optional[MessageEvent]:
         """Remove and return the pending batch for ``key`` (adapters with side tables override)."""
         return self._pending_text_batches.pop(key, None)
 
-    async def _dispatch_text_batch(self, event: "MessageEvent") -> None:
+    async def _dispatch_text_batch(self, event: MessageEvent) -> None:
         """Hand a flushed batch to the pipeline (adapters with per-chat guards override)."""
         await self.handle_message(event)
 
@@ -2850,7 +2948,7 @@ class BasePlatformAdapter(ABC):
             return None
         try:
             return await asyncio.wait_for(result_future, timeout=_HISTORY_MEDIA_LOOKUP_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _fail_open("Timed out loading media-delivery history for")
             return None
         except Exception:
@@ -2870,7 +2968,7 @@ class BasePlatformAdapter(ABC):
 
     @abstractmethod
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
-                   metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+                   metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send ``content`` (may be markdown) to a chat; returns SendResult with message id."""
 
     # Surfaces needing an explicit finalize edit (DingTalk AI Cards): the consumer never skips it.
@@ -2946,15 +3044,15 @@ class BasePlatformAdapter(ABC):
     _EA_REASON_BUDGET: int = 0  # 0 = the reason is never truncated
 
     @property
-    def _EA_HEADER(self) -> str:  # noqa: N802 — adapter-override contract name
+    def _EA_HEADER(self) -> str:
         return f"⚠️ {ea_header_text()}\n\n"
 
     @property
-    def _EA_REASON_LABEL(self) -> str:  # noqa: N802
+    def _EA_REASON_LABEL(self) -> str:
         return f"{ea_reason_label_text()}: "
 
     @property
-    def _EA_SMART_DENY_LINE(self) -> str:  # noqa: N802
+    def _EA_SMART_DENY_LINE(self) -> str:
         return f"\n\n{ea_smart_deny_line_text()}"
 
     @staticmethod
@@ -3013,14 +3111,14 @@ class BasePlatformAdapter(ABC):
 
     # ── Exec-approval prompt (template method). The choice set is one rule for every button
     # surface — three separate "same fix × N adapters" commits motivated lifting it here.
-    _EA_ACTION_STYLES: Dict[str, str] = {"once": "primary", "deny": "danger"}
+    _EA_ACTION_STYLES: dict[str, str] = {"once": "primary", "deny": "danger"}
 
     @property
-    def _EA_ACTION_LABELS(self) -> Dict[str, str]:  # noqa: N802 — adapter-override contract name
+    def _EA_ACTION_LABELS(self) -> dict[str, str]:
         return ea_action_labels()
 
     def _exec_approval_actions(
-            self, *, allow_permanent: bool, allow_session: bool, smart_denied: bool) -> List[Tuple[str, str, str]]:
+            self, *, allow_permanent: bool, allow_session: bool, smart_denied: bool) -> list[tuple[str, str, str]]:
         """``(label, choice, style)`` rows for the approval buttons. A smart deny is an owner
         override for one operation only, so it offers neither the session nor the permanent tier;
         the permanent tier is never offered without the session tier."""
@@ -3040,7 +3138,7 @@ class BasePlatformAdapter(ABC):
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str, description: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
+        metadata: Optional[dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
         smart_denied: bool = False,
     ) -> SendResult:
         """Interactive exec-approval prompt; a press resolves via
@@ -3056,12 +3154,12 @@ class BasePlatformAdapter(ABC):
                 allow_permanent=allow_permanent, allow_session=allow_session, smart_denied=smart_denied))
         return await self._send_exec_approval_prompt(prompt)
 
-    async def _send_exec_approval_prompt(self, prompt: "ExecApprovalPrompt") -> SendResult:
+    async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Render ``prompt`` with the platform's native buttons; the default has none."""
         return SendResult(success=False, error="Not supported")
 
     @staticmethod
-    def _format_choice_page(options: list, page: int, per_page: int) -> "tuple[list, Dict[str, Any]]":
+    def _format_choice_page(options: list, page: int, per_page: int) -> tuple[list, dict[str, Any]]:
         """Shared picker pagination: clamp ``page``, slice ``options`` -> ``(page_options, meta)``
         with ``page``/``total_pages``/``start``/``end``/``total``/``page_info`` (`` (N–M of T)``,
         empty for one page)."""
@@ -3070,13 +3168,24 @@ class BasePlatformAdapter(ABC):
         page = max(0, min(page, total_pages - 1))
         start, end = page * per_page, min(page * per_page + per_page, total)
         page_info = t("gateway.picker.page_info", start=start + 1, end=end, total=total) if total_pages > 1 else ""
-        meta: Dict[str, Any] = {"page": page, "total_pages": total_pages, "start": start,
+        meta: dict[str, Any] = {"page": page, "total_pages": total_pages, "start": start,
                    "end": end, "total": total, "page_info": page_info}
         return options[start:end], meta
 
+    async def send_control_request(
+        self, chat_id: str, text: str, request_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a session-control approval request; non-button adapters use text fallback."""
+        return await self.send(
+            chat_id=chat_id,
+            content=f"{text}\n\nRequest: {request_id} (approval requires the Telegram buttons; this adapter cannot render them.)",
+            metadata=metadata,
+        )
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
-        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Three-option slash-command confirmation (e.g. ``/reload-mcp``). Button adapters render
         Approve Once / Always Approve / Cancel and MUST resolve via
         ``GatewayRunner._resolve_slash_confirm(confirm_id, "once"|"always"|"cancel")``. Default (not
@@ -3086,7 +3195,7 @@ class BasePlatformAdapter(ABC):
 
     async def send_clarify(
         self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
-        session_key: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        session_key: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Clarify prompt; button-capable adapters SHOULD override. Multiple choice (``choices``):
         one button per choice plus "Other"; callbacks MUST resolve via
         ``tools.clarify_gateway.resolve_gateway_clarify(clarify_id, response)``, "Other" calls
@@ -3116,7 +3225,7 @@ class BasePlatformAdapter(ABC):
 
     async def send_private_notice(
         self, chat_id: str, user_id: Optional[str], content: str, reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send a notice privately when the platform supports it; default is a normal send."""
         return await self.send(chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata)
 
@@ -3148,8 +3257,8 @@ class BasePlatformAdapter(ABC):
         await self.stop_typing(chat_id)
 
     async def send_multiple_images(
-        self, chat_id: str, images: List[Tuple[str, str]],
-        metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
+        self, chat_id: str, images: list[tuple[str, str]],
+        metadata: Optional[dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
         """Send ``(url, alt)`` images (``http(s)://`` or ``file://``) one by one (GIFs via
         ``send_animation``, local files via ``send_image_file``); override to bundle natively
         (Signal). Returns success when at least one image was delivered — the outcome
@@ -3185,14 +3294,14 @@ class BasePlatformAdapter(ABC):
 
     async def send_image(
         self, chat_id: str, image_url: str, caption: Optional[str] = None,
-        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send an image natively; default falls back to sending the URL as text."""
         text = f"{caption}\n{image_url}" if caption else image_url
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
     async def send_animation(
         self, chat_id: str, animation_url: str, caption: Optional[str] = None,
-        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send a GIF as a native animation (auto-plays inline); default falls back to
         send_image."""
         return await self.send_image(
@@ -3204,7 +3313,7 @@ class BasePlatformAdapter(ABC):
         return url.lower().split('?')[0].endswith('.gif')
 
     @staticmethod
-    def extract_images(content: str) -> Tuple[List[Tuple[str, str]], str]:
+    def extract_images(content: str) -> tuple[list[tuple[str, str]], str]:
         """Extract ``![alt](url)`` and ``<img src=...>`` image URLs from a response;
         returns ``([(url, alt_text), ...], content with those tags removed)``."""
         md_pattern = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
@@ -3232,7 +3341,7 @@ class BasePlatformAdapter(ABC):
 
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None,
-        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send audio as a native voice message (Telegram bubble / Discord attachment).
         Default: friendly failure notice."""
         return await self._send_media_fallback_notice(
@@ -3240,7 +3349,7 @@ class BasePlatformAdapter(ABC):
 
     async def _send_media_fallback_notice(
         self, method: str, kind: str, path: str, chat_id: str, caption: Optional[str],
-        reply_to: Optional[str], metadata: Optional[Dict[str, Any]], *, file_name: Optional[str] = None,
+        reply_to: Optional[str], metadata: Optional[dict[str, Any]], *, file_name: Optional[str] = None,
     ) -> SendResult:
         """Shared default for send_voice/send_video/send_document/send_image_file. The local path is
         logged but NEVER echoed into chat (host layout leak); only the caller's ``file_name`` is
@@ -3326,7 +3435,7 @@ class BasePlatformAdapter(ABC):
         return False
 
     async def begin_streaming_tts(
-        self, chat_id: str, audio_format: AudioFormat, metadata: Optional[Dict[str, Any]] = None,
+        self, chat_id: str, audio_format: AudioFormat, metadata: Optional[dict[str, Any]] = None,
     ) -> Optional[StreamingTTSHandle]:
         """Open a streaming-audio session; returns an opaque handle for the
         write/finish/abort calls, or ``None`` to decline (whole-file fallback)."""
@@ -3356,21 +3465,21 @@ class BasePlatformAdapter(ABC):
 
     async def send_video(
         self, chat_id: str, video_path: str, caption: Optional[str] = None,
-        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a video natively (inline playable). Default: friendly failure notice."""
         return await self._send_media_fallback_notice(
             "send_video", "video", video_path, chat_id, caption, reply_to, metadata)
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
                             file_name: Optional[str] = None, reply_to: Optional[str] = None,
-                            metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+                            metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a document/file natively. Default: friendly failure notice."""
         return await self._send_media_fallback_notice(
             "send_document", "file", file_path, chat_id, caption, reply_to, metadata, file_name=file_name)
 
     async def _notify_media_delivery_failure(
         self, chat_id: str, media_path: str, *, is_voice: bool = False,
-        metadata: Optional[Dict[str, Any]] = None) -> None:
+        metadata: Optional[dict[str, Any]] = None) -> None:
         """User-visible notice when a MEDIA attachment upload failed: the tag was
         already stripped from the text, so silence would be a silent drop.
 
@@ -3395,7 +3504,7 @@ class BasePlatformAdapter(ABC):
 
     async def send_image_file(
         self, chat_id: str, image_path: str, caption: Optional[str] = None,
-        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a local image file natively (send_image takes a URL). Default: friendly notice."""
         return await self._send_media_fallback_notice(
             "send_image_file", "image", image_path, chat_id, caption, reply_to, metadata)
@@ -3407,14 +3516,14 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def filter_media_delivery_paths(media_files, session_key: str = "",
-                                    dropped: Optional[List[dict]] = None) -> List[Tuple[str, bool]]:
+                                    dropped: Optional[list[dict]] = None) -> list[tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths; ``dropped`` collects the rejects."""
         return [
             (safe_path, bool(is_voice)) for media_path, is_voice in media_files or []
             if (safe_path := _validated_delivery_path(media_path, session_key, "MEDIA directive path", dropped))]
 
     @staticmethod
-    def filter_local_delivery_paths(file_paths, session_key: str = "") -> List[str]:
+    def filter_local_delivery_paths(file_paths, session_key: str = "") -> list[str]:
         """Drop unsafe bare local file paths and normalize accepted paths."""
         safe_paths = (_validated_delivery_path(p, session_key, "local file path") for p in file_paths or [])
         return [p for p in safe_paths if p]
@@ -3463,7 +3572,7 @@ class BasePlatformAdapter(ABC):
         return _blank_spans(content, spans)
 
     @staticmethod
-    def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
+    def extract_media(content: str) -> tuple[list[tuple[str, bool]], str]:
         """Extract ``MEDIA:<path>`` tags and strip ``[[audio_as_voice]]`` / ``[[as_document]]`` ->
         ``([(path, is_voice), ...], cleaned)``. Both directives are message-global;
         ``[[as_document]]`` (unmodified sendDocument for large images) is detected by dispatch sites
@@ -3513,7 +3622,7 @@ class BasePlatformAdapter(ABC):
         return re.sub(r'\n{3,}', '\n\n', _strip_media_tag_directives(text)).rstrip()
 
     @staticmethod
-    def extract_local_files(content: str) -> Tuple[List[str], str]:
+    def extract_local_files(content: str) -> tuple[list[str], str]:
         """Bare local file paths (absolute, ``~/`` or drive-letter) with deliverable extensions ->
         ``(expanded_paths, cleaned_text)``. Candidates must exist on disk (URLs / hallucinated paths
         ignored); paths inside fenced or inline code are skipped so code samples are never
@@ -3545,6 +3654,15 @@ class BasePlatformAdapter(ABC):
             cleaned = cleaned.replace(raw, '')
         return list(unique), re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
+    def _typing_tick_retry_delay(self, result: Any, *, timed_out: bool, failed: bool) -> Optional[float]:
+        """Seconds before retrying one ``_keep_typing`` tick, or ``None`` to wait for the next tick.
+        The 2s default cadence already re-covers a missed tick, so the base adapter never retries."""
+        return None
+
+    def _typing_tick_anchor_before_send(self) -> bool:
+        """Whether a typing tick's deadline starts before its send request."""
+        return False
+
     async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None,
                            stop_event: asyncio.Event | None = None) -> None:
         """Refresh the typing indicator every ``interval`` seconds until cancelled (platform typing
@@ -3552,23 +3670,44 @@ class BasePlatformAdapter(ABC):
         setStatus disables the compose box). Each ``send_typing`` is bounded by a sub-interval
         timeout so one slow round-trip is abandoned before the next tick, not the bubble lapsing."""
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
+        loop = asyncio.get_running_loop()
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
+                deadline = loop.time() + interval if self._typing_tick_anchor_before_send() else None
                 if chat_id not in self._typing_paused:
-                    try:
-                        await asyncio.wait_for(self.send_typing(chat_id, metadata=metadata),
-                                               timeout=_send_typing_timeout)
-                    except asyncio.TimeoutError:
-                        pass  # Slow network — abandon this tick, stay on schedule.
-                    except Exception as typing_err:
-                        logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
+                    retry_used = False
+                    while True:
+                        timed_out = failed = False
+                        result = None
+                        try:
+                            result = await asyncio.wait_for(self.send_typing(chat_id, metadata=metadata),
+                                                           timeout=_send_typing_timeout)
+                        except TimeoutError:
+                            timed_out = True
+                        except Exception as typing_err:
+                            failed = True
+                            logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
+                        if deadline is None:
+                            deadline = loop.time() + interval
+                        retry_delay = self._typing_tick_retry_delay(
+                            result, timed_out=timed_out, failed=failed)
+                        # Retry only if the sleep plus a full bounded send still ends before the
+                        # next regular tick; otherwise low intervals send two actions back to back.
+                        remaining = deadline - loop.time()
+                        if (retry_used or retry_delay is None
+                                or remaining <= retry_delay + _send_typing_timeout):
+                            break
+                        retry_used = True
+                        await asyncio.sleep(retry_delay)
+                        if (stop_event is not None and stop_event.is_set()) or chat_id in self._typing_paused:
+                            break
+                if deadline is None:
+                    deadline = loop.time() + interval
                 if stop_event is None:
-                    await asyncio.sleep(interval)
+                    await asyncio.sleep(max(0.0, deadline - loop.time()))
                     continue
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + interval
                 while not stop_event.is_set():
                     remaining = deadline - loop.time()
                     if remaining <= 0:
@@ -3579,6 +3718,10 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
+            cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
+            if cancel_retrigger is not None:
+                with contextlib.suppress(Exception):
+                    cancel_retrigger(chat_id, metadata)
             # A send_typing after an outer stop_typing() may have recreated the platform loop.
             await self._stop_typing_quietly(chat_id, metadata)
             self._typing_paused.discard(chat_id)
@@ -3589,6 +3732,10 @@ class BasePlatformAdapter(ABC):
         self, chat_id: str, typing_task: asyncio.Task | None = None, *, metadata=None,
         timeout: float = 0.5, stop_attempts: int = 2) -> None:
         """Stop the refresh task and platform typing state as one operation."""
+        cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
+        if cancel_retrigger is not None:
+            with contextlib.suppress(Exception):
+                cancel_retrigger(chat_id, metadata)
         self._typing_paused.add(chat_id)
         try:
             if typing_task is not None and not typing_task.done():
@@ -3753,7 +3900,7 @@ class BasePlatformAdapter(ABC):
         lowered = (error or "").lower()
         return any(pat in lowered for pat in ("timed out", "readtimeout", "writetimeout"))
 
-    def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
+    def _unwrap_ephemeral(self, response: Any) -> tuple[Optional[str], int]:
         """Unwrap a str/None/:class:`EphemeralReply` response into ``(text, ttl)``. ``ttl > 0``
         means schedule ``_schedule_ephemeral_delete`` after a successful send; forced to 0 when the
         adapter doesn't override ``delete_message`` so non-supporting platforms degrade to normal
@@ -3776,6 +3923,10 @@ class BasePlatformAdapter(ABC):
         awaiting it holds every later update (and the next poll) behind that wait."""
         thread_meta = _thread_metadata_for_event(event)
         response = await self._message_handler(event)
+        # The handler ran the command: that is this event's admission, whatever the reply's fate.
+        # Scheduled command wakes (a /loop tick of /status) count their tick on this receipt.
+        event._gateway_inline_command_handled = True
+        event._gateway_accepted = True
         from gateway.outbox import active_turn, bind_event_turn, restore_turn, run_turn_child
         token = bind_event_turn(event)
         try:
@@ -3850,13 +4001,28 @@ class BasePlatformAdapter(ABC):
     @records_delivery
     async def _send_with_retry(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
-        max_retries: int = 2, base_delay: float = 2.0) -> "SendResult":
+        max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
-        async def _send(text: str) -> "SendResult":
+        result = await self._send_with_retry_body(
+            chat_id, content, reply_to=reply_to, metadata=metadata,
+            max_retries=max_retries, base_delay=base_delay)
+        task = asyncio.current_task()
+        pending = _PENDING_LEDGER_SETTLEMENT.get()
+        if pending is not None and task is not None and task.cancelling():
+            if getattr(result, "success", False):
+                self._settle_delivered_obligation_sync(pending[0])
+        return result
+
+    async def _send_with_retry_body(
+        self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
+        max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
+        """Send with exponential-backoff retry on transient network errors; permanent
+        failures fall back to a plain-text send, exhausted retries notify the user."""
+        async def _send(text: str) -> SendResult:
             return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
-        async def _send_again(previous: "SendResult") -> "Optional[SendResult]":
+        async def _send_again(previous: SendResult) -> Optional[SendResult]:
             """Retry: the whole payload normally; only the undelivered remainder after a partial split
             delivery (``raw_response["partial_overflow"]``). ``None`` when the adapter cannot resume — the
             caller then keeps the partial failure rather than re-sending the already-visible head."""
@@ -3977,7 +4143,8 @@ class BasePlatformAdapter(ABC):
                 mark_stale(chat_id, thread_id)
             prune = getattr(self, "_prune_stale_dm_topic_binding", None)
             if callable(prune):
-                prune(chat_id, thread_id, metadata=topic_meta)
+                # A state.db write: run it off the loop, still before the root-chat fallback send.
+                await asyncio.to_thread(prune, chat_id, thread_id, metadata=topic_meta)
             root_meta = {key: value for key, value in topic_meta.items() if key not in {
                 "thread_id", "message_thread_id", "direct_messages_topic_id",
                 "telegram_direct_messages_topic_id", "telegram_reply_to_message_id",
@@ -3986,10 +4153,14 @@ class BasePlatformAdapter(ABC):
             }}
             root_meta["telegram_stale_topic_recovery"] = True
             partial = self._is_partial_delivery(result)
-            root_content = (
-                "A response was partially delivered before its Telegram topic was deleted. "
-                "The complete response remains in Hermes session history."
-                if partial else "Recovered response from a deleted Telegram topic:\n\n" + content)
+            if partial:
+                root_content = ("A response was partially delivered before its Telegram topic was deleted. "
+                                "The complete response remains in Hermes session history.")
+            elif topic_meta.get("copy_block"):
+                # A copy block moves to the root unchanged: a banner would break the exact text.
+                root_content = content
+            else:
+                root_content = "Recovered response from a deleted Telegram topic:\n\n" + content
             logger.warning("[%s] Recovering completed reply from deleted Telegram topic chat=%s thread=%s",
                            self.name, chat_id, thread_id)
             return await self.send(chat_id=chat_id, content=root_content, reply_to=None, metadata=root_meta)
@@ -4000,6 +4171,12 @@ class BasePlatformAdapter(ABC):
         if self._is_partial_delivery(result):
             # Part of a split payload is already on screen; a plain-text re-send of the whole would duplicate it.
             logger.warning("[%s] Send failed after partial delivery: %s — not re-sending as plain text", self.name, error_str)
+            return result
+        if isinstance(metadata, dict) and metadata.get("copy_block"):
+            # A copy block already went out as plain text, so formatting is not the cause, and a
+            # banner-prefixed resend would no longer be the exact text to copy. The failure stands
+            # and the delivery ledger owns the retry.
+            logger.warning("[%s] Copy block send failed: %s — not re-sending with a fallback banner", self.name, error_str)
             return result
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
@@ -4016,14 +4193,14 @@ class BasePlatformAdapter(ABC):
                        "not retrying or falling back to plain text", self.name, result.error)
         return True
 
-    def _send_retry_is_final(self, result: "SendResult") -> bool:
+    def _send_retry_is_final(self, result: SendResult) -> bool:
         """True when a failed send must be returned as-is: neither a retry nor the plain-text
         fallback can fix it (a structured auth/target refusal, or a non-final send a platform's
         volume budget shed on purpose)."""
         return getattr(result, "error", None) == SEND_SHED_BY_BUDGET
 
     @staticmethod
-    def _is_partial_delivery(result: "SendResult") -> bool:
+    def _is_partial_delivery(result: SendResult) -> bool:
         """True when a split payload was PARTLY delivered (``raw_response["partial_overflow"]``, the
         contract Telegram's send/edit-overflow paths set and the stream consumer reads): the visible
         head must never be sent again."""
@@ -4031,14 +4208,14 @@ class BasePlatformAdapter(ABC):
         return isinstance(raw, dict) and bool(raw.get("partial_overflow"))
 
     async def _resume_partial_send(
-        self, chat_id: str, result: "SendResult", *, reply_to: Optional[str], metadata: Any) -> "Optional[SendResult]":
+        self, chat_id: str, result: SendResult, *, reply_to: Optional[str], metadata: Any) -> Optional[SendResult]:
         """Deliver only the remainder of a partially delivered split payload. ``None`` (the default) means
         this adapter cannot resume; ``_send_with_retry`` then returns the partial failure instead of
         re-sending the whole payload. Override only where non-delivery of the remainder is CERTAIN."""
         return None
 
     async def _send_plain_fallback(
-            self, chat_id: str, content: str, *, reply_to: Optional[str], metadata: Any) -> "SendResult":
+            self, chat_id: str, content: str, *, reply_to: Optional[str], metadata: Any) -> SendResult:
         """Last-resort send after a non-transient failure; platforms whose markup is not the
         likely culprit override it (Photon drops rich links instead of adding the banner)."""
         return await self.send(
@@ -4073,7 +4250,13 @@ class BasePlatformAdapter(ABC):
         return result
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
-        """Return True when two text debounce events came from the same sender."""
+        """Batch only unadmitted human text from the same sender."""
+        from gateway.platforms.event import _is_human_event
+
+        if not all(_is_human_event(candidate) and not candidate.is_command()
+                   and not getattr(candidate, "_gateway_compression_deferred", False)
+                   for candidate in (existing, event)):
+            return False
 
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
@@ -4246,7 +4429,7 @@ class BasePlatformAdapter(ABC):
                 await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
             except asyncio.CancelledError:
                 pass
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("[%s] Cancelled task for %s did not exit within 5s; "
                                "unblocking dispatch and letting the task unwind in the background",
                                self.name, session_key)
@@ -4340,6 +4523,21 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
+        # Retirement admission precedes busy/debounce queues. The runner repeats
+        # this check when draining prompts queued before retirement was requested.
+        runner = self.gateway_runner
+        if runner is not None and self.platform == Platform.TELEGRAM:
+            from gateway.telegram_retire import intercept
+            if self._is_sender_authorized(event.source.user_id, event.source.chat_type,
+                                          event.source.chat_id, thread_id=event.source.thread_id) is True:
+                notice = await intercept(runner, event)
+                if notice is not None:
+                    if notice:
+                        await self.send(str(event.source.chat_id), notice, metadata=_thread_metadata_for_event(event))
+                    event._gateway_accepted = True
+                    from gateway.telegram_retire import advance
+                    await advance(runner, event.source)
+                    return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
@@ -4354,6 +4552,19 @@ class BasePlatformAdapter(ABC):
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
+        # Busy admission bypasses the normal inbound path, so apply the same relay-origin contract
+        # before any branch can queue, debounce, or merge the event. Once each complete event carries
+        # ``reply_expected=False``, MessageEvent.absorb_reply_expected preserves it only when every
+        # merged event is likewise unaddressed; a typed human event restores the visible fallback.
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        apply_agent_origin_reply_expectation(event)
+        from gateway.cron_review import fail_busy_review
+        if fail_busy_review(event):
+            # A hidden cron review must never queue behind a live turn: a queued event is
+            # later drained in-band without its capture and would post its reply. The
+            # scheduler sends the original report on time instead.
+            event._gateway_accepted = True  # handled: the busy cause reaches the caller
+            return
         # Bypass commands run inline: queued they'd leak as user text (/new) or deadlock
         # (/approve, /deny — the agent is blocked on Event.wait).  Dispatch inline by
         # calling the message handler directly and sending the response.  Do NOT use
@@ -4396,8 +4607,9 @@ class BasePlatformAdapter(ABC):
         # Otherwise it lands in _pending_messages as a follow-up turn and the answer is
         # discarded.  Same shape as the /approve deadlock fix (PR #4926): agent thread
         # blocked on Event.wait, message must reach the resolver before being a new turn.
-        # See #4926.
-        if not cmd and event.allow_gateway_control:
+        # See #4926. Gateway-authored synthetic events (internal) never answer a human prompt;
+        # they take the normal busy-session queue below.
+        if not cmd and event.allow_gateway_control and not event.internal:
             try:
                 from tools import clarify_gateway as _clarify_mod
                 _has_text_clarify = _clarify_mod.get_pending_for_session(
@@ -4425,10 +4637,30 @@ class BasePlatformAdapter(ABC):
             # base path instead (returned False, or raised before storing it) and nothing is
             # queued, start this event.
             if session_key not in self._active_sessions:
-                orphan = self._pending_messages.pop(session_key, None)
-                if orphan is not None:
-                    self._start_session_processing(orphan, session_key)
-                elif not handled:
+                # Busy admission queues through the delivery adapter resolved when it stored the
+                # event; a reconnect during the handler's later awaits can replace that adapter.
+                # Recover from whichever slot actually holds it — this one, or the replacement —
+                # and start it on that slot's owner. A replacement with a live guard drains its
+                # own slot, so leave that one alone.
+                owners = [self]
+                runner = getattr(self, "gateway_runner", None)
+                if runner is not None:
+                    try:
+                        delivery_adapter = runner._delivery_adapter_for(event.source)
+                    except Exception:
+                        delivery_adapter = None
+                        logger.debug("[%s] Delivery-adapter lookup failed during pending recovery",
+                                     self.name, exc_info=True)
+                    if (delivery_adapter is not None and delivery_adapter is not self
+                            and session_key not in delivery_adapter._active_sessions):
+                        owners.append(delivery_adapter)
+                orphan = None
+                for owner in owners:
+                    orphan = owner.get_pending_message(session_key)
+                    if orphan is not None:
+                        owner._start_session_processing(orphan, session_key)
+                        break
+                if orphan is None and not handled:
                     event._gateway_accepted = self._start_session_processing(event, session_key)
                     return
             if handled:
@@ -4464,11 +4696,20 @@ class BasePlatformAdapter(ABC):
         lo, hi = bounds
         return random.uniform(lo / 1000.0, hi / 1000.0)
 
-    async def _synthesize_auto_tts(self, text_content: str) -> Tuple[List[str], Optional[str]]:
+    def _spoken_reply_text(self, extracted: "_ExtractedResponse") -> str:
+        """The reply as auto-TTS speaks it: paste-ready copy bodies are read, never spoken."""
+        raw = extracted.pre_extract or ""
+        without_copy = strip_copy_blocks(raw)
+        if without_copy == raw:
+            return extracted.text_content
+        _, spoken = self.extract_images(self.extract_media(without_copy)[1])
+        return _strip_media_directives(spoken).strip()
+
+    async def _synthesize_auto_tts(self, text_content: str) -> tuple[list[str], Optional[str]]:
         """Synthesize auto-TTS audio -> ``(existing_paths, requested_path)``; empty/None on failure
         (logged, never raised). Path built platform-aware HERE: HERMES_SESSION_PLATFORM is cleared
         post-handler."""
-        paths: List[str] = []
+        paths: list[str] = []
         requested_path = None
         try:
             from tools.tts_tool import text_to_speech_tool, check_tts_requirements
@@ -4499,7 +4740,7 @@ class BasePlatformAdapter(ABC):
 
     async def _play_tts_file(
         self, event: MessageEvent, text_content: str, tts_path: str, first: bool,
-        metadata: Dict[str, Any], record_delivery: Callable) -> bool:
+        metadata: dict[str, Any], record_delivery: Callable) -> bool:
         """Play one synthesized TTS file. Returns True when the ORIGINAL reply text rode
         along as a Telegram caption (first file, ≤1024 chars) so the text send is skipped."""
         caption = None
@@ -4524,7 +4765,7 @@ class BasePlatformAdapter(ABC):
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
         delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool, *,
-        outbox_refused: bool = False) -> Optional[str]:
+        metadata: Optional[Dict[str, Any]] = None, outbox_refused: bool = False) -> Optional[str]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None. ``outbox_refused`` ledgers an outbox-covered final after the adapter refused it
@@ -4539,18 +4780,26 @@ class BasePlatformAdapter(ABC):
             if not await asyncio.to_thread(ledger_enabled):
                 return None
             source = event.source
-            # ``ledger_message_id`` wins when set: a queued chain's final answers the last message
-            # of the chain, not the event that opened it (see ``MessageEvent.ledger_message_id``).
-            _ledger_id = getattr(event, "ledger_message_id", None)
-            if _ledger_id is None:
-                _ledger_id = getattr(event, "message_id", "")
+            # The ledger identity for the ordinary reply stays unchanged for compatibility. Copy
+            # blocks derive a per-part message ref below, so identical bodies never overwrite each
+            # other's obligations (and a block equal to the reply remains distinct).
+            _ledger_message_ref = getattr(event, "ledger_message_id", None)
+            if _ledger_message_ref is None:
+                _ledger_message_ref = getattr(event, "message_id", "")
+            _copy_index = (metadata or {}).get("copy_block_index") if (metadata or {}).get("copy_block") else None
+            if _copy_index is not None:
+                _ledger_message_ref = f"{_ledger_message_ref}#copy{_copy_index}"
             obligation_id = compute_obligation_id(
-                session_key, str(_ledger_id or ""), text_content)
+                session_key, str(_ledger_message_ref or ""), text_content)
+            from gateway.copy_blocks import wrap_copy_block
+            ledger_content = (
+                wrap_copy_block(text_content) if (metadata or {}).get("copy_block") else text_content
+            )
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
-                content=text_content,
+                content=ledger_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 resume_marker=getattr(event, "_restart_note_expected_marker", None),
                 resume_turn_id=getattr(event, "_gateway_active_turn_token", None))
@@ -4559,6 +4808,21 @@ class BasePlatformAdapter(ABC):
         except Exception:
             logger.debug("delivery ledger record failed", exc_info=True)
             return None
+
+    def _settle_delivered_obligation_sync(self, obligation_id: str) -> None:
+        """Mark delivered a send that already landed when this task was cancelled.
+
+        Another await would itself raise CancelledError and skip the write, which is how a
+        queued-lane interrupt left a landed Telegram message 'attempting' with attempts=0.
+        Only success settles here. A failed result needs the async finalizer's refusal,
+        follow-up and redelivery handling, which a cancelled turn cannot run, so that row
+        stays 'attempting' for the existing ambiguous-send recovery.
+        """
+        try:
+            from gateway.delivery_ledger import mark_delivered
+            mark_delivered(obligation_id)
+        except Exception:
+            logger.debug("delivery ledger update failed", exc_info=True)
 
     async def _finalize_delivery_obligation(
         self, obligation_id: str, result: Any, event: MessageEvent,
@@ -4595,7 +4859,7 @@ class BasePlatformAdapter(ABC):
 
     async def _deliver_media_attachments(
         self, event: MessageEvent, media_files: list, local_files: list, *,
-        force_document_attachments: bool, human_delay: float, metadata: Dict[str, Any],
+        force_document_attachments: bool, human_delay: float, metadata: dict[str, Any],
         record_delivery: Callable) -> None:
         """Deliver MEDIA-tag files and detected local files by type: images batched via
         ``send_multiple_images`` unless ``[[as_document]]``; otherwise audio → send_voice (MEDIA
@@ -4647,7 +4911,7 @@ class BasePlatformAdapter(ABC):
                     logger.error("[%s] Error sending local file %s: %s", self.name, path, err)
 
     async def _send_image_batch(
-        self, event: MessageEvent, images: list, metadata: Dict[str, Any], human_delay: float,
+        self, event: MessageEvent, images: list, metadata: dict[str, Any], human_delay: float,
         record_delivery: Callable) -> None:
         """Batch-send images; a failure is logged (never raised) so other attachments still go.
         The batch result feeds ``record_delivery`` so media-only turns report their real
@@ -4664,6 +4928,7 @@ class BasePlatformAdapter(ABC):
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
         reply_to: Optional[str], is_ephemeral_response: bool = False, release_marker: bool = True,
+        on_refused: Optional[Callable[["SendResult", "BasePlatformAdapter"], Awaitable[None]]] = None,
     ) -> "tuple[SendResult, BasePlatformAdapter]":
         """The delivery-ledger bracket every final text goes through, on the CURRENT transport
         (a reconnect may have replaced this adapter): record the obligation before the send,
@@ -4676,19 +4941,37 @@ class BasePlatformAdapter(ABC):
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+            event, session_key, text_content, delivery_adapter, is_ephemeral_response,
+            metadata=metadata)
         if obligation_id is not None and release_marker:
             # The ledger now owns the crash recovery. It carries text only, so a caller with
             # attachments still to send keeps the marker until they are delivered.
             await self._release_turn_marker(event)
-        result = await delivery_adapter._send_with_retry(
-            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+        # A turn can be cancelled after transport success but before finalization. The send
+        # wrapper settles that success synchronously so recovery cannot resend it. A cancelled
+        # transport produces no result and stays attempting.
+        settlement = _PENDING_LEDGER_SETTLEMENT.set(
+            (obligation_id, event, delivery_adapter) if obligation_id is not None else None)
+        try:
+            result = await delivery_adapter._send_with_retry(
+                chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+        finally:
+            _PENDING_LEDGER_SETTLEMENT.reset(settlement)
+        # Let records_delivery count the captured result before cancellation propagates,
+        # but suspend before refusal callbacks or a failure write can run.
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            await asyncio.sleep(0)
         if (obligation_id is None and not result.success and result.pre_send
                 and self._outbox_covers_final(event, delivery_adapter)):
             obligation_id = await self._record_delivery_obligation(
                 event, session_key, text_content, delivery_adapter, is_ephemeral_response,
-                outbox_refused=True)
+                metadata=metadata, outbox_refused=True)
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
+        if on_refused is not None and not getattr(result, "success", False):
+            # Ledger whatever must follow this message BEFORE finalizing it: finalizing can run a
+            # recovery sweep right away, and that sweep must see the followers too.
+            await on_refused(result, delivery_adapter)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
         return result, delivery_adapter
@@ -4736,7 +5019,7 @@ class BasePlatformAdapter(ABC):
         return
 
     async def _send_final_text(
-        self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
+        self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
         is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable,
         attachments_pending: bool = False) -> None:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
@@ -4747,6 +5030,74 @@ class BasePlatformAdapter(ABC):
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+
+    async def _send_copy_blocks(
+        self, event: MessageEvent, session_key: str, copy_blocks: list[str], metadata: Dict[str, Any],
+        record_delivery: Callable, *, attachments_pending: bool = False,
+        is_ephemeral_response: bool = False, ephemeral_ttl: int = 0,
+    ) -> None:
+        """Deliver copy blocks in source order through the final delivery ledger, without pacing."""
+        previous_send_started = None
+        for index, block in enumerate(copy_blocks):
+            send_started = time.monotonic()
+            if previous_send_started is not None:
+                logger.debug(
+                    "[%s] Copy block %d/%d inter-message start gap: %.3fs",
+                    self.name, index, len(copy_blocks), send_started - previous_send_started)
+            previous_send_started = send_started
+            copy_metadata = dict(metadata)
+            copy_metadata["copy_block"] = True
+            copy_metadata["copy_block_index"] = index
+            copy_metadata["plain"] = True
+            deferred: list = []
+
+            async def _defer_rest(refused, refusing_adapter, _index=index, _metadata=copy_metadata):
+                # A later block must never overtake an undelivered earlier one: the rest wait
+                # in the ledger behind the refused block, and redelivery keeps their order.
+                deferred.extend(await self._defer_copy_blocks(
+                    event, session_key, copy_blocks, _index + 1, _metadata, refusing_adapter,
+                    str(refused.error or "send failed"), is_ephemeral_response=is_ephemeral_response))
+
+            result, delivery_adapter = await self.send_final_ledgered(
+                event, session_key, block, copy_metadata,
+                reply_to=_reply_anchor_for_event(event),
+                is_ephemeral_response=is_ephemeral_response,
+                release_marker=(index == len(copy_blocks) - 1 and not attachments_pending),
+                on_refused=_defer_rest,
+            )
+            record_delivery(result)
+            if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
+                delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+            if not getattr(result, "success", False):
+                logger.error(
+                    "[%s] Copy block %d/%d failed for %s: %s",
+                    self.name, index + 1, len(copy_blocks), event.source.chat_id,
+                    result.error or "unknown delivery error",
+                )
+                for held in deferred:
+                    record_delivery(held)
+                return
+
+    async def _defer_copy_blocks(
+        self, event: MessageEvent, session_key: str, copy_blocks: list[str], start: int,
+        metadata: Dict[str, Any], delivery_adapter: "BasePlatformAdapter", error: str,
+        *, is_ephemeral_response: bool,
+    ) -> list:
+        """Ledger blocks ``start..`` as failed, in order, without sending them; one result each."""
+        from gateway.delivery_ledger import mark_failed
+        held: list = []
+        for index in range(start, len(copy_blocks)):
+            block_metadata = {**metadata, "copy_block_index": index}
+            # Never sent, so the durable outbox will not replay it: the ledger must own it.
+            obligation_id = await self._record_delivery_obligation(
+                event, session_key, copy_blocks[index], delivery_adapter, is_ephemeral_response,
+                metadata=block_metadata, outbox_refused=True)
+            if obligation_id is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(mark_failed, obligation_id, error)
+            held.append(SendResult(
+                success=False, error=f"copy block {index + 1} held behind an undelivered earlier block"))
+        return held
 
     async def _notify_turn_error(
         self, event: MessageEvent, e: BaseException, session_key: Optional[str] = None,
@@ -4775,8 +5126,8 @@ class BasePlatformAdapter(ABC):
                 "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
         return _thread_metadata
 
-    async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
-                                   metadata: Dict[str, Any], *, anything_sent: bool,
+    async def _deliver_attachments(self, event: MessageEvent, extracted: _ExtractedResponse,
+                                   metadata: dict[str, Any], *, anything_sent: bool,
                                    record_delivery: Callable, session_key: Optional[str] = None,
                                    is_ephemeral_response: bool = False) -> None:
         """Send extracted image URLs, MEDIA files and bare local files (human-paced),
@@ -4813,21 +5164,29 @@ class BasePlatformAdapter(ABC):
         # A scheduled heartbeat is proactive work: no typing indicator until it has something to say.
         if not getattr(self.config, "typing_indicator", True) or getattr(event, "_heartbeat_session_id", None):
             return None
-        kwargs: Dict[str, Any] = {"metadata": metadata}
+        kwargs: dict[str, Any] = {"interval": self.typing_refresh_interval, "metadata": metadata}
         if self._accepts_kwarg(self._keep_typing, "stop_event", var_kw=False, unknown=True):
             kwargs["stop_event"] = interrupt_event
         return asyncio.create_task(self._keep_typing(event.source.chat_id, **kwargs))
 
     async def _extract_response_content(self, response: str, event: MessageEvent, session_key: str,
-                                        *, is_ephemeral_response: bool) -> "_ExtractedResponse":
-        """Split a handler response into deliverable text + attachments. Order matters: MEDIA tags →
-        image URLs → residual directives → bare local paths (skipped for command replies and
-        ephemeral notices so paths they mention stay text; unknown-extension MEDIA tags survive for
-        the bare-path detector). History
-        dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered."""
-        # Captured before extract_media strips it: images then go via send_document (no recompression).
-        force_document = "[[as_document]]" in response
+                                        *, is_ephemeral_response: bool) -> _ExtractedResponse:
+        """Split a handler response into deliverable text, copy blocks and attachments. Order matters:
+        copy blocks are removed first so MEDIA/image/file directives inside a block remain literal body text.
+        Remaining text then follows the existing MEDIA → image → residual directive → bare local path
+        pipeline. History dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is
+        recovered."""
         pre_extract = response
+        # Platforms without a plain copy send keep blocks inline; their bodies ride through
+        # directive extraction as opaque tokens, so literal text never becomes an attachment.
+        if getattr(event, "_copy_blocks_inline_only", False):
+            # Interrupted turn: a block may be partial, so it stays inline, still literal.
+            response, inline_bodies = protect_inline_copy_bodies(response)
+            copy_blocks = []
+        else:
+            response, copy_blocks, inline_bodies = split_copy_blocks_protected(self, response)
+        # Captured after copy extraction: [[as_document]] inside a copy block is literal copied text.
+        force_document = "[[as_document]]" in response
         # Gateway-authored text (slash-command output, ephemeral notices) only mentions paths.
         skip_bare_paths = is_ephemeral_response or isinstance(response, CommandReply)
         # The handler's routed profile scope is gone by now; Docker MEDIA translation and the
@@ -4859,7 +5218,7 @@ class BasePlatformAdapter(ABC):
         # A2 (#29346): extraction can reduce a non-empty response to empty text with no attachment, and the
         # `if text_content` guard below then drops it silently. Recover on every platform (#33842 was
         # Discord-only); the guard avoids duplicating an attachment.
-        if not (text_content or images or local_files or media_files):
+        if not (text_content or copy_blocks or images or local_files or media_files):
             _recovered = _strip_media_directives(response).strip()
             if _recovered:
                 logger.warning("[%s] response_delivery_recovered: extract pipeline "
@@ -4867,8 +5226,11 @@ class BasePlatformAdapter(ABC):
                                "no attachment; delivering recovered original to %s", self.name,
                                len(pre_extract), event.source.chat_id)
                 text_content = _recovered
+        if inline_bodies:
+            # Same outer trim as text without blocks; bodies inside stay byte-exact.
+            text_content = restore_inline_copy_bodies(text_content, inline_bodies).strip()
         return _ExtractedResponse(
-            text_content=text_content, images=images, media_files=media_files,
+            text_content=text_content, copy_blocks=copy_blocks, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
     async def _fire_post_delivery_callback(
@@ -4904,9 +5266,16 @@ class BasePlatformAdapter(ABC):
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
             return
+        # A cancelled compression waiter must not resurrect itself from its visible
+        # pending slot. Shutdown spools it, while /stop and /new discard it.
+        pending = self._pending_messages.get(session_key)
+        if (current_task is not None and current_task.cancelling()
+                and pending is getattr(current_task, "_hermes_event", None)
+                and getattr(pending, "_gateway_compression_deferred", False)):
+            self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
         # A drain-deferred turn belongs to the shutdown spool, not this adapter's
         # post-turn handoff. Keep the FIFO head in its slot until shutdown flush.
-        pending = self._pending_messages.get(session_key)
         runner = getattr(self, "gateway_runner", None)
         if (getattr(pending, "_drain_deferred", False)
                 and (runner is None or getattr(runner, "_draining", False))):
@@ -4930,8 +5299,37 @@ class BasePlatformAdapter(ABC):
         elif current_task is not None and self._session_tasks.get(session_key) is current_task:
             self._cleanup_finished_session_task(session_key, interrupt_event)
 
+    async def _handle_compression_retries(
+        self, event: MessageEvent, session_key: str, interrupt_event: asyncio.Event,
+    ) -> Optional[Union[str, "EphemeralReply"]]:
+        """Keep one processing lifecycle while the same input waits for compression.
+
+        The pending slot stays visible during backoff for FIFO admission and shutdown.
+        Controls retain the existing task cancellation and guard ownership boundaries.
+        """
+        assert self._message_handler is not None
+        while True:
+            response = await self._message_handler(event)
+            if (response is not None or not getattr(event, "_gateway_compression_deferred", False)
+                    or self._pending_messages.get(session_key) is not event):
+                return response
+            if getattr(event, "_drain_deferred", False):
+                return None
+            delay = self._requeue_backoff_delay(session_key, event, event)
+            await asyncio.sleep(delay)
+            if (self._active_sessions.get(session_key) is not interrupt_event
+                    or self._pending_messages.get(session_key) is not event):
+                return None
+            self._pending_messages.pop(session_key)
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            # Restart recovery follows session-task successors. Keep the event that each shared
+            # background task actually consumes so a merged pending-slot event can report its
+            # terminal result back to the parked recovery observer.
+            setattr(current_task, "_hermes_event", event)
         deferred_session = getattr(event, "_deferred_session_key", None)
         if deferred_session is not None:
             current_generation = self._session_generations.get(session_key, 0)
@@ -4942,31 +5340,39 @@ class BasePlatformAdapter(ABC):
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, self._active_sessions.get(session_key))
                 return
-        delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        delivery_attempted = delivery_succeeded = required_delivery_failed = False  # feeds the processing-complete hook
+        from gateway.cron_review import ReviewCapture
+        review_capture = ReviewCapture(event)
 
-        def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+        def _record_delivery(result, *, required: bool = False):
+            nonlocal delivery_attempted, delivery_succeeded, required_delivery_failed
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                if required and not getattr(result, "success", False):
+                    required_delivery_failed = True
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
-        typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
+        typing_task = review_capture.start_typing(self, event, interrupt_event, _thread_metadata)
         from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
         turn_token = scoped_turn_entry()
         delivery_generation = None
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
-            response = await self._message_handler(event)
+            response = await self._handle_compression_retries(event, session_key, interrupt_event)
+            if self._pending_messages.get(session_key) is event and getattr(event, "_drain_deferred", False):
+                return  # Shutdown owns the retained input, not a completed delivery.
             bind_event_turn(event)
             delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
+            # A cron review is always muted, but its reply is the scheduler's verdict, not a
+            # presentation: review_capture keeps it off every send path instead.
             with self._media_delivery_scope(event.source):
-                if diagnostic_wake_muted(event):
+                if review_capture.future is None and diagnostic_wake_muted(event):
                     response = None
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
@@ -4976,6 +5382,7 @@ class BasePlatformAdapter(ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
+            response = review_capture.capture_reply(response, event)
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
@@ -4985,9 +5392,10 @@ class BasePlatformAdapter(ABC):
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
+                _spoken_text = self._spoken_reply_text(extracted)
                 if self._wants_auto_tts(
-                        event, session_key, interrupt_event, text_content, media_files):
-                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
+                        event, session_key, interrupt_event, _spoken_text, media_files):
+                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(_spoken_text)
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
@@ -5010,7 +5418,7 @@ class BasePlatformAdapter(ABC):
                 # _stop_typing_refresh's finally discards it, so it cannot leak into the next
                 # turn. No new await on the delivery path (a fire-and-forget stop task was
                 # measured to have no effect).
-                if text_content or extracted.images or extracted.media_files or extracted.local_files \
+                if text_content or extracted.copy_blocks or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
@@ -5018,14 +5426,20 @@ class BasePlatformAdapter(ABC):
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery,
                         attachments_pending=bool(
-                            extracted.images or extracted.media_files or extracted.local_files))
+                            extracted.copy_blocks or extracted.images or extracted.media_files or extracted.local_files))
+                if extracted.copy_blocks:
+                    await self._send_copy_blocks(
+                        event, session_key, extracted.copy_blocks, _final_thread_metadata,
+                        lambda result: _record_delivery(result, required=True),
+                        attachments_pending=bool(extracted.images or extracted.media_files or extracted.local_files),
+                        is_ephemeral_response=is_ephemeral_response, ephemeral_ttl=_ephemeral_ttl)
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery, session_key=session_key,
                     is_ephemeral_response=is_ephemeral_response)
             await self._release_turn_marker(event)
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (delivery_succeeded and not required_delivery_failed) if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
@@ -5053,6 +5467,7 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            review_capture.finish(error=RuntimeError("cron review turn cancelled"))
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
@@ -5062,7 +5477,7 @@ class BasePlatformAdapter(ABC):
             bind_event_turn(event)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            _thread_metadata = (await self._notify_turn_error(event, e, session_key)) or _thread_metadata
+            _thread_metadata = (await review_capture.notify_error(self, event, e, session_key)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
@@ -5073,13 +5488,18 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, delivery_generation)
+            if not (self._pending_messages.get(session_key) is event
+                    and getattr(event, "_gateway_compression_deferred", False)):
+                await self._fire_post_delivery_callback(session_key, delivery_generation)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+            if self.gateway_runner is not None and self.platform == Platform.TELEGRAM:
+                from gateway.telegram_retire import advance
+                await advance(self.gateway_runner, event.source)
 
     _REQUEUE_BACKOFF_INITIAL_SECONDS = 0.25
     # Kept at 1s: nothing wakes the back-off sleep, so a genuine message merged into the slot
@@ -5192,7 +5612,7 @@ class BasePlatformAdapter(ABC):
                 await asyncio.wait_for(
                     asyncio.gather(*(asyncio.shield(t) for t in tasks), return_exceptions=True),
                     timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("[%s] %d background task(s) did not exit within 5s; "
                                "releasing tracking and letting them unwind in the background",
                                self.name, sum(not t.done() for t in tasks))
@@ -5270,11 +5690,11 @@ class BasePlatformAdapter(ABC):
         return source
 
     @abstractmethod
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Get information about a chat/channel; dict with at least ``name``
         and ``type`` ("dm", "group", "channel")."""
 
-    def toolsets_for_source(self, source: "SessionSource") -> Optional[List[str]]:
+    def toolsets_for_source(self, source: SessionSource) -> Optional[list[str]]:
         """Per-source toolset override REPLACING ``platform_toolsets.<platform>``, or None
         (default); validated via ``_get_platform_tools`` (webhook adapter pins per-route)."""
         return None
@@ -5286,16 +5706,19 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def truncate_message(content: str, max_length: int = 4096,
-                         len_fn: Optional["Callable[[str], int]"] = None) -> List[str]:
+                         len_fn: Optional[Callable[[str], int]] = None, *,
+                         indicator_overhead: int = 0) -> list[str]:
         """Split a long message into chunks preserving code blocks: a split inside a fence closes it
         at the chunk end and reopens it (same language tag) in the next; multi-chunk output gets
-        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram)."""
+        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram).
+        ``indicator_overhead`` reserves additional length units for caller-side suffix encoding."""
         _len = len_fn or len
         if _len(content) <= max_length:
             return [content]
-        INDICATOR_RESERVE = 10   # room for " (XX/XX)"
+        # Every split consumes a source codepoint, so len(content) bounds both indicator numbers.
+        INDICATOR_RESERVE = _len(f" ({len(content)}/{len(content)})") + indicator_overhead
         FENCE_CLOSE = "\n```"
-        chunks: List[str] = []
+        chunks: list[str] = []
         remaining = content
         carry_lang: Optional[str] = None  # language tag ("" ok) when previous chunk ended mid-fence
         while remaining:
@@ -5304,13 +5727,17 @@ class BasePlatformAdapter(ABC):
             headroom = max_length - INDICATOR_RESERVE - _len(prefix) - _len(FENCE_CLOSE)
             if headroom < 1:
                 headroom = max(1, max_length // 2)
-            # Remainder fits in one final chunk; close a reopened fence if still open.
-            if _len(prefix) + _len(remaining) <= max_length - INDICATOR_RESERVE:
-                final_chunk = prefix + remaining
+            # Remainder can only be final if it fits before any synthesized closing fence;
+            # avoid rescanning the entire remainder on every non-final iteration.
+            final_budget = max_length - INDICATOR_RESERVE
+            if _len(prefix) + _len(remaining) <= final_budget:
+                # Reserve a close only for a reopened fence that remains open at the end.
+                final_close = ""
                 if carry_lang is not None and fence_state_after(remaining, True, carry_lang)[0]:
-                    final_chunk += FENCE_CLOSE
-                chunks.append(final_chunk)
-                break
+                    final_close = FENCE_CLOSE
+                if _len(prefix) + _len(remaining) + _len(final_close) <= final_budget:
+                    chunks.append(prefix + remaining + final_close)
+                    break
             # Natural split (newline, then space); a custom _len budget maps to a codepoint offset.
             _cp_limit = (
                 _custom_unit_to_cp(remaining, headroom, _len) if _len is not len else headroom)

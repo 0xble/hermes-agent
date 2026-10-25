@@ -1,5 +1,8 @@
 """Recovery retention regressions for upstream #106087, adapted from #106101."""
 
+import json
+import logging
+import os
 import sqlite3
 from collections import Counter
 
@@ -32,6 +35,57 @@ def test_repeated_failed_captures_are_bounded_without_losing_complete_recovery(t
     root = home / "state-snapshots"
     assert {p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")} == {complete, partials[-1]}
     assert backup.verify_sqlite_integrity(root / complete / "state.db")["valid"]
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("failed_rel", ["config.yaml", ".env", "auth.json", "cron/jobs.json"])
+def test_unreadable_file_retains_its_last_recovery_copy(
+        tmp_path, monkeypatch, capsys, caplog, failed_rel):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    failed = home / failed_rel
+    failed.parent.mkdir(parents=True, exist_ok=True)
+    original = b"critical recovery state\n"
+    failed.write_bytes(original)
+    (home / "gateway_state.json").write_text("{}\n")
+    # Neither generation is complete: a complete-anchor guard must not accidentally
+    # mask failure to record the unreadable non-DB path as an omission.
+    (home / "state.db").write_bytes(b"x" * 2048)
+    previous = backup.create_quick_snapshot(
+        hermes_home=home, label="pre-update", keep=1, max_file_size=1024)
+    assert previous
+    root = home / "state-snapshots"
+    anchor = root / previous
+    assert (anchor / failed_rel).read_bytes() == original
+    failed.chmod(0)
+    try:
+        if os.access(failed, os.R_OK):
+            pytest.skip("chmod 0 does not make the file unreadable for this user")
+        caplog.set_level(logging.WARNING, logger=backup.__name__)
+        for _ in range(3):
+            latest = backup.create_quick_snapshot(
+                hermes_home=home, label="pre-update", keep=1, max_file_size=1024)
+            assert latest
+            assert anchor.exists(), "copy failure pruned the last recovery generation"
+            assert (anchor / failed_rel).read_bytes() == original
+            current = root / latest
+            meta = json.loads((current / "manifest.json").read_text())
+            assert meta["failed_files"] == [failed_rel]
+            assert failed_rel not in meta["files"]
+            assert (current / "gateway_state.json").read_text() == "{}\n"
+            assert {p for p in root.iterdir() if p.is_dir()} == {anchor, current}
+            assert f"could not snapshot {failed_rel}" in capsys.readouterr().out
+            assert f"Could not snapshot {failed_rel}" in caplog.text
+        # An independent prune must recover the omission from disk, not run-local state.
+        backup.prune_quick_snapshots(keep=1, hermes_home=home)
+        assert (anchor / failed_rel).read_bytes() == original
+    finally:
+        failed.chmod(0o600)
+    healed = backup.create_quick_snapshot(
+        hermes_home=home, label="pre-update", keep=1, max_file_size=1024)
+    assert (root / healed / failed_rel).read_bytes() == original
+    assert not anchor.exists(), "a successful capture should release the older anchor"
 
 
 def test_manual_and_pre_update_snapshots_have_independent_retention(tmp_path):

@@ -62,6 +62,18 @@ def _context_rejection(request_tokens: int, window: int = 65_536, error="HTTP 50
     return verdict, compressed
 
 
+def test_unparseable_output_cap_uses_normal_failed_turn_reason():
+    verdict, compressed = _context_rejection(
+        3_000,
+        error="The requested max_tokens exceeds model maximum output tokens for this model.",
+    )
+    result = verdict.result
+    assert verdict.action == "return" and not compressed
+    assert result["failed"] is True
+    assert result["failure_reason"] == "format_error"
+    assert not result.get("compression_exhausted")
+
+
 def test_context_rejection_far_below_the_window_is_not_blamed_on_the_conversation():
     """A single-slot local server rejecting a ~3k-token request (another thread held its
     context) must not read as "this conversation has grown too long": no compression, transient

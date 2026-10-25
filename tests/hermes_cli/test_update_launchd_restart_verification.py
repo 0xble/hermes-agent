@@ -26,7 +26,7 @@ import pytest
 
 import hermes_cli.gateway as gateway_cli
 from gateway.restart import LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S
-import hermes_cli.update_cmd as update_cmd
+from hermes_cli import update_cmd
 
 LABEL = "ai.hermes.gateway"
 

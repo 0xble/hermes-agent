@@ -27,16 +27,26 @@ _IS_WINDOWS = platform.system() == "Windows"
 # (not merely "not Windows") so macOS and other POSIX platforms never touch systemd.
 # See #70716.
 _IS_LINUX = platform.system() == "Linux"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
 from hermes_cli.config import get_hermes_home
 
-from tools.process_registry_notifications import format_process_notification
+from tools.process_registry_notifications import format_process_notification, is_child_process_notification, should_surface_notification
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
-from tools.process_registry_results import load_completed_results, save_completed_result
+from tools.process_registry_termination import ProcessTerminationMixin
+from tools.process_registry_survival import ProcessSurvivalMixin
+from tools.process_registry_results import (
+    load_completed_results,
+    prune_completed_results,
+    refresh_completed_result,
+    save_completed_result,
+    save_cut_pending_result,
+)
+from tools.process_registry_env_log import log_delta_command
+from tools.process_registry_wait import monotonic as _monotonic, plan_for as _wait_plan
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +94,11 @@ WATCH_LIFETIME_MAX_HITS = 8
 HEARTBEAT_MIN_SECONDS = 60
 HEARTBEAT_OUTPUT_CHARS = 2000
 HEARTBEAT_TICK_SECONDS = 5
+# Reader final drain after a reconcile saw the direct child exit: the exited child's unread tail is at
+# most one pipe buffer (Linux pipe-max-size default 1 MiB), and the reader publishes within one select
+# interval plus that drain.
+_FINAL_DRAIN_MAX_CHARS = 1 << 20
+_READER_FINAL_DRAIN_WAIT_SECONDS = 1.0
 # Global circuit breaker across all sessions so concurrent siblings can't collectively
 # flood the user even when each is under its own cap.
 WATCH_GLOBAL_MAX_PER_WINDOW = 15
@@ -107,6 +122,9 @@ _SYSTEMD_SCOPE_PROBED_AT = 0.0
 # Both verdicts expire: the user bus can vanish after a True (session logout without linger,
 # #110803) and reappear after a False (linger enabled later, #104893).
 _SYSTEMD_SCOPE_PROBE_TTL_SECONDS = 60.0
+# systemd >= 254 expands ``$$``/``${X}`` in a ``--scope`` command line itself unless told not to;
+# older systemd-run rejects the option (and never expanded there), so the probe drops it on rejection.
+_SYSTEMD_RUN_NO_EXPAND = True
 _MIN_WORKER_MEMORY_MAX_BYTES = 64 * 1024 * 1024
 _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
@@ -139,7 +157,7 @@ def _worker_memory_max_bytes() -> int:
                 "Ignoring invalid TERMINAL_LOCAL_MEMORY_MAX_MB=%r; "
                 "expected an integer representing at least %d MiB",
                 override, _MIN_WORKER_MEMORY_MAX_BYTES // (1024 * 1024))
-    candidates: List[int] = []
+    candidates: list[int] = []
     try:
         for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
             if line.startswith("0::"):
@@ -170,12 +188,14 @@ def _worker_memory_max_bytes() -> int:
     return min(override_bound, safe_bound) if override_bound else safe_bound
 
 
-def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
+def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> list[str]:
     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
-    No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486)."""
+    No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486).
+    ``--expand-environment=no`` keeps the command byte-identical (#132385)."""
+    no_expand = ["--expand-environment=no"] if _SYSTEMD_RUN_NO_EXPAND else []
     return [
-        binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
+        binary, "--user", "--scope", "--quiet", *no_expand, "--unit", unit_name, "--collect",
         "--property", "MemoryAccounting=yes",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
         "--", *argv,
@@ -201,7 +221,7 @@ def _secure_user_runtime_dir(path: Path) -> bool:
         return False
 
 
-def systemd_user_bus_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def systemd_user_bus_env(base_env: Optional[dict[str, str]] = None) -> dict[str, str]:
     """Build an environment that can reach this user's lingering systemd manager.
 
     System-level gateway units run as an unprivileged ``User=`` but normally do
@@ -254,7 +274,7 @@ def _systemd_run_user_scope_available() -> bool:
 
     Use ``/bin/sh -c 'exit 0'``: NixOS provides ``/bin/sh`` but not ``/bin/true``
     (#105365), regardless of the gateway service's PATH."""
-    global _SYSTEMD_SCOPE_AVAILABLE, _SYSTEMD_SCOPE_PROBED_AT
+    global _SYSTEMD_SCOPE_AVAILABLE, _SYSTEMD_SCOPE_PROBED_AT, _SYSTEMD_RUN_NO_EXPAND
     verdict = _systemd_scope_cached()
     if verdict is not None:
         return verdict
@@ -273,12 +293,19 @@ def _systemd_run_user_scope_available() -> bool:
                 if binary:
                     # Unique unit avoids collisions; the timeout bounds D-Bus.
                     probe_unit = f"hermes-probe-scope-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-                    result = subprocess.run(
-                        _systemd_scope_argv(binary, probe_unit, "/bin/sh", "-c", "exit 0"),
-                        capture_output=True,
-                        timeout=3,
-                        env=systemd_user_bus_env(),
-                    )
+                    for _attempt in range(2):
+                        result = subprocess.run(
+                            _systemd_scope_argv(binary, probe_unit, "/bin/sh", "-c", "exit 0"),
+                            stdin=subprocess.DEVNULL, capture_output=True,
+                            timeout=3,
+                            env=systemd_user_bus_env(),
+                            check=False,
+                        )
+                        if not (result.returncode and _SYSTEMD_RUN_NO_EXPAND
+                                and b"expand-environment" in (result.stderr or b"")):
+                            break
+                        # systemd < 254 rejects the option: drop it and probe again.
+                        _SYSTEMD_RUN_NO_EXPAND = False
                     available = result.returncode == 0
                     if not available:
                         logger.debug(
@@ -312,7 +339,7 @@ def _is_supervised_gateway_process() -> bool:
         return False
 
 
-def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[str]:
+def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation with its own
     memory accounting, so an OOM in the worker cannot kill the gateway cgroup.
 
@@ -380,7 +407,7 @@ class GatewayChildDispatch(NamedTuple):
     argv: List[str]
 
 
-def scoped_spawn_lost_user_bus(spawn_env: Dict[str, str]) -> bool:
+def scoped_spawn_lost_user_bus(spawn_env: dict[str, str]) -> bool:
     """After a ``systemd-run --user --scope`` wrapper exits before its child could start: True
     when the user bus is gone (:func:`systemd_user_bus_env` derives nothing), in which case the
     cached True verdict is replaced so the next dispatch re-probes and degrades instead of
@@ -402,7 +429,7 @@ def scoped_spawn_lost_user_bus(spawn_env: Dict[str, str]) -> bool:
 
 
 def restart_safe_gateway_child_argv(
-    command: List[str], *, unit_suffix: str, require_restart_safe_scope: bool,
+    command: list[str], *, unit_suffix: str, require_restart_safe_scope: bool,
     outlives_parent: bool = False,
 ) -> GatewayChildDispatch:
     """Place a managed-systemd gateway child outside the gateway cgroup.
@@ -488,6 +515,7 @@ def _stop_systemd_unit(unit_name: str, *, timeout: Optional[float] = 15.0) -> bo
             timeout=timeout,
             stdin=subprocess.DEVNULL,
             env=systemd_user_bus_env(),
+            check=False,
         )
         if result.returncode != 0:
             stderr = (result.stderr or b"").decode(errors="replace").strip()
@@ -570,9 +598,15 @@ class ProcessSession:
     detached: bool = False                      # Recovered from checkpoint (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
+    wsl_chain: bool = False                     # spawned via wsl[.exe]: the host PID is the short-lived
+                                                # launcher; Linux-side workers outlive it (#120546)
     handoff_note: str = ""                      # why a subagent handed this process to its parent (rides the notice)
     persist_on_release: bool = False           # opt out of agent-lifecycle cleanup (release()/turn-abandon kill
                                                 # sweeps), per terminal(background=true, persist_on_release=true) (#41225)
+    survive_restart: bool = False              # explicit local non-PTY restart survival claim
+    log_path: str = ""                         # file-backed survivor stdout/stderr
+    exit_path: str = ""                        # wrapper exit code file
+    delivered_path: str = ""                   # atomic exactly-once notification marker
     # Watcher/notification routing (persisted for crash recovery)
     # systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
     # (#70716)
@@ -588,7 +622,7 @@ class ProcessSession:
     parent_session_id: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
     completion_output_chars: int = 0            # Output chars the completion carries; 0 = COMPLETION_OUTPUT_CHARS
-    watch_patterns: List[str] = field(default_factory=list)
+    watch_patterns: list[str] = field(default_factory=list)
     heartbeat_seconds: int = 0                  # 0 = off; else a "heartbeat" event every N s while running
     total_output_chars: int = 0                 # Chars ever ingested (the buffer is a rolling tail)
     _heartbeat_last: float = field(default=0.0, repr=False)          # time of the last heartbeat (or spawn)
@@ -602,12 +636,22 @@ class ProcessSession:
     _watch_strike_candidate: bool = field(default=False, repr=False)
     _watch_consecutive_strikes: int = field(default=0, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    # Only the finalization claimant publishes completion and releases waiters.
+    _finish_claimed: bool = field(default=False, repr=False)
+    _result_owner_write_done: bool = field(default=False, repr=False)
+    # The last stop of ``systemd_unit`` failed, so its descendants may still be alive; bulk
+    # cleanup retries the stop even after the session finished.
+    _scope_stop_pending: bool = field(default=False, repr=False)
+    # Stopped by a restart/bounded sweep: the final receipt keeps cut retention even when
+    # it is written before (or instead of) the pre-signal cut_pending snapshot.
+    _cut_receipt: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
     _reader_selectable: bool = field(default=False, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
     _kill_deadline: Optional[float] = field(default=None, repr=False)
+    _kill_requested: bool = field(default=False, repr=False)
 
     def __post_init__(self):
         # A session built without an explicit owner is owned by its own task, so ownership checks compare
@@ -618,10 +662,23 @@ class ProcessSession:
     def append_output(self, text: str) -> None:
         """Append to the rolling output buffer under the session lock, keeping the tail."""
         with self._lock:
-            self.output_buffer += text
-            self.total_output_chars += len(text)
-            if len(self.output_buffer) > self.max_output_chars:
-                self.output_buffer = self.output_buffer[-self.max_output_chars:]
+            self._append_locked(text)
+
+    def append_output_if_running(self, text: str) -> bool:
+        """Append unless the session has exited. Decided under the lock a kill holds while it
+        snapshots the output and sets ``exited``, so a chunk is either in the kill's receipt or
+        dropped, never added after it."""
+        with self._lock:
+            if self.exited:
+                return False
+            self._append_locked(text)
+        return True
+
+    def _append_locked(self, text: str) -> None:
+        self.output_buffer += text
+        self.total_output_chars += len(text)
+        if len(self.output_buffer) > self.max_output_chars:
+            self.output_buffer = self.output_buffer[-self.max_output_chars:]
 
     def mark_exited(self, exit_code, reason: str = "exited", source: str = "") -> None:
         """Record an exit. A kill that raced the observer already recorded its own
@@ -639,11 +696,11 @@ _WATCHER_ROUTE_KEYS = ("platform", "chat_id", "user_id", "user_name", "thread_id
 # Session fields persisted verbatim in the crash-recovery checkpoint (plus
 # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
 _CHECKPOINT_FIELDS = (
-    "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
+    "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
-    "heartbeat_seconds", "persist_on_release")
+    "heartbeat_seconds", "persist_on_release", "survive_restart", "log_path", "exit_path", "delivered_path")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -651,7 +708,42 @@ _CHECKPOINT_DEFAULTS = {
 }
 
 
-class ProcessRegistry(ProcessCheckpointMixin):
+_WSL_LAUNCHER_NAMES = frozenset({"wsl", "wsl.exe"})
+
+_WSL_CHAIN_NOTE = (
+    "Spawned via a wsl[.exe] launcher: the recorded host PID is the short-lived "
+    "launcher, not the Linux-side workers. Inspect them with `wsl -e ps` / "
+    "`wsl --list --running` from the host."
+)
+
+
+def _is_wsl_launcher_command(command: str) -> bool:
+    """True when *command* routes through a ``wsl[.exe]`` launcher chain (#120546).
+
+    The host PID recorded for such a spawn belongs to the short-lived launcher;
+    grandchildren inside the VM outlive it, so the entry must say so instead of
+    letting host-side hunting fail silently.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    candidates = []
+    try:
+        candidates.append((shlex.split(command, posix=True) or [""])[0])
+    except ValueError:
+        pass
+    # POSIX shlex eats Windows backslashes (``C:\...\wsl.exe``), so also try
+    # the naive first token where path separators survive.
+    words = command.strip().split()
+    if words:
+        candidates.append(words[0])
+    for first in candidates:
+        base = os.path.basename(first.replace("\\", "/")).strip("'\"").lower()
+        if base in _WSL_LAUNCHER_NAMES:
+            return True
+    return False
+
+
+class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSurvivalMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
@@ -664,11 +756,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
     _completions_restored = False
 
     def __init__(self):
-        self._running: Dict[str, ProcessSession] = {}
-        self._finished: Dict[str, ProcessSession] = {}
+        self._running: dict[str, ProcessSession] = {}
+        self._finished: dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
         # Side-channel for check_interval watchers (gateway reads after agent run)
-        self.pending_watchers: List[Dict[str, Any]] = []
+        self.pending_watchers: list[dict[str, Any]] = []
         # Unified queue for all background events (distinguished by "type"); the CLI
         # process_loop and the gateway drain it after each agent turn to trigger new turns.
         import queue as _queue_mod
@@ -677,10 +769,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # module-level singleton runs __init__ on `import model_tools`, and the replay opens
         # (creates, migrates) the launch profile's state.db (#123265). Importing the module is
         # side-effect free and keeps its import-order contract for later completion writers.
-        import tools.async_delegation  # noqa: F401
+        import tools.async_delegation
         # Completions the agent already consumed via wait()/read_log() (output in
         # hand): drain loops AND gateway/tui watchers skip them.
         self._completion_consumed: set = set()
+        # Shutdown fences survivor pollers before the old gateway can claim a completion
+        # into an in-memory queue that the successor cannot drain.
+        self._survivor_pollers_stopped = threading.Event()
+        self._survivor_poller_fence = threading.Lock()
         # Sessions merely *observed* exited via poll(). poll() is read-only and must NOT
         # mark consumed (a status check would suppress the watcher's autonomous delivery
         # turn), but the CLI has the poll result inline in the same turn, so
@@ -732,20 +828,25 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 self._emit_heartbeat(session, now)
 
     def _emit_heartbeat(self, session: ProcessSession, now: float) -> None:
+        """Queue a heartbeat carrying the output since the last one. A tick with nothing new is
+        skipped outright: every queued event costs the owner a full model turn, and "still running,
+        no output" is already visible on the process surfaces (status stack, /agents dock)."""
         # A timer may select a due session just before the reader finishes it.
         # Serialize the liveness check and enqueue with _move_to_finished so a
         # stale heartbeat cannot arrive after its completion notification.
         with self._lock:
             if session.exited or session.id not in self._running:
                 return
+            session._heartbeat_last = now
             with session._lock:
                 delta = session.total_output_chars - session._heartbeat_total_at_last
                 output = session.output_buffer[-delta:] if delta > 0 else ""
                 session._heartbeat_total_at_last = session.total_output_chars
+            if not output:
+                return
             if len(output) > HEARTBEAT_OUTPUT_CHARS:
                 cut = len(output) - HEARTBEAT_OUTPUT_CHARS
                 output = f"...({cut} earlier characters omitted)\n" + output[-HEARTBEAT_OUTPUT_CHARS:]
-            session._heartbeat_last = now
             session._heartbeat_seq += 1
             notification = {
                 **self._watch_event_base(session),
@@ -985,6 +1086,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """
         if session is None or session.exited or not session.detached or session.pid_scope != "host":
             return session
+        if self._file_backed(session):
+            return session
         fate = self._detached_host_fate(session.pid, session.host_start_time)
         if fate == "running":
             return session
@@ -1038,15 +1141,6 @@ class ProcessRegistry(ProcessCheckpointMixin):
             and not self._is_host_pid_alive(session.pid))
 
     @staticmethod
-    def _proc_alive(proc) -> bool:
-        """True if a psutil.Process is running and not a zombie (already dead, just unreaped)."""
-        try:
-            import psutil
-            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-        except Exception:
-            return False
-
-    @staticmethod
     def _config_value(section: str, key: str, fallback):
         """``config.yaml`` value for ``section.key``, else the DEFAULT_CONFIG value.
         Raises if config is unreadable; callers wrap with their own hard fallback so
@@ -1069,197 +1163,6 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Grace (s) between SIGTERM and escalated SIGKILL; 0 disables escalation."""
         return ProcessRegistry._config_seconds("daemon_term_grace_seconds", 2.0)
 
-    @classmethod
-    def _terminate_host_pid(
-        cls, pid: int, expected_start: Optional[int] = None, *, deadline: Optional[float] = None,
-    ) -> None:
-        """Terminate a host-visible PID and its descendants.
-        ``expected_start`` (kernel start time at spawn) is re-validated first: a mismatch
-        or dead PID means the number was recycled onto a stranger and we refuse to touch
-        it — a leaked orphan beats tree-killing someone's browser. POSIX: snapshot descendants,
-        SIGTERM the parent alone so it can perform an orderly shutdown, then clean up snapshot
-        descendants that survive its grace window. Survivors are SIGKILLed after a second
-        ``terminal.daemon_term_grace_seconds`` window. Windows:
-        ``taskkill /T /F`` (psutil's stale PPID links miss orphans there); ``os.kill``
-        is the fallback."""
-        if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
-            logger.warning(
-                "Refusing to terminate host pid %d: start-time mismatch — "
-                "PID was recycled onto an unrelated process.", pid)
-            return
-
-        def _deadline_active() -> bool:
-            return deadline is None or time.monotonic() < deadline
-
-        def _sigterm_quietly():
-            if not _deadline_active():
-                return
-            with suppress(OSError, ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGTERM)
-        if _IS_WINDOWS:
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                return
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True,
-                    encoding='utf-8', errors='replace',
-                    timeout=remaining if remaining is not None else 10,
-                    creationflags=windows_hide_flags(),
-                    stdin=subprocess.DEVNULL)
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                _sigterm_quietly()
-            return
-        import psutil
-        gone = (psutil.NoSuchProcess, psutil.AccessDenied, OSError)
-        try:
-            parent = psutil.Process(pid)
-        except psutil.NoSuchProcess:
-            return
-        except (OSError, PermissionError):
-            _sigterm_quietly()
-            return
-        # Snapshot before signalling: once the parent exits, psutil can no longer
-        # reliably find children that it failed to reap.
-        try:
-            descendants = parent.children(recursive=True)
-        except gone:
-            descendants = []
-
-        # Let self-managing parents (notably Chromium/Electron) shut down their
-        # tree before touching children. Killing their zygotes first can turn a
-        # graceful browser shutdown into a crash dump.
-        if not _deadline_active():
-            return
-        with suppress(gone):
-            parent.terminate()
-
-        grace = cls._daemon_term_grace_seconds()
-
-        def _wait_for_exit(targets) -> None:
-            if grace <= 0:
-                return
-            wait_deadline = time.monotonic() + grace
-            if deadline is not None:
-                wait_deadline = min(wait_deadline, deadline)
-            while time.monotonic() < wait_deadline and any(cls._proc_alive(p) for p in targets):
-                time.sleep(0.05)
-
-        # Preserve descendants during the parent's configured shutdown window.
-        _wait_for_exit([parent])
-        if not _deadline_active():
-            return
-
-        # The snapshot is an anti-orphan guarantee: only descendants still alive
-        # after the parent had its chance are asked to terminate themselves.
-        remaining = descendants if grace <= 0 else [
-            proc for proc in descendants if cls._proc_alive(proc)
-        ]
-        for proc in remaining:
-            if not _deadline_active():
-                return
-            with suppress(gone):
-                proc.terminate()
-
-        # Preserve the existing SIGKILL escalation semantics for every owned
-        # process that remains after its SIGTERM grace window. The parent is
-        # included in case it ignored the first signal.
-        targets = [parent, *remaining]
-        # Escalate to SIGKILL for anything that ignored SIGTERM within the grace window.
-        # ``psutil.wait_procs``' gone/alive partition is deliberately NOT trusted: it
-        # reaps via ``Process.wait()`` and mis-partitions across zombie transitions in a
-        # parent/child tree, leaving survivors un-killed. Re-probing every target is
-        # deterministic.
-        if grace <= 0:
-            return
-        _wait_for_exit(targets)
-        if not _deadline_active():
-            return
-        # A parent that ignored SIGTERM (the interactive ``bash -lic`` wrapper does) keeps
-        # running its script through both grace windows and can spawn children the first
-        # snapshot never saw. Re-snapshot while it is still alive: once it is SIGKILLed
-        # they reparent to init and nothing can find them again.
-        with suppress(gone):
-            if cls._proc_alive(parent):
-                known = {proc.pid for proc in targets}
-                targets.extend(p for p in parent.children(recursive=True) if p.pid not in known)
-        for proc in targets:
-            if not _deadline_active():
-                return
-            with suppress(gone):
-                if cls._proc_alive(proc):
-                    proc.kill()  # SIGKILL on POSIX
-                    logger.info("Escalated to SIGKILL for pid %d (ignored SIGTERM within %.1fs grace)", proc.pid, grace)
-
-    @staticmethod
-    def _live_descendants(pid: int) -> List[int]:
-        """PIDs of living non-zombie descendants of host PID ``pid`` (best-effort)."""
-        try:
-            import psutil
-            children = psutil.Process(pid).children(recursive=True)
-        except Exception:
-            return []
-        return [c.pid for c in children if ProcessRegistry._proc_alive(c)]
-
-    # SIGKILL / taskkill are asynchronous: the kernel needs a scheduling tick to
-    # tear the process down and the parent must reap it before poll()/isalive()
-    # stop saying "alive". Verifying survivors in that window flagged every
-    # escalated kill as incomplete.
-    _KILL_SETTLE_SECONDS = 1.0
-
-    def _post_kill_survivors(
-        self, session: "ProcessSession", deadline: Optional[float] = None,
-    ) -> List[int]:
-        """Host PIDs still alive once the kill signals have had time to land (#115490).
-
-        Fail-closed: anything unverifiable counts as a survivor, so a kill
-        that leaves a live tree can never write a killed receipt. Sandbox
-        (env) sessions have no host-visible tree and are unverifiable by
-        design — they return no survivors, preserving existing behavior.
-
-        A bounded caller owns the full kill budget: the settle probe may use the
-        shorter of the normal settle window and that caller's deadline, but it
-        never extends the operation past the deadline.
-        """
-        settle_deadline = time.monotonic() + self._KILL_SETTLE_SECONDS
-        if deadline is not None:
-            settle_deadline = min(settle_deadline, deadline)
-        while True:
-            survivors = self._probe_survivors(session)
-            if not survivors or time.monotonic() >= settle_deadline:
-                return survivors
-            time.sleep(min(0.05, max(0.0, settle_deadline - time.monotonic())))
-
-    def _probe_survivors(self, session: "ProcessSession") -> List[int]:
-        survivors: List[int] = []
-        proc = getattr(session, "process", None)
-        if proc is not None:
-            try:
-                root_alive = proc.poll() is None
-            except Exception:
-                root_alive = True
-            if root_alive:
-                survivors.append(getattr(proc, "pid", None) or session.pid)
-        pty = getattr(session, "_pty", None)
-        if pty is not None:
-            try:
-                pty_alive = bool(pty.isalive())
-            except Exception:
-                pty_alive = self._is_host_pid_alive(session.pid)
-            if pty_alive:
-                survivors.append(session.pid)
-        if session.pid_scope == "host" and session.pid:
-            if self._detached_host_fate(session.pid, session.host_start_time) == "running":
-                if session.pid not in survivors:
-                    survivors.append(session.pid)
-                survivors.extend(
-                    pid for pid in self._live_descendants(session.pid)
-                    if pid not in survivors)
-            # A dead/recycled root has no PID-scope descendants left to find:
-            # reparented orphans are outside PID scope (systemd scope stop,
-            # issued before this check, covers the cgroup case).
-        return [pid for pid in survivors if pid]
-
     # ----- Spawn -----
 
     @staticmethod
@@ -1270,6 +1173,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
             parent_session_id=get_session_env("HERMES_SESSION_ID", ""),
+            wsl_chain=_is_wsl_launcher_command(command),
             started_at=time.time(), **extra)
 
     @staticmethod
@@ -1285,7 +1189,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return tempfile.gettempdir()
 
-    def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> List[str]:
+    def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> list[str]:
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
         sourced, user tools on PATH), wrapped in a transient systemd scope when we are
         the supervised gateway (own cgroup: an OOM kills only the worker, not the
@@ -1308,7 +1212,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _spawn_env(env_vars: dict) -> dict:
         """Sanitized child env; PYTHONUNBUFFERED so tqdm/datasets-style buffering
         doesn't hide progress from process(action="poll")."""
-        env = _sanitize_subprocess_env(os.environ, env_vars)
+        env = _terminal_env(_sanitize_subprocess_env(os.environ, env_vars))
         env["PYTHONUNBUFFERED"] = "1"
         return env
 
@@ -1352,9 +1256,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         return session
 
     def spawn_local(
-        self, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "",
-        persist_on_release: bool = False) -> ProcessSession:
+        self, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
+        env_vars: dict | None = None, use_pty: bool = False, owner_task_id: str = "",
+        persist_on_release: bool = False, survive_restart: bool = False) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when unavailable or failing.
@@ -1367,7 +1271,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
         safe_command = _rewrite_bg(command)
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
-                                    persist_on_release=persist_on_release)
+                                    persist_on_release=persist_on_release, survive_restart=survive_restart)
+        if survive_restart or (persist_on_release and not use_pty and not _IS_WINDOWS):
+            if use_pty:
+                raise ValueError("survive_restart is only supported for non-PTY commands")
+            # persist_on_release jobs outlive the gateway that spawned them, so they take
+            # the same file-backed stdout/stderr: a pipe owned by a dead gateway raises
+            # BrokenPipeError in the re-adopted job on its next write.
+            try:
+                return self._spawn_local_survivor(
+                    session, safe_command, env_vars, restart_safe=survive_restart)
+            except Exception:
+                self._remove_survivor_run_dir(session)
+                raise
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -1415,21 +1331,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
         descendants) so nothing leaks untracked."""
         with suppress(Exception):
             if session.systemd_unit:
-                # Scope teardown is the authoritative cleanup for the worker cgroup
-                # (never killpg here); the wrapper PID is terminated as fallback.
+                # Scope teardown is the authoritative cleanup for the worker cgroup;
+                # the systemd-run wrapper PID is terminated below as fallback.
                 _stop_systemd_unit(session.systemd_unit)
-                # The worker runs in its own systemd scope and, since the #70716 session-isolation fix, its
-                # own session. Stop the scope (kills every process in the worker cgroup), then terminate the
-                # systemd-run wrapper PID as fallback.
-                self._terminate_host_pid(proc.pid, session.host_start_time)
-            elif not _IS_WINDOWS:
-                try:
-                    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    os.killpg(os.getpgid(proc.pid), kill_signal)  # windows-footgun: ok - guarded by _IS_WINDOWS above
-                except (ProcessLookupError, PermissionError, OSError):
-                    proc.kill()
-            else:
-                proc.kill()
+            # _terminate_host_pid revalidates the kernel start time captured at
+            # spawn before signalling: pgid == pid would only prove the pid leads a
+            # group, and a reaped child can be recycled onto an unrelated leader.
+            self._terminate_host_pid(proc.pid, session.host_start_time)
         with suppress(Exception):
             proc.wait(timeout=5)
 
@@ -1453,7 +1361,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         return session
 
     def spawn_via_env(
-        self, env: Any, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
+        self, env: Any, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
         timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
         The command is wrapped to capture its in-sandbox PID and redirect output to a
@@ -1549,10 +1457,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 import select as _select
                 session._reader_selectable = True
             idle_after_exit = 0
+            drained_after_request = 0
             while True:
                 if fd is not None:
                     try:
-                        ready, _, _ = _select.select([fd], [], [], 0.2)
+                        # Once a finish is requested, read only what is already buffered: the exited
+                        # child's tail, never an orphaned grandchild's future writes.
+                        wait_s = 0 if session._reader_finish_requested.is_set() else 0.2
+                        ready, _, _ = _select.select([fd], [], [], wait_s)
                     except (ValueError, OSError):
                         break  # fd already closed
                     if not ready:
@@ -1573,7 +1485,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 if chunk:
                     _append_chunk(chunk)
                 if session._reader_finish_requested.is_set():
-                    break
+                    # A single chunk is not the tail: the child can exit with a whole pipe buffer
+                    # unread. The cap only stops a grandchild that never lets the pipe go empty.
+                    drained_after_request += len(chunk)
+                    if drained_after_request >= _FINAL_DRAIN_MAX_CHARS:
+                        break
                 idle_after_exit = 0
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
@@ -1605,38 +1521,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             logger.warning("%s wait failed; recording known exit status: %s", label, e)
         self._finish_exited(session, exit_code())
 
-    @staticmethod
-    def _log_delta_command(quoted_log_path: str, offset: int) -> str:
-        """Shell command that reads only the log bytes written since ``offset``
-        (``cat``-ing the whole file every poll re-sends all output over docker/SSH).
-
-        Prints one header line ``"<size> <offset>"`` then the bytes in [offset, size).
-        The size is read first and the tail cut at that same size, so a growing file
-        never sends a byte twice; a file that shrank was rotated/truncated, so the
-        offset drops to 0 and the reader starts over. The window end is pulled back
-        to a UTF-8 character boundary (the backend decodes each ``execute()`` result
-        on its own, so a straddling multibyte char would become U+FFFD and break watch
-        patterns at the seam): up to 3 trailing continuation bytes are held for the
-        next poll and the header reports the trimmed size."""
-        return (
-            f"O={offset}; "
-            f"S=$({{ wc -c < {quoted_log_path}; }} 2>/dev/null | tr -dc '0-9'); "
-            f"S=${{S:-0}}; "
-            f'if [ "$S" -lt "$O" ]; then O=0; fi; '
-            # Scan back up to 3 continuation bytes (octal 200-277) to the lead byte; if
-            # the lead's declared length (3xx=2, 34x-35x=3, 36x-37x=4) exceeds the bytes
-            # present, trim to before it. Complete sequences and ASCII tails untouched.
-            f'N=0; P=$S; while [ "$P" -gt "$O" ] && [ "$N" -lt 3 ]; do '
-            f"B=$(tail -c +$P {quoted_log_path} 2>/dev/null | head -c 1 | od -An -to1 | tr -dc '0-9'); "
-            f'case "$B" in 2[0-7][0-7]) P=$((P-1)); N=$((N+1));; *) break;; esac; done; '
-            f'if [ "$N" -gt 0 ] || [ "$P" -eq "$S" ]; then '
-            f"B=$(tail -c +$P {quoted_log_path} 2>/dev/null | head -c 1 | od -An -to1 | tr -dc '0-9'); "
-            f'case "$B" in 3[0-3][0-7]) L=2;; 3[4-5][0-7]) L=3;; 3[6-7][0-7]) L=4;; *) L=1;; esac; '
-            f'if [ "$L" -gt $((N+1)) ]; then S=$((P-1)); fi; fi; '
-            f'echo "$S $O"; '
-            f'if [ "$S" -gt "$O" ]; then '
-            f"tail -c +$((O+1)) {quoted_log_path} 2>/dev/null | head -c $((S-O)); fi"
-        )
+    _log_delta_command = staticmethod(log_delta_command)
 
     def _env_poller_loop(self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str):
         """Background thread: poll a sandbox log file for non-local backends."""
@@ -1664,10 +1549,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     if used_offset < prev_output_bytes:
                         # Log rotated/truncated: what we hold no longer lines up. Restart.
                         with session._lock:
+                            if session.exited:
+                                return
                             session.output_buffer = ""
                     prev_output_bytes = new_size
                 if delta:
+                    # A kill that landed after this fetch already published its output
+                    # snapshot: leave the output as the kill reported it (as the PTY reader does).
                     with session._lock:
+                        if session.exited:
+                            return
                         session.output_buffer += delta
                         if len(session.output_buffer) > session.max_output_chars:
                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
@@ -1684,14 +1575,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         exit_code = int(exit_str.splitlines()[-1].strip())
                     except (ValueError, IndexError):
                         exit_code = -1
-                    session.exit_code = exit_code  # unlike mark_exited, a raced kill still takes this code
                     self._finish_exited(session, exit_code)
                     return
             except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
-                session.exited, session.exit_code = True, -1
-                session.completion_reason, session.termination_source = "lost", "backend_lost"
-                self._move_to_finished(session)
+                # Environment might be gone (sandbox reaped, etc.). A kill that already
+                # settled the session keeps its result.
+                self._finish_exited(session, -1, reason="lost", source="backend_lost")
                 return
 
     def _pty_reader_loop(self, session: ProcessSession):
@@ -1709,6 +1598,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
         if not _IS_WINDOWS:
             from tools.pty_query_responder import PtyQueryResponder
             responder = PtyQueryResponder(rows=30, cols=120)
+
+        def ingest(text: str) -> None:
+            # A kill can leave this reader running while a detached descendant holds the
+            # slave open (_release_finished_handles defers the close to it). Keep draining,
+            # but leave the killed session's output as the kill reported it.
+            self._ingest_output(session, text, unless_exited=True)
+
         try:
             while pty.isalive():
                 try:
@@ -1727,7 +1623,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                                     )
                         text = chunk if isinstance(chunk, str) else decoder.decode(chunk)
                         if text:
-                            self._ingest_output(session, text)
+                            ingest(text)
                 except Exception:  # EOFError included
                     break
         except Exception as e:
@@ -1736,36 +1632,48 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # A query prefix split across the final reads is plain output after all.
             tail = decoder.decode(responder.flush())
             if tail:
-                self._ingest_output(session, tail)
+                ingest(tail)
         self._finish_reader(
-            session, decoder, lambda t: self._ingest_output(session, t), "PTY",
+            session, decoder, ingest, "PTY",
             pty.wait, lambda: pty.exitstatus if hasattr(pty, 'exitstatus') else -1)
 
-    def _ingest_output(self, session: ProcessSession, text: str) -> None:
-        """Buffer a freshly-read chunk, then scan watch patterns and stream it live."""
-        session.append_output(text)
+    def _ingest_output(self, session: ProcessSession, text: str, *, unless_exited: bool = False) -> None:
+        """Buffer a freshly-read chunk, then scan watch patterns and stream it live.
+        ``unless_exited`` drops the chunk once the session has exited (atomically with a kill)."""
+        if not unless_exited:
+            session.append_output(text)
+        elif not session.append_output_if_running(text):
+            return
         self._check_watch_patterns(session, text)
         self._emit_output(session, text)
 
-    def _finish_exited(self, session: ProcessSession, exit_code) -> None:
-        """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish."""
-        session.mark_exited(exit_code)
+    def _finish_exited(self, session: ProcessSession, exit_code, reason: str = "exited", source: str = "") -> None:
+        """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish.
+        Under the session lock, like kill_process's commit: otherwise the kill can land between
+        mark_exited's ``killed`` check and its writes, and the reader overwrites the kill."""
+        with session._lock:
+            session.mark_exited(exit_code, reason, source)
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession) -> bool:
-        """Move a session from running to finished.
-        Idempotent: kill_process() and the reader thread can both call this; only
-        the FIRST move enqueues the completion notification, so no duplicates.
-        Returns True when this call is the one that persisted the session."""
+        """Claim finalization once; publish completion only after persistence finishes.
+        Keep pending results tracked, but never wait for receipt IO under the registry lock.
+        Returns True for the owner; reader/kill duplicates return False."""
         with self._lock:
             was_running = session.id in self._running
             if was_running:
+                if session._finish_claimed:
+                    return False
+                session._finish_claimed = True
                 session.exited_at = time.time()
-                # Keep the session tracked until its result is durable. A finite
-                # parent must not observe completion and exit during this write.
-                if session._kill_deadline is None or time.monotonic() < session._kill_deadline:
-                    save_completed_result(session)
-                self._running.pop(session.id)
+        if was_running and (session._kill_deadline is None or time.monotonic() < session._kill_deadline):
+            if session._kill_deadline is None:
+                save_completed_result(session)
+            else:
+                save_completed_result(session, prune=False)
+        with self._lock:
+            if was_running:
+                self._running.pop(session.id, None)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
         # finished-but-unpruned session keeps its stdout pipe (or PTY master)
@@ -1776,10 +1684,23 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # and the loop exits, dropping at most the unread tail of a process
         # that was just killed. poll()/wait()/read_log() serve from the
         # buffered ``output_buffer``, never from the pipe.
+        try:
+            self._publish_finished(session, was_running)
+        finally:
+            # The owner releases waiters only after its notice is queued (or its publish
+            # failed, so a waiter never parks forever). A duplicate leaves the event to it.
+            if was_running or not session._finish_claimed:
+                session._completion_event.set()
+        return was_running
+
+    def _publish_finished(self, session: ProcessSession, was_running: bool) -> None:
         self._release_finished_handles(session)
         if session._kill_deadline is None or time.monotonic() < session._kill_deadline:
             self._write_checkpoint()
         if was_running and session.notify_on_complete:
+            # Enqueueing is not delivery: only a consumer claims (before render) and acks (after).
+            if session.survive_restart and not self._survivor_delivery_pending(session):
+                return
             notification = {
                 "type": "completion",
                 "session_id": session.id,
@@ -1796,9 +1717,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "started_at": session.started_at,
             }
             _redact_process_result(notification)
-            self.completion_queue.put(notification)
-        session._completion_event.set()
-        return was_running
+            if session.survive_restart:
+                self._queue_survivor_completion(notification)
+            else:
+                self.completion_queue.put(notification)
 
     @staticmethod
     def _exit_fields(session: ProcessSession) -> dict:
@@ -1824,6 +1746,17 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE
                         stream.close()
         if session._pty is not None:
+            # A live ptyprocess reader sits in a blocking read holding the PTY file
+            # object's buffer lock, and that read only ends once every holder of
+            # the slave side is gone. A descendant that setsid()s past the kill
+            # keeps it open, so close() here would block forever (under _lock on
+            # the prune path). The reader closes the PTY itself via
+            # _finish_reader once its read ends. pywinpty reads don't block, so
+            # Windows closes here as before.
+            reader = session._reader_thread
+            if (not _IS_WINDOWS and reader is not None and reader.is_alive()
+                    and reader is not threading.current_thread()):
+                return
             # ptyprocess/pywinpty close() is idempotent (``closed`` flag) and
             # closes the master fd exactly once; it raises only if the child
             # ignores SIGKILL, which we don't want to surface on the finish path.
@@ -1831,6 +1764,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 session._pty.close()
 
     # ----- Query Methods -----
+
+    @staticmethod
+    def _reader_finalizing(session: ProcessSession) -> bool:
+        """A reconcile saw the direct child exit and set ``exited``, but the reader that owns the
+        output is still on its final drain: the buffer is not the whole output yet, so nothing
+        may consume it as the completion."""
+        reader = session._reader_thread
+        return (session._reader_finish_requested.is_set() and not session._completion_event.is_set()
+                and reader is not None and reader.is_alive())
 
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
@@ -1896,7 +1838,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         try:
             from tools.interrupt import is_interrupted as _is_interrupted
         except Exception:
-            _is_interrupted = lambda: False  # noqa: E731
+            _is_interrupted = lambda: False
         interrupted = False
         for session in pending:
             try:
@@ -2001,7 +1943,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def drain_notifications(
         self, session_key: str = "", owns_event=None, *, skip_poll_observed: bool = True,
-    ) -> "list[tuple[dict, str]]":
+    ) -> list[tuple[dict, str]]:
         """Pop all pending events and return ``(raw_event, formatted_text)`` pairs.
         Skips completions per ``_drain_should_skip`` (gateway/TUI pass
         ``skip_poll_observed=False``). Routing (``_owns_event``): async-delegation events
@@ -2011,11 +1953,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
         equality; non-owned events are re-queued for their owner. No filter consumes
         everything (legacy single-session) except restored delegation payloads (fail-closed)."""
         self.restore_completions()
+        try:  # terminal events held while their durable ownership was unprovable
+            from tools.async_delegation import reoffer_unresolved_completions
+            reoffer_unresolved_completions(self.completion_queue)
+        except Exception as exc:
+            logger.warning("Could not re-offer unresolved async delegation completions: %s", exc)
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
         # delegation.surface_child_process_notifications, read at most once per drain
         # and only when an sa- event shows up.
-        surface_child: "bool | None" = None
+        surface_child: bool | None = None
         while not self.completion_queue.empty():
             try:
                 evt = self.completion_queue.get_nowait()
@@ -2038,10 +1985,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # drain, so a requeue would pin the event forever. 'async_delegation'
             # is the result itself and is NEVER suppressed.
             _evt_task_id = str(evt.get("owner_task_id") or evt.get("task_id") or "")
-            if not is_async_delegation and _evt_task_id.startswith("sa-"):
+            if is_child_process_notification(evt):
                 if surface_child is None:
                     surface_child = self._surface_child_process_notifications()
-                if not surface_child:
+                if not should_surface_notification(evt, surface_child=surface_child):
                     logger.debug(
                         "Suppressed subagent-owned process notification "
                         "(delegation.surface_child_process_notifications=false): "
@@ -2049,6 +1996,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         evt.get("type", "completion"), _evt_sid, _evt_task_id)
                     continue
             if text := format_process_notification(evt):
+                if evt.get("type") == "completion":
+                    session = self.get(_evt_sid)
+                    # Claim BEFORE handing the event to a renderer; the consumer acks after render.
+                    if session is not None and session.survive_restart and not self._claim_survivor_delivery(session):
+                        # A live peer holds the claim: keep our copy so we can reclaim if it dies.
+                        if self._survivor_delivery_pending(session):
+                            requeue.append(evt)
+                        continue
                 results.append((evt, text))
         for evt in requeue:
             self.completion_queue.put(evt)
@@ -2086,7 +2041,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             })
         return next(iter(matches.values())) if len(matches) == 1 else None
 
-    def _reconcile_local_exit(self, session: "ProcessSession") -> None:
+    def _reconcile_local_exit(self, session: ProcessSession) -> None:
         """Reconcile ``session.exited`` against the real child state.
         The reader flips ``exited`` only at EOF; when the direct child has exited but a
         descendant (e.g. a daemon from ``hermes update``) holds the pipe open, poll()
@@ -2100,7 +2055,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         stdout pipe open, the reader blocks forever and poll() keeps returning "running" indefinitely (issue
         #17327 — 74 polls over 7 minutes on Feishu).
         """
-        if session is None or session.exited:
+        if session is None or session.exited or self._file_backed(session):
             return
         proc = getattr(session, "process", None)
         if proc is None:
@@ -2122,8 +2077,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # finish avoids a competing TextIOWrapper read here racing the
             # reader, publishing an empty owner-stamped result, then closing
             # the pipe before the buffered tail is ingested. It wakes within
-            # the reader's bounded select interval (or after one final chunk).
+            # the reader's bounded select interval and drains what is buffered.
             session._reader_finish_requested.set()
+            # Flipping ``exited`` before that drain lands would hand poll()/wait() a truncated
+            # snapshot (and wait() marks it consumed), so give the reader a moment to publish.
+            if session._completion_event.wait(_READER_FINAL_DRAIN_WAIT_SECONDS):
+                return
             with session._lock:
                 session.mark_exited(rc)
             logger.info(
@@ -2167,19 +2126,26 @@ class ProcessRegistry(ProcessCheckpointMixin):
         if session is None or self._uncollected_gone(session):
             return _not_found(session_id)
         self._reconcile_local_exit(session)  # orphaned-pipe reader guard
+        # Read with the preview under the lock the reader appends and exits under, so the
+        # finalization check describes the output actually returned.
         with session._lock:
             output_preview = _output_tail(session, 1000)
+            exited, finalizing = session.exited, self._reader_finalizing(session)
         result = {
             **self._status_head(session), "pid": session.pid,
             "uptime_seconds": int(time.time() - session.started_at), "output_preview": output_preview}
-        if session.exited:
+        if exited:
             result.update(self._exit_fields(session))
             # Read-only: record in _poll_observed (CLI inline dedup) but NOT in
             # _completion_consumed, or a status check would suppress the watcher's
-            # autonomous delivery turn. See __init__.
-            self._poll_observed.add(session_id)
+            # autonomous delivery turn. See __init__. A preview taken before the reader's
+            # final drain is partial and must not suppress the full completion.
+            if not finalizing:
+                self._poll_observed.add(session_id)
         if session.detached:
-            result.update(detached=True, note="Process recovered after restart -- output history unavailable")
+            result["detached"] = True
+            if not self._file_backed(session):
+                result["note"] = "Process recovered after restart -- output history unavailable"
         return result
 
     def read_log(self, session_id: str, offset: int | None = None, limit: int = 200) -> dict:
@@ -2191,6 +2157,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return _not_found(session_id)
         with session._lock:
             full_output = strip_ansi(session.output_buffer)
+            exited, finalizing = session.exited, self._reader_finalizing(session)
         lines = full_output.splitlines()
         total_lines = len(lines)
         # offset=None -> last N lines; an explicit offset=0 means the HEAD (don't
@@ -2209,14 +2176,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
         result = {
             **self._status_head(session), "output": "\n".join(selected),
             "total_lines": total_lines, "showing": f"{len(selected)} lines"}
-        if session.exited and observed_completion_output:
+        if exited and observed_completion_output and not finalizing:
             self._completion_consumed.add(session_id)
+            self._consume_survivor_completion(session_id)
         return result
 
-    def wait(self, session_id: str, timeout: int = None) -> dict:
+    def wait(self, session_id: str, timeout: int | None = None) -> dict:
         """Block until the process exits, the timeout elapses, the user interrupts, or a
         mid-turn user message (steer/redirect → ``request_yield``) releases the wait.
-        ``timeout`` defaults to (and is clamped by) TERMINAL_TIMEOUT. Returns a dict
+        ``timeout`` defaults per ``process_registry_wait.wait_plan`` and is clamped by
+        TERMINAL_TIMEOUT. Returns a dict
         with status exited|timeout|interrupted|not_found|error and an output snapshot."""
         from tools.interrupt import consume_yield as _consume_yield, is_interrupted as _is_interrupted
 
@@ -2228,23 +2197,25 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # falsy and would silently fall through to the default wait.
         if timeout is not None and timeout <= 0:
             return {"status": "error", "error": f"timeout must be positive (got {timeout})"}
-        timeout_note = None
-        effective_timeout = timeout or max_timeout
-        if timeout and timeout > max_timeout:
-            effective_timeout = max_timeout
-            timeout_note = f"Requested wait of {timeout}s was clamped to configured limit of {max_timeout}s"
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
-        deadline = time.monotonic() + effective_timeout
-        while time.monotonic() < deadline:
+        timeout_note = None
+        default_timeout, guidance = _wait_plan(session, max_timeout)
+        effective_timeout = default_timeout if timeout is None else timeout
+        if timeout and timeout > max_timeout:
+            effective_timeout = max_timeout
+            timeout_note = f"Requested wait of {timeout}s was clamped to configured limit of {max_timeout}s"
+        deadline = _monotonic() + effective_timeout
+        while _monotonic() < deadline:
             session = self._refresh_detached_session(session)
             if session is None:
                 return _not_found(session_id)
             self._reconcile_local_exit(session)  # orphaned-pipe reader guard
             result = None
-            if session.exited:
+            if session.exited and not self._reader_finalizing(session):
                 self._completion_consumed.add(session_id)
+                self._consume_survivor_completion(session_id)
                 result = self._exit_snapshot(session, "exited")
             elif _is_interrupted():
                 result = {
@@ -2258,13 +2229,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 result = {
                     "status": "interrupted", "command": session.command, "output": _output_tail(session, 1000),
                     "process_running": True,
-                    "note": ("User sent a new message -- wait released; the process is still "
-                             "running and you will be notified on exit. Respond to the user now.")}
+                    "note": ("User sent a new message -- wait released; the process is still running."
+                             f"{guidance} Respond to the user now.")}
             if result is not None:
                 if timeout_note:
                     result["timeout_note"] = timeout_note
                 return result
-            remaining = deadline - time.monotonic()
+            remaining = deadline - _monotonic()
             if remaining <= 0:
                 break
             session._completion_event.wait(timeout=min(1.0, remaining))
@@ -2276,11 +2247,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             f"Wait window of {effective_timeout}s elapsed — the process is still running. This is not an error.")
         if session.started_at:
             base_note += f" Uptime: {int(time.time() - session.started_at)}s."
-        base_note += (
-            " notify_on_complete is set: you will be notified on exit — do more work instead of waiting again."
-            if session.notify_on_complete else
-            " Poll again later or use terminal(background=true, "
-            "notify_on_complete=true) next time for automatic notification.")
+        base_note += guidance
         result["timeout_note"] = f"{timeout_note}. {base_note}" if timeout_note else base_note
         return result
 
@@ -2308,32 +2275,53 @@ class ProcessRegistry(ProcessCheckpointMixin):
         previous_kill_deadline = session._kill_deadline
         session._kill_deadline = deadline
         if session.exited:
-            # A double-forked descendant may still be alive in the systemd scope even
-            # though the main process exited — stop the scope to reap survivors.
-            # See #70716.
             # If the worker was spawned in its own systemd scope (#70716), stop the entire unit to reap any
             # double-forked descendants that were reparented inside the scope and survived the PID signal
             # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
             # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
             # above already handled the main process; this catches stragglers.
-            if session.systemd_unit:
-                _stop_systemd_unit_bounded(session.systemd_unit, deadline)
+            scope_stopped = self._stop_scope(session, deadline)
             with session._lock:
                 result = self._exit_snapshot(session, "already_exited")
+                finalizing = self._reader_finalizing(session)
+            if not scope_stopped:
+                result["scope_stop_failed"] = session.systemd_unit
             # Only suppress the autonomous turn after its output is present in
             # the explicit kill result, matching wait/log consumption.
-            if consume_output:
+            if consume_output and not finalizing:
                 self._completion_consumed.add(session_id)
+                self._consume_survivor_completion(session_id)
             session._kill_deadline = previous_kill_deadline
             return result
+        # Keep an additive receipt before a restart/shutdown signal can outlive this
+        # gateway. The normal completion write below may be fenced by the shared deadline.
+        session._kill_requested = True
+        if (source == "gateway_shutdown" or deadline is not None) and (
+            session._pty
+            or session.process
+            or (session.env_ref and session.pid)
+            or (session.detached and session.pid_scope == "host" and session.pid)
+        ):
+            # Set the marker before the snapshot/write so a reader that wins the race
+            # still persists the final receipt in the cut-retention budget.
+            session._cut_receipt = True
+            # Bounded kills keep half the remaining budget for the signals themselves.
+            save_cut_pending_result(
+                session, source, include_output=deadline is None, prune=deadline is None,
+                lock_timeout=(
+                    None if deadline is None
+                    else max(0.0, deadline - time.monotonic()) / 2
+                ),
+            )
+        # Only a bounded caller passes its deadline down; an unbounded kill keeps the plain calls.
+        bounded = {} if deadline is None else {"deadline": deadline}
         try:
-            early = self._signal_kill(session, session_id, consume_output, deadline=deadline)
+            early = self._signal_kill(session, session_id, consume_output, **bounded)
             if early is not None:
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
             # descendants reparented inside the cgroup.
-            if session.systemd_unit:
-                _stop_systemd_unit_bounded(session.systemd_unit, deadline)
+            scope_stopped = self._stop_scope(session, deadline)
             # Post-kill verification (#115490): the signals above can leave
             # survivors (SIGTERM-ignoring daemons, scope escapees). A kill that
             # leaves a live tree must not write a killed receipt or prune the
@@ -2343,7 +2331,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 signal_race_exited = session.exited
             # A reader that finalised the session mid-signal already proved
             # real exit; only a still-running session needs tree-death proof.
-            survivors = [] if signal_race_exited else self._post_kill_survivors(session, deadline=deadline)
+            survivors = [] if signal_race_exited else self._post_kill_survivors(session, **bounded)
             if survivors:
                 alive = ", ".join(map(str, survivors))
                 logger.warning(
@@ -2356,6 +2344,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         f"({alive}); session running"),
                     "session_id": session.id, "survivors": survivors,
                     "process_running": True}
+            # Descendants outside the root's tree are visible only to the scope; a scope that did
+            # not stop leaves nothing proving they are gone, even when the root exited meanwhile.
+            # The session keeps its unit, so a later kill retries the stop.
+            if not scope_stopped:
+                with session._lock:
+                    root_exited = session.exited
+                logger.warning("Kill incomplete for %s: systemd scope %s did not stop",
+                               session.id, session.systemd_unit)
+                return {
+                    "status": "error",
+                    "error": f"Kill incomplete: systemd scope {session.systemd_unit} did not stop",
+                    "session_id": session.id, "scope_stop_failed": session.systemd_unit,
+                    "process_running": not root_exited}
             # Capture output, mark consumed, THEN expose ``exited`` to watcher tasks —
             # closes the delayed-notification race without losing the transcript.
             with session._lock:
@@ -2366,13 +2367,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
                 session.termination_source = source
-            # The reader thread can finalise the session while the signal path
-            # blocks in the SIGKILL grace window: its ``save_completed_result``
-            # then persists this kill as a plain ``exited``. Re-write the receipt
-            # so the durable record matches what the caller was told.
-            if not self._move_to_finished(session):
-                if deadline is None or time.monotonic() < deadline:
-                    save_completed_result(session)
+            if session.survive_restart:
+                self._write_survivor_termination(session, session.completion_reason, source)
+            refresh_completed_result(session, self._move_to_finished(session), prune=deadline is None)
             if deadline is None or time.monotonic() < deadline:
                 self._write_checkpoint()
             return {
@@ -2385,6 +2382,21 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # Leaving it set makes a later reader callback skip both the completion receipt and
             # checkpoint forever after the deadline expires.
             session._kill_deadline = previous_kill_deadline
+            session._kill_requested = False
+            if (consume_output and session.exited and session_id in self._completion_consumed
+                    and (deadline is None or time.monotonic() < deadline)):
+                self._consume_survivor_completion(session_id)
+
+    @staticmethod
+    def _stop_scope(session: ProcessSession, deadline: Optional[float] = None) -> bool:
+        """Stop the session's systemd scope: True when it has none or the stop worked. Every kill
+        path stops the scope through here, so a failed stop always leaves it marked for retry.
+        A bounded caller's deadline caps the stop; one that cannot run in time counts as failed."""
+        if not session.systemd_unit:
+            return True
+        stopped = _stop_systemd_unit_bounded(session.systemd_unit, deadline)
+        session._scope_stop_pending = not stopped
+        return stopped
 
     def _signal_kill(
         self, session: ProcessSession, session_id: str, consume_output: bool,
@@ -2422,8 +2434,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # returning: a daemonized descendant may still be alive there even though the wrapper PID exited
             # or was recycled across the gateway restart (#70716, teknium1 review).
             if self._detached_host_fate(session.pid, session.host_start_time) != "running":
-                if session.systemd_unit:
-                    _stop_systemd_unit_bounded(session.systemd_unit, deadline)
+                scope_stopped = self._stop_scope(session, deadline)
                 with session._lock:
                     output = _completion_output(session)
                 if consume_output:
@@ -2432,7 +2443,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 # entry without queueing a completion, and do not signal a PID
                 # whose start time does not match.
                 self._close_reused_detached(session)
-                return {"status": "already_exited", "exit_code": session.exit_code, **output}
+                result = {"status": "already_exited", "exit_code": session.exit_code, **output}
+                if not scope_stopped:
+                    result["scope_stop_failed"] = session.systemd_unit
+                return result
             # Identity was just proven above. Re-passing the start time would make
             # an unreadable probe refuse the kill and leave the re-adopted child running.
             if deadline is None:
@@ -2525,7 +2539,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """O(1) running count for status-bar polling; dict ``len()`` is atomic, no lock."""
         return len(self._running)
 
-    def list_sessions(self, task_id: str = None, session_key: str = None, *, include_retained: bool = False) -> list:
+    def list_sessions(self, task_id: str | None = None, session_key: str | None = None, *, include_retained: bool = False) -> list:
         """Running and recently-finished processes for ``task_id`` and/or ``session_key``;
         cross-task entries sharing the gateway session (a forgotten preview server
         blocking session reset) are flagged ``"session_scoped": true``.
@@ -2572,6 +2586,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # these are the long-lived background processes a user may have forgotten about (#29177).
             if task_id and session_key and s.owner_task_id != task_id and s.session_key == session_key:
                 entry["session_scoped"] = True
+            if s.wsl_chain:
+                entry["wsl_chain"] = True
+                entry["wsl_note"] = _WSL_CHAIN_NOTE
             # Trigger metadata for goal-loop judges (a watcher may never exit).
             if s.watch_patterns and not s._watch_disabled:
                 entry.update(watch_patterns=list(s.watch_patterns), watch_hit=s._watch_hits > 0)
@@ -2579,6 +2596,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 entry["notify_on_complete"] = True
             if s.persist_on_release:
                 entry["persist_on_release"] = True
+            if s.survive_restart:
+                entry["survive_restart"] = True
             if s.exited:
                 entry["exit_code"] = s.exit_code
                 entry["exited_at"] = s.exited_at
@@ -2601,15 +2620,21 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return any(not s.exited and predicate(s) for s in self._running.values())
 
     def has_active_processes(self, task_id: str) -> bool:
-        """Whether any process for ``task_id`` is still running."""
-        return self._any_running(lambda s: s.task_id == task_id)
+        """Whether any process for ``task_id`` is still running.
 
-    def running_owned_by(self, owner_task_id: str) -> List[ProcessSession]:
+        Match both the collapsed container key (``task_id`` on a session) and
+        the raw spawning owner (``owner_task_id``), because callers use both:
+        the idle environment reaper is keyed by container while delegate
+        children need to see their own background work (#120546).
+        """
+        return self._any_running(lambda s: s.task_id == task_id or s.owner_task_id == task_id)
+
+    def running_owned_by(self, owner_task_id: str) -> list[ProcessSession]:
         """Running processes whose RAW spawning owner is ``owner_task_id``."""
         with self._lock:
             return [s for s in self._running.values() if s.owner_task_id == owner_task_id and not s.exited]
 
-    def unread_completions_owned_by(self, owner_task_id: str) -> List[ProcessSession]:
+    def unread_completions_owned_by(self, owner_task_id: str) -> list[ProcessSession]:
         """Exited ``notify_on_complete`` processes of ``owner_task_id`` whose result nobody read (no wait/log/poll).
         A child's completion notice is suppressed in the parent, so an unread exit is otherwise lost silently."""
         with self._lock:
@@ -2619,7 +2644,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     and s.id not in self._completion_consumed and s.id not in self._poll_observed]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
-                           to_session_key: str, note: str = "") -> Optional[ProcessSession]:
+                           to_session_key: str, note: str = "", to_source=None) -> Optional[ProcessSession]:
         """Move a RUNNING process from one owner to another under the registry lock. Ownership is the ``owner_task_id``
         field: completion notices are stamped from it at exit time and teardown kills by it, so flipping it here is the
         whole transfer. Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
@@ -2632,7 +2657,23 @@ class ProcessRegistry(ProcessCheckpointMixin):
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
-            return session
+            if to_source is not None:
+                session.parent_session_id = to_owner
+                for field in _WATCHER_ROUTE_KEYS:
+                    value = getattr(to_source, field, "")
+                    if field == "platform":
+                        value = getattr(value, "value", value)
+                    setattr(session, f"watcher_{field}", str(value or ""))
+                # An old reply anchor belongs to the old topic.
+                session.watcher_message_id = ""
+                for watcher in self.pending_watchers:
+                    if watcher.get("session_id") == session_id:
+                        watcher.update(session_key=to_session_key, parent_session_id=to_owner,
+                                       **{field: getattr(session, f"watcher_{field}") for field in _WATCHER_ROUTE_KEYS})
+        # Checkpoints acquire the same lock. Persist after releasing it, including
+        # crash-surviving watcher routes rather than only the in-memory owner.
+        self._write_checkpoint()
+        return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
         """Active processes for a gateway session key. Processes older than
@@ -2674,23 +2715,53 @@ class ProcessRegistry(ProcessCheckpointMixin):
         source: str = "kill_all", consume_output: bool = False,
         deadline: Optional[float] = None, stop_event: Optional[threading.Event] = None) -> int:
         """Kill all running processes, optionally only those ``task_id`` spawned (its ``owner_task_id``).
-        Returns count killed.
+        Returns how many it stopped. A session whose systemd scope did not stop is not counted
+        (its descendants may live on), and a later sweep retries it even after it finished.
 
-        Sessions with ``persist_on_release=True`` are skipped when ``source`` is an
-        agent-lifecycle sweep (the default ``kill_all`` release path, a gateway turn
-        timeout, or ``agent_close``): an explicitly persisted background job must survive
+        Sessions with ``persist_on_release=True`` or ``survive_restart=True`` are skipped when
+        ``source`` is an agent-lifecycle sweep (the default ``kill_all`` release path, a gateway turn
+        timeout, or ``agent_close``): an explicitly persistent background job must survive
         session end / compression / error recovery (#41225). An explicit operator stop
         (``process.kill`` via process_manage, CLI /stop) passes its own source and still
         reaches them, so the user can always stop a persisted process on purpose."""
         lifecycle = source in self._LIFECYCLE_KILL_SOURCES
         with self._lock:
+            all_sessions = (*self._running.values(), *self._finished.values())
             candidates = [
-                s for s in self._running.values()
+                s for s in all_sessions
                 if (task_id is None or s.owner_task_id == task_id)
-                and s.id not in exclude_ids
-                and not (lifecycle and s.persist_on_release)
+                and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
+                and not (lifecycle and (s.persist_on_release or s.survive_restart))
+                and not (source == "gateway_shutdown" and s.survive_restart)
             ]
             targets = [s for s in candidates if not s.exited]
+            restart_survivors = [
+                s for s in all_sessions
+                if (task_id is None or s.owner_task_id == task_id)
+                and s.id not in exclude_ids and not s.exited and s.survive_restart
+            ]
+            # Finished sessions whose systemd scope did not stop: retry only the scope stop.
+            scope_retries = [s for s in candidates if s.exited]
+        if source == "gateway_shutdown" and restart_survivors:
+            self._write_checkpoint()
+            logger.info(
+                "Shutdown: left %d restart-surviving process(es) running",
+                len(restart_survivors),
+            )
+        def _retry_finished_scopes() -> int:
+            # Like gone detached scopes, finished-scope retries can exhaust the
+            # budget. Preserve upstream's retry/accounting after the bounded sweep.
+            retried = 0
+            for session in scope_retries:
+                if ((stop_event is not None and stop_event.is_set())
+                        or (deadline is not None and time.monotonic() >= deadline)):
+                    break
+                retry_kwargs = {"source": source, "consume_output": consume_output}
+                if deadline is not None:
+                    retry_kwargs["deadline"] = deadline
+                retry = self.kill_process(session.id, **retry_kwargs)
+                retried += retry.get("status") == "already_exited" and "scope_stop_failed" not in retry
+            return retried
         bounded_guard_fired = (
             (stop_event is not None and stop_event.is_set())
             or (deadline is not None and time.monotonic() >= deadline)
@@ -2702,16 +2773,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
             and session.pid
             and self._detached_host_fate(session.pid, session.host_start_time) != "running"
         ]
-        for session in detached_nonrunning:
-            if ((stop_event is not None and stop_event.is_set())
-                    or (deadline is not None and time.monotonic() >= deadline)):
-                break
-            if session.systemd_unit:
-                _stop_systemd_unit_bounded(session.systemd_unit, deadline)
-            if ((stop_event is not None and stop_event.is_set())
-                    or (deadline is not None and time.monotonic() >= deadline)):
-                break
-            self._close_reused_detached(session)
+        def _close_detached_nonrunning() -> None:
+            # Scope teardown may spend the whole remaining budget. In bounded
+            # sweeps, run it only after active workers have had their signals.
+            for session in detached_nonrunning:
+                if ((stop_event is not None and stop_event.is_set())
+                        or (deadline is not None and time.monotonic() >= deadline)):
+                    break
+                self._stop_scope(session, deadline)
+                if ((stop_event is not None and stop_event.is_set())
+                        or (deadline is not None and time.monotonic() >= deadline)):
+                    break
+                self._close_reused_detached(session)
         targets = [session for session in targets if session not in detached_nonrunning]
         def _fallback_kill_one(session: ProcessSession) -> bool:
             if stop_event is not None and stop_event.is_set():
@@ -2721,7 +2794,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             kwargs = {"source": source, "consume_output": consume_output}
             if deadline is not None:
                 kwargs["deadline"] = deadline
-            return self.kill_process(session.id, **kwargs).get("status") in {"killed", "already_exited"}
+            result = self.kill_process(session.id, **kwargs)
+            return result.get("status") in {"killed", "already_exited"} and "scope_stop_failed" not in result
 
         def _signal_pid_group(
             pid: int, sig: int, *, pgid: Optional[int] = None,
@@ -2789,7 +2863,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return True
             if session.pid_scope == "host" and session.pid:
                 if session.detached:
-                    return self._host_pid_is_ours(session.pid, session.host_start_time)
+                    # An unreadable fingerprint forbids signalling, not liveness.
+                    return self._detached_host_fate(session.pid, session.host_start_time) == "running"
                 return self._is_host_pid_alive(session.pid)
             return False
 
@@ -2830,7 +2905,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return True
             _pgid, descendants = snapshot
             return any(
-                self._host_pid_is_ours(pid, start_time)
+                self._detached_host_fate(pid, start_time) == "running"
                 for pid, _child_pgid, start_time in descendants
             )
 
@@ -2848,9 +2923,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # more important than Chromium/Electron's orderly parent teardown (#111598).
         bounded_sweep = deadline is not None or stop_event is not None
         if not bounded_sweep:
+            scope_retried = _retry_finished_scopes()
+            _close_detached_nonrunning()
             killed = sum(_fallback_kill_one(session) for session in targets)
             self._write_checkpoint()
-            return killed
+            return killed + scope_retried
 
         # Real local workers are killed in one bounded sweep: TERM every process group,
         # one shared grace, KILL every survivor, then a short reap/poll. This deliberately
@@ -2869,6 +2946,31 @@ class ProcessRegistry(ProcessCheckpointMixin):
             if deadline is not None:
                 for session in targets:
                     session._kill_deadline = deadline
+            # Mark before any signal: a reader that finalizes during TERM, or a failed scope
+            # teardown that skips reconciliation, must still write a cut-retention receipt.
+            for session in signalable:
+                session._cut_receipt = True
+            # Small pre-signal receipts, capped at half the remaining budget so the signals
+            # themselves always keep the other half; any session not covered here gets one
+            # more attempt after the signals.
+            pre_signal_receipts: set[str] = set()
+            if source == "gateway_shutdown" or bounded_sweep:
+                receipt_cutoff = None if deadline is None else (
+                    time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
+                )
+                for session in signalable:
+                    if (stop_event is not None and stop_event.is_set()) or (
+                        receipt_cutoff is not None and time.monotonic() >= receipt_cutoff
+                    ):
+                        break
+                    if save_cut_pending_result(
+                        session, source, include_output=False, prune=False,
+                        lock_timeout=(
+                            None if receipt_cutoff is None
+                            else receipt_cutoff - time.monotonic()
+                        ),
+                    ):
+                        pre_signal_receipts.add(session.id)
             escalated_ids: set[str] = set()
             systemd_stops: dict[str, tuple[threading.Thread, threading.Event, dict[str, bool]]] = {}
 
@@ -2948,7 +3050,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         break
                     time.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
                 for session in signalable:
+                    if ((stop_event is not None and stop_event.is_set())
+                            or (deadline is not None and time.monotonic() >= deadline)):
+                        break
                     snapshot = snapshots[session.id]
+                    if _alive(session):
+                        # A TERM handler can spawn a setsid child during grace. Keep
+                        # the old tree for reparented children, and merge the new tree
+                        # while the root's identity can still authorize discovery.
+                        old_pgid, old_children = snapshot
+                        _new_pgid, new_children = _sweep_snapshot(session)
+                        snapshot = (old_pgid, tuple(dict.fromkeys((*old_children, *new_children))))
+                        snapshots[session.id] = snapshot
                     if not _snapshot_alive(session, snapshot):
                         continue
                     root_pgid, descendants = snapshot
@@ -3006,7 +3119,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 killed = 0
                 for session in signalable:
                     if session.id in systemd_stops and not systemd_ready.get(session.id, False):
+                        # A later sweep must retry the scope even if the root exits meanwhile.
+                        session._scope_stop_pending = True
                         continue
+                    if session.id in systemd_stops:
+                        session._scope_stop_pending = False
                     if _snapshot_alive(session, snapshots[session.id]):
                         # Do not report a clean kill, or move the live session out of
                         # the registry, while a snapshotted descendant survived.
@@ -3024,9 +3141,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         session.termination_source = source
                         if consume_output:
                             self._completion_consumed.add(session.id)
-                    moved = self._move_to_finished(session)
-                    if not moved and (deadline is None or time.monotonic() < deadline):
-                        save_completed_result(session)
+                    refresh_completed_result(session, self._move_to_finished(session), prune=deadline is None)
                     killed += 1
                 # Non-local targets are handled by the same bounded parallel phase, never serially.
                 remainder = [session for session in targets if session not in signalable]
@@ -3042,11 +3157,32 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 for session in targets:
                     if _fallback_kill_one(session):
                         killed += 1
+            if source == "gateway_shutdown" or bounded_sweep:
+                for session in signalable:
+                    if session.id in pre_signal_receipts:
+                        continue
+                    # Receipts are evidence, not the stop itself: never let them spend the
+                    # restart's shared deadline once the signals have gone out.
+                    if bounded_sweep and (
+                        (stop_event is not None and stop_event.is_set())
+                        or (deadline is not None and time.monotonic() >= deadline)
+                    ):
+                        break
+                    save_cut_pending_result(
+                        session, source, include_output=not bounded_sweep, prune=not bounded_sweep,
+                        lock_timeout=None if deadline is None else deadline - time.monotonic(),
+                    )
+            scope_retried = _retry_finished_scopes()
+            _close_detached_nonrunning()
+            if bounded_sweep and (stop_event is None or not stop_event.is_set()) and (
+                deadline is None or time.monotonic() < deadline
+            ):
+                prune_completed_results(deadline=deadline)
             if (stop_event is None or not stop_event.is_set()) and (
                 deadline is None or time.monotonic() < deadline
             ):
                 self._write_checkpoint()
-            return killed
+            return killed + scope_retried
         finally:
             # The sweep deadline fences writes only during teardown, not later reader completion.
             for session in targets:
@@ -3057,11 +3193,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def _prune_if_needed(self):
         """Drop expired finished sessions, then the oldest survivor while over
-        MAX_PROCESSES. Must hold _lock."""
+        MAX_PROCESSES. Must hold _lock. A session whose scope stop is still pending is kept
+        either way: it is kill_all's only handle on a scope that may hold live descendants."""
+        self._prune_delivered_survivor_runs()
         now = time.time()
-        expired = [sid for sid, s in self._finished.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]
+        prunable = {
+            sid: s for sid, s in self._finished.items()
+            if not getattr(s, "_scope_stop_pending", False)
+            and not self._retain_survivor_completion(s)
+        }
+        expired = [sid for sid, s in prunable.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]
         over_cap = len(self._running) + len(self._finished) - len(expired) >= MAX_PROCESSES
-        if over_cap and (survivors := [sid for sid in self._finished if sid not in expired]):
+        if over_cap and (survivors := [sid for sid in prunable if sid not in expired]):
             expired.append(min(survivors, key=lambda sid: self._finished[sid].started_at))
         for sid in expired:
             # Belt-and-suspenders handle release: sessions normally arrive in
@@ -3071,6 +3214,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # otherwise carry its OS handles to the grave unreleased. The
             # release is idempotent, so double-closing is safe.
             self._release_finished_handles(self._finished[sid])
+            self.prune_survivor_run_dir(self._finished[sid])
             del self._finished[sid]
         # Belt-and-suspenders against module-lifetime growth: forget consumed /
         # poll-observed marks for any session no longer tracked at all.
@@ -3122,7 +3266,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds for 'wait'.",
+                "description": "Max seconds for 'wait' (default 30 when the process has notify_on_complete, its completion routes to this session, and this session can receive the notice later, else TERMINAL_TIMEOUT; clamped by TERMINAL_TIMEOUT).",
                 "minimum": 1
             },
             "offset": {

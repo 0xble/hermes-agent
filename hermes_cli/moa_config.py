@@ -155,6 +155,12 @@ def _clean_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] |
 
     if include_enabled:
         clean["enabled"] = _coerce_bool(slot.get("enabled"), True)
+    if isinstance(slot.get("fallback_models"), list):
+        clean["fallback_models"] = [
+            candidate for raw in slot["fallback_models"]
+            if isinstance(raw, dict)
+            and (candidate := _clean_slot({k: v for k, v in raw.items() if k != "fallback_models"})) is not None
+        ]
     return clean
 
 
@@ -289,6 +295,37 @@ def resolve_moa_preset(config: Any, name: str | None = None) -> dict[str, Any]:
             f"MoA preset '{preset_name}' was not found. Available presets: "
             f"{available}. Run `hermes moa list`.")
     return deepcopy(preset)
+
+
+def skip_deep_merge(prefix: str, key: str) -> bool:
+    """True when the generic missing-config recursion must NOT descend into this section key.
+
+    ``moa.presets`` is a named map; a present-but-partial user map is authoritative
+    (see :func:`apply_user_moa_presets`), so the new-key probe must not imply a
+    union into it.
+    """
+    return prefix == "moa" and key == "presets"
+
+
+def apply_user_moa_presets(merged: dict[str, Any], raw: Any) -> None:
+    """Treat an explicit user MoA preset map as authoritative.
+
+    ``moa.presets`` is a named map. Generic default merging must not union the
+    schema's built-in names into a user map, because that resurrects presets
+    the user deleted. An omitted ``moa.presets`` key still receives defaults;
+    an explicit empty map remains empty. Called by the config load/merge paths
+    right after ``_deep_merge``.
+    """
+    raw_moa = raw.get("moa") if isinstance(raw, dict) else None
+    if not isinstance(raw_moa, dict) or "presets" not in raw_moa:
+        return
+    raw_presets = raw_moa.get("presets")
+    if not isinstance(raw_presets, dict):
+        return
+    merged_moa = merged.get("moa")
+    if not isinstance(merged_moa, dict):
+        return
+    merged_moa["presets"] = deepcopy(raw_presets)
 
 
 def exact_moa_preset_name(config: Any, text: str) -> str | None:

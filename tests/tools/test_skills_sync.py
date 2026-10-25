@@ -20,6 +20,33 @@ from tools.skills_sync import (
 from tools.skills_sync_bundled_ops import reset_bundled_skill
 
 
+@pytest.mark.parametrize("failure", ["copy", "update"])
+def test_sync_reports_real_filesystem_failure_without_raising(tmp_path, monkeypatch, failure):
+    from hermes_constants import get_hermes_home
+
+    bundled = tmp_path / "bundled"
+    source = bundled / "category" / "example"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("---\nname: example\n---\nold\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(bundled))
+    skills = get_hermes_home() / "skills"
+    skills.mkdir(parents=True, exist_ok=True)
+    if failure == "copy":
+        (skills / "category").write_text("not-a-directory", encoding="utf-8")
+    else:
+        assert sync_skills(quiet=True)["copied"] == ["example"]
+        (source / "SKILL.md").write_text("---\nname: example\n---\nnew\n", encoding="utf-8")
+        (skills / "category" / "example.bak").write_text("not-a-directory", encoding="utf-8")
+
+    result = sync_skills(quiet=True)
+
+    assert result["total_bundled"] == 1
+    assert result["copied"] == result["updated"] == []
+    assert len(result["failed"]) == 1
+    assert result["failed"][0].startswith(f"{failure} example ")
+    assert str(skills / "category" / "example") in result["failed"][0]
+
+
 class TestReadWriteManifest:
     def test_write_and_read_roundtrip_v2(self, tmp_path):
         manifest_file = tmp_path / ".bundled_manifest"

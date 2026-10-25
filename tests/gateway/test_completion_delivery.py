@@ -153,12 +153,22 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     runner = _runner(adapter)
     event = _async_event()
     text = "completion"
+    identity_checked = asyncio.Event()
+    real_identity_state = runner._completion_identity_state
+
+    def _identity_state(identity, *, claim=False):
+        state = real_identity_state(identity, claim=claim)
+        if claim and state == "inflight":
+            identity_checked.set()
+        return state
+
+    runner._completion_identity_state = _identity_state
 
     async def _exercise():
         first = asyncio.create_task(runner._deliver_completion_notification(text, dict(event)))
         await entered.wait()
         second = asyncio.create_task(runner._deliver_completion_notification(text, dict(event)))
-        await asyncio.sleep(0)
+        await identity_checked.wait()
         release.set()
         return await asyncio.gather(first, second)
 
@@ -550,24 +560,46 @@ def test_coalesced_format_redacts_before_truncating_output(monkeypatch):
     assert marker not in text
 
 
-def test_duplicate_primary_does_not_discard_fresh_batch_sibling():
+@pytest.mark.parametrize("primary", ["duplicate", "fresh"])
+def test_duplicate_primary_does_not_discard_fresh_batch_sibling(primary):
+    """An already-delivered copy, as primary or sibling, never swallows a fresh completion."""
     adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
-    duplicate = _completion_event(started_at=1.0, session_id="proc_duplicate")
-    fresh = _completion_event(started_at=2.0, session_id="proc_fresh")
-    duplicate_identity = runner._completion_delivery_identity(duplicate)
-    runner._completion_deliveries_delivered[duplicate_identity] = None
+    events = {
+        "duplicate": _completion_event(started_at=1.0, session_id="proc_duplicate"),
+        "fresh": _completion_event(started_at=2.0, session_id="proc_fresh"),
+    }
+    runner._completion_deliveries_delivered[runner._completion_delivery_identity(events["duplicate"])] = None
+
+    async def _hold(_evt, *, session_busy=False):
+        return 0.0
+
+    runner._completion_hold_seconds = _hold
+    order = [primary, "fresh" if primary == "duplicate" else "duplicate"]
 
     async def _exercise():
-        return await asyncio.gather(
-            runner._enqueue_process_completion_notification("duplicate", duplicate),
-            runner._enqueue_process_completion_notification("fresh", fresh),
-        )
+        runner._ensure_completion_batch_state()
+        tasks = {}
+        for name in order:
+            tasks[name] = asyncio.create_task(
+                runner._enqueue_process_completion_notification(f"{name}-completion-text", events[name])
+            )
+            # Wait until this entry is queued so the batch order is exactly ``order``.
+            while sum(map(len, runner._completion_notification_batches.values())) < len(tasks):
+                await asyncio.sleep(0)
+        queued = next(iter(runner._completion_notification_batches.values()))
+        assert [evt["session_id"] for _text, evt, _future in queued] == [
+            events[name]["session_id"] for name in order
+        ]
+        return [await tasks["duplicate"], await tasks["fresh"]]
 
     assert asyncio.run(_exercise()) == [True, True]
     adapter.handle_message.assert_awaited_once()
-    fresh_identity = runner._completion_delivery_identity(fresh)
-    assert fresh_identity in runner._completion_deliveries_delivered
+    payload = adapter.handle_message.await_args.args[0].text
+    assert "fresh-completion-text" in payload
+    assert "duplicate-completion-text" not in payload and "proc_duplicate" not in payload
+    assert runner._completion_delivery_identity(events["fresh"]) in runner._completion_deliveries_delivered
+    assert not runner._completion_deliveries_inflight
 
 
 def test_batch_format_failure_resolves_waiters_for_retry(monkeypatch):
@@ -1022,8 +1054,9 @@ def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isol
     answering liveness probes while the ledger is slow."""
     import contextlib
     import time
+    from itertools import pairwise
 
-    import hermes_cli.sqlite_util as sqlite_util
+    from hermes_cli import sqlite_util
     from tools import async_delegation
 
     events = [_distinct_async_event(f"deleg_slow_{i}") for i in range(2)]
@@ -1058,7 +1091,7 @@ def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isol
         finally:
             delivery_done.set()
             await heartbeat
-        return result, max(b - a for a, b in zip(ticks, ticks[1:]))
+        return result, max(b - a for a, b in pairwise(ticks))
 
     result, worst_gap = asyncio.run(_exercise())
 
@@ -1067,6 +1100,114 @@ def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isol
     for event in events:
         assert async_delegation.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
     assert worst_gap < 1.0, f"event loop stalled {worst_gap:.2f}s behind a slow ledger transaction"
+
+
+@pytest.mark.parametrize("siblings", [False, True])
+def test_cancelled_claim_refunds_during_executor_shutdown(monkeypatch, siblings):
+    """asyncio.run teardown must refund claims without keeping the loop alive for release."""
+    import concurrent.futures
+    import threading
+
+    from gateway.run_notifications_ledger import claim_off_loop, claim_siblings_off_loop
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_shutdown_{i}") for i in range(2 if siblings else 1)]
+    for event in events:
+        _persist_pending_completion(event)
+    entered, shutting_down = threading.Event(), threading.Event()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    real_shutdown = pool.shutdown
+    real_claim = async_delegation.claim_event_delivery
+
+    def _shutdown(*args, **kwargs):
+        # asyncio has forbidden new executor submissions before it calls shutdown.
+        shutting_down.set()
+        return real_shutdown(*args, **kwargs)
+
+    def _slow_claim(event, consumer):
+        entered.set()
+        assert shutting_down.wait(5)
+        return real_claim(event, consumer)
+
+    monkeypatch.setattr(pool, "shutdown", _shutdown)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _slow_claim)
+
+    async def _exercise():
+        asyncio.get_running_loop().set_default_executor(pool)
+        if siblings:
+            claiming = claim_siblings_off_loop([(event, "result") for event in events], "old")
+        else:
+            claiming = claim_off_loop(
+                lambda: _slow_claim(events[0], "old"),
+                lambda claim_id: async_delegation.defer_completion_delivery(
+                    events[0]["delegation_id"], claim_id,
+                ),
+            )
+        task = asyncio.create_task(claiming)
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Return immediately; only asyncio.run's executor teardown unblocks the claim.
+
+    asyncio.run(_exercise())
+    for event in events:
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+        assert async_delegation.claim_event_delivery(event, "next-consumer")
+
+
+def test_cancelled_finished_claim_refunds_after_executor_shutdown(monkeypatch):
+    """A finished worker whose result is not consumed needs an executor-independent refund."""
+    import concurrent.futures
+    import contextvars
+    import threading
+
+    from gateway.run_notifications_ledger import claim_off_loop
+    from tools import async_delegation
+
+    event = _distinct_async_event("deleg_finished_shutdown")
+    _persist_pending_completion(event)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    real_submit = pool.submit
+    submitted = []
+    released = threading.Event()
+    release_contexts = []
+    scope = contextvars.ContextVar("claim_release_scope", default=None)
+
+    def _submit(*args, **kwargs):
+        future = real_submit(*args, **kwargs)
+        submitted.append(future)
+        return future
+
+    def _release(claim_id):
+        async_delegation.defer_completion_delivery(event["delegation_id"], claim_id)
+        release_contexts.append((scope.get(), threading.current_thread().daemon))
+        released.set()
+
+    monkeypatch.setattr(pool, "submit", _submit)
+
+    async def _exercise():
+        asyncio.get_running_loop().set_default_executor(pool)
+        scope.set("owning-profile")
+        task = asyncio.create_task(claim_off_loop(
+            lambda: async_delegation.claim_event_delivery(event, "old"), _release,
+        ))
+        await asyncio.sleep(0)  # The claimant submits and suspends at its await.
+        # Block this test's loop so the worker finishes before its result can be consumed.
+        assert submitted[0].result(timeout=5)
+        pool.shutdown(wait=True)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_exercise())
+    assert released.wait(5), "finished claim was not refunded after executor shutdown"
+    assert release_contexts == [("owning-profile", False)]
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+    assert async_delegation.claim_event_delivery(event, "next-consumer")
 
 
 def test_cancelled_sibling_claim_releases_its_lease(monkeypatch, isolated_registry):
@@ -1147,11 +1288,11 @@ def test_cancelled_primary_claim_is_refunded_not_released(monkeypatch, isolated_
     assert row["delivery_attempts"] == 1, f"cancellation spent an attempt: {row['delivery_attempts']}"
 
 
-@pytest.mark.parametrize(("verdict", "expected_operation"), [("terminal", "drop"), ("retry", "release")])
-def test_cancelled_preflight_settle_is_not_released_again(
+@pytest.mark.parametrize(("verdict", "expected_operation"), [("terminal", "drop"), ("retry", "defer")])
+def test_cancelled_preflight_settle_is_not_duplicated(
     monkeypatch, isolated_registry, verdict, expected_operation,
 ):
-    """Cancellation during a pre-flight settle must not race a second finally settle."""
+    """Cancellation during terminal or deferred pre-flight handling must settle only once."""
     import threading
 
     from gateway import run_notifications
@@ -1172,7 +1313,7 @@ def test_cancelled_preflight_settle_is_not_released_again(
 
     runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
     runner._completion_delivery_ready = AsyncMock(return_value=True)
-    runner._classify_completion_target = AsyncMock(return_value=verdict)
+    runner._classify_completion_owner = AsyncMock(return_value=(verdict, "owner-session", "proven-session"))
     runner._settle_durable_claims = _settle
     monkeypatch.setattr(run_notifications, "claim_off_loop", AsyncMock(return_value=True))
     event = _async_event("deleg_terminal_drop_race")
@@ -1183,6 +1324,9 @@ def test_cancelled_preflight_settle_is_not_released_again(
             runner._deliver_completion_notification_scoped("completion", event)
         )
         while not entered.is_set():
+            if task.done():
+                await task
+                raise AssertionError(f"expected {expected_operation} settle, got {operations!r}")
             await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1198,6 +1342,52 @@ def test_cancelled_preflight_settle_is_not_released_again(
 
     asyncio.run(_exercise())
     assert [operation[0] for operation in operations] == [expected_operation]
+
+
+@pytest.mark.parametrize("event_kind", ["task_failure", "terminal_fallback"])
+def test_gateway_main_path_acknowledges_exact_outbox_event_and_restart_does_not_replay(
+    monkeypatch, isolated_registry, event_kind,
+):
+    """Gateway admission settles the outbox event, not the delegation lifecycle row."""
+    from tools import async_delegation
+
+    event = _async_event(f"deleg_outbox_{event_kind}")
+    if event_kind == "task_failure":
+        event.update(
+            task_failure_notice=True,
+            is_batch=True,
+            status="running",
+            results=[{"task_index": 0, "status": "error", "error": "worker failed"}],
+        )
+        result = None
+    else:
+        event.update(summary="fallback result")
+        result = {"status": "completed", "summary": event["summary"]}
+    _persist_pending_completion(event)
+    async_delegation._persist_outbox_event(event, result, event_kind=event_kind)
+
+    isolated_registry.completion_queue.put(dict(event))
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    runner._completion_notification_batch_window = 0
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    with async_delegation._DB_LOCK, async_delegation._transaction() as conn:
+        assert conn.execute(
+            "SELECT delivery_state FROM async_delegation_events WHERE event_id=?",
+            (event["_delivery_event_id"],),
+        ).fetchone() == ("delivered",)
+        assert conn.execute(
+            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            (event["delegation_id"],),
+        ).fetchone() == ("pending",)
+
+    restart_queue = queue.Queue()
+    assert async_delegation.restore_undelivered_completions(restart_queue) == 0
+    assert restart_queue.empty()
 
 
 def test_cancelled_settle_waits_for_queued_worker():
@@ -1258,3 +1448,282 @@ def test_cancelled_settle_waits_for_queued_worker():
     finally:
         pool.shutdown(wait=True)
     assert operations == [("drop", "delegation", "claim")]
+
+
+def test_unresolvable_async_event_is_consumed_once_and_dropped(
+    monkeypatch, isolated_registry, caplog,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_unresolvable")
+    event["session_key"] = ""
+    _persist_pending_completion(event)
+    isolated.put(event)
+
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    from tools import async_delegation
+
+    adapter.handle_message.assert_not_awaited()
+    assert isolated.empty()
+    assert async_delegation.get_durable_delegation("deleg_unresolvable")["delivery_state"] == "dropped"
+    warnings = [record.message for record in caplog.records if "Dropping async delegation deleg_unresolvable" in record.message]
+    assert len(warnings) == 1
+
+
+def test_unresolvable_async_drop_settles_off_the_event_loop(
+    monkeypatch, isolated_registry,
+):
+    """The terminal drop settle writes state.db, so it must run in a worker thread."""
+    import threading
+
+    from tools import async_delegation
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_unresolvable_off_loop")
+    event["session_key"] = ""
+    _persist_pending_completion(event)
+    isolated.put(event)
+
+    loop_threads: list[int] = []
+    drop_threads: list[int] = []
+    real_drop = async_delegation.drop_completion_delivery
+
+    def _recording_drop(delegation_id, claim_id):
+        drop_threads.append(threading.get_ident())
+        return real_drop(delegation_id, claim_id)
+
+    monkeypatch.setattr(async_delegation, "drop_completion_delivery", _recording_drop)
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    async def _run() -> None:
+        loop_threads.append(threading.get_ident())
+        await runner._async_delegation_watcher(interval=0)
+
+    asyncio.run(_run())
+
+    assert drop_threads, "the unresolvable completion was never settled"
+    assert loop_threads[0] not in drop_threads
+    assert async_delegation.get_durable_delegation("deleg_unresolvable_off_loop")["delivery_state"] == "dropped"
+
+
+def test_resolvable_async_event_without_adapter_remains_retryable(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_transient_route")
+    _persist_pending_completion(event)
+    isolated.put(event)
+
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner.adapters = {}
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    from tools import async_delegation
+
+    assert not isolated.empty()
+    row = async_delegation.get_durable_delegation("deleg_transient_route")
+    assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+
+
+def test_raw_api_session_async_event_routes_to_api_dispatcher(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_raw_api")
+    event["session_key"] = "raw-api-session-42"
+    event.pop("origin_profile", None)
+    isolated.put(event)
+
+    api_adapter = SimpleNamespace(handle_message=AdmittingHandler(), _ensure_session_db=lambda: object())
+    runner = _runner(api_adapter)
+    runner.adapters = {Platform.API_SERVER: api_adapter}
+    runner._self_post_api_server = AsyncMock(return_value=True)
+    monkeypatch.setattr("gateway.wake.adapter_supports_push", lambda _adapter: False)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    runner._self_post_api_server.assert_awaited_once()
+    assert runner._self_post_api_server.await_args.args[2] == "raw-api-session-42"
+    assert isolated.empty()
+
+
+@pytest.mark.parametrize(
+    ("session_key", "store_fails"),
+    [
+        # Platform plugin disabled or not loaded yet: Platform()/is_registered rejects it.
+        ("agent:main:unregistered_plugin_platform:dm:12345", False),
+        # Resolvable only through the session store, which failed this tick.
+        ("agent:main:store-only-session", True),
+    ],
+    ids=["unregistered-platform", "session-store-failure"],
+)
+def test_routed_async_event_with_unresolved_source_remains_retryable(
+    monkeypatch, isolated_registry, session_key, store_fails,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_unresolved_source")
+    event["session_key"] = session_key
+    _persist_pending_completion(event)
+    isolated.put(event)
+
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    if store_fails:
+        def _store_down():
+            raise OSError("session store unavailable")
+
+        runner.session_store = SimpleNamespace(_ensure_loaded=_store_down, _entries={})
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    from tools import async_delegation
+
+    adapter.handle_message.assert_not_awaited()
+    assert [isolated.get_nowait()["delegation_id"]] == ["deleg_unresolved_source"]
+    row = async_delegation.get_durable_delegation("deleg_unresolved_source")
+    assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["route-free", "closed-parent"])
+@pytest.mark.parametrize("event_kind", ["lifecycle", "task_failure", "terminal_fallback"])
+async def test_terminal_drop_sql_failure_retries_exact_event(monkeypatch, isolated_registry, route, event_kind):
+    """A real SQL rejection is not a terminal receipt, and must preserve the queue copy."""
+    from tools import async_delegation as ad
+
+    evt = _async_event("drop_sql_failure")
+    if route == "route-free":
+        evt["session_key"] = ""
+    else:
+        evt["parent_session_id"] = "closed-parent"
+    _persist_pending_completion(evt)
+    if event_kind != "lifecycle":
+        if event_kind == "task_failure":
+            evt.update(task_failure_notice=True, is_batch=True, status="running")
+        ad._persist_outbox_event(evt, None, event_kind=event_kind)
+    table = "async_delegations" if event_kind == "lifecycle" else "async_delegation_events"
+    key = "delegation_id" if event_kind == "lifecycle" else "event_id"
+    identity = evt["delegation_id"] if event_kind == "lifecycle" else evt["_delivery_event_id"]
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(f"""CREATE TRIGGER reject_terminal_drop BEFORE UPDATE ON {table}
+            WHEN NEW.delivery_state='dropped'
+            BEGIN SELECT RAISE(ABORT, 'temporary ledger write failure'); END""")
+
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    if route == "closed-parent":
+        runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value=None))
+    isolated_registry.completion_queue.put(evt)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+    await runner._async_delegation_watcher(interval=0)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        state = conn.execute(f"SELECT delivery_state, delivery_attempts, delivery_claim FROM {table} WHERE {key}=?", (identity,)).fetchone()
+        conn.execute("DROP TRIGGER reject_terminal_drop")
+    assert state == ("pending", 0, None)
+    assert list(isolated_registry.completion_queue.queue) == [evt]
+    adapter.handle_message.assert_not_awaited()
+
+    runner._running = True
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+    await runner._async_delegation_watcher(interval=0)
+    assert isolated_registry.completion_queue.empty()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(f"SELECT delivery_state FROM {table} WHERE {key}=?", (identity,)).fetchone() == ("dropped",)
+        if event_kind != "lifecycle":
+            assert conn.execute("SELECT delivery_state FROM async_delegations WHERE delegation_id=?", (evt["delegation_id"],)).fetchone() == ("pending",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["drop-sql", "claim-sql"])
+async def test_mixed_group_retains_only_unsettled_real_delivery(monkeypatch, isolated_registry, failure):
+    """Settled siblings leave the mutable retry group even when another drop cannot finish."""
+    from tools import async_delegation as ad
+
+    unsettled, delivered, settled = [_async_event(name) for name in ("unsettled", "delivered", "settled")]
+    unsettled["session_key"] = settled["session_key"] = ""
+    for evt in (unsettled, delivered, settled):
+        _persist_pending_completion(evt)
+    if failure == "drop-sql":
+        when = "NEW.delivery_state='dropped'"
+    else:
+        when = "NEW.delivery_claim IS NOT NULL"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(f"""CREATE TRIGGER reject_unsettled BEFORE UPDATE ON async_delegations
+            WHEN NEW.delegation_id='unsettled' AND {when}
+            BEGIN SELECT RAISE(ABORT, 'temporary ledger write failure'); END""")
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    group = [unsettled, delivered, settled]
+    assert await runner._deliver_async_delegation_group_scoped(group) is False
+    assert group == [unsettled]
+    assert [ad.get_durable_delegation(evt["delegation_id"])["delivery_state"] for evt in (unsettled, delivered, settled)] == ["pending", "delivered", "dropped"]
+    adapter.handle_message.assert_awaited_once()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("DROP TRIGGER reject_unsettled")
+    assert await runner._deliver_async_delegation_group_scoped(group) is None
+    assert group == []
+    assert ad.get_durable_delegation("unsettled")["delivery_state"] == "dropped"
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("session_key", "agent:broken"), ("parent_session_id", "owner-unavailable"),
+    ("platform", "telegram"), ("chat_id", "123"), ("user_id", "456"),
+])
+def test_partial_route_hints_are_not_terminal(monkeypatch, isolated_registry, field, value):
+    from tools import async_delegation as ad
+
+    evt = _async_event("partial_route")
+    evt["session_key"] = ""
+    evt[field] = value
+    _persist_pending_completion(evt)
+    isolated_registry.completion_queue.put(evt)
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+    row = ad.get_durable_delegation(evt["delegation_id"])
+    assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+    assert list(isolated_registry.completion_queue.queue) == [evt]
+
+
+def test_route_free_outbox_siblings_drop_exact_rows_without_restart_replay(monkeypatch, isolated_registry):
+    from tools import async_delegation as ad
+
+    lifecycle = _async_event("route_free_outbox")
+    lifecycle["session_key"] = ""
+    _persist_pending_completion(lifecycle)
+    events = []
+    for kind in ("task_failure", "terminal_fallback"):
+        evt = dict(lifecycle)
+        if kind == "task_failure":
+            evt.update(task_failure_notice=True, is_batch=True, status="running",
+                       results=[{"task_index": 0, "status": "error", "error": "failed"}])
+        ad._persist_outbox_event(evt, None, event_kind=kind)
+        events.append(evt)
+        isolated_registry.completion_queue.put(evt)
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+    assert isolated_registry.completion_queue.empty()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute("SELECT event_id, delivery_state FROM async_delegation_events ORDER BY event_id").fetchall() == sorted((evt["_delivery_event_id"], "dropped") for evt in events)
+    assert ad.get_durable_delegation(lifecycle["delegation_id"])["delivery_state"] == "pending"
+    restored = queue.Queue()
+    ad.restore_undelivered_completions(restored)
+    # The lifecycle is independently pending, but neither dropped outbox identity may replay.
+    assert not any(evt.get("_delivery_event_id") in {e["_delivery_event_id"] for e in events} for evt in restored.queue)

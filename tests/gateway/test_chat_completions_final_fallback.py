@@ -49,3 +49,8 @@ def test_final_response_emitted_when_no_deltas_streamed():
 
 def test_final_response_not_duplicated_after_streamed_deltas():
     assert _run_stream(["hello ", "world"], "hello world") == ["hello ", "world"]
+
+
+def test_fallback_after_a_held_copy_marker_prefix_never_repeats_it():
+    contents = _run_stream(["[[copy]]"], "[[copy]]\nRecovered copy.\n[[/copy]]")
+    assert "".join(contents) == "Recovered copy.\n"

@@ -14,6 +14,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from cron.scheduler_admission import begin_tick, wait_for_next_tick
+
 logger = logging.getLogger(__name__)
 
 # Cap for exponential tick backoff during fd exhaustion (interval doubled per failure).
@@ -61,7 +63,7 @@ def _guarded_store_write(action, description, *args, **kwargs):
     """
     try:
         action(*args, **kwargs)
-    except BaseException as e:  # noqa: BLE001 - mirror the tick body's BaseException policy
+    except BaseException as e:
         logger.warning("Cron %s write failed: %s", description, e, exc_info=True)
 
 
@@ -156,18 +158,18 @@ class CronScheduler(ABC):
 
     def stop(self) -> None:
         """Optional eager teardown; stop_event is the primary signal."""
-        return None
+        return
 
     # Optional hooks for external providers — default-safe; keep NON-abstract.
 
     def on_jobs_changed(self) -> None:
         """After a successful store mutation; external providers reconcile. Built-in: no-op."""
-        return None
+        return
 
     def register_job(self, job: dict[str, Any]) -> None:
         """Register the external trigger for a newly persisted job (must complete before callers
         report it as scheduled). Built-in: no-op."""
-        return None
+        return
 
     def recover_interrupted(self) -> int:
         """Run profile-local attempt recovery for every provider lifecycle."""
@@ -238,7 +240,7 @@ class CronScheduler(ABC):
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (desired state). Built-in: no-op."""
-        return None
+        return
 
 
 def provider_supports_force_fire(provider: Any) -> bool:
@@ -291,7 +293,7 @@ def _misfire_grace_minutes() -> float:
 
 
 def fire_overdue_jobs(
-    provider: "CronScheduler", *, adapters: Any = None, loop: Any = None, now: Any = None,
+    provider: CronScheduler, *, adapters: Any = None, loop: Any = None, now: Any = None,
 ) -> int:
     """Misfire backstop (gateway housekeeping loop): fire jobs whose external HTTP fire never
     arrived, else ``next_run_at`` stays parked in the past forever. No-op for the built-in (its tick
@@ -384,7 +386,7 @@ def fire_overdue_jobs(
     return fired
 
 
-def resolve_cron_scheduler() -> "CronScheduler":
+def resolve_cron_scheduler() -> CronScheduler:
     """Resolve ``cron.provider``; missing/failing/unavailable providers fall back to the built-in
     with a warning — cron must never be left without a trigger."""
     name = ""
@@ -414,8 +416,8 @@ def resolve_cron_scheduler() -> "CronScheduler":
 
 
 def scheduler_for_profile_mode(
-    provider: "CronScheduler", *, multiplex_profiles: bool
-) -> "CronScheduler":
+    provider: CronScheduler, *, multiplex_profiles: bool
+) -> CronScheduler:
     """External providers own one unscoped remote registry and cannot reconcile several profile
     stores: fail closed to the built-in multiplex ticker until the API carries profile identity."""
     if not multiplex_profiles or isinstance(provider, InProcessCronScheduler):
@@ -428,7 +430,7 @@ def scheduler_for_profile_mode(
 
 
 class InProcessCronScheduler(CronScheduler):
-    """Default in-process 60s ticker; ``start()`` blocks until ``stop_event``. ``can_dispatch`` is
+    """Default deadline-driven ticker; ``start()`` blocks until ``stop_event``. ``can_dispatch`` is
     an optional drain gate; skipped ticks leave due jobs intact for the next allowed tick."""
 
     @property
@@ -485,6 +487,8 @@ class InProcessCronScheduler(CronScheduler):
         consecutive_failures = 0
         next_tick = time.monotonic()
         while not stop_event.is_set():
+            tick_started = time.monotonic()
+            begin_tick()
             ok = False
             try:
                 if can_dispatch is not None and not can_dispatch():
@@ -523,13 +527,19 @@ class InProcessCronScheduler(CronScheduler):
                 _guarded_store_write(clear_ticker_error, "error clear")
                 consecutive_failures = 0
             wait_for = _backoff_wait_seconds(interval, consecutive_failures)
-            next_tick += wait_for
+            if consecutive_failures:
+                next_tick = tick_started
+            # Due-time and release wakes add scans without moving the periodic deadline.
+            if tick_started >= next_tick:
+                next_tick += wait_for
             now = time.monotonic()
             if next_tick < now:
                 # Tick overran interval or host was suspended; re-anchor to avoid
                 # burst-firing zero-length sleep cycles (#114467).
                 next_tick = now + wait_for
-            stop_event.wait(max(0.0, next_tick - now))
+            wait_for_next_tick(
+                stop_event, max(0.0, next_tick - now), max_wait=wait_for,
+                failures=consecutive_failures)
 
     def _start_multiplex(
         self, stop_event, *, profile_homes, adapters=None, loop=None, interval=60,
@@ -588,6 +598,8 @@ class InProcessCronScheduler(CronScheduler):
         consecutive_failures = 0
         next_tick = time.monotonic()
         while not stop_event.is_set():
+            tick_started = time.monotonic()
+            begin_tick()
             ok = False
             _tick_error = None
             _profile_errors: dict[str, str] = {}
@@ -665,10 +677,16 @@ class InProcessCronScheduler(CronScheduler):
             if ok:
                 consecutive_failures = 0
             wait_for = _backoff_wait_seconds(interval, consecutive_failures)
-            next_tick += wait_for
+            if consecutive_failures:
+                next_tick = tick_started
+            # Due-time and release wakes add scans without moving the periodic deadline.
+            if tick_started >= next_tick:
+                next_tick += wait_for
             now = time.monotonic()
             if next_tick < now:
                 # Tick overran interval or host was suspended; re-anchor to avoid
                 # burst-firing zero-length sleep cycles (#114467).
                 next_tick = now + wait_for
-            stop_event.wait(max(0.0, next_tick - now))
+            wait_for_next_tick(
+                stop_event, max(0.0, next_tick - now), max_wait=wait_for,
+                failures=consecutive_failures, profile_homes=cycle_homes)

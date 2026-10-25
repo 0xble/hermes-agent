@@ -1,7 +1,7 @@
 """Regression tests for sudo detection and sudo password handling."""
 
-import tools.terminal_tool as terminal_tool
-import tools.terminal_tool_sudo as terminal_tool_sudo
+from tools import terminal_tool
+from tools import terminal_tool_sudo
 
 
 def setup_function():
@@ -79,6 +79,11 @@ def test_validate_workdir_allows_unicode_filesystem_paths():
     ) is None
     assert terminal_tool._validate_workdir("/tmp/テスト") is None
     assert terminal_tool._validate_workdir("/home/jürgen/über projekt") is None
+
+
+def test_terminal_description_avoids_standalone_wait_commands():
+    assert "Never use a standalone foreground sleep or timer" in terminal_tool.TERMINAL_TOOL_DESCRIPTION
+    assert "process wait action" in terminal_tool.TERMINAL_TOOL_DESCRIPTION
 
 
 def test_validate_workdir_still_blocks_metachars_in_unicode_paths():

@@ -84,7 +84,7 @@ def _active_goal(session_id: str):
 def _blocked_goal(session_id: str):
     mgr = _active_goal(session_id)
     with patch("hermes_cli.goals.judge_goal",
-               return_value=("blocked", "needs the user to answer", False, None, False)):
+               return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False)):
         assert mgr.evaluate_after_turn("May I proceed?")["status"] == "paused"
     return mgr
 
@@ -106,7 +106,9 @@ async def test_stop_pauses_goal_so_user_input_does_not_revive_it(monkeypatch, se
 
     runner, adapter, source, key, session_id = await _runner(monkeypatch)
     (_active_goal if goal_state == "active" else _blocked_goal)(session_id)
-    continuation = runner._synthetic_prompt_event(source, "[Continuing toward your standing goal]\nGoal: x")
+    # Gateway-authored, as the post-turn judge enqueues it: invalidation keys on provenance, not text.
+    continuation = runner._synthetic_prompt_event(source, "[Continuing toward your standing goal]\nGoal: x",
+                                                  reply_expected=False, goal_continuation=True)
     adapter._pending_messages[key] = continuation
 
     if session_state == "busy":

@@ -13,6 +13,7 @@ import asyncio
 import logging
 import time
 from typing import Dict, Optional
+from collections.abc import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +21,14 @@ logger = logging.getLogger(__name__)
 # distinct sessions may transiently exceed the cap rather than break serialization.
 DEFAULT_MAX_LEASES = 512
 # Fallback wait (seconds) when the caller passes no positive timeout (bridged via
-# HERMES_TURN_LEASE_TIMEOUT — lease contention is not agent inactivity). Fail-closed but short:
-# never pin a sequential platform updater for minutes.
+# HERMES_TURN_LEASE_TIMEOUT — lease contention is not agent inactivity). Callers without
+# a durable waiting owner fail closed here, while queued inputs get the larger total bound.
 DEFAULT_LEASE_WAIT = 5.0
+DEFAULT_LEASE_NOTICE_DELAY = 30.0
+DEFAULT_MAX_LEASE_WAIT = 1800.0
 
 
-def _holder_desc(holder: Optional["TurnLeaseToken"]) -> tuple:
+def _holder_desc(holder: "Optional[TurnLeaseToken]") -> tuple:
     return (holder.owner_key, holder.generation) if holder else ("?", "?")
 
 
@@ -43,7 +46,7 @@ class TurnLeaseToken:
     """Held-lease handle from :meth:`SessionTurnLeaseRegistry.acquire`; ``released`` makes
     release idempotent."""
 
-    __slots__ = ("session_id", "owner_key", "generation", "released", "lease")
+    __slots__ = ("generation", "lease", "owner_key", "released", "session_id")
 
     def __init__(self, session_id: str, owner_key: str, generation: int, lease: "_SessionLease") -> None:
         self.session_id, self.owner_key, self.generation = session_id, owner_key, generation
@@ -58,7 +61,7 @@ class TurnLeaseToken:
 
 
 class _SessionLease:
-    __slots__ = ("lock", "holder", "acquired_at", "last_used", "pending_acquires")
+    __slots__ = ("acquired_at", "holder", "last_used", "lock", "pending_acquires")
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
@@ -76,7 +79,7 @@ class SessionTurnLeaseRegistry:
     visibility scope as the routing-key guards it extends); call only from the gateway loop."""
 
     def __init__(self, max_entries: int = DEFAULT_MAX_LEASES) -> None:
-        self._leases: Dict[str, _SessionLease] = {}
+        self._leases: dict[str, _SessionLease] = {}
         self._max_entries = max(1, int(max_entries))
 
     def _get_or_create(self, session_id: str) -> _SessionLease:
@@ -96,38 +99,51 @@ class SessionTurnLeaseRegistry:
             self._leases.pop(sid, None)
 
     async def acquire(
-        self, session_id: str, *, owner_key: str, generation: int, timeout: Optional[float] = None
+        self, session_id: str, *, owner_key: str, generation: int, timeout: Optional[float] = None,
+        on_timeout: Callable[[], Awaitable[None]] | None = None,
+        max_wait: float = DEFAULT_MAX_LEASE_WAIT,
+        on_wait: Callable[[], Awaitable[None]] | None = None,
     ) -> Optional[TurnLeaseToken]:
-        """Acquire the lease for ``session_id``, waiting if held. Raises
-        :class:`TurnLeaseTimeoutError` when the wait budget expires; None for a falsy id."""
+        """Acquire the lease for ``session_id``; None for a falsy id.
+
+        At the initial deadline, fail closed unless ``on_timeout`` durably takes
+        ownership of the waiting input. Extend the original FIFO wait until release
+        or ``max_wait``, with a one-time ``on_wait`` notice after 30 seconds.
+        """
         if not session_id:
             return None
         wait = float(timeout) if timeout and timeout > 0 else DEFAULT_LEASE_WAIT
         lease = self._get_or_create(session_id)
         token = TurnLeaseToken(session_id, owner_key, int(generation), lease=lease)
         if lease.lock.locked():
+            overlap = "previous turn is handing off the lease"
+            if lease.holder is not None:
+                overlap = ("same-key generation overlap" if owner_key == lease.holder.owner_key
+                           else "two routing keys are mapped to one session_id (#64934)")
             logger.warning(
                 "turn lease contention on session %s: routing key %s (gen %s) waiting behind "
-                "in-flight turn held by routing key %s (gen %s, held %.0fs) — two routing keys "
-                "are mapped to one session_id (#64934); serializing this turn behind the previous "
-                "turn's flush",
+                "in-flight turn held by routing key %s (gen %s, held %.0fs) — %s; "
+                "serializing this turn behind the previous turn's flush",
                 session_id, owner_key, generation, *_holder_desc(lease.holder),
-                time.time() - lease.acquired_at if lease.acquired_at else -1.0)
+                time.time() - lease.acquired_at if lease.acquired_at else -1.0,
+                overlap)
         # Lock.release() wakes a waiter while leaving the lock momentarily unlocked. Count every
         # in-progress acquire across that handoff (even apparently-uncontended ones — wait_for()
         # may schedule them before the lock coroutine runs) so eviction cannot orphan the old
         # lock and create a second lock for the same session.
         lease.pending_acquires += 1
+        started = time.monotonic()
         try:
-            await asyncio.wait_for(lease.lock.acquire(), timeout=wait)
-        except asyncio.TimeoutError:
+            await self._wait_for_lock(lease.lock, wait, on_timeout, max_wait, on_wait)
+        except TimeoutError:
+            elapsed = time.monotonic() - started
             logger.error(
                 "turn lease wait timed out after %.0fs on session %s (waiter: routing key %s gen "
                 "%s; holder: routing key %s gen %s) — failing closed: refusing to run this turn "
                 "UNSERIALIZED against the still-held lease",
-                wait, session_id, owner_key, generation, *_holder_desc(lease.holder))
+                elapsed, session_id, owner_key, generation, *_holder_desc(lease.holder))
             raise TurnLeaseTimeoutError(
-                session_id, owner_key=owner_key, generation=generation, wait_seconds=wait) from None
+                session_id, owner_key=owner_key, generation=generation, wait_seconds=elapsed) from None
         finally:
             lease.pending_acquires -= 1
         # Lock held and no await before holder publication, so the lease cannot become
@@ -135,6 +151,34 @@ class SessionTurnLeaseRegistry:
         lease.holder = token
         lease.acquired_at = lease.last_used = time.time()
         return token
+
+    @staticmethod
+    async def _wait_for_lock(lock, timeout, on_timeout, max_wait, on_wait):
+        # Keep the SAME asyncio.Lock waiter after the deadline, preserving FIFO order.
+        # Cancellation must drain it too: otherwise a detached acquire can steal the lease.
+        waiter = asyncio.create_task(lock.acquire())
+        acquired = False
+        notice_at = asyncio.get_running_loop().time() + DEFAULT_LEASE_NOTICE_DELAY
+        try:
+            async with asyncio.timeout(max_wait):
+                done, _ = await asyncio.wait({waiter}, timeout=timeout)
+                if not done:
+                    if on_timeout is None:
+                        raise TimeoutError
+                    await on_timeout()  # preserve durably off-loop before extending its wait
+                    if on_wait is not None:
+                        remaining = max(0, notice_at - asyncio.get_running_loop().time())
+                        done, _ = await asyncio.wait({waiter}, timeout=remaining)
+                        if not done:
+                            await on_wait()
+                await waiter
+                acquired = True
+        finally:
+            if not acquired:
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+                if not waiter.cancelled() and waiter.exception() is None and waiter.result():
+                    lock.release()
 
     def rebind(self, token: Optional[TurnLeaseToken], new_session_id: str) -> bool:
         """Alias a HELD lease onto ``new_session_id`` after mid-turn rotation (compression) so the

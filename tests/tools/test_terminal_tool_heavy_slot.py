@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from tools import terminal_tool_heavy_slot as heavy
-from tools.terminal_tool_heavy_slot import classify_command, wrap_heavy_command
+from tools.terminal_tool_heavy_slot import can_promote_expired_wait, classify_command, wrap_heavy_command
 
 HELPER = "/opt/heavy/bin/heavy-slot"
 
@@ -27,6 +27,32 @@ def helper(monkeypatch):
 
 @pytest.mark.parametrize(("command", "label"), [
     ("pytest -q tests", "pytest"),
+    ("node scripts/run-workspace-checks.mjs", "workspace-checks"),
+    ("npx eslint .", "eslint"),
+    ("npx tsc --noEmit", "tsc"),
+    ("npm ci", "install"),
+    ("pip install -r requirements.txt", "pip-install"),
+    ("uv sync --compile-bytecode", "uv-sync"),
+    ("python -m unittest discover", "unittest"),
+    ("agentkit evals admit --trials 12", "evals-admit"),
+    ("agentkit evals run --trials 12", "evals-run"),
+    ("./bin/check --fast", "check"),
+    ("node viewer/check.js", "check"),
+    ("python pm/launch.py install --test-environment", "pm-install"),
+    ("go test ./...", "go-test"),
+    ("scripts/run_tests.sh tests/agent/test_foo.py -k test_x", "run_tests"),
+    ("python scripts/run_tests_parallel.py tests/test_a.py", "run_tests"),
+    ("python -m compileall -j 4 .", "compileall"),
+    ("python -m pip install pytest", "pip-install"),
+    ("uv pip install pytest", "uv-install"),
+    ("pnpm build", "build"),
+    ("turbo run build", "build"),
+    ("pnpm --filter test build", "build"),
+    ("npm install test", "install"),
+    ("pnpm add -D vitest", "install"),
+    ("yarn workspace app add -D test", "install"),
+    ("npm run check", "check"),
+    ("npx playwright test", "playwright"),
     ("python -m pytest tests/", "pytest"),
     (".venv/bin/python -m pytest -n 8 tests/tools/test_a.py", "pytest"),
     ("cd repo && uv run pytest -q", "pytest"),
@@ -55,16 +81,31 @@ def helper(monkeypatch):
     ("pytest -n 8 tests/tools/test_a.py", "pytest"),
     ("pytest --numprocesses=auto tests/tools/test_a.py", "pytest"),
     ("jest --maxWorkers=4 src/a.test.js", "jest"),
+    ("jest -w 8", "jest"),
     ("vitest --pool=threads src/a.test.ts", "vitest"),
     ("vitest run --maxWorkers 4 src/a.test.ts", "vitest"),
+    ("vitest --watch=false", "vitest"),
+    ("vitest run --watch=false", "vitest"),
+    ("jest --watch=false", "jest"),
+    ("pnpm test --watch=false", "test"),
     ("scripts/run_tests.sh --workers 8 tests/agent/test_foo.py", "run_tests"),
 ])
-def test_recognizes_heavy_commands(command, label):
+def test_recognizes_heavy_commands(command, label, helper):
     assert classify_command(command) == label
+    assert f"hermes {label}" in wrap_heavy_command(command, env_type="local")
 
 
 @pytest.mark.parametrize("command", [
     "git status",
+    "ls",
+    "cat scripts/run-workspace-checks.mjs",
+    "rg eslint .",
+    "node viewer/serve.js",
+    "agentkit evals list",
+    "go version",
+    "python pm/launch.py status",
+    "uv --version",
+    "uv run --frozen python -c 'print(1)'",
     "grep -rn pytest .",
     "rg 'pytest -q' tools",
     "echo 'a; pytest b'",
@@ -74,17 +115,9 @@ def test_recognizes_heavy_commands(command, label):
     "ls # pytest",
     "python - <<'PY'\nprint('pytest -q tests')\nPY",
     "cat <<EOF > notes.md\npytest -q tests\nEOF",
-    "uv pip install pytest",
-    "pnpm add -D vitest",
-    "pnpm build",
-    "npm install test",
-    "yarn workspace app add -D test",
-    "turbo run build",
-    "pnpm --filter test build",
     "./bin/ci preflight",
     "~/.hermes/plugins/git-guard/bin/ci-gate deadbeef",  # ci-gate takes its own slot
     "pytest tests/tools/test_a.py tests/tools/test_b.py -q",  # targeted
-    "scripts/run_tests.sh tests/agent/test_foo.py -k test_x",  # targeted
     "vitest run src/a.test.ts",  # targeted
     "pytest -q -x --tb=short -k smoke tests/tools/test_a.py::test_b",  # targeted with single-run options
     "command pytest tests",  # `command` deliberately bypasses shell functions: left alone
@@ -94,11 +127,77 @@ def test_leaves_light_commands_alone(command):
     assert classify_command(command) is None
 
 
+@pytest.mark.parametrize(("command", "label"), [
+    ("tsc --watch", None),
+    ("tsc -b --watch", None),
+    ("tsc -w", None),
+    ("vitest --watch", None),
+    ("vitest -w", None),
+    ("jest --watch", None),
+    ("pnpm build --watch", None),
+    ("npm run build:watch", None),
+    ("pnpm watch", None),
+    ("turbo run watch", None),
+    ("tsc --version", None),
+    ("vitest --help", None),
+    ("jest -h", None),
+    ("pytest --version", None),
+    ("./bin/ci --help", None),
+    ("pnpm build", "build"),
+])
+def test_watch_info_and_non_watch_build_classification(command, label, helper):
+    assert classify_command(command) == label
+    wrapped = wrap_heavy_command(command, env_type="local")
+    if label is None:
+        assert wrapped == command
+    else:
+        assert f"hermes {label}" in wrapped
+
+
+def test_foreground_dispatcher_passes_bounded_queue_wait(helper):
+    wrapped = wrap_heavy_command("pytest -q tests", env_type="local", max_wait_seconds=30)
+    dispatcher, body = wrapped.split("\n", 1)
+    assert "HEAVY_SLOT_MAX_WAIT=30" in dispatcher
+    assert body == "_hermes_heavy_slot 'hermes pytest' pytest -q tests"
+
+
 def test_routes_only_the_heavy_simple_command(helper):
     wrapped = wrap_heavy_command("cd repo && export X=1 && pytest -q tests; echo done", env_type="local")
     dispatcher, body = wrapped.split("\n", 1)
     assert dispatcher.startswith("_hermes_heavy_slot() {") and HELPER in dispatcher
     assert body == "cd repo && export X=1 && _hermes_heavy_slot 'hermes pytest' pytest -q tests; echo done"
+
+
+def test_background_dispatcher_keeps_unbounded_queue_wait(helper):
+    wrapped = wrap_heavy_command("pytest -q tests", env_type="local", max_wait_seconds=None)
+    dispatcher, _body = wrapped.split("\n", 1)
+    assert "HEAVY_SLOT_MAX_WAIT" not in dispatcher
+
+
+@pytest.mark.parametrize(("command", "env_type", "expected"), [
+    ("pytest -q tests", "local", True),
+    ("cd repo && pytest -q tests", "local", False),
+    ("pytest -q tests && echo done", "local", False),
+    ("pytest -q tests", "docker", False),
+    ("echo pytest -q tests", "local", False),
+])
+def test_only_single_simple_heavy_commands_are_promotable(command, env_type, expected):
+    assert can_promote_expired_wait(command, env_type=env_type, environment={}) is expected
+
+
+@pytest.mark.parametrize(("background", "env_type", "timeout", "expected"), [
+    (False, "local", 180, 60),
+    (False, "local", 600, 120),
+    (False, "local", 6, 10),
+    (True, "local", 180, None),
+    (False, "docker", 180, None),
+])
+def test_terminal_tool_bounds_only_foreground_local_waits(background, env_type, timeout, expected):
+    from tools.terminal_tool import _heavy_slot_max_wait_for
+
+    assert _heavy_slot_max_wait_for(
+        background=background, env_type=env_type, effective_timeout=timeout,
+    ) == expected
 
 
 @pytest.mark.parametrize(("command", "expected"), [

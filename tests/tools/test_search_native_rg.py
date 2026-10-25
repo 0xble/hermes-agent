@@ -7,6 +7,7 @@ shared, so the two transports must agree on results.
 """
 
 import json
+import os
 
 import pytest
 
@@ -56,6 +57,39 @@ def _normalized(result):
         if key in d:
             d[key] = sorted(json.dumps(item, sort_keys=True) for item in d[key])
     return d
+
+
+@pytest.mark.parametrize("native", ["0", "1"])
+def test_filename_walker_thread_bound_reaches_real_rg_on_both_lanes(
+    tree, ops_factory, monkeypatch, native,
+):
+    from tools import file_operations_search
+
+    monkeypatch.setenv("HERMES_NATIVE_FILE_READ", native)
+    monkeypatch.setattr(os, "cpu_count", lambda: 28)
+    ops = ops_factory(tree, [])
+    if not ops._has_command("rg"):
+        pytest.skip("search thread-budget integration requires ripgrep")
+    calls = []
+    real_popen = file_operations_search.subprocess.Popen
+
+    def recording_popen(argv, *args, **kwargs):
+        calls.append(argv)
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(file_operations_search.subprocess, "Popen", recording_popen)
+    result = ops.search("*.py", str(tree), target="files")
+
+    assert result.error is None
+    assert set(result.files) == {str(tree / "a.py"), str(tree / "sub" / "c.py")}
+    if native == "1":
+        commands = [argv for argv in calls if "--files" in argv]
+        assert len(commands) == 1
+        assert commands[0][commands[0].index("--threads") + 1] == "4"
+    else:
+        commands = [arg for argv in calls for arg in argv if "--files" in arg]
+        assert len(commands) == 1
+        assert "--threads 4" in commands[0]
 
 
 def test_native_search_never_touches_the_shell_and_matches_shell_results(tree, ops_factory, monkeypatch):
@@ -126,3 +160,17 @@ def test_limit_hit_keeps_drained_matches_when_group_kill_is_refused(tree, ops_fa
     monkeypatch.setattr(os, "killpg", lambda pgid, sig: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted")))
     result = ops.search(pattern="needle", path=str(tree), limit=2)
     assert not result.error and len(result.matches) == 2, result.to_dict()
+
+
+def test_local_search_runs_the_pinned_ripgrep_not_the_first_on_path(_local_env, tmp_path, monkeypatch):
+    """The terminal PATH puts the user's tools first; Hermes's own search still runs PM's rg."""
+    import pm
+    from pm.install import InstalledPackage
+
+    pinned = tmp_path / "store" / "ripgrep" / "rg"
+    pinned.parent.mkdir(parents=True)
+    pinned.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(pm, "installed_package",
+                        lambda name: InstalledPackage(pinned.parent, "15", pinned) if name == "ripgrep" else None)
+    ops = ShellFileOperations(_local_env, cwd=str(tmp_path))
+    assert ops._resolve_command("rg") == str(pinned).replace("\\", "/")

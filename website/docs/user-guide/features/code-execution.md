@@ -94,8 +94,8 @@ for match in matches.get("matches", []):
         new_string="new_api_call(",
         replace_all=True
     )
-    if "error" not in str(result):
-        fixed += 1
+    # File-tool errors raise HermesToolError; successful patch calls return normally.
+    fixed += 1
 
 print(f"Fixed {fixed} files out of {len(matches.get('matches', []))} matches")
 ```
@@ -226,6 +226,8 @@ When a script fails, the agent receives structured error information:
 - **Non-zero exit code**: stderr is included in the output so the agent sees the full traceback
 - **Timeout**: Script is killed and the agent sees `"Script timed out after 300s and was killed."`
 - **Interruption**: If the user sends a new message during execution, the script is terminated and the agent sees `[execution interrupted — user sent a new message]`
+- **File-tool errors**: `read_file`, `write_file`, `patch`, and `search_files` raise `HermesToolError` when the tool returns an error envelope, so a failed read cannot be mistaken for empty successful data. Catch that exception if the script can recover.
+- **Other tool errors**: tools such as `terminal`, `web_search`, and `web_extract` still return their error dictionaries, so scripts can inspect fields such as `exit_code` or `success`.
 - **Tool call limit**: When the 50-call limit is hit, subsequent tool calls return an error message
 
 The response always includes `status` (success/error/timeout/interrupted), `output`, `tool_calls_made`, and `duration_seconds`.

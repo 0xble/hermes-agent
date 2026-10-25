@@ -22,6 +22,34 @@ are owned by [Telegram rendering](telegram-rendering.md).
 - Synthetic gateway event IDs may identify notifications but never become Telegram reply
   anchors. Numeric Telegram message IDs still anchor ordinary DM-topic replies.
 
+## Cancelled Final Settlement
+
+A captured successful final stays delivered when its turn is cancelled. A cancelled
+refusal or an interrupted transport stays attempting for the existing ambiguous-send
+recovery, without running refusal callbacks or submitting a failure write first.
+Cancellation is delivered at a real suspension, not at a coroutine return. The send
+wrapper therefore settles a known success synchronously, then returns through
+`records_delivery` so the captured result is counted exactly once. After resetting
+the settlement ContextVar, `send_final_ledgered` yields through `asyncio.sleep(0)`
+only when cancellation is pending, before refusal callbacks or failure finalization.
+
+This repairs the fork-local settlement introduced by #704. Current upstream guidance
+was checked at `dd5bc7ee13f12c6fbf70ca47d05135f63e76258a`. Related upstream
+[#107135](https://github.com/NousResearch/hermes-agent/pull/107135) owns replay
+claim/send/refund cancellation, and
+[#105810](https://github.com/NousResearch/hermes-agent/pull/105810) owns polling
+recovery, not this final-producer checkpoint. Reuse the existing ContextVar and
+ledger state machine rather than importing another recovery lifecycle.
+
+`test_cancel_after_captured_send_preserves_accounting_and_settlement` forces a real worker
+to finish before cancellation is delivered and drains that worker before observing
+the row. Both captured success and refusal count exactly 1 delivery metric. The test
+also proves no failure writer or non-suspending refusal callback ran.
+The adjacent success, interrupted-send and concurrent-obligation tests retain their
+contracts. Retire this adaptation when released upstream provides equivalent
+final-producer cancellation ordering. Roll back only this checkpoint and its test
+adaptation, without rewriting ledger rows.
+
 ## 2026-09-28 rich egress flood incident: independent diagnosis
 
 At 21:30 PDT the live Telegram API returned a roughly five-hour `RetryAfter` while inbound
@@ -119,7 +147,20 @@ media, controls, deletions, topic edits, reactions) wait FIFO and are never drop
 drafts are shed when no slot is free. Interim edits are skipped by the adapter inside the
 10.0s edit floor. The adapter pre-waits sends and final edits under the chat lock so pacing
 never eats a transport deadline. A request inside a durably recorded server penalty is refused
-locally with `RetryAfter` for every path. Any published `retry_after` widens that chat's gap
+locally with `RetryAfter` for every path. The durable penalty is checked again after
+`budget.take()` returns: a flood recorded while a delivery waits for its slot must
+refuse it before the callback. Regression:
+`test_penalty_recorded_while_queued_is_rechecked_before_egress`.
+Profile-scoped replacement resolution and its bounded reconnect wait live in
+`telegram_reconnect.py`, inherited by `TelegramAdapter`; reconnect-only cron
+ledger admission lives in `cron/scheduler_delivery_reconnect.py`. Moving these
+existing owners keeps the oversized adapter, startup and cron files below their
+main-branch line-count caps without duplicate implementations or re-export shims.
+A post-slot penalty refusal conservatively retains its pacing reservation:
+`take()` has no reservation token/refund API, and rolling back shared `next_at`
+can erase later concurrent reservations. This may waste one slot, not a Bot API
+request; cancellation-safe slot refunds are outside this delivery-safety patch.
+Any published `retry_after` widens that chat's gap
 2x for 10 minutes from the next call, and is persisted and logged. The inline-wait cap is
 floored at the chat's gap. Bubble cleanup uses `deleteMessages` (100 ids per request).
 `TelegramAdapter.PROGRESS_EDIT_INTERVAL` is 10.0s, the transport edit floor, and
@@ -144,6 +185,49 @@ requests or sleep for hours inside a ban. Reads (`get*`) and chat-less calls suc
 `answerCallbackQuery` are unmetered. Visible effect: with many topics active at once, typing
 indicators refresh chat-wide at most every 4s, so not every topic shows "typing" continuously,
 and progress bubbles update at most every 10s.
+
+**Daily volume shedding** (`daily_quota.py`, 2026-10-07). Per-chat message-creating calls are
+counted per Telegram day against `daily_message_soft_ceiling` (default 1500). Turns not typed by
+the user shed typing, interim edits, drafts and progress at 70% of it, and non-final notices at
+100%. Finals are never shed. Cleanup deletes are never shed either: they create no message, and
+shedding them stranded progress bubbles whenever a typed turn's cleanup ran after an in-band drain
+had relabelled the task as a background trigger (2026-10-08 to 10-10, ~170 failures/day). The
+Telegram adapter now runs post-delivery callbacks under the trigger of the turn that registered
+them. Regression: `tests/gateway/test_telegram_daily_quota.py`.
+
+**Daily call budget** (`daily_quota.py`, 2026-10-24). Messages alone did not bound the day: the
+2026-10-24 bans (2967s at 02:17 PDT, 36261s at 17:03 PDT) came after 26174 and 19875 metered calls
+while message counts (3024, 2407) were below ban-free days (3112, 4157). Typing and edits create no
+messages, so background producers spent ~9k calls overnight before the message rule engaged, and
+typed turns (10116 of the 19875) were never shed. Every metered call now also counts against
+`daily_call_soft_ceiling` (default 12000): background cosmetics shed at 50% of it, and at 100%
+typed turns shed typing, interim edits and explicitly labelled progress while labelled background
+notices shed too. Typed notices and all finals are never shed, and a typed turn's unlabelled
+`_interim_send` sends (/login codes, approval fallbacks, stuck warnings) are not inferred as progress.
+Untagged traffic (busy acks, button taps, restart and recovery notes, cron delivery: a few hundred
+calls a day) is outside the call rule and metered by the message rule only. Known gap: an outbox
+row persisted from an unlabelled typed `_interim_send` replays as progress (`gateway/outbox.py`
+`_outbound_class_for_payload`), so a restart can shed it once the call budget is past 50%. A penalty of 600s or more halves the call budget for the 24h
+after the penalty ends (a shorter penalty never pulls that end earlier), persisted in `daily_penalty` in `telegram-flood-state.db` and re-read on
+every flush so a penalty the standalone lane records reaches the running gateway. Visible effect: on a heavy day, typed
+turns lose the typing indicator and live progress bubble late in the Telegram day; the answer still
+arrives. `0` disables the call budget (counting continues). Regression: the call-budget cases in
+`tests/gateway/test_telegram_daily_quota.py`. Rollback: revert the `fix(telegram): bound daily
+calls` commit; the extra table is ignored by older code.
+
+**User voice echoes** (`telegram-chat-budget`). The shared gateway STT echo path
+classifies a response to a non-internal voice event as `OUTBOUND_FINAL` for budget
+priority, regardless of the queued task's inherited trigger or outbound class.
+The `_interim_send` marker remains intact for stream-is-the-message adapters;
+quota priority does not seal the running stream. Internal producers retain their
+existing classification. Failed `SendResult`s (including `daily_budget_shed`) and
+exceptions are WARNING-logged without adding transcript text to the log.
+Regression: the same daily-quota suite drives busy FIFO prefetch, overflow drain,
+and idle enrichment through the real Telegram send with goal/untagged pressure,
+checks topic routing and interim metadata, and verifies background traffic still
+sheds. Roll back by reverting the gateway echo/event binding and these tests;
+retire when an accepted upstream release protects originating-user echoes under
+an equivalent quota contract. No configuration or persistent-state changes.
 
 **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_chat_outbound_budget.py`
 pins the summed per-chat rate against each class ceiling with every path saturated at once,
@@ -185,7 +269,9 @@ released upstream mechanism.
   changes. Separate local flood-coherence and ledger deltas remain. Flood coherence
   is tracked in [issue #107612](https://github.com/NousResearch/hermes-agent/issues/107612).
 - Emphasis is an own contribution: [upstream PR 106906](https://github.com/NousResearch/hermes-agent/pull/106906),
-  open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19.
+  open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19. On 2026-10-10 it was
+  converted back to draft to free an open-PR slot for PR 133834 (the slot was still
+  refused). Mark it ready again once the author's open ready PR count is under the limit.
 
 ## Reconnect Teardown During Text Sends
 
@@ -290,9 +376,16 @@ rebuilds the adapter, a turn already in flight keeps the retired instance, whose
 `edit_message()`, `delete_message()` and `send_typing()` did not. Their refusal was
 not retryable, so the progress loop stopped editing and sent every later tool line
 as its own reply. Observed 2026-10-03 in the Booking Analytics topic after the
-12:33 PDT adapter rebuild. These three calls now forward to the live adapter. With
-no live adapter, an edit returns a retryable `Not connected` unless the failure is
-permanently fatal.
+12:33 PDT adapter rebuild. These three calls now forward to the live adapter. Replacement resolution uses
+the runner's profile-scoped adapter resolver (or an exact owner map for legacy
+runners), never the primary-only `runner.adapters` as a secondary fallback.
+`send`, `edit_message`, `delete_message`, `delete_messages` and `send_typing` are
+covered across default/named primary and secondary profiles, including missing
+replacements, by `test_retired_adapter_egress_is_profile_scoped_and_fail_closed`
+in `tests/gateway/test_telegram_multiplex_reconnect_isolation.py`. This adapts
+[upstream PR #117691](https://github.com/NousResearch/hermes-agent/pull/117691)
+to the current runner. With no live adapter, an edit returns a retryable
+`Not connected` unless the failure is permanently fatal.
 
 Source: `plugins/platforms/telegram/adapter.py`. Proof:
 `tests/gateway/test_telegram_replacement_adapter_egress.py`, red on the base. No new
@@ -310,7 +403,18 @@ window after `send_path_degraded` or a short flood refusal. Only after that wind
 it use the legacy standalone sender. If that fallback succeeds after a transient live
 failure, the job records `last_delivery_formatting_degraded` with the affected target
 and emits a WARNING; non-Telegram targets are unchanged. The existing delivery ledger
-remains the recovery path when fallback cannot send.
+remains the recovery path when fallback cannot send. A standalone timeout,
+including the thread-fallback timeout, is ambiguous and must never be queued
+from an earlier reconnect-only live error: the Bot API call may still deliver.
+The typed local timeout verdict preserves the existing two-value result seam;
+`test_ambiguous_standalone_timeout_is_not_replayed` exercises both execution
+lanes. Only the ambiguous payload is excluded: later, never-attempted copy
+blocks retain failed ledger rows, and trailing media is passed through the
+existing attachment-loss reporting path. Attachments remain outside the text-only
+ledger. `test_timeout_preserves_only_unattempted_payloads` covers each payload
+position in a text/copy/copy/media delivery. Contract borrowed from
+[upstream PR #127188](https://github.com/NousResearch/hermes-agent/pull/127188),
+without its older scheduler or the unrelated retry-verdict changes.
 
 Rich capability rejection is WARNING-logged with the existing redaction helper and the
 adapter latch resets at the next polling generation. The latch still suppresses retries

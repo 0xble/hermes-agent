@@ -111,9 +111,24 @@ class CLIInitMixin:
         _model_config = CLI_CONFIG["model"]
         # A dict-valued default carries its own provider, which must feed requested_provider
         # instead of being replaced by the merged model.provider (typically "auto").
-        _config_model, _nested_provider = _split_model_config_default(
-            _model_config.get("default") or _model_config.get("model") or ""
-        )
+        # @name and {model_preset: name} resolve through the shared default route so
+        # startup never treats the reference itself as a model id.
+        from hermes_cli.model_preset_runtime import resolve_default_route
+        from hermes_cli.model_presets import ModelPresetError
+
+        _route = None
+        try:
+            _route = resolve_default_route(CLI_CONFIG)
+        except ModelPresetError:
+            _route = None
+        if _route is not None and _route.name and _route.model:
+            _config_model, _nested_provider = _route.model, _route.provider
+            if _nested_provider and _nested_provider != _model_config.get("provider"):
+                _model_config["provider"] = _nested_provider
+        else:
+            _config_model, _nested_provider = _split_model_config_default(
+                _model_config.get("default") or _model_config.get("model") or ""
+            )
         # resume must not clobber an explicit -m with the session's stored model.
         self._explicit_model_override = bool(model)
         self.model = model or _config_model or ""
@@ -304,10 +319,10 @@ class CLIInitMixin:
         # A signature change across turns (/model, credential rotation) rebuilds the agent.
         self._active_agent_route_signature = None
         self.agent: Optional[Any] = None  # initialized on first use
-        self._tool_callbacks_installed = self._tirith_security_checked = False
+        self._tool_callbacks_installed = False
         self._app = None  # prompt_toolkit Application (set in run())
 
-        self.conversation_history: List[Dict[str, Any]] = []
+        self.conversation_history: list[dict[str, Any]] = []
         self.session_start = datetime.now()
         # Per-prompt elapsed timer shown in the status bar.
         self._prompt_start_time: Optional[float] = None
@@ -434,6 +449,7 @@ class CLIInitMixin:
         self._voice_mode = self._voice_tts = self._voice_recording = False
         self._voice_processing = self._voice_continuous = False
         self._voice_recorder = self._voice_tts_stop = None
+        self._voice_live_text = ""  # live STT partial (stt.streaming) shown in the placeholder
         self._voice_tts_done = threading.Event()
         self._voice_tts_done.set()
         self._voice_barge_capture = threading.Event()  # barge monitor is capturing the interruption
@@ -452,7 +468,7 @@ class CLIInitMixin:
         self._resize_recovery_timer = self._status_bar_unsuppress_timer = None  # latter: debounced un-suppress
         self._last_resize_width = None  # width change (reflow, needs viewport clear) vs rows-only
 
-        self._background_tasks: Dict[str, threading.Thread] = {}
+        self._background_tasks: dict[str, threading.Thread] = {}
         self._background_task_counter = 0
 
         # Cache-hit baseline, reset on model switch / compression so the bar shows the current regime.

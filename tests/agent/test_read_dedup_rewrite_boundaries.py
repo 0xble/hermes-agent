@@ -9,6 +9,8 @@ so the next repeat must serve content again, as after compaction (#32106).
 from __future__ import annotations
 
 import json
+import os
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -16,7 +18,7 @@ import pytest
 
 from tools.file_tools_read_tracking import _read_tracker, _read_tracker_lock, _task_data
 from tools.skills_tool import _skill_view_with_bump
-from tools.skills_tool_dedup import _check_skill_view_dedup, reset_skill_view_dedup
+from tools.skills_tool_dedup import _skill_view_tracker, reset_skill_view_dedup
 
 TASK = "rewrite-boundary-task"
 FILE_KEY = ("/x/big.txt", 1, 2000)
@@ -54,7 +56,7 @@ def _dedup_state():
     """(a skill_view repeat would get the stub, a read_file repeat would get the stub)."""
     with _read_tracker_lock:
         file_stubbed = FILE_KEY in _read_tracker.get(TASK, {}).get("dedup_generation_reads", ())
-    return _check_skill_view_dedup(TASK, "demo-skill", None) is not None, file_stubbed
+    return ("demo-skill", "") in _skill_view_tracker.get(TASK, {}), file_stubbed
 
 
 def _run(agent, history, monkeypatch):
@@ -100,8 +102,8 @@ def test_micro_compaction_splice_rearms_read_dedup(served, splice, monkeypatch):
     # A splice returns a new list with the oldest exchange folded into the rolling summary;
     # a no-op (nothing to absorb, or a defrag) returns the input list.
     compressor._micro_compact = (
-        (lambda messages: [{"role": "user", "content": "[MICRO] loaded demo-skill"}, *messages[4:]])
-        if splice else (lambda messages: messages))
+        (lambda messages, **_kw: [{"role": "user", "content": "[MICRO] loaded demo-skill"}, *messages[4:]])
+        if splice else (lambda messages, **_kw: messages))
     agent.context_compressor = compressor
     agent.client.chat.completions.create.return_value = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(
@@ -142,3 +144,40 @@ def test_native_checkpoint_rearms_read_dedup(served, monkeypatch):
     re_view = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") == "call_view"]
     assert re_view and "Do the demo steps." in re_view[-1]["content"]
     assert _dedup_state()[1] is False  # the file read served before the checkpoint is off the wire too
+
+
+def test_repeated_native_checkpoints_allow_one_skill_reread_each(served, monkeypatch):
+    """Each provider checkpoint drops the prior skill result, so one identical re-read is recovery."""
+    from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+    from run_agent import AIAgent
+
+    monkeypatch.setattr("agent.model_metadata._fetch_codex_oauth_context_lengths_with_source", lambda _t, **_kw: ({}, False))
+    agent = AIAgent(model="gpt-5.6", base_url="https://chatgpt.com/backend-api/codex", api_key="codex-token",
+                    quiet_mode=True, skip_context_files=True, skip_memory=True, max_iterations=12)
+    setattr(agent, "codex_responses_native_compaction", True)
+    setattr(agent, "runtime_capabilities", {"native_compaction": True})
+    setattr(agent, "_tool_guardrails", ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True)))
+    usage = SimpleNamespace(input_tokens=9, output_tokens=1, total_tokens=10)
+    rounds = 7
+    responses = [
+        SimpleNamespace(output=[
+            SimpleNamespace(type="compaction", encrypted_content=f"opaque-checkpoint-{i}"),
+            SimpleNamespace(type="function_call", id=f"fc_view_{i}", call_id=f"call_view_{i}", name="skill_view",
+                            arguments=json.dumps({"name": "demo-skill"})),
+        ], usage=usage, status="completed", model="gpt-5.6")
+        for i in range(rounds)
+    ] + [SimpleNamespace(
+        output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="done")])],
+        usage=usage, status="completed", model="gpt-5.6",
+    )]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    result = _run(agent, served, monkeypatch)
+
+    re_views = [
+        m["content"] for m in result["messages"]
+        if m.get("role") == "tool" and str(m.get("tool_call_id", "")).startswith("call_view_")
+    ]
+    assert len(re_views) == rounds
+    assert all("Do the demo steps." in body and "Blocked" not in body for body in re_views)
+    assert getattr(agent, "_tool_guardrails").halt_decision is None

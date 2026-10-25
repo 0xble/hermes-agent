@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 import contextlib
 import contextvars
 import logging
@@ -415,7 +415,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         update = SessionInfoUpdate(
             session_update="session_info_update",
             title=title if isinstance(title, str) and title.strip() else None,
-            updated_at=datetime.now(timezone.utc).isoformat(),
+            updated_at=datetime.now(UTC).isoformat(),
             field_meta=self._provenance_meta(
                 session_id, current_hermes_session_id or session_id, previous_hermes_session_id
             ),
@@ -654,7 +654,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             state.cancel_event.set()
             try:
                 if state.agent:
-                    request_hard_interrupt(state.agent)
+                    request_hard_interrupt(state.agent, delegation_reason="acp_cancel")
                     # Background delegations are detached from the turn's fan-out; they end with the cancel.
                     from tools.async_delegation import interrupt_for_session
                     interrupt_for_session(parent_session_id=str(getattr(state.agent, "session_id", "") or ""),
@@ -899,13 +899,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         """Install the ACP streaming callbacks on the session agent for one turn."""
         cbs = _TurnCallbacks()
         if conn:
-            tool_call_ids: dict[str, Deque[str]] = defaultdict(deque)
+            tool_call_ids: dict[str, deque[str]] = defaultdict(deque)
             tool_call_meta: dict[str, dict[str, Any]] = {}
             cbs.tool_call_ids, cbs.tool_call_meta = tool_call_ids, tool_call_meta
             # Shared with the step callback so a runtime that projects
             # ``tool.completed`` closes each call once, not twice.
             turn_state: dict[str, Any] = {}
-            policy_getter = lambda: self._edit_approval_policy_for_state(state)  # noqa: E731
+            policy_getter = lambda: self._edit_approval_policy_for_state(state)
             cbs.tool_progress_cb = make_tool_progress_cb(
                 conn, session_id, loop, tool_call_ids, tool_call_meta, edit_approval_policy_getter=policy_getter,
                 turn_state=turn_state,
@@ -925,7 +925,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
             cbs.stream_delta_cb = stream_delta_cb
             # Closes the synthetic permission-request bubble once the user has answered.
-            send_update = lambda update: _send_update(conn, session_id, loop, update)  # noqa: E731
+            send_update = lambda update: _send_update(conn, session_id, loop, update)
             cbs.approval_cb = make_approval_callback(conn.request_permission, loop, session_id, send_update=send_update)
             try:
                 from acp_adapter.edit_approval import make_acp_edit_approval_requester
@@ -969,6 +969,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     logger.debug("Could not emit ACP provenance update after rotation for %s", session_id, exc_info=True)
 
             final_response = result.get("final_response") or ""  # None on an interrupted turn
+            from gateway.copy_blocks import render_copy_blocks_inline
+            final_response = render_copy_blocks_inline(final_response)
             cancelled = bool(state.cancel_event and state.cancel_event.is_set())
             # The local "waiting for model" interrupt status is metadata, not prose; stop_reason carries it.
             from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX

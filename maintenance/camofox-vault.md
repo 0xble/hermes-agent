@@ -10,13 +10,14 @@ the browser vault fill tool, or the 1Password backends.
 - A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.
   Only explicit navigation creates/retries a tab, once; page actions and vault evaluations
   never replay on replacement tabs, and account identity survives invalidation.
-- Named Camofox accounts route per profile; account aliases are profile-specific. Their
-  shared identity userId is `hermes_camofox_` plus the first 24 lowercase hex
-  characters of SHA-256 over `camofox-account:{profile_camofox_state_dir}:{alias}`;
-  this matches the server and dotfiles launcher contract. The session key is unchanged.
-  This is a hard cutover from the old `hermes_<10hex>` account IDs: the parent's
-  server-side cutover retires old account profiles and moves their data to these
-  derived IDs; Hermes does not dual-read, map, or migrate profiles.
+- Named Camofox account aliases are profile-configured, but resolve to the server's
+  canonical persistent userId through `GET /browser/identities`. Clients do not
+  derive a named identity from their local Hermes home: the same server alias must
+  reuse its existing profile from Mac and Linux clients. Each mapping must name exactly
+  one `hermes_camofox_<24 lowercase hex>` identity. Missing, invalid, duplicate, or
+  unavailable mappings fail closed before navigation or handoff, including for an
+  already-bound task. Session keys remain scoped to the client profile state directory.
+  Hermes does not create an empty fallback identity, copy profiles, or migrate cookies.
   `browser_handoff(account=...)` opens/focuses that account's shared identity, restarts
   its headless-by-default browser as visible, adopts the returned tabId for subsequent
   browser actions (across turns, see [Camofox tab reuse](camofox-tab-reuse.md)), and never
@@ -101,6 +102,15 @@ the browser vault fill tool, or the 1Password backends.
 
 ## Provenance and patches
 
+- Fork patch identity: `vault-native-password-precedence`. Fork
+  [PR 742](https://github.com/0xble/hermes-agent/pull/742) keeps CLI and Connect
+  password selection native-first, with an unambiguous nonblank custom fallback.
+  The CLI reads exact-item JSON transiently and validates item, vault, category and
+  active state before selection. This PR includes no upstream contribution.
+  Preserve the synthetic subprocess and Connect precedence, ambiguity, malformed
+  output and byte-preservation regressions in the existing vault tests below.
+  Retire only when released upstream provides equivalent selection and validation.
+  Source publication does not imply runtime activation.
 - Fork patch identities: `op-batched-secret-loader` (one `op run` over distinct
   refs, private JSON handoff, per-ref fallback except on 429). Upstream
   [PR 116616](https://github.com/NousResearch/hermes-agent/pull/116616) proposes
@@ -170,6 +180,33 @@ the browser vault fill tool, or the 1Password backends.
   `90a17768fd85cc40153a2dbcc2d8f21f2f6dc748` (`--vault` selector).
 - Surfaces: `tools/browser_camofox*.py`, `tools/browser_tool.py`, `toolsets.py`,
   `agent/vault_login_classifier.py`, `agent/vault_backends/`, `tools/browser_vault_tool.py`.
+
+## Vault OTP and checkout hardening
+
+- `vault-origin-aliases` also governs authenticator codes: resolve a handle's login
+  metadata and exact allowed origins before minting an OTP; alias-only origins use the
+  password-fill consent/refusal cache and revalidate config after consent. Re-read the
+  live page origin after inspection; never authorize the requested or stale focus origin.
+  Keep the checked origin in the atomic write script, including after a user-code wait.
+- `vault-card-redaction-scope` keeps PAN/CVC global and low-entropy card metadata scoped.
+  Register canonical PAN digits even when the manager stores spaces/dashes, then redact
+  known PANs with whitespace/dash formatting without broadening short CVC matching.
+- `slice-9-vault-op-cards` ignores issue/start/valid-from date heuristics despite MM/YY
+  placeholders and permits masked password-type CVV only when classified as `cc-csc`.
+- Narrow fixes adapted from open upstream PRs
+  [128194](https://github.com/NousResearch/hermes-agent/pull/128194) at
+  `d0761c1092601b685c77259c7e4c966a7852cbe6` (OTP origin and stale navigation),
+  [136639](https://github.com/NousResearch/hermes-agent/pull/136639) at
+  `227a3f196dbeac096d419cd8dc901f1ecd182995` (PAN variants and issue dates), and
+  [134723](https://github.com/NousResearch/hermes-agent/pull/134723) at
+  `0811fe95947d932d01470f1b6b614485470f079f` (masked CVV). Inspection pinned released
+  upstream/main to `1fd18277267152893a8a24792b79213e7ca3f899`; these fixes were not
+  present there. Retire the adaptations only when released upstream satisfies both the
+  exact-origin alias-consent contract and this fork's scoped card redaction contract.
+- Regression: `tests/tools/test_browser_vault_otp_origin.py` (registered handler, synthetic
+  manager, isolated home) and `tests/tools/test_browser_vault_manager_card.py` (fill boundary,
+  PAN formatting, issue dates and masked CVV). Roll back the bundle's small commits bearing
+  the existing identities; do not retire the surrounding fork features.
 
 ## Verification
 

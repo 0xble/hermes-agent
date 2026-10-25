@@ -194,7 +194,7 @@ When `workdir` is set:
 - Pass `--workdir ""` (or `workdir=""` via the tool) on edit to clear it and restore the old behaviour
 
 :::note Isolation
-Each agent run binds its `workdir` to that run's unique task identity. Workdir jobs therefore use the normal parallel pool without mutating process-global terminal state or leaking paths between concurrent runs. Set `cron.max_parallel_jobs` if you want to limit total cron concurrency.
+Each agent run binds its `workdir` to that run's unique task identity. Workdir jobs therefore use the normal parallel pool without mutating process-global terminal state or leaking paths between concurrent runs. `cron.max_parallel_jobs` limits how many due jobs run at once (default `4`, `0` for unbounded), which also keeps the catch-up after a restart from firing every missed job at the same moment.
 :::
 
 ## Editing jobs
@@ -232,6 +232,7 @@ Notes:
 - `--add-skill` appends to the existing list without replacing it
 - `--remove-skill` removes specific attached skills
 - `--clear-skills` removes all attached skills
+- `--prompt` replaces the whole prompt. An edit is refused, and nothing is saved, when the new prompt looks like an unexpanded placeholder (`__FILE__`, `<prompt>`, `...`, `TODO`, `$(cat file)`, `@file`) or is under 10% of an existing prompt of 500+ characters. The error names both lengths. Pass `--allow-shrink` (`allow_shrink=true` in the `cronjob_manage` tool) when the short or literal prompt is intended. To load a long prompt from a file, let the shell expand it: `hermes cron edit <job_id> --prompt "$(cat prompt.md)"`.
 
 ## Lifecycle actions
 
@@ -350,6 +351,17 @@ hermes cron status
 
 For a named profile served by the default-profile multiplexer, `hermes cron status` names that scheduler host and reports the named profile's own heartbeat health. Missing or stale heartbeats point to `hermes --profile default gateway restart`. `cron list` and `cron create` also warn when that heartbeat is missing or stale; `cron status` additionally checks the last successful tick and reports tick errors.
 
+#### Cron store not writable (full disk, read-only mount, permissions)
+
+When the cron store (`~/.hermes/cron/`, or the profile's own `cron/` directory) can't be written, for example because the disk is full (`ENOSPC`), the mount is read-only (`EROFS`) or the permissions are wrong (`EACCES`), the scheduler does not run a job whose run it can't record. That prevents double fires after recovery. The ticker keeps running. It stops attempting the doomed writes and re-checks the store about once a minute. The outage shows up in four places:
+
+- `hermes cron status` probes the store itself and leads with `⚠ Cron store is NOT writable — scheduled jobs are being skipped`. Below that it shows the store path, the OS error, the last successful write and how many due runs have not fired. `hermes cron list` prints a one-line banner.
+- `hermes doctor` warns when the store is not writable, or when its filesystem has less than 100 MB free.
+- The gateway posts one notice to the profile's home channels when the store becomes unwritable and one when it has stayed writable for an hour (a store that fails again within that hour posts nothing more, so the last notice always matches its state). Both respect `display.suppress_warning_notifications` and use the profile's `display.language`.
+- Monitoring exports `hermes.cron.store.writable` (0 while any profile's store served by this gateway is unwritable, else 1) and `hermes.cron.store.skipped_runs` (summed over those stores).
+
+To fix it, free disk space on the filesystem holding the store, remount it read-write, or fix the ownership and permissions of the store directory so the gateway user can write it. You don't need to restart anything. On the next tick that can write, each job that stayed due fires **once** under the normal [misfire catch-up](#misfire-catch-up) rules, not once per missed tick. A one-shot that came due during the outage fires once instead of expiring (unless the gateway restarts while the store is unwritable).
+
 ### Gateway scheduler behavior
 
 On each tick Hermes:
@@ -392,7 +404,12 @@ move through `claimed`, `running`, and one immutable terminal state:
 `hermes cron run` / `/cron run`, so a one-shot invocation with no scheduler
 running heals the ledger too — Hermes marks an abandoned attempt `unknown` only
 when the original PID and process-start fingerprint prove that its owner is
-gone. Unknown attempts are audit records and are never automatically rerun.
+gone, or when a live owner has been **silent** for longer than the derived
+stale bound (`max(3 × HERMES_CRON_TIMEOUT, script timeout, 2 h)`): the run
+monitor stamps `progress_at` on the attempt while the agent is still calling
+tools or streaming, so a healthy multi-hour job is never reclaimed mid-run, while
+a worker deadlocked on a lock stops stamping and is released once the bound
+passes. Unknown attempts are audit records and are never automatically rerun.
 
 Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
@@ -436,7 +453,8 @@ computer wakes, while the VPN or Wi-Fi is still reconnecting — does not sit
 out a whole period. The scheduler re-runs it automatically after **5, 15, and
 30 minutes** (inspired by Claude Cowork's scheduled-task re-runs), then falls
 back to the normal schedule. Because zero API calls were made, the re-run is
-spend-neutral and cannot duplicate any side effect.
+spend-neutral and cannot duplicate any side effect. Re-runs also do not count
+toward a job's `repeat` limit: the occurrence they repeat already counted once.
 
 While a re-run is pending, the interim failure notice is suppressed — you get
 the real result when a re-run succeeds, or a normal failure alert once the
@@ -475,7 +493,8 @@ it. Any run that reaches the model clears the hold. One-shot jobs are not held.
 
 A recurring job that keeps failing with the *same* error alerts you **once**,
 not on every run. Each failure is recorded as a durable **incident**, keyed by
-the job plus a normalized signature of the error text, in the same per-profile
+the job plus a normalized signature of the error text (case, whitespace and
+measured durations such as `idle for 603s` are ignored), in the same per-profile
 ledger database as the execution history; the first failure of a signature is
 always delivered, and repeats are then withheld while the incident is `alerted`
 (the run is still recorded — `hermes cron runs` and the failure streak see it,
@@ -563,7 +582,7 @@ When scheduling jobs, you specify where the output goes:
 | `"mattermost"` | Mattermost home channel | |
 | `"email"` | Email | |
 | `"sms"` | SMS via Twilio | |
-| `"homeassistant"` | Home Assistant | |
+| `"homeassistant"` | Home Assistant (plugin) | Uses `HASS_HOME_CHANNEL`; requires the [`homeassistant` plugin](../messaging/homeassistant.md) |
 | `"dingtalk"` | DingTalk | |
 | `"feishu"` | Feishu/Lark | |
 | `"wecom"` | WeCom | |
@@ -586,6 +605,32 @@ machine — and a redactor failure replaces the payload rather than sending it u
 Credential-named URL query parameters are not stripped (magic links and pre-signed URLs are
 legitimate cron output), and user-chosen secrets with no recognisable shape are not detected.
 The run document under `cron/output/<job_id>/` keeps the agent's response as written.
+
+### Reviewed Telegram Reports
+
+Reports can opt into an invisible review by the agent in their destination topic. The job must use `deliver: local`. Jobs without `review` retain their existing delivery behavior.
+
+```yaml
+review:
+  contract: reports/stripe-brief.yaml
+  subject: "139328"
+  deadline_minutes: 10
+  rerun_deadline_minutes: 20
+  max_reruns: 1
+output_local_only: true
+```
+
+`contract` and `subject` are required. The subject must exactly match a Telegram topic thread ID or session title and resolve to exactly 1 live, unarchived, visible session. Set `cron.review.excluded_threads` in `config.yaml` to a list of thread IDs that must not receive reviewed reports. The default list is empty. If lookup fails or is ambiguous, nothing is sent and a cron incident records the error. The scheduler rechecks the binding immediately before the final send and refuses it if the topic ended or changed during review.
+
+Set or replace the declaration with `hermes cron create/edit --review-json '{"contract":"reports/stripe-brief.yaml","subject":"139328"}'`. Clear it with `hermes cron edit <job_id> --clear-review`. Unrelated edits preserve the declaration. Setting review also sets `output_local_only: true`, and clearing it sets that flag to false. The cron tool exposes the same `review_json` and `clear_review` arguments.
+
+The scheduler checks the report, then injects an internal turn into the destination's live agent. Its reply is captured without posting a message or starting a typing indicator. `PRESENT` sends the original. `FIX` sends the full corrected report only if it passes the contract. `RERUN` runs the job at most once, checks the new output, and sends it only if it passes. Invalid corrections, failed reruns, busy sessions, gateway failure, invalid replies, and timeouts fall back to the original. A contract load error also sends the original without review. Original contract violations remain recorded even when the original is sent. Existing silence and failure markers keep their scheduler behavior.
+
+The review deadline defaults to 10 minutes from queue admission. A rerun has a separate 20-minute budget, capped by the review deadline plus that budget, so the default total hold is at most 30 minutes before final delivery begins. Set `max_reruns: 0` to disable reruns. Held reports do not occupy cron execution slots or block ordinary queue deliveries. A gateway restart requeues reports still under review without changing their admission deadline, and the agent is never asked about the same report twice. A decision it already gave is reused even after the deadline, so a saved correction that passed the contract is still sent. A restart after the review prompt went out but before its decision was saved sends the original. A report whose review had not started goes out as the original once its deadline has passed. A report never gets a second rerun: a restart during the rerun sends the original. A review turn cut off by a restart is never resumed, so it cannot post a reply. Only a crash after final delivery begins produces an unknown send outcome, which is recorded and never retried. Gateway shutdown terminates tracked rerun process groups.
+
+Final delivery uses the normal bot lane and mirrors a labelled cron delivery as a user turn into the resolved session. The invisible review's assistant decision remains separate from the final report when the transcript is replayed. The visible report omits the optional generic cron wrapper so the contract's envelope survives. Review decisions, candidate checks, selected text, message ID, delivery errors, and elapsed time are recorded in `<HERMES_HOME>/cron/review-receipts.jsonl`. The file rotates at 2 MiB and retains 1 backup, `review-receipts.jsonl.1`.
+
+Relative contract paths resolve first under `<HERMES_HOME>/cron/contracts/`, then under the bundled `cron/contracts/`, then under the profile home. Absolute paths are supported. Contracts declare `title`, `required_lines`, `required_sections`, `optional_sections`, `word_cap`, and `silence_markers`. Sections are Markdown `##` headings, ordered as required sections followed by optional sections. Undeclared and duplicate sections fail. The bundled Stripe contract requires `# Stripe Priorities`, a `**Focus:**` line, `## Priorities`, and at most 400 words. Its optional sections are Upcoming, Waiting / Blocked, Changes, and Standup, in that order.
 
 ### Delivery failures are a distinct status
 
@@ -1409,6 +1454,8 @@ Ask the agent to manage jobs through the `cronjob_manage` tool, `hermes cron edi
 If a hand edit leaves `jobs.json` malformed, the scheduler repairs it on the next load instead of stopping: entries in the `jobs` list that are not JSON objects are dropped, and a `repeat.completed` that is not a non-negative integer is reset to a valid count (0 when it can't be read). Each repair is logged as a warning (value types only, never contents).
 
 Jobs may store `model` and `provider` as `null`. When those fields are omitted, Hermes resolves them at execution time from the global configuration. They only appear in the job record when a per-job override is set.
+
+A per-job `base_url` override needs an explicit `provider`. For a provider with a stored key (a named custom provider or a built-in one), the override must have the same origin as that provider's configured endpoint: the same scheme, host and port. Another scheme, port or subdomain is refused, so the stored key is only ever sent where you configured it. A bare `provider: custom` takes any `base_url` that no stored key goes with. When a stored key matches the URL's hostname (for example `DEEPSEEK_API_KEY` for `api.deepseek.com`), the same rule applies: the `base_url` must have the origin of an endpoint you configured or of a built-in provider.
 
 The storage uses atomic file writes so interrupted writes do not leave a partially written job file behind.
 

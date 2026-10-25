@@ -38,9 +38,10 @@ its optional icon, and the durable alias can be observed through one Telegram to
   sampling the configured title model on real opening messages against the live catalog.
 - `/title X` on a Telegram topic stores the user's exact text, or the next free lineage alias
   such as `X #2` only when that exact text is held by another session; the visible Telegram
-  topic is renamed to the unsuffixed label. Auto-titles that collide likewise keep the visible
-  label unsuffixed while the session row carries the alias. Non-Telegram collision behavior
-  remains upstream behavior.
+  topic is renamed to the unsuffixed label. Model-generated titles that match another
+  session's name are rejected before persistence, ignoring case and a trailing ` #N` on the stored name only. Numbers in a proposed subject remain meaningful. Background title
+  callbacks use their persisted alias so even a collision arriving between the check and
+  persistence cannot show a duplicate label.
 - `/title X` also re-picks the icon from `X` when `auto_topic_icons` is on, through the same
   selection helper as automatic renames, and replaces a manual icon (automatic renames never do).
   Any icon Hermes writes clears the adapter's remembered manual icon for that topic; see
@@ -48,9 +49,28 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - `preserve_manual_topic_icons` relies on a Bot API `StatusUpdate` handler that observes
   `forum_topic_created`/`forum_topic_edited` service messages in private chats; a user-chosen
   icon recorded there is never replaced by an automatic rename.
+- A title the model cannot support does not lock. The schema includes `abstain`; a true
+  answer, or a deterministic junk title (`None`, `Investigation`, `Unspecified...`, a platform
+  label plus a raw ID such as `Slack Thread <id>` or `YouTube Video <id>`, or a title that is
+  mostly IDs), leaves the placeholder in place. A clear opener still starts its model
+  title immediately. If that eager first attempt yields no usable title, turn completion
+  retries once with the opener plus a bounded excerpt of the assistant reply, without
+  waiting for a second user message. It joins any in-flight attempt on the background
+  thread, never on the main turn path. A settled `llm` or manually chosen `user` title
+  skips that retry. The model's greeting placeholder stays `derived` and also retries:
+  a reply can supply a subject even when the opener was only a greeting. If both attempts
+  are greetings, the placeholder stays provisional. Each failed attempt is logged, but
+  the turn's failure callback reports only the first failure, including a retry-only
+  failure. Gateway callbacks remain debug-only, not user-visible. Later turns retain
+  the existing turn-3 cap. A manual `/title` still wins, and a stored `llm` or `user`
+  title is never replaced. `auxiliary.title_generation.hold_until_reply: false` restores
+  the previous opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
-  multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. Upstream
-  #117296 defers the title until the turn settles whenever both share a self-hosted base URL,
+  multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. The opening
+  turn's subject-less opener is the exception: `auxiliary.title_generation.hold_until_reply`
+  (default true) waits for that turn's reply before the first model title. Other openers
+  start immediately and receive the bounded completion retry described above.
+  Upstream #117296 defers the title until the turn settles whenever both share a self-hosted base URL,
   which delays a new topic's name and icon by the whole first turn on a routing proxy. The
   declaration is keyed by endpoint URL, never by route name, and an undeclared or `false`
   endpoint keeps the deferral. Equivalent host case/default-port spelling uses the
@@ -63,8 +83,8 @@ its optional icon, and the durable alias can be observed through one Telegram to
 ## Provenance and patches
 
 - **Identity and status:** active fork adaptations `slice-15-title-config`,
-  `slice-16-topic-icons`, `slice-17-topic-lineage`, `slice-9-telegram-topic-edit`, and
-  `title-concurrent-endpoint`. The audit follow-up commit uses the owned identity
+  `slice-16-topic-icons`, `slice-17-topic-lineage`, `slice-9-telegram-topic-edit`,
+  `title-concurrent-endpoint`, `title-hold-until-reply`, and `telegram-topic-owner-routing`. The audit follow-up commit uses the owned identity
   `slice-7-aux-title-routing` for endpoint normalization and conflicting capacity declarations.
 - **Source / fork refs:** baseline upstream release `v2026.9.14`, fork base
   `origin/main` `a0f8f3996dae`; source designs are NousResearch/hermes-agent PR
@@ -86,6 +106,11 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - **Fork delivery:** landed on fork `main` as one squash-merged PR whose commit carries the
   `Fork-Patch:` trailer slices above. This unit is the owner of those identities;
   `scripts/check_fork_patches.py` verifies the trailer on every commit after the floor.
+  The published squash commit for PR #638 omitted its trailer; the stable patch-id backfill
+  below repairs classification without rewriting `main`.
+
+Fork-Patch-Backfill: b91a64164821e8c1a3669a3b5e153f871370e86c; telegram-topic-owner-routing
+Fork-Patch-Backfill: 3d381f0050b51c28e63a482435e87a0b8380d59a; telegram-topic-owner-routing
 
 ## Update
 

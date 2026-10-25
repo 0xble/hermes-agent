@@ -186,6 +186,10 @@ class ToolPreview:
 
 _SHELL_SILENT_HEADS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", "false", ":"}
 _SHELL_PIPE_TAIL_HEADS = {"head", "tail", "wc", "sort", "uniq"}
+_HERMES_STATE_DB_PREVIEW = "checking Hermes state"
+_STATE_DB_RE = re.compile(r"\bstate\.db(?:-(?:wal|shm))?\b")
+_HERMES_HOME_RE = re.compile(r"(?:\.hermes(?:[/\\]|\s|$)|\$\{?HERMES_HOME\}?(?:/|\s|$))")
+_SQLITE_STATE_RE = re.compile(r"\b(?:sqlite3|python(?:\d+(?:\.\d+)?)?|pypy(?:\d+(?:\.\d+)?)?|SessionDB)\b")
 
 
 def _shell_basename(head: str) -> str:
@@ -275,6 +279,16 @@ def _is_shell_boundary_echo(segment: str) -> bool:
     if _shell_basename(words[0] if words else "") != "echo":
         return False
     return bool(re.search(r"-{2,}|_exit=|(?:^|\s|=)\$[?{]|PIPESTATUS", " ".join(words[1:])))
+
+
+def _is_hermes_state_db_command(command: str) -> bool:
+    """Whether a terminal command inspects a Hermes state database."""
+    original = _oneline(command)
+    if not _STATE_DB_RE.search(original) or not _HERMES_HOME_RE.search(original):
+        return False
+    if any(_shell_head_word(segment) == "sqlite3" for segment in _split_shell_compound(original)):
+        return True
+    return bool(_SQLITE_STATE_RE.search(original) and re.search(r"(?:sqlite3|SessionDB|mode=ro|mode=rw|connect)", original, re.I))
 
 
 def summarize_shell_command(command: str) -> str:
@@ -406,9 +420,11 @@ def _preview_todo_list(args: dict, _max_len: int) -> str:
     return t("display.preview.todo_reading") if todos_arg is None else t("display.preview.todo_tasks", verb=verb, count=len(todos_arg))
 
 
-def _preview_shell(key: str):
+def _preview_shell(key: str, *, redact_hermes_state: bool = False):
     def _build(args: dict, max_len: int) -> str | None:
         command = args.get(key)
+        if redact_hermes_state and command is not None and _is_hermes_state_db_command(str(command)):
+            return _tail_trunc(_HERMES_STATE_DB_PREVIEW, max_len)
         return None if command is None else _tail_trunc(summarize_shell_command(str(command)), max_len) or None
     return _build
 
@@ -423,9 +439,9 @@ def _preview_memory(args: dict, _max_len: int) -> str:
     action, target = args.get("action", ""), args.get("target", "")
     if action == "add":
         return f"+{target}: \"{_clip(_oneline(args.get('content', '')), 25)}\""
-    if action in ("replace", "remove"):
+    if action in ("replace", "patch", "remove"):
         old = _oneline(args.get("old_text") or "") or t("display.preview.missing_old_text")
-        return f"{'~' if action == 'replace' else '-'}{target}: \"{old[:20]}\""
+        return f"{'-' if action == 'remove' else '~'}{target}: \"{old[:20]}\""
     return action
 
 
@@ -464,7 +480,7 @@ def _preview_bridge_call(tool_name: str):
 _PREVIEW_BUILDERS = {
     "browser_exec": _preview_browser_exec, "delegate_task": _preview_delegate_task,
     "process_manage": _preview_process_manage, "todo_list": _preview_todo_list,
-    "terminal": _preview_shell("command"), "execute_code": _preview_shell("code"),
+    "terminal": _preview_shell("command", redact_hermes_state=True), "execute_code": _preview_shell("code"),
     "read_file": _preview_read_file, "memory": _preview_memory, "send_message": _preview_send_message,
     "skill_view": _preview_skill_view, "clarify": _preview_clarify,
     "session_search": lambda args, _m: t("display.preview.session_search_recall", query=_clip(_oneline(args.get("query", "")), 25)),
@@ -546,7 +562,7 @@ def tool_labels_for_call(tool_name: str, args: dict | None) -> list:
     try:
         from tools.tool_labels import labels_for_call
         labels = labels_for_call(tool_name, args or {})
-    except Exception as exc:  # noqa: BLE001 — display must never abort a turn
+    except Exception as exc:
         logger.debug("bridge labels failed for %s: %s", tool_name, exc)
         return []
     skin = _get_skin()
@@ -565,9 +581,11 @@ def tool_row_emoji(tool_name: str, args: dict | None = None, default: str = "⚡
 
 
 def progress_tool_label(tool_name: str, default: str = "⚡") -> tuple[str, str]:
-    """``(emoji, label)`` naming a tool in a progress line: the friendly ``App · action`` label for
-    MCP and connector tools (``mcp__paper__get_guide`` -> ``Paper · get guide``) when friendly
-    labels are on, else the raw tool name with its registry/skin emoji."""
+    """``(emoji, label)`` naming a tool in a progress line: the friendly ``app · action`` label for
+    MCP and connector tools (``mcp__paper__get_guide`` -> ``paper · get_guide``) when friendly
+    labels are on, else the raw tool name with its registry/skin emoji. The app is lowercased to
+    match the raw lowercase names built-in tools show on the same lines; GUI payloads keep the
+    title-cased ``ToolLabel.app``."""
     if _friendly_tool_labels:
         try:
             from tools.tool_labels import label_for_tool_name
@@ -578,7 +596,7 @@ def progress_tool_label(tool_name: str, default: str = "⚡") -> tuple[str, str]
         if label is not None and label.kind in ("mcp", "connector"):
             skin = _get_skin()
             override = skin.tool_emojis.get(tool_name) if skin and skin.tool_emojis else None
-            return override or label.emoji, label.text
+            return override or label.emoji, replace(label, app=label.app.lower()).text
     return get_tool_emoji(tool_name, default), tool_name
 
 
@@ -969,7 +987,7 @@ class KawaiiSpinner:
         redirect_stdout(devnull) because _write targets the stdout captured at creation."""
         self._write(f"\r{self._clear_line_blanks()}\r  {text}" if self.running else f"  {text}", flush=True)
 
-    def stop(self, final_message: str = None):
+    def stop(self, final_message: str | None = None):
         self.running = False
         if self.thread:
             self.thread.join(timeout=0.5)
@@ -1111,9 +1129,9 @@ def _cute_memory(a: dict, _r) -> str:
     action, target = a.get("action", "?"), a.get("target", "")
     if action == "add":
         return _cute_row("🧠", "memory", f"+{target}: \"{_cute_trunc(a.get('content', ''))}\"")
-    if action in ("replace", "remove"):
+    if action in ("replace", "patch", "remove"):
         old = a.get("old_text") or t("display.preview.missing_old_text")
-        return _cute_row("🧠", "memory", f"{'~' if action == 'replace' else '-'}{target}: \"{_cute_trunc(old)}\"")
+        return _cute_row("🧠", "memory", f"{'-' if action == 'remove' else '~'}{target}: \"{_cute_trunc(old)}\"")
     return _cute_row("🧠", "memory", str(action))
 
 
@@ -1265,7 +1283,7 @@ def get_cute_tool_message(tool_name: str, args: dict, duration: float, result: s
     """Render a completion label without letting cosmetic failures escape."""
     try:
         return _get_cute_tool_message(tool_name, args, duration, result=result)
-    except Exception as exc:  # noqa: BLE001 — display must never abort a turn
+    except Exception as exc:
         logger.debug("Tool completion label failed for %s: %s", tool_name, exc)
         safe_name = tool_name[:9] if isinstance(tool_name, str) and tool_name else t("display.cute.fallback_tool_name")
         safe_duration = f"{duration:.1f}s" if isinstance(duration, (int, float)) else t("display.cute.fallback_done")
