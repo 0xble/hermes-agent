@@ -720,6 +720,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- The serve maintenance test waits for the completed consolidation-off summary,
+  not the early run-count checkpoint plus a fixed delay. Linux reproduction
+  delayed report writing after the checkpoint and observed the final summary in
+  the same isolated home. Pause, active-turn suppression and exactly-once count
+  assertions remain unchanged.
+
 - Completion-batch retry narrowing removes the original primary event, not the
   authority-only metadata copy. Already-admitted siblings are removed after their
   lost-ACK settlement too, so successful batches do not falsely request a retry.
