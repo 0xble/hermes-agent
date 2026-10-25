@@ -77,19 +77,18 @@ def _indent_level(spaces: str) -> int:
 
 # Order matters: code first (opaque), then links, then emphasis.
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
-# Private-use delimiters for held-out code spans; they carry no markdown meaning.
-_CODE_HOLD_OPEN, _CODE_HOLD_CLOSE = "", ""
-_CODE_HOLD_RE = re.compile(f"{_CODE_HOLD_OPEN}(\\d+){_CODE_HOLD_CLOSE}")
+# Private-use delimiters for held-out opaque spans; they carry no markdown meaning.
+_OPAQUE_HOLD_OPEN, _OPAQUE_HOLD_CLOSE = "", ""
 _LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^()\s]+(?:\([^()]*\)[^()\s]*)*)\)")
 # Slack mrkdwn autolink: <scheme:target> or <scheme:target|label>.
 # Mentions (<@U…>, <#C…>, <!here>) have no scheme: and stay as text.
-_SLACK_LINK_RE = re.compile(
-    r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^>|]+)(?:\|([^>]+))?>"
-)
+_SLACK_LINK_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^>|]+)(?:\|([^>]+))?>")
 _BOLD_RE = re.compile(r"(?:\*\*|__)(.+?)(?:\*\*|__)")
 # Delimiters must not touch a word character outside the span, so snake_case, file_names and
 # 2*3 arithmetic stay literal (CommonMark's rule for ``_``; agents rarely use intraword ``*``).
-_ITALIC_RE = re.compile(r"(?<![\w*_])(?:\*|_)(?![\*_\s])(.+?)(?<![\*_\s])(?:\*|_)(?![\w*_])")
+_ITALIC_RE = re.compile(
+    r"(?<![\w*_])(?:\*|_)(?![\*_\s])(.+?)(?<![\*_\s])(?:\*|_)(?![\w*_])"
+)
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
 
 
@@ -98,32 +97,35 @@ def _inline_elements(text: str) -> list[dict[str, Any]]:
     Produces ``text`` elements (optionally styled bold/italic/strike/code) and ``link`` elements.
     Unmatched markup is emitted verbatim as plain text, so this never loses characters."""
     elements: list[dict[str, Any]] = []
-    # Inline code is opaque, but emphasis may wrap it (``**`key`:**``). Code spans become
-    # placeholders so emphasis can span them, then come back as code elements that keep the
-    # surrounding style. Splitting on code first left the ``**`` halves as literal text.
-    codes: list[str] = []
+    # Code spans and links are opaque, but emphasis may wrap them (``**`key`:**``,
+    # ``**Fix ([#800](url)):**``). Both become placeholders so emphasis is matched across
+    # them, then come back as code or link elements carrying the surrounding style.
+    # Splitting on them first left each ``**`` half in a separate run, so it stayed literal.
+    held: list[tuple[str, str, str]] = []  # (kind, text, url)
+    # Literal user text must never be mistaken for one of our placeholders.
+    hold_open = _OPAQUE_HOLD_OPEN
+    while hold_open in text:
+        hold_open += _OPAQUE_HOLD_OPEN
+    hold_re = re.compile(f"{hold_open}(\\d+){_OPAQUE_HOLD_CLOSE}")
 
-    def _hold_code(m: re.Match[str]) -> str:
-        codes.append(m.group(1))
-        return f"{_CODE_HOLD_OPEN}{len(codes) - 1}{_CODE_HOLD_CLOSE}"
+    def _hold(kind: str, value: str, url: str = "") -> str:
+        held.append((kind, value, url))
+        return f"{hold_open}{len(held) - 1}{_OPAQUE_HOLD_CLOSE}"
 
-    def _held(m: re.Match[str]) -> Optional[str]:
+    def _held(m: re.Match[str]) -> Optional[tuple[str, str, str]]:
         i = int(m.group(1))
-        return codes[i] if i < len(codes) else None  # a literal delimiter pair in the input
+        return (
+            held[i] if i < len(held) else None
+        )  # a literal delimiter pair in the input
 
-    def _restore_code(s: str) -> str:
-        return _CODE_HOLD_RE.sub(lambda m: m.group(0) if _held(m) is None else f"`{_held(m)}`", s)
+    def _restore(s: str) -> str:
+        def sub(m: re.Match[str]) -> str:
+            h = _held(m)
+            if h is None:
+                return m.group(0)
+            return f"`{h[1]}`" if h[0] == "code" else h[1]
 
-    def emit_text(s: str, style: Optional[dict[str, bool]] = None) -> None:
-        pos = 0
-        for m in _CODE_HOLD_RE.finditer(s):
-            code = _held(m)
-            if code is None:
-                continue
-            _emit_plain(s[pos : m.start()], style)
-            _emit_plain(code, {**(style or {}), "code": True})
-            pos = m.end()
-        _emit_plain(s[pos:], style)
+        return hold_re.sub(sub, s)
 
     def _emit_plain(s: str, style: Optional[dict[str, bool]]) -> None:
         if not s:
@@ -133,51 +135,62 @@ def _inline_elements(text: str) -> list[dict[str, Any]]:
             el["style"] = dict(style)
         elements.append(el)
 
-    # Tokenize by the highest-priority markers first: code is held out, then links, then
-    # emphasis, recursing so spans never overlap incorrectly.
-    def walk(s: str, style: dict[str, bool]) -> None:
-        _walk_links(_INLINE_CODE_RE.sub(_hold_code, s), style)
-
-    def _emit_link(url: str, text: str, style: dict[str, bool]) -> None:
-        url, text = _restore_code(url), _restore_code(text)
-        link_el: dict[str, Any] = {"type": "link", "url": url, "text": text}
-        if style:
-            link_el["style"] = dict(style)
-        elements.append(link_el)
-
-    def _walk_links(s: str, style: dict[str, bool]) -> None:
+    def emit_text(s: str, style: Optional[dict[str, bool]] = None) -> None:
         pos = 0
-        for m in _LINK_RE.finditer(s):
-            _walk_slack_links(s[pos : m.start()], style)
-            _emit_link(m.group(2), m.group(1), style)
+        for m in hold_re.finditer(s):
+            h = _held(m)
+            if h is None:
+                continue
+            _emit_plain(s[pos : m.start()], style)
+            kind, value, url = h
+            if kind == "code":
+                _emit_plain(value, {**(style or {}), "code": True})
+            else:
+                link_el: dict[str, Any] = {"type": "link", "url": url, "text": value}
+                if style:
+                    link_el["style"] = dict(style)
+                elements.append(link_el)
             pos = m.end()
-        _walk_slack_links(s[pos:], style)
+        _emit_plain(s[pos:], style)
 
-    def _walk_slack_links(s: str, style: dict[str, bool]) -> None:
+    def _hold_md_link(m: re.Match[str]) -> str:
+        return _hold("link", _restore(m.group(1)), _restore(m.group(2)))
+
+    def _hold_slack_link(m: re.Match[str]) -> str:
         # rich_text does not interpret mrkdwn. Agents often emit <url|label>
         # (works in section/mrkdwn; was literal in lists/quotes/table cells).
-        pos = 0
-        for m in _SLACK_LINK_RE.finditer(s):
-            _walk_emphasis(s[pos : m.start()], style)
-            url = m.group(1)
-            _emit_link(url, m.group(2) or url, style)
-            pos = m.end()
-        _walk_emphasis(s[pos:], style)
+        url = _restore(m.group(1))
+        return _hold("link", _restore(m.group(2)) if m.group(2) else url, url)
+
     def _walk_emphasis(s: str, style: dict[str, bool]) -> None:
         if not s:
             return
-        # Try bold, then strike, then italic, recursing into the inner span.
-        for rx, key in ((_BOLD_RE, "bold"), (_STRIKE_RE, "strike"), (_ITALIC_RE, "italic")):
-            m = rx.search(s)
-            if m:
-                _walk_emphasis(s[: m.start()], style)
-                inner_style = dict(style)
-                inner_style[key] = True
-                _walk_emphasis(m.group(1), inner_style)
-                _walk_emphasis(s[m.end() :], style)
-                return
+        # Parse the outermost opening span first, regardless of emphasis kind.
+        matches = [
+            (m.start(), key, m)
+            for rx, key in (
+                (_BOLD_RE, "bold"),
+                (_STRIKE_RE, "strike"),
+                (_ITALIC_RE, "italic"),
+            )
+            if (m := rx.search(s))
+        ]
+        if matches:
+            _, key, m = min(matches, key=lambda item: item[0])
+            _walk_emphasis(s[: m.start()], style)
+            inner_style = dict(style)
+            inner_style[key] = True
+            _walk_emphasis(m.group(1), inner_style)
+            _walk_emphasis(s[m.end() :], style)
+            return
         emit_text(s, dict(style) if style else None)
-    walk(text, {})
+
+    # Hold out the highest-priority markers first (code, then links), then parse emphasis
+    # over the remaining text so spans never overlap incorrectly.
+    s = _INLINE_CODE_RE.sub(lambda m: _hold("code", m.group(1)), text)
+    s = _LINK_RE.sub(_hold_md_link, s)
+    s = _SLACK_LINK_RE.sub(_hold_slack_link, s)
+    _walk_emphasis(s, {})
     return elements or [{"type": "text", "text": text}]
 
 
@@ -209,7 +222,10 @@ def _header_block(text: str) -> Optional[Block]:
         return None
     if len(clean) > MAX_HEADER_TEXT:
         clean = clean[: MAX_HEADER_TEXT - 1] + "…"
-    return {"type": "header", "text": {"type": "plain_text", "text": clean, "emoji": True}}
+    return {
+        "type": "header",
+        "text": {"type": "plain_text", "text": clean, "emoji": True},
+    }
 
 
 def _divider_block() -> Block:
@@ -219,12 +235,16 @@ def _divider_block() -> Block:
 def _rich_text_block(kind: str, children: list[dict[str, Any]]) -> Block:
     """One ``rich_text`` block wrapping a single ``kind`` element (section/quote/preformatted)."""
     return {
-        "type": "rich_text", "elements": [{"type": kind, "elements": _nonempty_elements(children)}]}
+        "type": "rich_text",
+        "elements": [{"type": kind, "elements": _nonempty_elements(children)}],
+    }
 
 
 def _preformatted_block(text: str) -> Block:
     # rich_text_preformatted renders monospace; used for code fences + tables.
-    return _rich_text_block("rich_text_preformatted", [{"type": "text", "text": text.rstrip("\n")}])
+    return _rich_text_block(
+        "rich_text_preformatted", [{"type": "text", "text": text.rstrip("\n")}]
+    )
 
 
 def _quote_block(lines: list[str]) -> Block:
@@ -248,15 +268,22 @@ def _list_block(items: list[tuple[int, bool, str, int]]) -> Block:
         key = (indent, ordered)
         if key != cur_key:
             cur = {
-                "type": "rich_text_list", "style": "ordered" if ordered else "bullet",
-                "indent": indent, "elements": []}
+                "type": "rich_text_list",
+                "style": "ordered" if ordered else "bullet",
+                "indent": indent,
+                "elements": [],
+            }
             # Slack starts each element at 1, including after nesting or bullets.
             if ordered and number > 1:
                 cur["offset"] = number - 1
             elements.append(cur)
             cur_key = key
         cur["elements"].append(
-            {"type": "rich_text_section", "elements": _nonempty_elements(_inline_elements(text))})
+            {
+                "type": "rich_text_section",
+                "elements": _nonempty_elements(_inline_elements(text)),
+            }
+        )
     return {"type": "rich_text", "elements": elements}
 
 
@@ -323,7 +350,9 @@ def _table_block(rows: list[str], sep_line: str) -> Optional[Block]:
     last_non_default = max((c for c, a in enumerate(padded) if a != "left"), default=-1)
     column_settings = [{"align": a} for a in padded[: last_non_default + 1]]
     block: Block = {
-        "type": "table", "rows": [[_rich_text_cell(cell) for cell in row] for row in parsed]}
+        "type": "table",
+        "rows": [[_rich_text_cell(cell) for cell in row] for row in parsed],
+    }
     if column_settings:
         block["column_settings"] = column_settings
     return block
@@ -391,6 +420,7 @@ def render_blocks(
             # Split oversized sections on the 3000-char limit.
             for chunk in _split_text(rendered, MAX_SECTION_TEXT):
                 blocks.append(_section_block(chunk))
+
         while i < n:
             line = lines[i]
 
@@ -488,15 +518,31 @@ def render_blocks(
                     bm = _BULLET_RE.match(lines[i])
                     om = _ORDERED_RE.match(lines[i])
                     if bm:
-                        items.append((_indent_level(bm.group(1)), False, bm.group(2), 0))
+                        items.append(
+                            (_indent_level(bm.group(1)), False, bm.group(2), 0)
+                        )
                         i += 1
                     elif om:
-                        items.append((_indent_level(om.group(1)), True, om.group(3), int(om.group(2))))
+                        items.append(
+                            (
+                                _indent_level(om.group(1)),
+                                True,
+                                om.group(3),
+                                int(om.group(2)),
+                            )
+                        )
                         i += 1
-                    elif lines[i].strip() and lines[i].startswith((" ", "\t")) and items:
+                    elif (
+                        lines[i].strip() and lines[i].startswith((" ", "\t")) and items
+                    ):
                         # continuation line of the previous item
                         indent, ordered, txt, number = items[-1]
-                        items[-1] = (indent, ordered, txt + " " + lines[i].strip(), number)
+                        items[-1] = (
+                            indent,
+                            ordered,
+                            txt + " " + lines[i].strip(),
+                            number,
+                        )
                         i += 1
                     elif not lines[i].strip() and items:
                         # Blank line inside a list run. LLM-authored ordered
@@ -640,7 +686,10 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
                     continue
             elif btype == "header":
                 text_obj = block.get("text")
-                if not isinstance(text_obj, dict) or not (text_obj.get("text") or "").strip():
+                if (
+                    not isinstance(text_obj, dict)
+                    or not (text_obj.get("text") or "").strip()
+                ):
                     continue
                 clamped = _clamp_text_obj(text_obj, MAX_HEADER_TEXT)
                 if clamped is not text_obj:
@@ -665,7 +714,9 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
                 if not block.get("rows"):
                     continue
                 settings = block.get("column_settings")
-                if isinstance(settings, list) and any(not isinstance(cs, dict) for cs in settings):
+                if isinstance(settings, list) and any(
+                    not isinstance(cs, dict) for cs in settings
+                ):
                     fixed = [cs if isinstance(cs, dict) else {} for cs in settings]
                     while fixed and not fixed[-1]:
                         fixed.pop()
