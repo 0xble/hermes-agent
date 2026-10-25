@@ -1349,10 +1349,11 @@ For a user/plugin policy gate at the same point — keep the agent going with yo
 
 ## Standing Goals (`/goal`)
 
-When a standing goal is active, Hermes judges whether each assistant response satisfies it. If not, it feeds a continuation prompt back into the same session and keeps working until the goal is done, the turn budget is exhausted, or the user pauses/clears it. The turn budget is the real backstop — judge failures fail **open** (continue) so a flaky judge never wedges progress.
+By default, when a standing goal is active, Hermes judges whether each assistant response satisfies it. If not, it feeds a continuation prompt back into the same session and keeps working until the goal is done, the turn budget is exhausted, or the user pauses/clears it. The turn budget is the real backstop — judge failures fail **open** (continue) so a flaky judge never wedges progress.
 
 ```yaml
 goals:
+  autonomy: false      # Opt in to agent-managed lifecycle and evidence-backed completion
   max_turns: 20        # Max continuation turns before Hermes auto-pauses the goal (default: 20)
   auto_notices: true   # Announce agent-initiated goal_set receipts (goal set / subgoal added)
 ```
@@ -1360,6 +1361,10 @@ goals:
 `max_turns` caps how many continuation turns a goal can drive before Hermes auto-pauses it and asks the user to `/goal resume`. It protects against judge false negatives (goal actually done but judge says continue) and unbounded model spend on fuzzy or unachievable goals. See [Goals](./features/goals.md) for the full feature.
 
 `auto_notices` (fork setting) controls whether a goal the agent sets or extends through the `goal_set` tool is announced with its committed text and completion contract. `/goal` replies and judge verdicts are always shown regardless.
+
+`goals.autonomy` defaults to `false`, preserving the judge and approval behavior above. When `true`, the supporting `goal_set` plugin can set, revise, replace, pause, resume and complete goals without approval. Clear remains user-only. Completion requires a mapping from every verification criterion to recorded proof, passing quality gates and no recorded hard-limit breach. Refusals leave the goal active and name the gap in history and `/goal status`.
+
+Autonomous revisions and replacements retain constraints, hard limits and unmet criteria. Removing an item requires the user's current verbatim removal instruction naming it. A blocked route calls for another route or a timed sleep with an automatic wake. Existing blocked/input states migrate on load. A finite `max_turns` becomes a paced checkpoint that records consumed turns, sleeps and starts another continuation span, allowing ongoing model spend. Explicit contract limits still bind, and an explicit pause remains paused.
 
 ### API Timeouts
 
