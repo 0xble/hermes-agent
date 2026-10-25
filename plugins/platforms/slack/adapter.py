@@ -2096,7 +2096,7 @@ class SlackAdapter(BasePlatformAdapter):
             try:
                 client = self._get_client(chat_id, team_id=stream.team_id)
                 if not stream.stream_ts:
-                    await start_native_task_card_stream(client, stream, metadata)
+                    await self._start_native_task_card_stream(client, stream, metadata)
                 chunks: list[dict[str, Any]] = [{"type": "plan_update", "title": str(title)[:256]}]
                 chunks.extend(self._task_update_chunk(task) for task in tasks)
                 # chunks-only: Slack rejects markdown_text alongside chunks
@@ -2114,7 +2114,7 @@ class SlackAdapter(BasePlatformAdapter):
                         "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
                         "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts)
                     stream.stream_ts = ""
-                    await start_native_task_card_stream(client, stream, metadata)
+                    await self._start_native_task_card_stream(client, stream, metadata)
                     await client.api_call(
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
                 return SendResult(success=True, message_id=stream.stream_ts)
@@ -2135,23 +2135,8 @@ class SlackAdapter(BasePlatformAdapter):
     async def _start_native_task_card_stream(
         self, client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
     ) -> None:
-        """chat.startStream a plan-mode card in ``stream``'s thread; sets ``stream.stream_ts``."""
-        start_payload: dict[str, Any] = {
-            "channel": stream.channel, "thread_ts": stream.thread_ts,
-            "task_display_mode": "plan"}
-        md = metadata or {}
-        recipients = (
-            ("recipient_team_id", ("recipient_team_id", "team_id", "slack_team_id")),
-            ("recipient_user_id", ("recipient_user_id", "user_id")))
-        for key, sources in recipients:
-            value = _first_truthy(md, sources)
-            if value:
-                start_payload[key] = value
-        result = await client.api_call("chat.startStream", json=start_payload)
-        if hasattr(result, "get"):
-            stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
-        if not stream.stream_ts:
-            raise RuntimeError("Slack startStream returned no stream timestamp")
+        """Start through the transport helper, then restore the running status."""
+        await start_native_task_card_stream(client, stream, metadata)
         if self._typing_is_active(stream.channel, metadata):
             await self.send_typing(stream.channel, metadata=metadata)
 
