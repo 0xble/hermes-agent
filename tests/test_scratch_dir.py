@@ -833,3 +833,46 @@ def test_prune_rereads_declarations_before_removal(tmp_path, monkeypatch):
     monkeypatch.setattr(scratch_mod, "reap_processes_rooted_in", reap_then_declare)
     assert prune_scratch_dir(scratch) == 0
     assert payload.exists() and pinned.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
+                    reason="root reads through a mode-0 directory")
+def test_prune_keeps_every_idle_entry_when_a_declaration_cannot_be_inspected(tmp_path):
+    """A declaration behind an unreadable directory is not an absent one: its owner's inputs
+    stay, and so does every other idle entry, since the hidden pins could name any of them."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, pinned, other = scratch / "owner", scratch / "pinned", scratch / "other"
+    for d in (owner, pinned, other):
+        d.mkdir()
+    (pinned / "f").write_text("x", encoding="utf-8")
+    (other / "f").write_text("x", encoding="utf-8")
+    _pin(owner, pinned / "f")
+    for d in (owner, pinned, other):
+        _age_tree(d)
+    os.chmod(owner, 0)
+    try:
+        assert prune_scratch_dir(scratch) == 0
+    finally:
+        os.chmod(owner, 0o700)
+    assert owner.exists() and pinned.exists() and other.exists()
+
+
+def test_prune_keeps_scratch_local_aliases_on_a_declared_path(tmp_path):
+    """A declared path that runs through a symlinked scratch entry, or through a link inside an
+    otherwise undeclared entry, keeps both the link's entry and the data, so the declared path
+    still resolves after pruning."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, alias, target, hop, data, control = (
+        scratch / n for n in ("owner", "alias", "target", "hop", "data", "control"))
+    for d in (owner, target, hop, data, control):
+        d.mkdir()
+    (target / "f").write_text("x", encoding="utf-8")
+    (data / "g").write_text("x", encoding="utf-8")
+    alias.symlink_to(target)
+    (hop / "link").symlink_to(data)
+    _pin(owner, alias / "f", hop / "link" / "g")
+    for d in (owner, alias, target, hop, data, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert (alias / "f").exists() and (hop / "link" / "g").exists()
+    assert owner.exists() and target.exists() and data.exists() and not control.exists()

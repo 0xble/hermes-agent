@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import time
 from logging.handlers import RotatingFileHandler
@@ -200,13 +201,20 @@ def _has_keep_marker(entry: Path) -> bool:
 
 def _declared_inputs(entry: Path) -> list[str] | None:
     """Absolute paths *entry*'s ``input-pins.json`` declares, or None without a declaration.
-    Raises :class:`UnreadableRetention` when the declaration exists but is not readable."""
+    Raises :class:`UnreadableRetention` when the declaration may exist but cannot be read. An
+    explicit ``stat`` separates "absent" from "could not look": ``Path.is_file`` reports a
+    permission error as absence, which would let an unreadable owner's inputs be pruned."""
+    if entry.is_symlink():
+        return None
     pins = entry / _INPUT_PINS
     try:
-        if not pins.is_file() or entry.is_symlink():
-            return None
+        st = os.stat(pins)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
     except OSError as exc:
         raise UnreadableRetention(f"{pins}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise UnreadableRetention(f"{pins}: not a regular file")
     try:
         data = json.loads(pins.read_text(encoding="utf-8"))
         files = data["files"]
@@ -217,11 +225,48 @@ def _declared_inputs(entry: Path) -> list[str] | None:
     return list(files)
 
 
+_SYMLINK_HOPS = 40
+
+
+def _entries_on_path(path: str, roots: tuple[str, ...]) -> set[str]:
+    """Top-level scratch entry names a declared *path* passes through on its way to the data,
+    including every symlink hop, not only its canonical target: a scratch-local alias on the
+    path must survive or the declared path stops resolving."""
+    tops: set[str] = set()
+    pending = [os.path.abspath(path)]
+    seen: set[str] = set()
+    while pending and len(seen) < _SYMLINK_HOPS:
+        candidate = pending.pop()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        parts = Path(candidate).parts
+        cur = parts[0]
+        for i, part in enumerate(parts[1:], 1):
+            if part == ".":
+                continue
+            # Every earlier component is a real directory (a symlink ends this walk), so ``..``
+            # here is the physical parent.
+            cur = os.path.dirname(cur) if part == ".." else os.path.join(cur, part)
+            for root in roots:
+                if cur != root and _under(cur, root):
+                    tops.add(os.path.relpath(cur, root).split(os.sep, 1)[0])
+            if os.path.islink(cur):
+                try:
+                    target = os.readlink(cur)
+                except OSError:
+                    break
+                pending.append(os.path.join(os.path.dirname(cur), target, *parts[i + 1:]))
+                break
+    return tops
+
+
 def retained_entries(root: Path, entries: list[Path], candidates: list[Path]) -> set[str]:
     """Names of *candidates* that a retention declaration holds. A candidate is held when it has a
     ``.keep``, declares input pins itself, or contains an input declared by any entry of *root*,
-    followed transitively through that dependency's own declaration. Paths compare by realpath,
-    so aliases and directory pins resolve to the top-level entry that holds them.
+    followed transitively through that dependency's own declaration. Each declared path holds
+    every top-level entry it passes through, symlink hops included, and the entry holding its
+    realpath, so aliases and directory pins keep both the link and the data.
 
     *entries* is every top-level entry (declarations anywhere protect a candidate); only
     *candidates* pay for the ``.keep`` walk, since a marker protects only its own entry.
@@ -230,6 +275,7 @@ def retained_entries(root: Path, entries: list[Path], candidates: list[Path]) ->
     unknown, so no candidate can be shown to be free of them.
     """
     real_root = os.path.realpath(str(root))
+    roots = tuple(dict.fromkeys((real_root, os.path.abspath(str(root)))))
     by_name = {e.name: e for e in entries}
     declared: dict[str, list[str]] = {}
     for entry in entries:
@@ -244,12 +290,11 @@ def retained_entries(root: Path, entries: list[Path], candidates: list[Path]) ->
             continue
         reached.add(name)
         for path in declared.get(name, ()):
+            tops = _entries_on_path(path, roots)
             real = os.path.realpath(path)
-            if real == real_root or not _under(real, real_root):
-                continue
-            top = os.path.relpath(real, real_root).split(os.sep, 1)[0]
-            if top in by_name and top not in reached:
-                pending.append(top)
+            if real != real_root and _under(real, real_root):
+                tops.add(os.path.relpath(real, real_root).split(os.sep, 1)[0])
+            pending.extend(top for top in tops if top in by_name and top not in reached)
     return {c.name for c in candidates if c.name in reached or _has_keep_marker(c)}
 
 
