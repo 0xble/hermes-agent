@@ -463,3 +463,86 @@ async def test_post_delivery_cleanup_keeps_the_registering_turns_trigger(tmp_pat
         assert current_trigger() == "process"  # the follow-up turn keeps its own label afterwards
     finally:
         reset_trigger(token)
+
+
+# --- Daily call budget (2026-10-24: 36261s ban at 19875 calls, 10116 of them from typed turns) ---
+
+
+def _spend_calls(quota, n, endpoint="editMessageText"):
+    for _ in range(n):
+        quota.record(CHAT, endpoint)
+
+
+@pytest.mark.parametrize("calls, background, typed", [(0, False, False), (49, False, False), (50, True, False),
+                                                      (99, True, False), (100, True, True)])
+def test_call_budget_sheds_background_at_half_and_typed_cosmetics_at_the_ceiling(tmp_path, calls, background,
+                                                                                 typed):
+    quota = DailyQuota(soft_ceiling=1500, call_soft_ceiling=100, profile_dir=tmp_path,
+                       wall=Wall(_utc("2026-10-24 12:00:00")))
+    _spend_calls(quota, calls)  # edits and typing create no messages, so the message rule never engages
+    assert quota.messages(CHAT) == 0
+    assert quota.sheds(CHAT, OUTBOUND_PROGRESS, "goal") is background
+    assert quota.sheds(CHAT, OUTBOUND_PROGRESS, "typed") is typed
+    assert quota.sheds(CHAT, OUTBOUND_NOTICE, "goal") is typed  # background notices go at the ceiling
+    assert quota.sheds(CHAT, OUTBOUND_NOTICE, "typed") is False
+    assert quota.sheds(CHAT, None, "typed") is False and quota.sheds(CHAT, None, "goal") is False
+
+
+def test_long_penalty_halves_the_call_budget_for_a_day_across_restarts(tmp_path):
+    """The 17:03 PDT ban came 15h after the 02:17 PDT one, at fewer calls."""
+    wall = Wall(_utc("2026-10-24 09:17:52"))
+    quota = DailyQuota(call_soft_ceiling=100, profile_dir=tmp_path, wall=wall)
+    assert quota.call_ceiling(CHAT) == 100
+    quota.note_retry_after(CHAT, 2967.0)
+    assert quota.call_ceiling(CHAT) == 50
+    wall.t = _utc("2026-10-24 12:00:00")  # a new window, still within a day of the penalty
+    restarted = DailyQuota(call_soft_ceiling=100, profile_dir=tmp_path, wall=wall)
+    _spend_calls(restarted, 25)
+    assert restarted.call_ceiling(CHAT) == 50
+    assert restarted.sheds(CHAT, OUTBOUND_PROGRESS, "goal") is True
+    _spend_calls(restarted, 25)
+    assert restarted.sheds(CHAT, OUTBOUND_PROGRESS, "typed") is True
+    wall.t = _utc("2026-10-25 09:17:53")
+    assert DailyQuota(call_soft_ceiling=100, profile_dir=tmp_path, wall=wall).call_ceiling(CHAT) == 100
+
+
+def test_burst_penalty_keeps_the_full_call_budget(tmp_path):
+    quota = DailyQuota(call_soft_ceiling=100, profile_dir=tmp_path, wall=Wall(_utc("2026-10-24 01:10:00")))
+    quota.note_retry_after(CHAT, 5.0)  # the daily 18:10 PDT sendChatAction refusal
+    assert quota.call_ceiling(CHAT) == 100
+
+
+def test_disabled_call_budget_counts_but_never_sheds_typed(tmp_path):
+    quota = DailyQuota(call_soft_ceiling=0, profile_dir=tmp_path, wall=Wall(_utc("2026-10-24 12:00:00")))
+    _spend_calls(quota, 50000)
+    assert quota.call_ceiling(CHAT) is None
+    assert quota.sheds(CHAT, OUTBOUND_PROGRESS, "typed") is False
+    assert sum(quota.calls(CHAT).values()) == 50000
+
+
+@pytest.mark.asyncio
+async def test_limiter_sheds_typed_typing_once_the_call_budget_is_spent(tmp_path):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    limiter = ChatBudgetRateLimiter(ChatOutboundBudget(gap_override=0), daily=quota)
+    wire = AsyncMock(return_value=True)
+    token = bind_trigger(SimpleNamespace(text="what changed?"))
+    try:
+        for _ in range(10):
+            await limiter.process_request(wire, (), {}, "editMessageText", {"chat_id": CHAT}, None)
+        await limiter.process_request(wire, (), {}, "sendChatAction", {"chat_id": CHAT}, None)
+        assert wire.await_count == 10  # typing shed for a typed turn at the ceiling
+        await limiter.process_request(wire, (), {}, "sendMessage", {"chat_id": CHAT}, None)
+        assert wire.await_count == 11  # the reply still goes out
+    finally:
+        reset_trigger(token)
+
+
+def test_call_ceiling_comes_from_platform_extra(tmp_path):
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***", extra={"daily_call_soft_ceiling": 9000}))
+    adapter._update_receipt_dir = tmp_path
+    assert adapter._daily_quota().call_soft_ceiling == 9000
+    assert _adapter(tmp_path / "default")._daily_quota().call_soft_ceiling == dq.DEFAULT_CALL_SOFT_CEILING
