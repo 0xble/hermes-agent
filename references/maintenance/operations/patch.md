@@ -9,6 +9,17 @@
 - **Verification:** `scripts/run_tests.sh tests/hermes_cli/test_release_ack_environment.py tests/hermes_cli/test_immutable_gateway_ack.py tests/hermes_cli/test_immutable_no_gateway_restart.py` passes all 11 tests. Run with disposable `HOME` and `HERMES_HOME` roots. Include inherited-path recovery and non-isolated rejection regressions. Broader reconciliation tests initially hit the real-home metadata guard in this checkout location, then exceeded the observation timeout with an isolated OS home. Real launchd integration remains separately gated by operator authorization.
 - **Rollback and retirement:** Revert only this launcher environment qualification and its regression changes. No state format or dependency change. Retire with the owning immutable-release patch when upstream provides its complete observed-activation contract.
 
+## slack-progress-card-recovery
+
+- **Status:** Draft candidate, not landed or activated.
+- **Contract:** Retry transient append failures on the existing stream, coalescing the latest projection even while tools are idle. Honor Retry-After. Retry a start only after a positive rate-limit rejection. Suppress ambiguous starts and SDK connection retries instead of creating a duplicate card or fallback. Permanent failures log and use human-readable tool labels, never executable previews.
+- **Source surfaces:** `gateway/run_task_card_progress.py`, `gateway/run_turn_runner.py`, `plugins/platforms/slack/adapter.py`, `plugins/platforms/slack/task_card_stream.py`; [behavior record](../../../maintenance/slack-progress-card-recovery.md).
+- **Root cause:** `_task_card_publish` latched `native_failed` after every unsuccessful SendResult, ignoring retryable transport failures. Base `fdcba2ab110d`; timeout logs immediately precede the fallback warning. A retryable failure that did not latch this flag would falsify the diagnosis.
+- **Upstream findings:** Related [#137803](https://github.com/NousResearch/hermes-agent/pull/137803) handles explicit stream expiry, not ambiguous start or transient append timeouts. [#103197](https://github.com/NousResearch/hermes-agent/pull/103197) addressed incompatible payloads, a distinct cause. No matching transient recovery repair found in the scoped searches.
+- **Verification:** Regression against base production modules: 12 failed, exit 1. Candidate regression: 12 passed. Affected gateway tests and exact-head results are recorded in the draft PR. Repository-wide static failures are inherited: shebangs, oversized AGENTS.md, and Ruff.
+- **Outbound budget:** Retry gaps 2,4,8,16,30 seconds give attempts at 0,2,6,14,30,60. At most 5 logical attempts in a half-open 60-second window, or 10 HTTP append attempts with the SDK connection retry, versus appendStream Tier 3 floor 50/min (20%). Later retries are at most 4 HTTP attempts/min (8%). Positive start rejection uses Retry-After, startStream has no SDK retry. Existing successful native progress, reply and typing paths lack shared admission, so aggregate per-conversation budget compliance is not established. Keep draft pending qualification.
+- **Rollback and retirement:** Revert this patch and matching presentation assertions. No schema, dependency or config change. Retire when upstream preserves the same retry, ambiguity and clean-fallback contract.
+
 ## mcp-verbatim-tool-labels
 
 - **Status:** Candidate.
