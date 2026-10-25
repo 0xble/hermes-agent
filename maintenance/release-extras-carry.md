@@ -34,6 +34,17 @@ into a process that could not adopt it, so Slack stayed down until a second
 restart. The first fix (build-time only) failed its live canary for the reason
 above: release 2bb03a63 was staged by source checkout e8387e2758.
 
+Acknowledgement: a candidate with a committed PM environment boots with
+`PYTHONPATH=<release>:<generation site-packages>`, which the launcher's boot
+activation (`pm.environments.activate_dependencies`) exports to the gateway it
+spawns. The ack used to require an empty `PYTHONPATH`, so the first carried
+release (eb37d0af, 2026-10-24) never acknowledged and its promote transaction
+stayed pending. `_runs_hermes_main` now qualifies `PYTHONPATH` by launch shape
+(`seamless-restart-s2`): the generated `python -I -c` bootstrap ignores it, and
+`python -m hermes_cli.main` still requires it empty. `_is_intended_gateway`
+skips descendants that exit or are zombies mid-scan, instead of abandoning the
+scan on the first `psutil.ZombieProcess`. Never ship the carry without both.
+
 `_active_locked_extras` returns early when the candidate declares no extras or
 has no `pyproject.toml`, so fake releases never spawn their interpreter.
 
@@ -44,6 +55,8 @@ replays the canary: the pre-handoff call (source code) must not sync, and the
 post-swap call (candidate code) commits `slack`.
 `test_sigkill_stage_and_flip_converge_with_complete_current` covers non-git
 staging.
+`tests/hermes_cli/test_release_ack_environment.py` covers the launch-shape
+`PYTHONPATH` matrix and the zombie descendant.
 
 Retire when release staging reads its extras from a PM-owned record that follows
 the active install, or when immutable releases are retired. Rollback reverts

@@ -749,6 +749,29 @@ def _runs_hermes_main(argv: list[str], root: Path, *, pythonpath: str = "") -> b
     return argv[1:4] == runtime_command(root, (), module="hermes_cli.main", python=argv[0])[1:4]
 
 
+def _is_intended_gateway(process, root: Path, expected_python: Path) -> bool:
+    """Does ``process`` run the gateway from ``root`` on its expected interpreter?
+
+    A descendant that exits or is a zombie mid-scan is not the gateway; skip it
+    rather than abandoning the scan.
+    """
+    import psutil
+    from gateway.status import looks_like_gateway_command_line
+    try:
+        argv = process.cmdline()
+        # The wrapper embeds the command in its argv. Require the inner
+        # interpreter's entrypoint before applying the canonical parser,
+        # which also accepts a profile selector before `gateway run`.
+        if (not _runs_hermes_main(argv, root) or
+                not looks_like_gateway_command_line(shlex.join(argv))):
+            return False
+        return (Path(process.exe()).resolve() == _interpreter_process_executable(expected_python) and
+                Path(process.cwd()).resolve() == root and
+                _runs_hermes_main(argv, root, pythonpath=process.environ().get("PYTHONPATH", "")))
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+
+
 def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
                                 probe_timeout: float = 10) -> bool:
     """Finish a pending reload only after observing its supervised gateway."""
@@ -796,23 +819,12 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
             return False
         if gateway_pid is not None and (gateway_pid != os.getpid() or _LOADED_CODE_ROOT != intended_root):
             return False
+        expected_python = (intended_root / ".venv" / "bin" / "python" if
+                           intended_root.parent == paths.releases.resolve() else
+                           Path(record["journal_original"]["source_python"]))
         for process in processes:
-            argv = process.cmdline()
-            # The wrapper embeds the command in its argv. Require the inner
-            # interpreter's entrypoint before applying the canonical parser,
-            # which also accepts a profile selector before `gateway run`.
-            from gateway.status import looks_like_gateway_command_line
-            if (not _runs_hermes_main(argv, intended_root) or
-                    not looks_like_gateway_command_line(shlex.join(argv))):
-                continue
-            executable = Path(process.exe()).resolve()
-            expected_python = (intended_root / ".venv" / "bin" / "python" if
-                               intended_root.parent == paths.releases.resolve() else
-                               Path(record["journal_original"]["source_python"]))
-            if (executable == _interpreter_process_executable(expected_python) and
-                    (gateway_pid is None or _LOADED_CODE_ROOT == intended_root) and
-                    Path(process.cwd()).resolve() == intended_root and
-                    _runs_hermes_main(argv, intended_root, pythonpath=process.environ().get("PYTHONPATH", ""))):
+            if (_is_intended_gateway(process, intended_root, expected_python) and
+                    (gateway_pid is None or _LOADED_CODE_ROOT == intended_root)):
                 _verify_transaction(paths, record)
                 record["reload_ack"] = {"plist_sha256": plist["intended_sha256"],
                                         "launchd_pid": supervisor_pid,
