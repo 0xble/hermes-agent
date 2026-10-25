@@ -5,6 +5,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -138,7 +139,7 @@ async def test_promote_connects_once_starts_cron_and_is_idempotent(monkeypatch):
     first = await zcs.promote(runner)
     second = await zcs.promote(runner)
     assert first == {"promoted": True, "already": False, "failed": []}
-    assert second == {"promoted": True, "already": True}
+    assert second == {"promoted": True, "already": True, "failed": []}
     assert runner.adapters[platform] is adapter
     assert runner._zero_cut_cron_handles == ("stop", "provider", "cron", "house")
     assert calls.count("publish") == 1
@@ -168,9 +169,11 @@ async def test_promote_queues_failed_primary_connect_for_reconnect(monkeypatch):
     zcs.defer_platform(runner, platform, config)
     zcs.mark_ready()
     result = await zcs.promote(runner)
-    assert result == {"promoted": True, "already": False, "failed": ["telegram"]}
+    assert result == {"promoted": False, "failed": ["telegram"]}
     assert runner._failed_platforms[platform] == {"adapter": adapter, "config": config}
     assert runner.adapters == {}
+    assert zcs.is_standby() is True
+    assert zcs.readiness()["deferred"] == ["telegram"]
 
 
 @pytest.mark.asyncio
@@ -476,9 +479,10 @@ async def test_promote_secondary_connect_raise_is_queued_for_reconnect(monkeypat
     zcs.defer_platform(runner, Platform.TELEGRAM, object(), profile="work")
     zcs.mark_ready()
     result = await zcs.promote(runner)
-    assert result == {"promoted": True, "already": False, "failed": ["work:telegram"]}
+    assert result == {"promoted": False, "failed": ["work:telegram"]}
     assert reconnects == [("work", Platform.TELEGRAM)]
-    assert zcs.is_standby() is False
+    assert zcs.is_standby() is True
+    assert zcs.readiness()["deferred"] == ["work:telegram"]
 
 
 def _hold_lock(path):
@@ -504,13 +508,17 @@ async def test_promoted_slot_adopts_host_role_and_replays_outbox_only_after_pred
 
     monkeypatch.setattr("gateway.outbox.recover_gateway_destinations", recover)
     predecessor = _hold_lock(tmp_path / "gateway.lock")  # slot a still alive, finishing its turns
-    runner = SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=True))
+    monkeypatch.setattr("tools.process_registry.process_registry.recover_from_checkpoint",
+                        lambda: calls.append("processes"))
+    runner = SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=True),
+                             _recover_secondary_process_checkpoints=lambda registry: calls.append("profiles"),
+                             _start_pending_process_watchers=AsyncMock(side_effect=lambda _: calls.append("watchers")))
     task = asyncio.create_task(zcs._adopt_predecessor_duties(runner))
     await asyncio.sleep(0.1)
     assert calls == []
     predecessor.close()  # slot a exits
     await asyncio.wait_for(task, 2)
-    assert calls == ["claim", "record", "outbox"]
+    assert calls == ["processes", "profiles", "watchers", "claim", "record", "outbox"]
 
 
 @pytest.mark.asyncio
@@ -521,8 +529,13 @@ async def test_adopt_skips_outbox_replay_when_durable_outbox_is_off(monkeypatch,
     monkeypatch.setattr("gateway.run._refresh_host_gateway_record", lambda r: calls.append("record"))
     monkeypatch.setattr("gateway.outbox.recover_gateway_destinations",
                         lambda r: asyncio.sleep(0, result=calls.append("outbox")))
-    await zcs._adopt_predecessor_duties(SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=False)))
-    assert calls == ["claim", "record"]
+    monkeypatch.setattr("tools.process_registry.process_registry.recover_from_checkpoint",
+                        lambda: calls.append("processes"))
+    await zcs._adopt_predecessor_duties(SimpleNamespace(
+        config=SimpleNamespace(durable_outbox_enabled=False),
+        _recover_secondary_process_checkpoints=lambda registry: calls.append("profiles"),
+        _start_pending_process_watchers=AsyncMock(side_effect=lambda _: calls.append("watchers"))))
+    assert calls == ["processes", "profiles", "watchers", "claim", "record"]
 
 
 def test_clients_follow_a_promoted_b_once_a_is_gone(monkeypatch, tmp_path):

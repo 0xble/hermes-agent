@@ -2,6 +2,8 @@
 
 import json
 import subprocess
+import sys
+import textwrap
 import time
 
 import pytest
@@ -42,6 +44,27 @@ def _checkpoint_survivor(registry, home, *, pid, session_id="proc_survivor", log
     registry._running[session.id] = session
     registry._write_checkpoint()
     return session
+
+
+def _checkpoint_from_exited_producer(home, *, session_id, log_text):
+    """Use a real departed registry owner, not the still-live pytest parent."""
+    producer = subprocess.run([sys.executable, "-c", textwrap.dedent("""
+        import json, os, sys
+        from pathlib import Path
+        os.environ['HERMES_HOME'] = sys.argv[1]
+        import tools.process_registry as module
+        from tests.tools.test_survive_restart import _checkpoint_survivor
+        home = Path(sys.argv[1])
+        module.get_hermes_home = lambda: home
+        _checkpoint_survivor(module.ProcessRegistry(), home, pid=999999,
+                             session_id=sys.argv[2], exit_code=0, log_text=sys.argv[3])
+        print(json.dumps({'owner_pid': os.getpid()}))
+    """), str(home), session_id, log_text], capture_output=True, text=True, timeout=20)
+    assert producer.returncode == 0, producer.stderr
+    from pathlib import Path
+    entry = json.loads((Path(home) / "processes.json").read_text(encoding="utf-8-sig"))[0]
+    assert entry["registry_owner_pid"] == json.loads(producer.stdout)["owner_pid"]
+    assert entry["session_id"] == session_id
 
 
 @pytest.mark.parametrize("command,expected", [
@@ -618,8 +641,8 @@ def test_survivor_claim_by_crashed_owner_is_reclaimed_once(tmp_path, monkeypatch
     import textwrap
 
     home = _home(monkeypatch, tmp_path)
-    producer = ProcessRegistry()
-    session = _checkpoint_survivor(producer, home, pid=999999, exit_code=0, log_text="after crash\n")
+    session_id = "proc_survivor"
+    _checkpoint_from_exited_producer(home, session_id=session_id, log_text="after crash\n")
     crashed = subprocess.run([sys.executable, "-c", textwrap.dedent(f"""
         import os
         from pathlib import Path
@@ -627,19 +650,20 @@ def test_survivor_claim_by_crashed_owner_is_reclaimed_once(tmp_path, monkeypatch
         module.get_hermes_home = lambda: Path({str(home)!r})
         registry = module.ProcessRegistry()
         assert registry.recover_from_checkpoint() == 1
-        assert registry.get({session.id!r})._completion_event.wait(5)
+        assert registry.get({session_id!r})._completion_event.wait(5)
         assert len(registry.drain_notifications(session_key="session")) == 1
         os._exit(0)  # crash after claim, before render/acknowledgement
     """)], capture_output=True, text=True, timeout=20)
     assert crashed.returncode == 0, crashed.stderr
-    claim = json.loads((home / "process-runs" / session.id / "delivered").read_text(encoding="utf-8-sig"))
+    claim = json.loads((home / "process-runs" / session_id / "delivered").read_text(encoding="utf-8-sig"))
     assert claim["state"] == "claimed"
     successor = ProcessRegistry()
     assert successor.recover_from_checkpoint() == 1
-    assert successor.get(session.id)._completion_event.wait(5)
+    recovered = successor.get(session_id)
+    assert recovered is not None and recovered._completion_event.wait(5)
     events = successor.drain_notifications(session_key="session")
     assert len(events) == 1 and "after crash" in events[0][0]["output"]
-    successor.acknowledge_survivor_completion(session.id)
+    successor.acknowledge_survivor_completion(session_id)
     assert json.loads((home / "processes.json").read_text(encoding="utf-8-sig")) == []
     again = ProcessRegistry()
     again.recover_from_checkpoint()

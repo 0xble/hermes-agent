@@ -735,6 +735,23 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
         return False
     import psutil
     from hermes_cli.gateway_launchd import _launchctl_supervised_pid
+    from gateway.config import is_zero_cut_handover_enabled
+    from hermes_cli.config import load_config_readonly
+    if is_zero_cut_handover_enabled(load_config_readonly()) and record.get("candidate"):
+        # The transaction's installed definition is an intent, not proof that slot A is serving.
+        # Promotion may run the exact candidate in B while A still owns its original release/work.
+        from gateway.control_socket import query_gateway_control
+        from hermes_cli.gateway_launchd import get_launchd_slot_labels
+        expected = Path(record["candidate"]).name
+        serving = []
+        for slot, slot_label in zip(("a", "b"), get_launchd_slot_labels()):
+            identity = query_gateway_control(paths.home, "identify", slot=slot, timeout=probe_timeout)
+            state = query_gateway_control(paths.home, "status", slot=slot, timeout=probe_timeout)
+            if (identity or {}).get("code_sha") == expected and (state or {}).get("standby") is False:
+                serving.append(slot_label)
+        if len(serving) != 1:
+            return False
+        label = serving[0]
     supervisor_pid = _launchctl_supervised_pid(label, timeout=probe_timeout)
     if not supervisor_pid:
         return False
@@ -775,6 +792,7 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
                     not process.environ().get("PYTHONPATH")):
                 _verify_transaction(paths, record)
                 record["reload_ack"] = {"plist_sha256": plist["intended_sha256"],
+                                        "launchd_label": label,
                                         "launchd_pid": supervisor_pid,
                                         "gateway_pid": process.pid,
                                         "release_root": str(intended_root),

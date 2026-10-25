@@ -14,6 +14,7 @@ One or two invariant tests per Round 5 finding:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -41,10 +42,10 @@ MARKER_SH = POSIX.with_name("marker.sh")
 
 
 def _proc_is_live(stat_path: Path) -> bool:
-    # /proc can disappear between checking existence and reading the state.
+    # /proc can disappear before open (ENOENT) or after open but before read (ESRCH).
     try:
         state = stat_path.read_text(encoding="utf-8").rsplit(") ", 1)[1][:1]
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     return state != "Z"
 
@@ -67,14 +68,26 @@ def test_proc_is_live_preserves_states_and_handles_disappearance(tmp_path, monke
     assert _proc_is_live(stat) is False
 
 
-@pytest.mark.parametrize("error", [PermissionError, OSError])
+def test_proc_is_live_handles_process_reaped_during_read(tmp_path, monkeypatch):
+    def reaped_read(path, **kwargs):
+        raise ProcessLookupError(errno.ESRCH, "No such process", str(path))
+
+    monkeypatch.setattr(Path, "read_text", reaped_read)
+    assert _proc_is_live(tmp_path / "stat") is False
+
+
+@pytest.mark.parametrize("error", [
+    PermissionError(errno.EACCES, "stat read control"),
+    OSError(errno.EIO, "stat read control"),
+])
 def test_proc_is_live_does_not_hide_unrelated_read_errors(tmp_path, monkeypatch, error):
     def failing_read(path, **kwargs):
-        raise error("stat read control")
+        raise error
 
     monkeypatch.setattr(Path, "read_text", failing_read)
-    with pytest.raises(error, match="stat read control"):
+    with pytest.raises(type(error), match="stat read control") as raised:
         _proc_is_live(tmp_path / "stat")
+    assert raised.value is error
 
 
 def _env(tmp_path: Path, home: Path, **extra: str) -> dict:

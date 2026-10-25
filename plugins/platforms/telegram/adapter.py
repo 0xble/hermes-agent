@@ -5543,11 +5543,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         """Inline-keyboard approval prompt; buttons call ``resolve_gateway_approval()`` like the
         text ``/approve`` flow."""
         def build():
-            # Short monotonic ids in callback_data map back to session_key.
-            import itertools
-            if not hasattr(self, "_approval_counter"):
-                self._approval_counter = itertools.count(1)
-            approval_id = next(self._approval_counter)
+            # Cross-process prompt IDs must not collide while the predecessor still owns approvals.
+            import secrets
+            approval_id = secrets.randbits(64)
             buttons = [InlineKeyboardButton(
                 label, callback_data=f"ea:{choice}:{approval_id}",
                 **({"style": _APPROVE_BUTTON_STYLE} if choice in {"once", "session", "always"} else {}))
@@ -5999,6 +5997,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         if not query or not query.data:
             return
         self._accept_update()
+        from gateway.zero_cut_controls import forward_callback
+        if await forward_callback(self, update):
+            return
         data = query.data
         cb = self._callback_ctx(query)
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.

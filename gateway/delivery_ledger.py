@@ -403,6 +403,29 @@ def recorded_contents_since(session_key: str, since: float) -> Dict[str, int]:
     return counts
 
 
+def owned_pending_count() -> int:
+    """Deliveries this process can still settle, including delayed runtime retries.
+
+    Failed rows parked for boot recovery and orphaned in-flight rows cannot keep
+    their owner alive waiting for that same owner to die. Use the existing
+    in-flight ordering hold. Active send tasks remain separate retirement owners.
+    Leave ambiguous rows intact for the existing recovery policy.
+    """
+    if not _db_path().exists():
+        return 0
+    now, (pid, started) = time.time(), _owner_stamp()
+    with _transaction() as conn:
+        rows = conn.execute("""SELECT state, attempts, created_at, updated_at, last_error
+            FROM delivery_obligations
+            WHERE owner_pid=? AND owner_started_at IS ? AND state IN ('pending','attempting','failed')""",
+                            (pid, started)).fetchall()
+    return sum(
+        now - (updated_at or 0) < ATTEMPT_ORDER_HOLD_SECONDS if state != "failed" else (
+            attempts < MAX_ATTEMPTS and now - created_at <= STALE_AFTER_SECONDS
+            and retry_not_before(updated_at, last_error, attempts) is not None
+        ) for state, attempts, created_at, updated_at, last_error in rows)
+
+
 def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 

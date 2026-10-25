@@ -1460,25 +1460,24 @@ def test_post_submit_observation_failure_preserves_recoverable_outcome(db: Path)
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.history_failures = 1
-    runtime = _runtime(db, rpc)
-
+    # Lease expiry is not the fault under test.
+    now = time.time()
+    runtime = _runtime(db, rpc, clock=lambda: now)
     runtime.start()
-    assert rpc.submitted.wait(1.0)
-    _wait_for(
-        lambda: (
-            "observation failed after submit"
-            in str(runtime.status()["last_error"] or "")
-        )
-    )
-    assert state.get_task(db, identity)["status"] == "running"
-    rpc.complete(identity.task_id, content="Recovered after a transient read.")
-    runtime.wakeup()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
-    assert runtime.stop(timeout=5.0)
-
-    task = state.get_task(db, identity)
-    assert task["result"]["text"] == "Recovered after a transient read."
-    assert not [call for call in rpc.calls if call[0] == "submit"][1:]
+    try:
+        assert rpc.submitted.wait(5.0)
+        _wait_for(lambda: "observation failed after submit" in str(runtime.status()["last_error"] or ""))
+        assert rpc.history_failures == 0
+        assert state.get_task(db, identity)["status"] == "running"
+        rpc.complete(identity.task_id, content="Recovered after a transient read.")
+        runtime.wakeup()
+        _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+        task = state.get_task(db, identity)
+        assert task["result"]["text"] == "Recovered after a transient read."
+        assert task["execution_generation"] == 1
+        assert len([call for call in rpc.calls if call[0] == "submit"]) == 1
+    finally:
+        assert runtime.stop(timeout=5.0)
 
 
 def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(

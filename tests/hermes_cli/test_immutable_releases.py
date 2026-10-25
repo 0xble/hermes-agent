@@ -29,6 +29,23 @@ def _await_ready(process: subprocess.Popen, expected: str) -> None:
     assert line.strip() == expected, f"child exited {process.poll()} before {expected}"
 
 
+@pytest.fixture
+def retention_processes(monkeypatch):
+    """Inspect real fixture children without enumerating the developer's processes."""
+    import psutil
+
+    pids = []
+
+    def process_iter(attrs):
+        for pid in pids:
+            process = psutil.Process(pid)
+            process.info = process.as_dict(attrs=attrs)
+            yield process
+
+    monkeypatch.setattr(psutil, "process_iter", process_iter)
+    return pids
+
+
 def test_archive_fallback_rejects_unsafe_members(tmp_path, monkeypatch):
     import io
     import tarfile
@@ -63,6 +80,7 @@ def test_release_plist_executes_selected_release_with_managed_source_launcher(tm
     from hermes_cli._launchers import resolve_store_python
     from pm.environments import store_root
 
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"gateway": {"zero_cut_handover": {"enabled": False}}})
     home = tmp_path / "profile"
     source = tmp_path / "source"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -772,7 +790,7 @@ def test_failed_plugin_smoke_does_not_flip_pointer(tmp_path, monkeypatch):
     assert (home / "current").resolve() == a.resolve()
 
 
-def test_retention_keeps_live_and_rollback_pins(tmp_path):
+def test_retention_keeps_live_and_rollback_pins(tmp_path, retention_processes):
     home = tmp_path / ".hermes"
     for i in range(7):
         p = home / "releases" / str(i)
@@ -980,7 +998,7 @@ def test_prepare_venv_identical_lock_still_builds_in_place(tmp_path, monkeypatch
     assert called == [new]
 
 
-def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
+def test_retention_protects_real_process_cwd_and_receipt(tmp_path, retention_processes):
     home = tmp_path / "profile"
     release_paths = [home / "releases" / str(i) for i in range(9)]
     for i, path in enumerate(release_paths):
@@ -996,10 +1014,11 @@ def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
                               cwd=release_paths[0], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         _await_ready(worker, str(release_paths[0].resolve()))
+        retention_processes.append(worker.pid)
         assert release_paths[0].resolve() in releases._live_process_pins(home)
         removed = releases.retain(home)
-        # Unreadable host process metadata intentionally pins every release.
-        # Exact pruning belongs to the controlled-process test above.
+        # Discovery is scoped to the real fixture worker. Exact pruning also has
+        # controlled-process coverage above, including unreadable identities.
         protected = {"0", "1", "4", "5", "6", "7", "8"}
         assert protected <= {path.name for path in release_paths if path.exists()}
         assert protected.isdisjoint(path.name for path in removed)
@@ -1053,7 +1072,7 @@ def test_retention_failure_is_advisory_after_verified_update(tmp_path, monkeypat
                "prune blocked" in s["detail"] for s in receipt["steps"])
 
 
-def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monkeypatch):
+def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monkeypatch, retention_processes):
     from hermes_cli import update_cmd, update_cmd_fleet, update_cmd_fleet_verify, update_receipt
     from hermes_cli.update_cmd_fleet import _GatewayRestartOutcome
     home = tmp_path / "profile"
@@ -1068,6 +1087,7 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
                               cwd=releases_for_test[0], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         _await_ready(worker, str(releases_for_test[0].resolve()))
+        retention_processes.append(worker.pid)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
         monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **kw: None)
@@ -1247,13 +1267,13 @@ def test_locked_distribution_upgrade_survives_optional_restore(tmp_path, monkeyp
     assert result.stdout.strip() == "2.0 1.0"
 
 
-@pytest.mark.parametrize("manager", ["linux", "win32"])
-def test_immutable_opt_in_rejects_non_launchd_before_staging(tmp_path, monkeypatch, manager):
-    from hermes_cli import update_cmd
+@pytest.mark.platforms("linux", "windows")
+def test_immutable_opt_in_rejects_non_launchd_before_staging(tmp_path, monkeypatch):
+    from hermes_cli import main, update_cmd
     home = tmp_path / "profile"
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
-    monkeypatch.setattr(update_cmd.sys, "platform", manager)
     monkeypatch.setattr(releases, "stage_release", lambda *args, **kw: pytest.fail("staged"))
     with pytest.raises(RuntimeError, match="macOS launchd"):
         update_cmd._cmd_update_impl(object(), gateway_mode=False)
@@ -1556,3 +1576,52 @@ def test_candidate_import_smoke_rejects_disabled_enabled_manifest_only_language_
 
     with pytest.raises(RuntimeError, match="disabled via config"):
         releases.smoke_plugins(source, home)
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("slot", ["a", "b"])
+def test_saved_release_plist_policy_survives_pointer_movement(tmp_path, monkeypatch, enabled, slot):
+    """Execute saved definitions after current moves, including the actual process cwd."""
+    import plistlib
+    import shutil
+    import venv
+    from hermes_cli import gateway, stderr_timestamp
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: sys.executable)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+        "gateway": {"zero_cut_handover": {"enabled": enabled}}})
+    for marker in ("A", "B"):
+        root = home / "releases" / marker
+        _fake_release(root, marker)
+        (root / ".venv/bin/python").unlink()
+        venv.EnvBuilder(with_pip=False).create(root / ".venv")
+        package = root / "hermes_cli"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        shutil.copy2(stderr_timestamp.__file__, package / "stderr_timestamp.py")
+        (root / "hermes_bootstrap.py").write_text(
+            "import os,pathlib\n"
+            "with pathlib.Path(os.environ['HERMES_HOME'], 'bootstraps').open('a') as f: f.write(str(pathlib.Path(__file__).parent)+'\\n')\n")
+        (package / "main.py").write_text(
+            "import json,os,pathlib,sys\n"
+            "pathlib.Path(os.environ['HERMES_HOME'],'observed.json').write_text(json.dumps({'root':str(pathlib.Path(__file__).parent.parent),'python':sys.executable,'cwd':os.getcwd(),'path':os.environ['PATH'].split(':')[0],'argv':sys.argv[1:]}))\n")
+    for selected, moved in (("A", "B"), ("B", "A")):
+        root = home / "releases" / selected
+        other = home / "releases" / moved
+        releases.promote(home, root)
+        saved = plistlib.loads(gateway.generate_launchd_plist(release_target=root, slot=slot).encode())
+        releases.promote(home, other)
+        (home / "bootstraps").unlink(missing_ok=True)
+        subprocess.run(saved["ProgramArguments"], cwd=saved["WorkingDirectory"],
+                       env={**os.environ, **saved["EnvironmentVariables"]}, check=True, timeout=30)
+        observed = json.loads((home / "observed.json").read_text())
+        launch_root = root if enabled else home / "current"
+        assert observed == {"root": str(root), "python": str(launch_root / ".venv/bin/python"),
+                            "cwd": str(root if enabled else other), "path": str(launch_root / ".venv/bin"),
+                            "argv": ["gateway", "run", "--external-supervisor"]}
+        assert (home / "bootstraps").read_text().splitlines() == [str(root), str(root)]
+        assert saved["WorkingDirectory"] == str(launch_root)
+        assert saved["EnvironmentVariables"].get("HERMES_GATEWAY_SLOT", "a") == slot

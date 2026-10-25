@@ -18,6 +18,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger("gateway.session")
 
 
+def _live_turn_owner(entry) -> bool:
+    pid = getattr(entry, "active_turn_owner_pid", None)
+    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        return False
+    from gateway.status import _pid_exists
+    return _pid_exists(pid)
+
+
 def _now() -> datetime:
     """Return the current local time."""
     return datetime.now()
@@ -195,6 +203,8 @@ class SessionLifecycleMixin:
             nonlocal promoted
             if not entry.active_turn_token:
                 return False
+            if _live_turn_owner(entry):
+                return False
             started_at = entry.active_turn_started_at
             # Epoch arithmetic: a pre-upgrade naive marker reads as local time, an aware one exactly.
             marker_is_stale = started_at is None or (
@@ -246,6 +256,8 @@ class SessionLifecycleMixin:
         """Clear orphan turn markers after a verified clean shutdown."""
         def _discard(entry: SessionEntry) -> bool:
             if not entry.active_turn_token and entry.active_turn_started_at is None:
+                return False
+            if _live_turn_owner(entry):
                 return False
             entry.active_turn_token = None
             entry.active_turn_started_at = None

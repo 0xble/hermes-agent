@@ -125,8 +125,14 @@ def serving_slot(home: Any = None) -> str:
     from gateway.status import _get_process_hermes_home
     root = Path(home) if home is not None else _get_process_hermes_home()
     # Probe b first: with the flag off ``gateway.b.lock`` never exists, so this costs one stat.
-    if slot_lock_held(root, SLOT_STANDBY) and not slot_lock_held(root, SLOT_ACTIVE):
-        return SLOT_STANDBY
+    if slot_lock_held(root, SLOT_STANDBY):
+        if not slot_lock_held(root, SLOT_ACTIVE):
+            return SLOT_STANDBY
+        # Both slots may be live for an unbounded planned drain. New controls belong to the successor.
+        for slot in (SLOT_ACTIVE, SLOT_STANDBY):
+            status = _query_other_slot(root, slot, 0.5)
+            if status and status.get("standby") is False and not status.get("handover_accepted"):
+                return slot
     return SLOT_ACTIVE
 
 

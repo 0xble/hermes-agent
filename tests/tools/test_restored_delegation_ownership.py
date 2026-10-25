@@ -21,6 +21,7 @@ import queue
 import time
 
 from tools.process_registry import ProcessRegistry
+from tests.tools.test_async_terminal_fallback_ownership import _restore_after_owner_exit
 
 
 def _make_registry():
@@ -80,7 +81,7 @@ def test_restore_stamps_restored_flag(tmp_path, monkeypatch):
     ad._persist_completion(evt, {"summary": "SECRET RESULT"})
 
     q = queue.Queue()
-    restored = ad.restore_undelivered_completions(q)
+    restored = _restore_after_owner_exit(q, monkeypatch)
     assert restored == 1
     got = q.get_nowait()
     assert got["restored"] is True

@@ -2725,6 +2725,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         (``process.kill`` via process_manage, CLI /stop) passes its own source and still
         reaches them, so the user can always stop a persisted process on purpose."""
         lifecycle = source in self._LIFECYCLE_KILL_SOURCES
+
         with self._lock:
             all_sessions = (*self._running.values(), *self._finished.values())
             candidates = [
@@ -2732,17 +2733,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 if (task_id is None or s.owner_task_id == task_id)
                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
                 and not (lifecycle and (s.persist_on_release or s.survive_restart))
-                and not (source == "gateway_shutdown" and s.survive_restart)
+                and not self._survives_gateway_exit(s, source)
             ]
             targets = [s for s in candidates if not s.exited]
             restart_survivors = [
                 s for s in all_sessions
                 if (task_id is None or s.owner_task_id == task_id)
-                and s.id not in exclude_ids and not s.exited and s.survive_restart
+                and s.id not in exclude_ids and not s.exited and self._survives_gateway_exit(s, source)
             ]
             # Finished sessions whose systemd scope did not stop: retry only the scope stop.
             scope_retries = [s for s in candidates if s.exited]
-        if source == "gateway_shutdown" and restart_survivors:
+        if restart_survivors:
             self._write_checkpoint()
             logger.info(
                 "Shutdown: left %d restart-surviving process(es) running",

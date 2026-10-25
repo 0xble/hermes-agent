@@ -1580,12 +1580,10 @@ class GatewayBusySessionMixin:
         from tools import slash_confirm as _slash_confirm_mod
         source = event.source
         session_key = self._session_key_for_source(source)
-        # object.__new__ test runners lack the counter; fall back to a local one.
-        counter = getattr(self, "_slash_confirm_counter", None)
-        if counter is None:
-            import itertools as _itertools
-            counter = self._slash_confirm_counter = _itertools.count(1)
-        confirm_id = f"{next(counter)}"
+        # Both live slots can hold prompts. Process-local counters collide and
+        # route a predecessor's button to the successor's unrelated session.
+        import secrets
+        confirm_id = secrets.token_hex(8)
 
         # Register FIRST so a fast button click cannot race the send_slash_confirm return.
         _slash_confirm_mod.register(session_key, confirm_id, command, handler)

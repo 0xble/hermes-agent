@@ -1931,6 +1931,20 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         ):
             self._schedule_update_notification_watch()
 
+    async def _start_pending_process_watchers(self, process_registry) -> None:
+        """Arm one detached descriptor batch, including checkpoints adopted after startup."""
+        # Reassign, not clear(): descriptors appended while yielding belong to the next drain.
+        watchers = process_registry.pending_watchers
+        process_registry.pending_watchers = []
+        for i, watcher in enumerate(watchers):
+            self._spawn_supervised(
+                lambda w=watcher: self._run_process_watcher(w),
+                f"process_watcher:{watcher.get('session_id')}", restart=False,
+            )
+            logger.info("Started watcher for process %s", watcher.get("session_id"))
+            if i % 100 == 99:
+                await asyncio.sleep(0)
+
     async def _start_finish_wiring(self, connected_count: int) -> None:
         """Post-connect wiring: services, boot notifications, startup restore, recovered watchers."""
         from gateway.zero_cut_standby import is_standby
@@ -1990,20 +2004,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         await self._send_session_db_warning_notifications()
         from gateway.cron_store_notices import install_cron_store_notices
         install_cron_store_notices(self, asyncio.get_running_loop())
-        # Resume recovered process watchers. Detach the batch atomically (fresh list, not clear(): a
-        # concurrent append during the yield must not be lost); yield every 100 to keep the loop live.
+        # Recovered descriptors use the same drain as post-turn and late predecessor adoption.
         with _log_suppressed(logging.ERROR, "Recovered watcher setup error: %s"):
             from tools.process_registry import process_registry
-            watchers = process_registry.pending_watchers
-            process_registry.pending_watchers = []
-            for i, watcher in enumerate(watchers):
-                self._spawn_supervised(
-                    lambda w=watcher: self._run_process_watcher(w),
-                    f"process_watcher:{watcher.get('session_id')}", restart=False,
-                )
-                logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
-                if i % 100 == 99:
-                    await asyncio.sleep(0)
+            await self._start_pending_process_watchers(process_registry)
 
     # Long-lived supervised watchers spawned at the end of start(), in order; supervised name = method
     # name minus the leading underscore.

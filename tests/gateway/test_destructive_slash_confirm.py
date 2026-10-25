@@ -65,8 +65,6 @@ def _make_runner():
 
     runner._running_agents = {}
     runner._pending_messages = {}
-    import itertools as _it
-    runner._slash_confirm_counter = _it.count(1)
     runner.hooks = SimpleNamespace(
         emit=AsyncMock(),
         emit_collect=AsyncMock(return_value=[]),

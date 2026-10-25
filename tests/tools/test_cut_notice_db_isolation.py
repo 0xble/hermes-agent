@@ -13,6 +13,7 @@ from tools.process_registry import process_registry
 from tools.process_registry_notifications import _format_async_delegation, format_process_notification
 
 from tests.tools.test_delegation_recovery_admission import _cut_live_batch
+from tests.tools.test_async_terminal_fallback_ownership import _restore_after_owner_exit
 
 
 @pytest.fixture(autouse=True)
@@ -74,13 +75,13 @@ def test_stamp_fails_closed_when_ledger_is_locked(monkeypatch):
     assert "action='resume'" not in _format_async_delegation(cut)
 
 
-def test_restored_cut_is_stamped_at_replay():
+def test_restored_cut_is_stamped_at_replay(monkeypatch):
     cut = _recorded_cut("deleg_replayed_cut")
     with ad._DB_LOCK, ad._transaction() as conn:
         conn.execute("UPDATE async_delegations SET delivery_state='pending' WHERE delegation_id=?",
                      (cut["delegation_id"],))
     q = queue.Queue()
-    assert ad.restore_undelivered_completions(q) == 1
+    assert _restore_after_owner_exit(q, monkeypatch) == 1
     restored = q.get_nowait()
     assert restored["resume_available"] is True
     assert "action='resume'" in _format_async_delegation(restored)

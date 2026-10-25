@@ -107,7 +107,8 @@ def build_identify_payload() -> dict[str, Any]:
         "profile": _profile_label_for_home(record.get("hermes_home") or ""),
         "supervisor": _detect_supervisor(), **_get_code_identity_fields()}
     from gateway import zero_cut_standby as zcs
-    payload.update({"slot": zcs.readiness()["slot"], "standby": zcs.readiness()["standby"]})
+    readiness = zcs.readiness()
+    payload.update({key: readiness[key] for key in ("slot", "standby", "handover_accepted")})
     with contextlib.suppress(Exception):
         # served_profiles (multiplex mode) is stamped into runtime status by the runner.
         served = (read_runtime_status() or {}).get("served_profiles")

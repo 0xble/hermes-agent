@@ -7,10 +7,12 @@ import logging
 from typing import Any
 
 from gateway.gateway_slot import effective_gateway_standby, effective_gateway_slot
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger("gateway.zero_cut_standby")
 _ready = False
 _promoted = False
+_promoting = False
 _runner = None
 
 
@@ -23,6 +25,12 @@ def mark_ready() -> None:
     """Mark the local gateway ready after its runner has started successfully."""
     global _ready
     _ready = True
+
+
+def bind_runner(runner) -> None:
+    """Publish ownership for the initial active slot as well as a deferred standby."""
+    global _runner
+    _runner = runner
 
 
 def defer_platform(runner, platform, config, profile: str | None = None) -> bool:
@@ -48,7 +56,9 @@ def readiness() -> dict[str, Any]:
             f"{profile}:{platform.value}" if profile else platform.value
             for profile, platform in entries
         ]
-    return {"slot": slot, "standby": is_standby(), "ready": _ready, "deferred": runner_deferred}
+    handover = getattr(_runner, "_zero_cut_handover_state", None) or {}
+    return {"slot": slot, "standby": is_standby() or _promoting, "ready": _ready, "deferred": runner_deferred,
+            "handover_accepted": bool(handover.get("accepted"))}
 
 
 async def _connect_deferred(runner, platform, adapter) -> bool:
@@ -93,6 +103,8 @@ async def _promote_secondary_profiles(runner, profiles: list[str], failed: list[
                 error_message=f"Telegram was not started at standby promotion: {why}", needs_attention=True)
 
     for profile in [p for p in homes if p in profiles]:
+        if Platform.TELEGRAM in (runner._profile_adapters.get(profile) or {}):
+            continue
         try:
             await runner._start_one_profile_adapters(profile, homes[profile], claimed)
         except Exception:
@@ -105,29 +117,70 @@ async def _promote_secondary_profiles(runner, profiles: list[str], failed: list[
 
 
 async def promote(runner) -> dict[str, Any]:
+    lock = getattr(runner, "_zero_cut_promote_lock", None)
+    if lock is None:
+        lock = runner._zero_cut_promote_lock = asyncio.Lock()
+    async with lock:
+        return await _promote_once(runner)
+
+
+async def _promote_once(runner) -> dict[str, Any]:
     """Promote a ready standby in place, starting deferred adapters and autonomous services.
 
     A deferred primary that fails to connect (False or a raise) joins the primary reconnect queue;
     deferred secondaries start through the normal per-profile path, so a promoted gateway heals
     instead of silently serving without them. The payload names every platform not yet serving.
     """
-    global _promoted
+    global _promoted, _promoting
     if _promoted:
-        return {"promoted": True, "already": True}
+        return {**getattr(runner, "_zero_cut_promotion_result", {"promoted": True}), "already": True}
     if not is_standby():
         return {"promoted": False, "refused": "not_standby"}
     if not _ready:
         return {"promoted": False, "refused": "not_ready"}
 
     # The standby opened no shared store; take ownership before any adapter can deliver a turn.
-    _promoted = True
+    _promoted, _promoting = True, True
     try:
-        return await _promote(runner)
+        result = await _promote(runner)
+        if result.get("promoted") is not True:
+            _promoted = False
+            return result
+        runner._zero_cut_promotion_result = result
+        _promoting = False
+        # The successor owns this acknowledgement even if the updater has disappeared.
+        # Readback must see a serving slot, not a ready standby or a failed adapter.
+        await _acknowledge_release(runner)
+        return result
     except BaseException:
         # Back to standby so a retry runs again, rather than answering "already" with nothing serving.
         _promoted = False
         logger.exception("Standby promotion failed; still standby, promotion may be retried")
         raise
+    finally:
+        _promoting = False
+
+
+async def _acknowledge_release(runner) -> None:
+    """An ACK probe cannot roll back a serving gateway or depend on the updater surviving."""
+    import os
+    from hermes_cli.immutable_releases import acknowledge_running_release
+    try:
+        done = await asyncio.to_thread(acknowledge_running_release, get_hermes_home(), gateway_pid=os.getpid())
+    except Exception:
+        logger.exception("Serving candidate could not acknowledge its release yet")
+        done = False
+    if not done and (get_hermes_home() / "release-txn.json").exists():
+        task = getattr(runner, "_zero_cut_release_ack_task", None)
+        if task is None or task.done():
+            runner._zero_cut_release_ack_task = runner._retain_background_task(asyncio.create_task(
+                _retry_release_ack(runner), name="zero-cut-release-ack"))
+
+
+async def _retry_release_ack(runner) -> None:
+    while (get_hermes_home() / "release-txn.json").exists():
+        await asyncio.sleep(_PREDECESSOR_POLL_S)
+        await _acknowledge_release(runner)
 
 
 async def _promote(runner) -> dict[str, Any]:
@@ -147,7 +200,6 @@ async def _promote(runner) -> dict[str, Any]:
         platform = key[1]
         # A raise leaves the entry deferred, so the retry that promote()'s rollback allows can start it.
         adapter = runner._create_adapter(platform, config)
-        deferred.pop(key)
         if adapter is None:
             # Same classification an active boot makes (_start_prefilter_platforms): only a platform
             # that can heal without a config change joins the reconnect queue; either way it is flagged.
@@ -168,13 +220,18 @@ async def _promote(runner) -> dict[str, Any]:
             failed.append(platform.value)
             runner._failed_platforms[platform] = runner._startup_retry_entry(platform, adapter, config)
             continue
+        deferred.pop(key)
+        getattr(runner, "_failed_platforms", {}).pop(platform, None)
         runner._publish_primary_adapter(platform, adapter)
     secondary = sorted({profile for profile, _platform in deferred if profile is not None})
-    for key in [k for k in list(deferred) if k[0] is not None]:
-        deferred.pop(key)
     if secondary:
         await _promote_secondary_profiles(runner, secondary, failed)
+        for key in [k for k in list(deferred) if k[0] is not None]:
+            if key[1] in ((getattr(runner, "_profile_adapters", None) or {}).get(key[0]) or {}):
+                deferred.pop(key)
 
+    if failed:
+        return {"promoted": False, "failed": failed}
     await runner._start_finish_wiring(len(runner.adapters))
     runner._start_spawn_background_watchers()
     from gateway.run import _start_gateway_start_cron_and_housekeeping
@@ -184,6 +241,37 @@ async def _promote(runner) -> dict[str, Any]:
 
 
 _PREDECESSOR_POLL_S = 1.0
+
+
+def arm_handover(runner, params: dict) -> dict:
+    """The standby, not the updater, owns the release→promotion continuation."""
+    slot, pid = params.get("predecessor_slot"), params.get("predecessor_pid")
+    if slot not in {"a", "b"} or not isinstance(pid, int) or pid <= 0 or not is_standby():
+        return {"armed": False}
+    existing = getattr(runner, "_zero_cut_promotion_watch", None)
+    if existing is None:
+        runner._zero_cut_promotion_watch = asyncio.create_task(
+            _promote_after_release(runner, slot, pid), name="zero-cut-promotion-watch")
+    return {"armed": True}
+
+
+async def _promote_after_release(runner, slot: str, pid: int) -> None:
+    from gateway.control_socket import query_gateway_control
+    from gateway.status import _get_process_hermes_home
+    import psutil
+    home = _get_process_hermes_home()
+    while is_standby():
+        state = await asyncio.to_thread(query_gateway_control, home, "handover-status", slot=slot)
+        if (state or {}).get("failed"):
+            return
+        if ((state or {}).get("updates_settled") and (state or {}).get("token_lock_released")) or not psutil.pid_exists(pid):
+            try:
+                if (await promote(runner)).get("promoted") is True:
+                    return
+            except Exception:
+                logger.exception("Successor promotion failed; retaining both slots for retry")
+        # Unanswered control is not a death certificate and never authorizes lock stealing.
+        await asyncio.sleep(_PREDECESSOR_POLL_S)
 
 
 def _start_adopting(runner) -> None:
@@ -201,6 +289,12 @@ async def _adopt_predecessor_duties(runner) -> None:
     home = _get_process_hermes_home()
     while await asyncio.to_thread(slot_lock_held, home, other):
         await asyncio.sleep(_PREDECESSOR_POLL_S)
+    # Startup recovery correctly left live-predecessor checkpoints untouched.
+    # Now adopt its durable processes, without re-running their commands.
+    from tools.process_registry import process_registry
+    await asyncio.to_thread(process_registry.recover_from_checkpoint)
+    await asyncio.to_thread(runner._recover_secondary_process_checkpoints, process_registry)
+    await runner._start_pending_process_watchers(process_registry)
     from gateway.run import _claim_host_gateway_role, _refresh_host_gateway_record
     try:
         _claim_host_gateway_role()  # on the loop thread, so its SIGTERM cleanup handler installs
@@ -215,7 +309,8 @@ async def _adopt_predecessor_duties(runner) -> None:
 
 def reset_for_tests() -> None:
     """Reset local readiness and promotion state for isolated tests."""
-    global _ready, _promoted, _runner
+    global _ready, _promoted, _promoting, _runner
     _ready = False
     _promoted = False
+    _promoting = False
     _runner = None

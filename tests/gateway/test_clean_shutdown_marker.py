@@ -8,6 +8,7 @@ crash-turn recovery is skipped and orphan turn markers are discarded.
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
@@ -33,7 +34,8 @@ def _make_store(tmp_path):
 class TestCleanShutdownMarker:
     """Test that the marker file controls session suspension on startup."""
 
-    def test_marker_written_on_graceful_stop(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("handover", [False, True])
+    def test_marker_written_on_graceful_stop(self, tmp_path, monkeypatch, handover):
         """stop() should write .clean_shutdown marker."""
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
         marker = tmp_path / ".clean_shutdown"
@@ -43,6 +45,7 @@ class TestCleanShutdownMarker:
         from gateway.run import GatewayRunner
         runner = object.__new__(GatewayRunner)
         runner._restart_requested = False
+        setattr(runner, "_zero_cut_handover_state", {"idle": True, "failed": None} if handover else None)
         runner._restart_detached = False
         runner._restart_via_service = False
         runner._restart_task_started = False
@@ -74,7 +77,8 @@ class TestCleanShutdownMarker:
             import asyncio
             asyncio.get_event_loop().run_until_complete(runner.stop())
 
-        final_cleanup.assert_awaited_once_with("final-cleanup", timeout=None, restart=False)
+        options = {"handover": True} if handover else {}
+        final_cleanup.assert_awaited_once_with("final-cleanup", timeout=None, restart=False, **options)
 
         assert marker.exists(), ".clean_shutdown marker should exist after graceful stop"
 

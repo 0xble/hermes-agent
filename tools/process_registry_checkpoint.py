@@ -2,16 +2,37 @@
 
 import json
 import logging
+import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from tools.process_registry import ProcessSession
 
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger("tools.process_registry")
 
 
+def _foreign_registry_live(registry, entry) -> bool:
+    pid = entry.get("registry_owner_pid")
+    return bool(isinstance(pid, int) and pid > 0 and pid != os.getpid()
+                and registry._detached_host_fate(pid, entry.get("registry_owner_started_at")) == "running")
+
+
+def _retain_foreign_checkpoint(registry, entry) -> bool:
+    """A file-backed result remains recoverable after its registry owner exits."""
+    pid = entry.get("registry_owner_pid")
+    return bool(isinstance(pid, int) and pid > 0 and pid != os.getpid()
+                and (entry.get("exit_path") or _foreign_registry_live(registry, entry)))
+
+
 class ProcessCheckpointMixin:
+    if TYPE_CHECKING:
+        _running: dict[str, ProcessSession]
+        _finished: dict[str, ProcessSession]
+
     def _detached_host_fate(self, pid: Optional[int], expected_start: Optional[int]) -> str:
         """Subclass supplies the live PID decision. See ProcessRegistry."""
         raise NotImplementedError
@@ -25,6 +46,7 @@ class ProcessCheckpointMixin:
         try:
             with self._lock:
                 entries = []
+                known_ids = self._running.keys() | self._finished.keys()
                 pending_survivors = [
                     s for s in self._finished.values()
                     if self._retain_survivor_completion(s)
@@ -43,12 +65,26 @@ class ProcessCheckpointMixin:
                     # See #77484.
                     entry["command"] = redact_sensitive_text(s.command, code_file=True)
                     entry["owner_task_id"] = s.owner_task_id or s.task_id
+                    entry["registry_owner_pid"] = os.getpid()
+                    entry["registry_owner_started_at"] = self._safe_host_start_time(os.getpid())
                     entries.append(entry)
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
                     entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
             from utils import atomic_json_write
-            atomic_json_write(_checkpoint_path(), entries)
+            from hermes_cli.active_sessions import _FileLock
+            path = _checkpoint_path()
+            with _FileLock(path.with_suffix(".lock")):
+                try:
+                    previous = json.loads(path.read_text(encoding="utf-8-sig"))
+                except (OSError, ValueError):
+                    previous = []
+                local_ids = known_ids | {e.get("session_id") for e in entries}
+                # Ordinary successor writes can race its predecessor-adoption tick.
+                # Keep foreign file-backed results until recovery adopts or discards them.
+                entries.extend(e for e in previous if e.get("session_id") not in local_ids
+                               and _retain_foreign_checkpoint(self, e))
+                atomic_json_write(path, entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -74,6 +110,8 @@ class ProcessCheckpointMixin:
         recovered = 0
         unresolved_scope_entries: list[dict[str, Any]] = []
         for entry in entries:
+            if _foreign_registry_live(self, entry):
+                continue  # the original registry still owns pipes, notifications and finalization
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
             # A file-backed job (survive_restart, or a local persist_on_release job) has a
             # wrapper-written exit marker and log, so its result outlives the old gateway.
