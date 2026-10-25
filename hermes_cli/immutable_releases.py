@@ -211,8 +211,11 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
     from packaging.utils import canonicalize_name
     from packaging.markers import default_environment
 
-    project_data = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8-sig"))
-    groups = project_data["project"].get("optional-dependencies", {})
+    project_file = project / "pyproject.toml"
+    groups = (tomllib.loads(project_file.read_text(encoding="utf-8-sig"))["project"]
+              .get("optional-dependencies", {}) if project_file.is_file() else {})
+    if not groups:
+        return []
     installed = set(_active_distributions(source_python))
     declared: dict[str, set[str]] = {}
     for extra, requirements in groups.items():
@@ -332,15 +335,49 @@ def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv
 def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv",
                  source: Path | None = None, source_python: Path | None = None) -> tuple[Path, str]:
     """Build at the final release path: venv scripts and metadata are not relocatable."""
+    extras: set[str] = set()
     if source is not None:
         source_python = source_python or _source_install_python(source)
-        extras = _active_locked_extras(source_python, release)
-    else:
-        extras = []
-    _build_venv(release, uv=uv, extras=extras, python=source_python)
+        extras.update(_active_locked_extras(source_python, release))
+    extras.update(_committed_extras(previous, release))
+    _build_venv(release, uv=uv, extras=sorted(extras), python=source_python)
     if source is not None:
         restore_active_distributions(source, release, uv=uv, source_python=source_python)
     return release / ".venv", "built"
+
+
+def _committed_extras(release: Path | None, project: Path) -> set[str]:
+    """Extras `project` declares that `release`'s committed PM environment carries.
+
+    The source interpreter is frozen at first migration. Extras added since
+    (`hermes pm install --extra`, lazy installs) live only in the active
+    release's committed PM environment.
+    """
+    if release is None:
+        return set()
+    from pm.environments import project_python
+    python = project_python(release)
+    return set(_active_locked_extras(python, project)) if python.is_file() else set()
+
+
+def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
+    """Commit into a ready candidate's PM environment the extras the active release carries.
+
+    A ready candidate may come from an older builder: `hermes update` from a release
+    re-enters the source checkout (`main.cmd_update`), which stages with its own frozen
+    code. Committing the missing extras before activation lets the first boot select them
+    instead of lazily installing them into a process that cannot adopt them. Only the
+    candidate's own code carries: PM resolves against the calling tree's lockfile, and
+    the post-swap child imports from the candidate.
+    """
+    from pm.paths import repo_root
+    if previous is None or previous == candidate or repo_root() != candidate.resolve():
+        return []
+    missing = sorted(_committed_extras(previous, candidate) - _committed_extras(candidate, candidate))
+    if missing:
+        import pm
+        pm.sync_venv(missing, explicit=True, project_root=candidate)
+    return missing
 
 
 def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) -> None:
@@ -507,6 +544,7 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
     if target.is_symlink():
         raise RuntimeError(f"release target is a symlink, refusing to follow or replace: {target}")
     if _release_is_ready(target, sha):
+        carry_active_extras(target, read_pointer(paths.current))
         smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
         return target, "existing"
     if target.exists() or target.is_symlink():
@@ -693,20 +731,45 @@ def _verify_transaction(paths: ReleasePaths, record: dict[str, Any]) -> None:
             raise RuntimeError("launchd plist differs from transaction intent")
 
 
-def _runs_hermes_main(argv: list[str], root: Path) -> bool:
+def _runs_hermes_main(argv: list[str], root: Path, *, pythonpath: str = "") -> bool:
     """Is ``argv`` an interpreter entering ``hermes_cli.main`` for exactly ``root``?
 
     Two launch shapes exist: ``python -m hermes_cli.main`` and the generated
     ``python -I -c <bootstrap>`` launcher that launchd services run. The second
     is accepted only when its code equals the bootstrap generated for ``root``,
-    so another tree's or an arbitrary ``-c`` program cannot pass.
+    so another tree's or an arbitrary ``-c`` program cannot pass. Only that
+    isolated bootstrap ignores inherited PYTHONPATH and clears it before
+    importing. PM may export its selected paths again for child processes.
     """
     if argv[1:3] == ["-m", "hermes_cli.main"]:
-        return True
+        return not pythonpath
     if len(argv) < 4:
         return False
     from hermes_cli._launchers import runtime_command
     return argv[1:4] == runtime_command(root, (), module="hermes_cli.main", python=argv[0])[1:4]
+
+
+def _is_intended_gateway(process, root: Path, expected_python: Path) -> bool:
+    """Does ``process`` run the gateway from ``root`` on its expected interpreter?
+
+    A descendant that exits or is a zombie mid-scan is not the gateway; skip it
+    rather than abandoning the scan.
+    """
+    import psutil
+    from gateway.status import looks_like_gateway_command_line
+    try:
+        argv = process.cmdline()
+        # The wrapper embeds the command in its argv. Require the inner
+        # interpreter's entrypoint before applying the canonical parser,
+        # which also accepts a profile selector before `gateway run`.
+        if (not _runs_hermes_main(argv, root) or
+                not looks_like_gateway_command_line(shlex.join(argv))):
+            return False
+        return (Path(process.exe()).resolve() == _interpreter_process_executable(expected_python) and
+                Path(process.cwd()).resolve() == root and
+                _runs_hermes_main(argv, root, pythonpath=process.environ().get("PYTHONPATH", "")))
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
 
 
 def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
@@ -756,23 +819,12 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
             return False
         if gateway_pid is not None and (gateway_pid != os.getpid() or _LOADED_CODE_ROOT != intended_root):
             return False
+        expected_python = (intended_root / ".venv" / "bin" / "python" if
+                           intended_root.parent == paths.releases.resolve() else
+                           Path(record["journal_original"]["source_python"]))
         for process in processes:
-            argv = process.cmdline()
-            # The wrapper embeds the command in its argv. Require the inner
-            # interpreter's entrypoint before applying the canonical parser,
-            # which also accepts a profile selector before `gateway run`.
-            from gateway.status import looks_like_gateway_command_line
-            if (not _runs_hermes_main(argv, intended_root) or
-                    not looks_like_gateway_command_line(shlex.join(argv))):
-                continue
-            executable = Path(process.exe()).resolve()
-            expected_python = (intended_root / ".venv" / "bin" / "python" if
-                               intended_root.parent == paths.releases.resolve() else
-                               Path(record["journal_original"]["source_python"]))
-            if (executable == _interpreter_process_executable(expected_python) and
-                    (gateway_pid is None or _LOADED_CODE_ROOT == intended_root) and
-                    Path(process.cwd()).resolve() == intended_root and
-                    not process.environ().get("PYTHONPATH")):
+            if (_is_intended_gateway(process, intended_root, expected_python) and
+                    (gateway_pid is None or _LOADED_CODE_ROOT == intended_root)):
                 _verify_transaction(paths, record)
                 record["reload_ack"] = {"plist_sha256": plist["intended_sha256"],
                                         "launchd_pid": supervisor_pid,

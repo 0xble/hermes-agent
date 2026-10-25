@@ -85,21 +85,31 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
 
     The public handler return stays unchanged. This receipt means scheduled/queued,
     not model execution, authorization of a later turn, or successful outbound delivery.
+    A background wake is refused while the gateway-wide turn limit is reached
+    (``gateway/run_background_admission.py``); the caller keeps its claim and retries.
     """
     event._gateway_accepted = False
     metadata = getattr(event, "metadata", None)
+    runner = getattr(adapter, "gateway_runner", None)
     from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
     if is_gateway_wake(event) and not await asyncio.to_thread(internal_wake_is_current, event):
         raise WakeSuperseded("goal continuation or loop tick superseded before admission")
     # Last strict-pin check before admission: an idle adapter admits without awaiting again, so a
     # /new or /resume rebind after the caller's lookup would otherwise be acknowledged here and
     # only dropped at execution. Resolved on the runner's class so test doubles are not awaited.
-    runner = getattr(adapter, "gateway_runner", None)
     pin_holds = getattr(type(runner), "_strict_session_pin_holds", None)
     if (isinstance(metadata, dict) and metadata.get("gateway_session_strict") and pin_holds is not None
             and not await pin_holds(runner, event)):
         raise WakeNotAccepted("pinned session no longer owns its key")
-    await adapter.handle_message(event)
+    # A background wake needs a gateway-wide turn slot; without one it is refused, not queued.
+    # The reservation counts against the limit until the admitted turn claims its session.
+    admit_background = getattr(type(runner), "_admit_background_turn", None)
+    reserved = admit_background(runner, adapter, event) if admit_background is not None else None
+    try:
+        await adapter.handle_message(event)
+    finally:
+        if reserved is not None and event._gateway_accepted is not True:
+            runner._release_background_turn(reserved)
     if event._gateway_accepted is not True:
         raise WakeNotAccepted("internal wake not accepted by adapter")
 
