@@ -23,7 +23,7 @@ def post_lifecycle(path: str, body: dict, *, release: bool, timeout: int) -> dic
     # requires a whole-context transition. Never send all=True to a parked release.
     consent = {"all": True} if release else {**body, "allowRestart": True}
     data = cf._post(path, consent, timeout=timeout)
-    if data.get("ok") is True:
+    if data.get("ok") is True and data.get("released" if release else "restarted") is True:
         data["warning"] = ("No parking display: this identity's live tabs and in-memory page state "
                            "were discarded by the legacy browser transition. Logins persist.")
     return data
