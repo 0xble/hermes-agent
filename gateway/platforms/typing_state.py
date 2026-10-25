@@ -17,8 +17,8 @@ def typing_metadata_for_source(source, reply_to_message_id=None):
     """Resolve the status surface without changing recipient/send routing.
 
     Slack can use the triggering message as a synthetic status root even when
-    top-level DMs do not create thread sessions. Never pass that root to media
-    or error sends: flat reply mode must stay flat.
+    top-level DMs do not create thread sessions. Never pass that root to message
+    delivery: flat reply mode must stay flat, including prompts and notices.
     """
     from gateway.platforms.base import _platform_name, _thread_metadata_for_source
     from gateway.session_context import source_route_metadata

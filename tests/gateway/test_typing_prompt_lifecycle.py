@@ -101,3 +101,40 @@ async def test_clarify_pause_typed_answer_resumes_original_surface(monkeypatch, 
     assert await asyncio.to_thread(turn._ask_clarify_question, "Question?", None, False) == ("the answer", True)
     await adapter._stop_typing_refresh("D123", metadata=refresh_metadata)
     assert not getattr(adapter, "_typing_prompt_surfaces", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["approval", "clarify", "notice"])
+@pytest.mark.parametrize("thread_id", [None, "real-thread"])
+async def test_flat_slack_prompts_and_notices_do_not_inherit_typing_root(delivery, thread_id):
+    from gateway.run import _send_or_update_status_coro
+    from plugins.platforms.slack.adapter import SlackAdapter
+
+    adapter = SlackAdapter(PlatformConfig(enabled=True, extra={"reply_in_thread": False}))
+    client = AsyncMock()
+    client.chat_postMessage.return_value = {"ok": True, "ts": "prompt"}
+    adapter._app = SimpleNamespace(client=client)
+    source = SessionSource(platform=Platform.SLACK, chat_id="D123", chat_type="dm",
+                           user_id="U1", thread_id=thread_id)
+    event = MessageEvent(text="work", source=source, message_id="171.1")
+    runner = object.__new__(GatewayRunner)
+    runner._delivery_adapter_for = lambda source: adapter
+    _, _, metadata = runner._run_agent_progress_threading(source, event.message_id, False)
+    # The status has its own root even when message delivery must stay flat.
+    typing_metadata = typing_metadata_for_event(event)
+    assert typing_metadata is not None
+    assert typing_metadata["thread_id"] == (thread_id or event.message_id)
+
+    if delivery == "approval":
+        result = await adapter.send_exec_approval("D123", "pwd", "session", metadata=metadata)
+    elif delivery == "clarify":
+        result = await adapter.send_clarify("D123", "Question?", ["Yes", "No"],
+                                            "clarify-1", "session", metadata=metadata)
+    else:
+        result = await _send_or_update_status_coro(adapter, "D123", "notice", "Working", metadata)
+
+    assert result.success
+    client.chat_postMessage.assert_awaited_once()
+    payload = client.chat_postMessage.await_args.kwargs
+    assert payload["channel"] == "D123"
+    assert payload.get("thread_ts") == thread_id
