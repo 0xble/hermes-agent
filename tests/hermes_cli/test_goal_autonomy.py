@@ -54,6 +54,38 @@ def test_completion_preserves_unproven_goal_and_records_each_gap(home):
     assert state.revisions[-1]["evidence"] == evidence
 
 
+@pytest.mark.parametrize("excerpt", ["ok", "successfully", "all checks passed", "done done done"])
+def test_completion_refuses_generic_recorded_excerpts(home, excerpt):
+    _, db = home
+    mgr = manager()
+    db.append_message("autonomy", "tool", excerpt, tool_name="terminal")
+    result = mgr.complete(reason="finished", evidence={item: excerpt for item in (
+        "tests pass", "release readback matches")})
+    assert not result["ok"] and "tests pass" in result["error"]
+    assert "concrete recorded proof" in result["error"]
+    assert goals.load_goal("autonomy").status == "active"
+
+
+@pytest.mark.parametrize("status", ["cleared", "done"])
+@pytest.mark.parametrize("barrier", ["user", "pid", "session"])
+def test_autonomy_migration_never_revives_terminal_goals(home, status, barrier):
+    _, db = home
+    mgr = manager()
+    mgr.state.status = status
+    if barrier == "user":
+        mgr.state.waiting_on_user_message = True
+    elif barrier == "pid":
+        mgr.state.waiting_on_pid = 123
+    else:
+        mgr.state.waiting_on_session = "other"
+    goals.save_goal("autonomy", mgr.state)
+    expected = db.get_meta("goal:autonomy")
+    assert goals.load_goal("autonomy").status == status
+    assert goals.list_parked_goals() == []
+    assert not goals.store_has_parked_goal(db)
+    assert db.get_meta("goal:autonomy") == expected
+
+
 @pytest.mark.parametrize("action", ["replace", "revise"])
 def test_autonomous_contract_edits_cannot_retire_requirements(home, action):
     mgr = manager()

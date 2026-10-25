@@ -55,6 +55,9 @@ def record_hard_limit_breach(state, reason: str) -> None:
 def migrate_autonomous_goal(state) -> bool:
     if not goal_autonomy_enabled():
         return False
+    if state.status not in {"active", "paused", "blocked", "needs-input", "needs_input",
+                             "awaiting-approval", "awaiting_approval"}:
+        return False
     system_pause = state.status in {"blocked", "needs-input", "needs_input", "awaiting-approval", "awaiting_approval"} or (
         state.status == "paused" and
         (state.paused_reason or "").startswith(("turn budget exhausted", "quality gate", "judge ", "judged unachievable:")))
@@ -79,6 +82,18 @@ def migrate_autonomous_goal(state) -> bool:
     state.revisions.append({"at": time.time(), "kind": "autonomy_migration", "reason": reason,
                             "actor": "system", "authority": "autonomy"})
     return True
+
+
+def completion_proof_is_concrete(proof: str) -> bool:
+    from hermes_cli.goals import _REVISION_EVIDENCE_MIN_CHARS
+
+    excerpt = " ".join(proof.split())
+    if re.fullmatch(r"(?:[0-9a-fA-F]{7,64}|https?://\S+|\d+\s+passed)", excerpt):
+        return True
+    words = re.findall(r"\w+", excerpt.casefold())
+    generic = {"ok", "okay", "success", "successful", "successfully", "all", "checks",
+               "passed", "pass", "done", "complete", "completed"}
+    return len(excerpt) >= _REVISION_EVIDENCE_MIN_CHARS and len(words) >= 2 and bool(set(words) - generic)
 
 
 def current_removal_quote(session_id, quote, *, cursor=None):
@@ -268,6 +283,9 @@ class GoalAutonomyMixin:
         else:
             for criterion in criteria:
                 proof = evidence.get(criterion)
+                if not completion_proof_is_concrete(proof):
+                    gap = criterion + ": cite concrete recorded proof, such as a measured result, readback, URL or SHA"
+                    break
                 failure = self._recorded_evidence_error(proof, state)
                 if failure:
                     gap = criterion + ": " + failure["error"]

@@ -24,6 +24,9 @@ match an eligible tool result recorded since this goal began, including archived
 rows. Agent prose and goal bookkeeping cannot supply proof. Existing quality
 gates run before completion and must pass. This validates recorded provenance
 and coverage, while the calling agent owns the semantic adequacy of the proof.
+Generic acknowledgments such as `ok` are refused. A proof excerpt must be a
+measured passing test count, URL, SHA, or substantive text with at least 2 words
+and the existing 12-character evidence minimum. Recorded provenance still binds.
 
 Missing coverage, unrecorded proof, failed gates or a recorded hard-limit breach
 refuse completion, keep the goal active and record the named gap. Successful
@@ -62,6 +65,8 @@ remain paused. Legacy blocked/input/approval states and automatic pauses migrate
 to active timed waits on load. Idle scans include those rows so migration is not
 dependent on a new user message. Stale resume_pending takeover continues through
 the existing generation-fenced gateway path.
+Cleared and completed rows remain terminal even if legacy wait fields survive.
+Load and idle-store scans cannot reactivate those rows.
 
 Autonomous continuation text rides the next user-role injection, never a system
 prompt rebuild. It calls for another route or timed sleep instead of stopping
