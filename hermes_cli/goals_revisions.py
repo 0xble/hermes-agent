@@ -54,10 +54,15 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
         staged._state = GoalState.from_json(expected)
         staged._evaluation_snapshot = (db, expected)
         result = apply(staged)
+        # User authority can race independently of the goal row. Recheck a removal quote
+        # under the same writer lock as the contract delta.
+        from hermes_cli.goals_autonomy import validate_removal_quote
+        def precondition(cursor):
+            validate_removal_quote(staged.state, expected, cursor)
         # No-op and validation returns must also observe conflicting command writes.
         commit_and_publish_snapshot(
             manager, staged.state,
-            lambda: commit_goal_snapshot(manager.session_id, expected, staged.state, db),
+            lambda: commit_goal_snapshot(manager.session_id, expected, staged.state, db, precondition=precondition),
             lambda: _read_goal(manager.session_id, db),
         )
         return result

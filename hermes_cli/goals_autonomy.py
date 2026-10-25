@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Mapping
@@ -48,10 +49,11 @@ def record_hard_limit_breach(state, reason: str) -> None:
 def migrate_autonomous_goal(state) -> bool:
     if not goal_autonomy_enabled():
         return False
-    system_pause = state.status in {"blocked", "needs-input", "awaiting-approval"} or (
-        state.status == "paused" and (state.last_verdict == "blocked" or
-        (state.paused_reason or "").startswith(("turn budget exhausted", "quality gate", "judge "))))
-    if not system_pause and not state.waiting_on_user_message:
+    system_pause = state.status in {"blocked", "needs-input", "needs_input", "awaiting-approval", "awaiting_approval"} or (
+        state.status == "paused" and
+        (state.paused_reason or "").startswith(("turn budget exhausted", "quality gate", "judge ", "judged unachievable:")))
+    untimed_external = state.status == "active" and (state.waiting_on_pid or state.waiting_on_session) and not state.waiting_until
+    if not system_pause and not state.waiting_on_user_message and not untimed_external:
         return False
     reason = state.last_reason or state.paused_reason or "legacy input wait"
     if state.last_verdict == "blocked":
@@ -76,7 +78,7 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     from hermes_cli.goals_authority import (
         _normalize_authority_value, _removal_instruction_units,
     )
-    from hermes_cli.session_controls import check_user_quote
+    from hermes_cli.session_controls import _CURRENT_AUTHORITY, check_user_quote
 
     state = manager.state
     if state is None or state.status not in {"active", "paused"}:
@@ -104,7 +106,9 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     if after["max_turns"] != before["max_turns"]:
         removed.append("turn budget")
     if removed:
-        checked = check_user_quote(manager.session_id, user_quote, cursor=manager._cursor) if user_quote else "missing"
+        authority = _CURRENT_AUTHORITY.get() or {}
+        source_sid = authority.get("session_id") or manager.session_id
+        checked = check_user_quote(source_sid, user_quote, cursor=manager._cursor) if user_quote else "missing"
         targets = [] if isinstance(checked, str) else [
             _normalize_authority_value(target)
             for _verb, target, quoted in _removal_instruction_units(checked[0])
@@ -123,12 +127,57 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     revision = {"at": time.time(), "actor": "agent", "authority": "autonomy", "kind": kind,
                 "reason": reason, "before": before, "after": after,
                 "user_quote": user_quote if removed else ""}
+    if removed:
+        revision["quote_session_id"] = source_sid
+        revision["quote_message"] = checked[1]
     state.revisions.append(revision)
     manager._save()
     return {"ok": True, "revision": revision, "state": state, "version": len(state.revisions) + 1}
 
 
+def validate_removal_quote(state, expected, cursor):
+    from hermes_cli.goals_evaluation import GoalEvaluationConflict
+    from hermes_cli.session_controls import check_user_quote
+
+    if len(state.revisions) <= len(json.loads(expected).get("revisions") or []):
+        return
+    revision = state.revisions[-1]
+    if revision.get("authority") != "autonomy" or not revision.get("user_quote"):
+        return
+    checked = check_user_quote(revision["quote_session_id"], revision["user_quote"], cursor=cursor)
+    if isinstance(checked, str) or checked[1] != revision["quote_message"]:
+        raise GoalEvaluationConflict
+
+
+def autonomous_verdict(state, verdict, reason, wait_directive):
+    if goal_autonomy_enabled() and verdict in {"blocked", "done"}:
+        if verdict == "blocked":
+            record_hard_limit_breach(state, reason)
+            reason = "Choose a different route: " + reason
+        else:
+            reason = "Use goal_set complete with evidence for every criterion"
+        return "continue", reason, None
+    return verdict, reason, wait_directive
+
+
 class GoalAutonomyMixin:
+    @staticmethod
+    def _history_for_next_goal(previous):
+        if not goal_autonomy_enabled() or previous is None or previous.status != "done":
+            return []
+        return [*previous.revisions, {"at": time.time(), "kind": "set", "actor": "agent",
+                "authority": "autonomy", "reason": "Previous goal completed", "goal": previous.goal,
+                "contract": previous.contract.to_dict()}]
+
+    def _autonomy_timer_elapsed(self):
+        state = self.state
+        return (goal_autonomy_enabled() and state is not None
+                and state.waiting_until > 0 and time.time() >= state.waiting_until)
+
+    @staticmethod
+    def _autonomy_budget_exhausted(state):
+        return goal_autonomy_enabled() and state.max_turns > 0 and state.turns_used >= state.max_turns
+
     def complete(self, *, reason: str, evidence: Mapping[str, str]):
         from hermes_cli.goals_revisions import revise_goal_snapshot
 

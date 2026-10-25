@@ -992,6 +992,10 @@ def _goal_replace_failure(target_sid: str, *, cursor=None) -> Optional[dict[str,
 def request_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
                     reason: str = "", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Create a durable, 24-hour pending approval request."""
+    from hermes_cli.goals_autonomy import goal_autonomy_enabled
+    if kind == "goal" and goal_autonomy_enabled():
+        return apply_control(kind, action, target_sid, requester_sid=requester_sid,
+                             reason=reason, payload=payload)
     if (kind, action) not in CONTROLS:
         raise ValueError("unsupported_control")
     payload = _check_payload(kind, action, payload)
@@ -1098,8 +1102,9 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         # Replacement is an agent edit, so every existing requirement still binds.
         try:
             return _db()._execute_write(lambda conn: commit(
-                conn, {"via": "autonomy", "session_id": str(requester_sid)}, "session_control_autonomy"))
+                conn, {"via": "autonomy", "session_id": str(requester_sid), "quote": user_quote}, "session_control_autonomy"))
         except Exception as exc:
+            logger.warning("autonomous goal control failed", exc_info=True)
             return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
 
     # Cross-session goal clear/replace without a quote is intentionally non-blocking and does not

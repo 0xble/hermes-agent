@@ -1456,8 +1456,7 @@ DEFAULT_CONFIG = {
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
         "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
-        # Max continuation turns before auto-pause (/goal resume) — guards against judge false
-        # negatives and unbounded spend.
+        # Max turns before a pause (or an autonomous timed hold), guarding unbounded spend.
         "max_turns": 20,
         # Minimum seconds between autonomous continuation turns (continuation after continuation,
         # /loop or heartbeat wakes). A user message or a process/delegation result continues at

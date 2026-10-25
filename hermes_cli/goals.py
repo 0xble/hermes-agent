@@ -49,7 +49,8 @@ from hermes_cli.goal_evidence import (
 )
 from hermes_cli.goals_revisions import GoalRevisionsMixin
 from hermes_cli.goals_autonomy import (
-    AUTONOMY_CONTINUATION_TEMPLATE, GoalAutonomyMixin, goal_autonomy_enabled, migrate_autonomous_goal, record_hard_limit_breach,
+    AUTONOMY_CONTINUATION_TEMPLATE, GoalAutonomyMixin, goal_autonomy_enabled, migrate_autonomous_goal,
+    autonomous_verdict,
 )
 from hermes_cli.goals_status import GoalStatusMixin
 from hermes_cli.lifecycle_snapshot import snapshot_control
@@ -3005,12 +3006,13 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             raise GoalPersistenceError(
                 "existing goal migration was not saved; refusing to overwrite it; try again"
             )
-        if goal_autonomy_enabled() and live is not None and live.status != "cleared":
+        if goal_autonomy_enabled() and live is not None and live.status in {"active", "paused"}:
             raise ValueError("Use revise or replace to preserve the existing goal contract")
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(), last_turn_at=0.0,
             max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
             contract=contract if contract is not None else GoalContract(),
+            revisions=self._history_for_next_goal(live),
         )
         return self._save()
 
@@ -3125,6 +3127,8 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             state.clear_wait(preserve_notice_key=True)
             for k, v in barrier.items():
                 setattr(state, k, v)
+            if goal_autonomy_enabled() and (state.waiting_on_pid or state.waiting_on_session):
+                state.waiting_until = time.time() + 900
             if state.waiting_on_pid is not None:
                 state.waiting_on_pid_live_at_park = _pid_alive(state.waiting_on_pid)
             if state.waiting_on_session is not None:
@@ -3278,6 +3282,8 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
         s = self._state
         if s is None:
             return False
+        if self._autonomy_timer_elapsed():
+            return False
         if s.waiting_on_session is not None:
             still = _session_waiting(s.waiting_on_session)
         elif s.waiting_on_pid is not None:
@@ -3298,6 +3304,9 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
     def _stage_live_barrier(self) -> tuple[bool, Optional[str], Optional[str]]:
         s = self._state
         if s is None or s.status != "active" or not s.waiting_since:
+            return False, None, None
+        if self._autonomy_timer_elapsed():
+            s.clear_wait(preserve_notice_key=True)
             return False, None, None
         if s.waiting_on_session is not None:
             still = _session_waiting(s.waiting_on_session)
@@ -3564,7 +3573,7 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
         ``evidence_session_id`` names the transcript whose tool results feed the judge's evidence
         ledger when it differs from the goal's key (the TUI keys goals by session key)."""
         state = self._state
-        if state is None or state.status != "active":
+        if not self.is_active():
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
 
         # A real break in silence resets the no-progress ladder. Discover the current
@@ -3604,7 +3613,7 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             else:
                 state.clear_wait(preserve_notice_key=True)
 
-        if goal_autonomy_enabled() and state.max_turns > 0 and state.turns_used >= state.max_turns:
+        if self._autonomy_budget_exhausted(state):
             return self._autonomy_retry("turn budget exhausted; preserve the limit")
         state.turns_used += 1
         state.last_turn_at = time.time()
@@ -3654,13 +3663,7 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             resume_override=state.resume_override_reasons(),
             user_messages_block=_render_user_messages_block(self.session_id, state.created_at),
         )
-        if goal_autonomy_enabled() and verdict in {"blocked", "done"}:
-            if verdict == "blocked":
-                record_hard_limit_breach(state, reason)
-                reason = "Choose a different route: " + reason
-            else:
-                reason = "Use goal_set complete with evidence for every criterion"
-            verdict, wait_directive = "continue", None
+        verdict, reason, wait_directive = autonomous_verdict(state, verdict, reason, wait_directive)
         state.last_verdict = verdict
         state.last_reason = reason
         if verdict == "continue" and not silent_automatic:
@@ -3704,17 +3707,8 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
         # BLOCKED is NOT done: pause for missing user input, an external prerequisite, or
         # an impossible goal. A recoverable dependency must never be called unachievable.
         if verdict == "blocked":
-            # Only a real irreversible-constraint breach or a goal with nothing left to try
-            # pauses. Every other BLOCKED (approval, decision, credentials, an answer) is a
-            # wait on the user's next message: the goal stays active and no /goal resume chore.
-            needs_user = bool(_BLOCKED_ON_USER_RE.search(reason or "")) and not _BLOCKED_PAUSE_RE.search(reason or "")
-            if needs_user:
-                return self._apply_wait_directive({"user_message": True}, reason)
-            return self._pause_decision(
-                f"{_BLOCKED_PAUSE_PREFIX}{reason}", "blocked", reason,
-                f"⏸ Goal blocked — paused: {reason} If input is needed, supply it to continue; "
-                "use /goal set to re-scope or /goal resume to override this block (counts as your approval of it).",
-            )
+            from hermes_cli.goals_evaluation import blocked_goal_decision
+            return blocked_goal_decision(self, reason)
 
         if verdict == "done":
             state.status = "done"

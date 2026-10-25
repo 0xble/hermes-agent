@@ -126,3 +126,80 @@ def test_legacy_blocks_and_user_waits_migrate_but_default_off_does_not(home):
     goals.save_goal("autonomy", mgr.state)
     assert goals.load_goal("autonomy").status == "paused"
     assert not mgr.replace(reason="unapproved", goal="other")["ok"]
+
+
+@pytest.mark.parametrize("action", ["revise", "replace"])
+def test_current_removal_quote_authorizes_only_its_named_item(home, action):
+    _, db = home
+    mgr = manager()
+    quote = "Remove 'Never restart the gateway'."
+    db.append_message("autonomy", "user", quote)
+    result = getattr(mgr, action)(reason="user changed the limit", goal="Ship by another route",
+                                  contract={"constraints": ""}, user_quote=quote)
+    assert result["ok"], result
+    assert goals.load_goal("autonomy").contract.constraints == ""
+    assert goals.load_goal("autonomy").contract.verification == "tests pass; release readback matches"
+
+
+@pytest.mark.parametrize("scenario", ["budget", "gate", "user_wait", "done"])
+def test_automatic_stops_leave_active_timed_wakes(home, monkeypatch, scenario):
+    root, _ = home
+    mgr = manager()
+    verdict, wait = ("wait", {"user_message": True}) if scenario == "user_wait" else ("done", None)
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: (verdict, "needs approval", False, wait, False))
+    if scenario == "budget":
+        mgr.state.turns_used = mgr.state.max_turns
+        mgr._save()
+    if scenario == "gate":
+        import shlex
+        import sys
+        monkeypatch.setattr(goals, "_gate_workspace", lambda: (str(root), None))
+        mgr.add_gate(f"{shlex.quote(sys.executable)} -c 'raise SystemExit(1)'", max_retries=1)
+    for _ in range(3):
+        result = mgr.evaluate_after_turn("continue", user_initiated=True)
+        assert result["status"] == "active"
+        assert result["verdict"] != "blocked"
+        assert not mgr.state.waiting_on_user_message
+    if scenario == "budget":
+        assert mgr.state.turns_used == mgr.state.max_turns
+    assert result["should_continue"] or mgr.state.waiting_until > time.time()
+    if scenario == "gate":
+        assert not mgr.complete(reason="escape failed gate", evidence={})["ok"]
+
+
+def test_live_external_barrier_is_rechecked_on_a_timer(home, monkeypatch):
+    mgr = manager()
+    monkeypatch.setattr(goals, "_session_waiting", lambda _sid: True)
+    mgr.wait_on_session("still-running", reason="external work")
+    assert mgr.state.waiting_until > time.time()
+    mgr.state.waiting_until = time.time() - 1
+    mgr._save()
+    assert mgr.lifted_barrier_prompt() is not None
+    assert mgr.clear_lifted_wait(mgr.state.waiting_since)
+    assert not goals.load_goal("autonomy").waiting_on_session
+
+
+def test_explicit_pauses_and_approval_entry_respect_autonomy(home):
+    mgr = manager()
+    mgr.pause()
+    assert goals.load_goal("autonomy").status == "paused"
+    result = session_controls.request_control("goal", "resume", "autonomy",
+                                             requester_sid="autonomy", reason="continue")
+    assert result["ok"] and result["status"] == "applied"
+    assert goals.load_goal("autonomy").status == "active"
+
+
+def test_autonomy_reads_the_owning_profile_for_each_activity(home):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.goals_autonomy import goal_autonomy_enabled
+
+    root, _ = home
+    secondary = root / "secondary"
+    secondary.mkdir()
+    secondary.joinpath("config.yaml").write_text("goals:\n  autonomy: false\n", encoding="utf-8")
+    for selected, enabled in ((root, True), (secondary, False), (root, True)):
+        token = set_hermes_home_override(str(selected))
+        try:
+            assert goal_autonomy_enabled() is enabled
+        finally:
+            reset_hermes_home_override(token)
