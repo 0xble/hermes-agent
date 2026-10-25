@@ -53,6 +53,13 @@ What you'll see:
 4. **Loop fires if needed** — if `continue`, you'll see `↻ Continuing toward goal (1/20): <judge's reason>` and Hermes takes the next step automatically.
 5. **Terminates** — eventually you see either `✓ Goal achieved: <reason>` or `⏸ Goal paused — N/20 turns used`.
 
+## Quiet Goal Notices
+
+Set `goals.notices: false` in `config.yaml` to hide automatic goal status and
+continuation notices in CLI, TUI and messaging surfaces. Evaluation, autonomous
+continuation, explicit goal-control replies and loop outcomes remain enabled.
+The default is `true`. This presentation switch is independent of `goals.autonomy`.
+
 ## Commands
 
 | Command | What it does |
