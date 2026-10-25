@@ -298,9 +298,12 @@ def _repair_missing_ws_orphan_reaps() -> None:
     # Reuse that cleanup (including surviving viewers), never revoke a fence from
     # a stale liveness snapshot.
     with _sessions_lock:
-        closed_transports = [session.get("transport") for session in _sessions.values()
-                             if session.get("transport") is not _detached_ws_transport
-                             and _transport_is_dead(session.get("transport"))]
+        closed_transports = [
+            peer for session in _sessions.values()
+            for peer in (session["transport"].transports()
+                         if isinstance(session.get("transport"), FanoutTransport)
+                         else [session.get("transport")])
+            if peer is not _detached_ws_transport and _transport_is_dead(peer)]
     for transport in closed_transports:
         _close_sessions_for_transport(transport)
     with _sessions_lock:
@@ -523,6 +526,22 @@ def _schedule_startup_orphan_sweep() -> None:
         _startup_orphan_sweep_ran = True
     _reaper_daemon_timer(
         _WS_ORPHAN_REAP_GRACE_S, _sweep_orphaned_session_rows, "startup orphan session sweep failed", level="warning")
+
+
+def _shutdown_live_sessions() -> None:
+    # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
+    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
+        with contextlib.suppress(Exception):
+            step()
+    with _sessions_lock:
+        sessions = list(_sessions.items())
+    for sid, _session in sessions:
+        _close_session_by_id(sid, end_reason="tui_shutdown")
+    # Session events now use daemon mailbox writers even on stdio. A graceful
+    # exit must wait for final admitted frames rather than lose them at exit.
+    for _sid, session in sessions:
+        if isinstance(publisher := session.get("transport"), FanoutTransport):
+            publisher.flush()
 
 
 def register(server) -> None:
