@@ -24,7 +24,9 @@ For the shared `tools.interrupt.INTERRUPT_REASON_GATEWAY_SHUTDOWN` cause or an
 active foreground cleanup fence, local POSIX teardown omits descendant discovery.
 `execute()` binds its deadline wait worker's `acting_for_tid` to the submitting
 tool thread and resets it after the wait, so the kill decision sees the same
-shutdown cause as `_wait_for_process`'s parent-thread interrupt check. It retains
+shutdown cause as `_wait_for_process`'s parent-thread interrupt check. An
+inherited binding wins: the pre-exec guard's nested execute already acts for
+the tool thread, and rebinding it to the guard worker would hide `/stop`. It retains
 the existing bounded group TERM→KILL/reap sequence and both PGID fingerprint
 checks. Windows is unchanged.
 Normal timeout and `/stop` paths still snapshot before signalling and sweep
@@ -41,7 +43,8 @@ slow scans cannot delay a gateway interrupt or foreground cleanup. The real
 `execute()` → `run_bounded_sync` → `_wait_for_process` regression spawns a child,
 interrupts only the submitting tool thread, and requires returncode 130 without
 any `children()` call; it does not set worker interrupt context itself.
-Recycled group leaders must not be signalled before TERM or during
+A nested execute under an outer acting-for binding must still return 130 on
+`/stop` aimed at the tool thread. Recycled group leaders must not be signalled before TERM or during
 escalation; the caller's group is never signalled; normal cancellation retains
 identity-checked escapee sweeping. Run these with `test_pgid_starttime_drift.py`,
 `test_interrupt.py`, `test_local_interrupt_cleanup.py`, and

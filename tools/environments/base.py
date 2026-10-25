@@ -703,8 +703,9 @@ class BaseEnvironment(ABC):
             output = _new_output_collector(spawned, bounded_capture)
             output_holder.append(output)
             # The wait watches parent_tid, and its kill path must resolve that same
-            # thread's shutdown cause rather than treating it as ordinary /stop.
-            interrupt_token = acting_for_tid.set(parent_tid)
+            # thread's shutdown cause rather than treating it as ordinary /stop. Keep an
+            # outer binding: a pre-exec guard's nested execute acts for the tool thread.
+            interrupt_token = acting_for_tid.set(acting_for_tid.get() or parent_tid)
             try:
                 return self._wait_for_process(
                     spawned, timeout=effective_timeout, bounded_capture=bounded_capture,

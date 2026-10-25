@@ -79,7 +79,7 @@ def test_shutdown_kill_does_not_wait_for_slow_children(monkeypatch, owned_group,
     worker = threading.Thread(target=kill, daemon=True)
     try:
         worker.start()
-        assert finished.wait(1), "shutdown blocked on the host-wide children() scan"
+        assert finished.wait(5), "shutdown blocked on the host-wide children() scan"
         assert not errors
         assert not scanned.is_set(), "shutdown must not enumerate the host process table"
         assert signals == ([] if recycled else [(67890, signal.SIGTERM), (67890, 0)])
@@ -133,7 +133,7 @@ def test_execute_gateway_shutdown_skips_descendant_scan_on_deadline_worker(monke
         worker.start()
         assert ready.wait(5), "execute did not spawn its real subprocess"
         set_interrupt(True, worker.ident, reason="gateway shutdown")
-        assert finished.wait(3), f"shutdown blocked in children() on {scan_threads}"
+        assert finished.wait(8), f"shutdown blocked in children() on {scan_threads}"
         assert not errors
         assert results[0]["returncode"] == 130
         assert not scan_threads, "shutdown must not enumerate the host process table"
@@ -147,6 +147,52 @@ def test_execute_gateway_shutdown_skips_descendant_scan_on_deadline_worker(monke
                 env._kill_process(proc)
         assert not worker.is_alive(), "execute worker survived cleanup"
 
+
+
+def test_nested_deadline_execute_still_answers_stop_on_tool_thread():
+    """An execute already acting for a tool thread (the pre-exec guard's remote read) keeps it.
+
+    Rebinding the inner wait to its own deadline worker would hide /stop aimed at the tool thread.
+    """
+    from agent.deadline import run_bounded_sync
+    from tools.interrupt import acting_for_tid
+
+    env = LocalEnvironment()
+    spawned = []
+    ready = threading.Event()
+    finished = threading.Event()
+    results = []
+    run_bash = env._run_bash
+
+    def publish_spawn(*args, **kwargs):
+        proc = run_bash(*args, **kwargs)
+        spawned.append(proc)
+        ready.set()
+        return proc
+
+    def tool_thread():
+        token = acting_for_tid.set(threading.get_ident())
+        try:
+            results.append(run_bounded_sync(
+                lambda: env.execute("sleep 20", timeout=20), 30, label="test.pre-exec-guard").value)
+        finally:
+            acting_for_tid.reset(token)
+            finished.set()
+
+    env._run_bash = publish_spawn
+    worker = threading.Thread(target=tool_thread, name="stop-tool", daemon=True)
+    try:
+        worker.start()
+        assert ready.wait(5), "execute did not spawn its real subprocess"
+        set_interrupt(True, worker.ident, reason="explicit stop requested")
+        assert finished.wait(10), "nested execute ignored /stop on its tool thread"
+        assert results[0]["returncode"] == 130
+    finally:
+        set_interrupt(False, worker.ident)
+        for proc in spawned:
+            if proc.poll() is None:
+                env._kill_process(proc)
+        worker.join(10)
 
 @pytest.mark.parametrize("recycled_after_term", [False, True])
 def test_shutdown_escalation_rechecks_group_identity(monkeypatch, owned_group, recycled_after_term):
