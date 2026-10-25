@@ -729,6 +729,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- The successor extracted session creation into `tui_gateway/session_registry.py`,
+  which replaced main #779's facade factories at registration time. Port its
+  creation-time publisher into both extracted factories, so even a single-peer,
+  stdio or compute-host session retains one ordered mailbox through membership
+  changes and graceful final-event draining. Keep atomic prepare/admission,
+  burst batching, bounded overflow resume notices and physical flush unchanged.
+  Guards: unchanged session-event-publication, multi-client fanout, fanout burst
+  batching and gateway session-events-overflow suites.
+
 - The classic gateway goal proxy reuses the completion-history renderer added by
   autonomous goals. `/goal`, `/goal status` and `/goal show` remain local reads of
   mirrored gateway state, with no judge call or state write. Without the binding,
