@@ -876,3 +876,49 @@ def test_prune_keeps_scratch_local_aliases_on_a_declared_path(tmp_path):
     assert prune_scratch_dir(scratch) == 1
     assert (alias / "f").exists() and (hop / "link" / "g").exists()
     assert owner.exists() and target.exists() and data.exists() and not control.exists()
+
+
+def test_prune_keeps_an_alias_a_declared_path_climbs_out_of(tmp_path):
+    """``alias/../f`` resolves through the link first, so ``alias`` must survive with the data
+    even though the lexical form of the path never mentions where it lands."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, data, alias, control = (scratch / n for n in ("owner", "data", "alias", "control"))
+    for d in (owner, data / "sub", control):
+        d.mkdir(parents=True)
+    (data / "f").write_text("x", encoding="utf-8")
+    alias.symlink_to(data / "sub")
+    declared = Path(f"{alias}/../f")
+    _pin(owner, declared)
+    for d in (owner, data, alias, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert declared.exists() and owner.exists() and not control.exists()
+
+
+def test_prune_treats_a_dangling_declaration_link_as_unreadable(tmp_path):
+    """An ``input-pins.json`` link whose target is gone still declares something unknown, so
+    nothing idle is removed that pass."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, other = scratch / "owner", scratch / "other"
+    owner.mkdir()
+    other.mkdir()
+    (other / "f").write_text("x", encoding="utf-8")
+    (owner / "input-pins.json").symlink_to(tmp_path / "gone.json")
+    for d in (owner, other):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 0
+    assert owner.exists() and other.exists()
+
+
+def test_prune_log_escapes_control_characters_in_unreadable_declarations(tmp_path):
+    """A newline in an entry name cannot split or forge a prune-log record when its malformed
+    declaration is reported."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner = scratch / "own\nscratch prune: removed 'forged'"
+    owner.mkdir()
+    (owner / "input-pins.json").write_text("{not json", encoding="utf-8")
+    _age_tree(owner)
+    assert prune_scratch_dir(scratch) == 0
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert not any(line.startswith("scratch prune: removed") for line in log.splitlines())
+    assert "kept all 1 idle entries, unreadable retention declaration" in log

@@ -210,6 +210,10 @@ def _declared_inputs(entry: Path) -> list[str] | None:
     try:
         st = os.stat(pins)
     except (FileNotFoundError, NotADirectoryError):
+        # A dangling ``input-pins.json`` link is a declaration whose contents are gone, not an
+        # absent one: only a name that does not exist at all means "nothing declared".
+        if os.path.lexists(pins):
+            raise UnreadableRetention(f"{pins}: declaration target is missing") from None
         return None
     except OSError as exc:
         raise UnreadableRetention(f"{pins}: {exc}") from exc
@@ -233,7 +237,9 @@ def _entries_on_path(path: str, roots: tuple[str, ...]) -> set[str]:
     including every symlink hop, not only its canonical target: a scratch-local alias on the
     path must survive or the declared path stops resolving."""
     tops: set[str] = set()
-    pending = [os.path.abspath(path)]
+    # Join, never normpath: ``alias/../f`` must traverse ``alias`` before ``..`` applies, and
+    # ``abspath`` would drop it.
+    pending = [path if os.path.isabs(path) else os.path.join(os.getcwd(), path)]
     seen: set[str] = set()
     while pending and len(seen) < _SYMLINK_HOPS:
         candidate = pending.pop()
@@ -308,11 +314,12 @@ def _retention_filter(root: Path, skip_names: frozenset[str], doomed: list[Path]
         entries = [e for e in root.iterdir() if e.name not in skip_names]
         held = retained_entries(root, entries, doomed)
     except UnreadableRetention as exc:
-        audit.info("scratch prune: kept all %d idle entries, unreadable retention declaration: %s",
-                   len(doomed), exc)
+        audit.info("scratch prune: kept all %d idle entries, unreadable retention declaration: %r",
+                   len(doomed), str(exc))
         return []
     except OSError as exc:
-        audit.info("scratch prune: kept all %d idle entries, retention scan failed: %s", len(doomed), exc)
+        audit.info("scratch prune: kept all %d idle entries, retention scan failed: %r", len(doomed),
+                   str(exc))
         return []
     for entry in doomed:
         if entry.name in held:
