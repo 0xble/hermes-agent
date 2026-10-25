@@ -1459,10 +1459,14 @@ class SlackAdapter(BasePlatformAdapter):
             if template:
                 return template.format(file_label=file_label)
         message = str(exc)
-        if "Slack returned HTML instead of media" in message or "non-image data" in message:
+        if "Slack returned HTML instead of media" in message or (
+                "non-image data" in message and "<" in message.partition("starts with:")[2][:12]):
             return (
                 f"Slack attachment access failed for {file_label}: Slack returned an HTML/login or non-media response. "
                 "This usually means a scope, auth, or file-permission problem.")
+        if "non-image data" in message:
+            # Downloaded fine, but Hermes can't decode the format: not a Slack permission problem.
+            return f"Hermes downloaded {file_label} but couldn't read it as an image (unsupported format)."
         return None
 
     # Slash-command ephemeral helpers. response_url is valid 30 min; the much shorter TTL avoids
