@@ -53,6 +53,8 @@ Before the reader snapshot, briefly hold the existing process writer guard and c
 
 For a fresh attempt, seed the closure with repair groups, canonical and stored preimages of rows leaving the population, actual inserted rows and clones, and every remaining NULL-identity or NULL-order row. Query `idx_messages_display_identity` by session and `display_identity IN (...)`, with at most 500 identities per query. Validate each fetched row against the snapshot and recompute unseen or changed payloads. Expand through newly discovered canonical groups, their stored aliases, and foreign/colliding aliases until closed. Reuse the existing fold on selected rows in id order. No schema, index, identity-function or projection change is involved.
 
+Preimage seeding and stored-alias expansion are defence in depth, not the guarantee. The visibility trigger already recomputes order for a removed row's stored-identity peers, and any alias or NULL mismatch already puts its canonical key in `repair_keys`. Mutation testing on 2026-10-25 found no current scenario that depends on either step. Keep them so a later trigger or repair-key change cannot silently break the closure. The freshness guard also assumes each pooled reader's `BEGIN` opens a new snapshot, which holds while no caller returns a reader with an open statement.
+
 ### Fallback And Limits
 
 Unavailable or changed freshness signals select the existing planned whole-index fold. No WAL reader or no plan selects the full payload fold. Missing display indexes also fall back to the full payload fold. Non-compaction reconciliation keeps its existing generic/full behavior. Every transaction retry checks the original snapshot again and creates a new attempt-local selection. Rollback remains atomic.

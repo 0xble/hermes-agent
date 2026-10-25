@@ -80,7 +80,8 @@ def _fixture(db, seed):
             if choice in changes:
                 assignment, values = changes[choice]
                 conn.execute(f"UPDATE messages SET {assignment} WHERE id = ?", values)
-        # A removed oldest member has peers under both its own and a foreign alias.
+        # A removed oldest member has peers under both its own and a foreign alias. The visibility
+        # trigger and repair_keys cover it; preimage seeding is defence in depth.
         conn.execute("UPDATE messages SET active = 1, compacted = 0 WHERE id = ?", (ids[0],))
         conn.execute("UPDATE messages SET display_identity = ? WHERE id = ?", (bytes(32), ids[0]))
 
