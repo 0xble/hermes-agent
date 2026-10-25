@@ -63,6 +63,60 @@ def release_sha(source: Path) -> str:
     return result.stdout.strip()
 
 
+def merge_release_tree(source: Path, target: str, live: str) -> str:
+    """Compute candidate content without creating a synthetic commit or moving HEAD."""
+    from hermes_cli.update_custody import run_git
+
+    def run(args, *, check=True):
+        return run_git(["git"], args, cwd=source, check=check, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+
+    merged = run(["merge-tree", "--write-tree", target, live], check=False)
+    if merged.returncode != 0:
+        detail = (merged.stdout + merged.stderr).strip()
+        raise RuntimeError(f"candidate merge conflict: {detail}" if merged.returncode == 1 else detail)
+    return merged.stdout.splitlines()[0]
+
+
+def merge_release_commits(source: Path, target: str, live: str, *, existing: str | None = None,
+                          tree: str | None = None) -> str:
+    """Build a local-only release commit without moving the checkout or index."""
+    from hermes_cli.update_custody import run_git
+
+    def run(args):
+        return run_git(["git"], args, cwd=source, check=True, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+
+    tree = tree or merge_release_tree(source, target, live)
+    if tree == run(["rev-parse", f"{target}^{{tree}}"]).stdout.strip():
+        return target
+    if existing and tree == run(["rev-parse", f"{existing}^{{tree}}"]).stdout.strip():
+        return existing
+    commit = run(["-c", "user.name=Hermes Update", "-c", "user.email=hermes-update@localhost",
+                  "commit-tree", tree, "-p", target, "-p", live,
+                  "-m", f"Carry installed candidate {live} into update {target}"]).stdout.strip()
+    # Archives work from local objects, but a live synthetic commit must survive
+    # garbage collection even though it belongs to no published branch.
+    run(["update-ref", f"refs/hermes/carry-forward/{commit}", commit])
+    return commit
+
+
+def prune_carry_forward_refs(source: Path, paths: ReleasePaths) -> None:
+    """Retain synthetic objects only for the active and rollback releases."""
+    from hermes_cli.update_custody import run_git
+
+    def run(args):
+        return run_git(["git"], args, cwd=source, check=True, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+
+    keep = {release.name for pointer in (paths.current, paths.previous)
+            if (release := read_pointer(pointer)) is not None}
+    refs = run(["for-each-ref", "--format=%(refname)", "refs/hermes/carry-forward/"])
+    for ref in refs.stdout.splitlines():
+        if ref.rsplit("/", 1)[-1] not in keep:
+            run(["update-ref", "-d", ref])
+
+
 def _content_digest(release: Path) -> str:
     digest = hashlib.sha256()
     for name in ("pyproject.toml", "uv.lock"):
@@ -500,7 +554,7 @@ def _build_candidate_web(staging: Path) -> None:
 
 def stage_release(source: Path, home: Path, *, sha: str | None = None,
                   uv: str = "uv", plugin_dir: Path | None = None,
-                  source_python: Path | None = None) -> tuple[Path, str]:
+                  source_python: Path | None = None, branch: str | None = None) -> tuple[Path, str]:
     paths = ReleasePaths.for_home(home)
     sha = sha or release_sha(source)
     target = paths.release(sha)
@@ -536,6 +590,8 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
                             display_version=identity.display_version if identity else None,
                             distance=identity.distance if identity else None)
         stamp["branch"] = None
+        if branch:
+            stamp["sourceBranch"] = branch
         stamp["commitDate"] = None
         if identity:
             stamp["commitDate"] = identity.commit_date
@@ -605,6 +661,12 @@ def _write_txn(paths: ReleasePaths, record: dict[str, Any]) -> None:
 
 
 def _finish_txn(paths: ReleasePaths, record: dict[str, Any]) -> None:
+    # Prune after pointer verification, while the transaction can still recover.
+    journal = paths.home / "release-layout.json"
+    if journal.is_file():
+        source = Path(json.loads(journal.read_text(encoding="utf-8-sig"))["source"])
+        if (source / ".git").exists():
+            prune_carry_forward_refs(source, paths)
     # Keep a durable completion identity: after the pending record's final unlink,
     # an immediate CLI --rollback retry must not interpret the newly exchanged
     # previous pointer as a fresh request to roll back the rollback.
