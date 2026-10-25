@@ -29,7 +29,7 @@ from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.telegram_reconnect import TelegramReconnectMixin
-from plugins.platforms.telegram.daily_quota import DEFAULT_SOFT_CEILING, DailyQuota
+from plugins.platforms.telegram.daily_quota import DailyQuota, quota_from_platform_extra
 from plugins.platforms.telegram.session_control_cards import session_control_outcome
 from plugins.platforms.telegram.chat_budget import (
     EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
@@ -7087,20 +7087,13 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         return limiter
 
     def _daily_quota(self) -> DailyQuota:
-        """Per-chat daily volume ledger; ``daily_message_soft_ceiling`` in the platform extra sets the
-        budget (0 disables shedding, counting continues)."""
+        """Per-chat daily volume ledger; ``daily_message_soft_ceiling`` and ``daily_call_soft_ceiling``
+        in the platform extra set the budgets (0 disables that budget's shedding, counting continues)."""
         quota = self.__dict__.get("_telegram_daily_quota")
         if quota is None:
-            extra = getattr(getattr(self, "config", None), "extra", None) or {}
-            raw = extra.get("daily_message_soft_ceiling", DEFAULT_SOFT_CEILING) if isinstance(extra, dict) else None
-            try:
-                ceiling = int(raw) if raw is not None else DEFAULT_SOFT_CEILING
-            except (TypeError, ValueError):
-                logger.warning("[%s] Invalid daily_message_soft_ceiling %r; using %d", self.name, raw,
-                               DEFAULT_SOFT_CEILING)
-                ceiling = DEFAULT_SOFT_CEILING
-            quota = self.__dict__["_telegram_daily_quota"] = DailyQuota(
-                soft_ceiling=ceiling, profile_dir=getattr(self, "_update_receipt_dir", None))
+            quota = self.__dict__["_telegram_daily_quota"] = quota_from_platform_extra(
+                getattr(getattr(self, "config", None), "extra", None),
+                profile_dir=getattr(self, "_update_receipt_dir", None), label=self.name)
         return quota
 
     def _daily_sheds(self, chat_id: Any, kind: Optional[str]) -> bool:
