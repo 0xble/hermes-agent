@@ -314,7 +314,7 @@ def _build_child_agent(
                         (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
                         if child_progress_cb else None
                     ),
-                    session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
+                    session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides or {},
                     session_id=getattr(child_session_db, "reserved_session_id", None),
                     tool_progress_callback=child_progress_cb,
                     iteration_budget=None,  # fresh budget per subagent

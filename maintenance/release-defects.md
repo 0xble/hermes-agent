@@ -754,6 +754,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Guards: display-fold off-lock and carrier suites, managed-store surface parity with Unicode
   collision and cross-session refusal coverage, usage-limit delivery, runtime bootstrap, ACP
   cancellation, provider fork contracts and retry/recovery admission tests, plus exact-head CI.
+- Delegation child construction again supplies an empty request-override mapping, as on fork
+  parent `9ac6acc2`, instead of `None`. Route-field fixtures explicitly opt into tier inheritance
+  and set the parent's effective mode, preserving every route and wire-leak assertion.
+  Guards: `test_delegation_route_fields.py` (15 passed) and `test_delegate_by_parent.py` (11 passed).
 - Retire once the next release sync no longer carries these merge points.
 
 ## v0.21.6 merge integration

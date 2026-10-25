@@ -186,11 +186,14 @@ def test_every_backend_routed_result_names_its_backend_and_the_default_keeps_its
     assert "route" not in entry_of(plain)
 
 
-def test_an_inherited_fast_tier_is_reported_as_what_ran():
-    """An empty backend route inherits the parent's request settings, fast tier included: the report says fast."""
+def test_an_inherited_fast_tier_is_reported_as_what_ran(monkeypatch):
+    """Opted-in Fast inheritance reports the effective parent mode, not transient wire fields."""
     from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
 
-    _, _, (child,) = _spawn([{"label": "inherit"}], parent=_parent(request_overrides={"service_tier": "priority"}))
+    monkeypatch.setattr("tools.delegate_tool_config._cfg", lambda: {"inherit_service_tier": True})
+    parent = _parent(request_overrides={"service_tier": "priority"})
+    parent.service_tier = "priority"
+    _, _, (child,) = _spawn([{"label": "inherit"}], parent=parent)
     entry = _build_result_entry(child, {"final_response": "ok", "completed": True}, 0, 1.0,
                                 _SchemaOutcome(None, None, [], 0))
     assert entry["route"]["service_tier"] == "fast"
