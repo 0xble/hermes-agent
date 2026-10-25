@@ -61,6 +61,7 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_slash_lane import SlashHandoffLanes
     from .adapter_slash_payload import slash_command_text, slash_thread_id
     from .adapter_native_stop import handle_agent_session_stopped
+    from .thread_cleanup import process_changed_message
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
@@ -68,6 +69,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
     from adapter_native_stop import handle_agent_session_stopped  # type: ignore
+    from thread_cleanup import process_changed_message
 
 
 logger = logging.getLogger(__name__)
@@ -4427,118 +4429,6 @@ class SlackAdapter(BasePlatformAdapter):
                 return True
         return bool(msg_user and self._bot_user_id and msg_user == self._bot_user_id)
 
-    async def _cascade_delete_tombstoned_thread(self, event: dict, payload: Optional[dict]) -> None:
-        """Clear replies only for a deleted root in the configured owner's home IM.
-
-        Slack leaves a tombstone while replies exist. Parent authorship is irrelevant:
-        the owner can also delete a bot-authored root from Slack's client.
-        """
-        message = event["message"]
-        root_ts = str(message.get("ts") or "")
-        channel_id = str(event.get("channel") or "")
-        team_id = self._event_team_id(event, payload)
-        home = self.config.home_channel
-        if (
-            not home or not home.user_id or not home.scope_id
-            or event.get("channel_type") != "im" or not channel_id.startswith("D")
-            or channel_id != home.chat_id or team_id != home.scope_id
-            or not root_ts or message.get("thread_ts") != root_ts
-            or team_id not in self._team_clients or self._is_ignored_channel(channel_id)
-        ):
-            return
-        # Deleting replies changes the tombstone again. Claim the ROOT, not the event ts,
-        # before any await, so concurrent updates/redelivery cannot repeat deletes/notices.
-        if self._dedup.is_duplicate(self._workspace_event_id(team_id, f"cascade:{channel_id}:{root_ts}")):
-            return
-        bot_client = self._team_clients[team_id]
-        failures = []
-        operation = "check owner DM"
-        try:
-            info = _slack_response_payload(await bot_client.conversations_info(channel=channel_id))
-            if not info.get("ok"):
-                failures.append(f"check owner DM: {info.get('error') or 'unknown_error'}")
-                return
-            channel = info.get("channel") or {}
-            if not channel.get("is_im") or channel.get("user") != home.user_id:
-                return
-            operation = "read thread"
-            replies = []
-            cursor = ""
-            while True:
-                page = _slack_response_payload(await bot_client.conversations_replies(
-                    channel=channel_id, ts=root_ts, limit=200, cursor=cursor))
-                if not page.get("ok"):
-                    failures.append(f"read thread: {page.get('error') or 'unknown_error'}")
-                    break
-                messages = page.get("messages") or []
-                if not replies and not cursor and not any(
-                    m.get("ts") == root_ts and m.get("subtype") == "tombstone"
-                    for m in messages
-                ):
-                    return
-                replies.extend(m for m in messages if m.get("ts") != root_ts)
-                next_cursor = str((page.get("response_metadata") or {}).get("next_cursor") or "")
-                if not next_cursor:
-                    break
-                if next_cursor == cursor:
-                    failures.append("read thread: repeated_cursor")
-                    break
-                cursor = next_cursor
-            # Finish pagination before changing the result set. A failed read never deletes
-            # an incomplete snapshot, and a stale event for a live root deletes nothing.
-            if not failures and replies:
-                operation = "authenticate owner token"
-                token = _get_scoped_secret("SLACK_USER_TOKEN")
-                if not token:
-                    failures.append("SLACK_USER_TOKEN is not configured")
-                else:
-                    user_client = self._new_web_client(token, self._proxy_url)
-                    user_client.retry_handlers = []
-                    auth = _slack_response_payload(await user_client.auth_test())
-                    if (
-                        not auth.get("ok") or auth.get("team_id") != team_id
-                        or auth.get("user_id") != home.user_id or auth.get("bot_id")
-                    ):
-                        failures.append("SLACK_USER_TOKEN must belong to the owner in this workspace")
-                    else:
-                        bot_user_id = self._team_bot_user_ids[team_id]
-                        for reply in replies:
-                            ts = str(reply.get("ts") or "")
-                            if not ts or reply.get("thread_ts") != root_ts:
-                                failures.append(f"reply {ts or 'unknown'}: not in deleted thread")
-                                continue
-                            author = reply.get("user")
-                            if author not in (bot_user_id, home.user_id):
-                                failures.append(f"reply {ts}: unsupported author")
-                                continue
-                            client = bot_client if author == bot_user_id else user_client
-                            try:
-                                result = _slack_response_payload(await client.chat_delete(channel=channel_id, ts=ts))
-                                if not result.get("ok"):
-                                    failures.append(f"reply {ts}: {result.get('error') or 'unknown_error'}")
-                            except Exception as exc:
-                                error = _slack_response_payload(getattr(exc, "response", None)).get("error")
-                                failures.append(f"reply {ts}: {error or type(exc).__name__}")
-        except Exception as exc:
-            # Exception strings can include request data. Report only Slack's error code
-            # (or exception type), never tokens, message bodies, or raw SDK diagnostics.
-            error = _slack_response_payload(getattr(exc, "response", None)).get("error")
-            failures.append(f"{operation}: {error or type(exc).__name__}")
-        finally:
-            if failures:
-                details = list(dict.fromkeys(failures))
-                summary = "; ".join(details[:3])
-                if len(details) > 3:
-                    summary += f"; {len(details) - 3} more failures"
-                try:
-                    await bot_client.chat_postMessage(
-                        channel=channel_id,
-                        text=f"Couldn't clear deleted thread {root_ts}: {summary}",
-                        unfurl_links=False, unfurl_media=False,
-                    )
-                except Exception as exc:
-                    logger.warning("[Slack] Cascade-delete failure notice could not be sent (%s)", type(exc).__name__)
-
     async def _prefilter_inbound(
         self, event: dict, payload: Optional[dict]) -> Optional[tuple[dict, str, str]]:
         """Normalize edits, then drop replays / ignored channels / bot posts / deletions.
@@ -4546,13 +4436,10 @@ class SlackAdapter(BasePlatformAdapter):
         from .message_changes import log_message_ingress
         log_message_ingress(event, payload)
         if event.get("subtype") == "message_changed":
-            changed = event.get("message")
-            if isinstance(changed, dict) and changed.get("subtype") == "tombstone":
-                await self._cascade_delete_tombstoned_thread(event, payload)
+            normalized_event = await process_changed_message(self, event, payload)
+            if normalized_event is None:
                 return None
-            event = self._normalize_changed_message(event)
-            if event is None:
-                return None
+            event = normalized_event
         # Socket Mode redelivers after reconnects. Scope by workspace: ts is only unique per team.
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777) Scope the dedup id by
         # workspace: Slack event ts values are only unique within one workspace, so two teams' events with
