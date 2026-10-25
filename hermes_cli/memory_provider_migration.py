@@ -159,9 +159,10 @@ def _install_pending(home: Path, name: str, *, install: Callable[[str], dict],
     except Exception as exc:  # network, uv, kill list — report, do not raise
         result = {"ok": False, "error": str(exc)}
     if result.get("ok"):
-        say(f"  ✓ Memory provider '{name}' moved out of core — installed its plugin from the catalog "
+        from gateway.notice_style import ContextNotice
+        say(ContextNotice(f"  ✓ Memory provider '{name}' moved out of core — installed its plugin from the catalog "
             f"(memory.provider and your stored memories are unchanged; check its settings with "
-            f"`hermes memory status`).")
+            f"`hermes memory status`)."))
         return True
     error = str(result.get("error") or "unknown error").rstrip(". ")
     say(f"  ⚠ Memory provider '{name}' moved out of core and could not be installed automatically: "
