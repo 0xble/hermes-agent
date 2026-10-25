@@ -19,8 +19,6 @@ class GoalStatusMixin:
         sub = f", {len(subgoal_items)} subgoal{'s' if len(subgoal_items) != 1 else ''}" if subgoal_items else ""
         con = ", contract" if self.has_contract() else ""
         gat = f", {len(s.gates)} gate{'s' if len(s.gates) != 1 else ''}" if s.gates else ""
-        history = self.render_completion_history()
-        gat += f"\n{history}" if history else ""
         meta = f"{turns}{sub}{con}{gat}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):

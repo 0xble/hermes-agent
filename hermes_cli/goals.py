@@ -1171,8 +1171,9 @@ class GoalState:
         """Index of the latest user-authorized replacement revision, else -1."""
         return max(
             (i for i, revision in enumerate(self.revisions)
-             if revision.get("kind") == "replace" and revision.get("actor") == "user"
-             and revision.get("authority") in {"quote", "button", "session", "explicit_command"}),
+             if (revision.get("kind") == "set" and revision.get("authority") == "autonomy")
+             or (revision.get("kind") == "replace" and revision.get("actor") == "user"
+                 and revision.get("authority") in {"quote", "button", "session", "explicit_command"})),
             default=-1,
         )
 

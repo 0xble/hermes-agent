@@ -203,3 +203,16 @@ def test_autonomy_reads_the_owning_profile_for_each_activity(home):
             assert goal_autonomy_enabled() is enabled
         finally:
             reset_hermes_home_override(token)
+
+
+def test_prompt_generation_retains_unreachable_shipped_wordings(home, monkeypatch):
+    from scripts.dev import snapshot_goal_prompt_history as generator
+
+    root, _ = home
+    registry = root / "registry.py"
+    shipped = {"formatter": "plain", "template": "old shipped prompt {goal}", "source_commits": ("retired",)}
+    registry.write_text("GOAL_PROMPT_REGISTRY: tuple = " + repr((shipped,)), encoding="utf-8")
+    monkeypatch.setattr(generator, "OUTPUT", registry)
+    monkeypatch.setattr(generator, "SOURCE_FILES", ())
+    monkeypatch.setattr(generator, "_commits", lambda: [])
+    assert generator._snapshot()["plain"][shipped["template"]] == ["retired"]
