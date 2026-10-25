@@ -758,6 +758,14 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   parent `9ac6acc2`, instead of `None`. Route-field fixtures explicitly opt into tier inheritance
   and set the parent's effective mode, preserving every route and wire-leak assertion.
   Guards: `test_delegation_route_fields.py` (15 passed) and `test_delegate_by_parent.py` (11 passed).
+- Restore the fork's post-extraction inbound bindings: canonical `/learn` and `/plan` commands
+  enter durable admission, queued command turns are not enqueued twice, and `/stop`/`/new`
+  fence uncommitted arrivals while retaining paused unknown-turn followers. Turn preparation
+  uses `session_opening_pending`, binds the event's turn origin, preserves FIFO lease waits,
+  and defers behind detached compression ownership. The recovered-topic fixture patches the
+  renamed lobby helper, with all opening-turn assertions unchanged.
+  Guards: attended opening (12 passed), messaging slash FIFO (22), native arrival order (10),
+  steer overwrite (2), busy anchors (13), and turn leases (12), via the canonical runner.
 - Retire once the next release sync no longer carries these merge points.
 
 ## v0.21.6 merge integration

@@ -1451,7 +1451,6 @@ class GatewayBusySessionMixin:
             queued_event = apply_agent_origin_reply_expectation(queued_event)
             if await self._queue_command_turn(quick_key, event, queued_event, adapter, t("gateway.queue.queued")):
                 return None
-            self._enqueue_fifo(quick_key, queued_event, adapter)
             if is_agent_origin_text(queued_event.text) and queued_event.reply_expected is False:
                 return None
         depth = self._queue_depth(quick_key, adapter=adapter)
@@ -1480,7 +1479,6 @@ class GatewayBusySessionMixin:
                 queued_event = apply_agent_origin_reply_expectation(queued_event)
                 if await self._queue_command_turn(quick_key, event, queued_event, adapter, reply):
                     return None
-                self._enqueue_fifo(quick_key, queued_event, adapter)
                 if is_agent_origin_text(queued_event.text) and queued_event.reply_expected is False:
                     return None
             return reply

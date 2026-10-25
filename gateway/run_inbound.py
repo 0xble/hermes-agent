@@ -134,6 +134,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         authority = active_authority(self)
         sid = authority.logical_owner(self.session_store.peek_session_id(_quick_key)) if authority else None
         if not sid or sid not in authority.sessions:
+            if authority is not None:
+                # The chat's first input, and a command's turn, not committed yet never commit.
+                authority.fence_route(_quick_key)
             return
         from gateway.session_contract import Principal, SessionRef
         from hermes_state_runtime import RuntimeStoreError, list_session_admissions
@@ -141,9 +144,18 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         actor = Principal('messaging-control', authority.profile_id,
                           frozenset({'session:submit', 'session:control'}), 'busy-command')
         rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid)
+        # A FIFO paused on a lost (``unknown``) turn is the operator's to resume: its pause notice
+        # promised the queued followers stay saved, so a /new from the chat leaves them queued.
         paused = any(row['status'] == 'unknown' for row in rows)
+        if not paused:
+            # Input (and a command's turn) that arrived before this and is not committed yet never
+            # commits after it; one that committed before the fence is in the second listing and
+            # cancelled below. A paused FIFO keeps both, like its queued followers.
+            authority.fence_route(_quick_key)
+            rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid)
         for row in [] if paused else rows:
             if row['status'] == 'queued' and row['principal_id'].startswith('messaging:'):
+                # Claimed meanwhile (stale_generation): it runs as main's post-claim race does.
                 with suppress(RuntimeStoreError):
                     await authority.cancel_queued(actor, ref, row['admission_id'])
         handle = authority._handle(ref)
@@ -1618,7 +1630,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             )
         if not _handled and canonical in {"learn", "plan"}:
             # Resolution may rewrite a command; only its canonical handler builds the prompt.
-            return await _loop_command_fallthrough()
+            if not await _loop_command_current():
+                return True, None
+            return await self._admit_command_turn(event, source, _quick_key, stop_epoch)
         if not _handled:
             if not await _loop_command_current():
                 return True, None

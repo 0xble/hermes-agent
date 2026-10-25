@@ -393,14 +393,12 @@ class GatewayTurnPrepareMixin:
             from gateway.run import _load_gateway_config
             from gateway.attended_model import parse_attended_config
             attended_enabled = parse_attended_config(_load_gateway_config()).enabled
-        attended_new_session = attended_enabled and getattr(
+        attended_new_session = getattr(
             self._session_state(session_key).conversation, "attended_new_session", False,
         )
-        _is_new_session = (
-            (attended_enabled and attended_new_session)
-            or session_entry.created_at == session_entry.updated_at
-            or _was_auto_reset
-            or _is_fresh_reset
+        from gateway.session_state import session_opening_pending
+        _is_new_session = _was_auto_reset or session_opening_pending(
+            session_entry, attended_new_session=attended_enabled and attended_new_session,
         )
         # Consume is_fresh_reset so it doesn't leak onto later messages in the same session.
         if _is_fresh_reset:
@@ -477,12 +475,15 @@ class GatewayTurnPrepareMixin:
         except Exception as e:
             logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens):
+    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens, event=None):
         """Serialize [load history → run → flush] per resolved SESSION_ID so another routing key on
         the same session waits for the prior flush. Fail-closed on timeout (outer dispatch returns
-        a resend notice). Released in _handle_message's finally, granted per (routing key, run
-        generation) so a stale unwind can't release a newer turn's."""
+        a resend notice for callers without an inbound event). Inbound messages retain their FIFO
+        waiter beyond the deadline, backed by the recovery spool. Released in _handle_message's
+        finally, granted per (routing key, run generation) so a stale unwind can't
+        release a newer turn's."""
         from gateway.run import _float_env
+        from gateway.run_turn_lease_wait import lease_wait_max_seconds, lease_wait_notice, preserve_lease_wait_async
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is None:
             return
@@ -490,9 +491,14 @@ class GatewayTurnPrepareMixin:
             _lease_token = await _lease_registry.acquire(
                 session_entry.session_id, owner_key=_quick_key, generation=run_generation,
                 timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
+                max_wait=lease_wait_max_seconds(),
+                on_wait=(lambda: lease_wait_notice(self, _quick_key, event)) if event is not None else None,
+                on_timeout=(lambda: preserve_lease_wait_async(
+                    self, _quick_key, session_entry.session_id, event,
+                )) if event is not None else None,
             )
-        except TurnLeaseTimeoutError:
-            # The cleanup finally starts later; restore the tokens here or this exit leaks identity.
+        except BaseException:
+            # The cleanup finally starts later; cancellation and spool failures restore identity too.
             self._clear_session_env(_session_env_tokens)
             raise
         if _lease_token is not None:
@@ -616,6 +622,9 @@ class GatewayTurnPrepareMixin:
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        from gateway.session_context import set_turn_origin
+        from gateway.platforms.event import turn_origin_for_event
+        set_turn_origin(turn_origin_for_event(event))
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
         from gateway.response_filters import display_kind_for_event
         persist_user_display_kind = display_kind_for_event(event)
@@ -653,7 +662,7 @@ class GatewayTurnPrepareMixin:
         if _is_new_session and _auto:
             self._hmwa_auto_load_skills(event, _auto, _quick_key, session_key)
 
-        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens)
+        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens, event)
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
@@ -670,6 +679,11 @@ class GatewayTurnPrepareMixin:
             self._clear_session_env(_session_env_tokens)
             from gateway.session_results import record_unexecuted_failure
             return record_unexecuted_failure(t("gateway.errors.history_unavailable")), _session_env_tokens
+
+        # A detached hygiene worker still owns the old transcript until its compression lock clears.
+        if await self._defer_compression_locked_event(session_key, event, prepend=True):
+            self._clear_session_env(_session_env_tokens)
+            return None, _session_env_tokens
 
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, internal=event.internal)
 
