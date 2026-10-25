@@ -210,7 +210,7 @@ def _message_grants_authority(source: str) -> bool:
     return not any(w in _NEGATION_TOKENS or w in _QUALIFIER_TOKENS for w in words)
 
 
-def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
+def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> tuple[str, str] | str:
     """Bind a verbatim quote to current typed input before applying action-specific authority."""
     normalized = _normalize(quote)
     if len(normalized) < _REVISION_QUOTE_MIN_CHARS:

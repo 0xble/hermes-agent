@@ -226,7 +226,7 @@ def test_prompt_generation_retains_unreachable_shipped_wordings(home, monkeypatc
     registry.write_text("\ufeffGOAL_PROMPT_REGISTRY: tuple = " + repr((shipped,)), encoding="utf-8")
     monkeypatch.setattr(generator, "OUTPUT", registry)
     monkeypatch.setattr(generator, "SOURCE_FILES", ())
-    monkeypatch.setattr(generator, "_commits", lambda: [])
+    monkeypatch.setattr(generator, "_commits", list)
     assert generator._snapshot()["plain"][shipped["template"]] == ["retired"]
 
 
