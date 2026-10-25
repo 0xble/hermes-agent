@@ -170,6 +170,18 @@ def autonomous_verdict(state, verdict, reason, wait_directive):
 
 
 class GoalAutonomyMixin:
+    def _gate_failure_prompt(self, gate, exit_code, output):
+        from hermes_cli.goals import CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE
+
+        if not goal_autonomy_enabled():
+            return CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
+                goal=self.state.goal, command=gate.command, exit_code=exit_code, attempt=gate.attempts,
+                max_retries=gate.max_retries, output=output or "(no output)")
+        block = (self.state.contract.render_block() + f"\nQuality gate failed: $ {gate.command}\n"
+                 f"Exit code: {exit_code}\n{output or '(no output)'}\nRepair this gate without weakening it.")
+        return AUTONOMY_CONTINUATION_TEMPLATE.format(
+            goal=self.state.goal, contract_block=block, subgoals_block=self.state.render_subgoals_block())
+
     @staticmethod
     def _history_for_next_goal(previous):
         if not goal_autonomy_enabled() or previous is None or previous.status != "done":

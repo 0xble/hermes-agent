@@ -160,6 +160,7 @@ def test_automatic_stops_leave_active_timed_wakes(home, monkeypatch, scenario):
         assert result["status"] == "active"
         assert result["verdict"] != "blocked"
         assert not mgr.state.waiting_on_user_message
+        assert "say so clearly and stop" not in (result.get("continuation_prompt") or "")
     if scenario == "budget":
         assert mgr.state.turns_used == mgr.state.max_turns
     assert result["should_continue"] or mgr.state.waiting_until > time.time()

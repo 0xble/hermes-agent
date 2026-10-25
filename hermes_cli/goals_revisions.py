@@ -181,10 +181,10 @@ class GoalRevisionsMixin:
                user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
         """Apply an additive revision through the durable snapshot/CAS boundary.
 
-        Objective changes and removed or reworded requirements are destructive and fail closed;
-        explicit user commands own them. ``user_quote``/``user_messages`` are accepted only for
-        older model-tool callers and never grant authority. Stale revisions preserve the durable
-        winner and return ``state_changed``.
+        Default mode is additive-only and quotes do not grant removal authority. Opt-in autonomy
+        allows objective edits while preserving requirements unless an exact recorded removal
+        quote authorizes the delta. Stale revisions preserve the durable winner and return
+        ``state_changed``. ``user_messages`` is compatibility input, never authority.
         """
         return revise_goal_snapshot(
             self, reason=reason, actor=actor, goal=goal, contract=contract,

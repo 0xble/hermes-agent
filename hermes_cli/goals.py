@@ -1,7 +1,7 @@
 """Persistent session goals — the Ralph loop for Hermes.
 
-A goal is a free-form objective that stays active across turns; after each turn an auxiliary-model
-judge decides whether it is satisfied. The continuation prompt is a normal user message appended via
+A goal is a free-form objective that stays active across turns. By default an auxiliary-model
+judge decides whether it is satisfied; opt-in autonomy requires evidence-backed completion. The continuation prompt is a normal user message appended via
 ``run_conversation`` (no system-prompt mutation or toolset swap — prompt caching stays intact). Judge
 failures are fail-OPEN (``continue``); the turn budget is the backstop.
 """
@@ -1091,8 +1091,8 @@ class GoalState:
     gates: List[GoalGate] = field(default_factory=list)
     # Every durable mutation gets a new token, including pause/resume with equal values.
     mutation_id: str = ""
-    # Versioned revisions of the goal/contract/subgoals. ``authority`` records
-    # Non-binding audit trail: agent_addition, evidence, or explicit_command.
+    # Contract edits and completion events are an audit trail. Recorded hard-limit breaches
+    # remain binding under autonomy, even after a replacement.
     revisions: List[Dict[str, Any]] = field(default_factory=list)
     # Stable identity of the last parked state announced to the user. This is durable so repeated
     # internal wakes and gateway restarts do not replay an unchanged wait notice.

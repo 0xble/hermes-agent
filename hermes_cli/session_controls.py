@@ -991,7 +991,7 @@ def _goal_replace_failure(target_sid: str, *, cursor=None) -> Optional[dict[str,
 
 def request_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
                     reason: str = "", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Create a durable, 24-hour pending approval request."""
+    """Create a pending request, or apply an autonomous goal control immediately."""
     from hermes_cli.goals_autonomy import goal_autonomy_enabled
     if kind == "goal" and goal_autonomy_enabled():
         return apply_control(kind, action, target_sid, requester_sid=requester_sid,
