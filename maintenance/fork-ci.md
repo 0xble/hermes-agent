@@ -82,6 +82,11 @@ partway through the fourth case, not in launchd. Reusing a ready, immutable
 candidate preserves each kind's import rejection, unflipped pointer, and partial
 receipt without repeatedly testing unrelated build tooling.
 
+The Codex host-binding catalog test keeps unrelated account-usage refreshes
+offline. Otherwise its daemon can outlive the test, resolve a later test's pool,
+and send an earlier key into that test's HTTP recorder. Host and exact-key
+assertions remain unchanged. Dedicated usage tests still exercise real workers.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. Both exact-SHA profiles bind
