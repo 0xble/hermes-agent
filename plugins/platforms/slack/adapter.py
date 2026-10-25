@@ -53,8 +53,10 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 try:  # sibling module; support both package and flat plugin-dir import
+    from .attachment_errors import describe_download_exception
     from .block_kit import render_blocks, sanitize_blocks
 except ImportError:  # pragma: no cover - plugin loaded outside package context
+    from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
 
 
@@ -952,12 +954,6 @@ _TRANSIENT_UPLOAD_MARKERS = (
 _SLACK_PERMISSION_ERRORS = frozenset(
     {"access_denied", "file_access_denied", "no_permission", "not_allowed_token_type", "restricted_action"}
 )
-_SLACK_HTTP_STATUS_TEMPLATES = {
-    401: "Slack attachment access failed for {file_label} with HTTP 401. The bot token is not "
-         "authorized for this file.",
-    403: "Slack attachment access failed for {file_label} with HTTP 403. The bot likely lacks "
-         "permission or scope to read this file.",
-    404: "Slack attachment {file_label} returned HTTP 404 and is no longer reachable."}
 # (error codes, user-facing template) for ``_describe_slack_api_error``; first match wins.
 _SLACK_API_ERROR_TEMPLATES = (
     ({"not_authed", "invalid_auth", "account_inactive", "token_revoked"},
@@ -1445,29 +1441,8 @@ class SlackAdapter(BasePlatformAdapter):
     def _describe_slack_download_failure(
         self, exc: Exception, *, file_obj: Optional[dict[str, Any]] = None) -> Optional[str]:
         """Translate Slack download exceptions into user-facing attachment diagnostics."""
-        file_label = _attachment_label(file_obj)
-        response = getattr(exc, "response", None)
-        api_detail = self._describe_slack_api_error(response, file_obj=file_obj)
-        if api_detail:
-            return api_detail
-        try:
-            import httpx
-        except Exception:  # pragma: no cover
-            httpx = None
-        if httpx is not None and isinstance(exc, httpx.HTTPStatusError):
-            template = _SLACK_HTTP_STATUS_TEMPLATES.get(exc.response.status_code)
-            if template:
-                return template.format(file_label=file_label)
-        message = str(exc)
-        if "Slack returned HTML instead of media" in message or (
-                "non-image data" in message and "<" in message.partition("starts with:")[2][:12]):
-            return (
-                f"Slack attachment access failed for {file_label}: Slack returned an HTML/login or non-media response. "
-                "This usually means a scope, auth, or file-permission problem.")
-        if "non-image data" in message:
-            # Downloaded fine, but Hermes can't decode the format: not a Slack permission problem.
-            return f"Hermes downloaded {file_label} but couldn't read it as an image (unsupported format)."
-        return None
+        return self._describe_slack_api_error(getattr(exc, "response", None), file_obj=file_obj) or (
+            describe_download_exception(exc, _attachment_label(file_obj)))
 
     # Slash-command ephemeral helpers. response_url is valid 30 min; the much shorter TTL avoids
     # routing unrelated messages as ephemeral after a slow/dropped handler. Hard cap because TTL
