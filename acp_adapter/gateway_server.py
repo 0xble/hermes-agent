@@ -728,7 +728,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         if receipt.get("voice_stopped") is True:
             # TUI-26: a bare stop phrase typed into this LOCAL session's voice chat ended the chat on
             # the owner and admitted nothing, so no turn will settle: the prompt ends here.
-            self._pending_cancels.discard(session_id)
+            self._pending_cancels.pop(session_id, None)
             if self._conn:
                 from agent.i18n import t
                 await self._conn.session_update(session_id=held_id, update=acp.update_agent_message_text(

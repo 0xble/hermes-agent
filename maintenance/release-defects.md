@@ -745,6 +745,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
     authored max-iteration config. The deleted importer wrapper's config-write refusal is exercised
     on its unchanged shared `atomic_yaml_write` implementation. No assertion is relaxed.
   - Gateway contract, command-parity document and prompt-surface snapshots use their generators.
+  - Fork turn overrides retained pre-extraction behavior after upstream moved shared phases into
+    `run_turn_persistence`: restore local-viewer reasoning ownership, finite-turn footer suppression,
+    interrupted tool-tail closure, and the extracted worker tracker without dropping fork overrides.
+    Voice acknowledgement resolves the answering adapter rather than the default bot. Bind hygiene
+    helpers through their owning seam. A second ACP voice-stop path uses the same dict cancellation
+    identity, and the initial runtime snapshot tolerates reasoning config before initialization.
 - Guards: display-fold off-lock and carrier suites, managed-store surface parity with Unicode
   collision and cross-session refusal coverage, usage-limit delivery, runtime bootstrap, ACP
   cancellation, provider fork contracts and retry/recovery admission tests, plus exact-head CI.
