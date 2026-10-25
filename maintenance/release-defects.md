@@ -598,3 +598,15 @@ real workers can repair or install into the test interpreter while sibling files
 import it. The observed reviewer crash was `prompt_toolkit.utils` missing during
 import. All worker, tick, outcome, and billing assertions remain unchanged.
 Guard: `tests/e2e/core/kanban/test_kanban_rate_limit_review.py`.
+
+The immutable-release real-worker retention fixture scopes its process inventory
+to its owned worker, retaining real psutil identity reads and the exact pruning
+assertions. Unrelated unreadable processes intentionally keep every release,
+covered separately by `test_unreadable_process_identity_scopes_retention`.
+
+The cron replica contention harness checks peer liveness while waiting for both
+claims and includes the peer's stderr on failure. The peer records its stack
+before the unchanged barrier deadline if stalled. A hosted first-round timeout
+was not reproduced by isolated or full-file Linux execution, so its triggering
+cause remains unproven. These diagnostics strengthen failure evidence without
+changing deadlines, claims, scheduling, or any delivery assertions.
