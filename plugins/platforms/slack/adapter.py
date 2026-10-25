@@ -3734,17 +3734,17 @@ class SlackAdapter(BasePlatformAdapter):
             return
         source = self.build_source(
             chat_id=channel_id,
-            chat_name=self._channel_name_cache.get(
-                (str(metadata.get("team_id") or ""), channel_id), channel_id),
-            chat_type="dm",
-            user_id=user_id,
-            thread_id=thread_ts,
-            chat_topic=metadata.get("context_channel_id") or None,
-            scope_id=metadata.get("team_id") or None)
-        try:
-            session_store.get_or_create_session(source)
-        except Exception:
-            logger.debug(*fail_log, exc_info=True)
+            chat_name=self._channel_name_cache.get((str(metadata.get("team_id") or ""), channel_id), channel_id),
+            chat_type="dm", user_id=user_id, thread_id=thread_ts,
+            chat_topic=metadata.get("context_channel_id") or None, scope_id=metadata.get("team_id") or None)
+        def seed() -> None:
+            try:
+                session_store.get_or_create_session(source)
+            except Exception:
+                logger.debug(*fail_log, exc_info=True)
+        # The store read can wait seconds behind state.db writes; run inline it froze the event loop
+        # past the liveness watchdog (2026-10-25 10:06 and 10:44 PDT, app_home_opened ack).
+        self.spawn_ingress_reply(asyncio.to_thread(seed), label="dm session seed")
 
     async def _handle_assistant_thread_lifecycle_event(
         self, event: dict, body: Optional[dict] = None) -> None:
