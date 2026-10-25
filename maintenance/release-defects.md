@@ -864,6 +864,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   like a failed idle wait. Native and forced-split variants retain the fd, output, timeout
   and EMFILE fallback assertions. Guard: `test_drain_high_fd.py` passes 3 tests on Linux, and
   the forced split reproduces the original pending-CRLF failure with the old boundary.
+- Real gateway test children retain `HERMES_DISABLE_LAZY_INSTALLS=1`. The environment allowlist
+  dropped that parent policy, so `voice.record` could enter PM's `audio-io` dependency sync on a
+  selected CI venv and exceed the RPC deadline. Foreign test interpreters refuse that sync,
+  hiding the escape in earlier Linux reproductions. The session voice-mode assertions and
+  20-second RPC deadline remain unchanged, and an explicit child-environment regression binds
+  the hermetic policy independently of the caller's environment.
+- Classic CLI fixtures explicitly set `gateway.completion_notification_batch_window_seconds=0`
+  in their synthetic profile. The fork intentionally holds successful background results for
+  300 seconds by default (`maintenance/goal-lifecycle.md`), while the upstream live-session E2E
+  expects immediate completion cards and has a 300-second total file deadline. Linux tracing
+  proved the child had completed and persisted its result before the test's 90-second card wait
+  expired. Keep the real fan-in floor, delivery assertions and all timeouts unchanged.
 - The merge resurrected upstream's `tests/ci/test_cache_report_collection.py` without its
   `scripts/ci/timings_report.py` dependency. Fork main had already retired both with its cache-report
   CI tooling (`d77a654d8605` and retirement), so the orphan test is removed consistently with main.

@@ -52,7 +52,11 @@ CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', '
 
 
 def child_env():
-    return {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+    # Keep the parent's hermetic dependency policy in real gateway children. Otherwise a
+    # selected CI venv can install optional audio extras during a voice-routing RPC, while
+    # a foreign developer/test interpreter refuses that sync and hides the escaped install.
+    return {**{k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ},
+            'HERMES_DISABLE_LAZY_INSTALLS': '1'}
 
 
 async def rpc(ws, method, **params):

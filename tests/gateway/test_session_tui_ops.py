@@ -326,6 +326,13 @@ def test_config_get_voice_reports_the_sessions_own_voice_mode(tmp_path):
         asyncio.run(probe())
 
 
+def test_owner_child_environment_disables_lazy_dependency_installs(monkeypatch):
+    from tests.gateway.fixtures.local_recovery_probe import child_env
+
+    monkeypatch.setenv('HERMES_DISABLE_LAZY_INSTALLS', '0')
+    assert child_env()['HERMES_DISABLE_LAZY_INSTALLS'] == '1'
+
+
 @pytest.mark.platforms("linux")
 def test_voice_record_follows_the_sessions_gateway_voice_mode(tmp_path):
     """T9: push-to-talk (``voice.record``) gates on the session's gateway voice mode, the state
