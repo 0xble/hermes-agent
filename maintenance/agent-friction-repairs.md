@@ -83,10 +83,10 @@ kernel was evicted earlier or killed at the boundary. Remote kernels share the
 cap without an eviction note; a dead or disconnected remote kernel reports
 `kernel.state_lost`.
 
-## Foreground heavy-slot queue waits
+## Foreground semaphore queue waits
 
 Foreground local commands now bound their shared-slot admission wait to
-`min(120, max(10, effective_timeout // 3))` via `HEAVY_SLOT_MAX_WAIT`, while
+`min(120, max(10, effective_timeout // 3))` via `SEMAPHORE_MAX_WAIT`, while
 background commands keep the helper's unbounded wait. A single simple heavy
 command that reaches exit 75 is promoted automatically to a tracked background
 run without asking the model to retry; compound commands retain the explicit

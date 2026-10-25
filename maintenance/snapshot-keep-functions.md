@@ -6,7 +6,7 @@ Load when changing the terminal session snapshot: `_snapshot_bootstrap_script`, 
 
 Fork patch identity: `snapshot-keep-functions`.
 
-The login-shell bootstrap writes exports, functions and aliases into the session snapshot, which every later command sources. The per-command re-dump wrote exports only and then replaced the snapshot, so every function and alias from the user's profile, `terminal.shell_init_files`, or an earlier command disappeared from the second command on. Exported variables survived, which hid the loss. Found when the `heavy-slot` validation limiter (dotfiles #689), sourced through `terminal.shell_init_files`, wrapped `./bin/ci` only on a session's first command.
+The login-shell bootstrap writes exports, functions and aliases into the session snapshot, which every later command sources. The per-command re-dump wrote exports only and then replaced the snapshot, so every function and alias from the user's profile, `terminal.shell_init_files`, or an earlier command disappeared from the second command on. Exported variables survived, which hid the loss. Found when the `semaphore` validation limiter (dotfiles #689), sourced through `terminal.shell_init_files`, wrapped `./bin/ci` only on a session's first command.
 
 Both writers now emit one shared `_shell_state_dump`: exports with the per-session exclusions, then name-filtered functions, aliases, and the `shopt -s expand_aliases`, `set +e`, `set +u` trailer. The same mktemp plus atomic `mv` publish applies, and a failed dump still never replaces a good snapshot.
 
