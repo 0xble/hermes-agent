@@ -609,7 +609,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             _clarify_adapter = self._delivery_adapter_for(source)
             if _clarify_adapter:
                 try:
-                    _clarify_adapter.resume_typing_for_chat(source.chat_id)
+                    _clarify_adapter.resume_typing_for_chat(source.chat_id, metadata=self._event_thread_metadata(event, source))
                 except Exception:
                     logger.debug("Failed to resume typing after clarify response", exc_info=True)
                 # A typed answer to a native card (numeric pick, or text after "Other") never

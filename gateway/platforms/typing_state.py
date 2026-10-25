@@ -7,7 +7,8 @@ from typing import Any, Optional
 class TypingStateMixin:
     def _typing_scope_key(self, chat_id: str, metadata: Optional[dict[str, Any]] = None):
         """Adapters may refine the surface identity (for example, a workspace)."""
-        thread_id = (metadata or {}).get("thread_id")
+        md = metadata or {}
+        thread_id = next((md[k] for k in ("thread_id", "thread_ts", "message_thread_id", "direct_messages_topic_id") if md.get(k) is not None), None)
         return (str(chat_id), str(thread_id)) if thread_id is not None else str(chat_id)
 
     def set_status_text(self, chat_id: str, text: Optional[str], metadata=None) -> None:
