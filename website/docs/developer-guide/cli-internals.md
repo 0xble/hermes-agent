@@ -127,13 +127,21 @@ clones both sides are prefetched outside checkout-lock custody before merging.
 
 Selection unwraps our carry merges to the actual candidate instead of merging
 synthetic history back into main. An ancestor candidate needs no carry. Otherwise,
-selection requires positive unlanded evidence against both the fetched target and
-`origin/main`: every candidate commit must be unmatched by `git cherry`, and the
-combined merge-base-to-candidate patch must not match a historical patch by stable
-patch ID. A historical match returns the bare published target even if later main
-commits revert, delete or supersede the landed content. Unknown history refuses
-the update. A merge tree equal to the target is only a content no-op, not proof
-that a candidate never landed. An unchanged combined tree reuses the live release
+selection asks GitHub's commit-associated pull requests endpoint on the source
+`origin`, using the updater's existing API authentication. An associated PR with
+`merged_at` set into the same repository's target branch or `main` proves landing,
+including squash and rebase merges. Selection returns the bare published target
+even if later commits revert, delete or supersede the landed content. Patch IDs
+and tree equality are not landing evidence.
+
+Carrying requires an associated open PR whose head exactly matches the original
+candidate, with no merged PR into either base branch across the complete listing.
+No PR, closed-unmerged or moved heads, unsupported origins, offline/API failures,
+malformed responses and incomplete pagination are unknown, not proof of an
+unlanded candidate. Unknown status refuses with the live SHA and
+`--replace-candidate <exact-live-SHA>`. Git-only/local candidates therefore need
+explicit replacement unless graph ancestry proves they already landed.
+A merge tree equal to the target is only a content no-op. An unchanged combined tree reuses the live release
 without creating another commit or retention ref.
 
 Install stamps retain the original source branch across carries. Older releases
