@@ -211,8 +211,9 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
     from packaging.utils import canonicalize_name
     from packaging.markers import default_environment
 
-    project_data = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8-sig"))
-    groups = project_data["project"].get("optional-dependencies", {})
+    project_file = project / "pyproject.toml"
+    groups = (tomllib.loads(project_file.read_text(encoding="utf-8-sig"))["project"]
+              .get("optional-dependencies", {}) if project_file.is_file() else {})
     if not groups:
         return []
     installed = set(_active_distributions(source_python))
