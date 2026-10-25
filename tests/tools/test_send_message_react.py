@@ -17,7 +17,7 @@ class _FakePhotonAdapter:
     def __init__(self):
         self.calls = []
 
-    async def add_reaction(self, chat_id, emoji, message_id=None):
+    async def add_reaction(self, chat_id, message_id, emoji, **routing):
         self.calls.append(("add", chat_id, emoji, message_id))
         return {"success": True, "emoji": emoji}
 

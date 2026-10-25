@@ -3195,6 +3195,17 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         summary["total"] = len(desired_payloads)
         return summary
 
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        if not self._client:
+            return False
+        try:
+            channel = await self._resolve_channel(routing.get("thread_id") or chat_id)
+            message = await channel.fetch_message(int(message_id))
+            return await self._add_reaction(message, emoji)
+        except Exception as exc:
+            logger.debug("[%s] reaction target lookup failed: %s", self.name, exc)
+            return False
+
     async def _add_reaction(self, message: Any, emoji: str) -> bool:
         """Add an emoji reaction to a Discord message."""
         if not message or not hasattr(message, "add_reaction"):

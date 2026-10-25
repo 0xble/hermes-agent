@@ -2282,7 +2282,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         # silent; any other human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
-        if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
+        from gateway.response_filters import reaction_answered
+        if _intentional_silence and not (reaction_answered(agent_result) or silence_allowed(_silence_kind, _silence_reply_expected)):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
@@ -3456,6 +3457,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         from agent.skill_utils import parse_config_string_list
         enabled = self._resolve_enabled_toolsets_for_source(user_config, source, platform_key)
         disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None
+        if "reactions" not in enabled:
+            enabled.append("reactions")
         return enabled, disabled
 
     async def _run_background_task_inner(
@@ -4854,7 +4857,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             # Runtime provenance describes the continuation row, not the original human's silence
             # contract. A queued successor must not make the retry's second marker silently legal.
             silence_kind = None if getattr(turn_ctx, "silence_retry", False) else turn_ctx.persist_user_display_kind
-            if silence_allowed(silence_kind, turn_ctx.reply_expected):
+            from gateway.response_filters import reaction_answered
+            if reaction_answered(_delivery_result) or silence_allowed(silence_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",

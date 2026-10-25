@@ -3265,6 +3265,10 @@ class SlackAdapter(BasePlatformAdapter):
         self, channel: str, timestamp: str, emoji: str, team_id: str = "") -> bool:
         return await self._react(channel, timestamp, emoji, team_id, remove=False)
 
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        team_id = routing.get("team_id") or routing.get("scope_id") or ""
+        return await self._add_reaction(chat_id, message_id, emoji, team_id=team_id)
+
     async def _remove_reaction(
         self, channel: str, timestamp: str, emoji: str, team_id: str = "") -> bool:
         return await self._react(channel, timestamp, emoji, team_id, remove=True)

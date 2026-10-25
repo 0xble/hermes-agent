@@ -646,23 +646,29 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to get access token: %s", self.name, e)
             return None
 
-    async def _send_emotion(self, open_msg_id: str, open_conversation_id: str, emoji_name: str, *, recall: bool = False) -> None:
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        return await self._send_emotion(message_id, chat_id, emoji)
+
+    async def _send_emotion(self, open_msg_id: str, open_conversation_id: str, emoji_name: str, *, recall: bool = False) -> bool:
         """Add (or recall) an emoji reaction on a message."""
-        if not self._robot_sdk or not open_msg_id or not open_conversation_id:
-            return
+        if not self._robot_sdk or not open_msg_id or not open_conversation_id or not emoji_name:
+            return False
         action = "recall" if recall else "reply"
         try:
             token = await self._get_access_token()
             if not token:
-                return
+                return False
             text_emotion_cls, request_cls, headers_cls, sdk_method = _EMOTION_SDK[recall]
             text_emotion = getattr(dingtalk_robot_models, text_emotion_cls)(emotion_id=_EMOTION_ID, emotion_name=emoji_name, text=emoji_name, background_id=_EMOTION_BG)
             request = getattr(dingtalk_robot_models, request_cls)(robot_code=self._robot_code, open_msg_id=open_msg_id, open_conversation_id=open_conversation_id,
                                                                   emotion_type=2, emotion_name=emoji_name, text_emotion=text_emotion)
-            await self._sdk_call(getattr(self._robot_sdk, sdk_method), request, getattr(dingtalk_robot_models, headers_cls), token)
-            logger.info("[%s] _send_emotion: %s %s on msg=%s", self.name, action, emoji_name, open_msg_id[:24])
+            response = await self._sdk_call(getattr(self._robot_sdk, sdk_method), request, getattr(dingtalk_robot_models, headers_cls), token)
+            delivered = getattr(getattr(response, "body", None), "success", None) is True
+            logger.debug("[%s] _send_emotion: %s %s on msg=%s delivered=%s", self.name, action, emoji_name, open_msg_id[:24], delivered)
+            return delivered
         except Exception:
             logger.debug("[%s] _send_emotion %s failed", self.name, action, exc_info=True)
+            return False
 
     async def _resolve_media_codes(self, message: ChatbotMessage) -> None:
         """Resolve download codes in the message to real URLs (in place, in parallel)."""
