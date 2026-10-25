@@ -230,7 +230,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             with suppress(Exception):
                 from gateway.run import _resolve_gateway_model
                 model = model or _resolve_gateway_model(user_config)
-        stamp = self._load_attended_activity_stamp(session_key, refresh=True)
+        durable_stamp = stamp = self._load_attended_activity_stamp(session_key, refresh=True)
         cfg = parse_attended_config(user_config or {})
         stamp, new_session = self._ensure_attended_new_session_activity(session_key, cfg, stamp)
         reasoning_override = None
@@ -251,6 +251,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         from gateway.session_attended import session_attended_pin_until, session_attended_pinned
         return {
             "activity_stamp": stamp,
+            # Switch-back gating reads these on the loop; the process-local new-session stamp
+            # above must not stand in for Brian's durable first message.
+            "durable_activity_stamp": durable_stamp,
+            "route_active": self._load_attended_route_active(session_key),
             "attended_pinned": session_attended_pinned(store, session_key),
             "attended_pin_until": session_attended_pin_until(store, session_key),
             "new_session": new_session,
@@ -321,8 +325,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
         reasoning_scope=None, default_reasoning=None, attended_reasoning=None,
         attended_pinned=_NO_ATTENDED_ACTIVITY_STAMP, attended_pin_until=None, allow_switch_back=False, assignment=None,
+        durable_activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, route_active=_NO_ATTENDED_ACTIVITY_STAMP,
     ):
-        """Return the one authoritative desired route decision for a gateway session."""
+        """Return the one authoritative desired route decision for a gateway session.
+
+        Loop callers pass ``durable_activity_stamp`` and ``route_active`` from the off-loop
+        snapshot; the sentinel reads them here, which takes the session-store lock."""
         if not session_key:
             return None
         cfg = parse_attended_config(user_config or {})
@@ -378,8 +386,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             default_reasoning=default_reasoning, attended_reasoning=attended_reasoning,
             attended_pinned=attended_pinned, attended_pin_until=attended_pin_until,
         )
-        load_route_active = getattr(self, "_load_attended_route_active", None)
-        durable_route_active = load_route_active(session_key) if callable(load_route_active) else None
+        if route_active is not _NO_ATTENDED_ACTIVITY_STAMP:
+            durable_route_active = route_active
+        else:
+            load_route_active = getattr(self, "_load_attended_route_active", None)
+            durable_route_active = load_route_active(session_key) if callable(load_route_active) else None
         from gateway.run_session_readback import attended_switch_back_pending
         switched_back = attended_switch_back_pending(
             decision, previous_decision, model_role, durable_route_active,
@@ -393,7 +404,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             # A session opened by automation (a topic split, relay or wakeup) runs on the
             # attended route from a process-local stamp only. Its idle window has not started
             # until Brian sends a first genuine message, which writes the durable stamp.
-            awaiting_first_message = (self._load_attended_activity_stamp(session_key) is None
+            if durable_activity_stamp is _NO_ATTENDED_ACTIVITY_STAMP:
+                durable_activity_stamp = self._load_attended_activity_stamp(session_key)
+            awaiting_first_message = (durable_activity_stamp is None
                                       and not (attended_pinned and attended_pin_until is not None))
             if not allow_switch_back or not api_quiet or awaiting_first_message:
                 # Route expiry is deferred until the request boundary. A session that has
@@ -428,6 +441,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
         reasoning_scope=None, default_reasoning=None, attended_reasoning=None,
         attended_pinned=_NO_ATTENDED_ACTIVITY_STAMP, attended_pin_until=None, allow_switch_back=False, assignment=None,
+        durable_activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, route_active=_NO_ATTENDED_ACTIVITY_STAMP,
     ):
         """Build the detached attended route and stage its one-line notice on the session."""
         decision = self._attended_resolution_for_session(
@@ -437,6 +451,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             reasoning_scope=reasoning_scope, default_reasoning=default_reasoning,
             attended_reasoning=attended_reasoning, attended_pinned=attended_pinned, attended_pin_until=attended_pin_until,
             allow_switch_back=allow_switch_back, assignment=assignment,
+            durable_activity_stamp=durable_activity_stamp, route_active=route_active,
         )
         if decision is None:
             return None
@@ -832,6 +847,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 attended_reasoning=attended_snapshot.get("attended_reasoning") if attended_snapshot else None,
                 attended_pinned=attended_snapshot.get("attended_pinned", False),
                 attended_pin_until=attended_snapshot.get("attended_pin_until") if attended_snapshot else None,
+                durable_activity_stamp=attended_snapshot.get(
+                    "durable_activity_stamp", _NO_ATTENDED_ACTIVITY_STAMP),
+                route_active=attended_snapshot.get("route_active", _NO_ATTENDED_ACTIVITY_STAMP),
             )
             resolved = await asyncio.to_thread(
                 self._load_session_agent_runtime, source=source, skey=skey, user_config=user_config,
@@ -1582,10 +1600,22 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         attempt.cleanup_deferred = True
 
     @staticmethod
-    def _hmwa_hygiene_stamp(agent, desc, provenance_name, debug_label):
+    async def _hmwa_hygiene_stamp(agent, desc, provenance_name, debug_label):
+        """Compression provenance forces a durable activity write, so it runs off the loop."""
         from agent.session_activity import ActivityProvenance
         from gateway.run import _stamp_hygiene_compression_provenance
-        _stamp_hygiene_compression_provenance(agent, desc, getattr(ActivityProvenance, provenance_name), debug_label)
+        await asyncio.to_thread(
+            _stamp_hygiene_compression_provenance,
+            agent, desc, getattr(ActivityProvenance, provenance_name), debug_label,
+        )
+
+    @staticmethod
+    async def _hmwa_hygiene_off_loop(func, *args, failure_label):
+        """Run a best-effort hygiene state.db write from a loop callback in a worker thread."""
+        try:
+            await asyncio.to_thread(func, *args)
+        except Exception:
+            logger.debug("%s", failure_label, exc_info=True)
 
     async def _hmwa_hygiene_notify(self, source, meta, message, what):
         """Best-effort user notice on the hygiene thread; failure is logged, never raised."""
@@ -1605,7 +1635,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         _hyg_cooldown = await asyncio.to_thread(
             _hygiene_cooldown_for_failure, self, session_key, hs.failure_cooldown_seconds,
         )
-        _record_hygiene_cooldown(self, session_id, _hyg_cooldown, reason)
+        await asyncio.to_thread(_record_hygiene_cooldown, self, session_id, _hyg_cooldown, reason)
 
     async def _hmwa_hygiene_on_turn_hold(self, attempt, hs, session_entry, session_key, source):
         """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission
@@ -1667,10 +1697,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                             _skey, last_prompt_tokens=0, touch_activity=False,
                         )
                     ))
-                    try:
-                        _reset_hygiene_failure_streak(_gw, _skey)
-                    except Exception as _rs_err:
-                        logger.debug("hygiene streak reset after deferred adoption failed: %s", _rs_err)
+                    # Done-callbacks run on the loop; both state.db writes below go to a thread.
+                    _gw._retain_background_task(asyncio.ensure_future(_gw._hmwa_hygiene_off_loop(
+                        _reset_hygiene_failure_streak, _gw, _skey,
+                        failure_label="hygiene streak reset after deferred adoption failed",
+                    )))
                 elif _summary_failed:
                     # A real summary failure, not a turn-hold: same escalation and warning as the
                     # inline abort path, which this deferred attempt never reaches.
@@ -1680,11 +1711,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 else:
                     # Nothing to adopt (summary failed / fence refused / superseded): flat spacing so
                     # sustained traffic doesn't spawn and abandon a compressor every turn.
-                    _record_hygiene_cooldown(
-                        _gw, _sid, _HYGIENE_TURNHOLD_RETRY_SECONDS,
+                    _gw._retain_background_task(asyncio.ensure_future(_gw._hmwa_hygiene_off_loop(
+                        _record_hygiene_cooldown, _gw, _sid, _HYGIENE_TURNHOLD_RETRY_SECONDS,
                         "hygiene compression deferred: turn-hold budget expired and the "
                         "detached attempt did not commit",
-                    )
+                        failure_label="hygiene turn-hold retry spacing failed",
+                    )))
 
             attempt.future.add_done_callback(_hyg_adopt_or_space_retry)
             _log_suffix = (
@@ -1697,14 +1729,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             if _adopted is not None:
                 return _adopted
             # Short flat retry-after, else every turn re-spawns, holds and cancels a compressor.
-            _record_hygiene_cooldown(
-                self, session_entry.session_id, _HYGIENE_TURNHOLD_RETRY_SECONDS,
+            await asyncio.to_thread(
+                _record_hygiene_cooldown, self, session_entry.session_id, _HYGIENE_TURNHOLD_RETRY_SECONDS,
                 "hygiene compression deferred: turn-hold budget expired while the "
                 "summary was still streaming",
             )
             _log_suffix = ""
             _notify_user = True
-        self._hmwa_hygiene_stamp(
+        await self._hmwa_hygiene_stamp(
             attempt.agent, "session hygiene compression turn-hold",
             "AGENT_COMPRESSION_TURNHOLD", "hygiene compression turn-hold activity stamp failed",
         )
@@ -1730,7 +1762,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             await self._hmwa_hygiene_record_failure_cooldown(hs, session_key, session_id, _reason)
         except Exception as _cd_err:
             logger.debug("hygiene failure cooldown after deferred abort failed: %s", _cd_err)
-        self._hmwa_hygiene_stamp(
+        await self._hmwa_hygiene_stamp(
             agent, "session hygiene compression aborted after turn-hold",
             "AGENT_COMPRESSION_COOLDOWN", "hygiene deferred compression abort activity stamp failed",
         )
@@ -1777,7 +1809,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 else "timed out with no output from the summary model"
             ),
         )
-        self._hmwa_hygiene_stamp(
+        await self._hmwa_hygiene_stamp(
             attempt.agent,
             "session hygiene compression cancelled at commit fence" if _hyg_fence_cancelled
             else "session hygiene compression timed out",
@@ -1821,14 +1853,18 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if not attempt.cleanup_deferred:
             self._hmwa_hygiene_defer_cleanup(attempt, "session hygiene unwind")
         if hs.failure_cooldown_seconds >= 0:
-            try:
+            session_id = session_entry.session_id
+
+            def _record() -> None:
                 _record_hygiene_cooldown(
-                    self, session_entry.session_id,
+                    self, session_id,
                     _hygiene_cooldown_for_failure(self, session_key, hs.failure_cooldown_seconds),
                     "session hygiene compression cancelled at commit fence",
                 )
-            except Exception as _cd_err:
-                logger.debug("hygiene unwind cooldown record failed: %s", _cd_err)
+
+            # The unwinding turn cannot await; the streak read and cooldown write are state.db I/O.
+            self._retain_background_task(asyncio.ensure_future(self._hmwa_hygiene_off_loop(
+                _record, failure_label="hygiene unwind cooldown record failed")))
 
     async def _hmwa_hygiene_adopt_transcript(
         self, attempt, _compressed, history, plan, *, session_entry, source, _quick_key, run_generation,
@@ -1951,7 +1987,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 "session hygiene compression cancelled at commit fence" if _hyg_fence_cancelled
                 else getattr(_comp, "_last_summary_error", None),
             )
-            self._hmwa_hygiene_stamp(
+            await self._hmwa_hygiene_stamp(
                 attempt.agent, "session hygiene compression aborted",
                 "AGENT_COMPRESSION_COOLDOWN", "hygiene compression abort activity stamp failed",
             )
@@ -4123,7 +4159,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
 
     def _run_agent_build_turn_context(
         self, disp: GatewayRunner._RunAgentDisplay, AIAgent: Any, *, message: str, source: SessionSource,
-        session_key: Optional[str], run_generation: Optional[int], **turn_params,
+        session_key: Optional[str], run_generation: Optional[int],
+        reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP, **turn_params,
     ) -> tuple[TurnContext, TurnRunner, Any]:
         """Build the ``TurnContext`` and its ``TurnRunner``; ``turn_params`` (history, context_prompt,
         session_id, persist_user_*, …) are stored verbatim. Returns ``(turn_ctx, turn_runner,
@@ -4171,7 +4208,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             **self._snapshot_session_model_override(session_key),
             "model_role": state.conversation.model_role if state is not None else None,
             "model_scope": self._session_model_override_scope(session_key),
-            "reasoning_override": self._session_reasoning_override(session_key),
+            "reasoning_override": (self._session_reasoning_override(session_key)
+                                   if reasoning_override is _NO_ATTENDED_ACTIVITY_STAMP else reasoning_override),
             "reasoning_scope": state.conversation.reasoning_override_scope if state is not None else "session",
         }
         turn_runner = TurnRunner(self, turn_ctx, model_assignment=model_assignment)
@@ -5551,9 +5589,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 # before the worker can consume it on the same turn.
                 await self._resolve_session_agent_runtime_async(
                     source=source, session_key=session_key, user_config=disp.user_config)
+        # Hydrate the /reasoning pick off the loop; the assignment below is captured synchronously.
+        reasoning_override = await self._session_reasoning_override_async(session_key)
         turn_ctx, turn_runner, _cleanup_adapter = self._run_agent_build_turn_context(
             disp, AIAgent, message=message, source=source, session_key=session_key,
-            run_generation=run_generation, context_prompt=context_prompt, history=history,
+            run_generation=run_generation, reasoning_override=reasoning_override,
+            context_prompt=context_prompt, history=history,
             session_id=session_id, _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             recovery_id=recovery_id,
