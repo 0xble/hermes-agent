@@ -5330,93 +5330,9 @@ async def _wait_for_pid_exit(pid: int, attempts: int, delay: float) -> bool:
 
 
 async def _start_gateway_replace_existing_instance(existing_pid: int, replace: bool) -> bool:
-    """Handle a live gateway PID under this HERMES_HOME: replace it (``--replace``) or refuse.
-    Returns False when startup must abort (refused, permission denied, target still alive)."""
-    from gateway.status import _get_pid_path, get_process_start_time, remove_pid_file, terminate_pid
-    if not replace:
-        hermes_home = str(get_hermes_home())
-        logger.error(
-            "Another gateway instance is already running (PID %d, HERMES_HOME=%s) and did not "
-            "publish a host record this process could attach to.",
-            existing_pid, hermes_home)
-        print(
-            f"\n❌ A gateway already owns this host (PID {existing_pid}).\n"
-            f"   One gateway per host serves every profile, so there is nothing to start here.\n"
-            f"   Attach is impossible: PID {existing_pid} published no usable host record\n"
-            f"   (an older build, or an unwritable lock directory).\n"
-            f"   Take the host over:  hermes gateway run --replace\n"
-            f"   Or stop it first:    hermes gateway stop\n")
-        return False
-
-    # Never signal a process not provably ours (a poisoned PID record → cross-profile restart loop).
-    if _replace_target_belongs_to_other_profile(existing_pid):
-        from gateway.status import _get_process_hermes_home
-        logger.error(
-            "Refusing --replace: PID %d cannot be proven to belong "
-            "to this profile's gateway (HERMES_HOME %s). Remove the "
-            "stale PID record or stop the owning profile explicitly.",
-            existing_pid, _get_process_hermes_home())
-        return False
-    existing_start_time = get_process_start_time(existing_pid)
-    logger.info("Replacing existing gateway instance (PID %d) with --replace.", existing_pid)
-    # Takeover marker: target exits 0 on our SIGTERM (exit 1 → systemd Restart=on-failure flap loop).
-    try:
-        from gateway.status import write_takeover_marker
-        write_takeover_marker(existing_pid)
-    except Exception as e:
-        logger.debug("Could not write takeover marker: %s", e)
-    # Snapshot children BEFORE signalling: reparented orphans are invisible yet hold scoped token locks.
-    try:
-        from gateway.status import _snapshot_gateway_children
-        _old_gateway_children = _snapshot_gateway_children(existing_pid)
-    except Exception:
-        _old_gateway_children = []
-    try:
-        terminate_pid(existing_pid, force=False)
-    except ProcessLookupError:
-        pass  # Already gone
-    except (PermissionError, OSError):
-        logger.error("Permission denied killing PID %d. Cannot replace.", existing_pid)
-        _clear_takeover_marker_quiet()
-        return False
-    # Up to 10s for SIGTERM, then SIGKILL.
-    if not await _wait_for_pid_exit(existing_pid, 20, 0.5):
-        logger.warning("Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.", existing_pid)
-        old_gateway_exited = False
-        try:
-            terminate_pid(existing_pid, force=True, expected_start_time=existing_start_time)
-        except ProcessLookupError:
-            old_gateway_exited = True
-        except (PermissionError, OSError):
-            pass
-        # Confirm SIGKILL took (D-state/zombie) before clearing PID/locks, or two gateways share a token.
-        if not old_gateway_exited and not await _wait_for_pid_exit(existing_pid, 20, 0.25):
-            logger.error(
-                "Old gateway (PID %d) still appears alive after SIGKILL; "
-                "aborting replacement to avoid a duplicate gateway.", existing_pid)
-            _clear_takeover_marker_quiet()
-            return False
-    # Reap orphaned children (POSIX; mirrors Windows taskkill /T) so they stop holding scoped token locks.
-    try:
-        from gateway.status import reap_gateway_children
-        reap_gateway_children(_old_gateway_children, parent_pid=existing_pid)
-    except Exception:
-        logger.debug("Child reap for replaced gateway PID %d failed", existing_pid, exc_info=True)
-    remove_pid_file()
-    # remove_pid_file() is a no-op when the PID doesn't match; force-unlink covers a crashed old process.
-    with suppress(Exception):
-        _get_pid_path().unlink(missing_ok=True)  # this slot's file: a standby 'b' never unlinks slot a's
-    # The old process may not have consumed the marker (SIGKILL'd before its handler read it).
-    _clear_takeover_marker_quiet()
-    # Stopped (Ctrl+Z) processes don't release scoped locks on exit; stale lock files block the new gateway.
-    try:
-        from gateway.status import release_all_scoped_locks
-        _released = release_all_scoped_locks(owner_pid=existing_pid, owner_start_time=existing_start_time)
-        if _released:
-            logger.info("Released %d stale scoped lock(s) from old gateway.", _released)
-    except Exception:
-        pass
-    return True
+    """Forward the public startup seam to the source-owned replace implementation."""
+    from gateway.run_bootstrap import _start_gateway_replace_existing_instance as replace_existing
+    return await replace_existing(existing_pid, replace)
 
 
 def _start_gateway_configure_logging(verbosity: Optional[int]) -> None:

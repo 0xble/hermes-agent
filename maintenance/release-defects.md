@@ -731,6 +731,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Worker route commits acknowledge the owner-loop state handoff before agent construction
   reads the decision and the expiry notice. Fire-and-forget activity receipts retain their
   monotonic merge. Guards: 274 tests across model-pick expiry and attended-model suites.
+- The public replace seam now forwards to the extracted bootstrap implementation, restoring
+  the durable ownership-refusal stamp while retaining process-slot PID isolation. Its scoped-lock
+  release uses the canonical source module, not the removed status export.
+  Guard: the complete replace-ownership suite, including stamp durability and no-signal refusal.
 - Fork patch identity: `v0225-merge-integration`.
 - Merging upstream `v0.22.5`, current fork main and the installed display-fold fix (#765) left five bindings that Git merged cleanly but that no longer resolved. Exact-head CI caught them on the first hosted run.
   - `gateway/run_inbound.py` kept the fork's `metadata=_UNSET` default on `_transcribe_and_echo_pending_voice` but lost the `from gateway.run_common import _UNSET` import that upstream's side never had. Every `gateway.run` import raised `NameError`, which accounted for most failures in the first run.
