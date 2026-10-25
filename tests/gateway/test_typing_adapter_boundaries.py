@@ -37,12 +37,19 @@ def _refresh_gate(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_discord_base_refresh_starts_real_transport_loop(monkeypatch):
+    from plugins.platforms.discord import adapter as discord_module
+
+    # The optional-SDK shim leaves Route as a MagicMock, whose method/path do
+    # not reflect its constructor. Keep the HTTP boundary concrete in either environment.
+    monkeypatch.setattr(discord_module.discord.http, "Route", lambda method, path, **params:
+                        SimpleNamespace(method=method, path=path, **params))
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
     posted = asyncio.Event()
 
     async def request(route):
         assert route.method == "POST"
         assert route.path == "/channels/{channel_id}/typing"
+        assert route.channel_id == "123"
         posted.set()
 
     adapter._client = SimpleNamespace(http=SimpleNamespace(request=AsyncMock(side_effect=request)))
