@@ -1569,7 +1569,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         # (rendered on assistant.threads.setStatus). Absent => omit content and the
         # connector uses its default heartbeat. NEVER send empty-string content here:
         # on Slack that is the CLEAR request.
-        phrase = getattr(self, "_status_text", {}).get(str(chat_id))
+        phrase = self.get_status_text(chat_id, metadata)
         await self._typing_frame(chat_id, metadata, str(phrase) if phrase else None, "send_typing")
 
     async def stop_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:

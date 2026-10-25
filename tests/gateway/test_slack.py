@@ -156,7 +156,7 @@ async def test_intermediate_delivery_restores_running_thread_status(adapter, del
     adapter.set_status_text("D123", "gathering information", metadata=md)
     # Hold an actual active owner, without waiting on wall-clock refresh intervals.
     owner = asyncio.create_task(asyncio.Event().wait())
-    adapter.__dict__.setdefault("_typing_tasks", {})[adapter._typing_scope_key("D123", md)] = owner
+    adapter.__dict__.setdefault("_typing_refresh_owners", {})[adapter._typing_scope_key("D123", md)] = owner
     try:
         await adapter.send_typing("D123", metadata=md)
         before = status.await_count

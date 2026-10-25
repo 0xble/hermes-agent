@@ -131,8 +131,6 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     ``direct_messages_topic_id`` when supported."""
     thread_id = getattr(source, "thread_id", None)
     platform = _platform_name(getattr(source, "platform", None))
-    if platform == "slack" and thread_id is None:
-        thread_id = reply_to_message_id
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
     if platform == "slack" and reply_to_message_id:
         metadata["message_id"] = reply_to_message_id
@@ -464,7 +462,7 @@ from gateway.platforms.base_exec_approval import (
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
 from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
-from gateway.platforms.typing_state import TypingStateMixin, call_typing_with_metadata
+from gateway.platforms.typing_state import TypingStateMixin, call_typing_with_metadata, typing_metadata_for_event
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
@@ -3643,7 +3641,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
         loop = asyncio.get_running_loop()
         scope = self._typing_scope_key(chat_id, metadata)
-        tasks = self.__dict__.setdefault("_typing_tasks", {})
+        # Discord and Signal own _typing_tasks for their transport-level loops.
+        tasks = self.__dict__.setdefault("_typing_refresh_owners", {})
         tasks[scope] = asyncio.current_task()
         try:
             while True:
@@ -5346,7 +5345,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
-        typing_task = review_capture.start_typing(self, event, interrupt_event, _thread_metadata)
+        _typing_metadata = typing_metadata_for_event(event)
+        typing_task = review_capture.start_typing(self, event, interrupt_event, _typing_metadata)
         from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
         turn_token = scoped_turn_entry()
         delivery_generation = None
@@ -5411,7 +5411,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 # measured to have no effect).
                 if text_content or extracted.copy_blocks or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
-                    call_typing_with_metadata(self.pause_typing_for_chat, event.source.chat_id, metadata=_thread_metadata)
+                    call_typing_with_metadata(self.pause_typing_for_chat, event.source.chat_id, metadata=_typing_metadata)
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
@@ -5454,7 +5454,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             if pending_event is not None:
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
-                await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
+                await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
@@ -5478,13 +5478,13 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
-            await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
+            await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
             if not (self._pending_messages.get(session_key) is event
                     and getattr(event, "_gateway_compression_deferred", False)):
                 await self._fire_post_delivery_callback(session_key, delivery_generation)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
-                event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
+                event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)

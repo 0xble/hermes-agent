@@ -96,7 +96,8 @@ async def test_relay_thread_phrase_reaches_transport_frame():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("thread_id", [None, "171.0"])
-async def test_slack_flat_media_and_error_keep_send_routing(tmp_path, monkeypatch, thread_id):
+@pytest.mark.parametrize("delivery", ["media", "error"])
+async def test_slack_flat_media_and_error_keep_send_routing(tmp_path, monkeypatch, thread_id, delivery):
     adapter = slack_fixture.__wrapped__()
     monkeypatch.setattr("plugins.platforms.slack.adapter._AGENT_SESSIONS_SUPPORTED", False)
     adapter.config.extra.update(reply_in_thread=False, dm_top_level_threads_as_sessions=False)
@@ -107,8 +108,10 @@ async def test_slack_flat_media_and_error_keep_send_routing(tmp_path, monkeypatc
     metadata = _thread_metadata_for_event(event)
     path = tmp_path / "document.txt"
     path.write_text("test attachment")
-    result = await adapter.send_document("D123", str(path), metadata=metadata)
-    assert result.success
-    assert adapter._app.client.files_upload_v2.call_args.kwargs["thread_ts"] == thread_id
-    await adapter._notify_turn_error(event, RuntimeError("transport failed"))
-    assert adapter._app.client.chat_postMessage.call_args.kwargs.get("thread_ts") == thread_id
+    if delivery == "media":
+        result = await adapter.send_document("D123", str(path), metadata=metadata)
+        assert result.success
+        assert adapter._app.client.files_upload_v2.call_args.kwargs["thread_ts"] == thread_id
+    else:
+        await adapter._notify_turn_error(event, RuntimeError("transport failed"))
+        assert adapter._app.client.chat_postMessage.call_args.kwargs.get("thread_ts") == thread_id
