@@ -14,10 +14,56 @@ from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_
 logger = logging.getLogger("hermes_state")
 _Freshness = tuple[sqlite3.Connection, int, int]
 _VISIBLE = " AND (active = 1 OR compacted = 1)"
-_DISPLAY_FOLD_COLUMNS_SQL = ("SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, "
-                            "display_kind, display_metadata, display_order, display_identity FROM messages")
+_DISPLAY_FOLD_COLUMNS = ("id", "role", "content", "timestamp", "tool_call_id", "tool_calls", "tool_name",
+                         "display_kind", "display_metadata", "display_order", "display_identity")
+_DISPLAY_FOLD_COLUMNS_SQL = f"SELECT {', '.join(_DISPLAY_FOLD_COLUMNS)} FROM messages"
 _DISPLAY_FOLD_SCAN_SQL = (_DISPLAY_FOLD_COLUMNS_SQL + " INDEXED BY idx_messages_session_id "
                          "WHERE session_id = ? AND id > ?" + _VISIBLE + " ORDER BY id LIMIT 1000")
+
+
+def _exact_cell(column: str) -> str:
+    """One column as JSON that decodes to the exact value and type ``sqlite3`` returns. REAL goes
+    through ``%!.17g`` (the runtime's JSON REAL rendering keeps only 15 digits); a REAL zero is
+    flagged because neither form keeps its sign, and its row is fetched conventionally."""
+    return (f"CASE typeof({column}) WHEN 'blob' THEN json_object('b', hex({column})) "
+            f"WHEN 'real' THEN CASE WHEN {column} = 0 THEN json_object('z', 0) "
+            f"ELSE json_object('r', printf('%!.17g', {column})) END "
+            f"ELSE json_array({column}) END")
+
+
+_ONE_STEP_FOLD_SQL = ("SELECT json_group_array(json_array("
+                      + ", ".join(_exact_cell(column) for column in _DISPLAY_FOLD_COLUMNS) + ")) FROM ({})")
+
+
+def _decode_cell(cell):
+    if isinstance(cell, list):
+        return cell[0]
+    if "b" in cell:
+        return bytes.fromhex(cell["b"])
+    return float(cell["r"])
+
+
+def fold_rows(conn: sqlite3.Connection, select_sql: str, params) -> list[dict]:
+    """Rows of a ``_DISPLAY_FOLD_COLUMNS_SQL`` query, in id order, fetched in ONE SQLite step.
+
+    Each row a cursor yields releases and re-takes the GIL. With the gateway's busy threads every
+    re-take waits a switch interval, so the off-lock plan's ~17k rows took 80 s behind a single
+    CPU-bound thread (0.5 s alone) and pinned a compression worker past its ceiling (2026-10-25).
+    """
+    import json
+
+    page = conn.execute(_ONE_STEP_FOLD_SQL.format(select_sql), params).fetchone()[0]
+    rows, zeros = [], []
+    for raw in json.loads(page):
+        if any(isinstance(cell, dict) and "z" in cell for cell in raw):
+            zeros.append(raw[0][0])
+            continue
+        rows.append(dict(zip(_DISPLAY_FOLD_COLUMNS, map(_decode_cell, raw))))
+    if zeros:
+        rows.extend(dict(row) for row in conn.execute(
+            f"{_DISPLAY_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(zeros)})", zeros))
+    rows.sort(key=lambda row: row["id"])
+    return rows
 _DISPLAY_IDENTITY_INDEX_SQL = ("SELECT id, display_identity, display_order FROM messages "
                               "INDEXED BY idx_messages_display_identity WHERE session_id = ? "
                               "AND display_identity IS NOT NULL" + _VISIBLE)
@@ -94,7 +140,7 @@ class DisplayFoldMixin:
                 try:
                     last_id = 0
                     while True:
-                        rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id)).fetchall()
+                        rows = fold_rows(conn, _DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
                         if not rows:
                             break
                         for row in rows:
@@ -165,7 +211,7 @@ class DisplayFoldMixin:
             first_id: dict[bytes, int] = {}
             last_id = 0
             while True:
-                rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
+                rows = fold_rows(conn, _DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
                 batch_start = last_id
                 updates = []
                 for row in rows:
@@ -174,7 +220,6 @@ class DisplayFoldMixin:
                     order = first_id.setdefault(identity, last_id)
                     if order != row["display_order"] or identity != row["display_identity"]:
                         updates.append((order, identity, last_id))
-                rows.close()
                 if last_id == batch_start:
                     break
                 cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
@@ -189,7 +234,8 @@ class DisplayFoldMixin:
         with write_phase("display_stale_decode"):
             for start in range(0, len(stale), 500):
                 chunk = stale[start:start + 500]
-                for row in conn.execute(f"{_DISPLAY_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})", chunk):
+                for row in fold_rows(conn, f"{_DISPLAY_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})",
+                                     chunk):
                     fresh[row["id"]] = self._display_identity(self._display_dedupe_key(row))
         return {row_id: fresh[row_id] if row_id in fresh else plan[row_id][1]
                 for row_id, _stored, _order in visible}

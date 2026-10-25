@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
@@ -109,3 +110,21 @@ def _stable_tool_key(row: Any) -> Optional[tuple[Any, ...]]:
     if call_ids and all(call_ids):
         return ("assistant", None, row["timestamp"], row["tool_call_id"], call_ids, row["tool_name"])
     return None
+
+
+# hashlib releases the GIL for inputs of 2,048 bytes or more; display_identity stays below it.
+_GIL_HELD_HASH_CHUNK = 2047
+
+
+def display_identity(key: tuple[Any, ...]) -> bytes:
+    """sha256 of ``repr(key)``, fed in chunks below hashlib's GIL-release threshold.
+
+    The digest is identical, but a large payload no longer drops the GIL and then waits a switch
+    interval to take it back. A compaction plan hashes thousands of such rows (6,089 of 16,969 on
+    a live session), which took 11.6 s behind one CPU-bound thread and 1.5 s chunked (2026-10-25).
+    """
+    data = repr(key).encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256()
+    for start in range(0, len(data), _GIL_HELD_HASH_CHUNK):
+        digest.update(data[start:start + _GIL_HELD_HASH_CHUNK])
+    return digest.digest()
