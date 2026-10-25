@@ -2,6 +2,7 @@
 import io
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -390,7 +391,7 @@ def test_remote_events_redact_identity_and_never_probe_host_pid(monkeypatch, cap
     assert all(record["process_start"] == record["rss_bytes"] == "unknown" for record in records)
     assert all(record["pinned"] for record in records)
     assert secret not in caplog.text
-    assert idle_exits == [0]
+    assert len(idle_exits) == 1 and idle_exits[0] > 1800  # pinned: longer, still finite
     host_probe.assert_not_called()
 
 
@@ -507,15 +508,30 @@ def test_remote_retired_poller_cannot_dispatch_a_late_transport_read(monkeypatch
 
 
 @pytest.mark.parametrize("pinned", [False, True])
-def test_remote_runner_self_idle_exit_respects_pinned_lifetime(monkeypatch, tmp_path, pinned):
-    from types import SimpleNamespace
+def test_remote_runner_always_self_exits_and_pinned_outlives_idle_reaper(monkeypatch, tmp_path, pinned):
+    spawned = []
+
+    def spawn_remote(env, env_type, owner, *_, idle_exit, **__):
+        spawned.append(idle_exit)
+        return remote.RemoteKernel(env, env_type, "/isolated/kernel/" + owner, "123", "token", owner)
+
+    monkeypatch.setattr("agent.delegation_context.is_delegated_child_context", lambda: pinned)
+    monkeypatch.setattr(remote, "_spawn_remote_kernel", spawn_remote)
+    monkeypatch.setattr(remote, "_run_attached_cell", lambda *_, **__: {})
+    remote.execute_in_remote_kernel(
+        "cell", env=Environment(), env_type="ssh", task_env_id="owner", sandbox_tools=frozenset(),
+        timeout=2, max_tool_calls=1, reset=False, idle_exit=10,
+    )
+    idle_exit = spawned[0]
+    # A pinned runner is skipped by the host reaper, so it needs a longer window, never none.
+    assert idle_exit > 10 if pinned else idle_exit == 10
 
     monkeypatch.setenv("HERMES_KERNEL_DIR", str(tmp_path))
     namespace: dict = {"__name__": "isolated_runner"}
     source = remote.REMOTE_KERNEL_RUNNER_SOURCE.format(
-        cell_source=local.RUNNER_CELL_SOURCE, capture_limit=1000, idle_exit=0 if pinned else 1)
+        cell_source=local.RUNNER_CELL_SOURCE, capture_limit=1000, idle_exit=idle_exit)
     exec(compile(source, "isolated-remote-runner", "exec"), namespace)
-    times = iter([0, 2000])
+    times = iter([0, idle_exit + 1])
 
     class StillRunning(Exception):
         pass
@@ -525,11 +541,29 @@ def test_remote_runner_self_idle_exit_respects_pinned_lifetime(monkeypatch, tmp_
 
     namespace["os"] = SimpleNamespace(listdir=lambda _: [])
     namespace["time"] = SimpleNamespace(time=lambda: next(times), sleep=idle_wait)
-    if pinned:
-        with pytest.raises(StillRunning):
-            namespace["main"]()
-    else:
-        namespace["main"]()
+    namespace["main"]()
+
+
+@pytest.mark.parametrize("stage", ["teardown", "spawn"])
+def test_attribution_failure_never_aborts_claimed_spawn_or_teardown(monkeypatch, spawn_stub, stage):
+    proc, killed = spawn_stub
+    failing = Mock(side_effect=RuntimeError("attribution"))
+    kernel = local.SessionKernel(("attribution",))
+    if stage == "spawn":
+        monkeypatch.setattr("agent.redact.redact_sensitive_text", failing)
+    spawn(kernel)
+    assert kernel.proc is proc
+    tmpdir = kernel.tmpdir
+    assert tmpdir and os.path.isdir(tmpdir)
+    monkeypatch.setattr("agent.redact.redact_sensitive_text", failing)
+    kernel.teardown()
+    killed.assert_called_once_with(proc, escalate=True)
+    assert not os.path.exists(tmpdir)
+    env = Environment()
+    remote.RemoteKernel(env, "ssh", "/isolated/attribution", "123", "token", "owner").kill()
+    assert any("kill" in command for command in env.commands)
+    assert any("rm -rf" in command for command in env.commands)
+    failing.assert_called()
 
 
 def test_process_cleanup_failures_never_log_subprocess_secrets(monkeypatch, caplog, isolated):

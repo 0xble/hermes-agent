@@ -406,11 +406,20 @@ def _current_caller(task_id: str) -> str:
 
 def _log_kernel_lifecycle(kernel, event: str, *, task_id: str = "", caller: str = "",
                           reason: str = "", proc=None) -> None:
+    """Never raises: teardown and spawn call this after claiming their cleanup, so an escaping
+    attribution failure would orphan the live child and make the retry a no-op."""
+    try:
+        _emit_kernel_lifecycle(kernel, event, task_id=task_id, caller=caller, reason=reason, proc=proc)
+    except Exception:  # health: allow BLE001 -- attribution is best-effort; exception text can carry process or identity details.
+        logger.debug("kernel lifecycle log failed (details omitted)")
+
+
+def _emit_kernel_lifecycle(kernel, event: str, *, task_id: str, caller: str, reason: str, proc) -> None:
     """Local process identity is sampled outside registry locks. Remote PIDs are not host PIDs."""
     from agent.redact import redact_sensitive_text
     remote = hasattr(kernel, "env_type")
     proc = proc if proc is not None else getattr(kernel, "proc", None)
-    pid = kernel.pid or "unknown" if remote else getattr(proc, "pid", "unknown")
+    pid = (kernel.pid or "unknown") if remote else getattr(proc, "pid", "unknown")
     rss = "unknown"
     if not remote and proc is not None:
         import psutil

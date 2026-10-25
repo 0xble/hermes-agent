@@ -65,7 +65,7 @@ def main():
             if f.startswith("cell_req_") and f.endswith(".json")
         )
         if not pending:
-            if IDLE_EXIT_SECONDS > 0 and time.time() - last_activity > IDLE_EXIT_SECONDS:
+            if time.time() - last_activity > IDLE_EXIT_SECONDS:
                 return  # self-reap: nobody is talking to us anymore
             time.sleep(0.2)
             continue
@@ -168,6 +168,15 @@ class RemoteKernel:
                 self.sh(cmd)
             except Exception:  # health: allow BLE001 -- best-effort transport cleanup must not log tokens or output from exceptions.
                 logger.debug("remote kernel cleanup failed (details omitted)")
+
+
+# The host reaper skips child-pinned kernels, so a pinned runner gets a longer self-exit window
+# instead of none: a gateway killed without teardown must not leave it on the remote host forever.
+PINNED_RUNNER_IDLE_FACTOR = 4
+
+
+def _runner_idle_exit(idle_exit: int, pinned: bool) -> int:
+    return idle_exit * PINNED_RUNNER_IDLE_FACTOR if pinned else idle_exit
 
 
 def _kernel_key(owner: str, env_type: str, task_env_id: str, sandbox_tools: frozenset) -> tuple:
@@ -344,7 +353,7 @@ def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
                 if not reused:
                     candidate = _spawn_remote_kernel(
                         env, env_type, owner, task_env_id, sandbox_tools,
-                        idle_exit=0 if kernel.pinned else idle_exit)
+                        idle_exit=_runner_idle_exit(idle_exit, kernel.pinned))
                     if candidate is None:
                         _REGISTRY.discard(key, kernel, reason="spawn_failed")
                         return None, False, state_reset, state_lost

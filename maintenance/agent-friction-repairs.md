@@ -90,8 +90,9 @@ The configured `max_session_kernels` remains an unpinned cache budget, not a
 hard active-runner ceiling. Local and remote registries share idle-LRU selection
 and final-detach reconciliation. The existing reaper also reconciles overshoot
 and promptly removes exited local processes. Live child namespaces are exempt
-from idle TTL, including the remote runner's own idle exit, and remain owned by
-child teardown.
+from the host idle TTL and remain owned by child teardown. A pinned remote runner
+still self-exits after `PINNED_RUNNER_IDLE_FACTOR` times the idle timeout, so a
+gateway killed without teardown cannot leave it running on the remote host.
 
 Resource setup and process publication are fenced by each record's lifetime
 lock. Teardown signals pending spawn before waiting on that fence, closes the
@@ -108,6 +109,8 @@ RSS sampling uses the existing process utilities outside registry locks. Remote
 process-start identity and RSS are explicitly unknown rather than treating a
 remote PID as a host PID. Identity strings pass forced redaction, and touched
 lifecycle failure paths omit exception text, tracebacks, code and transport output.
+Attribution never raises: spawn and teardown log after claiming their cleanup, so
+an escaping failure would orphan the child and make a retry a no-op.
 
 Proof is `tests/tools/test_code_kernel_lifetime.py`, existing real-process
 `tests/tools/test_code_kernel.py`, transport-stub
@@ -121,7 +124,7 @@ Related upstream work, not adopted implementations, is
 separate memory-limit concern, not authority for an RSS kill or hard active cap.
 Upstream guidance was checked at
 `55ee4acdd822b73fb9573a2321531ae3a9d0b3e0`, and the fork adaptation is based on
-`d774cdddca041862144daa682d01148ed93fa24d`. The route retains a bounded fork
+`a6521fc59857ceddead3083f34a730c7f9d0d040`. The route retains a bounded fork
 repair without adding a policy knob or service. Retire this divergence only
 when released upstream preserves the complete lifetime, cache, authority and
 secret-safe attribution contract with these regressions passing.
