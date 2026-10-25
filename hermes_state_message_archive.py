@@ -8,7 +8,7 @@ from hermes_state_common import _placeholders
 from hermes_state_write_metrics import add_write_rows, write_phase
 
 if TYPE_CHECKING:
-    from hermes_state_messages import _FoldPlan
+    from hermes_state_display_fold import _AffectedFold, _FoldPlan
 
 
 _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
@@ -35,7 +35,7 @@ def archive_named_rows(
     db, conn, session_id: str, compacted_messages: list[dict[str, Any]], covered: list[int], *,
     tail_count: int, carried_messages: list[dict[str, Any]] | None, patched_model_config: Any,
     patch: bool, merged_away: set[int],
-    fold_plan: _FoldPlan | None = None,
+    fold_plan: _FoldPlan | _AffectedFold | None = None,
 ) -> int:
     """Archive *covered* as summarized and clone every other active row after the new set.
 
@@ -57,6 +57,7 @@ def archive_named_rows(
             rewind_ids += db._tail_originals(covered_active, tail_count, merged_away)
         rewind_ids += unseen
         rewind_ids = list(dict.fromkeys(rewind_ids))
+    db._seed_display_removals(conn, session_id, fold_plan, rewind_ids)
     archive_message_rows(conn, session_id, rewind_ids)
     # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
     # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
