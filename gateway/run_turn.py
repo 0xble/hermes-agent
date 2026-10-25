@@ -64,6 +64,8 @@ logger = logging.getLogger("gateway.run")
 
 _tool_call_logger_lock = threading.Lock()
 _NO_ATTENDED_ACTIVITY_STAMP = object()
+# Bound on the hygiene gate's wait for a cooldown write scheduled by an unwinding or deferred attempt.
+_HYGIENE_PENDING_COOLDOWN_WAIT_S = 10.0
 _attended_notice_lock = threading.RLock()
 
 
@@ -814,7 +816,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             await self._rehydrate_session_model_override_async(skey)
             if not attended_enabled:
                 await self._expire_attended_temporary_picks_async(skey, user_config)
-            if attended_enabled:
+            # A role hold resolves through the same route decision with attended routing off, so it
+            # takes the same off-loop snapshot rather than reading the session store on the loop.
+            if attended_enabled or state.conversation.model_role:
                 current_override = self._session_model_override(skey) or {}
                 attended_cfg = parse_attended_config(user_config or {})
                 attended_snapshot_epoch = self._session_model_override_epoch(skey)
@@ -823,11 +827,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                     skey, str(current_override.get("model") or ""), attended_cfg.model, user_config,
                 )
                 activity_stamp = attended_snapshot.get("activity_stamp")
-                if state.conversation.last_user_activity_at is None:
-                    state.conversation.last_user_activity_at = activity_stamp
-                await self._expire_attended_temporary_picks_async(
-                    skey, user_config, activity_stamp=activity_stamp,
-                )
+                if attended_enabled:
+                    if state.conversation.last_user_activity_at is None:
+                        state.conversation.last_user_activity_at = activity_stamp
+                    await self._expire_attended_temporary_picks_async(
+                        skey, user_config, activity_stamp=activity_stamp,
+                    )
                 if state.conversation.reasoning_override is None:
                     attended_snapshot["reasoning_override"] = None
                     attended_snapshot["reasoning_scope"] = "session"
@@ -1494,6 +1499,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 return getter(session_entry.session_id) if getter is not None else None
 
             _cooldown_state = None
+            await self._hmwa_hygiene_await_pending_cooldown(session_entry.session_id)
             with suppress(Exception):
                 _cooldown_state = await asyncio.to_thread(_read_cooldown)
             if _cooldown_state and _cooldown_state.get("remaining_seconds", 0) > 0:
@@ -1623,6 +1629,30 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         except Exception:
             logger.debug("%s", failure_label, exc_info=True)
 
+    def _hmwa_hygiene_schedule_cooldown(self, session_id, func, *args, failure_label):
+        """Write a cooldown off the loop from a path that cannot await. The hygiene gate awaits the
+        pending write before reading the durable cooldown, so the next turn cannot re-arm early."""
+        pending = getattr(self, "_hygiene_pending_cooldowns", None)
+        if not isinstance(pending, dict):
+            pending = self._hygiene_pending_cooldowns = {}
+        task = self._retain_background_task(asyncio.ensure_future(
+            self._hmwa_hygiene_off_loop(func, *args, failure_label=failure_label)))
+        pending[session_id] = task
+
+        def _forget(done, _sid=session_id):
+            if pending.get(_sid) is done:
+                del pending[_sid]
+
+        task.add_done_callback(_forget)
+        return task
+
+    async def _hmwa_hygiene_await_pending_cooldown(self, session_id):
+        """Bounded wait for a scheduled cooldown write on ``session_id`` (no-op when none)."""
+        pending = getattr(self, "_hygiene_pending_cooldowns", None)
+        task = pending.get(session_id) if isinstance(pending, dict) else None
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=_HYGIENE_PENDING_COOLDOWN_WAIT_S)
+
     async def _hmwa_hygiene_notify(self, source, meta, message, what):
         """Best-effort user notice on the hygiene thread; failure is logged, never raised."""
         try:
@@ -1717,12 +1747,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 else:
                     # Nothing to adopt (summary failed / fence refused / superseded): flat spacing so
                     # sustained traffic doesn't spawn and abandon a compressor every turn.
-                    _gw._retain_background_task(asyncio.ensure_future(_gw._hmwa_hygiene_off_loop(
-                        _record_hygiene_cooldown, _gw, _sid, _HYGIENE_TURNHOLD_RETRY_SECONDS,
+                    _gw._hmwa_hygiene_schedule_cooldown(
+                        _sid, _record_hygiene_cooldown, _gw, _sid, _HYGIENE_TURNHOLD_RETRY_SECONDS,
                         "hygiene compression deferred: turn-hold budget expired and the "
                         "detached attempt did not commit",
                         failure_label="hygiene turn-hold retry spacing failed",
-                    )))
+                    )
 
             attempt.future.add_done_callback(_hyg_adopt_or_space_retry)
             _log_suffix = (
@@ -1869,8 +1899,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 )
 
             # The unwinding turn cannot await; the streak read and cooldown write are state.db I/O.
-            self._retain_background_task(asyncio.ensure_future(self._hmwa_hygiene_off_loop(
-                _record, failure_label="hygiene unwind cooldown record failed")))
+            self._hmwa_hygiene_schedule_cooldown(
+                session_id, _record, failure_label="hygiene unwind cooldown record failed")
 
     async def _hmwa_hygiene_adopt_transcript(
         self, attempt, _compressed, history, plan, *, session_entry, source, _quick_key, run_generation,

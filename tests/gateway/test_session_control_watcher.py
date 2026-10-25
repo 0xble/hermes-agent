@@ -30,6 +30,7 @@ def state(tmp_path, monkeypatch):
 def _runner(state, *, target_route=True, request_success=True, send_success=True, send_error=None,
             send_retryable=True, injection_result=True, target_origin=True):
     from gateway.run_session_controls import GatewaySessionControlsMixin
+    from gateway.run_background_admission import GatewayBackgroundAdmissionMixin
     from gateway.run_goals import GatewayGoalsMixin
     from gateway.session import Platform, SessionEntry, SessionSource
     from hermes_cli import session_controls
@@ -59,7 +60,7 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
     target = SessionEntry("target-key", "target", now, now, origin=source if target_origin else None)
     requester = SessionEntry("requester-key", "requester", now, now, origin=requester_source)
 
-    class Runner(GatewaySessionControlsMixin, GatewayGoalsMixin):
+    class Runner(GatewaySessionControlsMixin, GatewayGoalsMixin, GatewayBackgroundAdmissionMixin):
         session_store = SimpleNamespace(
             lookup_by_session_id=lambda sid: {"target": target, "requester": requester}.get(sid)
         )
