@@ -9,7 +9,7 @@ _standalone_send`` and text sends now route through ``_send_via_adapter``
 import asyncio
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -140,6 +140,62 @@ def test_standalone_rich_delivery_and_text_retry(monkeypatch, _standalone_send, 
         assert fake.calls[1]["text"] == fake.calls[0]["text"]
         assert fake.calls[1]["channel"] == "D1"
         assert fake.calls[1]["thread_ts"] == "123.456"
+
+
+@pytest.mark.parametrize("route", ["standalone", "live"])
+@pytest.mark.parametrize("rich,reject", [(True, False), (True, True), (False, False)])
+def test_media_caption_blocks_and_fallback_match_both_routes(
+    monkeypatch, _standalone_send, tmp_path, route, rich, reject
+):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.slack import adapter as slack_adapter
+    from tools.send_message_tool import _send_live_adapter_media
+
+    client = AsyncMock()
+    client.chat_postMessage.side_effect = (
+        [{"ok": False, "error": "invalid_blocks"}, {"ok": True, "ts": "171.123"}]
+        if reject else [{"ok": True, "ts": "171.123"}]
+    )
+    client.files_upload_v2.return_value = {"ok": True, "file": {"timestamp": "171.124"}}
+    monkeypatch.setattr("slack_sdk.web.async_client.AsyncWebClient", lambda **kwargs: client)
+    config = PlatformConfig(enabled=True, token="good-token", extra={"rich_blocks": rich})
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"document")
+    text = (
+        "![Photo](https://example.com/p.png)\n\n-# Source\n\n"
+        "```cards\n- title: Details\n  url: https://example.com/details\n```"
+    )
+    media = [(str(document), False)]
+    if route == "standalone":
+        result = asyncio.run(_standalone_send(
+            config, "D1", text, caption=text, media_files=media, thread_id="123.456"))
+    else:
+        adapter = slack_adapter.SlackAdapter(config)
+        adapter._app = MagicMock()
+        adapter._get_client = MagicMock(return_value=client)
+        result = asyncio.run(_send_live_adapter_media(
+            adapter, "D1", text, media, thread_id="123.456", metadata={"thread_id": "123.456"}))
+    assert result["success"]
+    upload = client.files_upload_v2.await_args.kwargs
+    assert upload["channel"] == "D1"
+    assert upload["thread_ts"] == "123.456"
+    assert upload["file"] == str(document)
+    if not rich:
+        assert client.chat_postMessage.await_count == 0
+        expected = slack_adapter._standalone_format_mrkdwn(text) if route == "standalone" else text
+        assert upload["initial_comment"] == expected
+        return
+    assert client.chat_postMessage.await_count == (2 if reject else 1)
+    posted = client.chat_postMessage.await_args_list[0].kwargs
+    assert [b["type"] for b in posted["blocks"]] == ["image", "context", "carousel"]
+    assert all("actions" not in card for card in posted["blocks"][2]["elements"])
+    assert posted["text"] == slack_adapter._standalone_format_mrkdwn(text)
+    assert posted["channel"] == "D1"
+    assert posted["thread_ts"] == "123.456"
+    assert upload["initial_comment"] == ""
+    if reject:
+        fallback = client.chat_postMessage.await_args_list[1].kwargs
+        assert fallback == {key: value for key, value in posted.items() if key != "blocks"}
 
 
 def test_standalone_disabled_rich_mode_stays_text(monkeypatch, _standalone_send):
