@@ -381,13 +381,17 @@ def _render_table(rows: list[str]) -> str:
 # ----------------------------------------------------------------------------
 
 
-def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
+def render_blocks(
+    markdown: str, mrkdwn_fn=None, *, native_image_lines: Optional[set[int]] = None
+) -> Optional[list[Block]]:
     """Convert agent markdown to a Slack Block Kit ``blocks`` list.
     Args:
         markdown: The agent's response text (standard markdown).
         mrkdwn_fn: Optional callable converting a markdown paragraph to Slack
             mrkdwn for ``section`` blocks (the adapter passes
             ``format_message``).  When ``None``, the raw paragraph text is used.
+        native_image_lines: Optional output set of zero-based source lines whose
+            image occurrence was emitted natively. Populated only on success.
 
     Returns:
         A list of Block Kit block dicts, or ``None`` when the content is empty,
@@ -399,6 +403,7 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
 
     try:
         blocks: list[Block] = []
+        image_lines: set[int] = set()
         lines = markdown.replace("\r\n", "\n").split("\n")
         i = 0
         n = len(lines)
@@ -421,6 +426,10 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
 
             special = presentation_line(line, fmt)
             if special:
+                if special["type"] == "image" or any(
+                    element.get("type") == "image" for element in special.get("elements", [])
+                ):
+                    image_lines.add(i)
                 accessory = thumbnail(line) if para else None
                 flush_para()
                 if accessory and blocks and blocks[-1]["type"] == "section":
@@ -567,6 +576,8 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
             # Too structurally complex to express safely — let the caller fall
             # back to plain text rather than truncating and losing content.
             return None
+        if native_image_lines is not None:
+            native_image_lines.update(image_lines)
         return blocks
     except Exception:
         # Never let a rendering bug drop a message.

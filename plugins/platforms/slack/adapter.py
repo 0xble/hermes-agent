@@ -2913,6 +2913,15 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         """``files_upload_v2`` of a local path (or in-memory ``content``) with up to
         ``attempts`` tries on transient errors; re-raises otherwise."""
         source = {"file": file_path} if content is None else {"content": content}
+        if caption and len(self.format_message(caption)) <= self.MAX_MESSAGE_LENGTH:
+            blocks = self._maybe_blocks(caption)
+            if blocks:
+                payload = await _standalone_post_text(
+                    self._client_for(chat_id, metadata), chat_id, self.format_message(caption),
+                    _slack_unfurl_kwargs(self.config.extra), thread_ts, blocks)
+                if not payload.get("ok", True):
+                    return SendResult(success=False, error=f"Slack API error: {payload.get('error', 'unknown')}")
+                caption = None  # Already posted with blocks, never repeat it on an upload retry.
         for attempt in range(attempts):
             try:
                 result = await self._client_for(chat_id, metadata).files_upload_v2(
@@ -3122,7 +3131,9 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
             return [*blocks, self._feedback_block()]
         return blocks
 
-    def _maybe_blocks(self, content: str) -> Optional[list]:
+    def _maybe_blocks(
+        self, content: str, *, native_image_lines: Optional[set[int]] = None
+    ) -> Optional[list]:
         """Block Kit for ``content``: ``markdown_blocks`` (native block, "platform AI" apps only,
         12k cap) over ``rich_blocks`` (local renderer). ``None`` when disabled or declined — a
         ``text`` fallback always accompanies blocks, so ``None`` is safe at any point.
@@ -3137,7 +3148,8 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         if not self._extra_flag("rich_blocks"):
             return None
         try:
-            blocks = render_blocks(content, mrkdwn_fn=self.format_message)
+            blocks = render_blocks(
+                content, mrkdwn_fn=self.format_message, native_image_lines=native_image_lines)
             return sanitize_blocks(self._append_feedback_block(blocks))
         except Exception:  # pragma: no cover - renderer already guards itself
             logger.debug("[Slack] block render failed; using plain text", exc_info=True)
@@ -3145,11 +3157,12 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
 
     def extract_images(self, content: str) -> tuple[list[tuple[str, str]], str]:
         """Native image syntax stays in blocks, other images remain attachments."""
+        native_image_lines: set[int] = set()
         if (self._extra_flag("rich_blocks") and not self._extra_flag("markdown_blocks")
                 and len(self.format_message(content)) <= self.MAX_MESSAGE_LENGTH
-                and self._maybe_blocks(content)):
+                and self._maybe_blocks(content, native_image_lines=native_image_lines)):
             from .rich_media import extract_attachment_images
-            return extract_attachment_images(content, super().extract_images)
+            return extract_attachment_images(content, super().extract_images, native_image_lines)
         return super().extract_images(content)
 
     def format_tool_preview(self, preview) -> str:

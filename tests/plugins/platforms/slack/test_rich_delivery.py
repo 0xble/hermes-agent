@@ -33,6 +33,22 @@ def test_native_images_are_not_uploaded_twice_and_inline_occurrences_remain(adap
     assert "![Again]" not in cleaned
 
 
+@pytest.mark.parametrize("prefix", ["- One\n  ", "1. One\n\t", "> One\n> ", "```text\n"])
+@pytest.mark.parametrize("native_first", [False, True])
+def test_extraction_then_rendering_preserves_unrendered_image_occurrences(adapter, prefix, native_first):
+    slack, _ = adapter
+    content = (f"![Native]({URL})\n\n" if native_first else "") + prefix + f"![Photo]({URL})"
+    attachments, cleaned = slack.extract_images(content)
+    blocks = slack._maybe_blocks(cleaned)
+    assert attachments == [(URL, "Photo")]
+    assert "![Photo]" not in cleaned
+    native = [block for block in blocks if block["type"] == "image"]
+    assert len(native) == int(native_first)
+    if native_first:
+        assert native[0]["image_url"] == URL
+        assert native[0]["alt_text"] == "Native"
+
+
 def test_context_icon_is_preserved(adapter):
     slack, _ = adapter
     text = f"-# ![Source]({URL}) Verified"
