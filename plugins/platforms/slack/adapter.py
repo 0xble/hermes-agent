@@ -1477,7 +1477,8 @@ class SlackAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         return self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH) or [formatted]
 
-    async def _send_slash_ephemeral(self, ctx: dict[str, Any], content: str) -> SendResult:
+    async def _send_slash_ephemeral(self, ctx: dict[str, Any], content: str,
+                                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Replace the ephemeral ack via ``response_url`` (``replace_original`` valid 30 min). First
         chunk replaces the ack, the rest post as new ephemerals; Slack caps a response_url at 5
         POSTs so overflow gets a truncation notice. ``success=False`` lets ``send()`` fall back.
@@ -1502,6 +1503,8 @@ class SlackAdapter(BasePlatformAdapter):
                 for idx, chunk in enumerate(chunks):
                     # Only the first chunk replaces the ack.
                     payload = {"response_type": "ephemeral", "replace_original": idx == 0, "text": chunk}
+                    if len(chunks) == 1:
+                        payload.update(self._context_notice_payload(content, metadata))
                     async with session.post(
                         ctx["response_url"], json=payload, timeout=aiohttp.ClientTimeout(total=10)
                     ) as resp:
@@ -1518,7 +1521,8 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def _post_ephemeral_fallback(
-        self, chat_id: str, ctx: dict[str, Any], content: str) -> SendResult:
+        self, chat_id: str, ctx: dict[str, Any], content: str,
+        metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Deliver a slash reply via ``chat.postEphemeral`` when ``response_url`` fails.
         Keeps the reply private (a public channel post must never happen for an ephemeral reply).
         Cannot ``replace_original``, so the ack stays; no 5-POST cap applies here.
@@ -1532,7 +1536,10 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             client = self._get_client(chat_id)
             for chunk in chunks:
-                result = await client.chat_postEphemeral(channel=chat_id, user=user_id, text=chunk)
+                payload = {"channel": chat_id, "user": user_id, "text": chunk}
+                if len(chunks) == 1:
+                    payload.update(self._context_notice_payload(content, metadata))
+                result = await client.chat_postEphemeral(**payload)
                 payload = _slack_response_payload(result)
                 if not payload.get("ok"):
                     err = payload.get("error", "unknown_error") if payload else "unexpected_response"
@@ -2240,7 +2247,7 @@ class SlackAdapter(BasePlatformAdapter):
                 # stay stuck on "is thinking..." (#24117).
                 return SendResult(success=True)
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
-            last_result = await self._post_chunks(chat_id, team_id, content, formatted, thread_ts)
+            last_result = await self._post_chunks(chat_id, team_id, content, formatted, thread_ts, metadata)
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
                 await self.stop_typing(chat_id, metadata=metadata)
@@ -2268,7 +2275,8 @@ class SlackAdapter(BasePlatformAdapter):
                 retry_after=self._retry_after_from_exc(e) if _retryable else None)
 
     async def _post_chunks(
-        self, chat_id: str, team_id: str, content: str, formatted: str, thread_ts: Optional[str]
+        self, chat_id: str, team_id: str, content: str, formatted: str, thread_ts: Optional[str],
+        metadata: Optional[dict[str, Any]] = None,
     ) -> Any:
         """``chat.postMessage`` each ``MAX_MESSAGE_LENGTH`` chunk; returns the last response.
         Block Kit only for single-chunk messages (a >39k response is pathological for the 50-block /
@@ -2276,7 +2284,7 @@ class SlackAdapter(BasePlatformAdapter):
         ``reply_broadcast`` only the first chunk is also posted to the main channel."""
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         broadcast = self.config.extra.get("reply_broadcast", False)
-        blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+        blocks = self._maybe_blocks(content, metadata) if len(chunks) == 1 else None
         last_result = None
         for i, chunk in enumerate(chunks):
             kwargs = {
@@ -2284,6 +2292,9 @@ class SlackAdapter(BasePlatformAdapter):
                 "mrkdwn": True, **_slack_unfurl_kwargs(self.config.extra)}
             if blocks and i == 0:
                 kwargs["blocks"] = blocks
+                if blocks[0]["type"] == "context":
+                    from gateway.platforms.helpers import strip_markdown
+                    kwargs["text"] = strip_markdown(content)
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
                 if broadcast and i == 0:
@@ -2304,14 +2315,14 @@ class SlackAdapter(BasePlatformAdapter):
         """Ephemeral slash reply replacing the "Running /cmd…" ack: response_url, then
         chat.postEphemeral, NEVER a public post (a private reply must not leak because a path
         failed). Ephemerals don't auto-clear the Assistant status, so clear it here."""
-        ephemeral_result = await self._send_slash_ephemeral(slash_ctx, content)
+        ephemeral_result = await self._send_slash_ephemeral(slash_ctx, content, metadata)
         if ephemeral_result.success:
             await self._clear_thread_status_quietly(chat_id, metadata)
             return ephemeral_result
         logger.warning(
             "[Slack] response_url slash reply failed (%s); retrying via chat.postEphemeral",
             ephemeral_result.error)
-        fallback_result = await self._post_ephemeral_fallback(chat_id, slash_ctx, content)
+        fallback_result = await self._post_ephemeral_fallback(chat_id, slash_ctx, content, metadata)
         if fallback_result.success:
             await self._clear_thread_status_quietly(chat_id, metadata)
             return fallback_result
@@ -2334,6 +2345,7 @@ class SlackAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             kwargs = {"channel": chat_id, "user": user_id, "text": formatted, "mrkdwn": True}
+            kwargs.update(self._context_notice_payload(content, metadata))
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
             result = await self._client_for(chat_id, metadata).chat_postEphemeral(**kwargs)
@@ -2357,7 +2369,9 @@ class SlackAdapter(BasePlatformAdapter):
         with the same (channel, thread, status_key) edit that message in place via ``chat.update``.
         """
         thread_ts = self._resolve_thread_ts(None, metadata) or ""
-        key = (str(chat_id), str(thread_ts), str(status_key))
+        # A terminal/action-needed status must never reuse a compact FYI bubble.
+        style_key = f"{status_key}:context" if (metadata or {}).get("notice_style") == "context" else str(status_key)
+        key = (str(chat_id), str(thread_ts), style_key)
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
             result = await self.edit_message(
@@ -2395,10 +2409,14 @@ class SlackAdapter(BasePlatformAdapter):
                 "channel": chat_id, "ts": message_id, "text": formatted}
             # Block Kit only on the FINAL edit: re-deriving a layout on every streaming flush
             # would be wasteful and jittery. ``text`` is the fallback either way.
-            if finalize:
-                blocks = self._maybe_blocks(content)
+            if finalize or (metadata or {}).get("notice_style") == "context":
+                blocks = self._maybe_blocks(content, metadata)
+                if blocks or (metadata or {}).get("notice_style") == "context":
+                    update_kwargs["blocks"] = blocks or []
                 if blocks:
-                    update_kwargs["blocks"] = blocks
+                    if blocks[0]["type"] == "context":
+                        from gateway.platforms.helpers import strip_markdown
+                        update_kwargs["text"] = strip_markdown(content)
             await self._call_with_block_fallback(
                 lambda: self._client_for(chat_id, metadata), "chat_update", update_kwargs, "edit")
             if finalize:
@@ -2650,7 +2668,7 @@ class SlackAdapter(BasePlatformAdapter):
         md = metadata or {}
         # Streaming contract: interim sends (commentary, segment-tail flushes) and editable
         # previews are never the turn final, whatever their text looks like.
-        if md.get("_interim_send") or md.get("expect_edits"):
+        if md.get("_interim_send") or md.get("expect_edits") or md.get("notice_style") == "context":
             return None
         key = self._stream_key(chat_id, md)
         stream = self._active_streams.get(key) if key else None
@@ -3126,7 +3144,16 @@ class SlackAdapter(BasePlatformAdapter):
             return [*blocks, self._feedback_block()]
         return blocks
 
-    def _maybe_blocks(self, content: str) -> Optional[list]:
+    def _context_notice_payload(self, content: str, metadata: Optional[dict[str, Any]]) -> dict:
+        """Context-only fields for ephemeral transports, without changing unmarked replies."""
+        if (metadata or {}).get("notice_style") == "context":
+            blocks = self._maybe_blocks(content, metadata)
+            if blocks and blocks[0]["type"] == "context":
+                from gateway.platforms.helpers import strip_markdown
+                return {"blocks": blocks, "text": strip_markdown(content)}
+        return {}
+
+    def _maybe_blocks(self, content: str, metadata: Optional[dict[str, Any]] = None) -> Optional[list]:
         """Block Kit for ``content``: ``markdown_blocks`` (native block, "platform AI" apps only,
         12k cap) over ``rich_blocks`` (local renderer). ``None`` when disabled or declined — a
         ``text`` fallback always accompanies blocks, so ``None`` is safe at any point.
@@ -3134,6 +3161,10 @@ class SlackAdapter(BasePlatformAdapter):
         1. ``markdown_blocks`` — Slack's native ``markdown`` block renders the *raw* standard markdown
         (tables, headers, code fences with syntax highlighting) with Slack doing the translation (#8552). 2.
         """
+        if (metadata or {}).get("notice_style") == "context":
+            formatted = self.format_message(content)
+            if formatted.strip() and len(formatted) <= 3000:
+                return [{"type": "context", "elements": [{"type": "mrkdwn", "text": formatted}]}]
         if self._extra_flag("markdown_blocks"):
             md_blocks = self._markdown_block_payload(content)
             if md_blocks:
