@@ -35,7 +35,14 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   and topic-session binding peeks, and Slack thread hydration (active-session check, watermark
   read and write) run through `asyncio.to_thread`. Concurrent Slack replies in one thread may
   now persist watermarks out of order; a regressed watermark only re-injects already-seen replies
-  after a restart. The Slack DM seed (`_seed_dm_session`, and the `_adopt_legacy_slack_entry`
+  after a restart. The off-loop `/reasoning` rehydration publishes the stored pick only while
+  `ConversationState.reasoning_override_epoch` is unchanged (every write of the field and every
+  conversation `clear()` bumps it), so a set, reset or boundary during the read wins. Cooldown
+  writes scheduled from the done-callback and unwind paths are tracked per session id, and the
+  hygiene gate waits for a pending one (bounded by `_HYGIENE_PENDING_COOLDOWN_WAIT_S`, 10 s)
+  before reading the durable cooldown. With SQLite available, the failure-streak bump refreshes
+  only a live session's in-memory view, never get-or-creates one from a worker thread. A role hold
+  with attended routing off takes the same off-loop resolution snapshot. The Slack DM seed (`_seed_dm_session`, and the `_adopt_legacy_slack_entry`
   and compression-tip reads under it) belongs to PR #814 (`slack-seed-off-loop`).
 - The pre-open deleted-WAL holder scan (host-wide libproc on macOS, already bounded at 5 s
   fail-open by upstream `233434b41447`; a cold scan took 77 s on the loaded host) reuses a

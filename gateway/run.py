@@ -136,12 +136,12 @@ def _hygiene_cooldown_for_failure(gateway, session_key: str, base_cooldown_secon
     (#79624). The streak is mirrored to SQLite by rotation-stable ``session_key`` so it outlives both the
     per-run agent and gateway restarts; ``PersistentState`` keeps the hot in-process view.
     """
-    streak, state = 1, None
-    try:
-        state = gateway._session_state(session_key).persistent
+    increment, streak, state = getattr(_gateway_session_db_inner(gateway), "increment_hygiene_failure_streak", None), 1, None
+    try:  # SQLite authoritative: refresh only a live session (off-loop get-or-create resurrects one)
+        lookup = gateway._peek_session_state if callable(increment) else gateway._session_state
+        state = getattr(lookup(session_key), "persistent", None)
     except Exception as exc:
         logger.debug("hygiene failure streak update failed: %s", exc)
-    increment = getattr(_gateway_session_db_inner(gateway), "increment_hygiene_failure_streak", None)
     if callable(increment):
         try:
             streak = max(1, int(increment(session_key)))
