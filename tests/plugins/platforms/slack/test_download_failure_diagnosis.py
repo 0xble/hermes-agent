@@ -18,3 +18,13 @@ def test_login_page_is_an_access_problem():
 def test_undecodable_image_is_not_blamed_on_slack():
     detail = _describe("Refusing to cache non-image data as .heic (starts with: '\\x00\\x00\\x00$ftypheic')")
     assert "unsupported format" in detail and "permission" not in detail
+
+
+def test_svg_is_unsupported_not_an_access_problem():
+    detail = _describe("Refusing to cache non-image data as .png (starts with: '<svg xmlns=\"http://www.w3.org\"')")
+    assert "unsupported format" in detail
+
+
+def test_login_page_after_blank_lines_is_still_an_access_problem():
+    detail = _describe("Refusing to cache non-image data as .jpg (starts with: '\\r\\n\\r\\n<!DOCTYPE html>')")
+    assert "scope, auth, or file-permission" in detail

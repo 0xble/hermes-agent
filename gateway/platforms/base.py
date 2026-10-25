@@ -697,6 +697,7 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
         if png is None:
             snippet = data[:80].decode("utf-8", errors="replace")
             raise ValueError(f"Refusing to cache non-image data as {ext} (starts with: {snippet!r})")
+        validate_inbound_media_size(len(png), media_type="image")  # PNG can be several times larger
         data, ext = png, ".png"
     return _write_cache_file(get_image_cache_dir(), "img", ext, data)
 
