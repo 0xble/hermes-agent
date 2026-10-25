@@ -374,6 +374,12 @@ def is_genuine_user_message(event: Any) -> bool:
     """Return true only for a human message that should reset attended idle time."""
     if event is None or bool(getattr(event, "internal", False)):
         return False
+    if bool(getattr(getattr(event, "source", None), "is_bot", False)):
+        return False
+    # Recovery is not arrival. A legacy spool's ordering/flush time is not a receipt.
+    if (getattr(event, "_hermes_recovered_followup", False)
+            and getattr(event, "_attended_activity_received_at", None) is None):
+        return False
     metadata = getattr(event, "metadata", None) or {}
     if not isinstance(metadata, Mapping):
         metadata = {}
