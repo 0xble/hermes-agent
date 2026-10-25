@@ -87,3 +87,12 @@ registered plugin. Resolution keeps catalog and plugin key names plus the existi
 overlay, without changing endpoint/transport precedence. The existing CommandCode
 resolution assertion and `tests/hermes_cli/test_provider_catalog_credentials.py`
 guard this. Retire the patch when upstream resolution preserves the same union.
+
+Fork patch identity: `lpg-qualification-fixtures`. The inherited nested-emphasis
+renderer fix had not regenerated the Telegram conformance vectors. Regenerate
+with `scripts/generate_conformance_vectors.py`, retaining the unchanged corpus
+and all parity assertions. The bare Slack adapter test double must initialize
+its constructor-owned channel-type cache. Local quickstart sequencing tests use
+the existing deterministic preflight fixture, preserving both successful setup
+leg assertions and the separate refusal tests. Guards: `tests/conformance/test_vector_generator.py`,
+`tests/gateway/test_slack_mention.py`, and `tests/hermes_cli/test_local_quickstart.py`.
