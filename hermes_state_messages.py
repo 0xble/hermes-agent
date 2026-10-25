@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from agent.context_compressor import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _is_checkpoint_item,
-    _newest_checkpoint_carrier, split_user_originated_turn)
+    _newest_checkpoint_carrier, split_user_originated_turn, ContextCompressor)
 from agent.memory_context import sanitize_context
 from agent.message_metadata import (
     CANONICAL_ROW, DATA_USE, DB_ROW_SNAPSHOT, lift_data_use, MESSAGE_UID, REPLAY_PERSISTED_CONTENT, TOOL_CALL_UID, TOOL_CALL_UIDS,
@@ -33,6 +33,17 @@ from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_
 from hermes_state_message_archive import archive_message_rows
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
+
+
+def _display_summary_carrier(message):
+    """A folded assistant carrier represents the original reply, not its synthetic handoff.
+
+    Keep the wrapper in model replay. Display reads share this projection after UID folding,
+    so the original reply is neither duplicated nor hidden as an all-synthetic summary.
+    """
+    if message.get("role") == "assistant" and ContextCompressor._is_context_summary_message(message):
+        return ContextCompressor._strip_context_summary_handoff_message(message) or message
+    return message
 
 # One INSERT shape for every message writer (append, batch, replace, compact, import).
 _INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_call_id,
@@ -1524,7 +1535,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             rows = self._read_all(sql, params)
             if latest:
                 rows.reverse()
-        return [self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True) for row in rows]
+        messages = [self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True) for row in rows]
+        return [_display_summary_carrier(message) for message in messages] if include_compacted else messages
 
     @staticmethod
     def _tool_exclusion_sql(exclude_tools: Sequence[str], exclude_prefixes: Sequence[str]) -> tuple[str, list]:
@@ -1772,7 +1784,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             rows = self._dedupe_display_generations(rows, drop_removed=display)
         return self._rows_to_conversation(rows, session_id=session_id, include_ancestors=include_ancestors,
             repair_alternation=repair_alternation, include_row_ids=include_row_ids,
-            include_summary_markers=repair_alternation)
+            include_summary_markers=repair_alternation, display=display)
 
     def conversation_revision(self, session_id: str, include_ancestors: bool = False) -> tuple:
         """A cheap fingerprint of what ``get_messages_as_conversation`` (live rows) would load: the
@@ -1811,7 +1823,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
 
     def _rows_to_conversation(self, rows, *, session_id: str, include_ancestors: bool, repair_alternation: bool,
                               include_row_ids: bool = False,
-                              include_summary_markers: bool = False) -> list[dict[str, Any]]:
+                              include_summary_markers: bool = False, display: bool = False) -> list[dict[str, Any]]:
         """Decode fetched rows (ordered by id, pre-filtered) into OpenAI format, stable key order. Every dict is
         stamped ``_DB_PERSISTED_MARKER_KEY`` (born durable) so an identity-losing handoff never re-appends the
         transcript on flush. Unaddressed live-replay projections also carry the stored-row CAS digest: if a later rewrite
@@ -1886,6 +1898,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                 unindexed_tool_owners.clear()
                 if tool_uid := resolve_tool_call_uid(tool_uid_index, row["tool_call_id"]):
                     msg[TOOL_CALL_UID] = tool_uid
+            if display:
+                msg = _display_summary_carrier(msg)
             if include_ancestors:
                 skip, exact_clone_key = self._dedupe_replayed_user(messages, msg, exact_user_clones)
                 if skip:
@@ -1928,7 +1942,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             include_ancestors=False, repair_alternation=True, include_row_ids=True, include_summary_markers=True)
         display_history = self._rows_to_conversation(
             self._dedupe_display_generations(rows, drop_removed=True), session_id=session_id,
-            include_ancestors=True, repair_alternation=False, include_row_ids=True)
+            include_ancestors=True, repair_alternation=False, include_row_ids=True, display=True)
         return model_history, display_history
 
     def _resume_lineage_ids(self, session_id: str) -> list[str]:

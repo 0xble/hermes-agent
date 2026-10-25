@@ -784,6 +784,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - The next hosted run exposed attribute and projection losses not visible to undefined-name scans:
   - Display-fold projections omitted the summary-carrier UID and flag. Both the off-lock plan and
     its stale-row fallback now use the same carrier identity and retained-slot rule as the full fold.
+    After folding, display reads unwrap an assistant's composite carrier back to its original reply,
+    while model reads retain the summary verbatim. Otherwise the selected carrier hides the reply
+    as synthetic context even though the original row remains durably archived. SQL message reads,
+    conversation display, export and atomic resume share this projection. Linux guards cover the
+    complete transcript ledger (10 passed), manual compression (29), planned/full carrier folding
+    (2), compacted reads (47), off-writer folding (26) and stale held-generation fences (7).
   - The fork turn mixin lost the upstream persistence mixin base, hiding usage-window wording and
     response-before-limit-offer methods. Existing fork overrides still win in the restored MRO.
   - Prune rewrite calls the shared upstream transcript transaction helper, retaining rollback row
