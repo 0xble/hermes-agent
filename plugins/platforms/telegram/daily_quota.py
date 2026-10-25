@@ -198,14 +198,14 @@ class DailyQuota:
         """
         if kind is None or kind == OUTBOUND_FINAL:
             return False
-        calls = self.call_pressure(chat_key)
+        # Untagged traffic (busy acks, button taps, restart and recovery notes, cron delivery) is a
+        # few hundred calls a day and mostly answers the user, so only the message rule meters it.
+        calls = 0.0 if trigger == TRIGGER_UNTAGGED else self.call_pressure(chat_key)
         if trigger == "typed":
             return kind != OUTBOUND_NOTICE and calls >= 1.0
         pressure = self.pressure(chat_key)
         if kind == OUTBOUND_NOTICE:
-            # Untagged covers busy acks and button taps answering the user, so only labelled
-            # background producers lose notices to the call rule.
-            return pressure >= PRESSURE_NOTICES or (calls >= 1.0 and trigger != TRIGGER_UNTAGGED)
+            return pressure >= PRESSURE_NOTICES or calls >= 1.0
         # progress, typing, interim edits, drafts
         return pressure >= PRESSURE_COSMETIC or calls >= BACKGROUND_CALL_FRACTION
 
@@ -218,7 +218,8 @@ class DailyQuota:
             time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(window.start)), _top(window.calls))
         if wait >= STRICT_PENALTY_SECS:
             # The strict day starts when sending resumes; time inside the ban spends nothing.
-            self._penalized_at[chat_key] = self._wall() + wait
+            # A shorter penalty landing inside a longer one must not pull that end earlier.
+            self._penalized_at[chat_key] = max(self._wall() + wait, self._penalized_at.get(chat_key, 0.0))
             self._persist_penalty(chat_key)
         if wait < RESET_PENALTY_SECS:
             return
@@ -343,7 +344,7 @@ class DailyQuota:
             return
         try:
             with self._db() as conn:
-                conn.execute("INSERT INTO daily_penalty VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET at=excluded.at",
+                conn.execute("INSERT INTO daily_penalty VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET at=MAX(at, excluded.at)",
                              (key, self._penalized_at[key]))
                 conn.commit()
         except (OSError, sqlite3.Error):

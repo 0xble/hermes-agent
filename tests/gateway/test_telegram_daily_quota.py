@@ -550,13 +550,15 @@ def test_call_ceiling_comes_from_platform_extra(tmp_path):
     assert _adapter(tmp_path / "default")._daily_quota().call_soft_ceiling == dq.DEFAULT_CALL_SOFT_CEILING
 
 
-def test_untagged_notices_survive_the_call_budget(tmp_path):
-    """Busy acks and button taps run untagged; they answer the user, so the call rule spares them."""
+def test_untagged_traffic_is_outside_the_call_budget(tmp_path):
+    """Busy acks, button taps and restart notes run untagged and answer the user."""
     quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path, wall=Wall(_utc("2026-10-24 12:00:00")))
     _spend_calls(quota, 10)
     assert quota.sheds(CHAT, OUTBOUND_NOTICE, "untagged") is False
     assert quota.sheds(CHAT, OUTBOUND_NOTICE, "goal") is True
-    assert quota.sheds(CHAT, OUTBOUND_PROGRESS, "untagged") is True
+    # Restart and recovery notes ride untagged _interim_send: the call rule spares them too.
+    assert quota.sheds(CHAT, OUTBOUND_PROGRESS, "untagged") is False
+    assert quota.sheds(CHAT, OUTBOUND_PROGRESS, "goal") is True
 
 
 def test_standalone_lane_penalty_reaches_the_running_gateway(tmp_path):
@@ -591,3 +593,13 @@ async def test_typed_interim_notice_is_delivered_at_the_call_ceiling(tmp_path):
         reset_trigger(token)
     assert result.error != "daily_budget_shed"
     adapter._bot.send_message.assert_awaited()
+
+
+def test_shorter_penalty_inside_a_longer_one_keeps_the_later_end(tmp_path):
+    wall = Wall(_utc("2026-10-25 00:03:00"))
+    quota = DailyQuota(call_soft_ceiling=100, profile_dir=tmp_path, wall=wall)
+    quota.note_retry_after(CHAT, 36261.0)  # ends 10:07:21
+    quota.note_retry_after(CHAT, 700.0)
+    wall.t = _utc("2026-10-26 10:07:00")  # within 24h of the long ban's end
+    assert quota.call_ceiling(CHAT) == 50
+    assert DailyQuota(call_soft_ceiling=100, profile_dir=tmp_path, wall=wall).call_ceiling(CHAT) == 50
