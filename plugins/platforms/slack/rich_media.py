@@ -14,6 +14,44 @@ import hermes_yaml as yaml
 IMAGE_RE = re.compile(r"!\[([^\]\n]*)\]\((https://[^\s)]+)\)")
 
 
+def extract_attachment_images(content: str, extract):
+    """Shield only renderer-owned image occurrences from the legacy extractor.
+
+    Occurrences, not URLs: the same URL can legitimately appear again inline as
+    an attachment. Fences remain opaque to native-image parsing.
+    """
+    prefix = "\x00HERMES_NATIVE_IMAGE"
+    while prefix in content:
+        prefix += "_"
+    saved = {}
+    lines = []
+    fence = None
+    for line in content.splitlines(keepends=True):
+        marker = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if marker:
+            token = marker[1]
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence):
+                fence = None
+            lines.append(line)
+            continue
+        match = None
+        if fence is None:
+            match = image_line(line)
+            if match is None and line.strip().startswith("-# "):
+                match = IMAGE_RE.match(line.strip()[3:].strip())
+        if match and https_url(match[2]):
+            key = f"{prefix}{len(saved)}\x00"
+            saved[key] = match[0]
+            line = line.replace(match[0], key, 1)
+        lines.append(line)
+    images, cleaned = extract("".join(lines))
+    for key, value in saved.items():
+        cleaned = cleaned.replace(key, value)
+    return images, cleaned
+
+
 def https_url(value, limit: int = 3000) -> bool:
     if not isinstance(value, str) or len(value) > limit or any(c.isspace() for c in value):
         return False
