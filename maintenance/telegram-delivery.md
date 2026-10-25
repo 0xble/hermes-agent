@@ -201,9 +201,12 @@ while message counts (3024, 2407) were below ban-free days (3112, 4157). Typing 
 messages, so background producers spent ~9k calls overnight before the message rule engaged, and
 typed turns (10116 of the 19875) were never shed. Every metered call now also counts against
 `daily_call_soft_ceiling` (default 12000): background cosmetics shed at 50% of it, and at 100%
-typed turns shed typing, interim edits and progress while background notices shed too. Typed
-notices and all finals are never shed. A penalty of 600s or more halves the call budget for 24h,
-persisted in `daily_penalty` in `telegram-flood-state.db`. Visible effect: on a heavy day, typed
+typed turns shed typing, interim edits and explicitly labelled progress while labelled background
+notices shed too. Typed notices, untagged notices (busy acks, button taps) and all finals are never
+shed, and a typed turn's unlabelled `_interim_send` sends (/login codes, approval fallbacks, stuck
+warnings) are not inferred as progress. A penalty of 600s or more halves the call budget for the 24h
+after the penalty ends, persisted in `daily_penalty` in `telegram-flood-state.db` and re-read on
+every flush so a penalty the standalone lane records reaches the running gateway. Visible effect: on a heavy day, typed
 turns lose the typing indicator and live progress bubble late in the Telegram day; the answer still
 arrives. `0` disables the call budget (counting continues). Regression: the call-budget cases in
 `tests/gateway/test_telegram_daily_quota.py`. Rollback: revert the `fix(telegram): bound daily
