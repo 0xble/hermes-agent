@@ -2,6 +2,7 @@
 
 import os
 import signal
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -106,7 +107,13 @@ def test_execute_gateway_shutdown_skips_descendant_scan_on_deadline_worker(monke
         ready.set()
         return proc
 
-    def slow_children(_self, recursive=False):
+    real_children = psutil.Process.children
+
+    def slow_children(self, recursive=False):
+        # The test live-system guard snapshots descendants inside its own killpg wrapper;
+        # only a scan issued by the production kill path is under test.
+        if not sys._getframe(1).f_code.co_filename.endswith(os.path.join("environments", "local.py")):
+            return real_children(self, recursive=recursive)
         scan_threads.append(threading.current_thread().name)
         release_scan.wait(10)
         return []
