@@ -15,6 +15,9 @@ from typing import Any, List
 import pytest
 
 from gateway.platforms.base import SendResult
+from gateway.config import Platform
+from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
 from tools import approval as _approval
 from tools.approval_gateway_wait import _ApprovalEntry
 
@@ -61,9 +64,10 @@ def _runner(adapter):
     from gateway.run_turn_runner import TurnRunner
 
     runner = object.__new__(TurnRunner)
-    runner._ctx = SimpleNamespace(
+    runner._ctx = TurnContext(
         _status_adapter=adapter, _status_chat_id="C1", _status_thread_metadata={"thread_id": "t1"},
-        session_key=SESSION, source=SimpleNamespace(chat_id="C1", platform="telegram", session_key=SESSION),
+        session_key=SESSION,
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="C1", thread_id="t1"),
     )
 
     class _Fut:
