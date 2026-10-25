@@ -254,27 +254,27 @@ def _source_install_python(source: Path, home: Path | None = None) -> Path:
     return Path(sys.executable)
 
 
-def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
-    """Infer selected leaf extras from installed direct requirements.
+def _optional_dependencies(project: Path) -> dict[str, list[str]]:
+    """The candidate's declared extras; none for a tree without `pyproject.toml`."""
+    project_file = project / "pyproject.toml"
+    return (tomllib.loads(project_file.read_text(encoding="utf-8-sig"))["project"]
+            .get("optional-dependencies", {}) if project_file.is_file() else {})
 
-    Wheel metadata lists *available*, not selected, extras. A uniquely named
-    installed requirement identifies a partially installed leaf group; groups
-    with all applicable direct requirements installed identify the remainder.
+
+def _leaf_requirements(project: Path) -> dict[str, set[str]]:
+    """Each leaf extra's direct requirements that apply on this host.
+
+    Composite extras are reconstructed from their leaf groups, and an extra with no
+    applicable requirement here (platform-gated off) is absent.
     """
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
     from packaging.markers import default_environment
 
-    project_file = project / "pyproject.toml"
-    groups = (tomllib.loads(project_file.read_text(encoding="utf-8-sig"))["project"]
-              .get("optional-dependencies", {}) if project_file.is_file() else {})
-    if not groups:
-        return []
-    installed = set(_active_distributions(source_python))
     declared: dict[str, set[str]] = {}
-    for extra, requirements in groups.items():
+    for extra, requirements in _optional_dependencies(project).items():
         if extra in {"all", "termux", "termux-all"}:
-            continue  # composite extras are reconstructed from their leaf groups
+            continue
         direct = set()
         for raw in requirements:
             req = Requirement(raw)
@@ -284,6 +284,20 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
                 direct.add(canonicalize_name(req.name))
         if direct:
             declared[extra] = direct
+    return declared
+
+
+def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
+    """Infer selected leaf extras from installed direct requirements.
+
+    Wheel metadata lists *available*, not selected, extras. A uniquely named
+    installed requirement identifies a partially installed leaf group; groups
+    with all applicable direct requirements installed identify the remainder.
+    """
+    declared = _leaf_requirements(project)
+    if not declared:
+        return []
+    installed = set(_active_distributions(source_python))
     unique = {name for extra, names in declared.items() for name in names
               if sum(name in other for other in declared.values()) == 1}
     selected = {extra for extra, names in declared.items()
@@ -393,7 +407,9 @@ def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv",
     if source is not None:
         source_python = source_python or _source_install_python(source)
         extras.update(_active_locked_extras(source_python, release))
-    extras.update(_committed_extras(previous, release))
+    # At first migration nothing is active yet; the source checkout's own committed
+    # environment is what its gateway ran.
+    extras.update(_committed_extras(previous if previous is not None else source, release))
     _build_venv(release, uv=uv, extras=sorted(extras), python=source_python)
     if source is not None:
         restore_active_distributions(source, release, uv=uv, source_python=source_python)
@@ -411,7 +427,19 @@ def _committed_extras(release: Path | None, project: Path) -> set[str]:
         return set()
     from pm.environments import project_python
     python = project_python(release)
-    return set(_active_locked_extras(python, project)) if python.is_file() else set()
+    inferred = set(_active_locked_extras(python, project)) if python.is_file() else set()
+    return (_recorded_extras(release) & set(_optional_dependencies(project))) | inferred
+
+
+def _recorded_extras(release: Path) -> set[str]:
+    """The extras PM recorded for `release`'s committed environment; none when nothing is committed."""
+    from pm.environments import runtime_facts_path
+    try:
+        data = json.loads(runtime_facts_path(release).read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return set()
+    fact = data.get("packages", {}).get("venv", {})
+    return set(fact.get("extras", [])) if fact.get("environment") else set()
 
 
 def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
@@ -427,16 +455,30 @@ def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
     from pm.paths import repo_root
     if previous is None or previous == candidate or repo_root() != candidate.resolve():
         return []
-    missing = sorted(_committed_extras(previous, candidate) - _committed_extras(candidate, candidate))
+    from pm.environments import project_python
+    # Missing means the candidate's boot environment lacks an applicable requirement, so a
+    # recorded extra that is platform-gated off, or already installed, never re-syncs.
+    leaves = _leaf_requirements(candidate)
+    installed = set(_active_distributions(project_python(candidate)))
+    missing = sorted(extra for extra in _committed_extras(previous, candidate)
+                     if extra in leaves and not leaves[extra] <= installed)
     if missing:
         import pm
-        pm.sync_venv(missing, explicit=True, project_root=candidate)
+        from hermes_cli.update_receipt import record_step
+        # An update never fails because of a plugin: evict one that keeps the candidate's
+        # environment from building, as every other update-path sync does.
+        pm.sync_venv(missing, explicit=True, project_root=candidate, evict_incompatible_plugins=True)
+        record_step("immutable_extras_carry", True, f"carried {', '.join(missing)} from {previous}")
     return missing
 
 
 def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) -> None:
-    """Load enabled plugins with the candidate interpreter before promotion."""
-    python = _release_python(release)
+    """Load enabled plugins with the interpreter the candidate will boot, before promotion.
+
+    That is its committed PM generation when one exists (a carry commits one), else `.venv`.
+    """
+    from pm.environments import project_python
+    python = project_python(release)
     if not python.exists():
         raise RuntimeError(f"candidate interpreter missing: {python}")
     plugin_dir = plugin_dir or home / "plugins"

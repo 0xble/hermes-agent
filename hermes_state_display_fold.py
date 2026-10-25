@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 import sqlite3
 from typing import Optional
@@ -14,10 +15,61 @@ from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_
 logger = logging.getLogger("hermes_state")
 _Freshness = tuple[sqlite3.Connection, int, int]
 _VISIBLE = " AND (active = 1 OR compacted = 1)"
-_DISPLAY_FOLD_COLUMNS_SQL = ("SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, "
-                            "display_kind, display_metadata, display_order, display_identity FROM messages")
+_DISPLAY_FOLD_COLUMNS = ("id", "role", "content", "timestamp", "tool_call_id", "tool_calls", "tool_name",
+                         "display_kind", "display_metadata", "display_order", "display_identity")
+_DISPLAY_FOLD_COLUMNS_SQL = f"SELECT {', '.join(_DISPLAY_FOLD_COLUMNS)} FROM messages"
 _DISPLAY_FOLD_SCAN_SQL = (_DISPLAY_FOLD_COLUMNS_SQL + " INDEXED BY idx_messages_session_id "
                          "WHERE session_id = ? AND id > ?" + _VISIBLE + " ORDER BY id LIMIT 1000")
+# The plan's one-step pages hold the page as JSON too (up to ~5x a fetchall, ~17x for control
+# characters), so they stay small enough for memory and SQLITE_MAX_LENGTH; ~85 steps per 17k rows.
+_DISPLAY_PLAN_PAGE_SQL = _DISPLAY_FOLD_SCAN_SQL.replace("LIMIT 1000", "LIMIT 200")
+
+
+def _exact_cell(column: str) -> str:
+    """One column as JSON that decodes to the exact value and type ``sqlite3`` returns. REAL goes
+    through ``%!.17g`` (the runtime's JSON REAL rendering keeps only 15 digits); a REAL zero is
+    flagged because neither form keeps its sign."""
+    return (f"CASE typeof({column}) WHEN 'blob' THEN json_object('b', hex({column})) "
+            f"WHEN 'real' THEN CASE WHEN {column} = 0 THEN json_object('z', 0) "
+            f"ELSE json_object('r', printf('%!.17g', {column})) END "
+            f"ELSE json_array({column}) END")
+
+
+def _decode_cell(cell):
+    if isinstance(cell, list):
+        return cell[0]
+    if "b" in cell:
+        return bytes.fromhex(cell["b"])
+    return float(cell["r"])
+
+
+def one_step_rows(conn: sqlite3.Connection, select_sql: str, params, columns: tuple[str, ...]) -> list[tuple]:
+    """The rows of *select_sql* (selecting *columns*), fetched in ONE SQLite step, in no set order.
+
+    Each row a cursor yields releases and re-takes the GIL. With the gateway's busy threads every
+    re-take waits a switch interval, so the off-lock plan's ~17k rows took 80 s behind a single
+    CPU-bound thread (0.5 s alone) and pinned a compression worker past its ceiling, and the
+    in-lock 19k-row display index held the writer 5-9 s (2026-10-25). A page holding a REAL zero
+    is refetched conventionally to keep the zero's sign.
+    """
+    cells = ", ".join(_exact_cell(column) for column in columns)
+    page = conn.execute(f"SELECT json_group_array(json_array({cells})) FROM ({select_sql})", params).fetchone()[0]
+    rows = []
+    for raw in json.loads(page):
+        if any(isinstance(cell, dict) and "z" in cell for cell in raw):
+            return [tuple(row) for row in conn.execute(select_sql, params)]
+        rows.append(tuple(map(_decode_cell, raw)))
+    return rows
+
+
+def fold_rows(conn: sqlite3.Connection, select_sql: str, params) -> list[dict]:
+    """Rows of a ``_DISPLAY_FOLD_COLUMNS_SQL`` query as dicts in id order, in one SQLite step."""
+    rows = [dict(zip(_DISPLAY_FOLD_COLUMNS, row))
+            for row in one_step_rows(conn, select_sql, params, _DISPLAY_FOLD_COLUMNS)]
+    rows.sort(key=lambda row: row["id"])
+    return rows
+
+
 _DISPLAY_IDENTITY_INDEX_SQL = ("SELECT id, display_identity, display_order FROM messages "
                               "INDEXED BY idx_messages_display_identity WHERE session_id = ? "
                               "AND display_identity IS NOT NULL" + _VISIBLE)
@@ -94,7 +146,7 @@ class DisplayFoldMixin:
                 try:
                     last_id = 0
                     while True:
-                        rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id)).fetchall()
+                        rows = fold_rows(conn, _DISPLAY_PLAN_PAGE_SQL, (session_id, last_id))
                         if not rows:
                             break
                         for row in rows:
@@ -118,11 +170,10 @@ class DisplayFoldMixin:
         for name, sql in (("display_identity", _DISPLAY_IDENTITY_INDEX_SQL),
                           ("display_backfill", _DISPLAY_BACKFILL_INDEX_SQL)):
             with write_phase(f"{name}_enumerate", thread_cpu=True):
-                count = 0
-                for row in conn.execute(sql, (session_id,)):
-                    rows[row[0]] = (row[0], row[1], row[2])
-                    count += 1
-                add_write_rows(f"{name}_rows", count)
+                fetched = one_step_rows(conn, sql, (session_id,), ("id", "display_identity", "display_order"))
+                for row in fetched:
+                    rows[row[0]] = row
+                add_write_rows(f"{name}_rows", len(fetched))
         with write_phase("display_materialize", thread_cpu=True):
             add_write_rows("display_materialized_rows", len(rows))
             return [rows[row_id] for row_id in sorted(rows)]
@@ -156,7 +207,7 @@ class DisplayFoldMixin:
         if plan is not None:
             try:
                 visible = self._visible_display_index(conn, session_id)
-            except sqlite3.OperationalError as exc:  # a display index is missing: full scan
+            except sqlite3.DatabaseError as exc:  # a display index is missing (or a page too long): full scan
                 logger.debug("display index read failed for %s, full fold: %s", session_id, exc)
             else:
                 self._fold_display_orders(conn, visible, plan)
@@ -165,6 +216,7 @@ class DisplayFoldMixin:
             first_id: dict[bytes, int] = {}
             last_id = 0
             while True:
+                # Streams: this no-plan fallback must retain identities, not a page of payloads.
                 rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
                 batch_start = last_id
                 updates = []
