@@ -731,16 +731,18 @@ def _verify_transaction(paths: ReleasePaths, record: dict[str, Any]) -> None:
             raise RuntimeError("launchd plist differs from transaction intent")
 
 
-def _runs_hermes_main(argv: list[str], root: Path) -> bool:
+def _runs_hermes_main(argv: list[str], root: Path, *, pythonpath: str = "") -> bool:
     """Is ``argv`` an interpreter entering ``hermes_cli.main`` for exactly ``root``?
 
     Two launch shapes exist: ``python -m hermes_cli.main`` and the generated
     ``python -I -c <bootstrap>`` launcher that launchd services run. The second
     is accepted only when its code equals the bootstrap generated for ``root``,
-    so another tree's or an arbitrary ``-c`` program cannot pass.
+    so another tree's or an arbitrary ``-c`` program cannot pass. Only that
+    isolated bootstrap ignores inherited PYTHONPATH and clears it before
+    importing. PM may export its selected paths again for child processes.
     """
     if argv[1:3] == ["-m", "hermes_cli.main"]:
-        return True
+        return not pythonpath
     if len(argv) < 4:
         return False
     from hermes_cli._launchers import runtime_command
@@ -810,7 +812,7 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
             if (executable == _interpreter_process_executable(expected_python) and
                     (gateway_pid is None or _LOADED_CODE_ROOT == intended_root) and
                     Path(process.cwd()).resolve() == intended_root and
-                    not process.environ().get("PYTHONPATH")):
+                    _runs_hermes_main(argv, intended_root, pythonpath=process.environ().get("PYTHONPATH", ""))):
                 _verify_transaction(paths, record)
                 record["reload_ack"] = {"plist_sha256": plist["intended_sha256"],
                                         "launchd_pid": supervisor_pid,
