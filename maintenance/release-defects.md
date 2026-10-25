@@ -573,3 +573,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   plugin discovery against absent and alternate catalog credentials. The existing
   `tests/plugins/model_providers/test_commandcode_profile.py` assertion stays intact.
 - Retire when upstream provider resolution preserves the same credential union.
+
+## Telegram Flood Delay Test Clock
+
+- Fork patch identity: `meridian-qualification-fixtures`.
+- The delay-preservation test used an arbitrary real event-loop epoch, so
+  `(now + 30) - now` could return `30.000000000000057`. Bind the test clock
+  to an exactly representable epoch while preserving both exact error-string
+  and numeric delay assertions. Runtime cooldown behavior is unchanged.
+- Guard: `tests/gateway/test_telegram_final_delivery.py`.
