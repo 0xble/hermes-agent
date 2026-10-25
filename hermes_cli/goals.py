@@ -3616,10 +3616,10 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             else:
                 state.clear_wait(preserve_notice_key=True)
 
-        if self._autonomy_budget_exhausted(state):
-            return self._autonomy_budget_checkpoint(state, "turn pacing checkpoint reached")
         state.turns_used += 1
         state.last_turn_at = time.time()
+        if self._autonomy_budget_exhausted(state):
+            return self._autonomy_budget_checkpoint(state, "turn pacing checkpoint reached")
         gap_floor = max(float(self.min_continuation_gap_seconds), float(DEFAULT_MIN_CONTINUATION_GAP_SECONDS))
 
         # Gates run BEFORE the judge: a failing gate is deterministic evidence the goal is not done,

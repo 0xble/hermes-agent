@@ -150,7 +150,7 @@ def test_automatic_stops_leave_active_timed_wakes(home, monkeypatch, scenario):
     verdict, wait = ("wait", {"user_message": True}) if scenario == "user_wait" else ("done", None)
     monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: (verdict, "needs approval", False, wait, False))
     if scenario == "budget":
-        mgr.state.turns_used = mgr.state.max_turns
+        mgr.state.turns_used = mgr.state.max_turns - 1
         mgr._save()
     if scenario == "gate":
         import shlex
