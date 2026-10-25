@@ -77,6 +77,32 @@ def test_explicit_empty_platform_pin_is_not_refilled_by_native_recovery(platform
     ) == set()
 
 
+@pytest.mark.parametrize("platform", ["cli", "slack", "telegram", "discord"])
+def test_reaction_toolset_respects_explicit_selection(platform):
+    """A new configurable capability must not expand an authored toolset pin."""
+    config = {"platform_toolsets": {platform: ["web"]}}
+    enabled = _get_platform_tools(config, platform, include_default_mcp_servers=False)
+    assert "web" in enabled
+    assert "reactions" not in enabled
+
+    config["platform_toolsets"][platform].append("reactions")
+    assert "reactions" in _get_platform_tools(
+        config, platform, include_default_mcp_servers=False,
+    )
+
+    config["agent"] = {"disabled_toolsets": ["reactions"]}
+    assert "reactions" not in _get_platform_tools(
+        config, platform, include_default_mcp_servers=False,
+    )
+
+
+@pytest.mark.parametrize("platform", ["slack", "telegram", "discord"])
+def test_default_gateway_toolsets_include_reactions(platform):
+    assert "reactions" in _get_platform_tools(
+        {}, platform, include_default_mcp_servers=False,
+    )
+
+
 @pytest.mark.parametrize("selection", [None, ["terminal", "file"]])
 def test_native_recovery_keeps_non_checklist_toolsets_on_non_empty_saves(selection):
     """Feishu's non-checklist tools survive defaults and non-empty selections."""
