@@ -273,10 +273,12 @@ class GatewayConfigLoadersMixin:
         _r_state = self._peek_session_state(session_key)
         if _r_state is not None and _r_state.conversation.reasoning_override is not None:
             return _r_state.conversation.reasoning_override
+        epoch = _r_state.conversation.reasoning_override_epoch if _r_state is not None else 0
         loaded = await asyncio.to_thread(self._load_persisted_reasoning_override, session_key)
         _r_state = self._peek_session_state(session_key)
-        if _r_state is not None and _r_state.conversation.reasoning_override is not None:
-            return _r_state.conversation.reasoning_override  # a pick landed during the read: it wins
+        if (_r_state.conversation.reasoning_override_epoch if _r_state is not None else 0) != epoch:
+            # A set, reset or boundary landed during the read: the stored copy may be stale.
+            return _r_state.conversation.reasoning_override if _r_state is not None else None
         return self._publish_persisted_reasoning_override(session_key, loaded)
 
     def _load_persisted_reasoning_override(self, session_key: str) -> Optional[tuple[dict, Optional[str]]]:
