@@ -260,3 +260,14 @@ def test_removal_quote_must_still_be_current_at_commit(home, monkeypatch):
     result = mgr.revise(reason="remove limit", contract={"constraints": ""}, user_quote=quote)
     assert result["error_code"] == "state_changed"
     assert goals.load_goal("autonomy").contract.constraints == "Never restart the gateway"
+
+
+def test_replacement_advances_the_instance_and_requires_fresh_readbacks(home):
+    _, db = home
+    mgr = manager()
+    old_instance = mgr.state.created_at
+    evidence = proof(db)
+    assert mgr.replace(reason="objective changed", goal="Ship the alternate repair")["ok"]
+    assert mgr.state.created_at > old_instance
+    assert not mgr.complete(reason="old proof", evidence=evidence)["ok"]
+    assert mgr.complete(reason="fresh proof", evidence=proof(db))["ok"]

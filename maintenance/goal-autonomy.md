@@ -33,8 +33,9 @@ Autonomous mode does not accept the auxiliary judge's DONE as completion.
 Autonomous edits patch only named contract fields. Every constraint, boundary,
 stop condition, outcome, verification item and additive criterion is retained
 unless a current verbatim user removal instruction names the exact item. A
-replacement may change the objective. It preserves the original evidence epoch,
-quality gates, consumed turns, budget and breach history. Its reason and before/
+replacement may change the objective. It advances the continuation-instance fence
+and requires fresh proof, while preserving quality gates, consumed turns, budget
+and breach history. Its reason and before/
 after diff are recorded. A removal quote is rechecked under the commit lock so a
 newer user message cannot inherit stale authority. Starting another goal after
 completion retains the preceding goal's completion history.

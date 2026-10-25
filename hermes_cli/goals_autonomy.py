@@ -129,7 +129,10 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     state.contract = GoalContract.from_dict(after)
     state.subgoals = after["subgoals"]
     state.max_turns = after["max_turns"]
-    # Keep created_at: already collected proof and recorded breaches still bind this goal.
+    # Replacement is a new continuation instance. Keep breach/contract history, but
+    # require fresh proof of the new objective rather than accepting stale readbacks.
+    if kind == "replace":
+        state.created_at = max(time.time(), state.created_at + 1e-6)
     revision = {"at": time.time(), "actor": "agent", "authority": "autonomy", "kind": kind,
                 "reason": reason, "before": before, "after": after,
                 "user_quote": user_quote if removed else ""}
