@@ -70,3 +70,20 @@ currency. Preserve this release policy when applying generic maintenance guidanc
 - For separately authorized activation, use the runtime support file's host-specific
   acceptance and recovery requirements. Preserve unresolved acceptance gaps until
   demonstrated behavior closes them.
+
+## Deploy-Base Qualification Repairs
+
+Fork patch identities: `lpg-backport-qualification`, `lpg-provider-credentials`.
+These repairs are scoped to the LPG deploy base in [PR #790](https://github.com/0xble/hermes-agent/pull/790).
+Subprocess output uses explicit UTF-8 decoding, inherited contributor Baris Sencan
+is mapped to `isair`, and the complete existing CI runs on standard hosted runners.
+The canonical runner partitions the full discovered Python suite into 10 slices.
+The existing aggregate rejects cancelled dependencies and is required by `qualification`.
+The contributor collision guard verifies preserved exact filenames and content on
+case-insensitive filesystems.
+
+models.dev listing a provider must not hide credentials already declared by its
+registered plugin. Resolution keeps catalog and plugin key names plus the existing
+overlay, without changing endpoint/transport precedence. The existing CommandCode
+resolution assertion and `tests/hermes_cli/test_provider_catalog_credentials.py`
+guard this. Retire the patch when upstream resolution preserves the same union.
