@@ -3143,6 +3143,15 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
             logger.debug("[Slack] block render failed; using plain text", exc_info=True)
             return None
 
+    def extract_images(self, content: str) -> tuple[list[tuple[str, str]], str]:
+        """Native image syntax stays in blocks, other images remain attachments."""
+        if (self._extra_flag("rich_blocks") and not self._extra_flag("markdown_blocks")
+                and len(self.format_message(content)) <= self.MAX_MESSAGE_LENGTH
+                and self._maybe_blocks(content)):
+            from .rich_media import extract_attachment_images
+            return extract_attachment_images(content, super().extract_images)
+        return super().extract_images(content)
+
     def format_tool_preview(self, preview) -> str:
         """Keep compact tool arguments out of mrkdwn emphasis conversion."""
         # Substitute embedded delimiters in the display text only.
@@ -6522,21 +6531,32 @@ async def _resolve_slack_user_dm(token: str, user_id: str) -> Optional[str]:
 
 
 def _standalone_post_kwargs(
-    chat_id: str, text: Any, unfurl_kwargs: dict[str, Any], thread_id: Optional[str]
+    chat_id: str, text: Any, unfurl_kwargs: dict[str, Any], thread_id: Optional[str], blocks=None
 ) -> dict[str, Any]:
     """``chat.postMessage`` kwargs for the standalone senders (key order is the wire order)."""
     kwargs: dict[str, Any] = {"channel": chat_id, "text": text, "mrkdwn": True, **unfurl_kwargs}
+    if blocks:
+        kwargs["blocks"] = blocks
     if thread_id:
         kwargs["thread_ts"] = thread_id
     return kwargs
 
 
 async def _standalone_post_text(
-    client, chat_id: str, text: Any, unfurl_kwargs: dict[str, Any], thread_id: Optional[str]
+    client, chat_id: str, text: Any, unfurl_kwargs: dict[str, Any], thread_id: Optional[str], blocks=None
 ) -> dict[str, Any]:
-    """``chat.postMessage`` via the SDK client; returns the response as a plain dict."""
-    kwargs = _standalone_post_kwargs(chat_id, text, unfurl_kwargs, thread_id)
-    return _slack_response_payload(await client.chat_postMessage(**kwargs))
+    """Post a media caption with the same rejected-block fallback as live replies."""
+    kwargs = _standalone_post_kwargs(chat_id, text, unfurl_kwargs, thread_id, blocks)
+    try:
+        payload = _slack_response_payload(await client.chat_postMessage(**kwargs))
+    except Exception as error:
+        if not blocks or not SlackAdapter._is_block_payload_rejection(error):
+            raise
+        payload = {"error": "invalid_blocks"}
+    if blocks and payload.get("error") in {"invalid_blocks", "msg_too_long", "too_many_blocks"}:
+        kwargs.pop("blocks")
+        payload = _slack_response_payload(await client.chat_postMessage(**kwargs))
+    return payload
 
 
 async def _standalone_upload_file(
@@ -6571,7 +6591,7 @@ async def _standalone_upload_file(
 
 async def _standalone_send_media(
     token: str, chat_id: str, media_files: list, thread_id: Optional[str], formatted: Optional[str],
-    formatted_caption: Optional[str], unfurl_kwargs: dict[str, Any]) -> dict[str, Any]:
+    formatted_caption: Optional[str], unfurl_kwargs: dict[str, Any], blocks=None) -> dict[str, Any]:
     """Media branch of ``_standalone_send``: ``files_upload_v2`` per file (+ optional text post).
     ``caption`` rides as ``initial_comment`` on the first successful upload unless
     link-preview controls are explicit (the upload API cannot carry them)."""
@@ -6587,12 +6607,12 @@ async def _standalone_send_media(
     _apply_slack_proxy(client, resolve_proxy_url())
     last_message_id = None
     # The upload API cannot carry unfurl controls; explicit ones need a separate caption post.
-    caption_as_upload_comment = bool(formatted_caption) and not unfurl_kwargs
+    caption_as_upload_comment = bool(formatted_caption) and not unfurl_kwargs and not blocks
     text_to_send = "" if caption_as_upload_comment else (formatted_caption or formatted or "")
     if text_to_send.strip():
         try:
             post_payload = await _standalone_post_text(
-                client, chat_id, text_to_send, unfurl_kwargs, thread_id)
+                client, chat_id, text_to_send, unfurl_kwargs, thread_id, blocks)
             if not post_payload.get("ok", True):
                 return send_error(f"Slack API error: {post_payload.get('error', 'unknown')}")
             last_message_id = post_payload.get("ts")
@@ -6609,7 +6629,7 @@ async def _standalone_send_media(
                 # Deliver the caption even though the file is missing.
                 try:
                     fb = await _standalone_post_text(
-                        client, chat_id, formatted_caption, unfurl_kwargs, thread_id)
+                        client, chat_id, formatted_caption, unfurl_kwargs, thread_id, blocks)
                     if fb.get("ok", True):
                         last_message_id = fb.get("ts") or last_message_id
                         caption_pending = False
@@ -6688,9 +6708,14 @@ async def _standalone_send(
     formatted = _standalone_format_mrkdwn(message) if message else message
     formatted_caption = _standalone_format_mrkdwn(caption) if caption else caption
     unfurl_kwargs = _slack_unfurl_kwargs(getattr(pconfig, "extra", None))
+    renderer = SlackAdapter.__new__(SlackAdapter)
+    renderer.config = pconfig
+    display_text = (caption or message) if media_files else message
+    blocks = renderer._maybe_blocks(display_text) if display_text and len(
+        _standalone_format_mrkdwn(display_text)) <= SlackAdapter.MAX_MESSAGE_LENGTH else None
     if media_files:
         return await _standalone_send_media(
-            token, chat_id, media_files, thread_id, formatted, formatted_caption, unfurl_kwargs)
+            token, chat_id, media_files, thread_id, formatted, formatted_caption, unfurl_kwargs, blocks)
     # --- Text-only path (existing aiohttp chat.postMessage) ---
     if not formatted or not formatted.strip():
         logger.debug("[Slack] _standalone_send: skipping empty/whitespace message")
@@ -6704,9 +6729,12 @@ async def _standalone_send(
         last_error = "unknown"
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            payload = _standalone_post_kwargs(chat_id, formatted, unfurl_kwargs, thread_id)
+            payload = _standalone_post_kwargs(chat_id, formatted, unfurl_kwargs, thread_id, blocks)
             for tok in tokens:
                 data = await _slack_json_post(session, tok, "chat.postMessage", payload, _req_kw)
+                if "blocks" in payload and data.get("error") in {"invalid_blocks", "msg_too_long", "too_many_blocks"}:
+                    payload.pop("blocks")
+                    data = await _slack_json_post(session, tok, "chat.postMessage", payload, _req_kw)
                 if data.get("ok"):
                     return {
                         "success": True, "platform": "slack", "chat_id": chat_id,

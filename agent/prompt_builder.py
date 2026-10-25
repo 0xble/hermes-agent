@@ -731,6 +731,17 @@ PLATFORM_HINTS = {
 # TUI, not an HTML chat renderer. Its content (tables/LaTeX/Mermaid, MEDIA: rich previews incl. Excalidraw)
 # described a renderer that does not exist anywhere in web/. If a real WebUI chat surface ships, write a
 # hint from its actual renderer — do not resurrect this text.
+SLACK_RICH_BLOCKS_HINT = (
+    "You are in Slack. Markdown renders native headers, lists, quotes, code and aligned pipe tables. "
+    "Use tables for comparisons, standalone ![alt](https://url) for a full image, "
+    "and ![thumb:alt](https://url) as a paragraph's final line for a right thumbnail. "
+    "Use -# text for context/source notes, optionally -# ![alt](https://url) text for an icon. "
+    "For peer cards use a fenced cards YAML list: - title: Name, with optional indented subtitle, body, "
+    "image (HTTPS URL), url (HTTPS Details link). Maximum 10 cards, title/subtitle 150 characters, body 200. "
+    "Keep YAML fields on separate lines. Native images are not also uploaded. Other markdown image URLs "
+    "remain attachments. MEDIA:/absolute/path sends files. Plain-text fallback is always retained."
+)
+
 TELEGRAM_RICH_MESSAGES_HINT = (
     "Telegram now supports rich Markdown, so lean into it: whenever it makes the answer clearer or easier to scan, "
     "actively reach for real Markdown tables (pipe `| col | col |` syntax), bullet and numbered lists, task lists (`- "

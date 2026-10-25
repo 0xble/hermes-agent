@@ -112,3 +112,41 @@ def test_standalone_send_stops_on_non_token_error(monkeypatch, _standalone_send)
 
     assert result == {"error": "Slack API error: msg_too_long"}
     assert len(fake_session.calls) == 1
+
+
+@pytest.mark.parametrize("reject", [False, True])
+def test_standalone_rich_delivery_and_text_retry(monkeypatch, _standalone_send, reject):
+    import copy
+
+    class RichSession(_SlackSession):
+        def post(self, url, *, headers, json, **kwargs):
+            self.calls.append(copy.deepcopy(json))
+            error = reject and "blocks" in json
+            response = {"ok": False, "error": "invalid_blocks"} if error else {"ok": True, "ts": "171.123"}
+            return _SlackPostContext(_SlackResponse(response))
+
+    fake = RichSession()
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *args, **kwargs: fake)
+    pconfig = SimpleNamespace(enabled=True, token="good-token", extra={"rich_blocks": True})
+    text = "![Photo](https://example.com/photo.png)\n\n-# Source"
+    result = asyncio.run(_standalone_send(pconfig, "D1", text, thread_id="123.456"))
+    assert result["success"]
+    assert [b["type"] for b in fake.calls[0]["blocks"]] == ["image", "context"]
+    assert fake.calls[0]["text"] == text
+    assert fake.calls[0]["thread_ts"] == "123.456"
+    assert len(fake.calls) == (2 if reject else 1)
+    if reject:
+        assert "blocks" not in fake.calls[1]
+        assert fake.calls[1]["text"] == fake.calls[0]["text"]
+        assert fake.calls[1]["channel"] == "D1"
+        assert fake.calls[1]["thread_ts"] == "123.456"
+
+
+def test_standalone_disabled_rich_mode_stays_text(monkeypatch, _standalone_send):
+    fake = _SlackSession()
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *args, **kwargs: fake)
+    pconfig = SimpleNamespace(enabled=True, token="good-token", extra={})
+    result = asyncio.run(_standalone_send(pconfig, "D1", "![Photo](https://example.com/p.png)"))
+    assert result["success"]
+    assert "blocks" not in fake.calls[0][1]
+
