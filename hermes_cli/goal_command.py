@@ -28,12 +28,12 @@ def _english(key, default, **values):
 
 
 def _status(mgr, arg, render):
-    details = mgr.render_removable_items()
+    details = "\n".join(filter(None, (mgr.render_removable_items(), mgr.render_completion_history())))
     return GoalCommandResult(mgr.status_line() + (f"\n{details}" if details else ""))
 
 
 def _show(mgr, arg, render):
-    details = mgr.render_removable_items()
+    details = "\n".join(filter(None, (mgr.render_removable_items(), mgr.render_completion_history())))
     return GoalCommandResult(f"{mgr.status_line()}\n{mgr.render_contract()}" + (f"\n{details}" if details else ""))
 
 

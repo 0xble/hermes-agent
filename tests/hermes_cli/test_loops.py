@@ -1139,17 +1139,33 @@ class TestGoalMixing:
 
 class TestDispatchLoopCommand:
 
-    def test_set_warns_when_goal_is_active(self, hermes_home):
+    @pytest.mark.parametrize("goal_status", ["active", "waiting", "paused", "done", "absent"])
+    def test_set_warning_matches_goal_deferral(self, hermes_home, goal_status):
         from hermes_cli.goals import GoalManager
-        from hermes_cli.loops import LoopManager, dispatch_loop_command
+        from hermes_cli.loops import LoopManager, dispatch_loop_command, goal_blocks_loop_tick, load_loop
 
-        GoalManager(session_id="d-goal").set("ship the release")
+        goal = GoalManager(session_id="d-goal")
+        if goal_status != "absent":
+            goal.set("ship the release")
+        if goal_status == "waiting":
+            goal.wait_for_seconds(3600, reason="waiting on CI")
+        elif goal_status == "paused":
+            goal.pause()
+        elif goal_status == "done":
+            goal.mark_done("release shipped")
         result = dispatch_loop_command(LoopManager(session_id="d-goal"), "5m check CI")
-        assert "active goal" in result["output"]
-        assert "loop ticks defer while the goal is active" in result["output"]
-        stored = __import__("hermes_cli.loops", fromlist=["load_loop"]).load_loop("d-goal")
-        assert stored is not None and "active goal" in (stored.goal_warning or "")
+        stored = load_loop("d-goal")
         assert result["created"] is True
+        assert stored is not None
+        assert goal_blocks_loop_tick("d-goal") is (goal_status == "active")
+        if goal_status == "active":
+            assert "loop ticks defer now" in result["output"]
+            assert "only while the goal is actively taking turns" in result["output"]
+            assert "parked/waiting, paused, or done" in result["output"]
+            assert stored.goal_warning and stored.goal_warning in result["output"]
+        else:
+            assert stored.goal_warning is None
+            assert "loop ticks defer" not in result["output"]
 
     def test_create_self_paced(self, hermes_home):
         from hermes_cli.loops import LoopManager, dispatch_loop_command

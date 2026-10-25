@@ -1,0 +1,14 @@
+{
+  "description": "List captured downloads for the current Camofox tab. With download_id from the listing, save that file on the Python host and return its local output_path, never its contents. Files are limited to 20 MiB and responses to 28 MiB. Requires browser_navigate or browser_handoff first.",
+  "name": "browser_downloads",
+  "parameters": {
+    "properties": {
+      "download_id": {
+        "description": "ID from the listing to save locally. Omit to list metadata only.",
+        "type": "string"
+      }
+    },
+    "required": [],
+    "type": "object"
+  }
+}

@@ -1,6 +1,7 @@
 """Retirement never uses callback timing as deletion authority."""
 import asyncio
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -40,6 +41,7 @@ def setup_retire(monkeypatch):
 def runtime(setup_retire):
     runner, source, adapter, _ = setup_retire
     runner.source, runner.adapter, runner.bot = source, adapter, adapter._bot
+    runner._async_profile_scope_for_source = lambda _: nullcontext()
     return runner
 
 
@@ -166,22 +168,24 @@ async def test_now_interrupts_first_preserves_pending_obligations(setup_retire):
 
 
 @pytest.mark.asyncio
-async def test_prompt_and_commands_admitted_unrelated_work_rejected(setup_retire, monkeypatch):
+async def test_owner_question_replies_do_not_bypass_retirement_and_preparation_is_fenced(setup_retire):
     runner, source, _adapter, _ = setup_retire
     await retire.request(runner, source)
     state = await retire.load(runner, source)
     state["questions"] = [{"id": "goal", "suggestion": "Work"}]
     await retire.save(runner, source, state)
-    resolve = AsyncMock(return_value=True)
-    monkeypatch.setattr("gateway.telegram_retire_work.resolve_answers", resolve)
     event = SimpleNamespace(source=source, allow_gateway_control=True, internal=False,
                             get_command=lambda: None, text="1 Work")
-    assert await retire.intercept(runner, event) == "Retirement owners recorded."
-    resolve.return_value = False
+    assert await retire.intercept(runner, event) == retire.NOTICE
     event.text = "start a new project"
     assert await retire.intercept(runner, event) == retire.NOTICE
     event.get_command = lambda: "retire"
     assert await retire.intercept(runner, event) is None
+    wake = MessageEvent(text="prepare", source=source, internal=True,
+                        metadata={"retirement_generation": state["generation"]})
+    assert await retire.intercept(runner, wake) is None
+    await retire.request(runner, source, cancel=True)
+    assert await retire.intercept(runner, wake) == ""
 
 
 @pytest.mark.asyncio
@@ -194,7 +198,7 @@ async def test_complete_split_receipt_authorizes_delete(runtime):
 
 
 @pytest.mark.asyncio
-async def test_pending_owner_question_never_sends_closing_or_deletes(runtime, monkeypatch):
+async def test_pending_preparation_never_sends_closing_or_deletes(runtime, monkeypatch):
     monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(return_value=False))
     await retire.request(runtime, runtime.source)
     await retire.advance(runtime, runtime.source)
@@ -287,7 +291,8 @@ async def test_unresolved_delete_can_recover_without_housekeeping_spam(runtime, 
         await retire.advance(runtime, runtime.source)
         assert (await retire.load(runtime, runtime.source))["phase"] == "done"
         assert runtime.bot.delete_forum_topic.await_count == 2
-        assert [c.args[1] for c in runtime.adapter.send.await_args_list].count(retire.CLOSING) == 2
+        from gateway.telegram_retire_prepare import closing_note
+        assert [c.args[1] for c in runtime.adapter.send.await_args_list].count(closing_note(recovered)) == 2
 
 
 @pytest.mark.asyncio
@@ -317,3 +322,127 @@ async def test_unresolved_delete_unknown_probe_never_retries_or_cancels(runtime)
             await retire.request(runtime, runtime.source, cancel=cancel)
     assert await retire.load(runtime, runtime.source) == state
     runtime.bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_housekeeping_reconciles_confirmed_deleted_topic_without_sending(runtime, monkeypatch):
+    monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=("telegram",)))
+    runtime.bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot", id=900))
+    lookup = AsyncMock(side_effect=[[{"id": 42}], []])
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", lookup)
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    unresolved = await retire.load(runtime, runtime.source)
+    assert unresolved is not None
+    assert unresolved["phase"] == "delete_unresolved"
+    sends = runtime.adapter.send.await_count
+    deletes = runtime.bot.delete_forum_topic.await_count
+    runtime.session_store.unbind_session.assert_not_called()
+
+    await retire.resume_all(runtime)
+
+    settled = await retire.load(runtime, runtime.source)
+    assert settled is not None
+    assert settled["phase"] == "done"
+    assert settled["generation"] == unresolved["generation"]
+    assert settled["closing_receipt"] == unresolved["closing_receipt"]
+    assert runtime.adapter.send.await_count == sends
+    assert runtime.bot.delete_forum_topic.await_count == deletes == 1
+    runtime.bot.send_message.assert_not_awaited()
+    runtime.session_store.unbind_session.assert_called_once_with("topic-key", "session-1")
+    runtime._session_db.delete_telegram_topic_binding.assert_awaited_once_with(
+        chat_id="100", thread_id="42", profile_name="default")
+    assert lookup.await_count == 2
+    assert lookup.await_args is not None
+    assert lookup.await_args.args[-3:] == ("@HermesBot", "--id", "42")
+
+
+async def _saved_unresolved_retirement(runtime):
+    await retire.request(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    assert state is not None
+    state.update(phase="delete_unresolved", closing_receipt={
+        "generation": state["generation"], "message_id": "10", "chat_id": "100", "thread_id": "42"})
+    await retire.save(runtime, runtime.source, state)
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["present", "incomplete", "unknown", "no_cli", "disconnected"])
+async def test_passive_reconciliation_keeps_unproven_state_without_sends(runtime, monkeypatch, outcome):
+    state = await _saved_unresolved_retirement(runtime)
+    command = () if outcome == "no_cli" else ("telegram",)
+    monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=command))
+    runtime.bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot", id=900))
+    lookup = AsyncMock(return_value=[{"id": 42}])
+    if outcome == "incomplete":
+        lookup.return_value = {"topics": []}
+    elif outcome == "unknown":
+        lookup.side_effect = TimeoutError("lookup unresolved")
+    elif outcome == "disconnected":
+        runtime.adapter._bot = None
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", lookup)
+
+    await retire.resume_all(runtime)
+    await retire.resume_all(runtime)
+
+    assert await retire.load(runtime, runtime.source) == state
+    runtime.adapter.send.assert_not_awaited()
+    runtime.bot.send_message.assert_not_awaited()
+    runtime.bot.delete_forum_topic.assert_not_awaited()
+    runtime._session_db.delete_telegram_topic_binding.assert_not_awaited()
+    runtime.session_store.unbind_session.assert_not_called()
+    if outcome in {"no_cli", "disconnected"}:
+        lookup.assert_not_awaited()
+    else:
+        assert lookup.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [
+    ("generation", "other-generation"), ("message_id", None),
+    ("chat_id", "101"), ("thread_id", "43"), (None, None),
+])
+async def test_passive_reconciliation_requires_exact_closing_receipt(runtime, monkeypatch, field, value):
+    state = await _saved_unresolved_retirement(runtime)
+    if field is None:
+        state.pop("closing_receipt")
+    else:
+        state["closing_receipt"][field] = value
+    await retire.save(runtime, runtime.source, state)
+    monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=("telegram",)))
+    lookup = AsyncMock(return_value=[])
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", lookup)
+
+    await retire.resume_all(runtime)
+
+    assert await retire.load(runtime, runtime.source) == state
+    lookup.assert_not_awaited()
+    runtime.adapter.send.assert_not_awaited()
+    runtime.bot.send_message.assert_not_awaited()
+    runtime.bot.delete_forum_topic.assert_not_awaited()
+    runtime._session_db.delete_telegram_topic_binding.assert_not_awaited()
+    runtime.session_store.unbind_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_passive_reconciliation_does_not_unbind_superseded_generation(runtime, monkeypatch):
+    state = await _saved_unresolved_retirement(runtime)
+    replacement = {**state, "phase": "cancelled", "generation": "new-generation"}
+    monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=("telegram",)))
+    runtime.bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot", id=900))
+
+    async def supersede(*args):
+        await retire.save(runtime, runtime.source, replacement, force=True)
+        return []
+
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", AsyncMock(side_effect=supersede))
+
+    await retire.resume_all(runtime)
+
+    assert await retire.load(runtime, runtime.source) == replacement
+    runtime.adapter.send.assert_not_awaited()
+    runtime.bot.send_message.assert_not_awaited()
+    runtime.bot.delete_forum_topic.assert_not_awaited()
+    runtime._session_db.delete_telegram_topic_binding.assert_not_awaited()
+    runtime.session_store.unbind_session.assert_not_called()

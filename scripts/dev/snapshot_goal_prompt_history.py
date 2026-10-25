@@ -31,6 +31,7 @@ OUTPUT = REPO / "hermes_cli" / "goals_prompt_registry.py"
 # These names are the formatter boundaries used by agent.synthetic_prompt. The legacy aliases are
 # included because the current goals module keeps them in a separate compatibility module.
 FORMATTER_NAMES: dict[str, tuple[str, ...]] = {
+    "autonomy": ("AUTONOMY_CONTINUATION_TEMPLATE",),
     "plain": ("CONTINUATION_PROMPT_TEMPLATE", "_LEGACY_CONTINUATION_PROMPT_TEMPLATE"),
     "contract": (
         "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",
@@ -49,8 +50,9 @@ FORMATTER_NAMES: dict[str, tuple[str, ...]] = {
     "barrier_lift": ("GOAL_WAIT_LIFTED_NOTE_OPEN",),
 }
 
-SOURCE_FILES = ("hermes_cli/goals.py", "hermes_cli/goals_legacy_prompts.py")
+SOURCE_FILES = ("hermes_cli/goals.py", "hermes_cli/goals_legacy_prompts.py", "hermes_cli/goals_autonomy.py")
 FORMATTER_FIELDS = {
+    "autonomy": {"goal", "contract_block", "subgoals_block"},
     "plain": {"goal"},
     "contract": {"goal", "contract_block"},
     "subgoals": {"goal", "subgoals_block"},
@@ -205,6 +207,13 @@ def _snapshot() -> dict[str, dict[str, list[str]]]:
         path = REPO / source_file
         if path.exists():
             _collect_source(registry, "working-tree", source_file, path.read_text(encoding="utf-8-sig"), new_only=True)
+    # Shipped wordings may come from retired branches no longer reachable from main.
+    # Keep their frozen provenance rather than turning those persisted turns into human input.
+    if OUTPUT.exists():
+        for node in ast.parse(OUTPUT.read_text(encoding="utf-8-sig")).body:
+            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "GOAL_PROMPT_REGISTRY":
+                for row in ast.literal_eval(node.value):
+                    registry[row["formatter"]][row["template"]] = list(row["source_commits"])
     return registry
 
 
@@ -222,9 +231,13 @@ def _render(registry: dict[str, dict[str, list[str]]]) -> str:
         commit for entries in registry.values() for commits in entries.values() for commit in commits
         if commit != "working-tree"
     ))
+    if OUTPUT.exists():
+        for node in ast.parse(OUTPUT.read_text(encoding="utf-8-sig")).body:
+            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "SCANNED_GOAL_PROMPT_COMMITS":
+                scanned_commits = tuple(dict.fromkeys((*ast.literal_eval(node.value), *scanned_commits)))
     grouped_counts = {kind: len(entries) for kind, entries in registry.items()}
     body = pformat(tuple(rows), width=120, sort_dicts=False)
-    return f'''"""Generated goal formatter wording registry; do not edit by hand.\n\nRegenerate with:\n    python scripts/dev/snapshot_goal_prompt_history.py\n"""\n\nfrom typing import Final, TypedDict\n\n\nclass GoalPromptEntry(TypedDict):\n    formatter: str\n    template: str\n    source_commits: tuple[str, ...]\n\n\nGOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = {body}\n\n# Current formatter names are the guard-test contract: a wording change must first be added to\n# the generated history snapshot before the classifier can be considered complete.\nCURRENT_GOAL_FORMATTER_NAMES: Final[tuple[tuple[str, str], ...]] = (\n    ("plain", "CONTINUATION_PROMPT_TEMPLATE"),\n    ("contract", "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE"),\n    ("subgoals", "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE"),\n    ("gate_failed", "CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE"),\n    ("barrier_lift", "GOAL_WAIT_LIFTED_NOTE_OPEN"),\n)\n\nGOAL_PROMPT_REGISTRY_COUNTS: Final[dict[str, int]] = {grouped_counts!r}\n\n# All historical goal formatter versions contributing to the frozen registry. Individual rows\n# name their newest and oldest source commits instead of repeating this complete list per row.\nSCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = {pformat(scanned_commits, width=120)}\n'''
+    return f'''"""Generated goal formatter wording registry; do not edit by hand.\n\nRegenerate with:\n    python scripts/dev/snapshot_goal_prompt_history.py\n"""\n\nfrom typing import Final, TypedDict\n\n\nclass GoalPromptEntry(TypedDict):\n    formatter: str\n    template: str\n    source_commits: tuple[str, ...]\n\n\nGOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = {body}\n\n# Current formatter names are the guard-test contract: a wording change must first be added to\n# the generated history snapshot before the classifier can be considered complete.\nCURRENT_GOAL_FORMATTER_NAMES: Final[tuple[tuple[str, str], ...]] = (\n    ("autonomy", "AUTONOMY_CONTINUATION_TEMPLATE"),\n    ("plain", "CONTINUATION_PROMPT_TEMPLATE"),\n    ("contract", "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE"),\n    ("subgoals", "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE"),\n    ("gate_failed", "CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE"),\n    ("barrier_lift", "GOAL_WAIT_LIFTED_NOTE_OPEN"),\n)\n\nGOAL_PROMPT_REGISTRY_COUNTS: Final[dict[str, int]] = {grouped_counts!r}\n\n# All historical goal formatter versions contributing to the frozen registry. Individual rows\n# name their newest and oldest source commits instead of repeating this complete list per row.\nSCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = {pformat(scanned_commits, width=120)}\n'''
 
 
 def main() -> int:

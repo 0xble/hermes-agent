@@ -298,14 +298,16 @@ def _bounded_evidence_match(needle: str, content: str) -> bool:
     return bool(raw and re.search(rf"(?<!\w){re.escape(raw)}(?!\w)", text))
 
 
-def _evidence_is_negated(content: str, evidence: str) -> bool:
+def _evidence_is_negated(content: str, evidence: str, *, include_no: bool = False) -> bool:
     """Reject a cited excerpt when the recorded result explicitly preserves it."""
     target = " ".join(unicodedata.normalize("NFKC", str(evidence or "")).casefold().split())
+    negators = r"\b(?:do not|don['’]t|dont|never|not|keep|preserve|retain|without)\b"
+    if include_no:
+        negators += r"|\bno\b"
     for unit in re.split(r"(?<=[.!?;])\s+", unicodedata.normalize("NFKC", str(content or ""))):
         normalized = " ".join(unit.casefold().split())
         match = re.search(rf"(?<!\w){re.escape(target)}(?!\w)", normalized)
-        if match and re.search(r"\b(?:do not|don['’]t|dont|never|not|keep|preserve|retain|without)\b",
-                               normalized[:match.start()]):
+        if match and re.search(negators, normalized[:match.start()]):
             return True
     return False
 

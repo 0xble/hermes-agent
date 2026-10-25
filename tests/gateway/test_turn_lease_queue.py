@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -52,12 +53,16 @@ async def test_admitted_successor_waits_past_lease_deadline(monkeypatch, tmp_pat
         return "processed once"
 
     runner._handle_message_with_agent = handle
+    before = time.time()
     task = asyncio.create_task(runner._handle_message(event))
     try:
         await asyncio.wait_for(spooled.wait(), HANG_GUARD_SECONDS)
+        receipt = getattr(event, "_attended_activity_received_at", None)
+        assert receipt is not None and before <= receipt <= time.time()
         assert not task.done(), "the admitted message was rejected at the lease deadline"
         assert not executed
         payload = json.loads(event._gateway_lease_wait_spool.read_text())
+        assert payload["data"]["_attended_activity_received_at"] == receipt
         assert payload["data"]["message_id"] == event.message_id
         assert payload["data"]["text"] == event.text
         expected = "same-key generation overlap" if holder_key == "same-key" else "two routing keys"

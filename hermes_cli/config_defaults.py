@@ -1455,8 +1455,8 @@ DEFAULT_CONFIG = {
     # goal is satisfied, else a continuation prompt re-enters the session until done, budget
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
-        # Max continuation turns before auto-pause (/goal resume) — guards against judge false
-        # negatives and unbounded spend.
+        "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
+        # Max turns before pausing, or a paced counter checkpoint when autonomy is enabled.
         "max_turns": 20,
         # Minimum seconds between autonomous continuation turns (continuation after continuation,
         # /loop or heartbeat wakes). A user message or a process/delegation result continues at
@@ -2282,7 +2282,7 @@ DEFAULT_CONFIG = {
         # Media is read fully into memory first, so unbounded uploads (Discord Nitro: 500 MB) or
         # huge remote URLs can OOM-kill constrained deployments. Enforced in
         # gateway/platforms/base.py for every adapter. 0 = no cap. Default 128 MiB.
-        "max_inbound_media_bytes": 134217728,
+        "max_inbound_media_bytes": 128 * 1024 * 1024,
         # Let adapters read HTTP_PROXY/HTTPS_PROXY/NO_PROXY/SSL_CERT_FILE from the environment and
         # auto-detect generic/macOS system proxies. False when the gateway inherits a proxy it must
         # not use (e.g. a scheduled task picking up a Clash/V2Ray HTTP_PROXY -> "Cannot connect to
