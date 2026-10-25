@@ -105,7 +105,7 @@ phases distinguish planned, full, indexed, decode and update work.
 
 ## GIL-Bound Scans
 
-The off-lock plan, the in-lock full fold and the stale-row decode read rows through `fold_rows`. It fetches each page (up to 1,000 rows) in one SQLite step, as a `json_group_array` that decodes to the exact values and types `sqlite3` returns. BLOBs travel as hex. REALs use `printf('%!.17g')`, because the runtime's JSON REAL rendering keeps only 15 digits. A row with a REAL zero is refetched conventionally, since no text form keeps the sign of zero. `display_identity` (`hermes_state_identity.py`) feeds sha256 in chunks of 2,047 bytes, so hashlib never releases the GIL. The digest is unchanged.
+The off-lock plan, the in-lock full fold, the stale-row decode and the in-lock display index (`_visible_display_index`) read rows through `one_step_rows`. It fetches each page in one SQLite step, as a `json_group_array` that decodes to the exact values and types `sqlite3` returns. BLOBs travel as hex. REALs use `printf('%!.17g')`, because the runtime's JSON REAL rendering keeps only 15 digits. A page containing a REAL zero is refetched conventionally, since no text form keeps the sign of zero. `display_identity` (`hermes_state_identity.py`) feeds sha256 in chunks of 2,047 bytes, so hashlib never releases the GIL. The digest is unchanged.
 
 Every row a cursor yields, and every large hash, releases the GIL and must take it back. On the loaded gateway each re-take waits a switch interval. A live session's plan, measured on a 16,969-row snapshot (76 MB) on 2026-10-25:
 
@@ -116,3 +116,5 @@ Every row a cursor yields, and every large hash, releases the GIL and must take 
 | One-step fetch and chunked hash | 1.5 s |
 
 Committed compressions spent 2,393 s of 7,245 s of worker time in commit, of which only 258 s was SQLite wait or hold. That pinned compression workers past the 600 s ceiling and drove pool-saturation refusals.
+
+Live, after #799 shipped (13:29-13:48), every slow compaction hold took `display_fallback=1`, with 10 fallbacks and 0 incremental folds. The writer-wide freshness token changes on any write to the database, so under constant writes the affected-group path almost never qualifies. The fallback's in-lock 19k-row index enumeration then held the writer for 5-9 s. With one-step fetch, the same 16,969-row index takes 0.07 s behind 1 CPU-bound thread, against 3.1 s before. This makes the fallback cheap no matter how often freshness fails.

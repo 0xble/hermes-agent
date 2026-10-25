@@ -72,3 +72,31 @@ def test_display_identity_is_plain_sha256_of_the_key_repr():
     for size in (0, 1, 2046, 2047, 2048, 4095, 70_000):
         key = ("user", "y" * size, 1.7e9, None, None, None)
         assert display_identity(key) == hashlib.sha256(repr(key).encode("utf-8", "surrogatepass")).digest()
+
+
+def test_in_lock_display_index_is_one_row_step_per_index(tmp_path):
+    """The fallback fold's in-lock index enumeration held the writer 5-9 s on 19k-row sessions."""
+    from pathlib import Path
+
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=Path(tmp_path) / "state.db")
+    try:
+        sid = db.create_session("s1", source="cli")
+        with db._lock:
+            conn = db._conn
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executemany(
+                "INSERT INTO messages (session_id, role, content, timestamp, active, display_identity, display_order) "
+                "VALUES (?, 'user', ?, ?, 1, ?, ?)",
+                [(sid, f"m{i}", 1.7e9 + i, display_identity(("m", i)) if i % 3 else None, i if i % 5 else None)
+                 for i in range(1, 801)])
+            conn.execute("COMMIT")
+            expected = sorted(tuple(row) for row in conn.execute(
+                "SELECT id, display_identity, display_order FROM messages WHERE session_id = ?", (sid,)))
+            counting = _CountingConn(conn)
+            got = db._visible_display_index(counting, sid)
+        assert [tuple(row) for row in got] == expected
+        assert counting.rows_stepped == 2
+    finally:
+        db.close()
