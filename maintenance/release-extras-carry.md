@@ -3,34 +3,51 @@
 Patch identity: `release-extras-carry`.
 
 A new immutable release must boot with every optional extra the active release
-carries. `prepare_venv` infers the selected extras from two interpreters and
-builds the union: the migration-bound source interpreter (`release-layout.json`
-`source_python`, the pre-migration checkout's venv) and the active release's
-committed PM environment (`pm.environments.project_python(previous)`, which is the
-release's PM generation when one is committed and its `.venv` otherwise).
+carries. The active release's extras are inferred from its committed PM
+environment (`pm.environments.project_python(previous)`: its PM generation when
+one is committed, its `.venv` otherwise) against the candidate's
+`pyproject.toml`, by `_committed_extras`. Two points apply them:
 
-Why both: the source interpreter is frozen at first migration. An extra added
-afterwards, by `hermes pm install --extra` or by a gateway lazy install, lands in
-the active release's PM generation under `installs/<key>/environments/` and never
-reaches that interpreter. Inferring from the source alone rebuilt every release
-without it. On 2026-10-24 three consecutive updates came up without `slack`: the
-adapter's lazy install committed it into the new release's generation, but the
-running process could not adopt it, so Slack stayed down until a second restart,
-and the next update dropped it again. The new release's own `.venv` now contains
-the carried extras, so the carry also holds for a release whose gateway never
-committed a PM generation.
+- **Build:** `prepare_venv` builds with the union of the migration-bound source
+  interpreter's extras (`release-layout.json` `source_python`) and the active
+  release's committed extras.
+- **Ready candidate:** `stage_release`'s ready path calls `carry_active_extras`,
+  which commits the missing extras into the candidate's PM environment with
+  `pm.sync_venv(missing, explicit=True, project_root=candidate)` before
+  activation. It runs only when this process's code is the candidate's
+  (`pm.paths.repo_root() == candidate`), because PM resolves against the calling
+  tree's lockfile.
+
+Why both: `hermes update` from a release re-enters the source checkout
+(`hermes_cli/main.py::cmd_update`), and the fetch-only path
+(`update_cmd._apply_fetched_immutable_update`) stages the candidate with that
+checkout's code, whose HEAD never moves. A fix to `prepare_venv` therefore never
+reaches the build on a migrated install. The post-swap child imports the
+candidate, reaches `stage_release` through `_activate_immutable_release`, finds
+the release ready, and commits the missing extras there. The gateway's first
+boot selects that generation.
+
+Incident: on 2026-10-24 every update came up without `slack`. The source
+interpreter never had it, because it was added later by lazy installs into each
+release's PM generation. The adapter's lazy install committed it after boot,
+into a process that could not adopt it, so Slack stayed down until a second
+restart. The first fix (build-time only) failed its live canary for the reason
+above: release 2bb03a63 was staged by source checkout e8387e2758.
 
 `_active_locked_extras` returns early when the candidate declares no extras or
-has no `pyproject.toml`, so fake releases never spawn their interpreter. The
-non-git staging path (`source=None`) now reaches inference through the previous
-release, which `test_sigkill_stage_and_flip_converge_with_complete_current`
-exercises.
+has no `pyproject.toml`, so fake releases never spawn their interpreter.
 
-Proof: `tests/hermes_cli/test_immutable_releases.py::test_prepare_venv_carries_extras_from_previous_release_environment`
-records `slack` only in the previous release's committed generation and fails on
-the source-only build (`[['telegram']]`).
+Proof, in `tests/hermes_cli/test_immutable_releases.py`:
+`test_prepare_venv_carries_extras_from_previous_release_environment` covers the
+build. `test_ready_candidate_from_older_builder_commits_active_extras_before_activation`
+replays the canary: the pre-handoff call (source code) must not sync, and the
+post-swap call (candidate code) commits `slack`.
+`test_sigkill_stage_and_flip_converge_with_complete_current` covers non-git
+staging.
 
-Retire when the release build reads its extras from a PM-owned record that
-follows the active install, or when immutable releases are retired. Rollback
-reverts the `prepare_venv` union and the early return together with the test. No
-state migration is involved: releases already built keep their venvs.
+Retire when release staging reads its extras from a PM-owned record that follows
+the active install, or when immutable releases are retired. Rollback reverts
+`_committed_extras`, `carry_active_extras`, its `stage_release` call, the
+`prepare_venv` union and the early return, together with the tests. No state
+migration is involved. A PM generation the carry committed stays a normal PM
+generation.
