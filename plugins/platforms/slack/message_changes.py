@@ -16,10 +16,11 @@ def log_message_ingress(event: dict, payload: dict | None) -> None:
     message = event.get("message")
     nested = message if isinstance(message, dict) else {}
     logger.info(
-        "[Slack] ingress: event_id=%s type=%s subtype=%s user=%s channel=%s "
+        "[Slack] ingress: event_id=%s type=%s subtype=%s user=%s bot_id=%s channel=%s "
         "ts=%s event_ts=%s message_ts=%s thread_ts=%s",
         (payload or {}).get("event_id", ""), event.get("type", ""), event.get("subtype", ""),
-        event.get("user") or nested.get("user", ""), event.get("channel", ""),
+        event.get("user") or nested.get("user", ""),
+        event.get("bot_id") or nested.get("bot_id", ""), event.get("channel", ""),
         event.get("ts", ""), event.get("event_ts", ""), nested.get("ts", ""),
         event.get("thread_ts") or nested.get("thread_ts", ""),
     )
