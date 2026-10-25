@@ -286,7 +286,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             args.append(effort or "none")
         logger.info(fmt, *args)
 
-    def _handoff_attended_state(self, session_key: Optional[str], *, conversation=None, runner=None) -> None:
+    def _handoff_attended_state(self, session_key: Optional[str], *, conversation=None, runner=None, wait=False) -> None:
         """Publish worker-thread attended bookkeeping on the owning gateway loop."""
         def apply() -> None:
             if session_key and conversation:
@@ -310,7 +310,23 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         except RuntimeError:
             current = None
         if loop is not None and loop.is_running() and current is not loop:
-            loop.call_soon_threadsafe(apply)
+            if not wait:
+                loop.call_soon_threadsafe(apply)
+                return
+            from concurrent.futures import Future
+            committed = Future()
+
+            def publish():
+                try:
+                    apply()
+                except BaseException as exc:
+                    committed.set_exception(exc)
+                else:
+                    committed.set_result(None)
+
+            loop.call_soon_threadsafe(publish)
+            # The worker's next routing step reads this state. Scheduling alone races it.
+            committed.result(timeout=30)
         else:
             apply()
 
@@ -622,7 +638,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 fields["model_pick_expired"] = False
             elif notice:
                 fields["pending_attended_notice"] = None
-            self._handoff_attended_state(skey, conversation=fields)
+            self._handoff_attended_state(skey, conversation=fields, wait=True)
             with _attended_notice_lock:
                 notices = getattr(self, "_pre_agent_fallback_notices", None)
                 if notices is None:

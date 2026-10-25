@@ -728,6 +728,9 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   and fresh CLI first-message suites (26 passed, 13 platform skips), including a guarded-loop
   attach regression. Hosted qualification remains required.
 
+- Worker route commits acknowledge the owner-loop state handoff before agent construction
+  reads the decision and the expiry notice. Fire-and-forget activity receipts retain their
+  monotonic merge. Guards: 274 tests across model-pick expiry and attended-model suites.
 - Fork patch identity: `v0225-merge-integration`.
 - Merging upstream `v0.22.5`, current fork main and the installed display-fold fix (#765) left five bindings that Git merged cleanly but that no longer resolved. Exact-head CI caught them on the first hosted run.
   - `gateway/run_inbound.py` kept the fork's `metadata=_UNSET` default on `_transcribe_and_echo_pending_voice` but lost the `from gateway.run_common import _UNSET` import that upstream's side never had. Every `gateway.run` import raised `NameError`, which accounted for most failures in the first run.
