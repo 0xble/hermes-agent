@@ -56,10 +56,12 @@ try:  # sibling module; support both package and flat plugin-dir import
     from .attachment_errors import describe_download_exception
     from .block_kit import render_blocks, sanitize_blocks
     from .task_card_stream import start_native_task_card_stream
+    from .task_cards import finish_task_card
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
     from task_card_stream import start_native_task_card_stream  # type: ignore
+    from task_cards import finish_task_card  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -338,6 +340,7 @@ class _NativeTaskCardStream:
     channel: str
     thread_ts: str
     stream_ts: str = ""
+    message_timestamps: list[str] = field(default_factory=list)
     stopped: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -2140,11 +2143,14 @@ class SlackAdapter(BasePlatformAdapter):
                 return
             stream.stopped = True
             try:
-                if self._app and stream.stream_ts:
-                    await self._get_client(stream.channel, team_id=stream.team_id).api_call(
-                        "chat.stopStream", json={"channel": stream.channel, "ts": stream.stream_ts})
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.debug("[Slack] Native task-card stopStream failed: %s", exc)
+                if self._app and (stream.stream_ts or stream.message_timestamps):
+                    extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+                    ephemeral = extra.get("native_task_cards_ephemeral", True)
+                    await finish_task_card(
+                        self._get_client(stream.channel, team_id=stream.team_id), stream,
+                        delete=self._truthy_config(ephemeral))
+            except Exception as exc:  # Never let progress cleanup block the real reply.
+                logger.warning("[Slack] Native task-card cleanup failed: %s", exc)
             finally:
                 if self._native_task_card_streams.get(key) is stream:
                     self._native_task_card_streams.pop(key, None)
@@ -2152,7 +2158,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None) -> None:
-        """Finalize an active Slack-native progress stream exactly once."""
+        """Seal and remove transient progress, including on interrupted turns."""
         key = self._native_task_card_key(chat_id, reply_to, metadata)
         if key is None:
             return
@@ -2223,7 +2229,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # stay stuck on "is thinking..." (#24117).
                 return SendResult(success=True)
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
-            last_result = await self._post_chunks(chat_id, team_id, content, formatted, thread_ts)
+            from .message_delivery import post_chunks
+            last_result = await post_chunks(self, chat_id, team_id, content, formatted, thread_ts, metadata)
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
                 await self.stop_typing(chat_id, metadata=metadata)
@@ -2249,32 +2256,6 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False, error=str(e), retryable=_retryable,
                 retry_after=self._retry_after_from_exc(e) if _retryable else None)
-
-    async def _post_chunks(
-        self, chat_id: str, team_id: str, content: str, formatted: str, thread_ts: Optional[str]
-    ) -> Any:
-        """``chat.postMessage`` each ``MAX_MESSAGE_LENGTH`` chunk; returns the last response.
-        Block Kit only for single-chunk messages (a >39k response is pathological for the 50-block /
-        3000-char limits); ``text`` stays the notification/accessibility fallback. With
-        ``reply_broadcast`` only the first chunk is also posted to the main channel."""
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-        broadcast = self.config.extra.get("reply_broadcast", False)
-        blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
-        last_result = None
-        for i, chunk in enumerate(chunks):
-            kwargs = {
-                "channel": chat_id, "text": chunk,
-                "mrkdwn": True, **_slack_unfurl_kwargs(self.config.extra)}
-            if blocks and i == 0:
-                kwargs["blocks"] = blocks
-            if thread_ts:
-                kwargs["thread_ts"] = thread_ts
-                if broadcast and i == 0:
-                    kwargs["reply_broadcast"] = True
-            client_fn = lambda: self._get_client(chat_id, team_id=team_id)
-            last_result = await self._call_with_block_fallback(
-                client_fn, "chat_postMessage", kwargs, "send")
-        return last_result
 
     @staticmethod
     def _retry_after_from_exc(e: BaseException) -> Optional[float]:

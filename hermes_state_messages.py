@@ -27,7 +27,7 @@ from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json)
 from hermes_state_transactions import execute_transcript_write
 
-from hermes_state_write_metrics import add_write_rows, timed_write_phase
+from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_phase
 from hermes_state_message_archive import archive_message_rows
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
@@ -79,10 +79,8 @@ _DISPLAY_BACKFILL_INDEX_SQL = ("SELECT id, display_identity, display_order FROM 
                                "INDEXED BY idx_messages_display_backfill WHERE session_id = ? "
                                "AND (display_order IS NULL OR display_identity IS NULL)" + _DISPLAY_ACTIVE_CLAUSE)
 _SET_DISPLAY_FOLD_SQL = "UPDATE messages SET display_order = ?, display_identity = ? WHERE id = ?"
-# Display-fold plan: row id -> (stored identity, recomputed identity, user display_metadata).
-# The third slot is _NOT_A_USER_ROW for every non-user row (only user rows key on metadata).
-_NOT_A_USER_ROW = object()
-_FoldPlan = Dict[int, Tuple[Optional[bytes], bytes, Any]]
+# Display-fold plan: row id -> (stored identity, recomputed identity).
+_FoldPlan = Dict[int, Tuple[Optional[bytes], bytes]]
 _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls, message_uid FROM messages "
                       "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?")
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
@@ -1268,7 +1266,7 @@ class SessionMessagesMixin:
         return [seen[key] for key in sorted(seen, key=first_id.__getitem__)]
 
     def _display_fold_plan(self, session_id: str) -> Optional[_FoldPlan]:
-        """``{row id: (stored identity, recomputed identity, user metadata)}`` for every display-visible row of
+        """``{row id: (stored identity, recomputed identity)}`` for every display-visible row of
         *session_id*, read from one pooled-reader snapshot WITHOUT the writer lock.
 
         Recomputing the display key decodes every row the session ever compacted (thousands of
@@ -1277,9 +1275,9 @@ class SessionMessagesMixin:
         ``archive_and_compact``). The plan is only a hint: :meth:`_reconcile_display_orders`
         reuses a recomputed identity only while the row's stored identity still equals the one
         this snapshot saw. A content, role, timestamp, tool or display_kind change in between
-        nulls the stored identity (``messages_display_identity_update``). ``display_metadata``
-        is the one key input that trigger does not watch, and only user rows key on it, so the
-        plan keeps each user row's metadata and the lock re-reads that column for user rows only.
+        nulls the stored identity (``messages_display_identity_update``). User handoff keys use
+        only the live view's content, not its presentation metadata. Metadata-only edits do
+        not invalidate that identity, and display visibility is filtered separately on read.
         Every changed row and every row the snapshot did not see is recomputed under the lock.
         ``None`` (no WAL reader, a read-only store, any read error) keeps the full in-lock scan."""
         if not session_id or getattr(self, "read_only", False) or not getattr(self, "_wal_active", False):
@@ -1298,8 +1296,7 @@ class SessionMessagesMixin:
                             break
                         for row in rows:
                             plan[row["id"]] = (
-                                row["display_identity"], self._display_identity(self._display_dedupe_key(row)),
-                                row["display_metadata"] if row["role"] == "user" else _NOT_A_USER_ROW)
+                                row["display_identity"], self._display_identity(self._display_dedupe_key(row)))
                         last_id = rows[-1]["id"]
                 finally:
                     if conn.in_transaction:
@@ -1309,6 +1306,7 @@ class SessionMessagesMixin:
             return None
         return plan
 
+    @timed_write_phase("display_index")
     def _visible_display_index(self, conn, session_id: str) -> List[Tuple[int, Optional[bytes], Optional[int]]]:
         """``(id, display_identity, display_order)`` of every display-visible row, id order, from the
         two partial display indexes alone (no row payload is read)."""
@@ -1341,44 +1339,38 @@ class SessionMessagesMixin:
             else:
                 self._fold_display_orders(conn, visible, plan)
                 return
-        first_id: dict[bytes, int] = {}
-        last_id = 0
-        while True:
-            rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
-            batch_start = last_id
-            updates = []
-            for row in rows:
-                last_id = row["id"]
-                identity = self._display_identity(self._display_dedupe_key(row))
-                order = first_id.setdefault(identity, last_id)
-                if order != row["display_order"] or identity != row["display_identity"]:
-                    updates.append((order, identity, last_id))
-            rows.close()
-            if last_id == batch_start:
-                break
-            cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
-            add_write_rows("display_reconciled", cursor.rowcount)
+        with write_phase("display_full_fold"):
+            first_id: dict[bytes, int] = {}
+            last_id = 0
+            while True:
+                rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
+                batch_start = last_id
+                updates = []
+                for row in rows:
+                    last_id = row["id"]
+                    identity = self._display_identity(self._display_dedupe_key(row))
+                    order = first_id.setdefault(identity, last_id)
+                    if order != row["display_order"] or identity != row["display_identity"]:
+                        updates.append((order, identity, last_id))
+                rows.close()
+                if last_id == batch_start:
+                    break
+                cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+                add_write_rows("display_reconciled", cursor.rowcount)
 
+    @timed_write_phase("display_planned_fold")
     def _fold_display_orders(self, conn, visible: List[Tuple[int, Optional[bytes], Optional[int]]],
                              plan: _FoldPlan) -> None:
         """The full scan's fold over *visible*, recomputing only rows *plan* cannot vouch for."""
         stale = [row_id for row_id, stored, _order in visible
                  if stored is None or plan.get(row_id, (None,))[0] != stored]
-        stale_set = set(stale)
-        # A role change nulls the stored identity, so an unchanged row keeps the snapshot's role.
-        users = [row_id for row_id, _stored, _order in visible
-                 if row_id not in stale_set and plan[row_id][2] is not _NOT_A_USER_ROW]
-        for start in range(0, len(users), 500):
-            chunk = users[start:start + 500]
-            for row_id, metadata in conn.execute(
-                    f"SELECT id, display_metadata FROM messages WHERE id IN ({_placeholders(chunk)})", chunk):
-                if metadata != plan[row_id][2]:
-                    stale.append(row_id)
         fresh: Dict[int, bytes] = {}
-        for start in range(0, len(stale), 500):
-            chunk = stale[start:start + 500]
-            for row in conn.execute(f"{_DISPLAY_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})", chunk):
-                fresh[row["id"]] = self._display_identity(self._display_dedupe_key(row))
+        add_write_rows("display_stale", len(stale))
+        with write_phase("display_stale_decode"):
+            for start in range(0, len(stale), 500):
+                chunk = stale[start:start + 500]
+                for row in conn.execute(f"{_DISPLAY_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})", chunk):
+                    fresh[row["id"]] = self._display_identity(self._display_dedupe_key(row))
         first_id: Dict[bytes, int] = {}
         updates = []
         for row_id, stored, order in visible:
@@ -1387,8 +1379,9 @@ class SessionMessagesMixin:
             if folded != order or identity != stored:
                 updates.append((folded, identity, row_id))
         if updates:
-            cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
-            add_write_rows("display_reconciled", cursor.rowcount)
+            with write_phase("display_updates"):
+                cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+                add_write_rows("display_reconciled", cursor.rowcount)
 
     def _ensure_display_order(self, session_id: str) -> bool:
         """Backfill one legacy session once, preserving the pre-index display identity exactly."""
