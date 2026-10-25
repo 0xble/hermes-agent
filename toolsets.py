@@ -21,7 +21,7 @@ _HERMES_CORE_TOOLS = [
     "browser_vault",  # rides with the browser; deferred by default (tools.tool_search.defer)
     "browser_vault_list",  # explicit list surface retained for browser toolset discovery
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
-    "text_to_speech",
+    "text_to_speech", "react_to_message",
     "todo_list", "memory", "compact_context",
     "session_search",
     "clarify",
@@ -473,7 +473,10 @@ def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[
     """*disabled* plus every platform-gated toolset a session on *platform* does not get. An agent stores
     this as its ``disabled_toolsets``, so the tool list, the tool_search listing and bridge, MCP refreshes
     and delegate children (which inherit it) all subtract the gated tools in ``_select_tool_names``."""
-    if platform == "desktop":
+    from gateway.config import Platform
+
+    gateway_platforms = {p.value for p in Platform if p != Platform.LOCAL}
+    if platform not in gateway_platforms:
         from tools.react_to_message_tool import check_react_requirements
         if not check_react_requirements():
             disabled = [*(disabled or ()), "reactions"]
