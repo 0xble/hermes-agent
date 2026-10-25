@@ -151,6 +151,44 @@ async def test_obvious_owner_moves_and_unknown_owner_gets_one_internal_preparati
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["process", "cron"])
+async def test_unchanged_live_work_does_not_repeat_preparation(runtime, monkeypatch, kind):
+    from cron import jobs
+    from tools.process_registry import process_registry
+
+    r = runtime
+    samples = iter(range(3))
+
+    def live_records(**_):
+        sample = next(samples)
+        if kind == "process":
+            return [{"session_id": "worker", "command": "watch service", "status": "running",
+                     "owner_task_id": "old", "uptime_seconds": sample,
+                     "output_preview": f"Health check {sample}"}]
+        return [{"id": "watch", "name": "Service Watch", "enabled": True,
+                 "deliver": "telegram:101:17", "last_run": sample, "next_run": sample + 1}]
+
+    if kind == "process":
+        monkeypatch.setattr(process_registry, "list_sessions", live_records)
+    else:
+        monkeypatch.setattr(jobs, "list_jobs", live_records)
+
+    async def admit(event):
+        event._gateway_accepted = True
+
+    r.adapter.handle_message = AsyncMock(side_effect=admit)
+    await retire.save(r.runner, r.source, r.state)
+    for _ in range(3):
+        state = await retire.load(r.runner, r.source)
+        assert state is not None
+        assert not await work.prepare(r.runner, r.source, state)
+    assert r.adapter.handle_message.await_count == 1
+    waiting = await retire.load(r.runner, r.source)
+    assert waiting is not None and waiting["phase"] == "waiting"
+    r.adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_pending_handoff_reconciles_even_when_item_no_longer_in_inventory(runtime, monkeypatch):
     r = runtime
     r.state["handoffs"] = {"task:t1": {"item": {"id": "task:t1", "kind": "task", "task_id": "t1"},

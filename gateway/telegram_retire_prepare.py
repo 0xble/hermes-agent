@@ -24,8 +24,15 @@ async def queue_preparation(runner, source, state: dict, items: list[dict], *, b
     """Choose owners in context, never turn an ownership gap into a user questionnaire."""
     from gateway.telegram_retire import save
 
-    fingerprint = json.dumps({"items": items, "busy": busy, "reason": state.get("reason", ""),
-                              "target": state.get("target", ""), "context": state.get("context", "")},
+    # Runtime snapshots contain advancing clocks and output. Only a changed
+    # decision, not another observation of the same work, may wake the model.
+    decision_items = [
+        {field: item.get(field, "") for field in ("id", "kind", "title", "blocked_owner", "blocked_reason")}
+        for item in sorted(items, key=lambda item: item["id"])
+    ]
+    fingerprint = json.dumps({"items": decision_items, "busy": busy, "reason": state.get("reason", ""),
+                              "target": state.get("target", ""), "context": state.get("context", ""),
+                              "owners": state.get("owners", {})},
                              sort_keys=True, default=str)
     key = (state["session_id"], state["generation"])
     admitted = getattr(runner, "_telegram_retire_preparations", None)

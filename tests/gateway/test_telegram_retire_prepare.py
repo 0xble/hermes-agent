@@ -51,6 +51,40 @@ async def test_preparation_is_silent_pinned_deduplicated_and_readmitted_after_re
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scope,field,value", [
+    ("item", "id", "other"),
+    ("item", "kind", "cron"),
+    ("item", "title", "Another Service"),
+    ("item", "blocked_owner", "Service Operations"),
+    ("item", "blocked_reason", "Destination is retiring"),
+    ("state", "reason", "Its lasting subject moved"),
+    ("state", "target", "Service Operations"),
+    ("state", "context", "Continue the service watch"),
+    ("state", "owners", {"loop": "Service Operations"}),
+    ("busy", "busy", "Active claim still running"),
+])
+async def test_preparation_rearms_for_changed_decisions_not_inventory_order(runtime, scope, field, value):
+    r = runtime
+    items = [{"id": "loop", "kind": "loop", "title": "Watch Service"},
+             {"id": "goal", "kind": "goal", "title": "Operate Service"}]
+    assert not await queue_preparation(r.runner, r.source, r.state, items)
+    assert not await queue_preparation(r.runner, r.source, r.state, list(reversed(items)))
+    assert r.adapter.handle_message.await_count == 1
+    busy = ""
+    if scope == "item":
+        items[0][field] = value
+    elif scope == "state":
+        r.state[field] = value
+    else:
+        busy = value
+    assert not await queue_preparation(r.runner, r.source, r.state, items, busy=busy)
+    assert r.adapter.handle_message.await_count == 2
+    assert not await queue_preparation(r.runner, r.source, r.state, items, busy=busy)
+    assert r.adapter.handle_message.await_count == 2
+    r.adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_refused_preparation_can_retry_without_consuming_the_wake(runtime):
     r = runtime
     r.adapter.handle_message.side_effect = None
