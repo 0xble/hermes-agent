@@ -225,6 +225,10 @@ def test_full_picker_discovers_codex_models_with_pinned_canonical_url(monkeypatc
         })
 
     monkeypatch.setattr(httpx, "get", catalog_get)
+    # Usage refresh is unrelated to catalog discovery. A daemon would outlive these
+    # patches and resolve credentials or use HTTP recorders installed by later tests.
+    monkeypatch.setattr("agent.account_usage_cache.refresh_account_usage_async", lambda providers: [])
+    monkeypatch.setattr("agent.account_usage_cache.refresh_account_usage_entries_async", lambda requests: [])
     # Unrelated metadata sources stay offline; config, auth, discovery, cache and picker are real.
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", dict)
     monkeypatch.setattr("hermes_cli.models.get_curated_nous_model_ids", list)
