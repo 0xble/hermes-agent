@@ -12,7 +12,10 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import immutable_releases as releases, main, update_cmd, update_receipt
+from hermes_cli import update_cmd_candidate as candidates
 from hermes_cli.subcommands.update import build_update_parser
+
+_real_landing_status = candidates.candidate_landing_status
 
 # Every subprocess is confined to the fixture's throwaway repository and home.
 pytestmark = pytest.mark.live_system_guard_bypass
@@ -52,6 +55,8 @@ def installed(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # The forge boundary is injected, while Git, staging and activation stay real.
+    monkeypatch.setattr(candidates, "candidate_landing_status", lambda *a, **kw: "unmerged")
     monkeypatch.setattr(main, "PROJECT_ROOT", source)
     monkeypatch.setattr(releases, "_build_candidate_web", lambda *_: None)
     monkeypatch.setattr(releases, "prepare_venv", lambda *a, **kw: None)
@@ -184,7 +189,7 @@ def test_merged_or_contained_live_keeps_bare_target(installed, already_in):
 
 
 @pytest.mark.parametrize("landing", ["squash", "merge", "squash-deleted-branch"])
-def test_carried_candidate_landing_returns_to_published_target(installed, landing):
+def test_carried_candidate_landing_returns_to_published_target(installed, landing, monkeypatch):
     combined = apply(installed)
     # Carry over a second main advance too, so synthetic ancestry cannot leak in.
     commit_file(installed.source, "later.txt", "later main change\n")
@@ -200,6 +205,7 @@ def test_carried_candidate_landing_returns_to_published_target(installed, landin
     target = git(installed.source, "rev-parse", "HEAD")
     git(installed.source, "update-ref", "refs/remotes/origin/main", target)
     git(installed.source, "fetch", ".", "main")
+    monkeypatch.setattr(candidates, "candidate_landing_status", lambda *a, **kw: "merged")
     assert apply(installed).name == target
     assert (releases.read_pointer(installed.home / "previous")).name == combined.name
     assert git(installed.source, "status", "--porcelain") == ""
@@ -207,7 +213,7 @@ def test_carried_candidate_landing_returns_to_published_target(installed, landin
 
 @pytest.mark.parametrize("commits,landing", [(1, "squash"), (2, "squash"), (2, "cherry-pick")])
 @pytest.mark.parametrize("followup", ["revert", "delete", "edit"])
-def test_squash_landed_candidate_respects_later_main_changes(installed, commits, landing, followup, capsys):
+def test_squash_landed_candidate_respects_later_main_changes(installed, commits, landing, followup, capsys, monkeypatch):
     if commits == 2:
         git(installed.source, "switch", "candidate")
         live = commit_file(installed.source, "candidate.txt", "reviewed candidate content\n")
@@ -235,6 +241,7 @@ def test_squash_landed_candidate_respects_later_main_changes(installed, commits,
     target = git(installed.source, "rev-parse", "HEAD")
     git(installed.source, "update-ref", "refs/remotes/origin/main", target)
     git(installed.source, "fetch", ".", "main")
+    monkeypatch.setattr(candidates, "candidate_landing_status", lambda *a, **kw: "merged")
     active = apply(installed)
     assert active.name == target
     if followup == "edit":
@@ -265,6 +272,143 @@ def test_unlanded_candidate_is_not_mistaken_for_target_history(installed, commit
     assert (active / "candidate.txt").read_text() == expected
     assert (active / "other.txt").read_text() == "installed optimistic change\n"
     assert git(installed.source, "rev-parse", f"{active.name}^2") == installed.live
+
+
+@pytest.mark.parametrize("followup", ["revert", "delete", "edit"])
+def test_nearby_context_squash_landing_is_authoritative(installed, monkeypatch, followup, capsys):
+    root = installed.source
+    lines = [f"line{i}\n" for i in range(1, 21)]
+    # Shared history with real adjacent lines, not an untouched candidate-only file.
+    git(root, "switch", "--detach", installed.base)
+    base = commit_file(root, "nearby.txt", "".join(lines))
+    git(root, "switch", "-C", "candidate", base)
+    lines[9] = "candidate-change\n"
+    live = commit_file(root, "nearby.txt", "".join(lines))
+    change_live(installed, live)
+    git(root, "switch", "-C", "main", base)
+    lines[9] = "line10\n"
+    lines[7] = "main-nearby-change\n"
+    commit_file(root, "nearby.txt", "".join(lines))
+    git(root, "merge", "--squash", "candidate")
+    git(root, "commit", "-m", "squash candidate against changed context")
+    landing = git(root, "rev-parse", "HEAD")
+    if followup == "revert":
+        git(root, "revert", "--no-edit", landing)
+    elif followup == "delete":
+        git(root, "rm", "nearby.txt")
+        git(root, "commit", "-m", "delete landed content")
+    else:
+        lines[9] = "superseding-main-change\n"
+        commit_file(root, "nearby.txt", "".join(lines))
+    target = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/remotes/origin/main", target)
+    git(root, "fetch", ".", "main")
+    monkeypatch.setattr(candidates, "candidate_landing_status", lambda *a, **kw: "merged")
+    active = apply(installed)
+    assert active.name == target
+    if followup == "delete":
+        assert not (active / "nearby.txt").exists()
+    else:
+        expected = "line10\n" if followup == "revert" else "superseding-main-change\n"
+        assert (active / "nearby.txt").read_text().splitlines(keepends=True)[9] == expected
+    assert "CARRYING FORWARD" not in capsys.readouterr().out
+    assert "carried_candidates" not in update_receipt._current.get().data
+    assert git(root, "rev-parse", "HEAD") == target
+    assert git(root, "status", "--porcelain") == ""
+
+
+
+@pytest.mark.parametrize("origin", [
+    "https://github.com/example/hermes-agent.git",
+    "git@github.com:example/hermes-agent.git",
+    "ssh://git@github.com/example/hermes-agent.git",
+])
+@pytest.mark.parametrize("state", ["merged", "unmerged", "unknown"])
+def test_landing_evidence_uses_origin_pr_record(installed, monkeypatch, origin, state):
+    from hermes_cli import source_check
+
+    git(installed.source, "remote", "add", "origin", origin)
+    pr = {"base": {"ref": "main", "repo": {"full_name": "example/hermes-agent"}},
+          "head": {"sha": installed.live}, "state": "open", "merged_at": None}
+    if state == "merged":
+        pr.update(state="closed", merged_at="2026-10-24T12:00:00Z")
+    urls = []
+
+    def request(url):
+        urls.append(url)
+        return json.dumps([] if state == "unknown" else [pr])
+
+    monkeypatch.setattr(source_check, "_request", request)
+    assert _real_landing_status(installed.source, installed.live, base_branches={"main"}) == state
+    assert urls == [f"https://api.github.com/repos/example/hermes-agent/commits/{installed.live}/pulls?per_page=100&page=1"]
+
+
+@pytest.mark.parametrize("case", ["offline", "malformed", "no-pr", "closed", "moved-head", "other-base", "other-repo", "non-github", "no-origin"])
+def test_uncertain_landing_evidence_is_unknown(installed, monkeypatch, case):
+    from hermes_cli import source_check
+
+    pr = {"base": {"ref": "main", "repo": {"full_name": "example/hermes-agent"}},
+          "head": {"sha": installed.live}, "state": "open", "merged_at": None}
+    if case != "no-origin":
+        origin = "https://example.com/example/hermes-agent.git" if case == "non-github" else "https://github.com/example/hermes-agent.git"
+        git(installed.source, "remote", "add", "origin", origin)
+    if case == "closed":
+        pr["state"] = "closed"
+    elif case == "moved-head":
+        pr["head"]["sha"] = installed.target
+    elif case == "other-base":
+        pr["base"]["ref"] = "unrelated"
+    elif case == "other-repo":
+        pr["base"]["repo"]["full_name"] = "other/hermes-agent"
+
+    def request(url):
+        if case == "offline":
+            raise OSError("offline")
+        if case == "malformed":
+            return '{"message": "unavailable"}'
+        return json.dumps([] if case == "no-pr" else [pr])
+
+    monkeypatch.setattr(source_check, "_request", request)
+    assert _real_landing_status(installed.source, installed.live, base_branches={"main"}) == "unknown"
+
+
+@pytest.mark.parametrize("last_page", ["merged", "failure", "empty", "incomplete"])
+def test_landing_evidence_reads_all_pages_before_carry(installed, monkeypatch, last_page):
+    from hermes_cli import source_check
+
+    git(installed.source, "remote", "add", "origin", "https://github.com/example/hermes-agent.git")
+    pr = {"base": {"ref": "stable", "repo": {"full_name": "example/hermes-agent"}},
+          "head": {"sha": installed.live}, "state": "open", "merged_at": None}
+    urls = []
+
+    def request(url):
+        urls.append(url)
+        if len(urls) == 1 or last_page == "incomplete":
+            return json.dumps([pr] * 100)
+        if last_page == "failure":
+            raise OSError("page unavailable")
+        if last_page == "empty":
+            return "[]"
+        return json.dumps([{**pr, "state": "closed", "merged_at": "2026-10-24T12:00:00Z"}])
+
+    monkeypatch.setattr(source_check, "_request", request)
+    expected = {"merged": "merged", "failure": "unknown", "empty": "unmerged", "incomplete": "unknown"}[last_page]
+    assert _real_landing_status(installed.source, installed.live, base_branches={"main", "stable"}) == expected
+    assert len(urls) == (10 if last_page == "incomplete" else 2)
+
+
+def test_unknown_landing_refuses_without_dropping_or_carrying(installed, monkeypatch, capsys):
+    monkeypatch.setattr(candidates, "candidate_landing_status", lambda *a, **kw: "unknown")
+    with pytest.raises(SystemExit) as stopped:
+        apply(installed)
+    assert stopped.value.code == 2
+    assert releases.read_pointer(installed.home / "current").name == installed.live
+    assert installed.handed == []
+    out = capsys.readouterr().out
+    assert "landing" in out.lower()
+    assert f"--replace-candidate {installed.live}" in out
+    assert "carried_candidates" not in update_receipt._current.get().data
+    assert apply(installed, "--replace-candidate", installed.live).name == installed.target
 
 
 def test_uppercase_replacement_names_the_same_commit(installed):

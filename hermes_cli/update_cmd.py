@@ -2217,7 +2217,8 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
     if current is not None and not _release_is_ready(current, current.name):
         raise RuntimeError("current release is not ready; refusing to activate from an invalid pointer")
     from hermes_cli.update_cmd_candidate import candidate_branch, select_update_candidate
-    selected = select_update_candidate(source, home, fetched, getattr(args, "replace_candidate", None))
+    selected = select_update_candidate(
+        source, home, fetched, getattr(args, "replace_candidate", None), target_branch=branch)
     selected_branch = branch if selected == fetched else candidate_branch(home, current, source=source)
     fetched = selected
     # Capture migration metadata and the source plist transactionally at activation,
