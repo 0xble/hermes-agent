@@ -41,6 +41,7 @@ def test_compaction_reports_phase_times_and_existing_row_amplification(tmp_path,
         assert count == 11
         warning = next(record.message for record in caplog.records if "held the write lock" in record.message)
         for name in ("archive_mark_inactive", "insert_incl_fts", "clone_incl_fts", "display_reconcile",
+                     "display_index", "display_planned_fold", "display_stale_decode",
                      "callback_total", "commit"):
             assert re.search(rf"{name}=\d+\.\d{{3}}s", warning), warning
         inserted_match = re.search(r"inserted=(\d+)", warning)
