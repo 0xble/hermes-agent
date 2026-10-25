@@ -4,6 +4,15 @@ import asyncio
 from typing import Any, Optional
 
 
+def call_typing_with_metadata(method, *args, metadata=None):
+    """Preserve legacy adapter overrides without dropping metadata on newer ones."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    if BasePlatformAdapter._accepts_kwarg(method, "metadata", var_kw=True, unknown=False):
+        return method(*args, metadata=metadata)
+    return method(*args)
+
+
 class TypingStateMixin:
     def _typing_scope_key(self, chat_id: str, metadata: Optional[dict[str, Any]] = None):
         """Adapters may refine the surface identity (for example, a workspace)."""

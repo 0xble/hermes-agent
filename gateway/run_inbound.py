@@ -28,6 +28,7 @@ from gateway.config import Platform
 from gateway.cron_review import is_review_event
 from gateway.platforms.base import EphemeralReply, as_command_reply
 from gateway.platforms.event import MessageEvent, MessageType, turn_origin_for_event
+from gateway.platforms.typing_state import call_typing_with_metadata
 from gateway.run_busy import approval_input_words
 from gateway.run_common import _UNSET
 from gateway.run_inbound_media import rehome_inbound_media
@@ -653,7 +654,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             _clarify_adapter = self._delivery_adapter_for(source)
             if _clarify_adapter:
                 try:
-                    _clarify_adapter.resume_typing_for_chat(source.chat_id, metadata=self._event_thread_metadata(event, source))
+                    call_typing_with_metadata(_clarify_adapter.resume_typing_for_chat, source.chat_id, metadata=self._event_thread_metadata(event, source))
                 except Exception:
                     logger.debug("Failed to resume typing after clarify response", exc_info=True)
                 # A typed answer to a native card (numeric pick, or text after "Other") never

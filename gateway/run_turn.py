@@ -30,6 +30,7 @@ from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, turn_origin_for_event
+from gateway.platforms.typing_state import call_typing_with_metadata
 from gateway.session_context import bound_turn_origin, set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
@@ -3846,7 +3847,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
             def _pause_typing_before_finalize(_adapter=adapter, _chat_id=source.chat_id) -> None:
-                _adapter.pause_typing_for_chat(_chat_id, metadata=self._thread_metadata_for_source(source))
+                call_typing_with_metadata(_adapter.pause_typing_for_chat, _chat_id, metadata=self._thread_metadata_for_source(source))
         # Non-editing platforms (QQ, WeChat) skip streaming — the partial first message could never
         # be updated — unless they have a native-streaming transport (WeCom msgtype "stream").
         _adapter_supports_edit = getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
@@ -4374,7 +4375,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             or _relay_prospective_thread_id
             else None
         )
-        if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
+        if source.platform == Platform.SLACK:
+            _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+            if _status_thread_metadata and event_message_id:
+                _status_thread_metadata = {**_status_thread_metadata, "message_id": event_message_id}
+        elif source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             _status_thread_metadata = {"thread_id": _progress_thread_id, "reply_to_message_id": event_message_id}
         else:
             _status_thread_metadata = self._thread_metadata_for_progress(

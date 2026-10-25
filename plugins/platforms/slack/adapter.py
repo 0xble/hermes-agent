@@ -2729,7 +2729,11 @@ class SlackAdapter(BasePlatformAdapter):
         _status = self.get_status_text(chat_id, metadata) or getattr(
             self.config, "typing_status_text", None)
         _status = _status or self._default_status_text(_status_started)
+        owner = getattr(self, "_typing_tasks", {}).get(self._typing_scope_key(chat_id, metadata))
         await self._set_thread_status(chat_id, team_id, thread_ts, _status, "failed")
+        # An interim reassertion can finish after final cleanup has removed its owner.
+        if owner is not None and not self._typing_is_active(chat_id, metadata):
+            await self.stop_typing(chat_id, metadata=metadata)
 
     async def _set_thread_status(
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
