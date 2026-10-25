@@ -132,8 +132,15 @@ def test_detached_restart_all_never_runs_the_host_gateway_in_the_caller(monkeypa
     monkeypatch.setattr(gw, "_installed_service_kind_for", lambda windows: None)
     monkeypatch.setattr(gw, "get_python_path", lambda: sys.executable)
     monkeypatch.setattr(gw, "run_gateway", lambda **k: pytest.fail("the caller became the host gateway"))
-    launched = []
-    monkeypatch.setattr(gw.subprocess, "Popen", lambda cmd, **k: launched.append(cmd) or SimpleNamespace())
+    launched, real_popen = [], gw.subprocess.Popen
+
+    def _popen(cmd, **kwargs):
+        if "hermes_cli.main" not in cmd:
+            return real_popen(cmd, **kwargs)
+        launched.append(cmd)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(gw.subprocess, "Popen", _popen)
 
     gw._cmd_restart(SimpleNamespace(system=False, all=True, force=False, detach=True))
 

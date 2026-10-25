@@ -2979,7 +2979,7 @@ class TestUnitAnchoredServiceIdentity:
             f'[Service]\nEnvironment="HERMES_HOME={alice_home}"\n', encoding="utf-8"
         )
         monkeypatch.setattr(gateway_cli, "_SYSTEM_UNIT_DIR", unit_dir)
-        monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: root_home)
+        monkeypatch.setattr(hermes_constants, "account_default_hermes_home", lambda: root_home)
         monkeypatch.setenv("HERMES_HOME", str(bob_home))
         name = gateway_cli.get_service_name()
         assert name != gateway_cli._SERVICE_BASE
@@ -3018,7 +3018,7 @@ class TestUnitAnchoredServiceIdentity:
         unit_path.write_text(f'[Service]\nEnvironment="HERMES_HOME={profile_home}"\n', encoding="utf-8")
         monkeypatch.setattr(gateway_cli, "_SYSTEM_UNIT_DIR", unit_dir)
         monkeypatch.setattr(os, "geteuid", lambda: 0)
-        monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: root_home)
+        monkeypatch.setattr(hermes_constants, "account_default_hermes_home", lambda: root_home)
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
         assert gateway_cli.get_service_name() == gateway_cli._SERVICE_BASE
         # The profile branch, consulted against the home that owns the profile, would have answered
@@ -3040,7 +3040,7 @@ class TestUnitAnchoredServiceIdentity:
         )
         monkeypatch.setattr(gateway_cli, "_SYSTEM_UNIT_DIR", unit_dir)
         monkeypatch.setattr(os, "geteuid", lambda: 0)
-        monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: root_home)
+        monkeypatch.setattr(hermes_constants, "account_default_hermes_home", lambda: root_home)
         monkeypatch.delenv("HERMES_HOME", raising=False)
 
         pre_sync_name = gateway_cli.get_service_name()

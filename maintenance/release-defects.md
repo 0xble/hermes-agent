@@ -720,6 +720,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- Service identity fixtures use account-native home naming. Detached restart mocks only
+  the gateway launch, leaving process scans real. The vanished-file race probes preflight
+  directly before reopening because upstream serializes startup preflight and quarantine.
+
 - Post-turn goal/loop bookkeeping retains the owner's failed-result fence even for text-only
   refusal returns. Soft eviction honors the memory manager's teardown claim during a reset's
   pre-extraction flush and cleanup captures its transcript before eviction clears the agent.
