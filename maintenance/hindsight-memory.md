@@ -14,7 +14,10 @@ work and the outer turn cleanup have drained, including errors and cancellation.
 The worker and turn completion events bind during agent lookup, before publication
 in the cache. Completion checks cache identity without removing a successor or
 clearing its generation. A per-agent handoff-lock claim prevents duplicate soft
-release when idle eviction races turn completion. Resolver doubles that reuse an
+release when idle eviction races turn completion. Idle, LRU-cap and pressure sweeps
+record the session-end key on the agent while popping it under the cache lock. When
+that agent's turn has not drained, the drain-time release commits with the key, so
+the end-of-session commit still runs exactly once. Resolver doubles that reuse an
 agent across turns must model cache ownership and match the configured default
 model. Otherwise outer-turn cleanup correctly retires their uncached client.
 Silence-retry coverage keeps its call-count, retry-budget and history assertions

@@ -113,10 +113,6 @@ def running_turn(monkeypatch):
     runner._run_agent_start_turn_worker = capture_worker
     monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0")
     monkeypatch.setattr("gateway.run_turn_silence_recovery.silence_recovery_due", lambda *a, **kw: False)
-    print("isolated memory resources", {
-        "agent_id": id(agent), "manager_id": id(manager), "provider_id": id(provider),
-        "threads": [(thread.name, thread.ident, thread.native_id) for thread in threads],
-    })
     harness = SimpleNamespace(**locals())
     yield harness
     resume.set()
@@ -218,6 +214,52 @@ async def test_failed_or_cancelled_turn_defers_evicted_agent_until_real_worker_e
         for thread in h.threads:
             thread.join(5)
             assert not thread.is_alive()
+    finally:
+        h.resume.set()
+        h.post_resume.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def join_release_threads(prefix):
+    for thread in [t for t in threading.enumerate() if t.name.startswith(prefix)]:
+        thread.join(5)
+        assert not thread.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_sweep_during_undrained_turn_commits_session_end_once_at_drain(running_turn):
+    h = running_turn
+    task = asyncio.create_task(h.runner._run_agent_inner(
+        "hi", "", [], h.source, "sid", h.key, run_generation=1,
+    ))
+    try:
+        await wait_set(h.started)
+        # Inactivity-timeout shape: the outer turn returns and frees its running slot while the
+        # blocking worker is still inside the agent, so the cached agent becomes sweepable.
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        worker = h.worker_holder[0]
+        assert worker.turn_done.is_set() and not worker.worker_done.is_set()
+        h.runner._release_running_agent_state(h.key)
+        assert h.runner._agent_cache[h.key][0] is h.agent
+        h.agent._last_activity_ts = 0
+        h.runner._agent_cache_idle_ttl = lambda: 0
+        assert h.runner._sweep_idle_cached_agents() == 1
+        join_release_threads("agent-cache-idle-")
+        assert h.key not in h.runner._agent_cache
+        h.agent.commit_memory_session.assert_not_called()
+        assert not h.released.is_set()
+        h.resume.set()
+        await worker.executor_task
+        await wait_set(h.released)
+        join_release_threads("agent-turn-release-")
+        h.agent.commit_memory_session.assert_called_once_with([{"role": "user", "content": "hi"}])
+        h.provider.shutdown.assert_called_once_with()
+        h.agent.release_clients.assert_called_once_with()
+        h.runner._commit_then_release_soft(h.agent, h.key)
+        h.agent.commit_memory_session.assert_called_once()
+        h.agent.release_clients.assert_called_once_with()
     finally:
         h.resume.set()
         h.post_resume.set()

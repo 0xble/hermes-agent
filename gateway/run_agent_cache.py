@@ -1195,6 +1195,15 @@ class GatewayAgentCacheMixin:
         agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
         return agent if agent and agent is not _AGENT_PENDING_SENTINEL else None
 
+    @staticmethod
+    def _pop_for_session_end(cache: Any, key: str) -> None:
+        """Pop a session-ending sweep entry. Its commit key stays on the agent for an unfinished turn
+        that drains after this pop and therefore owns the soft release."""
+        agent = _first_agent(cache.pop(key, None))
+        if agent is not None:
+            with suppress(AttributeError):  # Slotted doubles and the pending sentinel carry no key.
+                agent._gateway_session_end_key = key
+
     def _turn_lifetime_drained(self, agent: Any) -> bool:
         """True when this exact agent has no unfinished turn, or both turn stages have drained."""
         lifetime = getattr(agent, "_gateway_turn_lifetime", None)
@@ -1251,6 +1260,9 @@ class GatewayAgentCacheMixin:
         ``commit_key``, end-of-session memory is committed atomically with the detach."""
         if agent is None or not self._claim_soft_release(agent):
             return
+        if commit_key is None:
+            deferred = getattr(agent, "_gateway_session_end_key", None)
+            commit_key = deferred if isinstance(deferred, str) else None
         manager = self._detach_memory_manager(agent, commit_key)
         if manager is not None:
             if retired is not None:
@@ -1344,7 +1356,7 @@ class GatewayAgentCacheMixin:
                 protect_recent=bounds.protect_recent,
             )
             for key, _ in plan:
-                _cache.pop(key, None)
+                self._pop_for_session_end(_cache, key)
         if not plan:
             _mid_turn = sum(1 for _, a in ordered if a is not None and id(a) in running_ids)
             _unflushed = sum(1 for _, a in ordered if _is_live(a) and not transcript_persistence_caught_up(a))
@@ -1423,7 +1435,7 @@ class GatewayAgentCacheMixin:
         candidates = [(key, _tuple_agent(_cache.get(key))) for key in list(_cache.keys())[:max(0, len(_cache) - cap)]]
         evict_plan = [(key, agent) for key, agent in candidates if agent is None or id(agent) not in running_ids]
         for key, _ in evict_plan:
-            _cache.pop(key, None)
+            self._pop_for_session_end(_cache, key)
         remaining_over_cap = len(_cache) - cap
         if remaining_over_cap > 0:
             logger.warning(
@@ -1460,7 +1472,7 @@ class GatewayAgentCacheMixin:
                     continue
                 to_evict.append((key, agent))
             for key, _ in to_evict:
-                _cache.pop(key, None)
+                self._pop_for_session_end(_cache, key)
         for key, agent in to_evict:
             logger.info("Agent cache idle-TTL evict: session=%s (idle=%.0fs)", key, now - getattr(agent, "_last_activity_ts", now))
             self._spawn_release_thread(self._commit_then_release_soft, (agent, key), f"agent-cache-idle-{key[:24]}",
