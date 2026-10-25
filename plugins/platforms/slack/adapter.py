@@ -19,7 +19,7 @@ try:
     import aiohttp as _aiohttp
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-    from slack_sdk.web.async_client import AsyncWebClient
+    from plugins.platforms.slack.outbound_budget import BudgetedAsyncWebClient as AsyncWebClient
 
     aiohttp = _aiohttp
     SLACK_AVAILABLE = True
@@ -352,7 +352,7 @@ def check_slack_requirements() -> bool:
     def _import():
         from slack_bolt.async_app import AsyncApp
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-        from slack_sdk.web.async_client import AsyncWebClient
+        from plugins.platforms.slack.outbound_budget import BudgetedAsyncWebClient as AsyncWebClient
         import aiohttp
         return {
             "AsyncApp": AsyncApp, "AsyncSocketModeHandler": AsyncSocketModeHandler,
