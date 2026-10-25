@@ -48,6 +48,10 @@ from hermes_cli.goal_evidence import (
     _render_evidence_block,
 )
 from hermes_cli.goals_revisions import GoalRevisionsMixin
+from hermes_cli.goals_autonomy import (
+    AUTONOMY_CONTINUATION_TEMPLATE, GoalAutonomyMixin, goal_autonomy_enabled, migrate_autonomous_goal, record_hard_limit_breach,
+)
+from hermes_cli.goals_status import GoalStatusMixin
 from hermes_cli.lifecycle_snapshot import snapshot_control
 from hermes_time import safe_strftime
 from hermes_cli.heartbeat import SILENCE_MARKER, is_intentional_silence_response
@@ -1369,7 +1373,8 @@ def load_goal(session_id: str, *, cursor=None) -> Optional[GoalState]:
     if not raw:
         return None
     state = _parse_goal_row(session_id, raw)
-    if not _migrate_legacy_revision_requirements(state):
+    migrated = _migrate_legacy_revision_requirements(state)
+    if not (migrate_autonomous_goal(state) or migrated):
         return state
 
     # Session-control mutations already own the SessionDB write transaction. Re-entering
@@ -1388,7 +1393,8 @@ def load_goal(session_id: str, *, cursor=None) -> Optional[GoalState]:
         if row is None or not row[0]:
             return None
         live = GoalState.from_json(row[0])
-        if _migrate_legacy_revision_requirements(live):
+        migrated = _migrate_legacy_revision_requirements(live)
+        if migrate_autonomous_goal(live) or migrated:
             live.mutation_id = uuid.uuid4().hex
             conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (live.to_json(), _meta_key(session_id)))
         return live
@@ -1667,13 +1673,13 @@ def list_parked_goals() -> List[Tuple[str, "GoalState"]]:
         logger.debug("GoalManager: list_meta_prefix failed: %s", exc)
         return []
     for key, raw in rows:
-        if not raw or '"active"' not in raw:
+        if not raw or ('"active"' not in raw and not goal_autonomy_enabled()):
             continue
         try:
-            state = GoalState.from_json(raw)
+            state = load_goal(key[len("goal:"):]) if goal_autonomy_enabled() else GoalState.from_json(raw)
         except Exception:
             continue
-        if state.status == "active" and (
+        if state is not None and state.status == "active" and (
                 state.waiting_on_pid is not None or state.waiting_on_session is not None or getattr(state, "waiting_on_user_message", False) or state.waiting_until):
             out.append((key[len("goal:"):], state))
     return out
@@ -1683,10 +1689,12 @@ def store_has_parked_goal(db: Any) -> bool:
     """True when *db* holds an active goal with a wait barrier. Propagates read errors so an idle
     gate can tell "empty" from "unavailable" (callers fail open)."""
     for _key, raw in db.list_meta_prefix("goal:"):
-        if raw and '"active"' in raw:
+        if raw and ('"active"' in raw or goal_autonomy_enabled()):
             try:
                 state = GoalState.from_json(raw)
             except Exception:
+                return True
+            if goal_autonomy_enabled() and migrate_autonomous_goal(state):
                 return True
             if state.status == "active" and (
                     state.waiting_on_pid is not None or state.waiting_on_session is not None or getattr(state, "waiting_on_user_message", False) or state.waiting_until):
@@ -2778,7 +2786,7 @@ def _live_goal(state: Optional[GoalState]) -> GoalState:
     return state
 
 
-class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
+class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalContractCommandsMixin):
     """Per-session goal state + continuation decisions.
 
     The CLI and gateway each hold one per live session. ``evaluate_after_turn`` calls the judge and
@@ -2832,40 +2840,6 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
 
     def has_contract(self) -> bool:
         return self._state is not None and self._state.has_contract()
-
-    def status_line(self) -> str:
-        s = self._state
-        if isinstance(self._unreadable, GoalRowCorrupt):
-            return ("⚠ The stored goal is unreadable, so it is inert: no continuation or judge runs. "
-                    "/goal clear discards it; then /goal <text> sets a new one.")
-        if self._unreadable is not None:
-            return "⚠ The stored goal could not be read right now, so it is inert this turn. Try again."
-        if s is None or s.status == "cleared":
-            return "No active goal. Set one with /goal <text>."
-        turns = f"{_goal_budget_label(s.turns_used, s.max_turns)} turns"
-        subgoal_items = contract_items("subgoals", s.subgoals)
-        sub = f", {len(subgoal_items)} subgoal{'s' if len(subgoal_items) != 1 else ''}" if subgoal_items else ""
-        con = ", contract" if self.has_contract() else ""
-        gat = f", {len(s.gates)} gate{'s' if len(s.gates) != 1 else ''}" if s.gates else ""
-        meta = f"{turns}{sub}{con}{gat}"
-        if s.status == "active":
-            if s.waiting_on_session and _session_waiting(s.waiting_on_session):
-                return f"⏳ Goal (parked on {s.waiting_reason or f'session {s.waiting_on_session}'}, {meta}): {s.goal}"
-            if s.waiting_on_pid and _pid_alive(s.waiting_on_pid):
-                return f"⏳ Goal (parked on {s.waiting_reason or f'pid {s.waiting_on_pid}'}, {meta}): {s.goal}"
-            if s.waiting_until and time.time() < s.waiting_until:
-                remaining = int(s.waiting_until - time.time())
-                wr = s.waiting_reason or f"{remaining}s"
-                return f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}"
-            if s.waiting_on_user_message:
-                return f"⏳ Goal (waiting for your message — {meta}): {s.goal}"
-            return f"⊙ Goal (active, {meta}): {s.goal}"
-        if s.status == "paused":
-            extra = f" — {s.paused_reason}" if s.paused_reason else ""
-            return f"⏸ Goal (paused, {meta}{extra}): {s.goal}"
-        if s.status == "done":
-            return f"✓ Goal done ({meta}): {s.goal}"
-        return f"Goal ({s.status}, {meta}): {s.goal}"
 
     # --- mutation -----------------------------------------------------
 
@@ -2996,6 +2970,8 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
         self._save()
 
     def _pause_decision(self, paused_reason: str, verdict: str, reason: str, message: str) -> dict[str, Any]:
+        if goal_autonomy_enabled():
+            return self._autonomy_retry(paused_reason)
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
@@ -3029,6 +3005,8 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
             raise GoalPersistenceError(
                 "existing goal migration was not saved; refusing to overwrite it; try again"
             )
+        if goal_autonomy_enabled() and live is not None and live.status != "cleared":
+            raise ValueError("Use revise or replace to preserve the existing goal contract")
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(), last_turn_at=0.0,
             max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
@@ -3456,6 +3434,8 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
         continuation fires; the loop resumes once the barrier clears. ``None`` = the barrier is
         unobservable here, so the caller continues instead."""
         state = self._require_active()
+        if goal_autonomy_enabled() and wait_directive.get("user_message"):
+            wait_directive = {"seconds": 900}
         if wait_directive.get("session_id"):
             tgt = f"session {self.wait_on_session(str(wait_directive['session_id']), reason=reason).waiting_on_session}"
         elif wait_directive.get("pid"):
@@ -3624,6 +3604,8 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
             else:
                 state.clear_wait(preserve_notice_key=True)
 
+        if goal_autonomy_enabled() and state.max_turns > 0 and state.turns_used >= state.max_turns:
+            return self._autonomy_retry("turn budget exhausted; preserve the limit")
         state.turns_used += 1
         state.last_turn_at = time.time()
         gap_floor = max(float(self.min_continuation_gap_seconds), float(DEFAULT_MIN_CONTINUATION_GAP_SECONDS))
@@ -3672,6 +3654,13 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
             resume_override=state.resume_override_reasons(),
             user_messages_block=_render_user_messages_block(self.session_id, state.created_at),
         )
+        if goal_autonomy_enabled() and verdict in {"blocked", "done"}:
+            if verdict == "blocked":
+                record_hard_limit_breach(state, reason)
+                reason = "Choose a different route: " + reason
+            else:
+                reason = "Use goal_set complete with evidence for every criterion"
+            verdict, wait_directive = "continue", None
         state.last_verdict = verdict
         state.last_reason = reason
         if verdict == "continue" and not silent_automatic:
@@ -3800,6 +3789,9 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
 
     @staticmethod
     def _current_continuation_prompt(s: "GoalState") -> str:
+        if goal_autonomy_enabled():
+            return AUTONOMY_CONTINUATION_TEMPLATE.format(
+                goal=s.goal, contract_block=s.contract.render_block(), subgoals_block=s.render_subgoals_block())
         # Contract first (it carries the verification surface); subgoals fold in as extra criteria.
         if s.has_contract():
             contract_block = s.contract.render_block()

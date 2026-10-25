@@ -57,7 +57,9 @@ def replacement_contract(payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
     from hermes_cli.goals import _CONTRACT_FIELDS
     raw = (payload or {}).get("contract")
     raw = raw.to_dict() if hasattr(raw, "to_dict") else dict(raw or {})
-    return {f: str(raw.get(f) or "").strip() for f in _CONTRACT_FIELDS}
+    from hermes_cli.goals_autonomy import goal_autonomy_enabled
+    return {f: str(raw.get(f) or "").strip() for f in _CONTRACT_FIELDS
+            if f in raw or not goal_autonomy_enabled()}
 
 
 def _check_payload(kind: str, action: str, payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -478,7 +480,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                 goal=str(payload.get("goal") or ""),
                 max_turns=payload.get("max_turns"),
                 contract=payload.get("contract"),
-                actor="user",
+                actor="agent" if (authority or {}).get("via") == "autonomy" else "user",
                 user_quote=str((authority or {}).get("quote") or ""),
             )
         continuation_prompt = manager.next_continuation_prompt() if result.get("ok") else None
@@ -492,7 +494,8 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
                     "state": manager.state}
-        result = manager.resume()
+        autonomous = (authority or {}).get("via") == "autonomy"
+        result = manager.resume(reset_budget=not autonomous, user_override=not autonomous)
         if result is None:
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
@@ -1034,6 +1037,10 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     """
     if (kind, action) not in CONTROLS:
         return {"ok": False, "error_code": "unsupported_control"}
+    from hermes_cli.goals_autonomy import goal_autonomy_enabled
+    autonomous_goal = kind == "goal" and goal_autonomy_enabled()
+    if autonomous_goal and action == "clear":
+        return {"ok": False, "error_code": "user_only", "error": "Only the user can clear a goal with /goal clear"}
     try:
         payload = _check_payload(kind, action, payload)
         target_sid = resolve_target(target_sid)
@@ -1085,6 +1092,15 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         _save_record(record, cursor=conn)
         return {"ok": not bool(code), "status": record["status"], "record": record,
                 **({"error_code": code, "error": code} if code else {}), **result}
+
+    if autonomous_goal:
+        # No route/approval requirement: goal writes use the same transaction and wake receipt.
+        # Replacement is an agent edit, so every existing requirement still binds.
+        try:
+            return _db()._execute_write(lambda conn: commit(
+                conn, {"via": "autonomy", "session_id": str(requester_sid)}, "session_control_autonomy"))
+        except Exception as exc:
+            return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
 
     # Cross-session goal clear/replace without a quote is intentionally non-blocking and does not
     # require a Telegram route. A supplied quote remains subject to the normal safety checks, so a

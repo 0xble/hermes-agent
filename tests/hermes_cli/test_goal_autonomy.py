@@ -43,7 +43,7 @@ def test_completion_preserves_unproven_goal_and_records_each_gap(home):
         assert gap in result["error"]
         assert goals.load_goal("autonomy").status == "active"
         assert "complete_refused" in json.dumps(goals.load_goal("autonomy").revisions)
-        assert gap in dispatch_goal_command(mgr, "status").output
+        assert gap in dispatch_goal_command(mgr, "status", authorize_gate=lambda: None).output
     evidence = proof(db)
     assert mgr.complete(reason="verified", evidence=evidence)["ok"]
     state = goals.load_goal("autonomy")
