@@ -29,3 +29,4 @@ async def start_native_task_card_stream(client: Any, stream: Any, metadata: dict
         stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
     if not stream.stream_ts:
         raise RuntimeError("Slack startStream returned no stream timestamp")
+    stream.message_timestamps.append(stream.stream_ts)
