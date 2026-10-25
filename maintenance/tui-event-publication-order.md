@@ -8,6 +8,8 @@ The replay sequence and each session's subscriber mailboxes must observe the sam
 
 Connector progress is authorized against its captured runtime owner at admission. A rejected stale owner must not allocate a replay entry. Preserve the compute-host drain barrier before `turn.end` and shutdown, since its next action may hard-exit without running daemon writers.
 
+Settlement must not initialize tool discovery or resolve cold Git provenance merely to populate optional UI metadata. Query the existing tool registry and share the canonical version cache through its nonblocking read. A cold snapshot keeps its empty version until resolution finishes, and subsequent snapshots report the resolved identity. Final session events still drain before `turn.end`.
+
 This patch does not change queue limits, wire contracts, replay retention, or the multiclient model's seed-11 invariant.
 
 ## Upstream Provenance And Adoption
