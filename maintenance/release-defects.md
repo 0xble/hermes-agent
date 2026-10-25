@@ -725,6 +725,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   delayed report writing after the checkpoint and observed the final summary in
   the same isolated home. Pause, active-turn suppression and exactly-once count
   assertions remain unchanged.
+- Canonical compression fixtures bind authority profile IDs to their isolated
+  database home instead of the relative placeholder `owned`. Real post-compaction
+  plugin discovery initializes that profile and previously seeded `owned/SOUL.md`
+  in the checkout. The live-memory-hook test now observes the actual background
+  hook's home while still running discovery, so this isolation defect fails at
+  its source without changing the CI modified-source guard.
 
 - Completion-batch retry narrowing removes the original primary event, not the
   authority-only metadata copy. Already-admitted siblings are removed after their
