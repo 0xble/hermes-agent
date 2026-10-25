@@ -68,6 +68,24 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
     assert not any("#38798" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("platform", ["cli", "feishu", "discord"])
+def test_explicit_empty_platform_pin_is_not_refilled_by_native_recovery(platform):
+    """An empty saved selection must not regain native tools (#82010, #135022)."""
+    assert _get_platform_tools(
+        {"platform_toolsets": {platform: []}}, platform,
+        include_default_mcp_servers=False,
+    ) == set()
+
+
+@pytest.mark.parametrize("selection", [None, ["terminal", "file"]])
+def test_native_recovery_keeps_non_checklist_toolsets_on_non_empty_saves(selection):
+    """Feishu's non-checklist tools survive defaults and non-empty selections."""
+    config = {} if selection is None else {"platform_toolsets": {"feishu": selection}}
+    assert {"feishu_doc", "feishu_drive"} <= _get_platform_tools(
+        config, "feishu", include_default_mcp_servers=False,
+    )
+
+
 def test_null_platform_toolsets_fall_back_to_platform_default():
     """A YAML ``platform:`` value is absent, not an explicit empty list."""
     config = {"platform_toolsets": {"cli": None}}
