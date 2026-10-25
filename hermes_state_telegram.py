@@ -342,6 +342,24 @@ class SessionTelegramTopicsMixin:
         )
         return dict(row) if row else None
 
+    def resolve_telegram_topic_owner(
+        self, *, chat_id: str, owner_key: str, profile_name: str = "default",
+    ) -> Optional[dict[str, Any]]:
+        """Follow explicit shared-owner redirects, including successive topic merges."""
+        seen = set()
+        while owner_key:
+            if owner_key in seen:
+                raise RuntimeError("Telegram topic owner redirect cycle")
+            seen.add(owner_key)
+            owner = self.get_telegram_topic_owner(
+                chat_id=chat_id, owner_key=owner_key, profile_name=profile_name)
+            if not owner or owner.get("status") != "active":
+                return None
+            if owner.get("thread_id"):
+                return owner
+            owner_key = str(owner.get("canonical_owner_key") or "")
+        return None
+
     def reserve_telegram_topic_owner(
         self, *, chat_id: str, owner_key: str, topic_name: str, profile_name: str = "default",
     ) -> dict[str, Any]:

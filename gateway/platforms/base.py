@@ -4515,7 +4515,8 @@ class BasePlatformAdapter(ABC):
                                           event.source.chat_id, thread_id=event.source.thread_id) is True:
                 notice = await intercept(runner, event)
                 if notice is not None:
-                    await self.send(str(event.source.chat_id), notice, metadata=_thread_metadata_for_event(event))
+                    if notice:
+                        await self.send(str(event.source.chat_id), notice, metadata=_thread_metadata_for_event(event))
                     event._gateway_accepted = True
                     from gateway.telegram_retire import advance
                     await advance(runner, event.source)
