@@ -36,11 +36,6 @@ async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
     )
     runner._resume_pending_candidates = lambda _platform=None: entries
     runner._auto_resume_ready = lambda _entry: (adapter, source)
-    runner._session_states = {}
-    runner._session_state = lambda key: runner._session_states.setdefault(
-        key, SimpleNamespace(turn=SimpleNamespace(agent=None, started_ts=None))
-    )
-    runner._peek_session_state = runner._session_state
     runner._release_running_agent_state = lambda key: setattr(
         runner._session_state(key).turn, "agent", None
     )
