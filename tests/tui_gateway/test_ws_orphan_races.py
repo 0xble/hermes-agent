@@ -267,7 +267,7 @@ def test_late_rpc_from_closed_socket_keeps_orphan_reap_armed(monkeypatch, path, 
         assert session["transport"] is server._detached_ws_transport
         assert sid in server._pending_ws_reaps  # left armed (unpersisted/prompt) or re-armed (reuse cancels first)
     else:
-        assert session["transport"] is transport
+        assert server._session_transport_contains(session, transport)
         assert sid not in server._pending_ws_reaps
 
 

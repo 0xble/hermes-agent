@@ -29,7 +29,8 @@ async def cli(runner, source, *args, timeout=30):
     from tools.environments.local import served_profile_child_env
     home = runner._resolve_profile_home_for_source(source)
     env = served_profile_child_env(target_home=home, inherit_credentials=True)
-    session_id = runner.session_store.peek_session_id(runner._session_key_for_source(source))
+    session_id = await asyncio.to_thread(
+        runner.session_store.peek_session_id, runner._session_key_for_source(source))
     env.update(HERMES_SESSION_ID=session_id or "", HERMES_SESSION_PROFILE=source.profile or "default",
                HERMES_SESSION_KEY=runner._session_key_for_source(source))
     executable = locate_command(args[0]).command
@@ -197,7 +198,7 @@ async def receipt(runner, source, state, item, dest):
         owner_source = replace(source, thread_id=str(dest["thread_id"]))
         owner_key = runner._session_key_for_source(owner_source)
         if (owner_key != dest["session_key"]
-                or runner.session_store.peek_session_id(owner_key) != dest["session_id"]):
+                or await asyncio.to_thread(runner.session_store.peek_session_id, owner_key) != dest["session_id"]):
             raise RuntimeError("Handoff destination binding changed")
         title = f"Retired topic: {item['kind']}"
         context = "Own the transferred work. Preserve its original limits and report to this topic.\n" + json.dumps(item, ensure_ascii=False)

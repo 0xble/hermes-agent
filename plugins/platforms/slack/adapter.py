@@ -3734,17 +3734,17 @@ class SlackAdapter(BasePlatformAdapter):
             return
         source = self.build_source(
             chat_id=channel_id,
-            chat_name=self._channel_name_cache.get(
-                (str(metadata.get("team_id") or ""), channel_id), channel_id),
-            chat_type="dm",
-            user_id=user_id,
-            thread_id=thread_ts,
-            chat_topic=metadata.get("context_channel_id") or None,
-            scope_id=metadata.get("team_id") or None)
-        try:
-            session_store.get_or_create_session(source)
-        except Exception:
-            logger.debug(*fail_log, exc_info=True)
+            chat_name=self._channel_name_cache.get((str(metadata.get("team_id") or ""), channel_id), channel_id),
+            chat_type="dm", user_id=user_id, thread_id=thread_ts,
+            chat_topic=metadata.get("context_channel_id") or None, scope_id=metadata.get("team_id") or None)
+        def seed() -> None:
+            try:
+                session_store.get_or_create_session(source)
+            except Exception:
+                logger.debug(*fail_log, exc_info=True)
+        # The store read can wait seconds behind state.db writes; run inline it froze the event loop
+        # past the liveness watchdog (2026-10-25 10:06 and 10:44 PDT, app_home_opened ack).
+        self.spawn_ingress_reply(asyncio.to_thread(seed), label="dm session seed")
 
     async def _handle_assistant_thread_lifecycle_event(
         self, event: dict, body: Optional[dict] = None) -> None:
@@ -4081,9 +4081,9 @@ class SlackAdapter(BasePlatformAdapter):
             return True
         if thread_marker in self._mentioned_threads or event_thread_ts in self._mentioned_threads:
             return True
-        if is_thread_reply and self._has_active_session_for_thread(
-            channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id, team_id=team_id,
-            chat_type=chat_type):
+        if is_thread_reply and await asyncio.to_thread(
+            self._has_active_session_for_thread, channel_id=channel_id, thread_ts=event_thread_ts,
+            user_id=user_id, team_id=team_id, chat_type=chat_type):
             return True
         if is_thread_reply and await self._bot_authored_thread_root(
             channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id):
@@ -4319,9 +4319,9 @@ class SlackAdapter(BasePlatformAdapter):
         thread_root_media_types: list[str] = []
         if not is_thread_reply:
             return channel_context, thread_root_media_urls, thread_root_media_types
-        has_active_thread_session = self._has_active_session_for_thread(
-            channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id, team_id=team_id,
-            chat_type="dm" if is_dm else "group")
+        has_active_thread_session = await asyncio.to_thread(  # session-store lock: off the loop
+            self._has_active_session_for_thread, channel_id=channel_id, thread_ts=event_thread_ts,
+            user_id=user_id, team_id=team_id, chat_type="dm" if is_dm else "group")
 
         async def _fetch(**kw) -> None:
             nonlocal channel_context
@@ -4340,7 +4340,7 @@ class SlackAdapter(BasePlatformAdapter):
             ) = await self._collect_thread_root_images(
                 channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id)
         elif is_mentioned:
-            await _fetch(after_ts=self._get_thread_watermark(**watermark_args), force_refresh=True)
+            await _fetch(after_ts=await asyncio.to_thread(self._get_thread_watermark, **watermark_args), force_refresh=True)
         else:
             # Restart rehydration (#63530 restart gap / #33215): persistent sessions survive gateway
             # restarts, but thread replies posted while the gateway was down never reached the session. On
@@ -4351,12 +4351,12 @@ class SlackAdapter(BasePlatformAdapter):
             rehydration_key = self._thread_rehydration_key(
                 channel_id, event_thread_ts, user_id, team_id)
             if rehydration_key in self._thread_rehydration_checked:
-                self._set_thread_watermark(watermark_ts=ts, **watermark_args)
+                await asyncio.to_thread(self._set_thread_watermark, watermark_ts=ts, **watermark_args)
                 return channel_context, thread_root_media_urls, thread_root_media_types
-            watermark_ts = self._get_thread_watermark(**watermark_args)
+            watermark_ts = await asyncio.to_thread(self._get_thread_watermark, **watermark_args)
             if watermark_ts:
                 await _fetch(after_ts=watermark_ts, force_refresh=True)
-        self._set_thread_watermark(watermark_ts=ts, **watermark_args)
+        await asyncio.to_thread(self._set_thread_watermark, watermark_ts=ts, **watermark_args)
         self._mark_thread_rehydration_checked(channel_id, event_thread_ts, user_id, team_id)
         return channel_context, thread_root_media_urls, thread_root_media_types
 

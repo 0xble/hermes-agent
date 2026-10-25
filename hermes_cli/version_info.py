@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -266,6 +267,8 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False, revisi
 # --- Cache + public API -----------------------------------------------------
 
 _cached_version_info: VersionInfo | None = None
+_version_info_prefetch_lock = threading.Lock()
+_version_info_prefetch_thread: threading.Thread | None = None
 
 
 def _reset_version_info_cache() -> None:
@@ -303,6 +306,28 @@ def get_version_info() -> VersionInfo:
 
     _cached_version_info = info
     return info
+
+
+def get_version_info_nonblocking() -> VersionInfo | None:
+    """Return cached provenance, warming it once off-thread when a UI cannot wait.
+
+    Source installs can require several git subprocesses on a cold cache. Optional
+    display metadata must not put that discovery on an interrupted turn's settle
+    path. Use the same resolver/cache as blocking identity consumers.
+    """
+    global _version_info_prefetch_thread
+    if _cached_version_info is not None:
+        return _cached_version_info
+    with _version_info_prefetch_lock:
+        if _cached_version_info is None and (
+            _version_info_prefetch_thread is None or not _version_info_prefetch_thread.is_alive()
+        ):
+            from agent.memory_provider import spawn_context_thread
+
+            _version_info_prefetch_thread = spawn_context_thread(
+                get_version_info, name="hermes-version-info")
+            _version_info_prefetch_thread.start()
+    return _cached_version_info
 
 
 def get_code_identity(refresh: bool = False) -> dict:

@@ -646,7 +646,18 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False,
     if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
             or any(part in (".", "..") for part in repository.split("/"))):
         raise ValueError("ZIP update requires a GitHub owner/repository")
+    from hermes_cli.update_receipt import _current, record_step
+    # A ZIP swap can change files while Git HEAD stays fixed. Keep that evidence
+    # separate from the stash disposition, which may name deliberately parked work.
+    record_step("zip_source_swap", False, "unverified: ZIP update started", replace=True)
     installed = _download_and_swap_zip(branch, f"https://github.com/{repository}/archive/{ref}.zip", target_sha)
+    record_step("zip_source_swap", True, "ZIP source replacement completed", replace=True)
+    current = _current.get()
+    steps = current.data["steps"] if current is not None else []
+    latest = next((s for s in reversed(steps) if s["name"] == "local_changes_stash"), {})
+    if latest.get("detail", "").startswith("unverified: "):
+        record_step("local_changes_stash", True,
+                    "not_needed: ZIP update replaced source without a git stash", replace=True)
     completion_request["expected_sha"] = installed or target_sha
     completion_request["apply_mode"] = "zip"
     _complete_source_update(completion_request)
