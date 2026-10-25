@@ -150,11 +150,27 @@ def enabled_plugins_ordered(*, proposed_home=None, enabled=None, disabled=None,
 
 
 def _provider_from_config(home: Path, config: dict[str, Any], *, installing: Path | None = None) -> Optional[str]:
-    """The ``memory.provider`` key of an already-parsed config, when its
-    plugin dir exists (no dir = not a member)."""
+    """The configured memory provider when its bundled or installed plugin exists."""
     provider = (config.get("memory") or {}).get("provider")
     if not provider or not provider.strip():
         return None
     name = provider.strip()
-    return name if (_is_directory(home / "plugins" / name) or
-                    (installing is not None and (home / "plugins" / name).resolve() == installing.resolve())) else None
+    return name if provider_directory(home, name, installing=installing) is not None else None
+
+
+def provider_directory(home: Path, name: str, *, installing: Path | None = None) -> Optional[Path]:
+    """Match memory activation's bundled-first lookup without importing the provider.
+
+    Forks may retain a provider under plugins/memory after it moves to the catalog.
+    Its manifest must join the dependency union too; no core extra is implied.
+    """
+    from pm.paths import repo_root
+
+    bundled = repo_root() / "plugins" / "memory" / name
+    if _is_directory(bundled) and (bundled / "__init__.py").is_file():
+        return bundled
+    installed = home / "plugins" / name
+    if (_is_directory(installed) or
+            (installing is not None and installed.resolve() == installing.resolve())):
+        return installed
+    return None
