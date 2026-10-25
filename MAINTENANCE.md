@@ -115,3 +115,9 @@ from its backend poll mock. Returning an empty registry erased the running
 quickstart job when a poll from the preceding test fired. The unchanged progress,
 setup-button, download, and completion-navigation assertions remain the guard in
 `apps/desktop/src/app/settings/local-models-settings.test.tsx`.
+
+The notice policy also gates CLI/TUI judge, automatic resume, and lifted-wait
+output. Judging and queued follow-ups remain active. Explicit controls and
+compression-failure recovery warnings remain visible. Guards:
+`tests/hermes_cli/test_goal_notice_surfaces.py` and
+`tests/tui_gateway/test_goal_notice_surfaces.py`.

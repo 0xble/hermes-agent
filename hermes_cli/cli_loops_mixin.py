@@ -11,6 +11,8 @@ import time
 
 from rich.markup import escape as _escape
 
+from hermes_cli.goal_notices import goal_notices_enabled
+
 _FRESH_START = "  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n"
 
 
@@ -540,7 +542,8 @@ class CLILoopsMixin:
             prompt = mgr.next_continuation_prompt()
             if prompt:
                 from cli import _DIM, _RST, _cprint
-                _cprint(f"  {_DIM}▶ Goal barrier lifted — resuming.{_RST}")
+                if goal_notices_enabled():
+                    _cprint(f"  {_DIM}▶ Goal barrier lifted — resuming.{_RST}")
                 self._pending_input.put(prompt)
         except Exception as exc:
             logging.debug("parked-goal resume check failed: %s", exc)
@@ -700,7 +703,8 @@ class CLILoopsMixin:
             _bg_procs = None
         decision = mgr.evaluate_after_turn(
             last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
-        _print_decision_message(decision)
+        if goal_notices_enabled():
+            _print_decision_message(decision)
         if decision.get("should_continue"):
             prompt = decision.get("continuation_prompt")
             if prompt:
