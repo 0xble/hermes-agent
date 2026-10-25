@@ -75,6 +75,11 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   (#105567's close race stays inside). 11:52: the lock holder sat in a kernel-stalled stat().
 - A full routing-index save (`replace_gateway_routing_entries`) writes only the difference,
   with unchanged full-replace semantics; it used to rewrite every row of the scope per update.
+  The diff runs inside SQLite (two statements over one `json_each` parameter), never as rows
+  fetched into Python under the writer lock: each row round trip re-takes the GIL, and with
+  ~120 busy agent threads that turned a 10 ms diff of 2,753 rows into 3-17 s holds
+  (2026-10-25: 58 holds, 365 s in 2 h; callback CPU ~0.4 s). Keep new writer callbacks
+  O(1) in Python round trips where the row count grows with history or sessions.
 - The turn-liveness watchdog does not count time the turn's execution thread spends inside a
   SessionDB write (writer-lock queue, busy retries, commit) as no progress; a finished write
   counts as activity. Nothing else (lease refresh included) feeds the activity clock.

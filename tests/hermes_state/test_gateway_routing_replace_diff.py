@@ -38,3 +38,56 @@ def test_replace_writes_only_the_difference_and_keeps_replace_semantics(tmp_path
         assert _rows(db, "s") == {}
     finally:
         db.close()
+
+
+class _CountingConn:
+    """Counts Python<->SQLite row round trips made by a write callback. Each fetched row and each
+    executemany parameter set is one GIL release/re-take while the writer lock is held."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.round_trips = 0
+
+    def execute(self, sql, params=()):
+        self.round_trips += 1
+        cursor = self._conn.execute(sql, params)
+        rows = cursor.fetchall()
+        self.round_trips += len(rows)
+        return iter(rows)
+
+    def executemany(self, sql, seq):
+        seq = list(seq)
+        self.round_trips += len(seq)
+        return self._conn.executemany(sql, seq)
+
+
+def test_replace_round_trips_under_the_writer_lock_do_not_grow_with_the_index(tmp_path):
+    """Under ~120 busy agent threads each round trip waits a GIL switch interval, so a per-row
+    diff of the live 2,753-row index held the writer lock 3-17 s. The diff must stay in SQLite."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        entries = {f"agent:main:slack:dm:{i}": f'{{"session_id": "s{i}"}}' for i in range(2000)}
+        db.replace_gateway_routing_entries(entries, scope="s")
+        entries["agent:main:slack:dm:7"] = '{"session_id": "changed"}'
+        del entries["agent:main:slack:dm:9"]
+        entries["agent:main:slack:dm:new"] = '{"session_id": "new"}'
+
+        counted = []
+        execute_write = db._execute_write
+
+        def _counting_execute_write(fn, *args, **kwargs):
+            def _wrapped(conn):
+                proxy = _CountingConn(conn)
+                counted.append(proxy)
+                return fn(proxy)
+            return execute_write(_wrapped, *args, **kwargs)
+
+        db._execute_write = _counting_execute_write
+        db.replace_gateway_routing_entries(entries, scope="s")
+        del db._execute_write
+
+        assert counted and counted[-1].round_trips <= 4
+        stored = {k: v[0] for k, v in _rows(db, "s").items()}
+        assert stored == entries
+    finally:
+        db.close()
