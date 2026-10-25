@@ -304,7 +304,7 @@ def _evidence_is_negated(content: str, evidence: str) -> bool:
     for unit in re.split(r"(?<=[.!?;])\s+", unicodedata.normalize("NFKC", str(content or ""))):
         normalized = " ".join(unit.casefold().split())
         match = re.search(rf"(?<!\w){re.escape(target)}(?!\w)", normalized)
-        if match and re.search(r"\b(?:do not|don['’]t|dont|never|not|keep|preserve|retain|without)\b",
+        if match and re.search(r"\b(?:do not|don['’]t|dont|never|no|not|keep|preserve|retain|without)\b",
                                normalized[:match.start()]):
             return True
     return False

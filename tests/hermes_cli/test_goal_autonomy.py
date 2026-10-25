@@ -316,3 +316,13 @@ def test_an_implicit_outcome_cannot_be_replaced_by_an_easy_check(home, action):
     result = mgr.complete(reason="only the easy check", evidence={"Status checked": "status is green"})
     assert not result["ok"] and "Ship the full repair" in result["error"]
     assert goals.load_goal("autonomy").status == "active"
+
+
+def test_completion_rejects_negated_recorded_proof(home):
+    _, db = home
+    mgr = manager()
+    db.append_message("autonomy", "tool", "No 12 passed result was observed", tool_name="terminal")
+    result = mgr.complete(reason="not verified", evidence={
+        "tests pass": "12 passed", "release readback matches": "12 passed"})
+    assert not result["ok"] and "negated" in result["error"]
+    assert goals.load_goal("autonomy").status == "active"
