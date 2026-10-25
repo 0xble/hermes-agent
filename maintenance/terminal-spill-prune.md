@@ -10,8 +10,11 @@ Load when changing `tools/environments/base_output.py` spill creation or pruning
 - A bounded terminal call never scans the spill directory on its own thread and
   never waits for a scan. It at most starts one daemon `terminal-spill-prune`
   thread.
-- Single flight per process: a non-blocking lock is held for the entire scan.
-  Callers that lose the lock skip.
+- Single flight per process: a caller starts a prune only while holding a
+  non-blocking start gate and only when no prune thread is alive. Callers that
+  lose the gate or see a live prune skip. The worker holds no lock, so a failed
+  thread start, an interrupt or a fork cannot strand pruning, and a failed start
+  never costs the call its spill file.
 - At most one scan per spill directory per `_SPILL_PRUNE_INTERVAL_S` (60 s). The
   interval is keyed by directory because one gateway serves several
   `HERMES_HOME` profiles. It is reserved before the scan starts, so a slow or

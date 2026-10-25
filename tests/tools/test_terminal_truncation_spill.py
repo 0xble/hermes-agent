@@ -18,6 +18,9 @@ def small_cap(tmp_path, monkeypatch):
         "max_bytes": 2000, "max_lines": 2000, "max_line_length": 2000,
     }})
     from tools.environments import base_output
+    # Join a prune left by an earlier test so this one's first call starts its own.
+    if (prune := getattr(base_output, "_spill_prune_thread", None)) is not None:
+        prune.join(timeout=5)
     monkeypatch.setattr(base_output, "_spill_prune_last", {}, raising=False)
     return tmp_path
 

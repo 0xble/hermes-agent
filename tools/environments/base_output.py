@@ -31,15 +31,16 @@ _SPILL_MAX_AGE_S = 7 * 86400
 # retention while capping a full directory scan at once per minute per spill dir.
 _SPILL_PRUNE_INTERVAL_S = 60.0
 _monotonic = time.monotonic
-# Held for the whole scan, including on the worker thread: one prune per process.
-_spill_prune_lock = threading.Lock()
+# Guards only the start decision, never a scan: a caller that loses it skips.
+_spill_prune_gate = threading.Lock()
 # Last prune start per spill dir; one process serves several HERMES_HOME profiles.
 _spill_prune_last: dict[str, float] = {}
+# The single in-flight prune; a live one makes every other caller skip.
 _spill_prune_thread: threading.Thread | None = None
 
 
 def _prune_spill_dir(spill_dir: Path) -> None:
-    """Delete ``out-*.log`` spills older than ``_SPILL_MAX_AGE_S``; releases the prune lock."""
+    """Delete ``out-*.log`` spills older than ``_SPILL_MAX_AGE_S``."""
     try:
         cutoff = time.time() - _SPILL_MAX_AGE_S
         with os.scandir(spill_dir) as entries:
@@ -51,10 +52,10 @@ def _prune_spill_dir(spill_dir: Path) -> None:
                         os.unlink(entry.path)
                 except OSError:
                     pass  # Vanished or unreadable spill: skip it; the next prune retries.
+    except FileNotFoundError:
+        pass  # No spill has overflowed in this home yet.
     except OSError:
         logger.debug("terminal spill prune of %s failed", spill_dir, exc_info=True)
-    finally:
-        _spill_prune_lock.release()
 
 
 def _maybe_prune_spills(spill_dir: Path) -> None:
@@ -63,27 +64,30 @@ def _maybe_prune_spills(spill_dir: Path) -> None:
     Collector creation is on the terminal critical path, so callers never scan,
     never wait for an in-flight prune, and skip entirely within the interval.
     The interval is reserved before the scan starts so a slow or failing scan
-    cannot turn a burst of terminal calls into a burst of scans.
+    cannot turn a burst of terminal calls into a burst of scans. The worker
+    holds no lock, so a failed start, an interrupt or a fork cannot strand one.
     """
     global _spill_prune_thread
     key = str(spill_dir)
     if _monotonic() - _spill_prune_last.get(key, float("-inf")) < _SPILL_PRUNE_INTERVAL_S:
         return
-    if not _spill_prune_lock.acquire(blocking=False):
+    if not _spill_prune_gate.acquire(blocking=False):
         return
     try:
         now = _monotonic()
         if now - _spill_prune_last.get(key, float("-inf")) < _SPILL_PRUNE_INTERVAL_S:
-            _spill_prune_lock.release()
+            return
+        if _spill_prune_thread is not None and _spill_prune_thread.is_alive():
             return
         _spill_prune_last[key] = now
         from agent.memory_provider import spawn_context_thread
         thread = spawn_context_thread(_prune_spill_dir, args=(spill_dir,), name="terminal-spill-prune")
         _spill_prune_thread = thread
         thread.start()
-    except BaseException:
-        _spill_prune_lock.release()
-        raise
+    except RuntimeError:  # Thread exhaustion: skip this prune, keep the call's spill file.
+        logger.debug("terminal spill prune of %s not started", spill_dir, exc_info=True)
+    finally:
+        _spill_prune_gate.release()
 
 
 class _BoundedOutputCollector:

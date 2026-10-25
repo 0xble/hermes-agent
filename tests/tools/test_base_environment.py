@@ -129,6 +129,11 @@ class TestSpillPruning:
     whole spill directory on the calling thread (a live gateway had 15 stacks
     doing this concurrently over ~6,400 files)."""
 
+    @pytest.fixture(autouse=True)
+    def _no_inherited_prune(self):
+        # A prune started by an earlier test must not make this one's caller skip.
+        self._join_prune()
+
     @staticmethod
     def _setup(tmp_path, monkeypatch, scandir_hook=None):
         spill_dir = tmp_path / "cache" / "terminal-output"
@@ -140,7 +145,8 @@ class TestSpillPruning:
         scans_lock = threading.Lock()
 
         def counting_scandir(path=None):
-            if path is not None and os.fspath(path) == str(spill_dir):
+            # pathlib scans "<dir>/"; normalize so any scan of the directory counts.
+            if path is not None and os.path.normpath(os.fspath(path)) == os.path.normpath(spill_dir):
                 with scans_lock:
                     scans.append(path)
                 if scandir_hook is not None:
@@ -169,7 +175,7 @@ class TestSpillPruning:
 
         _, scans = self._setup(tmp_path, monkeypatch, scandir_hook=block)
         # Rate limiting off: only single-flight can keep this at one scan.
-        monkeypatch.setattr(base_output, "_SPILL_PRUNE_INTERVAL_S", 0.0)
+        monkeypatch.setattr(base_output, "_SPILL_PRUNE_INTERVAL_S", 0.0, raising=False)
         try:
             with ThreadPoolExecutor(max_workers=20) as pool:
                 futures = [
