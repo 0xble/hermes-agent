@@ -2143,9 +2143,8 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
                 return SendResult(success=False, error=str(exc), retryable=True)
 
-    @staticmethod
     async def _start_native_task_card_stream(
-        client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
+        self, client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
     ) -> None:
         """chat.startStream a plan-mode card in ``stream``'s thread; sets ``stream.stream_ts``."""
         start_payload: dict[str, Any] = {
@@ -2164,6 +2163,8 @@ class SlackAdapter(BasePlatformAdapter):
             stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
         if not stream.stream_ts:
             raise RuntimeError("Slack startStream returned no stream timestamp")
+        if self._typing_is_active(stream.channel, metadata):
+            await self.send_typing(stream.channel, metadata=metadata)
 
     @staticmethod
     def _task_update_chunk(task: dict[str, str]) -> dict[str, Any]:
