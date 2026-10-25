@@ -178,3 +178,22 @@ async def test_photon_reaction_retains_last_inbound_fallback():
     adapter._sidecar_call.assert_awaited_once_with("/react", {
         "spaceId": "+15550001111", "messageId": "latest", "emoji": "👍",
     })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("emoji, name", [
+    ("+1", "+1"), (":pray:", "pray"), ("joy", "joy"),
+    ("👍", "thumbsup"), ("🙏", "pray"), ("😂", "joy"), ("❤️", "heart"),
+])
+async def test_slack_reactions_normalize_names_and_unicode(emoji, name):
+    from plugins.platforms.slack.adapter import SlackAdapter
+
+    adapter = object.__new__(SlackAdapter)
+    adapter._app = object()
+    transport = AsyncMock(return_value={"ok": True})
+    adapter._get_client = Mock(return_value=SimpleNamespace(reactions_add=transport))
+    assert await adapter.add_reaction("C2", "123.45", emoji, scope_id="T2") is True
+    adapter._get_client.assert_called_once_with("C2", team_id="T2")
+    transport.assert_awaited_once_with(channel="C2", timestamp="123.45", name=name)
+    transport.return_value = {"ok": False}
+    assert await adapter.add_reaction("C2", "123.45", emoji, scope_id="T2") is False

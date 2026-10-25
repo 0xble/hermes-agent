@@ -71,10 +71,11 @@ def test_gateway_reaction_error_does_not_acknowledge(monkeypatch):
 
 
 def test_gateway_reaction_requirements_do_not_leak_to_desktop(monkeypatch):
+    from toolsets import session_disabled_toolsets
+
     monkeypatch.setattr(reactions.desktop_ui, "user_enabled", lambda *a, **kw: False)
-    tokens = set_session_vars(platform="telegram")
-    try:
-        assert reactions.check_react_requirements() is True
-    finally:
-        clear_session_vars(tokens)
-    assert reactions.check_react_requirements() is False
+    assert registry.is_toolset_available("reactions")
+    assert "reactions" not in (session_disabled_toolsets([], "telegram") or [])
+    assert "reactions" in session_disabled_toolsets([], "desktop")
+    monkeypatch.setattr(reactions.desktop_ui, "user_enabled", lambda *a, **kw: True)
+    assert "reactions" not in (session_disabled_toolsets([], "desktop") or [])

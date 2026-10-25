@@ -6,7 +6,7 @@ import json
 
 from gateway.session_context import get_session_env
 from tools import desktop_ui
-from tools.registry import no_cache_check_fn, registry, tool_error
+from tools.registry import registry, tool_error
 
 
 def _gateway_platform():
@@ -160,5 +160,5 @@ registry.register(
     handler=lambda args, **kw: react_to_message_tool(
         emoji=args.get("emoji", ""), message_row_id=args.get("message_row_id"),
         messages_back=args.get("messages_back")),
-    check_fn=check_react_requirements, emoji="💛",
+    emoji="💛",
 )

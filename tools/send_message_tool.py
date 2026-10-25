@@ -209,6 +209,13 @@ def _handle_react(args, remove=False):
         return json.dumps(_error(f"Reaction failed: {e}"))
     if result is False:
         return tool_error(f"Platform '{platform_name}' does not support this reaction or delivery failed.")
+    delivered = result.get("success") is True if isinstance(result, dict) else result is True
+    if not remove and delivered:
+        from gateway.session_context import acknowledge_current_message_reaction
+        target = (platform_name, str(chat_id), str(message_id))
+        current = tuple(get_session_env(f"HERMES_SESSION_{key}") for key in ("PLATFORM", "CHAT_ID", "MESSAGE_ID"))
+        if target == current:
+            acknowledge_current_message_reaction()
     return json.dumps(result if isinstance(result, dict) else {"success": bool(result)})
 
 
