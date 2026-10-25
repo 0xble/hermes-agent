@@ -431,7 +431,7 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
             "slash_worker": None, "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
-            "transport": current_transport() or _stdio_transport,
+            "transport": _new_session_publisher(current_transport() or _stdio_transport),
             "auth_user_id": _transport_auth_user_id(current_transport())}
         _register_session_cwd(_sessions[sid])
         if idem_key is not None:

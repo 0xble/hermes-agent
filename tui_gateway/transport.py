@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 # Errno values that mean "the peer is gone" rather than "the host has a real I/O problem". Anything
@@ -138,6 +139,7 @@ class _FanoutPeer:
     writing: bool = False
     attached: bool = True
     generation: int = 0
+    drained: threading.Event = field(default_factory=threading.Event)
 
 
 class FanoutTransport:
@@ -225,6 +227,7 @@ class FanoutTransport:
                 # notice ``write`` leaves behind; deliver it, then let go.
                 if not peer.pending:
                     peer.writing = False
+                    peer.drained.set()
                     if not peer.attached:
                         self._remove(peer)
                     return
@@ -268,6 +271,7 @@ class FanoutTransport:
                     if peer.generation != generation:
                         continue
                     peer.writing = False
+                    peer.drained.set()
                     self._remove(peer)
                 return
 
@@ -282,18 +286,27 @@ class FanoutTransport:
             logger.debug("fanout overflow close failed; membership already dropped", exc_info=True)
 
     def write(self, obj: dict, *, overflow: Callable[[Transport], Optional[dict]] | None = None) -> bool:
-        """Fan *obj* out. A peer whose bounded backlog is full loses its subscription; *overflow*
-        (called with its transport, under the membership lock) may return one final frame that
-        replaces the dropped backlog, so a socket that is still healthy learns it must resume
-        rather than silently continuing with partial history. Without such a notice the peer's
-        transport is closed so the client notices, reconnects and replays."""
-        # Freeze the queued frame so a caller cannot mutate it after admission. Same serialization
-        # guard as the single-peer transports: an unserializable frame reaches every peer as -32603.
-        encoded = serialize_frame(obj, "fanout", logger)
-        size = len(encoded.encode("utf-8", errors="surrogatepass"))
-        frame = json.loads(encoded)
+        return self.publish(obj, overflow=overflow)
+
+    def publish(self, obj: dict, prepare: Callable[[dict], bool | None] | None = None, *,
+                overflow: Callable[[Transport], Optional[dict]] | None = None) -> bool:
+        """Atomically stamp/freeze/admit a session frame, once before fanout.
+
+        ``prepare`` may reject a stale owner before allocating a replay entry.
+        It must not perform I/O or acquire session/history/membership locks.
+        ``overflow`` runs under this lock and may replace a detached peer's
+        backlog with one resume notice instead of closing its healthy socket.
+        Socket writes and overflow closes run outside this mailbox lock.
+        """
         overflowed: list[Transport] = []
+        writers: list[_FanoutPeer] = []
         with self._lock:
+            if prepare is not None and prepare(obj) is False:
+                return False
+            # Freeze in the same critical section as sequencing and admission.
+            encoded = serialize_frame(obj, "fanout", logger)
+            size = len(encoded.encode("utf-8", errors="surrogatepass"))
+            frame = json.loads(encoded)
             for peer in list(self._peers):
                 if not peer.attached:
                     continue
@@ -310,22 +323,41 @@ class FanoutTransport:
                             self._peers.append(peer)
                         if not peer.writing:
                             peer.writing = True
-                            threading.Thread(target=self._drain, args=(peer,),
-                                             name="tui-fanout", daemon=True).start()
+                            peer.drained = threading.Event()
+                            writers.append(peer)
                     continue
                 peer.pending.append((frame, size))
                 peer.pending_bytes += size
                 if not peer.writing:
                     peer.writing = True
-                    threading.Thread(target=self._drain, args=(peer,),
-                                     name="tui-fanout", daemon=True).start()
+                    peer.drained = threading.Event()
+                    writers.append(peer)
             remaining = any(peer.attached for peer in self._peers)
+        for peer in writers:
+            threading.Thread(target=self._drain, args=(peer,),
+                             name="tui-fanout", daemon=True).start()
         for transport in overflowed:
             self._signal_overflow_detach(transport)
         return remaining
 
+    def flush(self, timeout: float | None = None) -> bool:
+        """Wait for admitted frames, without holding the mailbox lock during I/O.
+
+        A new writer gets a new completion event, so later idle-to-busy epochs
+        cannot clear the barrier captured here. Detach still revokes pending
+        frames, but an in-flight physical write must finish before the barrier.
+        """
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._lock:
+            pending = [peer.drained for peer in self._peers if peer.writing]
+        for done in pending:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not done.wait(remaining):
+                return False
+        return True
+
     def close(self) -> None:
-        """Detach without closing sockets owned by the connection handlers."""
+        """Revoke pending frames without closing connection-owned sockets. Flush first for graceful exit."""
         with self._lock:
             for peer in list(self._peers):
                 self._remove(peer)

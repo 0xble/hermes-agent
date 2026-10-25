@@ -26,6 +26,7 @@ from typing import Any, Callable, Collection
 
 from tui_gateway import pending_moa
 from tui_gateway.host_supervisor import MUTATOR_ROUTE_TABLE, _build_sha
+from tui_gateway.transport import FanoutTransport
 
 
 def now_ns() -> int:
@@ -145,6 +146,8 @@ class ComputeHost:
                 continue
             with contextlib.suppress(Exception):
                 server._finalize_session(session, end_reason=f"compute_host_{reason}")
+            if isinstance(publisher := session.get("transport"), FanoutTransport):
+                publisher.flush()
 
     def handle_frame(self, frame: dict[str, Any]) -> None:
         kind = str(frame.get("type") or "")
@@ -158,8 +161,8 @@ class ComputeHost:
 
     def _handle_shutdown(self, frame: dict[str, Any]) -> None:
         self.emit({"type": "shutdown.ack", "request_id": frame.get("request_id")})
-        # Explicit shutdown is a clean close; SIGTERM and orphan paths do the durability flush.
-        self.close()
+        # Drain the same final events on explicit shutdown as on EOF/SIGTERM.
+        self.shutdown(reason="shutdown")
 
     def _track_turn_future(self, future: concurrent.futures.Future, sid: str) -> None:
         """Track an in-flight turn; the done callback pops it or the map grows forever."""
@@ -293,6 +296,9 @@ class ComputeHost:
             session_info = server._session_info(session.get("agent"), session)
             with self._progress_lock:
                 self._progress_counter += 1
+            # The run thread has admitted its final events, but their mailbox
+            # writer may still be sending. The parent treats turn.end as final.
+            session["transport"].flush()
             self._reply(
                 "turn.end", sid, request_id, **meta, interrupted=interrupted, ended_ns=now_ns(),
                 session_info=session_info, session_info_emitted=True)
@@ -327,7 +333,7 @@ class ComputeHost:
         sid = str(frame.get("sid") or "")
         session = server._sessions.get(sid)
         if session is not None:
-            session["transport"] = self._transport
+            server._attach_session_transport(session, self._transport)
             if frame.get("cols") is not None:
                 session["cols"] = int(frame.get("cols") or 80)
             for key in ("cwd", "profile_home"):
@@ -421,9 +427,9 @@ class ComputeHost:
                 "tool_progress_mode": server._load_tool_progress_mode(), "edit_snapshots": {},
                 "tool_started_at": {}, "model_override": frame.get("model_override"),
                 "source": server._resolve_session_source(frame.get("source")),
-                "transport": self._transport}
+                "transport": server._new_session_publisher(self._transport)}
         session = server._sessions[sid]
-        session["transport"] = self._transport
+        server._attach_session_transport(session, self._transport)
         # The host pipe names no login; the record carries the one the gateway stamped at creation.
         session["auth_user_id"] = frame.get("auth_user_id")
         session["profile_home"] = profile_home or session.get("profile_home")

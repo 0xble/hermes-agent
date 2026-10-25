@@ -261,7 +261,6 @@ def _emit_tool_lifecycle(event, sid, name, args, payload):
     if not _connector_tool_lifecycle(name, args):
         return _emit(event, sid, payload)
     from tui_gateway.connector_payload import connector_ui_payload
-    from tui_gateway.event_replay import _stamp_event
 
     payload = connector_ui_payload(payload)
     # Capture the owner after projection so id reuse cannot redirect its link,
@@ -269,14 +268,14 @@ def _emit_tool_lifecycle(event, sid, name, args, payload):
     with _sessions_lock:
         if _connector_lifecycle_is_stale(sid, name, args):
             return
-        transport = (_sessions.get(sid) or {}).get("transport")
+        owner = _sessions.get(sid)
+        transport = (owner or {}).get("transport")
         if transport is None:
             transport = current_transport() or _stdio_transport
     frame = _event_frame(event, sid, payload)
-    _stamp_event(frame)
-    from tui_gateway.hosted_room_member_activity import project_room_member_activity
-    project_room_member_activity(frame, _sessions)
-    transport.write(frame)
+    return _publish_session_frame(
+        frame, transport, accept=lambda: _sessions.get(sid) is owner
+        and not (owner or {}).get("_finalized", False))
 
 
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):

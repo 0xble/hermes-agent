@@ -5139,9 +5139,9 @@ def test_ws_orphan_reap_spares_turn_reattached_within_grace(monkeypatch):
 
     try:
         server._close_sessions_for_transport(disconnecting_transport)
-        assert session["transport"] is server._detached_ws_transport
+        assert server._ws_session_is_detached(session)
 
-        session["transport"] = _LiveTransport()
+        server._attach_session_transport(session, _LiveTransport())
         callbacks.pop(0)()
 
         assert interrupted == []
@@ -5596,8 +5596,7 @@ def test_close_transport_rebinds_session_to_remaining_viewer(monkeypatch):
 
 
 def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
-    """The last viewer closing still lands the session on the drop sentinel
-    and schedules the grace reap (unchanged single-window behavior)."""
+    """The last viewer closing parks the mailbox and schedules the grace reap."""
     reap_calls = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: reap_calls.append(sid))
 
@@ -5613,7 +5612,7 @@ def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
     reaped, detached = server._close_sessions_for_transport(only)
 
     assert reaped == 0 and detached == 1
-    assert session["transport"] is server._detached_ws_transport
+    assert server._ws_session_is_detached(session)
     assert reap_calls == ["solo-sid"]
 
 
@@ -5650,7 +5649,7 @@ def test_close_transport_skips_dead_remaining_viewers(monkeypatch):
         reaped, detached = server._close_sessions_for_transport(popout)
 
         assert reaped == 0 and detached == 1
-        assert session["transport"] is server._detached_ws_transport
+        assert server._ws_session_is_detached(session)
         assert reap_calls == ["dead-viewer-sid"]
     finally:
         server._sessions.pop("dead-viewer-sid", None)
@@ -5667,7 +5666,7 @@ def test_live_session_payload_registers_transport_as_viewer():
     session = _session(transport=server._detached_ws_transport, running=False)
     server._live_session_payload("viewer-sid", session, transport=t)
 
-    assert session["transport"] is t
+    assert server._session_transport_contains(session, t)
     assert t in session.get("viewers", {})
 
 
@@ -5776,7 +5775,7 @@ def test_claim_or_reuse_live_winner_cancels_pending_reap(monkeypatch):
         response = server._resume_reuse_live(ctx, *live)
 
         assert response["result"]["session_id"] == "winner-sid"
-        assert winner["transport"] is transport
+        assert server._session_transport_contains(winner, transport)
         assert "winner-sid" not in server._pending_ws_reaps
         assert len(cancelled) == 1
     finally:
@@ -5918,7 +5917,7 @@ def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(monkeypatch)
         )
 
         assert resp is not None and resp["result"]["session_id"] == "lazy-sid"
-        assert session["transport"] is live_transport
+        assert server._session_transport_contains(session, live_transport)
         assert "lazy-sid" not in server._pending_ws_reaps
         assert len(cancelled) == 1
     finally:
@@ -19043,7 +19042,7 @@ def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
     try:
         server._close_sessions_for_transport(transport, end_reason="ws_disconnect")
         assert seen == [("a", "ws_disconnect")]  # only the flagged one closed
-        assert server._sessions["b"]["transport"] is server._detached_ws_transport  # re-pointed
+        assert server._ws_session_is_detached(server._sessions["b"])
     finally:
         server._sessions.clear()
 
@@ -19086,7 +19085,7 @@ def test_close_sessions_for_transport_skips_session_rebound_before_claim(
 
                 def _resume_rebind():
                     with server._session_resume_lock:
-                        session["transport"] = new_transport
+                        server._attach_session_transport(session, new_transport)
                     rebound.set()
 
                 thread = threading.Thread(target=_resume_rebind)
@@ -19103,7 +19102,7 @@ def test_close_sessions_for_transport_skips_session_rebound_before_claim(
         assert reaped == 0
         assert detached == 0
         assert server._sessions["rebound"] is session
-        assert session["transport"] is new_transport
+        assert server._session_transport_contains(session, new_transport)
         assert teardowns == []
         assert reaps == []
     finally:

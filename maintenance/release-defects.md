@@ -798,6 +798,14 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   release uses the canonical source module, not the removed status export.
   Guard: the complete replace-ownership suite, including stamp durability and no-signal refusal.
 - Fork patch identity: `v0225-merge-integration`.
+- Integrating fork main through #818 keeps atomic fanout prepare/stamp/admission alongside
+  overflow resume notices and their physical-drain barrier. Routing replacement performs its
+  diff and retirement-fence check in SQLite and returns only rejected route keys, without
+  fetching the live index under the writer lock. Residual compaction phase metrics retain the
+  successor's held-row CAS and schema-32 display-only carrier projection. Active-release
+  extras carry and candidate acknowledgement are inherited intact from #784.
+  Guards: fanout burst/publication, routing diff and retirement scope, compaction metrics,
+  carrier display/inspection and immutable-release extras suites.
 - Memory-provider eviction resolves the shutdown handoff under the shutdown lock.
   A worker that captured the manager owns session-end and shutdown, while eviction
   detaches its claimed reference without taking that ownership back. Reset's

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -30,6 +30,7 @@ def state(tmp_path, monkeypatch):
 def _runner(state, *, target_route=True, request_success=True, send_success=True, send_error=None,
             send_retryable=True, injection_result=True, target_origin=True):
     from gateway.run_session_controls import GatewaySessionControlsMixin
+    from gateway.run_background_admission import GatewayBackgroundAdmissionMixin
     from gateway.run_goals import GatewayGoalsMixin
     from gateway.run_plugin_injection import GatewayPluginInjectionMixin
     from gateway.session import Platform, SessionEntry, SessionSource
@@ -54,13 +55,14 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
             return SimpleNamespace(success=self.send_success, error=send_error, retryable=send_retryable)
 
     adapter = Adapter()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="target", chat_type="dm", thread_id="42")
     requester_source = SessionSource(platform=Platform.TELEGRAM, chat_id="requester", chat_type="dm", thread_id="43")
     target = SessionEntry("target-key", "target", now, now, origin=source if target_origin else None)
     requester = SessionEntry("requester-key", "requester", now, now, origin=requester_source)
 
-    class Runner(GatewaySessionControlsMixin, GatewayGoalsMixin, GatewayPluginInjectionMixin):
+    class Runner(GatewaySessionControlsMixin, GatewayGoalsMixin, GatewayPluginInjectionMixin,
+                 GatewayBackgroundAdmissionMixin):
         session_store = SimpleNamespace(
             lookup_by_session_id=lambda sid: {"target": target, "requester": requester}.get(sid)
         )

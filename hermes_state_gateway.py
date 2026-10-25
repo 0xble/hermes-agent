@@ -351,31 +351,35 @@ class SessionGatewayMixin:
         return bool(self._execute_write(_do))
 
     def replace_gateway_routing_entries(self, entries: dict[str, str], *, scope: str = "") -> set[str]:
-        """Atomically replace the routing index for *scope* (keys absent from *entries*
-        are removed); other scopes untouched.
+        """Atomically replace *scope*, writing only its diff inside SQLite.
 
-        Writes only the difference: every session update full-saves the index, and rewriting all
-        rows (thousands per scope) on each one multiplied WAL traffic under the shared writer lock. Returns skipped retired route keys."""
-        from hermes_state_mutation_retirement import ROUTE_RETIRED_SQL, route_retired_params
+        Rows fetched into Python or passed to executemany each re-take the GIL,
+        stretching a large index diff's writer-lock hold under busy agent threads.
+        Return only skipped retired route keys, never materialize the live index.
+        """
+        from hermes_state_mutation_retirement import ROUTE_RETIRED_SQL, route_namespace, route_retired_params
         now = time.time()
-        wanted = {k: v for k, v in entries.items() if k and v}
-        rows = [{'scope': scope, 'key': k, **route_retired_params(k, v, now)} for k, v in wanted.items()]
+        # Keep unpaired surrogates a bind-time UnicodeEncodeError so the caller
+        # falls back to sessions.json instead of storing invalid UTF-8 via JSON.
+        payload = json.dumps({k: {"entry": v, "ns": route_namespace(k)}
+                              for k, v in entries.items() if k and v}, ensure_ascii=False)
+        params = {**route_retired_params("", "", now), "scope": scope, "payload": payload}
+        wanted = ("WITH wanted AS (SELECT key, json_extract(value, '$.entry') AS entry, "
+                  "json_extract(value, '$.ns') AS ns FROM json_each(:payload)) ")
+        retired = ROUTE_RETIRED_SQL.replace(":entry", "wanted.entry").replace(":ns", "wanted.ns")
         def _do(conn):
-            current = dict(conn.execute(
-                "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (scope,)).fetchall())
-            stale = [(scope, k) for k in current if k not in wanted]
-            if stale:
-                conn.executemany("DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?", stale)
-            changed = [row for row in rows if current.get(row["key"]) != row["entry"]]
-            if changed:
-                conn.executemany(
-                    "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
-                    "SELECT :scope, :key, :entry, :now WHERE NOT " + ROUTE_RETIRED_SQL +
-                    " ON CONFLICT(scope, session_key) DO UPDATE SET "
-                    "entry_json=excluded.entry_json, updated_at=excluded.updated_at",
-                    changed)
-            kept = {r[0] for r in conn.execute("SELECT session_key FROM gateway_routing WHERE scope = ?", (scope,))}
-            return {row['key'] for row in rows} - kept
+            conn.execute(
+                "DELETE FROM gateway_routing WHERE scope = :scope "
+                "AND session_key NOT IN (SELECT key FROM json_each(:payload))", params)
+            conn.execute(
+                wanted + "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+                "SELECT :scope, key, entry, :now FROM wanted WHERE NOT " + retired +
+                " ON CONFLICT(scope, session_key) DO UPDATE SET "
+                "entry_json=excluded.entry_json, updated_at=excluded.updated_at "
+                "WHERE gateway_routing.entry_json IS NOT excluded.entry_json", params)
+            return {row[0] for row in conn.execute(
+                wanted + "SELECT key FROM wanted WHERE NOT EXISTS ("
+                "SELECT 1 FROM gateway_routing WHERE scope = :scope AND session_key = wanted.key)", params)}
         return self._execute_write(_do)
 
     def load_gateway_routing_entries(self, *, scope: str = "") -> dict[str, str]:

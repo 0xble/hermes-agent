@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.config import Platform
 from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
+from gateway.run_background_admission import BACKGROUND_RESERVATION_ATTR
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -1074,6 +1075,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
         if _turn_owner_exists():
             return
+        reservation = self._reserve_background_turn(session_key)
+        if reservation is None:
+            return  # background turn limit reached: the tick stays unclaimed and due
         begin_generation = getattr(self, "_begin_session_run_generation", None)
         if callable(begin_generation):
             generation = begin_generation(session_key)
@@ -1089,10 +1093,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 can_claim=lambda: not _turn_owner_exists() and is_run_current(session_key, generation),
             )
         )
-        if not wakeup:
-            return
-        if _turn_owner_exists() or not is_run_current(session_key, generation):
-            # The claim was consumed. Recovery will skip it after the current owner releases.
+        if not wakeup or _turn_owner_exists() or not is_run_current(session_key, generation):
+            self._release_background_turn(reservation)
+            # A consumed claim is skipped by recovery after the current owner releases.
             return
         # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
         # surface. Persist the completion as a durable delivery row — never self-post it as a new role=user
@@ -1104,6 +1107,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         event = self._synthetic_prompt_event(
             source, wakeup, internal=True, reply_expected=False, goal_continuation=False,
         )
+        setattr(event, BACKGROUND_RESERVATION_ATTR, reservation)  # a claimed tick is never refused
         from hermes_cli.session_controls import loop_wake_metadata
         event.metadata.update({
             "gateway_session_key": session_key,
@@ -1209,6 +1213,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
                 or self._queue_depth(key, adapter=adapter) > 0):
             return  # a turn (or restart auto-resume) is in flight; its post-turn judge owns the barrier
+        if not self._background_turn_room():
+            return  # background turn limit reached: keep the barrier for a later scan
 
         marker_owned, resume_marker = await self._stale_resume_pending_marker(key, entry)
         if marker_owned:
@@ -1244,7 +1250,11 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             goal_session_id=sid, goal_state=mgr.state,
         )
         event.metadata["gateway_session_key"] = key
+        reservation = self._reserve_background_turn(key, event)
+        if reservation is None:
+            return  # background turn limit reached: keep the barrier for a later scan
         if not await self._clear_stale_resume_pending(key, resume_marker, sid, "goal wakeup"):
+            self._release_background_turn(reservation)
             return  # marker changed or the session disappeared; retry on the next scan
         from gateway.wake import WakeNotAccepted, admit_internal_event
 

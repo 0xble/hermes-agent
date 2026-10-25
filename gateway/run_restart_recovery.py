@@ -6,7 +6,7 @@ import time
 from contextlib import nullcontext, suppress
 
 from agent.i18n import t
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, turn_origin_for_event
 from gateway.replay_scheduler import REPLAY_PRIORITY_STARTUP, REPLAY_PRIORITY_RESUME, REPLAY_PRIORITY_SYNTHETIC
 
 logger = logging.getLogger("gateway.run")
@@ -407,6 +407,8 @@ class RestartRecoveryMixin:
 
             profile_home = self._resolve_profile_home_for_source(source)
             if resume_task is not None and not resume_task.done():
+                if turn_origin_for_event(event) == "user" and not getattr(event, "_hermes_recovered_declined", False):
+                    self._promote_background_admission(key)  # a person's input waits on this resume
                 async def _defer_until_resume(
                     event=event, key=key, profile_home=profile_home,
                     resume_task=resume_task, dispatch_now=_dispatch,
@@ -679,6 +681,7 @@ class RestartRecoveryMixin:
                 ),
                 profile_home=self._resolve_profile_home_for_source(source),
                 on_drop=lambda key=entry.session_key: self._drop_queued_resume(key),
+                gated=True,
             )
 
             async def _follow_resume(handle=handle):

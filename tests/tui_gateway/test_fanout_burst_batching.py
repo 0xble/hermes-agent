@@ -74,6 +74,44 @@ def test_the_drain_sends_a_queued_backlog_as_one_batch():
         loop.close()
 
 
+def test_atomic_publication_keeps_overflow_notice_and_drain_barrier(monkeypatch):
+    """Prepare sequencing and healthy-socket resume notices share one publisher."""
+    monkeypatch.setattr(FanoutTransport, "_MAX_PENDING_FRAMES", 1)
+    loop = asyncio.new_event_loop()
+    runner = threading.Thread(target=loop.run_forever, daemon=True)
+    runner.start()
+    try:
+        socket = _LoopSocket(loop)
+        fanout = FanoutTransport(socket)
+        prepared = []
+        overflowed = []
+
+        def prepare(frame):
+            prepared.append(frame)
+            frame["params"]["seq"] = len(prepared)
+
+        def overflow(transport):
+            overflowed.append(transport)
+            return {"resume_after": len(prepared)}
+
+        assert fanout.publish(_delta(0), prepare, overflow=overflow)
+        assert socket.first_send_started.wait(10)
+        assert fanout.publish(_delta(1), prepare, overflow=overflow)
+        assert not fanout.publish(_delta(2), prepare, overflow=overflow)
+        assert len(prepared) == 3 and overflowed == [socket]
+        assert not fanout.contains(socket) and not socket.closed
+        assert not fanout.flush(0), "the physical send and notice are still pending"
+        loop.call_soon_threadsafe(socket.release.set)
+        assert fanout.flush(10)
+        assert [frame.get("resume_after") for frame in socket.frames] == [None, 3]
+        assert socket.frames[0]["params"]["seq"] == 1
+        assert not socket.closed
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        runner.join(5)
+        loop.close()
+
+
 def test_a_viewer_a_turn_of_streamed_text_behind_keeps_its_subscription():
     """A viewer stalled for a whole long reply (thousands of few-hundred-byte deltas, well under the
     byte cap) is behind, not stuck: it keeps its subscription and gets every frame in order. A
