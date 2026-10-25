@@ -210,8 +210,8 @@ def _message_grants_authority(source: str) -> bool:
     return not any(w in _NEGATION_TOKENS or w in _QUALIFIER_TOKENS for w in words)
 
 
-def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
-    """Validate a quote against only the requester's latest typed user message."""
+def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
+    """Bind a verbatim quote to current typed input before applying action-specific authority."""
     normalized = _normalize(quote)
     if len(normalized) < _REVISION_QUOTE_MIN_CHARS:
         return "user_quote_too_short"
@@ -248,6 +248,16 @@ def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> T
         return "user_message_too_long"
     if normalized not in source:
         return "user_quote_not_found"
+    return normalized, stripped
+
+
+def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
+    """Validate a quote against only the requester's latest typed user message."""
+    checked = _read_current_user_quote(requester_session_id, quote, cursor=cursor)
+    if isinstance(checked, str):
+        return checked
+    normalized, stripped = checked
+    source = _normalize(stripped)
     if _is_negated(normalized, source):
         return "user_quote_negated"
     # Authority comes from the user's instruction in its full context, never a trimmed substring:

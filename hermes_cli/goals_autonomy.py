@@ -81,6 +81,33 @@ def migrate_autonomous_goal(state) -> bool:
     return True
 
 
+def current_removal_quote(session_id, quote, *, cursor=None):
+    from hermes_cli.goals_authority import _authority_unit_records, _REMOVAL_VERBS
+    from hermes_cli.session_controls import _read_current_user_quote, _message_grants_authority, _normalize
+
+    checked = _read_current_user_quote(session_id, quote, cursor=cursor)
+    if isinstance(checked, str):
+        return checked
+    normalized, source = checked
+    # The entire current instruction must authorize removal. Quoted item names are
+    # data, so their own words (such as "Never restart") cannot negate the directive.
+    if normalized != _normalize(source):
+        return "user_quote_qualified"
+    units = _authority_unit_records(source)
+    if not units:
+        return "user_quote_qualified"
+    for direct, targets, _original in units:
+        if not _message_grants_authority(direct):
+            return "user_quote_qualified"
+        if targets:
+            grammar = rf"\s*(?:please\s+)?{_REMOVAL_VERBS}\s+(?:(?:the\s+)?(?:constraint|criterion|requirement)\s*)?[.!;\s]*"
+        else:
+            grammar = rf"\s*(?:please\s+)?{_REMOVAL_VERBS}\s+.+"
+        if not re.fullmatch(grammar, direct, re.IGNORECASE | re.DOTALL):
+            return "user_quote_qualified"
+    return checked
+
+
 def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
                     max_turns=None, user_quote="", kind="revise"):
     """Validate the entire delta before changing the staged snapshot."""
@@ -88,7 +115,7 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     from hermes_cli.goals_authority import (
         _normalize_authority_value, _removal_instruction_units,
     )
-    from hermes_cli.session_controls import _CURRENT_AUTHORITY, check_user_quote
+    from hermes_cli.session_controls import _CURRENT_AUTHORITY
 
     state = manager.state
     if state is None or state.status not in {"active", "paused"}:
@@ -123,7 +150,7 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     if removed:
         authority = _CURRENT_AUTHORITY.get() or {}
         source_sid = authority.get("session_id") or manager.session_id
-        checked = check_user_quote(source_sid, user_quote, cursor=manager._cursor) if user_quote else "missing"
+        checked = current_removal_quote(source_sid, user_quote, cursor=manager._cursor) if user_quote else "missing"
         targets = [] if isinstance(checked, str) else [
             _normalize_authority_value(target)
             for _verb, target, quoted in _removal_instruction_units(checked[0])
@@ -155,14 +182,13 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
 
 def validate_removal_quote(state, expected, cursor):
     from hermes_cli.goals_evaluation import GoalEvaluationConflict
-    from hermes_cli.session_controls import check_user_quote
 
     if len(state.revisions) <= len(json.loads(expected).get("revisions") or []):
         return
     revision = state.revisions[-1]
     if revision.get("authority") != "autonomy" or not revision.get("user_quote"):
         return
-    checked = check_user_quote(revision["quote_session_id"], revision["user_quote"], cursor=cursor)
+    checked = current_removal_quote(revision["quote_session_id"], revision["user_quote"], cursor=cursor)
     if isinstance(checked, str) or checked[1] != revision["quote_message"]:
         raise GoalEvaluationConflict
 

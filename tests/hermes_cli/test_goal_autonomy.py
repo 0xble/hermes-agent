@@ -223,7 +223,7 @@ def test_prompt_generation_retains_unreachable_shipped_wordings(home, monkeypatc
     root, _ = home
     registry = root / "registry.py"
     shipped = {"formatter": "plain", "template": "old shipped prompt {goal}", "source_commits": ("retired",)}
-    registry.write_text("GOAL_PROMPT_REGISTRY: tuple = " + repr((shipped,)), encoding="utf-8")
+    registry.write_text("\ufeffGOAL_PROMPT_REGISTRY: tuple = " + repr((shipped,)), encoding="utf-8")
     monkeypatch.setattr(generator, "OUTPUT", registry)
     monkeypatch.setattr(generator, "SOURCE_FILES", ())
     monkeypatch.setattr(generator, "_commits", lambda: [])
@@ -338,3 +338,19 @@ def test_no_prefixed_evidence_keeps_the_default_off_admission_contract(home):
     assert mgr._recorded_evidence_error("12 passed", mgr.state)["error_code"] == "evidence_negated"
     root.joinpath("config.yaml").write_text("goals:\n  autonomy: false\n", encoding="utf-8")
     assert mgr._recorded_evidence_error("12 passed", mgr.state) is None
+
+
+@pytest.mark.parametrize("source", [
+    "Do not remove 'Never restart the gateway'.",
+    "If needed, remove 'Never restart the gateway'.",
+    "Example: Remove 'Never restart the gateway'.",
+    "Remove 'tests pass' and rename 'Never restart the gateway'.",
+    "Remove 'Never restart the gateway'. Actually keep it.",
+])
+def test_quoted_target_data_cannot_supply_removal_authority(home, source):
+    _, db = home
+    mgr = manager()
+    db.append_message("autonomy", "user", source)
+    result = mgr.revise(reason="remove a limit", contract={"constraints": ""}, user_quote=source)
+    assert result["error_code"] == "constraint_quote_required"
+    assert goals.load_goal("autonomy").contract.constraints == "Never restart the gateway"

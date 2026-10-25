@@ -210,7 +210,7 @@ def _snapshot() -> dict[str, dict[str, list[str]]]:
     # Shipped wordings may come from retired branches no longer reachable from main.
     # Keep their frozen provenance rather than turning those persisted turns into human input.
     if OUTPUT.exists():
-        for node in ast.parse(OUTPUT.read_text(encoding="utf-8")).body:
+        for node in ast.parse(OUTPUT.read_text(encoding="utf-8-sig")).body:
             if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "GOAL_PROMPT_REGISTRY":
                 for row in ast.literal_eval(node.value):
                     registry[row["formatter"]][row["template"]] = list(row["source_commits"])
@@ -232,7 +232,7 @@ def _render(registry: dict[str, dict[str, list[str]]]) -> str:
         if commit != "working-tree"
     ))
     if OUTPUT.exists():
-        for node in ast.parse(OUTPUT.read_text(encoding="utf-8")).body:
+        for node in ast.parse(OUTPUT.read_text(encoding="utf-8-sig")).body:
             if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "SCANNED_GOAL_PROMPT_COMMITS":
                 scanned_commits = tuple(dict.fromkeys((*ast.literal_eval(node.value), *scanned_commits)))
     grouped_counts = {kind: len(entries) for kind, entries in registry.items()}
