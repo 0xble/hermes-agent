@@ -132,7 +132,7 @@ def _standalone_telegram_rate_limiter():
 
     from plugins.platforms.telegram.daily_quota import DailyQuota
     # One-shot lane: persist every call so the gateway's daily ledger sees this lane's volume.
-    daily = DailyQuota(soft_ceiling=None, profile_dir=profile_dir, flush_interval=0.0)
+    daily = DailyQuota(soft_ceiling=None, call_soft_ceiling=None, profile_dir=profile_dir, flush_interval=0.0)
     return ChatBudgetRateLimiter(ChatOutboundBudget(), penalty_remaining=penalty_remaining,
                                  on_retry_after=on_retry_after, daily=daily)
 
