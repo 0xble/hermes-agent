@@ -1,4 +1,4 @@
-"""Read-only regression probes against PR 789 exact worktree."""
+"""Typing ownership across legacy adapters, approval buttons and delayed transport."""
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -6,20 +6,40 @@ from unittest.mock import AsyncMock
 import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import _thread_metadata_for_event
+from gateway.platforms.typing_state import call_typing_with_metadata
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from tests.gateway.test_slack import adapter as slack_fixture
+from tests.gateway.test_telegram_approval_buttons import _make_adapter
 import plugins.platforms.slack.adapter as slack_module
+
+@pytest.mark.parametrize("args", [("C",), ("C", "working")])
+@pytest.mark.parametrize("scoped", [False, True])
+def test_metadata_forwarding_preserves_legacy_and_scoped_signatures(args, scoped):
+    calls = []
+    if scoped:
+        def method(*values, metadata=None):
+            calls.append((values, metadata))
+    else:
+        def method(*values):
+            calls.append((values, None))
+    metadata = {"thread_id": "T"}
+    call_typing_with_metadata(method, *args, metadata=metadata)
+    assert calls == [(args, metadata if scoped else None)]
+
 
 @pytest.mark.asyncio
 async def test_telegram_approval_button_resumes_its_topic(monkeypatch):
     """The real callback must undo the topic pause installed by the turn runner."""
-    a = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    a = _make_adapter()
     md = {"thread_id": "11"}
     a.pause_typing_for_chat("123", metadata=md)
-    a._approval_state = {7: ("telegram:123:11", md)}
+    a._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=7))
+    result = await a.send_exec_approval("123", "pwd", "telegram:123:11", metadata=md)
+    assert result.success
+    approval_id = next(iter(a._approval_state))
     a.pause_typing_for_chat("123", metadata={"thread_id": "22"})
     a._callback_authorized = AsyncMock(return_value=True)
     a._edit_md_quiet = AsyncMock()
@@ -29,7 +49,7 @@ async def test_telegram_approval_button_resumes_its_topic(monkeypatch):
                             message=SimpleNamespace(chat_id=123, message_thread_id=11,
                                                     chat=SimpleNamespace(type="supergroup")))
     cb = a._callback_ctx(query)
-    await a._handle_exec_approval_callback(query, "ea:once:7", cb)
+    await a._handle_exec_approval_callback(query, f"ea:once:{approval_id}", cb)
     assert not a._typing_is_paused("123", md), a._typing_paused
     assert a._typing_is_paused("123", {"thread_id": "22"})
 
@@ -49,9 +69,11 @@ def test_normal_scope_metadata_agrees(platform, chat_type, thread_id):
     assert a._typing_scope_key(source.chat_id, initial) == a._typing_scope_key(source.chat_id, status)
 
 @pytest.mark.asyncio
-async def test_top_level_slack_without_thread_sessions_uses_same_scope():
+@pytest.mark.parametrize("reply_in_thread", [True, False])
+async def test_top_level_slack_without_thread_sessions_uses_same_scope(reply_in_thread):
     a = slack_fixture.__wrapped__()
     a.config.extra["dm_top_level_threads_as_sessions"] = False
+    a.config.extra["reply_in_thread"] = reply_in_thread
     root_ts = "171.1"
     source_thread = a._session_thread_ts({"ts": root_ts}, root_ts, True, {})
     assert source_thread is None
@@ -61,6 +83,10 @@ async def test_top_level_slack_without_thread_sessions_uses_same_scope():
     runner._delivery_adapter_for = lambda source: a
     initial = _thread_metadata_for_event(event)
     _, _, status = runner._run_agent_progress_threading(source, root_ts, False)
+    assert initial == status
+    await a.send_typing(source.chat_id, metadata=initial)
+    if not reply_in_thread:
+        a._app.client.assistant_threads_setStatus.assert_not_called()
     a.pause_typing_for_chat(source.chat_id, metadata=status)
     assert a._typing_is_paused(source.chat_id, initial), (initial, status, a._typing_paused)
 
