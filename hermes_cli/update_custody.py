@@ -454,6 +454,10 @@ def _prefetch_for_move(git_cmd: list[str], args: list[str], kwargs: dict) -> Non
         targets = [target for target in dict.fromkeys(targets) if target]
         if not targets:
             return
+        if sub == "merge-tree" and len(targets) == 2:
+            # A three-way merge also reads the merge base's version of paths both sides changed.
+            targets.append(resolve("merge-base", *targets))
+            targets = [target for target in dict.fromkeys(targets) if target]
         # An unborn HEAD (a fresh clone) has nothing checked out: diff from the empty tree.
         base = resolve("rev-parse", "--verify", "-q", "HEAD^{commit}") \
             or resolve("hash-object", "-t", "tree", "--stdin", stdin="")

@@ -2274,8 +2274,9 @@ _POST_SWAP_FORWARDED_FLAGS = (
 
 def _post_swap_argv_tail(args) -> list[str]:
     tail = [flag for attr, flag in _POST_SWAP_FORWARDED_FLAGS if getattr(args, attr, False)]
-    valued = ((flag, getattr(args, attr, None)) for attr, flag in (("branch", "--branch"), ("replace_candidate", "--replace-candidate")))
-    return tail + [part for flag, value in valued if value for part in (flag, str(value))]
+    # Selection-only flags stay behind: the child runs the target's parser, which may predate them.
+    branch = getattr(args, "branch", None)
+    return tail + (["--branch", str(branch)] if branch else [])
 
 
 def _post_swap_payload(
