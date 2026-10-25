@@ -11,6 +11,8 @@ from hermes_cli.goal_command import dispatch_goal_command
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text("goals:\n  autonomy: true\n", encoding="utf-8")
     goals._DB_CACHE.clear()

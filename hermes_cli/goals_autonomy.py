@@ -260,6 +260,8 @@ class GoalAutonomyMixin:
         return _decision("active", False, None, "wait", reason, "")
 
     def render_completion_history(self) -> str:
+        labels = {"complete": "Completed", "complete_refused": "Completion refused",
+                  "hard_limit_breach": "Hard limit breach"}
         rows = [row for row in (self.state.revisions if self.state else [])
-                if row.get("kind") in {"complete", "complete_refused", "hard_limit_breach"}]
-        return "\n".join(f"{row['kind']}: {row['reason']}" for row in rows[-5:])
+                if row.get("kind") in labels]
+        return "\n".join(f"{labels[row['kind']]}: {row['reason']}" for row in rows[-5:])
