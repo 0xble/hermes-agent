@@ -1,5 +1,14 @@
 # Maintained fork patch register
 
+## seamless-restart-s2: Isolated Launcher Environment Acknowledgement
+
+- **Independent hypothesis (2026-10-24):** The supervised gateway matches the intended release, interpreter, cwd and exact generated `-I -c` bootstrap, but acknowledgement rejects its nonempty `PYTHONPATH`. PM deliberately exports the selected dependency paths at `pm/environments.py:554`, and the stderr wrapper passes them to its child. Process inspection reports that launch environment even though isolated Python ignores it and the bootstrap clears it before importing. This predicts deterministic acknowledgement failure with a PM-activated wrapper and success without inherited `PYTHONPATH`. A different failed identity predicate would falsify this diagnosis.
+- **Contract and boundary:** Accept ignored `PYTHONPATH` only for the exact generated isolated bootstrap for the intended root. Keep rejecting ambient paths for the non-isolated `-m` entrypoint. Preserve supervisor, release readiness, interpreter, cwd, pointer and plist verification. Existing recovery must finish an already-issued matching reload without issuing another reload.
+- **Source surfaces:** `hermes_cli/immutable_releases.py`; `tests/hermes_cli/test_release_ack_environment.py` (fixture reused from `tests/hermes_cli/test_immutable_release_transactions.py`). Reuses fork identity `seamless-restart-s2`.
+- **Upstream disposition:** Fork-owned immutable transaction and acknowledgement implementation, not an upstream interface. No upstream replacement applies to this local boundary.
+- **Verification:** `scripts/run_tests.sh tests/hermes_cli/test_release_ack_environment.py tests/hermes_cli/test_immutable_gateway_ack.py tests/hermes_cli/test_immutable_no_gateway_restart.py` passes all 11 tests. Run with disposable `HOME` and `HERMES_HOME` roots. Include inherited-path recovery and non-isolated rejection regressions. Broader reconciliation tests initially hit the real-home metadata guard in this checkout location, then exceeded the observation timeout with an isolated OS home. Real launchd integration remains separately gated by operator authorization.
+- **Rollback and retirement:** Revert only this launcher environment qualification and its regression changes. No state format or dependency change. Retire with the owning immutable-release patch when upstream provides its complete observed-activation contract.
+
 ## mcp-verbatim-tool-labels
 
 - **Status:** Candidate.
