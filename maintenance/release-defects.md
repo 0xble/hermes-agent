@@ -582,3 +582,19 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   to an exactly representable epoch while preserving both exact error-string
   and numeric delay assertions. Runtime cooldown behavior is unchanged.
 - Guard: `tests/gateway/test_telegram_final_delivery.py`.
+
+## Deploy-Base Qualification Probes
+
+Fork patch identity: `meridian-qualification-probes`.
+
+The cron fork-race probe must wait up to 2 seconds for asynchronous SIGKILL
+delivery before asserting every recorded descendant is gone or a zombie. A
+survivor still fails the same assertion. No additional kill occurs before it.
+Guard: `tests/agent/test_deadline_fork_race.py`.
+
+The Kanban E2E harness strips launch-profile settings, but must explicitly
+retain the suite's lazy-install disablement and pytest recovery guard. Otherwise
+real workers can repair or install into the test interpreter while sibling files
+import it. The observed reviewer crash was `prompt_toolkit.utils` missing during
+import. All worker, tick, outcome, and billing assertions remain unchanged.
+Guard: `tests/e2e/core/kanban/test_kanban_rate_limit_review.py`.

@@ -96,7 +96,6 @@ class Board:
         os_home.mkdir(exist_ok=True)
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("HERMES_") and not k.endswith(("_API_KEY", "_TOKEN"))}
-        env.pop("PYTEST_CURRENT_TEST", None)
         env.update({
             "HOME": str(os_home), "HERMES_HOME": str(self.hermes_home),
             "HERMES_BIN": str(self.hermes_bin), "PYTHONPATH": str(REPO),
@@ -105,6 +104,9 @@ class Board:
             # HOME's own state.db; the whole tree is under ``root`` (asserted below), so let workers
             # open their real session store.
             "HERMES_STATE_DB_GUARD_BYPASS": "1",
+            # Agent tool discovery must not mutate the interpreter shared by
+            # concurrent test files. Keep the suite's install/recovery guards.
+            "HERMES_DISABLE_LAZY_INSTALLS": "1", "TIRITH_ENABLED": "false",
             **FAST_ENV, **self.env_extra,
         })
         assert env["HERMES_HOME"].startswith(str(self.root))
