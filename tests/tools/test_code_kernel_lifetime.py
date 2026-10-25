@@ -577,3 +577,32 @@ def test_process_cleanup_failures_never_log_subprocess_secrets(monkeypatch, capl
     proc.kill.assert_called_once()
     proc.wait.assert_called_once_with(timeout=5)
     assert secret not in caplog.text
+
+
+def test_remote_runner_idle_window_starts_after_a_long_cell_answers(monkeypatch, tmp_path):
+    """A cell longer than the idle window must not make the runner exit right after answering."""
+    cells = tmp_path / "cells"
+    cells.mkdir()
+    (cells / "cell_req_000001.json").write_text(json.dumps({"id": "000001", "code": "pass"}))
+    monkeypatch.setenv("HERMES_KERNEL_DIR", str(tmp_path))
+    namespace: dict = {"__name__": "isolated_runner"}
+    exec(compile(remote.REMOTE_KERNEL_RUNNER_SOURCE.format(
+        cell_source=local.RUNNER_CELL_SOURCE, capture_limit=1000, idle_exit=10),
+        "isolated-remote-runner", "exec"), namespace)
+    clock = [0.0]
+
+    def long_cell(request, count):
+        clock[0] += 60  # six idle windows of work
+        return {"id": request["id"], "status": "ok", "execution_count": count}, None
+
+    class StillRunning(Exception):
+        pass
+
+    def idle_wait(_):
+        raise StillRunning
+
+    namespace["run_cell"] = long_cell
+    namespace["time"] = SimpleNamespace(time=lambda: clock[0], sleep=idle_wait)
+    with pytest.raises(StillRunning):
+        namespace["main"]()
+    assert (cells / "cell_res_000001.json").exists()

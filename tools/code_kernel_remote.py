@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 # Host poll interval for a cell result file; each poll is one env.execute round-trip
 # (0.1-0.4s on ssh/docker), so this is a floor, not a rate.
 _CELL_POLL_INTERVAL = 0.5
+# While a cell's result is missing, how often to check whether the runner is still there.
+_CELL_LIVENESS_INTERVAL = 5.0
 
 # The remote runner: a forever-loop that polls for cell request files, execs them in one
 # persistent namespace, writes response files. Pure files + stdlib only (transport-agnostic);
@@ -89,6 +91,9 @@ def main():
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
             os.replace(tmp, os.path.join(CELLS, res_name))
+            # Idle is measured from the last result, so a cell longer than the
+            # idle window cannot trigger self-exit right after it answers.
+            last_activity = time.time()
             if payload["status"] == "exit":
                 return
 
@@ -381,8 +386,14 @@ def _run_remote_cell(kernel: RemoteKernel, code: str, timeout: int) -> tuple[str
     # One round-trip: tmp write + rename publishes the request atomically.
     _ship_file_to_remote(kernel.env, f"{kernel.kernel_dir}/cells/cell_req_{seq}.json",
                          json.dumps({"id": seq, "code": code}, ensure_ascii=False), atomic=True)
+    q_req = shlex.quote(f"{kernel.kernel_dir}/cells/cell_req_{seq}.json")
     deadline = time.monotonic() + timeout
+    next_liveness = time.monotonic() + _CELL_LIVENESS_INTERVAL
     while time.monotonic() < deadline:
+        if time.monotonic() >= next_liveness:
+            next_liveness = time.monotonic() + _CELL_LIVENESS_INTERVAL
+            if _reclaim_unstarted_cell(kernel, q_req, only_if_dead=True):
+                return "not-started", {}
         try:
             body = kernel.sh(f"cat {q_cells}/{q_res} 2>/dev/null", timeout=20).strip()
         except Exception:
@@ -403,7 +414,26 @@ def _run_remote_cell(kernel: RemoteKernel, code: str, timeout: int) -> tuple[str
                 logger.debug("remote kernel: cell result cleanup failed (details omitted)")
             return status, payload
         time.sleep(_CELL_POLL_INTERVAL)
+    if _reclaim_unstarted_cell(kernel, q_req, only_if_dead=False):
+        return "not-started", {}
     return "timeout", {}
+
+
+def _reclaim_unstarted_cell(kernel: RemoteKernel, q_req: str, *, only_if_dead: bool) -> bool:
+    """Rename a request the runner never picked up, proving its code did not run.
+
+    The runner removes a request before executing it and only scans ``cell_req_*.json``,
+    so a successful rename means the cell never started and never will. ``only_if_dead``
+    limits the mid-cell probe to a runner that has exited. Transport failures prove nothing.
+    """
+    reclaim = f"mv {q_req} {q_req}.cancelled 2>/dev/null && echo RECLAIMED"
+    if only_if_dead:
+        reclaim = f"kill -0 {shlex.quote(kernel.pid)} 2>/dev/null || {{ {reclaim}; }}"
+    try:
+        return "RECLAIMED" in kernel.sh(reclaim, timeout=15)
+    except Exception:  # health: allow BLE001 -- an unreadable transport leaves the cell's fate unknown, never "not started".
+        logger.debug("remote kernel: unstarted-cell reclaim probe failed (details omitted)")
+        return False
 
 
 def execute_in_remote_kernel(
@@ -486,6 +516,12 @@ def _run_attached_cell(kernel: RemoteKernel, key: tuple, code: str, *, env, task
         "traceback": cell_payload.get("traceback", ""), "tool_calls_made": tool_call_counter[0], "kernel": kernel_info,
         "tool_errors": tool_errors_since(tool_call_log),
     }
+    if cell_status == "not-started":
+        _REGISTRY.discard(key, kernel, reason="runner_gone")
+        kernel_info.update(ended=True, state_lost=True, note=(
+            "The remote session kernel exited before this cell started, so the code did NOT run and is safe "
+            "to retry. Earlier kernel state was lost; the next call starts a fresh kernel."))
+        return result
     if cell_status in ("timeout", "protocol-error", "no-result"):
         # No safe way to interrupt one cell in place (same contract as local): kill, report, respawn.
         _REGISTRY.discard(key, kernel, reason=cell_status)

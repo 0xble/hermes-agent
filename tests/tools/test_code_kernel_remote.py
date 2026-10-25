@@ -191,6 +191,43 @@ class TestDeathDetection(RemoteKernelBase):
         self.assertTrue(any("kill " in c for c in env.commands))
 
 
+class TestUnstartedCellReclaim(RemoteKernelBase):
+    """A runner that exits before taking a request leaves provably unrun code, not a timeout."""
+
+    def _env(self, *, reclaimed, results=()):
+        results = list(results)
+
+        def cat_handler(command):
+            payload = results.pop(0) if results else None  # None: result not written yet
+            return {"output": json.dumps(payload) if payload is not None else "", "returncode": 0}
+
+        return ScriptedEnv([
+            (".cancelled", lambda c: {"output": "RECLAIMED\n" if reclaimed else "", "returncode": 0}),
+            ("nohup", lambda c: {"output": "PID:91\n", "returncode": 0}),
+            ("kill -0", lambda c: {"output": "ALIVE\n", "returncode": 0}),
+            ("cat ", cat_handler),
+        ])
+
+    def test_runner_gone_before_pickup_reports_not_run_without_waiting(self):
+        env = self._env(reclaimed=True)
+        with patch("tools.code_kernel_remote._CELL_LIVENESS_INTERVAL", 0.0):
+            started = time.monotonic()
+            result = _run(env, timeout=30)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("did NOT run", result["kernel"]["note"])
+        self.assertTrue(result["kernel"]["state_lost"])
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
+        probe = next(c for c in env.commands if ".cancelled" in c)
+        self.assertIn("kill -0 91", probe)
+
+    def test_picked_up_cell_keeps_waiting_for_its_result(self):
+        env = self._env(reclaimed=False, results=[None, None, _cell(stdout="late\n")])
+        with patch("tools.code_kernel_remote._CELL_LIVENESS_INTERVAL", 0.0):
+            result = _run(env, timeout=30)
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(result["stdout"], "late\n")
+
 class TestOwnershipIsolation(RemoteKernelBase):
     def test_changed_tool_set_spawns_kernel_with_fresh_stubs(self):
         env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))
