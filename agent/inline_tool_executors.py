@@ -39,6 +39,9 @@ def _goal_receipt_text(function_name: str, result: Any) -> str:
         return ""
     try:
         from hermes_cli.config import load_config_readonly
+        from hermes_cli.goal_notices import goal_notices_enabled
+        if not goal_notices_enabled():
+            return ""
         if not (load_config_readonly().get("goals") or {}).get("auto_notices", True):
             return ""
         receipt = json.loads(result) if isinstance(result, str) else result
