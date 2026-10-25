@@ -29,6 +29,7 @@ class GoalContractCommandsMixin:
         """
         from hermes_cli.goals import (
             _bounded_evidence_match, _evidence_is_negated, _evidence_tool_excluded, _get_session_db,
+            goal_autonomy_enabled,
         )
 
         db = _get_session_db()
@@ -54,7 +55,7 @@ class GoalContractCommandsMixin:
                         continue
                     content = str(row.get("content") or "")
                     if _bounded_evidence_match(raw_evidence, content):
-                        if _evidence_is_negated(content, raw_evidence):
+                        if _evidence_is_negated(content, raw_evidence, include_no=goal_autonomy_enabled()):
                             found_negated = True
                             continue
                         return None
@@ -332,7 +333,7 @@ class GoalContractCommandsMixin:
         retry cap below still bounds a genuinely stuck red suite.
         """
         from hermes_cli.goals import (
-            CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE, _decision, _gate_workspace, _goal_budget_label,
+            _decision, _gate_workspace, _goal_budget_label,
             run_gate,
         )
 
@@ -368,10 +369,7 @@ class GoalContractCommandsMixin:
                 )
 
             self._save()
-            prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
-                goal=state.goal, command=gate.command, exit_code=exit_code, attempt=gate.attempts,
-                max_retries=gate.max_retries, output=tail or "(no output)",
-            )
+            prompt = self._gate_failure_prompt(gate, exit_code, tail)
             return _decision(
                 "active", True, prompt, "gate_failed",
                 f"gate failed (exit {exit_code}): $ {gate.command}",
