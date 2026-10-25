@@ -31,6 +31,8 @@ source inspection alone.
 - Source surfaces: `gateway/platforms/typing_state.py`, `gateway/platforms/base.py`, typing/status callers in `gateway/`, and the Slack and Telegram adapters.
 - Regression: `tests/gateway/test_slack.py`, `tests/gateway/test_typing_refresh_interval.py`, `tests/gateway/test_telegram_typing_retrigger.py`, and legacy clarify/approval adapter tests.
 - Metadata is forwarded only when an adapter override accepts it, preserving legacy pause, resume and status signatures.
+- Prompt pause/resume records the original refresh surface by session on the delivery adapter. Typed approval, deny, clarify and relay answers consume that record instead of deriving a new surface from the answer event. Turn cleanup retires abandoned records.
+- Typing uses `typing_metadata_for_source`, independently of progress-message metadata. Top-level Mattermost and Buzz progress can target a synthetic root while their refresh transport remains chat-scoped. Keep progress, prompt, stream, media and error send routing unchanged.
 
 ## Verification and Retirement
 
