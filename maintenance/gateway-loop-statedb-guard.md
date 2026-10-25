@@ -23,6 +23,20 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   (retained results open state.db), the startup-restore drain's session-key resolution (Telegram
   topic recovery), the boot resume-candidate snapshot, and the first open of each served secondary
   profile's handles (primed off the loop at startup and on hot-add).
+- 2026-10-25 sweep of the sites the guard named on the live gateway (about 120 active agents,
+  writer-lock holds of 3-13 s, two exit-75 kills): attended route resolution takes the durable
+  activity stamp and `get_attended_route_active` from the off-loop resolution snapshot; turn
+  assembly hydrates the persisted `/reasoning` pick through `_session_reasoning_override_async`
+  and passes it to `_run_agent_build_turn_context`; `/status` awaits the fenced model-override
+  rehydration; hygiene compression's provenance stamps (a forced activity write), failure-streak
+  reads, cooldown writes and streak resets run in worker threads, including from the
+  turn-hold done-callback and the unwind path, which schedule them as retained tasks; Telegram's
+  in-send and control-send stale-topic prunes, delivery's automation topic-owner claim, `/retire`
+  and topic-session binding peeks, and Slack thread hydration (active-session check, watermark
+  read and write) run through `asyncio.to_thread`. Concurrent Slack replies in one thread may
+  now persist watermarks out of order; a regressed watermark only re-injects already-seen replies
+  after a restart. The Slack DM seed (`_seed_dm_session`, and the `_adopt_legacy_slack_entry`
+  and compression-tip reads under it) belongs to PR #814 (`slack-seed-off-loop`).
 - The pre-open deleted-WAL holder scan (host-wide libproc on macOS, already bounded at 5 s
   fail-open by upstream `233434b41447`; a cold scan took 77 s on the loaded host) reuses a
   clean verdict for 10 s while both sidecars keep their identity, never while one is missing,
@@ -181,7 +195,10 @@ disk. Upstream has no matching issue or PR (searched 2026-10-10).
 tolerance), `agent/turn_liveness.py`, `hermes_state.py` (checkpoint connection, write marker),
 `hermes_state_gateway.py` (routing diff), `hermes_state_health.py`,
 `hermes_state_messages.py` (off-lock historical display fold),
-`cron/scheduler.py` and `hermes_cli/config_defaults.py` (cron bound). Proof surface:
+`cron/scheduler.py` and `hermes_cli/config_defaults.py` (cron bound), and the 2026-10-25 sweep
+in `gateway/run_turn.py`, `gateway/run_config_loaders.py`, `gateway/slash_commands_status.py`,
+`gateway/delivery.py`, `gateway/telegram_retire*.py`, `gateway/telegram_topic_sessions.py` and
+the Telegram and Slack adapters. Proof surface:
 `tests/gateway/test_startup_resume_admission.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
 `test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and
@@ -199,7 +216,8 @@ changed rows and user metadata, fold equivalence and non-WAL fallback), and
 Further proof surface: `tests/hermes_state/test_loop_guard.py`, `tests/hermes_state/test_holder_scan_bounded.py`,
 `test_goal_family_commands_keep_loop_live` in `tests/gateway/test_turn_state_db_off_loop.py`, and the
 boot-delay case in `tests/hermes_cli/test_worktree_pushed_tier.py`, and
-`tests/gateway/test_loop_thread_statedb_sites.py`. Known remaining loop site: adapter-reconnect
+`tests/gateway/test_loop_thread_statedb_sites.py`, `tests/gateway/test_loop_thread_statedb_sweep.py`.
+Known remaining loop site: adapter-reconnect
 recovery (`_recover_spool_after_reconnect`) stays synchronous on purpose (e0ba43707ba1): its
 candidate snapshot, spool claim and key resolution must finish before the per-session reconnect
 gate is installed, with no await in between, or fresh inbound can overtake a claimed follow-up.

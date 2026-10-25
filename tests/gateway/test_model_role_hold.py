@@ -449,7 +449,7 @@ def test_status_card_shows_role_marker():
     runner._queue_depth = lambda *_args, **_kwargs: 0
     runner._status_session_db_facts = AsyncMock(return_value=(None, {}, 0, {}))
     runner._cached_agent_for = lambda _key: None
-    runner._rehydrate_session_model_override = lambda _key: None
+    runner._rehydrate_session_model_override_async = AsyncMock(return_value=None)
     runner._session_model_override = lambda _key: {}
     runner._resolve_route_context = AsyncMock(return_value=None)
     runner.async_session_store = SimpleNamespace(get_or_create_session=AsyncMock(return_value=entry))
