@@ -94,7 +94,9 @@ def test_detached_restart_keeps_force_for_the_replacement(monkeypatch):
     launched, real_popen = [], start.subprocess.Popen
 
     def _popen(cmd, **kwargs):  # only the gateway launch is faked; process scans stay real
-        if "hermes_cli.main" not in cmd:
+        # The isolated -c bootstrap embeds the module name inside its program.
+        if not ("gateway" in cmd and "run" in cmd
+                and any("hermes_cli.main" in str(arg) for arg in cmd)):
             return real_popen(cmd, **kwargs)
         launched.append(cmd)
         return SimpleNamespace()
@@ -135,7 +137,9 @@ def test_detached_restart_all_never_runs_the_host_gateway_in_the_caller(monkeypa
     launched, real_popen = [], gw.subprocess.Popen
 
     def _popen(cmd, **kwargs):
-        if "hermes_cli.main" not in cmd:
+        # The isolated -c bootstrap embeds the module name inside its program.
+        if not ("gateway" in cmd and "run" in cmd
+                and any("hermes_cli.main" in str(arg) for arg in cmd)):
             return real_popen(cmd, **kwargs)
         launched.append(cmd)
         return SimpleNamespace()

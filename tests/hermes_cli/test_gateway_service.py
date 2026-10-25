@@ -1653,7 +1653,10 @@ class TestHermesHomeForTargetUser:
     """Unit tests for _hermes_home_for_target_user()."""
 
     def test_remaps_default_home(self, monkeypatch):
+        import hermes_constants
+
         monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
+        monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: Path("/root/.hermes"))
         monkeypatch.delenv("HERMES_HOME", raising=False)
 
         result = gateway_cli._hermes_home_for_target_user("/home/alice")
@@ -3041,6 +3044,8 @@ class TestUnitAnchoredServiceIdentity:
         monkeypatch.setattr(gateway_cli, "_SYSTEM_UNIT_DIR", unit_dir)
         monkeypatch.setattr(os, "geteuid", lambda: 0)
         monkeypatch.setattr(hermes_constants, "account_default_hermes_home", lambda: root_home)
+        # Account identity and the process fallback must describe the same sudo home.
+        monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: root_home)
         monkeypatch.delenv("HERMES_HOME", raising=False)
 
         pre_sync_name = gateway_cli.get_service_name()
