@@ -29,6 +29,9 @@ adapter state — so it is trivially unit-testable.
 from __future__ import annotations
 
 import re
+
+from .rich_media import (cards_block, presentation_line, sanitize_carousel,
+                         sanitize_context, sanitize_image, thumbnail)
 from typing import Any, Dict, List, Optional, Tuple
 
 # Slack Block Kit hard limits (https://docs.slack.dev/reference/block-kit/blocks)
@@ -416,6 +419,17 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
         while i < n:
             line = lines[i]
 
+            special = presentation_line(line, fmt)
+            if special:
+                accessory = thumbnail(line) if para else None
+                flush_para()
+                if accessory and blocks and blocks[-1]["type"] == "section":
+                    blocks[-1]["accessory"] = accessory
+                else:
+                    blocks.append(special)
+                i += 1
+                continue
+
             # Blank line: paragraph boundary
             if not line.strip():
                 flush_para()
@@ -433,7 +447,9 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
                     body.append(lines[i])
                     i += 1
                 i += 1  # consume closing fence
-                blocks.append(_preformatted_block("\n".join(body)))
+                text = "\n".join(body)
+                card = cards_block(text, fmt) if fence.group(2).strip() == "cards" else None
+                blocks.append(card or _preformatted_block(text))
                 continue
 
             # Horizontal rule → divider
@@ -640,6 +656,12 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
             btype = block["type"]
 
             if btype == "section":
+                accessory = block.get("accessory")
+                if isinstance(accessory, dict) and accessory.get("type") == "image":
+                    block = dict(block)
+                    block["accessory"] = sanitize_image(accessory)
+                    if not block["accessory"]:
+                        block.pop("accessory")
                 text_obj = block.get("text")
                 has_body = bool(block.get("fields")) or bool(block.get("accessory"))
                 if isinstance(text_obj, dict):
@@ -663,19 +685,17 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
                     block = dict(block)
                     block["text"] = clamped
             elif btype == "context":
-                elements = block.get("elements") or []
-                if not elements:
+                block = sanitize_context(block)
+                if not block:
                     continue
-                clamped_els = [
-                    _clamp_text_obj(el, MAX_SECTION_TEXT)
-                    if isinstance(el, dict)
-                    and el.get("type") in ("mrkdwn", "plain_text")
-                    else el
-                    for el in elements
-                ]
-                if any(c is not e for c, e in zip(clamped_els, elements)):
-                    block = dict(block)
-                    block["elements"] = clamped_els
+            elif btype == "image":
+                block = sanitize_image(block, block=True)
+                if not block:
+                    continue
+            elif btype == "carousel":
+                block = sanitize_carousel(block)
+                if not block:
+                    continue
             elif btype in ("rich_text", "actions", "context_actions"):
                 if not block.get("elements"):
                     continue
