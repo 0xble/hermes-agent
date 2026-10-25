@@ -7,6 +7,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -260,6 +261,26 @@ class GatewayConfigLoadersMixin:
             return _r_state.conversation.reasoning_override
         # After a gateway restart the in-memory pick is gone; rehydrate it from the routing entry
         # (written through by _set_session_reasoning_override), the same way /model overrides are.
+        return self._publish_persisted_reasoning_override(
+            session_key, self._load_persisted_reasoning_override(session_key))
+
+    async def _session_reasoning_override_async(self, session_key: Optional[str]) -> dict | None:
+        """Loop-side ``_session_reasoning_override``: the restart rehydration reads the session
+        store, whose lock a turn worker holds across its state.db write, so it runs off the loop."""
+        if not session_key:
+            return None
+        self._apply_pending_bulk_reset_if_idle(session_key)
+        _r_state = self._peek_session_state(session_key)
+        if _r_state is not None and _r_state.conversation.reasoning_override is not None:
+            return _r_state.conversation.reasoning_override
+        loaded = await asyncio.to_thread(self._load_persisted_reasoning_override, session_key)
+        _r_state = self._peek_session_state(session_key)
+        if _r_state is not None and _r_state.conversation.reasoning_override is not None:
+            return _r_state.conversation.reasoning_override  # a pick landed during the read: it wins
+        return self._publish_persisted_reasoning_override(session_key, loaded)
+
+    def _load_persisted_reasoning_override(self, session_key: str) -> Optional[tuple[dict, Optional[str]]]:
+        """``(override, scope)`` persisted on the routing entry, or ``None``; never mutates state."""
         store = getattr(self, "session_store", None)
         if store is None:
             return None
@@ -271,10 +292,21 @@ class GatewayConfigLoadersMixin:
             return None
         if not persisted:
             return None
+        scope = None
+        with suppress(Exception):
+            scope = store.get_reasoning_override_scope(session_key)
+        return persisted, scope
+
+    def _publish_persisted_reasoning_override(
+        self, session_key: str, loaded: Optional[tuple[dict, Optional[str]]],
+    ) -> dict | None:
+        if loaded is None:
+            return None
+        persisted, scope = loaded
         conversation = self._session_state(session_key).conversation
         conversation.reasoning_override = dict(persisted)
-        with suppress(Exception):
-            conversation.reasoning_override_scope = store.get_reasoning_override_scope(session_key)
+        if scope is not None:
+            conversation.reasoning_override_scope = scope
         logger.info("Rehydrated persisted /reasoning override for session=%s: %s", session_key, persisted)
         return conversation.reasoning_override
 
