@@ -323,16 +323,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return None
 
         # Adapter admission can precede this task by an arbitrary delay on an idle lane.
-        from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
-        if is_gateway_wake(event) and not await self._run_in_executor_with_context(
-                internal_wake_is_current, event):
-            return None
-        from gateway.platforms.event import is_goal_continuation_event
-        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
-        from gateway.wake import automatic_route_available
+        from gateway.wake import automatic_event_is_current
 
-        metadata = getattr(event, "metadata", None) or {}
-        if (is_goal_continuation_event(event) or metadata.get(LOOP_WAKE_METADATA_KEY)) and not await automatic_route_available(self, source):
+        if not await automatic_event_is_current(self, event):
             return None
         if is_internal:
             await _admit_outbox_event(self, event, source)

@@ -607,9 +607,6 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         """
         from gateway.wake import automatic_route_available
 
-        if source is not None and not await automatic_route_available(self, source):
-            return
-
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
@@ -628,6 +625,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         # new goal: judging it would spend the new goal's turns and verdicts on old work.
         if goal_instance is not None and getattr(mgr.state, "created_at", None) != goal_instance:
             logger.info("goal continuation: turn answered a superseded goal instance; not judged")
+            return
+
+        # Probe only eligible goals, but before judging can spend a retired topic's turns.
+        if source is not None and not await automatic_route_available(self, source):
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -965,6 +966,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         schedules the next tick without pausing the loop.
         """
         from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
+        from gateway.wake import automatic_route_available
+
+        if not state.awaiting_response and now < state.next_due_at:
+            return
 
         route = state.route or {}
         platform_name = route.get("platform", "")
@@ -990,11 +995,6 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not session_key:
             return
 
-        from gateway.wake import automatic_route_available
-
-        if not await automatic_route_available(self, source):
-            return
-
         def _turn_owner_exists(include_marker: bool = True) -> bool:
             if self._is_session_running(session_key) or session_key in self._running_agents:
                 return True
@@ -1009,6 +1009,12 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                     if entry is not None and getattr(entry, "resume_pending", False):
                         return True
             return False
+
+        if _turn_owner_exists(include_marker=False):
+            return
+        # Preserve retired state before compression migration or orphan-tick recovery writes.
+        if not await automatic_route_available(self, source):
+            return
 
         # The route may resolve to a different durable session after compression, /resume, a
         # topic rebind or /new. Only compression carries the loop; the others defer untouched.
@@ -1036,8 +1042,6 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 await self._migrate_compressed_loop(sid, tip)
             return
 
-        if not state.awaiting_response and now < state.next_due_at:
-            return
         entry = None
         with suppress(Exception):
             entry = self.session_store._entries.get(session_key)
