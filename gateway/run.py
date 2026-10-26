@@ -5757,11 +5757,8 @@ async def _start_gateway_start_control_socket(runner):
     import atexit
     _control_server = None
     try:
-        # Started immediately after the PID-file claim: winning that O_EXCL race is the moment this process
-        # becomes the authoritative gateway for its HERMES_HOME, so from here on "does a socket answer?" is
-        # a truthful liveness/identity query for updater and fleet consumers. Strictly non-fatal: a bind
-        # failure only means consumers fall back to the process-scan/state-file layer, exactly as before
-        # this feature. See #92091.
+        # After the PID-file claim, the socket truthfully identifies the authoritative gateway.
+        # Bind failure is non-fatal: consumers fall back to process-scan/state-file discovery (#92091).
         from gateway.control_socket import GatewayControlServer
         from gateway.update_launcher import make_agent_update_handler
         from gateway.slash_commands import _spawn_detached_update
@@ -5820,6 +5817,7 @@ async def _start_gateway_start_control_socket(runner):
         from gateway.cron_review import CronReviewControl
         from gateway import zero_cut_standby as zcs
         from gateway.zero_cut_handover_drain import request_handover, status as handover_status
+        from gateway.writer_census import writer_census
         _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
@@ -5835,7 +5833,8 @@ async def _start_gateway_start_control_socket(runner):
                            "reload-plugins": reload_plugins_verb(runner, _main_loop),
                            "promote": lambda: asyncio.run_coroutine_threadsafe(zcs.promote(runner), _main_loop).result(),
                            "handover": lambda: request_handover(runner, _main_loop),
-                           "handover-status": lambda: handover_status(runner)})
+                           "handover-status": lambda: handover_status(runner),
+                           "writer-census": lambda: writer_census(runner)})
         if not await _control_server.start():
             _control_server = None
         else:

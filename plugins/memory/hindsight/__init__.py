@@ -381,6 +381,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_backlog: collections.deque = collections.deque()
         self._retain_backlog_next_at = 0.0
         self._writer_thread: threading.Thread | None = None
+        self._census_lifetime_ns = time.monotonic_ns()  # Disambiguate recycled object IDs within this process.
         self._sync_thread = None  # legacy alias external callers may join; points at the writer
         self._shutting_down = threading.Event()
         self._atexit_registered = False
@@ -589,6 +590,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # A previous writer may have exited after shutdown(); allow the fresh one to drain.
         self._shutting_down.clear()
         thread = spawn_context_thread(self._writer_loop, name="hindsight-writer")
+        thread._census_started_ns = time.monotonic_ns()  # Disambiguate replacement writers and reused OS IDs.
         self._writer_thread = self._sync_thread = thread
         thread.start()
 
