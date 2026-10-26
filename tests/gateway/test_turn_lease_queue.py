@@ -507,7 +507,10 @@ async def test_long_lease_wait_sends_one_busy_ack(monkeypatch, tmp_path, prior_a
         await lease_wait_notice(runner, key, event)
         assert len(adapter.sent) == 1
         assert adapter.sent[0] == ("Already queued" if prior_ack else
-                                   f"{t('gateway.busy.queued_head')} {t('gateway.busy.queued_tail')}")
+                                   t("gateway.busy.ack", head=t("gateway.busy.queued_head"), detail="",
+                                     tail=t("gateway.busy.queued_tail")))
+        if not prior_ack and adapter.sent[0].startswith("⏳ Queued"):
+            assert adapter.sent[0] == "⏳ Queued for the next turn. I'll respond once the current task finishes."
         runner._turn_leases.release(holder)
         await asyncio.wait_for(task, HANG_GUARD_SECONDS)
     finally:
