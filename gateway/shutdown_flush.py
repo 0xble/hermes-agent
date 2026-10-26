@@ -536,7 +536,8 @@ def _upgrade_shutdown_follow_up(payload: Dict[str, Any], data: Dict[str, Any]) -
     resume marker was cleared by delivery recovery. Upgrade legacy spools at read time too:
     False from the deferral callback otherwise appends them to history and deletes the spool."""
     if payload.get("reason") in ("shutdown_follow_up", "turn_lease_wait"):
-        return {**data, "drain_deferred": True, "shutdown_follow_up": True}
+        return {**data, "drain_deferred": True, "shutdown_follow_up": True,
+                "_recovery_reason": payload["reason"]}
     return data
 
 

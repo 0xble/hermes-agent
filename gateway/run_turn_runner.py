@@ -29,6 +29,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
+from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -532,12 +533,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         _progress_len_fn: Any
         _PROGRESS_TEXT_LIMIT: int
         _edit_accepts_metadata: bool
-        # A permanent edit failure already moved progress to a fresh bubble that has not yet been
-        # edited successfully. A second failure in a row means edits are unusable, not one dead bubble.
+        # A second failure before the fresh bubble edits successfully means edits are unusable.
         reanchored: bool = False
-        # Monotonic deadline set by a flood refusal. Until it passes, new lines are only buffered:
-        # no edit, split, or send, so a refused bubble is not retried once per incoming tool line.
+        # Buffer until the monotonic flood deadline, without editing, splitting or sending.
         defer_until: float = 0.0
+        # Accepted includes durable outbox deferral without a message id. Bubble resets keep this.
+        tool_progress_sent: bool = False
 
     # Default minimum seconds between progress edits. An adapter may raise it with
     # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
@@ -584,11 +585,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
             kwargs["metadata"] = ctx._progress_metadata
-        return await st.adapter.edit_message(**kwargs)
+        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
+        with outbound_class(OUTBOUND_PROGRESS):
+            return await st.adapter.edit_message(**kwargs)
 
     @staticmethod
     def _progress_text(lines: list) -> str:
-        return "\n".join(str(line) for line in lines)
+        text = "\n".join(str(line) for line in lines)
+        return _ToolProgressLine(text) if any(isinstance(line, _ToolProgressLine) for line in lines) else text
 
     def _split_progress_groups(self, st, lines: list) -> list[list]:
         """Partition progress lines into platform-sized editable bubbles."""

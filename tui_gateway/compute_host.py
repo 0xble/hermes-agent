@@ -303,6 +303,7 @@ class ComputeHost:
                 "turn.end", sid, request_id, **meta, interrupted=interrupted, ended_ns=now_ns(),
                 session_info=session_info, session_info_emitted=True)
         except Exception as exc:
+            session = None
             with contextlib.suppress(Exception):
                 from tui_gateway import server
                 session = server._sessions.get(sid)
@@ -310,6 +311,11 @@ class ComputeHost:
                     with session.get("history_lock", threading.Lock()):
                         session["running"] = False
                         server._clear_inflight_turn(session)
+            # turn.error is also a completion boundary. Drain outside history_lock,
+            # even when metadata construction or inflight cleanup raised.
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    session["transport"].flush()
             self._reply("turn.error", sid, request_id, reason="exception", message=str(exc))
 
     def _emit_turn_activity(self, sid: str, session: dict, turn_id: str, started_at: float) -> None:

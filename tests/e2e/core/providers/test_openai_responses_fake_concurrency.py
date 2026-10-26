@@ -23,7 +23,9 @@ def test_cold_sdk_schema_rebuild_is_serialized(monkeypatch, renderers):
     # Fresh deferred models keep this test cold even after other tests warmed the SDK.
     # Rendezvous at the real model_rebuild check/delete window. If both renderers
     # enter it, hold the first deletion until the second has tried the same deletion.
-    # With serialization only one arrives, so the rendezvous expires harmlessly.
+    # With serialization only one arrives, so the rendezvous expires harmlessly. Both renderers
+    # are released together by ``start``, so an unserialized second contender reaches the window
+    # within milliseconds; 1 s keeps the serialized (passing) case from idling the full wait.
     contenders = threading.Barrier(2)
     deletions = threading.Barrier(2)
 
@@ -32,7 +34,7 @@ def test_cold_sdk_schema_rebuild_is_serialized(monkeypatch, renderers):
             if name != "__pydantic_core_schema__":
                 return super().__delattr__(name)
             try:
-                contenders.wait(timeout=5)
+                contenders.wait(timeout=1)
             except threading.BrokenBarrierError:
                 return super().__delattr__(name)
             try:

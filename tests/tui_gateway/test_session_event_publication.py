@@ -272,7 +272,7 @@ def test_park_reconnect_and_reclaim_keep_then_release_publisher(monkeypatch, tmp
     assert ref() is None
 
 
-@pytest.mark.parametrize("mode", ["stdio", "compute"])
+@pytest.mark.parametrize("mode", ["stdio", "compute", "compute-info-error", "compute-usage-error"])
 def test_graceful_exit_drains_final_events_before_completion(monkeypatch, tmp_path, mode):
     import io
     import json
@@ -298,7 +298,7 @@ def test_graceful_exit_drains_final_events_before_completion(monkeypatch, tmp_pa
             return super().write(text)
 
     out = GateStream()
-    host = ComputeHost(stdout=out, heartbeat_secs=0) if mode == "compute" else None
+    host = ComputeHost(stdout=out, heartbeat_secs=0) if mode.startswith("compute") else None
     peer = host._transport if host else StdioTransport(lambda: out, threading.Lock())
     session = record(peer, tmp_path)
     sid = "publication-exit"
@@ -315,7 +315,18 @@ def test_graceful_exit_drains_final_events_before_completion(monkeypatch, tmp_pa
     monkeypatch.setattr(publisher, "flush", observe_flush)
     if host:
         monkeypatch.setattr(server, "_install_borrowed_lease", lambda *a: None)
-        monkeypatch.setattr(server, "_session_info", lambda *a: {})
+        def usage(*args):
+            if mode == "compute-usage-error":
+                raise RuntimeError("usage failed")
+            return {}
+
+        def session_info(*args):
+            if mode == "compute-info-error":
+                raise RuntimeError("session info failed")
+            return server._get_usage(None)
+
+        monkeypatch.setattr(server, "_get_usage", usage)
+        monkeypatch.setattr(server, "_session_info", session_info)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda *a: None)
 
         def run_prompt(*args, **kwargs):
@@ -351,7 +362,7 @@ def test_graceful_exit_drains_final_events_before_completion(monkeypatch, tmp_pa
         assert [event["params"]["payload"]["tool_id"] for event in events] == ["first", "final"]
         assert [event["params"]["seq"] for event in events] == sorted(event["params"]["seq"] for event in events)
         if host:
-            assert frames[-1]["type"] == "turn.end"
+            assert frames[-1]["type"] == ("turn.error" if mode.endswith("error") else "turn.end")
     finally:
         if host:
             host.close()

@@ -88,6 +88,43 @@ def _fixture(db, seed):
     db._execute_write(generations)
 
 
+def test_alias_only_repair_requires_stored_alias_expansion(tmp_path):
+    states = {}
+    for expand_aliases in (True, False):
+        with closing(SessionDB(tmp_path / f"aliases-{expand_aliases}.sqlite")) as db:
+            db.create_session("s", source="test")
+            db.append_messages_batch("s", [
+                {"role": "assistant", "content": "same identity", "timestamp": 100.0},
+                {"role": "assistant", "content": "same identity", "timestamp": 100.0},
+            ])
+            ids = [row[0] for row in db._read_all("SELECT id FROM messages ORDER BY id")]
+
+            def corrupt(conn):
+                for row_id, alias in zip(ids, (b"a" * 32, b"b" * 32)):
+                    conn.execute("UPDATE messages SET display_identity = ?, display_order = 99 WHERE id = ?",
+                                 (alias, row_id))
+
+            db._execute_write(corrupt)
+            plan = db._display_fold_plan("s")
+            assert plan is not None
+            assert len(plan.repair_keys) == 1
+            if not expand_aliases:
+                plan.aliases.clear()  # Negative control: canonical keys match neither stored alias.
+
+            def incremental(conn):
+                selection = db._begin_display_fold(conn, plan)
+                assert type(selection).__name__ == "_AffectedFold"
+                db._reconcile_display_orders(conn, "s", selection)
+
+            db._execute_write(incremental)
+            states[expand_aliases] = _state(db)
+            db._execute_write(lambda conn: db._reconcile_display_orders(conn, "s"))
+            oracle = _state(db)
+            assert (states[expand_aliases] == oracle) is expand_aliases
+            assert [row[2] for row in oracle] == [min(ids), min(ids)]
+    assert [row[2] for row in states[False]] == [99, 99]
+
+
 @pytest.mark.parametrize("named", [False, True])
 @pytest.mark.parametrize("mode", ["incremental", "no_plan", "missing_index", "missing_backfill", "guard_unavailable", "replacement", "retry"])
 def test_randomized_incremental_equals_full_fold(tmp_path, monkeypatch, caplog, named, mode):

@@ -18,6 +18,7 @@ from agent.replay_cleanup import strip_stale_dangerous_confirmations
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -351,6 +352,7 @@ class GatewayTurnProgressMixin:
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
         stream bubble when the consumer accepts tool progress, else the progress queue."""
+        msg = _ToolProgressLine(msg)
         ctx = self._ctx
         sc = self._stream_consumer()
         native = sc is not None and getattr(sc, "accepts_tool_progress", False)
@@ -627,7 +629,8 @@ class GatewayTurnProgressMixin:
 
     @staticmethod
     def _progress_text(lines: list) -> str:
-        return "\n".join(str(line) for line in lines)
+        text = "\n".join(str(line) for line in lines)
+        return _ToolProgressLine(text) if any(isinstance(line, _ToolProgressLine) for line in lines) else text
 
     def _split_progress_groups(self, st, lines: list) -> list[list]:
         """Partition progress lines into platform-sized editable bubbles."""
@@ -642,12 +645,7 @@ class GatewayTurnProgressMixin:
         return groups + ([current] if current else [])
 
     async def _send_progress_text(self, st, text: str):
-        ctx = self._ctx
-        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
-        with outbound_class(OUTBOUND_PROGRESS):
-            result = await st.adapter.send(
-                chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-            )
+        result = await send_progress_text(st, self._ctx, text)
         self._track_progress_result(result)
         return result
 
@@ -700,7 +698,7 @@ class GatewayTurnProgressMixin:
             _, base_msg, count = raw
             if not st.progress_lines:
                 return base_msg
-            st.progress_lines[-1] = _append_progress_repeat_count(base_msg, count + 1)
+            st.progress_lines[-1] = type(base_msg)(_append_progress_repeat_count(base_msg, count + 1))
             return st.progress_lines[-1]
         st.progress_lines.append(raw)
         return raw
@@ -755,7 +753,7 @@ class GatewayTurnProgressMixin:
                 # The fresh bubble starts at the newest line; the dead one keeps what it shows.
                 st.progress_lines = st.progress_lines[-1:]
         # First tool: send all accumulated text as a new message; editing unsupported: just this line.
-        result = await self._send_progress_text(st, "\n".join(st.progress_lines) if st.can_edit else msg)
+        result = await self._send_progress_text(st, self._progress_text(st.progress_lines) if st.can_edit else msg)
         if result.success and result.message_id:
             st.progress_msg_id = result.message_id
         return True

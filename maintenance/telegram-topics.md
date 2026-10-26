@@ -21,6 +21,11 @@ its optional icon, and the durable alias can be observed through one Telegram to
   omits `name`, so Telegram keeps the visible name; resending the saved session title
   reverted an earlier `--title` rename. Manual icon ownership is
   preserved when configured, and successful automatic writes record state and history.
+- Legacy topic-icon schema rebuilds stay inside the `SessionDB` writer transaction.
+  A failure rebuilding either icon table, creating later indexes, or writing the
+  schema-version marker must roll back the exact pre-migration schema and rows.
+  Retrying preserves manual icon ownership and profile isolation. Patch identity:
+  `slice-16-topic-icons`.
 - Icon choice favors relevance, with variety only among relevant icons. The model is always
   offered the whole catalog; withholding recently used icons made the obvious icon unavailable and
   forced unrelated picks. The model returns up to three ranked icons (`icons`, with the older
@@ -49,6 +54,11 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - `preserve_manual_topic_icons` relies on a Bot API `StatusUpdate` handler that observes
   `forum_topic_created`/`forum_topic_edited` service messages in private chats; a user-chosen
   icon recorded there is never replaced by an automatic rename.
+- Paste-only `@file:` openers may title from an explicit usable preview in both
+  the instant-title and model-upgrade entrypoints. The raw opener must still pass
+  nonempty, type, machine-prefix, and summary guards. Blank, machine-authored,
+  and attachment-only previews do not make a file drop titleable. Patch identity:
+  `slice-15-title-config`.
 - A title the model cannot support does not lock. The schema includes `abstain`; a true
   answer, or a deterministic junk title (`None`, `Investigation`, `Unspecified...`, a platform
   label plus a raw ID such as `Slack Thread <id>` or `YouTube Video <id>`, or a title that is
@@ -123,6 +133,12 @@ its ledger rows in the same reviewed change.
 ## Verify and recover
 
 Run the focused title, icon, gateway, and state tests through `scripts/run_tests.sh`.
+`tests/hermes_state/test_telegram_icon_migration.py` injects failures at both
+legacy icon-table drops, a later index, and the schema-version write, then checks
+exact rollback and successful retry.
+`tests/agent/test_title_preview_eligibility.py` exercises preview eligibility through
+both title entrypoints with and without the model upgrade. Completion-retry
+behavior stays covered by `tests/agent/test_title_completion_retry.py`.
 Run `python scripts/check_fork_patches.py` against the worktree HEAD, `git diff --check`,
 and `ruff check` on changed Python files. If rollback is required, revert the landed
 squash commit (found by its `Fork-Patch:` trailer) as one unit and retain the two icon tables

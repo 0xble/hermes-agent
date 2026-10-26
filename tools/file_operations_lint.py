@@ -21,7 +21,9 @@ LINTERS = {
     '.py': 'python -m py_compile {file} 2>&1',
     '.js': 'node --check {file} 2>&1',
     '.ts': 'npx tsc --noEmit {file} 2>&1',
-    '.go': 'go vet {file} 2>&1',
+    # Syntax only: ``go vet FILE`` type-checks the file without its package siblings, so a
+    # type declared in another file reads as ``undefined``. Package vet/lint/tests own types.
+    '.go': 'gofmt -e {file} 2>&1 >/dev/null',
     '.rs': 'rustfmt --check {file} 2>&1',
 }
 
@@ -30,10 +32,9 @@ LINTERS = {
 # re-execs ``env node`` through that PATH.
 _MANAGED_NODE_LINTERS = {'.js': ('node', '--check'), '.ts': ('npx', 'tsc', '--noEmit')}
 
-# Per-file shell linters that flood phantom errors on real projects (single-file
-# ``tsc`` ignores tsconfig, ``go vet`` fails outside a module, ``rustfmt --check``
-# is style-only): skipped when an LSP server claims the file. py_compile /
-# node --check are file-local and correct so always run.
+# Shell linters an LSP server supersedes (single-file ``tsc`` ignores tsconfig,
+# ``gofmt -e`` sees syntax but not types, ``rustfmt --check`` is style-only):
+# skipped when an LSP server claims the file. py_compile / node --check always run.
 _SHELL_LINTER_LSP_REDUNDANT = frozenset({'.ts', '.go', '.rs'})
 
 # Shell linters that resolve the toolchain from the checkout they run in: ``npx tsc`` runs the
@@ -52,10 +53,6 @@ _LINTER_UNUSABLE_PATTERNS = {
     'rustfmt': (
         'no input filename given',  # outside a Cargo project
         'error: not a workspace',
-    ),
-    'go': (
-        'cannot find package',  # outside a module / GOPATH
-        'go: cannot find main module',
     ),
 }
 
