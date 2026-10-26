@@ -84,9 +84,10 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
                   and entry.session_id == session_id and entry.origin):
             return False
 
-    # Live deferred turns own their spools through their inbound finalizer, including
-    # the window after writing the user row. A reconnect is not a restart decision.
-    if drain_deferred and runner._is_session_running(key):
+    # Only a reconnect observing this process's live lease waiter defers to its finalizer.
+    # Startup recovery and unrelated durable shutdown follow-ups still need a decision.
+    if (reconnect_recovery and drain_deferred and data.get("_recovery_reason") == "turn_lease_wait"
+            and runner._is_session_running(key)):
         return None
     followup = data.get("shutdown_follow_up") is True
     candidate_ids = recovered_input_candidate_ids(data.get("recovery_id"), data.get("message_id"))
