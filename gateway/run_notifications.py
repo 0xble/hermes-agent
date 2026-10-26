@@ -173,8 +173,10 @@ _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", 
 _MAX_COMPLETION_INJECTION_ATTEMPTS = 8
 _COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
 # Drain retries of a refused watch event follow the same bounded-backoff policy, keyed to the
-# 2 s drain cadence instead of the watcher's check interval (#140899).
-_WATCH_INJECTION_RETRY_BASE_DELAY = 4.0
+# 2 s drain cadence instead of the watcher's check interval (#140899). A 10 s first wait keeps
+# a refused watch from retaking every slot the background turn gate frees ahead of due goal
+# and loop wakes, which are scanned far less often than the drain runs.
+_WATCH_INJECTION_RETRY_BASE_DELAY = 10.0
 
 
 def _refusal_retry_at(step: int) -> float:
@@ -1582,20 +1584,17 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
-        """Consume queued watch events and inject them when notifications are enabled.
+        """Consume watches in their owning profile, draining even when its mode is off.
 
-        The queue is ALWAYS drained (so watch events don't rot or requeue-spin) but injection is
-        skipped when the OWNING profile's ``display.background_process_notifications`` is ``off``
-        — one shared queue carries every served profile's events, so the gate is evaluated per
-        event inside its profile scope, never once for the ambient (launch) profile.
-
-        See #9290.
+        Refused events retain one queue entry and retry without spinning.
         """
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
         watch_events = _drain_gateway_watch_events(completion_queue)
         for evt in watch_events:
             next_retry_at = evt.get("_watch_next_retry_at")
-            if next_retry_at is not None and next_retry_at > time.monotonic():
+            # A draining gateway offers every event once more so it reaches the drain spool.
+            if (next_retry_at is not None and next_retry_at > time.monotonic()
+                    and not getattr(self, "_draining", False)):
                 # Backoff between refused injections: hold the event for a later drain tick
                 # instead of re-attempting admission every 2 s (#140899).
                 completion_queue.put(evt)
