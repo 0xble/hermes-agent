@@ -239,14 +239,14 @@ def test_existing_socket_client_returns_census(tmp_path, writers):
     asyncio.run(exercise())
 
 
-def test_lifetime_stamps_do_not_retain_provider_and_replacement_changes_stamp(monkeypatch):
+def test_lifetime_stamps_do_not_retain_provider_and_replacement_changes_stamp():
     from plugins.memory.hindsight import HindsightMemoryProvider
 
     p = HindsightMemoryProvider()
     other = HindsightMemoryProvider()
     assert p._census_lifetime_ns != other._census_lifetime_ns
     stop = threading.Event()
-    monkeypatch.setattr(p, "_writer_loop", stop.wait)
+    p._writer_loop = stop.wait
     p._ensure_writer()
     first = p._writer_thread
     try:
