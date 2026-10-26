@@ -65,6 +65,24 @@ through the outbox drain, scoped cron home-channel delivery, busy composition
 and sent metadata, and real credit producers through the threaded callback.
 Transport clients are faked, not formatters.
 
+`tests/gateway/test_telegram_ingress_nonblocking.py` drives busy acknowledgements
+through the native ingress-consumer boundary with a real `MessageEvent` and
+`SessionSource`. Both unmarked and context-marked Telegram acknowledgements return
+before the outbound budget opens and retain the same text and metadata.
+`tests/gateway/test_restart_resume_admission_identity.py` uses native session states
+and the replay scheduler to verify each interrupted resume marker is admitted
+exactly once and reaches a successful terminal outcome. Do not replace the
+runner's `_session_states()` method with a dictionary in this fixture, since that
+breaks scheduler admission before a turn can start.
+
+For checkouts nested beneath a real Hermes home, use the portable CI environment
+(`bin/ci check --lane python`) rather than the machine's inherited home. Targeted
+runs can use the same `scripts.ci.portable.environment` with `scripts/run_tests.sh`
+and the candidate's already-provisioned `HERMES_PYTHON`. This keeps credentials,
+runtime plugins and profile state out of qualification. Do not disable the
+real-home I/O guard: a source payload-manifest probe outside the checkout can
+otherwise be mistaken for profile I/O in a hidden-home worktree.
+
 The footer handler's legacy argument route reads `event.message`, while native
 `MessageEvent` supplies `text`. Coverage exercises native no-argument toggling
 and separately the existing compatibility argument route. This presentation-only
