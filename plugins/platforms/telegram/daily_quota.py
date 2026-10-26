@@ -25,8 +25,8 @@ ban-free days with 3112 and 4157. Edits and typing created no messages, so backg
 ~9k calls overnight before the message rule engaged, and typed turns were never metered at all
 (10116 of the 19875). ``call_soft_ceiling`` (``daily_call_soft_ceiling``) bounds every metered call:
 - Background cosmetic traffic is shed at ``BACKGROUND_CALL_FRACTION`` of it.
-- At the ceiling, typed turns shed typing, interim edits and progress too, and background notices
-  are shed. Typed notices and every final still go out.
+- At the ceiling, typed turns shed typing, interim edits and drafts, and background notices
+  are shed. Enabled tool-progress bubbles, typed notices and every final still go out.
 - For ``STRICT_WINDOW_SECS`` after a penalty of ``STRICT_PENALTY_SECS`` or more, the call ceiling
   is scaled by ``STRICT_FACTOR``: the 36261s ban arrived at fewer calls than the ban before it,
   15 hours later, so a recent ban lowers the safe volume.
@@ -70,7 +70,7 @@ PRESSURE_COSMETIC = 1
 PRESSURE_NOTICES = 2
 
 from gateway.platforms.base import (  # noqa: E402
-    OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS, current_outbound_class, outbound_class)
+    OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS, OUTBOUND_TOOL_PROGRESS, current_outbound_class, outbound_class)
 
 # Endpoints that create a message in the chat. A media group creates one message per item.
 _MESSAGE_ENDPOINTS = frozenset({
@@ -192,9 +192,9 @@ class DailyQuota:
     def sheds(self, chat_key: str, kind: Optional[str], trigger: Optional[str] = None) -> bool:
         """Whether a call of this outbound class must be shed now. Finals (``None``) never are.
 
-        Typed turns keep progress and notices until the day's call budget is spent; then only their
-        cosmetic traffic goes. Background producers shed cosmetics at half the call budget or at the
-        message rule, and notices at the full budget.
+        Typed turns keep enabled tool progress and notices. Their typing, draft and interim text
+        traffic is shed when the day's call budget is spent. Background producers shed cosmetics at
+        half the call budget or at the message rule, and notices at the full budget.
         """
         if kind is None or kind == OUTBOUND_FINAL:
             return False
@@ -202,7 +202,7 @@ class DailyQuota:
         # few hundred calls a day and mostly answers the user, so only the message rule meters it.
         calls = 0.0 if trigger == TRIGGER_UNTAGGED else self.call_pressure(chat_key)
         if trigger == "typed":
-            return kind != OUTBOUND_NOTICE and calls >= 1.0
+            return kind not in (OUTBOUND_NOTICE, OUTBOUND_TOOL_PROGRESS) and calls >= 1.0
         pressure = self.pressure(chat_key)
         if kind == OUTBOUND_NOTICE:
             return pressure >= PRESSURE_NOTICES or calls >= 1.0

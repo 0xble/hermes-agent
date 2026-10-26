@@ -78,6 +78,10 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
+class _ToolProgressLine(str):
+    """A real tool line, distinct from thinking text in the shared progress queue."""
+
+
 class TurnRunner:
     """Per-turn callbacks, with routing assignment supplied by gateway turn assembly."""
 
@@ -328,6 +332,7 @@ class TurnRunner:
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
         stream bubble when the consumer accepts tool progress, else the progress queue."""
+        msg = _ToolProgressLine(msg)
         ctx = self._ctx
         sc = self._stream_consumer()
         native = sc is not None and getattr(sc, "accepts_tool_progress", False)
@@ -619,7 +624,11 @@ class TurnRunner:
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
             kwargs["metadata"] = ctx._progress_metadata
-        return await st.adapter.edit_message(**kwargs)
+        from gateway.platforms.base import OUTBOUND_PROGRESS, OUTBOUND_TOOL_PROGRESS, outbound_class
+        kind = (OUTBOUND_TOOL_PROGRESS if any(isinstance(line, _ToolProgressLine)
+                for line in getattr(st, "progress_lines", ())) else OUTBOUND_PROGRESS)
+        with outbound_class(kind):
+            return await st.adapter.edit_message(**kwargs)
 
     @staticmethod
     def _progress_text(lines: list) -> str:
@@ -639,8 +648,10 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
-        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
-        with outbound_class(OUTBOUND_PROGRESS):
+        from gateway.platforms.base import OUTBOUND_PROGRESS, OUTBOUND_TOOL_PROGRESS, outbound_class
+        kind = (OUTBOUND_TOOL_PROGRESS if any(isinstance(line, _ToolProgressLine)
+                for line in getattr(st, "progress_lines", ())) else OUTBOUND_PROGRESS)
+        with outbound_class(kind):
             result = await st.adapter.send(
                 chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
             )
@@ -735,7 +746,7 @@ class TurnRunner:
             _, base_msg, count = raw
             if not st.progress_lines:
                 return base_msg
-            st.progress_lines[-1] = f"{base_msg} (×{count + 1})"
+            st.progress_lines[-1] = type(base_msg)(f"{base_msg} (×{count + 1})")
             return st.progress_lines[-1]
         st.progress_lines.append(raw)
         return raw
