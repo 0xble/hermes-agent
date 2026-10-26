@@ -112,6 +112,59 @@ weeks, months and years. The combined timeout is capped below the native signed
 unit limits cannot overflow subprocess polling. Zero/unknown/infinite phase
 limits use the bounded fallback. This does not change active-turn drain settings.
 
+### Immutable Live Candidates
+
+Immutable updates select a release before staging it, without moving the source
+checkout, index or environment. If `current` names a live candidate that is not
+contained in `origin/main` or the fetched target, `update_cmd_candidate.py` carries
+it forward using `git merge-tree --write-tree` and `git commit-tree`. The result
+contains both the fetched target and the live candidate. A local
+`refs/hermes/carry-forward/<SHA>` ref keeps this merge reachable for later updates.
+Activation prunes these refs except for the current and previous releases.
+`stage_release` archives that selected SHA directly from the local object store.
+The merge does not need a push or a published synthetic branch. In partial
+clones both sides are prefetched outside checkout-lock custody before merging.
+
+Selection unwraps our carry merges to the actual candidate instead of merging
+synthetic history back into main. An ancestor candidate needs no carry. Otherwise,
+selection asks GitHub's commit-associated pull requests endpoint on the source
+`origin`, using the updater's existing API authentication. An associated PR with
+`merged_at` set into the same repository's target branch or `main` proves landing,
+including squash and rebase merges. Selection returns the bare published target
+even if later commits revert, delete or supersede the landed content. Patch IDs
+and tree equality are not landing evidence.
+
+Carrying requires an associated open PR whose head exactly matches the original
+candidate, with no merged PR into either base branch across the complete listing.
+No PR, closed-unmerged or moved heads, unsupported origins, offline/API failures,
+malformed responses and incomplete pagination are unknown, not proof of an
+unlanded candidate. Unknown status refuses with the live SHA and
+`--replace-candidate <exact-live-SHA>`. Git-only/local candidates therefore need
+explicit replacement unless graph ancestry proves they already landed.
+A merge tree equal to the target is only a content no-op. An unchanged combined tree reuses the live release
+without creating another commit or retention ref.
+
+Install stamps retain the original source branch across carries. Older releases
+can recover it from their update receipt's argv and exact release transition,
+or an unambiguous named Git ref. Before carrying unlanded content, selection
+checks that branch's current head directly on origin, not a stale tracking ref.
+A changed or unavailable branch, or missing provenance, refuses the update
+instead of resurrecting stale code. A local-only checkout uses its local ref.
+
+A conflicting merge also refuses the update before staging or promotion,
+prints the full live SHA and records a failed `candidate_carry_forward` step.
+`hermes update --replace-candidate <exact-live-SHA>` explicitly authorizes replacing
+only that installed candidate. The authorization must be a complete 40-hex SHA
+and match the current release exactly, ignoring hex letter case. It does not bypass the separate
+`--allow-drop-main` guard. Neither flag crosses the post-swap handoff: the child
+runs the target's parser, which may predate them, and never selects a target.
+
+Successful selection prints the carried or replaced SHA and records
+`candidate_update_target`, `carried_candidates` or `replaced_candidate` in
+the update receipt. The shared immutable updater owns this selection for both
+CLI updates and `request_update`. Replacing a candidate is a CLI-only escape:
+`request_update` has no replacement argument.
+
 ## Nous free tier sign-in
 
 Sign-in completion is one function, `settle_after_upgrade`, called by every caller that persists an

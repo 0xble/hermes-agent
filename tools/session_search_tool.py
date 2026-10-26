@@ -608,7 +608,8 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
 
     filters = dict(role_filter=role_filter, after=after, before=before,
                    exclude_session_ids=exclude_session_ids, detail=detail, limit=limit)
-    scope = (search_operation(db, caller="session_search tool", query=query, sort=sort, filters=filters)
+    discovery_query = "" if isinstance(session_id, str) and session_id.strip() else query
+    scope = (search_operation(db, caller="session_search tool", query=discovery_query, sort=sort, filters=filters)
              if isinstance(db, SessionDB) else nullcontext())
     with scope as operation:
         with search_stage(db, "hydration_ms"):
