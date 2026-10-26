@@ -449,6 +449,9 @@ def _run_single_child(
         )
     finally:
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
+        # This is the driver's final boundary, including any synchronous schema-retry turn.
+        # An abandoned conversation can publish only after its genuine done callback.
+        run.checkpoint_finished_child()
 
 
 def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) -> dict[str, Any]:
