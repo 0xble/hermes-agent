@@ -31,7 +31,7 @@ from hermes_state_transactions import execute_transcript_write
 
 from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_phase
 from hermes_state_message_archive import archive_message_rows, archive_named_rows
-from hermes_state_display_fold import DisplayFoldMixin
+from hermes_state_display_fold import DisplayFoldMixin, _FoldPlan
 from hermes_state_search_runtime import search_stage
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
@@ -851,7 +851,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         """Run compaction on the caller's write transaction without committing it."""
         from hermes_state import SessionCompressionInProgressError
         from hermes_state_errors import CompressionLeaseLostError
-        fold_plan = self._begin_display_fold(conn, fold_plan)
+        affected_fold = self._begin_display_fold(conn, fold_plan)
         with write_phase("compaction_prepare"):
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
@@ -874,7 +874,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
             return archive_named_rows(
                 self, conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
                 carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
-                merged_away=proved[1], fold_plan=fold_plan)
+                merged_away=proved[1], fold_plan=affected_fold)
         with write_phase("archive_enumerate"):
             tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
@@ -892,7 +892,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
                      int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
             rewind_ids += tail_ids
             rewind_ids = list(dict.fromkeys(rewind_ids))
-        self._seed_display_removals(conn, session_id, fold_plan, rewind_ids)
+        self._seed_display_removals(conn, session_id, affected_fold, rewind_ids)
         archive_message_rows(conn, session_id, rewind_ids, exclude_rewound=True)
         # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
         # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
@@ -904,7 +904,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
             self._clone_message_rows(conn, tail_ids)
             inserted += len(tail_ids)
             tool_calls_total += tail_tool_calls
-        self._reconcile_display_orders(conn, session_id, fold_plan)
+        self._reconcile_display_orders(conn, session_id, affected_fold)
         with write_phase("session_counters"):
             conn.execute(f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
                 (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
