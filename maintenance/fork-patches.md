@@ -24,8 +24,16 @@ passes on the selected upstream release without the local implementation.
 | Telegram emphasis | `tests/gateway/test_telegram_emphasis.py` | Own contribution: [upstream PR 106906](https://github.com/NousResearch/hermes-agent/pull/106906), open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19. |
 | Telegram flood recovery | `tests/gateway/test_telegram_flood_coherence.py`, split-send and delivery-ledger tests | Adopted commits are pinned below. Media rate limits are classified but attachments are not durable redelivery obligations. |
 | Cron | per-job-timezone and contention-skip tests under `tests/cron/` | Local narrow patches pending equivalent released behavior. Preserve civil-time scheduling and truthful skip results. |
+| Intentional reactions | `tests/agent/test_reaction_only_final.py`, `tests/gateway/test_{adapter_reactions,reaction_only_turn,reaction_toolsets}.py`, `tests/tools/test_gateway_reactions.py` | Narrow adaptation of reviewed `240993e186e70e36878cdcf88ec7e09c0cefefcf` against reference base `0c9c66de13bdd258f75e2eae87ab5f98cda4429f` onto company base `b849a00ca05c4aee94c6036480fed6f05d972003`. Public adapter operations confirm delivery on the gateway loop. Per-execution acknowledgments suppress empty-response fallback only for the actual triggering message. Preserve queued-event rebinding, profile/workspace isolation, desktop behavior, explicit toolset selections, disabled toolsets, human Slack ingress, terminal guards, and goal-notice suppression. No automatic status reactions or newer silence-reprompt/reasoning systems are adopted. Retire only when the accepted upstream release passes these contracts without this patch. |
 | Backup and state | `tests/hermes_cli/test_backup.py`, `scripts/schema_rehearsal.py` | Adopted backup fixes plus local integrity/rehearsal tooling. Verify on copies, including fork-only rows. |
 | Maintenance tooling | `scripts/{sync_fork_candidate,check_fork_patches,install_candidate_extensions}.py`, `scripts/rollback_fork_runtime.sh` | Fork-specific tooling, not an upstream runtime feature. Exercise rollback failure recovery and native update receipt checks before promotion. |
+
+The intentional-reaction identity is `gateway-intentional-message-reactions`.
+The same unit also owns identity `intentional-reactions` for the lifecycle
+follow-up series. `tests/gateway/test_reaction_lifecycle_ownership.py` verifies
+that confirmed explicit reactions on Signal, Telegram and Photon survive status
+completion, including repeated completion and in-flight delivery. Failed or
+unrelated reactions retain existing status behavior and enablement settings.
 
 For rows without a linked contribution, no upstream submission is recorded here.
 Reassess the contribution route when changing that behavior rather than treating
