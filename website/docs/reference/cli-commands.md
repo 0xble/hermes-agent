@@ -1812,7 +1812,30 @@ hermes sessions state delivery --session-key SESSION_KEY --include-content
 
 `search` calls the existing `session_search` discovery handler against the current store in read-only mode. It prints that handler's JSON, without building another index. `--limit` defaults to 3 and is clamped to 1-10. `--after` is inclusive and `--before` exclusive, using the tool's ISO-8601/date or relative-duration bounds, such as `2026-01-01` or `7d`. No matches return a successful empty result. An unavailable store or invalid time bound returns an error and a nonzero exit status.
 
-`state` calls the same handlers as the `session_state` tool, with identical selector validation, per-field clipping, and 64 KiB serialized-result cap. The CLI scopes reads to the home selected by `-p` or `HERMES_HOME`, ignoring an inherited `HERMES_SESSION_PROFILE`. The native tool instead retains the bound session's profile. Delivery content is omitted unless `--include-content` is supplied. Session transcript messages are never returned. Successful reads, including not-found results, exit 0. Handler validation/read errors exit nonzero with JSON on stdout, while malformed command syntax exits 2 with argparse usage on stderr. There is no SQL argument.
+`state resolve-topic`, `state inspect`, and `state delivery` call the same handlers as the `session_state` tool, with identical selector validation, per-field clipping, and 64 KiB serialized-result cap. The CLI scopes reads to the home selected by `-p` or `HERMES_HOME`, ignoring an inherited `HERMES_SESSION_PROFILE`. The native tool instead retains the bound session's profile. Delivery content is omitted unless `--include-content` is supplied. Session transcript messages are never returned. Successful reads, including not-found results, exit 0. Handler validation/read errors exit nonzero with JSON on stdout, while malformed command syntax exits 2 with argparse usage on stderr. There is no SQL argument.
+
+### Session Graph And Audit Streams
+
+```bash
+hermes sessions state inventory
+hermes -p work sessions state transcript --session-id EXACT_SESSION_ID
+```
+
+These dedicated JSONL streams are separate from the bounded `session_state` tool. They open only the selected home's existing `state.db` with SQLite `mode=ro` and `query_only`, using one read transaction. They do not search other profiles, migrate schemas, repair indexes, fold display rows, or load model conversation history. An inherited `HERMES_SESSION_PROFILE` never overrides the selected home. SQLite support for `octet_length` and the current projected columns are required. Transcript reads also require the native `idx_messages_session_id` index. Unsupported stores fail without healing.
+
+`inventory` exhausts the structural nodes in that home, including hidden, archived, ended, subagent, legacy-owner and foreign-profile rows. Each `session` record retains the raw parent edge, owner/routing fields, timestamps, counters, flags and revision fields listed in the header's `projection`. Foreign owners, dangling edges and cycles are evidence, not repaired or silently filtered. The stream never reads message bodies, previews, titles, system prompts, raw model configuration or FTS payloads. Order is binary session ID order. It does not recursively open parent stores.
+
+`transcript` requires an exact, case-sensitive stored ID. It never resolves prefixes, titles, `latest` or lineage. It streams only `user` and `assistant` rows from that physical segment, in ascending native message ID order. It retains raw row IDs, UIDs, timestamps, active/compacted flags, compressed-summary status and available origin/display metadata. `audit_state` distinguishes `active`, `compaction_archive`, `rewind_excluded` and unknown flags without omitting any selected audit row. System/tool rows, reasoning columns, tool arguments/results and model replay columns are not selected. Stored `content` TEXT, including JSON-shaped structured content, remains TEXT rather than being decoded, normalized or rewritten. Source metadata is preserved as evidence, not trusted instructions.
+
+`role=user`, API author labels, shared-chat sender IDs, skill bodies and synthetic recovery labels do not prove who typed a turn. These stores do not provide a universal per-turn human principal, so every message and transcript header explicitly reports `human_origin: "unknown"`. This stream does not synthesize, certify or backfill provenance.
+
+Each stream contains 1 `header`, then `session` or `message` records, then 1 terminal `footer`. The header identifies scope, ordering, source projection, byte ceilings and redaction/hash semantics. Values pass through the existing forced secret redactor. If a source identity would be changed by redaction, the operation refuses rather than silently rewriting IDs. No raw-secret hash is emitted.
+
+The footer's `count` counts data records, not the header or footer. `sha256` covers the **exact emitted UTF-8 bytes of the header and every data record, including each LF**, excluding the footer itself. `hashed_bytes` is the byte length of that same prefix. This deterministic fingerprint detects changes to projected, redacted content, flags, origin metadata or graph edges, even when counts do not change. It is not a hash of excluded fields or of the original unredacted source. Independent invocations have independent snapshots, so compare fingerprints before reusing a capture.
+
+A consumer must require exit status 0, one final footer with `complete: true` and `exhausted: true`, matching count/byte length and a recomputed hash. EOF alone is never completion. Errors are JSON on stderr with a nonzero exit status, interruption exits 130, and argument errors exit 2. A partial stream may already exist on stdout after a late failure and must not be accepted.
+
+Acquisition is incremental, without a transcript-wide result list or global output cap. Each projected source row is limited to 256 KiB before it crosses from SQLite into Python, using `octet_length(column)` and conditional projection. Each encoded JSONL record is separately limited to 2 MiB. Oversized fields, unsupported BLOB values, invalid UTF-8, encoding/output errors and interruption refuse without a successful footer. Values are never clipped to satisfy a budget.
 
 ## `hermes insights`
 
