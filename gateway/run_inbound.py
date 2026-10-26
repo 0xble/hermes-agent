@@ -327,6 +327,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if is_gateway_wake(event) and not await self._run_in_executor_with_context(
                 internal_wake_is_current, event):
             return None
+        from gateway.platforms.event import is_goal_continuation_event
+        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+        from gateway.wake import automatic_route_available
+
+        metadata = getattr(event, "metadata", None) or {}
+        if (is_goal_continuation_event(event) or metadata.get(LOOP_WAKE_METADATA_KEY)) and not await automatic_route_available(self, source):
+            return None
         if is_internal:
             await _admit_outbox_event(self, event, source)
             return event, source, True

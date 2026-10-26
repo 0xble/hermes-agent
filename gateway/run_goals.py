@@ -605,6 +605,11 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority.
         """
+        from gateway.wake import automatic_route_available
+
+        if source is not None and not await automatic_route_available(self, source):
+            return
+
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
@@ -985,6 +990,11 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not session_key:
             return
 
+        from gateway.wake import automatic_route_available
+
+        if not await automatic_route_available(self, source):
+            return
+
         def _turn_owner_exists(include_marker: bool = True) -> bool:
             if self._is_session_running(session_key) or session_key in self._running_agents:
                 return True
@@ -1231,6 +1241,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
         mgr, prompt = await self._run_in_executor_with_context(_check)
         if not prompt:
+            return
+        from gateway.wake import automatic_route_available
+
+        if not await automatic_route_available(self, source):
             return
         # A marker absent from the initial snapshot may be created while the barrier check runs.
         # The live SessionEntry is the generation fence for that narrow race: defer to the next

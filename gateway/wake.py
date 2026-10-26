@@ -97,6 +97,32 @@ def session_owned_by_profile(config: Any, profile: Optional[str], session_id: An
     return bool(row) and (row.get("profile_name") or profile) == profile
 
 
+async def automatic_route_available(runner: Any, source: Any) -> bool:
+    """Suppress automatic work only for an exact, read-only deleted-topic result.
+
+    Topic closure and lookup outages are not deletion. Never probe by sending or
+    change the saved goal, loop, session binding or ownership from this check.
+    """
+    from gateway.config import Platform
+
+    if source.platform != Platform.TELEGRAM or not source.thread_id:
+        return True
+    adapter = runner._delivery_adapter_for(source)
+    bot = getattr(adapter, "_bot", None)
+    if bot is None:
+        return True
+    try:
+        from gateway.telegram_retire import _probe_deleted
+
+        deleted = await _probe_deleted(bot, source, runner=runner, read_only=True)
+    except Exception:
+        logger.debug("automatic wake: topic availability lookup failed", exc_info=True)
+        return True
+    if deleted:
+        logger.debug("automatic wake: skipping deleted Telegram topic %s", source.thread_id)
+    return not deleted
+
+
 async def admit_internal_event(adapter: Any, event: Any) -> None:
     """Require a concrete adapter admission, not merely a handler returning None.
 

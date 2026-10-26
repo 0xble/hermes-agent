@@ -48,6 +48,10 @@ def _db():
 # never saw.
 REPLACEMENT_MAX_CHARS = 1500
 
+# Quoted and approved replacements preserve omitted contract fields, additive subgoals
+# and the existing turn budget. Plugins use this semantic capability, not signatures alone.
+PRESERVES_GOAL_REPLACEMENT_REQUIREMENTS = True
+
 
 _REPLACE_PAYLOAD_KEYS = frozenset({"goal", "contract", "max_turns"})
 
