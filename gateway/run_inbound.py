@@ -1779,11 +1779,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return False
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from agent.delegation_context import top_level_delegation_context
         from gateway.outbox import scoped_turn_entry, restore_turn, store_for
         token = scoped_turn_entry()
         result = None
         try:
-            result = await self._handle_admitted_message(event)
+            with top_level_delegation_context():
+                result = await self._handle_admitted_message(event)
             return result
         finally:
             turn_id = getattr(event, "_outbox_turn_id", None)
