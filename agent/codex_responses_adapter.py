@@ -1180,7 +1180,17 @@ class _OutputScan:
             if item_status in _INCOMPLETE_STATUSES and item_type not in _SERVER_SIDE_TOOL_CALL_TYPES:
                 self.has_incomplete_items = True
                 self.saw_streaming_or_item_incomplete = True
-            if item_type == "message":
+            if item_type == "image_generation_call" and item_status == "completed":
+                from agent.responses_image_content import generated_image_content
+
+                # Treat hosted images as final assistant media, including their replay
+                # marker, just like a final text message. Never persist raw base64.
+                self._message(SimpleNamespace(
+                    phase="final_answer", content=[SimpleNamespace(
+                        type="output_text", text=generated_image_content(item),
+                    )],
+                ), "completed")
+            elif item_type == "message":
                 self._message(item, item_status)
             elif item_type in {"reasoning", "compaction"}:
                 if item_type == "reasoning":
