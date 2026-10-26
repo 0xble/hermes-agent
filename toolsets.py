@@ -475,8 +475,12 @@ def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[
     and delegate children (which inherit it) all subtract the gated tools in ``_select_tool_names``."""
     from gateway.config import Platform
 
-    gateway_platforms = {p.value for p in Platform if p != Platform.LOCAL}
-    if platform not in gateway_platforms:
+    try:
+        # Platform resolves registered plugins as well as built-in gateway adapters.
+        is_gateway = Platform(platform) != Platform.LOCAL
+    except ValueError:
+        is_gateway = False
+    if not is_gateway:
         from tools.react_to_message_tool import check_react_requirements
         if not check_react_requirements():
             disabled = [*(disabled or ()), "reactions"]

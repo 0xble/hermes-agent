@@ -76,8 +76,8 @@ def test_gateway_reaction_requirements_do_not_leak_to_desktop(monkeypatch):
     monkeypatch.setattr(reactions.desktop_ui, "user_enabled", lambda *a, **kw: False)
     assert registry.is_toolset_available("reactions")
     assert "reactions" not in (session_disabled_toolsets([], "telegram") or [])
-    assert "reactions" in session_disabled_toolsets([], "desktop")
-    assert "reactions" in session_disabled_toolsets([], "cli")
+    for platform in ("desktop", "cli", "local", "cron", None):
+        assert "reactions" in session_disabled_toolsets([], platform)
     from model_tools import get_tool_definitions
     tools = get_tool_definitions(enabled_toolsets=["hermes-telegram"],
                                  disabled_toolsets=session_disabled_toolsets([], "telegram"),

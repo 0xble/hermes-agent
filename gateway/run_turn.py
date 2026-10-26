@@ -3530,8 +3530,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         from agent.skill_utils import parse_config_string_list
         enabled = self._resolve_enabled_toolsets_for_source(user_config, source, platform_key)
         disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None
-        if "reactions" not in enabled:
-            enabled.append("reactions")
         return enabled, disabled
 
     async def _run_background_task_inner(
