@@ -14,6 +14,7 @@ import pytest
 
 from cron.scheduler import run_job
 from hermes_state import SessionDB
+from tests.cron.conftest import owner_execution_runner
 
 _RUNTIME = {
     "api_key": "test-key",
@@ -48,7 +49,7 @@ class TitleHangingSessionDB(SessionDB):
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure"])
-def test_run_result_and_teardown_survive_title_cleanup_timeout(tmp_path, outcome):
+def test_run_result_and_teardown_survive_title_cleanup_timeout(tmp_path, outcome, monkeypatch):
     release = threading.Event()
     db = TitleHangingSessionDB(db_path=tmp_path / "state.db", release=release)
     job = {"id": f"title-timeout-{outcome}", "name": "title timeout", "prompt": "hello"}
@@ -70,6 +71,9 @@ def test_run_result_and_teardown_survive_title_cleanup_timeout(tmp_path, outcome
              patch("run_agent.AIAgent") as mock_agent_cls, \
              patch("cron.scheduler._teardown_cron_agent", side_effect=lambda *_a, **_k: torn_down.set()), \
              patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0.05):
+            # Cron runs inside its profile owner, which requires the canonical owner store; build
+            # the owner seam under the acquire patch so the hanging store is that owner store.
+            monkeypatch.setattr("cron.scheduler_authority.run_canonical_job", owner_execution_runner())
             agent = MagicMock()
             agent.session_id = None
             agent.run_conversation.side_effect = _run_conversation
