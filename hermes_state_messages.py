@@ -3,7 +3,6 @@ replayed-user dedupe. Mixin bound via the MRO, built on SessionDB's _read_ctx/_e
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -24,11 +23,14 @@ from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
     _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 from hermes_state_identity import (
-    _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json)
+    _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json,
+    display_identity)
 from hermes_state_transactions import execute_transcript_write
 
-from hermes_state_write_metrics import add_write_rows, timed_write_phase
-from hermes_state_message_archive import archive_message_rows
+from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_phase
+from hermes_state_message_archive import archive_message_rows, archive_named_rows
+from hermes_state_display_fold import DisplayFoldMixin
+from hermes_state_search_runtime import search_stage
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
@@ -67,22 +69,6 @@ _DISPLAY_META_ROW_SQL = "SELECT display_metadata FROM messages WHERE id = ? AND 
 _DISPLAY_INDEX_MISSING_SQL = ("SELECT 1 FROM messages WHERE session_id = ?" + _DISPLAY_ACTIVE_CLAUSE
                               + " AND (display_order IS NULL OR display_identity IS NULL) LIMIT 1")
 _ACTIVE_IDS_SQL = "SELECT id FROM messages WHERE session_id = ? AND active = 1 ORDER BY id"
-_DISPLAY_FOLD_COLUMNS_SQL = ("SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, "
-                             "display_kind, display_metadata, display_order, display_identity FROM messages")
-_DISPLAY_FOLD_SCAN_SQL = (_DISPLAY_FOLD_COLUMNS_SQL + " INDEXED BY idx_messages_session_id "
-                          "WHERE session_id = ? AND id > ?" + _DISPLAY_ACTIVE_CLAUSE + " ORDER BY id LIMIT 1000")
-# The WHERE clauses repeat each partial index's own predicate so SQLite can serve them from the index.
-_DISPLAY_IDENTITY_INDEX_SQL = ("SELECT id, display_identity, display_order FROM messages "
-                               "INDEXED BY idx_messages_display_identity WHERE session_id = ? "
-                               "AND display_identity IS NOT NULL" + _DISPLAY_ACTIVE_CLAUSE)
-_DISPLAY_BACKFILL_INDEX_SQL = ("SELECT id, display_identity, display_order FROM messages "
-                               "INDEXED BY idx_messages_display_backfill WHERE session_id = ? "
-                               "AND (display_order IS NULL OR display_identity IS NULL)" + _DISPLAY_ACTIVE_CLAUSE)
-_SET_DISPLAY_FOLD_SQL = "UPDATE messages SET display_order = ?, display_identity = ? WHERE id = ?"
-# Display-fold plan: row id -> (stored identity, recomputed identity, user display_metadata).
-# The third slot is _NOT_A_USER_ROW for every non-user row (only user rows key on metadata).
-_NOT_A_USER_ROW = object()
-_FoldPlan = Dict[int, Tuple[Optional[bytes], bytes, Any]]
 _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls, message_uid FROM messages "
                       "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?")
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
@@ -137,7 +123,7 @@ def _stale_holder(row, now: float) -> bool:
     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
 
 
-class SessionMessagesMixin:
+class SessionMessagesMixin(DisplayFoldMixin):
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe."""
 
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
@@ -928,51 +914,6 @@ class SessionMessagesMixin:
             [session_id, *tail_ids] if retarget else tail_ids)
         add_write_rows("cloned", cursor.rowcount)
 
-    def _archive_named_rows(
-        self, conn, session_id: str, compacted_messages: list[dict[str, Any]], covered: list[int], *,
-        tail_count: int, carried_messages: Optional[list[dict[str, Any]]], patched_model_config: Any,
-        patch: bool, merged_away: set[int],
-        fold_plan: Optional[_FoldPlan] = None,
-    ) -> int:
-        """Archive *covered* as summarized and clone every other active row after the new set.
-
-        A gap below the newest held id, and rows appended after an unpersisted turn, are not
-        in *covered*. They take the concurrent-append path: rewind the original, insert the
-        compacted transcript, then clone them so they stay live and searchable once each.
-        """
-        active_ids = [int(row["id"]) for row in conn.execute(_ACTIVE_IDS_SQL, (session_id,)).fetchall()]
-        covered_set = set(covered)
-        carried_ids = self._resolve_carried_row_ids(conn, session_id, carried_messages or [])
-        covered_set.update(carried_ids)
-        unseen = [row_id for row_id in active_ids if row_id not in covered_set]
-        covered_active = [row_id for row_id in active_ids if row_id in covered_set]
-        rewind_ids = list(carried_ids)
-        if tail_count > 0:
-            rewind_ids += self._tail_originals(covered_active, tail_count, merged_away)
-        rewind_ids += unseen
-        rewind_ids = list(dict.fromkeys(rewind_ids))
-        archive_message_rows(conn, session_id, rewind_ids)
-        # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
-        # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
-        # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
-        self._carry_parent_timestamps(conn, session_id, compacted_messages)
-        inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
-        if unseen:
-            _ids, unseen_tool_calls = self._tail_rows_after_watermark(
-                conn,
-                f"SELECT id, tool_calls FROM messages WHERE id IN ({_placeholders(unseen)}) ORDER BY id",
-                tuple(unseen))
-            self._clone_message_rows(conn, unseen)
-            inserted += len(unseen)
-            tool_calls_total += unseen_tool_calls
-        # A carried copy whose stored identity was computed differently lands in its own
-        # display_order group and would project twice; re-fold before publishing (#122167).
-        self._reconcile_display_orders(conn, session_id, fold_plan)
-        conn.execute(
-            f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
-            (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
-        return inserted
-
     def archive_and_compact(self, session_id: str, compacted_messages: list[dict[str, Any]],
         model_config_patch: Optional[dict[str, Any]] = None, watermark: Optional[int] = None,
         lock_holder: Optional[str] = None, tail_count: int = 0,
@@ -1014,44 +955,49 @@ class SessionMessagesMixin:
         # The display re-fold's history read happens here, before the writer lock (see _display_fold_plan).
         fold_plan = self._display_fold_plan(session_id)
         def _do(conn):
-            if lock_holder is not None:
-                lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
-                if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
-                    raise CompressionLeaseLostError(
-                        f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
-            if held_messages is not None:
-                self._raise_if_unheld_summary(conn, session_id, held_messages)
-            patch = model_config_patch is not None
-            # on_missing="raise": never commit against a vanished session row (caller keeps the original).
-            patched_model_config = self._merge_model_config_json(
-                conn, session_id, model_config_patch, on_missing="raise") if patch else None
-            proved = self._proved_coverage(conn, session_id, covered_ids, unresolved_held, watermark)
+            attempt_fold = self._begin_display_fold(conn, fold_plan)
+            with write_phase("compaction_prepare"):
+                if lock_holder is not None:
+                    lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
+                    if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
+                        raise CompressionLeaseLostError(
+                            f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
+                if held_messages is not None:
+                    self._raise_if_unheld_summary(conn, session_id, held_messages)
+                patch = model_config_patch is not None
+                # on_missing="raise": never commit against a vanished session row (caller keeps the original).
+                patched_model_config = self._merge_model_config_json(
+                    conn, session_id, model_config_patch, on_missing="raise") if patch else None
+                proved = self._proved_coverage(conn, session_id, covered_ids, unresolved_held, watermark)
             if proved is not None:
-                return self._archive_named_rows(
-                    conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
+                return archive_named_rows(
+                    self, conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
                     carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
-                    merged_away=proved[1], fold_plan=fold_plan)
-            tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
-                conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
-                (session_id, int(watermark)))
-            # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
-            # concurrent append would steal a LIMIT slot.
-            rewind_ids: list[int] = self._resolve_carried_row_ids(
-                conn, session_id, carried_messages or [])
-            if tail_count > 0:
-                bound = watermark is not None
-                rewind_ids += [int(row["id"]) for row in conn.execute(
-                    f"SELECT id FROM messages WHERE session_id = ? AND active = 1{' AND id <= ?' if bound else ''} "
-                    "ORDER BY id DESC LIMIT ?",
-                    (session_id, *((int(watermark),) if bound else ()),
-                     int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
-            rewind_ids += tail_ids
-            rewind_ids = list(dict.fromkeys(rewind_ids))
+                    merged_away=proved[1], fold_plan=attempt_fold)
+            with write_phase("archive_enumerate"):
+                tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
+                    conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
+                    (session_id, int(watermark)))
+                # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
+                # concurrent append would steal a LIMIT slot.
+                rewind_ids: list[int] = self._resolve_carried_row_ids(
+                    conn, session_id, carried_messages or [])
+                if tail_count > 0:
+                    bound = watermark is not None
+                    rewind_ids += [int(row["id"]) for row in conn.execute(
+                        f"SELECT id FROM messages WHERE session_id = ? AND active = 1{' AND id <= ?' if bound else ''} "
+                        "ORDER BY id DESC LIMIT ?",
+                        (session_id, *((int(watermark),) if bound else ()),
+                         int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
+                rewind_ids += tail_ids
+                rewind_ids = list(dict.fromkeys(rewind_ids))
+            self._seed_display_removals(conn, session_id, attempt_fold, rewind_ids)
             archive_message_rows(conn, session_id, rewind_ids, exclude_rewound=True)
             # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
             # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
             # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
-            self._carry_parent_timestamps(conn, session_id, compacted_messages)
+            with write_phase("archive_timestamp_carry"):
+                self._carry_parent_timestamps(conn, session_id, compacted_messages)
             inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
             if tail_ids:
                 self._clone_message_rows(conn, tail_ids)
@@ -1059,9 +1005,10 @@ class SessionMessagesMixin:
                 tool_calls_total += tail_tool_calls
             # A carried copy whose stored identity was computed differently lands in its own
             # display_order group and would project twice; re-fold before publishing (#122167).
-            self._reconcile_display_orders(conn, session_id, fold_plan)
-            conn.execute(f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
-                (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
+            self._reconcile_display_orders(conn, session_id, attempt_fold)
+            with write_phase("session_counters"):
+                conn.execute(f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
+                    (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
             return inserted
         return execute_transcript_write(self, _do, compacted_messages, session_id=session_id)
 
@@ -1247,7 +1194,7 @@ class SessionMessagesMixin:
     @staticmethod
     def _display_identity(key: tuple[Any, ...]) -> bytes:
         """Fixed-width durable identity for indexed display-generation lookup."""
-        return hashlib.sha256(repr(key).encode("utf-8", "surrogatepass")).digest()
+        return display_identity(key)
 
     def _dedupe_display_generations(self, rows):
         """Collapse compaction generations so each logical message appears once (the protected tail is copied
@@ -1266,129 +1213,6 @@ class SessionMessagesMixin:
         # Order by the logical message's FIRST row, not the chosen representative's: a protected-tail
         # copy in a newer generation has a higher id than messages emitted after the original.
         return [seen[key] for key in sorted(seen, key=first_id.__getitem__)]
-
-    def _display_fold_plan(self, session_id: str) -> Optional[_FoldPlan]:
-        """``{row id: (stored identity, recomputed identity, user metadata)}`` for every display-visible row of
-        *session_id*, read from one pooled-reader snapshot WITHOUT the writer lock.
-
-        Recomputing the display key decodes every row the session ever compacted (thousands of
-        rows and megabytes of content for a long topic session). Under the writer lock that read
-        stalled every other writer on a loaded disk (2026-10-11 10:57: 21 turns queued behind an
-        ``archive_and_compact``). The plan is only a hint: :meth:`_reconcile_display_orders`
-        reuses a recomputed identity only while the row's stored identity still equals the one
-        this snapshot saw. A content, role, timestamp, tool or display_kind change in between
-        nulls the stored identity (``messages_display_identity_update``). ``display_metadata``
-        is the one key input that trigger does not watch, and only user rows key on it, so the
-        plan keeps each user row's metadata and the lock re-reads that column for user rows only.
-        Every changed row and every row the snapshot did not see is recomputed under the lock.
-        ``None`` (no WAL reader, a read-only store, any read error) keeps the full in-lock scan."""
-        if not session_id or getattr(self, "read_only", False) or not getattr(self, "_wal_active", False):
-            return None
-        plan: _FoldPlan = {}
-        try:
-            with self._read_ctx() as conn:
-                if conn is self._conn:  # degraded read path runs on the writer under its lock
-                    return None
-                conn.execute("BEGIN")
-                try:
-                    last_id = 0
-                    while True:
-                        rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id)).fetchall()
-                        if not rows:
-                            break
-                        for row in rows:
-                            plan[row["id"]] = (
-                                row["display_identity"], self._display_identity(self._display_dedupe_key(row)),
-                                row["display_metadata"] if row["role"] == "user" else _NOT_A_USER_ROW)
-                        last_id = rows[-1]["id"]
-                finally:
-                    if conn.in_transaction:
-                        conn.execute("ROLLBACK")
-        except sqlite3.Error as exc:
-            logger.debug("display fold plan for %s unavailable, folding under the lock: %s", session_id, exc)
-            return None
-        return plan
-
-    def _visible_display_index(self, conn, session_id: str) -> List[Tuple[int, Optional[bytes], Optional[int]]]:
-        """``(id, display_identity, display_order)`` of every display-visible row, id order, from the
-        two partial display indexes alone (no row payload is read)."""
-        rows: Dict[int, Tuple[int, Optional[bytes], Optional[int]]] = {}
-        for sql in (_DISPLAY_IDENTITY_INDEX_SQL, _DISPLAY_BACKFILL_INDEX_SQL):
-            for row in conn.execute(sql, (session_id,)):
-                rows[row[0]] = (row[0], row[1], row[2])
-        return [rows[row_id] for row_id in sorted(rows)]
-
-    @timed_write_phase("display_reconcile")
-    def _reconcile_display_orders(self, conn, session_id: str,
-                                  plan: Optional[_FoldPlan] = None) -> None:
-        """Re-fold split display generations by the recomputed display key.
-
-        A compaction generation that computed the display identity differently (or cloned
-        without inheriting it) leaves one logical message in two ``display_order`` groups,
-        and ``GROUP BY display_order`` then projects it twice (#122167). Folding by the same
-        recomputed key :meth:`_dedupe_display_generations` uses keeps every display projection
-        on one definition of a logical message; the live copy wins its group via the read
-        path's ``ORDER BY candidate.active DESC, candidate.id DESC``. Writes only on drift.
-
-        With a *plan* from :meth:`_display_fold_plan`, rows the snapshot already recomputed
-        are folded from the display indexes alone, and only new or changed rows are read and
-        recomputed here. The result is the same fold as the full scan below."""
-        if plan is not None:
-            try:
-                visible = self._visible_display_index(conn, session_id)
-            except sqlite3.OperationalError as exc:  # a display index is missing: full scan
-                logger.debug("display index read failed for %s, full fold: %s", session_id, exc)
-            else:
-                self._fold_display_orders(conn, visible, plan)
-                return
-        first_id: dict[bytes, int] = {}
-        last_id = 0
-        while True:
-            rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
-            batch_start = last_id
-            updates = []
-            for row in rows:
-                last_id = row["id"]
-                identity = self._display_identity(self._display_dedupe_key(row))
-                order = first_id.setdefault(identity, last_id)
-                if order != row["display_order"] or identity != row["display_identity"]:
-                    updates.append((order, identity, last_id))
-            rows.close()
-            if last_id == batch_start:
-                break
-            cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
-            add_write_rows("display_reconciled", cursor.rowcount)
-
-    def _fold_display_orders(self, conn, visible: List[Tuple[int, Optional[bytes], Optional[int]]],
-                             plan: _FoldPlan) -> None:
-        """The full scan's fold over *visible*, recomputing only rows *plan* cannot vouch for."""
-        stale = [row_id for row_id, stored, _order in visible
-                 if stored is None or plan.get(row_id, (None,))[0] != stored]
-        stale_set = set(stale)
-        # A role change nulls the stored identity, so an unchanged row keeps the snapshot's role.
-        users = [row_id for row_id, _stored, _order in visible
-                 if row_id not in stale_set and plan[row_id][2] is not _NOT_A_USER_ROW]
-        for start in range(0, len(users), 500):
-            chunk = users[start:start + 500]
-            for row_id, metadata in conn.execute(
-                    f"SELECT id, display_metadata FROM messages WHERE id IN ({_placeholders(chunk)})", chunk):
-                if metadata != plan[row_id][2]:
-                    stale.append(row_id)
-        fresh: Dict[int, bytes] = {}
-        for start in range(0, len(stale), 500):
-            chunk = stale[start:start + 500]
-            for row in conn.execute(f"{_DISPLAY_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})", chunk):
-                fresh[row["id"]] = self._display_identity(self._display_dedupe_key(row))
-        first_id: Dict[bytes, int] = {}
-        updates = []
-        for row_id, stored, order in visible:
-            identity = fresh[row_id] if row_id in fresh else plan[row_id][1]
-            folded = first_id.setdefault(identity, row_id)
-            if folded != order or identity != stored:
-                updates.append((folded, identity, row_id))
-        if updates:
-            cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
-            add_write_rows("display_reconciled", cursor.rowcount)
 
     def _ensure_display_order(self, session_id: str) -> bool:
         """Backfill one legacy session once, preserving the pre-index display identity exactly."""
@@ -1720,10 +1544,9 @@ class SessionMessagesMixin:
                 chunk)]
 
     def get_messages_around(self, session_id: str, around_message_id: int, window: int = 5) -> dict[str, Any]:
-        """Up to *window* messages either side of an anchor id (ascending). ``messages_before``/``_after`` count
-        strictly around the anchor (fewer than *window* = session boundary). Empty for a foreign anchor."""
+        """Anchor window in ID order, with strict before/after counts. Foreign anchors return an empty window."""
         window = max(window, 0)
-        with self._read_ctx() as conn:
+        with self._read_ctx() as conn, search_stage(self, "sql_ms"):
             if not conn.execute("SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
                                 (around_message_id, session_id)).fetchone():
                 return {"window": [], "messages_before": 0, "messages_after": 0}

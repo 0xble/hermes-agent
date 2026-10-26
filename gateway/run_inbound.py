@@ -18,14 +18,14 @@ import json
 import os
 import re
 import time
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from pathlib import Path
 
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.cron_review import is_review_event
-from gateway.platforms.base import OUTBOUND_FINAL, EphemeralReply, as_command_reply, outbound_class
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.base import EphemeralReply, as_command_reply
+from gateway.platforms.event import MessageEvent, MessageType, turn_origin_for_event
 from gateway.run_busy import approval_input_words
 from gateway.run_common import _UNSET
 from gateway.run_inbound_media import rehome_inbound_media
@@ -266,6 +266,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
             return None
 
+        # Capture before any admission buffer can park input for shutdown spooling,
+        # including restore gates, compression deferral, and orphan FIFO rescue.
+        if is_genuine_user_message(event) and getattr(event, "_attended_activity_received_at", None) is None:
+            setattr(event, "_attended_activity_received_at", time.time())
+
         reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
         startup_restore_keys = getattr(self, "_startup_restore_keys", None)
         # Session-key normalization precedes the turn's key derivation. The
@@ -285,6 +290,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             and not getattr(event, "_hermes_startup_restore_replay", False)
             and not _is_restore_control_event(event)
         ):
+            # Persist only after the normal user and bot admission checks on drain.
             self._queue_startup_restore_event(event, session_key=reconnect_key)
             return None
 
@@ -911,6 +917,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         schedule_activity: Any = getattr(self, "_schedule_attended_user_activity", None)
         if callable(schedule_activity):
             schedule_activity(event, source, _quick_key)
+        if turn_origin_for_event(event) == "user":  # a queued restart resume's preclaim may hold this slot
+            self._promote_background_admission(_quick_key)
         from gateway.cron_review import fail_busy_review
         if fail_busy_review(event):
             # The runner slot can still be live when the adapter guard is not (reconnect,
@@ -1641,7 +1649,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return
         if getattr(event, "_attended_activity_task", None) is not None:
             return
-        event._attended_activity_received_at = time.time()
+        if getattr(event, "_attended_activity_received_at", None) is None:
+            event._attended_activity_received_at = time.time()
         task = asyncio.create_task(self._mark_attended_user_activity(
             event, source, session_key, retry_on_failure=True,
         ))
@@ -1740,7 +1749,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             # here would send it a second time.
             return None
         if self._draining and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(self._session_key_for_source(source), event)
+            session_key = self._session_key_for_source(source)
+            self._schedule_attended_user_activity(event, source, session_key)
+            self._preserve_drain_event(session_key, event)
             return None
         # Expand alias quick commands before the running-session split (fork patch: the idle
         # path re-expands harmlessly since the target is then a resolvable built-in).
@@ -1814,7 +1825,6 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if self._is_session_running(_quick_key):
             # The durable lock lookup yielded; another turn may now own the slot.
             return await self._hm_handle_running_session_message(event, source, _quick_key)
-
 
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
@@ -2027,28 +2037,6 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
         with scoped_runtime_main(vision_runtime):
             return await self._enrich_message_with_vision(message_text, image_paths)
-
-    async def _echo_stt_transcripts(
-        self, adapter, source: SessionSource, transcripts: List[str], *, event: MessageEvent,
-        metadata=None, log_context: str = "Transcript",
-    ) -> None:
-        """Send each transcript back as ``🎙️ "…"`` (best-effort; failures are logged, never raised)."""
-        # A user's echo is a direct response, even when a busy background turn spawned its task.
-        # Give it answer priority based on the originating event, not the ambient outbound class
-        # or trigger. Keep _interim_send metadata: stream sealing and quota priority are separate.
-        # Internal producers retain their existing budget classification; this is no blanket STT
-        # exemption for background traffic.
-        echo_scope = nullcontext() if event.internal else outbound_class(OUTBOUND_FINAL)
-        with echo_scope:
-            for tx in transcripts:
-                try:
-                    result = await adapter.send(
-                        source.chat_id, t("gateway.voice.transcript_echo_short", text=tx), metadata=metadata,
-                    )
-                    if getattr(result, "success", True) is False:
-                        logger.warning("%s echo failed (non-fatal): %s", log_context, result.error)
-                except Exception as echo_exc:
-                    logger.warning("%s echo failed (non-fatal): %s", log_context, echo_exc)
 
     async def _enrich_inbound_voice(
         self, event: MessageEvent, source: SessionSource, message_text: str, audio_paths: list[str]

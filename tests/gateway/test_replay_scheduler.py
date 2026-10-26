@@ -182,3 +182,54 @@ async def test_gateway_replay_dispatch_and_drop_share_captured_profile(tmp_path,
     assert dropped.future.cancelled()
     assert seen == [("dispatch", tmp_path), ("drop", tmp_path)]
     assert current.get() is None
+
+
+@pytest.mark.asyncio
+async def test_gated_resume_waits_for_room_until_a_person_waits_on_its_session():
+    from gateway.replay_scheduler import BackgroundTurnGate
+
+    running = {"busy"}
+    scheduler = ReplayScheduler(2, gate=BackgroundTurnGate(1, lambda: running, spacing_s=0))
+    started = []
+
+    async def work(name):
+        started.append(name)
+        return name
+
+    scheduler.start()
+    blocked = scheduler.enqueue(priority=2, kind="resume", session_key="s1", dispatch=lambda: work("s1"), gated=True)
+    other = scheduler.enqueue(priority=2, kind="resume", session_key="s2", dispatch=lambda: work("s2"), gated=True)
+    human = scheduler.enqueue(priority=1, kind="human", session_key="h", dispatch=lambda: work("human"))
+    assert await asyncio.wait_for(scheduler.wait_for(human), 5) == "human"
+    assert started == ["human"]  # typed input never waits on the gate
+
+    assert scheduler.promote("s2")
+    assert await asyncio.wait_for(scheduler.wait_for(other), 5) == "s2"
+    assert not blocked.future.done()
+
+    running.clear()
+    assert await asyncio.wait_for(scheduler.wait_for(blocked), 5) == "s1"
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_draining_drops_queued_gated_items_without_starting_them():
+    from gateway.replay_scheduler import BackgroundTurnGate
+
+    draining = False
+    gate = BackgroundTurnGate(1, lambda: {"busy"}, closing=lambda: draining, spacing_s=0)
+    scheduler = ReplayScheduler(1, gate=gate)
+    dropped, started = [], []
+
+    async def work():
+        started.append("resume")
+
+    scheduler.start()
+    resume = scheduler.enqueue(priority=2, kind="resume", session_key="s", dispatch=work,
+                               on_drop=lambda: dropped.append("s"), gated=True)
+    draining = True
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(scheduler.wait_for(resume), 5)
+    # The drop callback releases the resume's preclaim so the drain does not wait on it.
+    assert dropped == ["s"] and started == []
+    await scheduler.close()

@@ -50,6 +50,21 @@ def silence_retry_prompt(agent: Any, ctx: "TurnContext"):
 
 
 @dataclass
+class TurnWorker:
+    """Executor future and drain fences for 1 gateway turn."""
+    executor_task: Any = None
+    agent_timeout: Optional[float] = None
+    agent_warning: Optional[float] = None
+    task_id: str = ""
+    process_baseline: Any = None
+    worker_done: Any = None
+    turn_done: Any = None
+    timeout_fired: Any = None
+    cleanup_lock: Any = None
+    is_current: Any = None
+
+
+@dataclass
 class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
@@ -149,3 +164,12 @@ class TurnContext:
     _native_slack_task_cards: bool = False
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None
+    # Current turn worker, assigned before agent resolution so its completion events can bind the agent.
+    _worker: Optional[TurnWorker] = None
+
+    def bind_agent_lifetime(self, agent: Any) -> None:
+        """Keep only drain fences on the agent, never the entire turn context."""
+        if self.agent_holder:
+            self.agent_holder[0] = agent
+        if self._worker is not None:
+            agent._gateway_turn_lifetime = (self._worker.worker_done, self._worker.turn_done)

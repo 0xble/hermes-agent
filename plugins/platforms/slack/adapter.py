@@ -53,8 +53,10 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 try:  # sibling module; support both package and flat plugin-dir import
+    from .attachment_errors import describe_download_exception
     from .block_kit import render_blocks, sanitize_blocks
 except ImportError:  # pragma: no cover - plugin loaded outside package context
+    from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
 
 
@@ -952,12 +954,6 @@ _TRANSIENT_UPLOAD_MARKERS = (
 _SLACK_PERMISSION_ERRORS = frozenset(
     {"access_denied", "file_access_denied", "no_permission", "not_allowed_token_type", "restricted_action"}
 )
-_SLACK_HTTP_STATUS_TEMPLATES = {
-    401: "Slack attachment access failed for {file_label} with HTTP 401. The bot token is not "
-         "authorized for this file.",
-    403: "Slack attachment access failed for {file_label} with HTTP 403. The bot likely lacks "
-         "permission or scope to read this file.",
-    404: "Slack attachment {file_label} returned HTTP 404 and is no longer reachable."}
 # (error codes, user-facing template) for ``_describe_slack_api_error``; first match wins.
 _SLACK_API_ERROR_TEMPLATES = (
     ({"not_authed", "invalid_auth", "account_inactive", "token_revoked"},
@@ -1445,25 +1441,8 @@ class SlackAdapter(BasePlatformAdapter):
     def _describe_slack_download_failure(
         self, exc: Exception, *, file_obj: Optional[dict[str, Any]] = None) -> Optional[str]:
         """Translate Slack download exceptions into user-facing attachment diagnostics."""
-        file_label = _attachment_label(file_obj)
-        response = getattr(exc, "response", None)
-        api_detail = self._describe_slack_api_error(response, file_obj=file_obj)
-        if api_detail:
-            return api_detail
-        try:
-            import httpx
-        except Exception:  # pragma: no cover
-            httpx = None
-        if httpx is not None and isinstance(exc, httpx.HTTPStatusError):
-            template = _SLACK_HTTP_STATUS_TEMPLATES.get(exc.response.status_code)
-            if template:
-                return template.format(file_label=file_label)
-        message = str(exc)
-        if "Slack returned HTML instead of media" in message or "non-image data" in message:
-            return (
-                f"Slack attachment access failed for {file_label}: Slack returned an HTML/login or non-media response. "
-                "This usually means a scope, auth, or file-permission problem.")
-        return None
+        return self._describe_slack_api_error(getattr(exc, "response", None), file_obj=file_obj) or (
+            describe_download_exception(exc, _attachment_label(file_obj)))
 
     # Slash-command ephemeral helpers. response_url is valid 30 min; the much shorter TTL avoids
     # routing unrelated messages as ephemeral after a slow/dropped handler. Hard cap because TTL
@@ -2259,7 +2238,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # stay stuck on "is thinking..." (#24117).
                 return SendResult(success=True)
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
-            last_result = await self._post_chunks(chat_id, team_id, content, formatted, thread_ts)
+            from .message_delivery import post_chunks
+            last_result = await post_chunks(self, chat_id, team_id, content, formatted, thread_ts, metadata)
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
                 await self.stop_typing(chat_id, metadata=metadata)
@@ -2285,32 +2265,6 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False, error=str(e), retryable=_retryable,
                 retry_after=self._retry_after_from_exc(e) if _retryable else None)
-
-    async def _post_chunks(
-        self, chat_id: str, team_id: str, content: str, formatted: str, thread_ts: Optional[str]
-    ) -> Any:
-        """``chat.postMessage`` each ``MAX_MESSAGE_LENGTH`` chunk; returns the last response.
-        Block Kit only for single-chunk messages (a >39k response is pathological for the 50-block /
-        3000-char limits); ``text`` stays the notification/accessibility fallback. With
-        ``reply_broadcast`` only the first chunk is also posted to the main channel."""
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-        broadcast = self.config.extra.get("reply_broadcast", False)
-        blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
-        last_result = None
-        for i, chunk in enumerate(chunks):
-            kwargs = {
-                "channel": chat_id, "text": chunk,
-                "mrkdwn": True, **_slack_unfurl_kwargs(self.config.extra)}
-            if blocks and i == 0:
-                kwargs["blocks"] = blocks
-            if thread_ts:
-                kwargs["thread_ts"] = thread_ts
-                if broadcast and i == 0:
-                    kwargs["reply_broadcast"] = True
-            client_fn = lambda: self._get_client(chat_id, team_id=team_id)
-            last_result = await self._call_with_block_fallback(
-                client_fn, "chat_postMessage", kwargs, "send")
-        return last_result
 
     @staticmethod
     def _retry_after_from_exc(e: BaseException) -> Optional[float]:
@@ -3789,17 +3743,17 @@ class SlackAdapter(BasePlatformAdapter):
             return
         source = self.build_source(
             chat_id=channel_id,
-            chat_name=self._channel_name_cache.get(
-                (str(metadata.get("team_id") or ""), channel_id), channel_id),
-            chat_type="dm",
-            user_id=user_id,
-            thread_id=thread_ts,
-            chat_topic=metadata.get("context_channel_id") or None,
-            scope_id=metadata.get("team_id") or None)
-        try:
-            session_store.get_or_create_session(source)
-        except Exception:
-            logger.debug(*fail_log, exc_info=True)
+            chat_name=self._channel_name_cache.get((str(metadata.get("team_id") or ""), channel_id), channel_id),
+            chat_type="dm", user_id=user_id, thread_id=thread_ts,
+            chat_topic=metadata.get("context_channel_id") or None, scope_id=metadata.get("team_id") or None)
+        def seed() -> None:
+            try:
+                session_store.get_or_create_session(source)
+            except Exception:
+                logger.debug(*fail_log, exc_info=True)
+        # The store read can wait seconds behind state.db writes; run inline it froze the event loop
+        # past the liveness watchdog (2026-10-25 10:06 and 10:44 PDT, app_home_opened ack).
+        self.spawn_ingress_reply(asyncio.to_thread(seed), label="dm session seed")
 
     async def _handle_assistant_thread_lifecycle_event(
         self, event: dict, body: Optional[dict] = None) -> None:
@@ -4137,9 +4091,9 @@ class SlackAdapter(BasePlatformAdapter):
             return True
         if thread_marker in self._mentioned_threads or event_thread_ts in self._mentioned_threads:
             return True
-        if is_thread_reply and self._has_active_session_for_thread(
-            channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id, team_id=team_id,
-            chat_type=chat_type):
+        if is_thread_reply and await asyncio.to_thread(
+            self._has_active_session_for_thread, channel_id=channel_id, thread_ts=event_thread_ts,
+            user_id=user_id, team_id=team_id, chat_type=chat_type):
             return True
         if is_thread_reply and await self._bot_authored_thread_root(
             channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id):
@@ -4375,9 +4329,9 @@ class SlackAdapter(BasePlatformAdapter):
         thread_root_media_types: list[str] = []
         if not is_thread_reply:
             return channel_context, thread_root_media_urls, thread_root_media_types
-        has_active_thread_session = self._has_active_session_for_thread(
-            channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id, team_id=team_id,
-            chat_type="dm" if is_dm else "group")
+        has_active_thread_session = await asyncio.to_thread(  # session-store lock: off the loop
+            self._has_active_session_for_thread, channel_id=channel_id, thread_ts=event_thread_ts,
+            user_id=user_id, team_id=team_id, chat_type="dm" if is_dm else "group")
 
         async def _fetch(**kw) -> None:
             nonlocal channel_context
@@ -4396,7 +4350,7 @@ class SlackAdapter(BasePlatformAdapter):
             ) = await self._collect_thread_root_images(
                 channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id)
         elif is_mentioned:
-            await _fetch(after_ts=self._get_thread_watermark(**watermark_args), force_refresh=True)
+            await _fetch(after_ts=await asyncio.to_thread(self._get_thread_watermark, **watermark_args), force_refresh=True)
         else:
             # Restart rehydration (#63530 restart gap / #33215): persistent sessions survive gateway
             # restarts, but thread replies posted while the gateway was down never reached the session. On
@@ -4407,12 +4361,12 @@ class SlackAdapter(BasePlatformAdapter):
             rehydration_key = self._thread_rehydration_key(
                 channel_id, event_thread_ts, user_id, team_id)
             if rehydration_key in self._thread_rehydration_checked:
-                self._set_thread_watermark(watermark_ts=ts, **watermark_args)
+                await asyncio.to_thread(self._set_thread_watermark, watermark_ts=ts, **watermark_args)
                 return channel_context, thread_root_media_urls, thread_root_media_types
-            watermark_ts = self._get_thread_watermark(**watermark_args)
+            watermark_ts = await asyncio.to_thread(self._get_thread_watermark, **watermark_args)
             if watermark_ts:
                 await _fetch(after_ts=watermark_ts, force_refresh=True)
-        self._set_thread_watermark(watermark_ts=ts, **watermark_args)
+        await asyncio.to_thread(self._set_thread_watermark, watermark_ts=ts, **watermark_args)
         self._mark_thread_rehydration_checked(channel_id, event_thread_ts, user_id, team_id)
         return channel_context, thread_root_media_urls, thread_root_media_types
 

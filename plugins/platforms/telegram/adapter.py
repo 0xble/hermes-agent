@@ -29,11 +29,11 @@ from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.telegram_reconnect import TelegramReconnectMixin
-from plugins.platforms.telegram.daily_quota import DEFAULT_SOFT_CEILING, DailyQuota
+from plugins.platforms.telegram.daily_quota import DailyQuota, quota_from_platform_extra, send_outbound_class
 from plugins.platforms.telegram.session_control_cards import session_control_outcome
 from plugins.platforms.telegram.chat_budget import (
     EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
-    current_trigger, keep_trigger, reset_trigger)
+    current_trigger, keep_trigger, reset_trigger, skip_progress_edit)
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -162,7 +162,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len, in_ingress_consumer,
-    OUTBOUND_NOTICE, OUTBOUND_PROGRESS, SEND_SHED_BY_BUDGET, current_outbound_class,
+    OUTBOUND_NOTICE, OUTBOUND_PROGRESS, OUTBOUND_TOOL_PROGRESS, SEND_SHED_BY_BUDGET, current_outbound_class,
 )
 
 # Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
@@ -956,6 +956,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
     _STATUS_MESSAGE_IDS_MAX = 2000
 
     MAX_MESSAGE_LENGTH = 4096
+    # Two MarkdownV2 parenthesis escapes and a conservative fence-separation newline.
+    CHUNK_INDICATOR_OVERHEAD = 3
     supports_code_blocks = True  # MarkdownV2 renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     RICH_MESSAGE_MAX_CHARS = 32768  # Bot API 10.1 rich cap; above it use legacy chunking
@@ -3158,19 +3160,16 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                 chat_id=chat_id_str, owner_key=owner_key, profile_name=profile_name)
             if existing:
                 status = str(existing.get("status") or "")
+                if str(existing.get("topic_name") or "") != name:
+                    raise RuntimeError(f"Telegram topic owner {owner_key} title changed; refusing reroute")
                 if status != "active" or not existing.get("thread_id"):
                     if status == "active" and existing.get("canonical_owner_key"):
-                        canonical = db.get_telegram_topic_owner(
+                        canonical = db.resolve_telegram_topic_owner(
                             chat_id=chat_id_str,
-                            owner_key=str(existing["canonical_owner_key"]),
+                            owner_key=owner_key,
                             profile_name=profile_name,
                         )
-                        if (
-                            canonical
-                            and canonical.get("status") == "active"
-                            and canonical.get("thread_id")
-                            and str(canonical.get("topic_name") or "") == name
-                        ):
+                        if canonical:
                             existing = canonical
                         else:
                             raise RuntimeError(
@@ -3178,8 +3177,6 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                     else:
                         raise RuntimeError(
                             f"Telegram topic owner {owner_key} is {status or 'unresolved'}; refusing duplicate fallback")
-                if str(existing.get("topic_name") or "") != name:
-                    raise RuntimeError(f"Telegram topic owner {owner_key} title changed; refusing reroute")
                 thread_id = str(existing["thread_id"])
                 binding = db.get_telegram_topic_binding(
                     chat_id=chat_id_str, thread_id=thread_id, profile_name=profile_name)
@@ -4547,7 +4544,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                             continue
                         # Thread is genuinely gone: retry without it and prune the stale binding.
                         logger.warning("[%s] Thread %s not found, retrying without message_thread_id", self.name, effective_thread_id)
-                        self._prune_stale_dm_topic_binding(chat_id, effective_thread_id, metadata=metadata)
+                        await asyncio.to_thread(self._prune_stale_dm_topic_binding, chat_id, effective_thread_id, metadata=metadata)
                         used_thread_fallback = True
                         effective_thread_id = None
                         thread_kwargs = {"message_thread_id": None}
@@ -4770,8 +4767,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         if not (isinstance(metadata, dict) and metadata.get("copy_block")):
             content = _normalize_dollar_entities(content)
         # Copy blocks are intentionally opaque: preserve the body byte-for-byte and bypass all rich rendering.
-        outbound = current_outbound_class() or (
-            OUTBOUND_PROGRESS if isinstance(metadata, dict) and metadata.get("_interim_send") else None)
+        outbound = send_outbound_class(current_outbound_class(), metadata, current_trigger())
         if self._daily_sheds(chat_id, outbound):
             return SendResult(success=False, error=SEND_SHED_BY_BUDGET)
         if not self._bot:
@@ -4859,7 +4855,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
             content = _normalize_dollar_entities((metadata or {}).get("rich_fallback_content", content))
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
                 chunks = [
@@ -4893,14 +4889,16 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
     async def _send_chunks(
         self, chat_id: str, chunks: List[str], delivered: List[str], reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]], error_types: tuple) -> SendResult:
-        """Deliver formatted ``chunks`` in order, appending each landed message id to ``delivered``
-        (pre-seeded with the ids of an earlier partial send when resuming — the chunk index used for
-        reply routing continues from there). A mid-loop refusal returns the ``partial_overflow`` result."""
+        """Send chunks in order, extending ``delivered`` (including pre-seeded ids on resume).
+        A definite refusal returns ``partial_overflow`` for the unsent remainder."""
         thread_id = self._metadata_thread_id(metadata)
         requested_thread_id = self._message_thread_id_for_send(thread_id)
         used_thread_fallback = False
         prior = len(delivered)
         for chunk in chunks:
+            if (delivered and current_outbound_class() == OUTBOUND_TOOL_PROGRESS
+                    and self._daily_sheds(chat_id, OUTBOUND_PROGRESS)):
+                break  # Only the first bubble is protected, not its cosmetic split tail.
             outcome = await self._send_chunk_with_retries(
                 chat_id, chunk, len(delivered), reply_to, metadata, thread_id, used_thread_fallback, error_types)
             if isinstance(outcome, SendResult):
@@ -5050,19 +5048,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                 "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing edit without an API call",
                 self.name, chat_id, _edit_cooldown)
             return _flood_cap_result(_edit_cooldown)
-        # Shared per-chat budget (#116312): an interim (preview) edit is SKIPPED when the slot is busy —
-        # the text it would show is shown by the next edit anyway, so a burst of edits can't trip flood
-        # control. A final edit is never skipped (the completed answer is always delivered) but waits
-        # for its slot below. Over-cap interim edits are exempt: the saturated-preview dedup
-        # below already throttles them to one real edit per ~4096-char growth. Consumed only when the
-        # edit actually fires. The skip is flagged in raw_response so the stream consumer does not
-        # record never-shown text as the visible prefix (a later flood fallback would then drop the
-        # tail the user never saw).
-        if (
-            not finalize
-            and utf16_len(content) <= self.MAX_MESSAGE_LENGTH
-            and (self._chat_budget().interim_blocked(chat_id) or self._daily_sheds(chat_id, OUTBOUND_PROGRESS))
-        ):
+        # Flag skipped previews so the consumer does not record never-shown text as visible.
+        if skip_progress_edit(self, chat_id, content, finalize):
             logger.debug(
                 "[%s] skipping interim edit for chat %s (shared send+edit budget: slot busy)",
                 self.name, chat_id)
@@ -5193,7 +5180,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         next accumulated-token edit repeats the overflow cycle (#48648). Final edits still use
         ``_edit_overflow_split`` to deliver the complete response.
         """
-        return self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]
+        return self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)[0]
 
     async def _send_overflow_continuation(
         self, chat_id: str, chunk: str, reply_to_id: Optional[int], thread_kwargs: Dict[str, Any],
@@ -5249,7 +5236,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         """Split an oversized edit across the existing message + continuations: edit ``message_id`` with
         chunk 1, send the rest as replies to the previous chunk, return ``message_id=<last-chunk-id>`` so
         the consumer keeps editing the newest message. A failed continuation reports partial delivery."""
-        chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+        chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)
         if len(chunks) <= 1:
             chunks = [content]  # defensive: a single chunk just edits normally
         first_chunk = chunks[0]
@@ -5376,7 +5363,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             return SendResult(success=False, error="api_unavailable")
         # Drafts share the regular-send UTF-16 length contract.
         text = content if len(
-            content) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]
+            content) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)[0]
         # Same MarkdownV2 conversion as ``send`` (MarkdownV2 then plain) so the draft doesn't snap at the end. Exception: a Rich
         # final with rich drafts disabled previews raw — the legacy formatter would turn pipe tables into bullets.
         plain_rich_preview = bool(
@@ -5428,7 +5415,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                 logger.warning(
                     "[%s] Thread %s not found for control message, retrying without message_thread_id", self.name, message_thread_id)
                 # Same prune as the streaming send path; control sends carry no gateway metadata.
-                self._prune_stale_dm_topic_binding(kwargs.get("chat_id"), message_thread_id)
+                await asyncio.to_thread(self._prune_stale_dm_topic_binding, kwargs.get("chat_id"), message_thread_id)
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("message_thread_id", None)
                 return await call_with_flood_guard(self, kwargs.get("chat_id"), lambda: _await_with_thread_deadline(
@@ -7087,20 +7074,13 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         return limiter
 
     def _daily_quota(self) -> DailyQuota:
-        """Per-chat daily volume ledger; ``daily_message_soft_ceiling`` in the platform extra sets the
-        budget (0 disables shedding, counting continues)."""
+        """Per-chat daily volume ledger; ``daily_message_soft_ceiling`` and ``daily_call_soft_ceiling``
+        in the platform extra set the budgets (0 disables that budget's shedding, counting continues)."""
         quota = self.__dict__.get("_telegram_daily_quota")
         if quota is None:
-            extra = getattr(getattr(self, "config", None), "extra", None) or {}
-            raw = extra.get("daily_message_soft_ceiling", DEFAULT_SOFT_CEILING) if isinstance(extra, dict) else None
-            try:
-                ceiling = int(raw) if raw is not None else DEFAULT_SOFT_CEILING
-            except (TypeError, ValueError):
-                logger.warning("[%s] Invalid daily_message_soft_ceiling %r; using %d", self.name, raw,
-                               DEFAULT_SOFT_CEILING)
-                ceiling = DEFAULT_SOFT_CEILING
-            quota = self.__dict__["_telegram_daily_quota"] = DailyQuota(
-                soft_ceiling=ceiling, profile_dir=getattr(self, "_update_receipt_dir", None))
+            quota = self.__dict__["_telegram_daily_quota"] = quota_from_platform_extra(
+                getattr(getattr(self, "config", None), "extra", None),
+                profile_dir=getattr(self, "_update_receipt_dir", None), label=self.name)
         return quota
 
     def _daily_sheds(self, chat_id: Any, kind: Optional[str]) -> bool:

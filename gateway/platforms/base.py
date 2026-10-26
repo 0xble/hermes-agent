@@ -691,9 +691,26 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     ValueError when *data* isn't an image (e.g. an upstream HTML error page)."""
     validate_inbound_media_size(len(data), media_type="image")
     if not _looks_like_image(data):
-        snippet = data[:80].decode("utf-8", errors="replace")
-        raise ValueError(f"Refusing to cache non-image data as {ext} (starts with: {snippet!r})")
+        # iPhone and macOS screenshots arrive as HEIC, Chromium ones as AVIF. Store them as PNG so
+        # every consumer (vision tools, re-sends, model input) gets a format it can read.
+        png = _transcode_raster_to_png(data)
+        if png is None:
+            snippet = data[:80].decode("utf-8", errors="replace")
+            raise ValueError(f"Refusing to cache non-image data as {ext} (starts with: {snippet!r})")
+        validate_inbound_media_size(len(png), media_type="image")  # PNG can be several times larger
+        data, ext = png, ".png"
     return _write_cache_file(get_image_cache_dir(), "img", ext, data)
+
+
+def _transcode_raster_to_png(data: bytes) -> Optional[bytes]:
+    """PNG bytes for a recognised raster image outside ``_looks_like_image`` (HEIC/HEIF, AVIF,
+    TIFF, ICO), else None. SVG and unrecognised bytes stay refused."""
+    from agent.image_routing import _sniff_mime_from_bytes, _transcode_to_png
+
+    mime = _sniff_mime_from_bytes(data)
+    if mime is None or mime == "image/svg+xml":
+        return None
+    return _transcode_to_png(data)
 
 
 async def cache_image_from_bytes_async(data: bytes, ext: str = ".jpg") -> str:
@@ -1748,13 +1765,14 @@ OUTBOUND_FINAL = "final"
 SEND_SHED_BY_BUDGET = "daily_budget_shed"
 OUTBOUND_NOTICE = "notice"
 OUTBOUND_PROGRESS = "progress"
+OUTBOUND_TOOL_PROGRESS = "tool_progress"
 _OUTBOUND_CLASS: "_contextvars.ContextVar[Optional[str]]" = _contextvars.ContextVar(
     "gateway_outbound_class", default=None)
 
 
 @contextlib.contextmanager
 def outbound_class(kind: str):
-    """Label sends made inside this block as ``notice`` or ``progress``."""
+    """Label sends and edits as notices, tool progress, or expendable cosmetic progress."""
     token = _OUTBOUND_CLASS.set(kind)
     try:
         yield
@@ -4524,7 +4542,8 @@ class BasePlatformAdapter(ABC):
                                           event.source.chat_id, thread_id=event.source.thread_id) is True:
                 notice = await intercept(runner, event)
                 if notice is not None:
-                    await self.send(str(event.source.chat_id), notice, metadata=_thread_metadata_for_event(event))
+                    if notice:
+                        await self.send(str(event.source.chat_id), notice, metadata=_thread_metadata_for_event(event))
                     event._gateway_accepted = True
                     from gateway.telegram_retire import advance
                     await advance(runner, event.source)
@@ -5697,15 +5716,17 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def truncate_message(content: str, max_length: int = 4096,
-                         len_fn: Optional[Callable[[str], int]] = None) -> list[str]:
+                         len_fn: Optional[Callable[[str], int]] = None, *,
+                         indicator_overhead: int = 0) -> list[str]:
         """Split a long message into chunks preserving code blocks: a split inside a fence closes it
         at the chunk end and reopens it (same language tag) in the next; multi-chunk output gets
-        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram)."""
+        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram).
+        ``indicator_overhead`` reserves additional length units for caller-side suffix encoding."""
         _len = len_fn or len
         if _len(content) <= max_length:
             return [content]
         # Every split consumes a source codepoint, so len(content) bounds both indicator numbers.
-        INDICATOR_RESERVE = _len(fr" \({len(content)}/{len(content)}\)" + "\n")
+        INDICATOR_RESERVE = _len(f" ({len(content)}/{len(content)})") + indicator_overhead
         FENCE_CLOSE = "\n```"
         chunks: list[str] = []
         remaining = content

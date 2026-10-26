@@ -3,8 +3,9 @@
 Every event frame through :func:`server.write_json` (hence ``_emit``) gets a per-session monotonic
 ``seq`` and lands in a small ring per session; a reconnecting client calls ``session.events.since``
 with its last seen seq and gets everything newer. Invariants: stdio TUI unaffected (``seq`` only on
-event frames; Ink ignores unknown keys); one lock guards counters + buffers, and write_json already
-serializes per-transport writes so stamping cannot reorder frames; memory bound =
+event frames; Ink ignores unknown keys); one lock guards counters + buffers. The session
+mailbox holds its publication lock through stamping, frame freeze and admission, so
+live delivery and replay share the same sequence order. Memory bound =
 _REPLAY_BUFFER_MAX events AND _REPLAY_BUFFER_BYTES_MAX frozen UTF-8 payload bytes per session,
 _REPLAY_PROCESS_BYTES_MAX frozen UTF-8 payload bytes across at most _REPLAY_SESSIONS_MAX sessions,
 oldest evicted FIFO (their seq/truncation counters are retained so a revisited session stays
@@ -75,9 +76,10 @@ def _stamp_event(obj: dict) -> None:
     if not sid:
         # Session-less global events (skin.changed etc.) are re-fetchable via their own RPCs.
         return
-    # Freeze OUTSIDE the lock (same rule as transport.write) so one large payload cannot stall
-    # other threads' frames. The server-owned seq is restored when replaying, so the snapshot can
-    # be serialized before sequence assignment without retaining the mutable params dict.
+    # Freeze outside the process-wide replay lock so a large payload cannot stall
+    # other sessions. The caller keeps its own mailbox lock through stamping and
+    # admission. The server-owned seq is restored when replaying, so the snapshot
+    # can be serialized before assignment without retaining the mutable params dict.
     payload = _freeze_params(params)
     size = len(payload)
     with _replay_lock:

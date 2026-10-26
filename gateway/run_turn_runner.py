@@ -29,6 +29,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
+from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -328,6 +329,7 @@ class TurnRunner:
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
         stream bubble when the consumer accepts tool progress, else the progress queue."""
+        msg = _ToolProgressLine(msg)
         ctx = self._ctx
         sc = self._stream_consumer()
         native = sc is not None and getattr(sc, "accepts_tool_progress", False)
@@ -567,12 +569,12 @@ class TurnRunner:
         _progress_len_fn: Any
         _PROGRESS_TEXT_LIMIT: int
         _edit_accepts_metadata: bool
-        # A permanent edit failure already moved progress to a fresh bubble that has not yet been
-        # edited successfully. A second failure in a row means edits are unusable, not one dead bubble.
+        # A second failure before the fresh bubble edits successfully means edits are unusable.
         reanchored: bool = False
-        # Monotonic deadline set by a flood refusal. Until it passes, new lines are only buffered:
-        # no edit, split, or send, so a refused bubble is not retried once per incoming tool line.
+        # Buffer until the monotonic flood deadline, without editing, splitting or sending.
         defer_until: float = 0.0
+        # Accepted includes durable outbox deferral without a message id. Bubble resets keep this.
+        tool_progress_sent: bool = False
 
     # Default minimum seconds between progress edits. An adapter may raise it with
     # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
@@ -619,11 +621,14 @@ class TurnRunner:
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
             kwargs["metadata"] = ctx._progress_metadata
-        return await st.adapter.edit_message(**kwargs)
+        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
+        with outbound_class(OUTBOUND_PROGRESS):
+            return await st.adapter.edit_message(**kwargs)
 
     @staticmethod
     def _progress_text(lines: list) -> str:
-        return "\n".join(str(line) for line in lines)
+        text = "\n".join(str(line) for line in lines)
+        return _ToolProgressLine(text) if any(isinstance(line, _ToolProgressLine) for line in lines) else text
 
     def _split_progress_groups(self, st, lines: list) -> list[list]:
         """Partition progress lines into platform-sized editable bubbles."""
@@ -638,12 +643,7 @@ class TurnRunner:
         return groups + ([current] if current else [])
 
     async def _send_progress_text(self, st, text: str):
-        ctx = self._ctx
-        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
-        with outbound_class(OUTBOUND_PROGRESS):
-            result = await st.adapter.send(
-                chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-            )
+        result = await send_progress_text(st, self._ctx, text)
         self._track_progress_result(result)
         return result
 
@@ -735,7 +735,7 @@ class TurnRunner:
             _, base_msg, count = raw
             if not st.progress_lines:
                 return base_msg
-            st.progress_lines[-1] = f"{base_msg} (×{count + 1})"
+            st.progress_lines[-1] = type(base_msg)(f"{base_msg} (×{count + 1})")
             return st.progress_lines[-1]
         st.progress_lines.append(raw)
         return raw
@@ -789,8 +789,7 @@ class TurnRunner:
             if self._abandon_progress_bubble(st):
                 # The fresh bubble starts at the newest line; the dead one keeps what it shows.
                 st.progress_lines = st.progress_lines[-1:]
-        # First tool: send all accumulated text as a new message; editing unsupported: just this line.
-        result = await self._send_progress_text(st, "\n".join(st.progress_lines) if st.can_edit else msg)
+        result = await self._send_progress_text(st, self._progress_text(st.progress_lines) if st.can_edit else msg)
         if result.success and result.message_id:
             st.progress_msg_id = result.message_id
         return True
@@ -1178,15 +1177,6 @@ class TurnRunner:
                 count = row.get("message_count", 0)
         return count
 
-    def _pop_cached_agent_for_eviction(self):
-        """Evict under the lock but DEFER release (release_clients can block on memory-provider /
-        socket teardown while the idle sweeper waits on this lock). The turn rebuilds a fresh agent, so
-        the caller does a SOFT release that keeps sandbox / browser / bg processes."""
-        from gateway.run import _AGENT_PENDING_SENTINEL
-        evicted = self._runner._agent_cache.pop(self._ctx.session_key, None)
-        agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
-        return agent if agent and agent is not _AGENT_PENDING_SENTINEL else None
-
     def _lookup_cached_agent(self, sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count):
         ctx = self._ctx
         out = self._CachedAgentLookup()
@@ -1198,7 +1188,7 @@ class TurnRunner:
                 return out
             if cached[1] != sig:
                 # Overwriting the slot would orphan the old instance's memory workers.
-                out.evicted = self._pop_cached_agent_for_eviction()
+                out.evicted = self._runner._pop_cached_agent_for_eviction(ctx.session_key)
                 return out
             # cached[2] = message_count at cache time (stale when a second process appended rows);
             # cached[3] = the session_id the snapshot was taken for.
@@ -1225,6 +1215,7 @@ class TurnRunner:
                 )
             else:
                 out.agent = cached[0]
+                self._ctx.bind_agent_lifetime(out.agent)
                 # Refresh LRU order so cap enforcement evicts truly-oldest entries.
                 if hasattr(cache, "move_to_end"):
                     with suppress(KeyError):
@@ -1235,7 +1226,7 @@ class TurnRunner:
                 logger.debug("Reusing cached agent for session %s", ctx.session_key)
                 out.reused = True
                 return out
-            out.evicted = self._pop_cached_agent_for_eviction()
+            out.evicted = self._runner._pop_cached_agent_for_eviction(ctx.session_key)
         return out
 
     def _release_evicted_agent(self, agent) -> None:
@@ -1311,6 +1302,7 @@ class TurnRunner:
             agent = self._build_fresh_agent(
                 turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr, skip_context_files,
             )
+            self._ctx.bind_agent_lifetime(agent)
             if cache_lock and cache is not None:
                 with cache_lock:
                     # Record the snapshot's session_id with message_count so the cross-process guard

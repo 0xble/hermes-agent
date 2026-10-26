@@ -19,6 +19,18 @@ Shedding follows the message count against ``soft_ceiling`` (``PlatformConfig.ex
 - At the ceiling, non-final notices are also shed.
 - Final replies are never shed.
 
+Messages alone did not bound the day. The 2026-10-24 bans (2967s at 02:17 PDT, then 36261s at
+17:03 PDT) came after 26174 and 19875 calls while message counts sat at 3024 and 2407, below
+ban-free days with 3112 and 4157. Edits and typing created no messages, so background producers spent
+~9k calls overnight before the message rule engaged, and typed turns were never metered at all
+(10116 of the 19875). ``call_soft_ceiling`` (``daily_call_soft_ceiling``) bounds every metered call:
+- Background cosmetic traffic is shed at ``BACKGROUND_CALL_FRACTION`` of it.
+- At the ceiling, typed turns shed typing, interim edits and drafts, and background notices
+  are shed. The initial tool-progress bubble, typed notices and every final still go out.
+- For ``STRICT_WINDOW_SECS`` after a penalty of ``STRICT_PENALTY_SECS`` or more, the call ceiling
+  is scaled by ``STRICT_FACTOR``: the 36261s ban arrived at fewer calls than the ban before it,
+  15 hours later, so a recent ban lowers the safe volume.
+
 Cleanup deletes are never shed: they create no message, so shedding them saves nothing against the
 daily cap and only strands the bubbles they would remove. The per-minute budget still meters them.
 """
@@ -40,6 +52,14 @@ logger = logging.getLogger(__name__)
 DAY_SECS = 86400.0
 DEFAULT_SOFT_CEILING = 1500
 COSMETIC_FRACTION = 0.7
+# Lowest long-ban window measured was 19875 calls (right after an earlier ban); unpenalized long
+# bans came at 24296 and 26174. 12000 keeps a normal day near half of those.
+DEFAULT_CALL_SOFT_CEILING = 12000
+BACKGROUND_CALL_FRACTION = 0.5
+STRICT_PENALTY_SECS = 600.0
+STRICT_WINDOW_SECS = 86400.0
+STRICT_FACTOR = 0.5
+TRIGGER_UNTAGGED = "untagged"  # chat_budget.TRIGGER_UNTAGGED; that module imports this one
 LOG_INTERVAL_SECS = 3600.0
 FLUSH_INTERVAL_SECS = 60.0
 # A server penalty this long is a window reset, not a burst penalty, so it re-anchors the window.
@@ -50,7 +70,7 @@ PRESSURE_COSMETIC = 1
 PRESSURE_NOTICES = 2
 
 from gateway.platforms.base import (  # noqa: E402
-    OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS, current_outbound_class, outbound_class)
+    OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS, OUTBOUND_TOOL_PROGRESS, current_outbound_class, outbound_class)
 
 # Endpoints that create a message in the chat. A media group creates one message per item.
 _MESSAGE_ENDPOINTS = frozenset({
@@ -89,13 +109,16 @@ class DailyQuota:
     """
 
     def __init__(self, *, soft_ceiling: Optional[int] = DEFAULT_SOFT_CEILING, profile_dir: Optional[Path] = None,
-                 wall: Callable[[], float] = time.time, flush_interval: float = FLUSH_INTERVAL_SECS):
+                 wall: Callable[[], float] = time.time, flush_interval: float = FLUSH_INTERVAL_SECS,
+                 call_soft_ceiling: Optional[int] = DEFAULT_CALL_SOFT_CEILING):
         self.soft_ceiling = soft_ceiling
+        self.call_soft_ceiling = call_soft_ceiling
         self._profile_dir = Path(profile_dir) if profile_dir is not None else None
         self._wall = wall
         self._flush_interval = flush_interval
         self._windows: Dict[str, _Window] = {}
         self._anchors: Dict[str, float] = {}
+        self._penalized_at: Dict[str, float] = {}
         self._loaded: set[str] = set()
         self._last_flush = wall()
         self._last_log = wall()
@@ -149,20 +172,42 @@ class DailyQuota:
             return PRESSURE_COSMETIC
         return PRESSURE_NONE
 
+    def call_ceiling(self, chat_key: str) -> Optional[float]:
+        """Today's call budget, scaled down while a recent long penalty is in force. None = off."""
+        if not self.call_soft_ceiling or self.call_soft_ceiling <= 0:
+            return None
+        self._load(chat_key)
+        penalized_at = self._penalized_at.get(chat_key)
+        if penalized_at is not None and self._wall() - penalized_at < STRICT_WINDOW_SECS:
+            return self.call_soft_ceiling * STRICT_FACTOR
+        return float(self.call_soft_ceiling)
+
+    def call_pressure(self, chat_key: str) -> float:
+        """Fraction of today's call budget spent (0 when the budget is off)."""
+        ceiling = self.call_ceiling(chat_key)
+        if ceiling is None:
+            return 0.0
+        return sum(self._window(chat_key).calls.values()) / ceiling
+
     def sheds(self, chat_key: str, kind: Optional[str], trigger: Optional[str] = None) -> bool:
         """Whether a call of this outbound class must be shed now. Finals (``None``) never are.
 
-        Normal typed turns keep their progress and notice UX. Pressure shedding applies to autonomous
-        background producers, which caused the recurrence, while final replies remain unshed everywhere.
+        Typed turns keep the initial tool bubble and notices. Their typing, draft and interim text
+        traffic is shed when the day's call budget is spent. Background producers shed cosmetics at
+        half the call budget or at the message rule, and notices at the full budget.
         """
-        if trigger == "typed":
-            return False
         if kind is None or kind == OUTBOUND_FINAL:
             return False
+        # Untagged traffic (busy acks, button taps, restart and recovery notes, cron delivery) is a
+        # few hundred calls a day and mostly answers the user, so only the message rule meters it.
+        calls = 0.0 if trigger == TRIGGER_UNTAGGED else self.call_pressure(chat_key)
+        if trigger == "typed":
+            return kind not in (OUTBOUND_NOTICE, OUTBOUND_TOOL_PROGRESS) and calls >= 1.0
         pressure = self.pressure(chat_key)
         if kind == OUTBOUND_NOTICE:
-            return pressure >= PRESSURE_NOTICES
-        return pressure >= PRESSURE_COSMETIC  # progress, typing, interim edits, drafts
+            return pressure >= PRESSURE_NOTICES or calls >= 1.0
+        # progress, typing, interim edits, drafts
+        return pressure >= PRESSURE_COSMETIC or calls >= BACKGROUND_CALL_FRACTION
 
     def note_retry_after(self, chat_key: str, wait: float) -> None:
         """A long server penalty ends at the window reset: anchor there and record the evidence."""
@@ -171,6 +216,11 @@ class DailyQuota:
             "Telegram chat %s refused for %.0fs after %d messages and %d calls in the window since %s %s",
             chat_key, wait, window.messages, sum(window.calls.values()),
             time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(window.start)), _top(window.calls))
+        if wait >= STRICT_PENALTY_SECS:
+            # The strict day starts when sending resumes; time inside the ban spends nothing.
+            # A shorter penalty landing inside a longer one must not pull that end earlier.
+            self._penalized_at[chat_key] = max(self._wall() + wait, self._penalized_at.get(chat_key, 0.0))
+            self._persist_penalty(chat_key)
         if wait < RESET_PENALTY_SECS:
             return
         reset = self._wall() + wait
@@ -185,9 +235,12 @@ class DailyQuota:
 
     def log_summary(self) -> None:
         for key, window in list(self._windows.items()):
-            logger.info("Telegram chat %s daily volume since %s: %d messages (soft ceiling %s), %d calls %s",
+            ceiling = self.call_ceiling(key)
+            logger.info("Telegram chat %s daily volume since %s: %d messages (soft ceiling %s), %d calls "
+                        "(call ceiling %s) %s",
                         key, time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(window.start)), window.messages,
-                        self.soft_ceiling, sum(window.calls.values()), _top(window.calls))
+                        self.soft_ceiling, sum(window.calls.values()),
+                        "off" if ceiling is None else f"{ceiling:.0f}", _top(window.calls))
 
     # --- persistence ------------------------------------------------------------------------
     def _db(self):
@@ -196,6 +249,7 @@ class DailyQuota:
         conn.execute("CREATE TABLE IF NOT EXISTS daily_volume (chat_id TEXT NOT NULL, window_start REAL NOT NULL, "
                      "endpoint TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (chat_id, window_start, endpoint))")
         conn.execute("CREATE TABLE IF NOT EXISTS daily_anchor (chat_id TEXT PRIMARY KEY, anchor REAL NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS daily_penalty (chat_id TEXT PRIMARY KEY, at REAL NOT NULL)")
         return closing(conn)
 
     def _load(self, key: str) -> None:
@@ -209,6 +263,9 @@ class DailyQuota:
                 row = conn.execute("SELECT anchor FROM daily_anchor WHERE chat_id=?", (key,)).fetchone()
                 if row is not None:
                     self._anchors[key] = float(row[0])
+                row = conn.execute("SELECT at FROM daily_penalty WHERE chat_id=?", (key,)).fetchone()
+                if row is not None:
+                    self._penalized_at[key] = max(float(row[0]), self._penalized_at.get(key, 0.0))
                 start = self._window_start(key, self._wall())
                 rows = conn.execute("SELECT endpoint, count FROM daily_volume WHERE chat_id=? AND window_start=?",
                                     (key, start)).fetchall()
@@ -252,11 +309,14 @@ class DailyQuota:
                 # Read the shared totals back: another lane (the standalone sender) spends the same day.
                 totals = conn.execute("SELECT endpoint, count FROM daily_volume WHERE chat_id=? AND window_start=?",
                                       (key, window.start)).fetchall()
+                penalty = conn.execute("SELECT at FROM daily_penalty WHERE chat_id=?", (key,)).fetchone()
         except (OSError, sqlite3.Error):
             logger.warning("Could not persist Telegram daily volume for chat %s", key, exc_info=True)
             return
         window.dirty.clear()
         window.dirty_messages = 0
+        if penalty is not None:  # the standalone lane records penalties too
+            self._penalized_at[key] = max(float(penalty[0]), self._penalized_at.get(key, 0.0))
         for endpoint, count in totals:
             if endpoint == "__messages__":
                 window.messages = int(count)
@@ -279,6 +339,45 @@ class DailyQuota:
         except (OSError, sqlite3.Error):
             logger.warning("Could not persist Telegram daily window anchor for chat %s", key, exc_info=True)
 
+    def _persist_penalty(self, key: str) -> None:
+        if self._profile_dir is None:
+            return
+        try:
+            with self._db() as conn:
+                conn.execute("INSERT INTO daily_penalty VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET at=MAX(at, excluded.at)",
+                             (key, self._penalized_at[key]))
+                conn.commit()
+        except (OSError, sqlite3.Error):
+            logger.warning("Could not persist Telegram long penalty for chat %s", key, exc_info=True)
+
+
+def send_outbound_class(explicit: Optional[str], metadata: Any, trigger: Optional[str]) -> Optional[str]:
+    """Outbound class for a plain send: the explicit label, else progress for an ``_interim_send``.
+    A typed turn's unlabelled interim sends include /login codes, approval fallbacks and stuck
+    warnings, so they stay unclassed (never shed); only labelled progress sheds for typed turns."""
+    if explicit:
+        return explicit
+    if isinstance(metadata, dict) and metadata.get("_interim_send") and trigger != "typed":
+        return OUTBOUND_PROGRESS
+    return None
+
+
+def _extra_int(extra: Any, key: str, default: int, label: str) -> int:
+    raw = extra.get(key, default) if isinstance(extra, dict) else None
+    try:
+        return int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        logger.warning("[%s] Invalid %s %r; using %d", label, key, raw, default)
+        return default
+
+
+def quota_from_platform_extra(extra: Any, *, profile_dir: Optional[Path], label: str) -> DailyQuota:
+    """The adapter's ledger: ``daily_message_soft_ceiling`` and ``daily_call_soft_ceiling`` in the
+    platform extra set the budgets (0 disables that budget's shedding, counting continues)."""
+    return DailyQuota(
+        soft_ceiling=_extra_int(extra, "daily_message_soft_ceiling", DEFAULT_SOFT_CEILING, label),
+        call_soft_ceiling=_extra_int(extra, "daily_call_soft_ceiling", DEFAULT_CALL_SOFT_CEILING, label),
+        profile_dir=profile_dir)
 
 def _top(calls: Dict[str, int], n: int = 6) -> str:
     items = sorted(calls.items(), key=lambda kv: -kv[1])[:n]

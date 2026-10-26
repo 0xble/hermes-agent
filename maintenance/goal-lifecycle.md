@@ -2,6 +2,9 @@
 
 ## Required behavior
 
+The opt-in [autonomous lifecycle](goal-autonomy.md) overrides the default judge,
+approval and automatic pause policy described below.
+
 The native judge receives the complete goal, completion contract, and additive
 subgoals. Only the assistant-response preview is bounded. Admitted real user
 input revives a judge-blocked goal before model work without resetting its budget.
