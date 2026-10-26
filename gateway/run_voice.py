@@ -15,6 +15,7 @@ import time
 import weakref
 from contextlib import nullcontext, suppress
 from difflib import SequenceMatcher
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional
 
@@ -56,9 +57,16 @@ class GatewayVoiceMixin:
             adapter._voice_input_callback = functools.partial(
                 self._handle_voice_channel_input, adapter=adapter)
 
+    def _voice_mode_path(self) -> Path:
+        override = self.__dict__.get("_VOICE_MODE_PATH")
+        if override is not None:
+            return Path(override)
+        from hermes_constants import get_process_hermes_home
+        return get_process_hermes_home() / "gateway_voice_mode.json"
+
     def _load_voice_modes(self) -> dict[str, str]:
         try:
-            data = json.loads(self._VOICE_MODE_PATH.read_text(encoding="utf-8-sig"))
+            data = json.loads(self._voice_mode_path().read_text(encoding="utf-8-sig"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
         if not isinstance(data, dict):
@@ -72,9 +80,10 @@ class GatewayVoiceMixin:
 
     def _save_voice_modes(self) -> None:
         try:
-            self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            path = self._voice_mode_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(self._voice_mode, indent=2)
-            self._VOICE_MODE_PATH.write_text(payload, encoding="utf-8")
+            path.write_text(payload, encoding="utf-8")
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
 
@@ -208,6 +217,19 @@ class GatewayVoiceMixin:
             adapter._voice_input_callback = None
         return t("gateway.voice.channel_left")
 
+    def _voice_ack_guild_for(self, source: SessionSource) -> Optional[int]:
+        """Guild whose voice call is bound to *source*'s text channel on the bot that ANSWERS it.
+        Under multiplexing a secondary profile's call lives on its own adapter, never the default's
+        (#139345): reading ``self.adapters`` would miss its call or borrow the primary bot's."""
+        if source.platform != Platform.DISCORD:
+            return None
+        adapter = self._delivery_adapter_for(source)
+        bound = getattr(adapter, "_voice_text_channels", None)
+        if not (isinstance(bound, dict) and hasattr(adapter, "voice_mixer_active")):
+            return None
+        return next((gid for gid, channel in bound.items()
+                     if str(channel) == str(source.chat_id) and adapter.voice_mixer_active(gid)), None)
+
     def _handle_voice_timeout_cleanup(self, chat_id: str, *, adapter=None) -> None:
         """Adapter callback on voice-channel timeout: clear runner-side voice_mode state.
         ``adapter`` (bound at join) is that profile's bot, not always ``self.adapters[DISCORD]``."""
@@ -305,7 +327,8 @@ class GatewayVoiceMixin:
         from gateway.session_identity import clear_identity
         clear_identity(source)
         if self._canonicalize(source, transport_profile=getattr(adapter, "_owner_profile", None)) is None:
-            logger.warning("Dropping voice input: its profile route targets an unserved profile")
+            from gateway.parked_route_refusal import drop_rejected_route
+            drop_rejected_route(adapter, source)  # a parked target is refused in the voice text channel
             return
         # Validate the session owner against the current allowlist before auto-resuming. A session created
         # before TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or before the owner was removed from
@@ -368,6 +391,10 @@ class GatewayVoiceMixin:
         # attachment." — the peer sees the failure instead of the text reply the
         # agent already produced (#90103). Keep /voice scoped to human platforms.
         if getattr(event.source.platform, "value", None) == "a2a":
+            return False
+        # A local session's speech plays in its own client: LocalSessionAdapter has no audio delivery,
+        # so an owner-side synthesis would be a paid provider call nobody hears.
+        if event.source.platform == Platform.LOCAL:
             return False
         chat_id = event.source.chat_id
         voice_mode = self._voice_mode.get(self._voice_key_for_source(event.source))

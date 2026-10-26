@@ -23,6 +23,15 @@ class _SessionStore:
         self.save_calls = 0
         self.peer_records = []
 
+    def get_model_role(self, _session_key):
+        return None
+
+    def get_model_override(self, _session_key):
+        return None
+
+    def get_model_override_scope(self, _session_key):
+        return "session"
+
     def _save(self):
         self.save_calls += 1
 

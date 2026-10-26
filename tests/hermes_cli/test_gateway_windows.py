@@ -842,11 +842,20 @@ def test_hermes_owns_windows_service_requires_name_or_binary_under_a_hermes_root
     assert owns("gw", r"C:\Users\kaize\AppData\Local\hermes\gateway-service\Hermes_Gateway.cmd", roots)
 
 
-def test_wizard_install_service_asks_once_and_never_starts_after_windows_install(monkeypatch):
-    """The wizard asks start-now/start-on-login once, forwards both answers, and returns
+def test_wizard_install_service_asks_once_and_never_starts_after_windows_install(tmp_path, monkeypatch):
+    """The wizard asks start-now/service-consent once, forwards both answers, and returns
     without a second start: the Windows installer owns start and the elevated child
     starts itself, so a parent-side start would re-ask the install questions and re-offer
     UAC while the child is still waiting on consent (#116550)."""
+    import io
+    import sys
+    from hermes_cli import config as config_api
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_api.save_config({"gateway": {"service_install_choice": None}})
+    stream = io.StringIO()
+    stream.isatty = lambda: True
+    monkeypatch.setattr(sys, "stdin", stream)
     answers = iter([True, True])
     monkeypatch.setattr(gateway, "prompt_yes_no", lambda *a, **k: next(answers))
     monkeypatch.setattr(gateway, "is_wsl", lambda: False)
@@ -855,8 +864,18 @@ def test_wizard_install_service_asks_once_and_never_starts_after_windows_install
         install=lambda **kw: installs.append(kw) or True,
     ))
     monkeypatch.setattr(gateway, "_setup_service_action", lambda *a, **k: starts.append((a, k)))
+    monkeypatch.setattr(gateway, "_is_service_installed", lambda: bool(installs))
 
     gateway._wizard_install_service("windows")
 
     assert installs == [{"force": False, "start_now": True, "start_on_login": True}]
     assert starts == []
+    assert config_api.load_config()["gateway"]["service_install_choice"] == "install"
+
+
+def test_decode_schtasks_output_honours_a_utf16_bom():
+    """A genuine UTF-16 write (BOM) decodes as UTF-16, never as a code page; a malformed one falls
+    back like any other bytes instead of raising past callers that catch only timeout/OS errors."""
+    text = "Herm\u00e9s"
+    assert gateway_windows._decode_schtasks_output(text.encode("utf-16")) == text
+    assert gateway_windows._decode_schtasks_output(b"\xff\xfe<\x00?")

@@ -595,9 +595,11 @@ def test_preset_effort_agrees_across_cli_tui_cron_fallback_and_switch_back(tmp_p
     assert agent.reasoning_config == HIGH
 
 
-@pytest.mark.parametrize("model", ["@coding", {"default": "@coding"}, {"model_preset": "coding"}])
+@pytest.mark.parametrize("model", [
+    "@coding", {"default": "@coding"}, {"model": "@coding"}, {"model_preset": "coding"},
+])
 def test_cli_and_tui_start_on_the_preset_route(tmp_path, monkeypatch, model):
-    """Both authored forms resolve to the preset's model and provider at startup."""
+    """All authored forms resolve to the preset's model and provider at startup."""
     from types import SimpleNamespace
 
     from hermes_cli.cli_config_load import load_cli_config

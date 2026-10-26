@@ -35,10 +35,11 @@ from agent.fast_mode import STATIC_TIERS
 from agent.replay_cleanup import canonicalize_replay_history
 from agent.reasoning_effort import clamp_effort, route_supported_efforts
 from agent.voice_turn_route import session_runtime_view
-from agent.compaction_display import project_compaction_message_for_display  # noqa: F401
-from agent.skill_commands import describe_skill_invocation  # noqa: F401
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX  # noqa: F401
+from agent.compaction_display import project_compaction_message_for_display
+from agent.skill_commands import describe_skill_invocation
+from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe, pending_moa
+from hermes_state import _BARE_BILLING_PROVIDERS
 from tui_gateway.checkpoints import (_load_checkpoints_enabled, _resolve_checkpoint_hash,
                                      resolve_checkpoints_enabled as _resolve_checkpoints_enabled)
 from tui_gateway._env import env_float, env_int
@@ -52,6 +53,20 @@ from tui_gateway.transport import (FanoutTransport, StdioTransport, Transport, b
                                    current_transport, reset_transport)
 
 logger = logging.getLogger(__name__)
+
+
+def _bootstrap_served_profile_store(db_path: Path) -> None:
+    """A served profile whose first RPC is a read (Bot Chat registry lookup on a fresh bot) has no
+    ``state.db`` yet. Browsing never creates a store, but THIS process is the profile's session
+    owner (``_open_profile_session_db`` acquires the writer for every agent build), so it seeds the
+    store it is about to own instead of answering ``storage_unavailable`` until a turn happens."""
+    try:
+        if db_path.stat().st_size > 0:
+            return
+    except FileNotFoundError:
+        pass
+    from hermes_state_registry import acquire, release_or_close
+    release_or_close(acquire(db_path))
 
 _hermes_home = _HERMES_HOME_AT_IMPORT = get_hermes_home()
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env")
@@ -506,6 +521,7 @@ def _profile_db(params: dict | None = None, *, writer: bool = False):
                 db = acquire(Path(profile_home) / "state.db")
             else:
                 from hermes_cli.web_server_sessions import _open_session_db_at_path
+                _bootstrap_served_profile_store(Path(profile_home) / "state.db")
                 db = _open_session_db_at_path(Path(profile_home) / "state.db", read_only=True)
             owns = True
         except Exception as exc:
@@ -616,8 +632,10 @@ def _profile_scoped(handler):
             home = _profile_home(p.get("profile"))
             profile_home = str(home) if home else None
         else:
+            # Sessionless: the authority ticket's profile (WS legacy fallback), else the launch one.
+            from tui_gateway.ws_legacy_fallback import connection_profile_home
             session = _sessions.get(str(p.get("session_id") or ""))
-            profile_home = session.get("profile_home") if isinstance(session, dict) else None
+            profile_home = session.get("profile_home") if isinstance(session, dict) else connection_profile_home()
         with _session_profile_runtime_scope({"profile_home": profile_home or None}):
             return handler(rid, params)
     return wrapper
@@ -735,13 +753,13 @@ def unregister_live_transport(transport: Transport | None) -> None:
     _server_requests.forget(transport)
 
 
-def _broadcast_global_event(event: str, payload: dict | None = None) -> None:
+def _broadcast_global_event(event: str, payload: dict | None = None, *, skip=frozenset()) -> None:
     """Fan a session-less, surface-global event (``skin.changed``) to every connected client — background
     emitters bottom out at stdio in ``write_json``'s ladder. No registered transports → ``_emit`` when stdout is the
     stdio TUI's JSON-RPC channel, else dropped (nobody is listening; stdout is a log sink)."""
     with _live_transports_lock:
-        targets = list(_live_transports)
-    if not targets:
+        targets = [transport for transport in _live_transports if transport not in skip]
+    if not targets and not skip:
         if _stdio_is_rpc_channel:
             return _emit(event, "", payload)
         logger.debug("global-event broadcast dropped (no connected client) type=%s", event)
@@ -1360,7 +1378,12 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             # App-global backends multiplex profiles: prefer the live session's own home.
             profile = profile_name_for_home(sess.get("profile_home")) or profile
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
-            identity = getattr(sess.get("transport"), "auth_identity", None)
+            transport = sess.get("transport")
+            peers = transport.transports() if isinstance(transport, FanoutTransport) else [transport]
+            # Sessions publish through a fan-out mailbox; the authenticated identity lives on a peer.
+            identity = next((getattr(peer, "auth_identity", None) for peer in peers
+                             if _methods_browser_control._is_authenticated_identity(
+                                 getattr(peer, "auth_identity", None))), None)
             if _methods_browser_control._is_authenticated_identity(identity):
                 browser_control_principal = _methods_browser_control._principal_digest(identity)
                 browser_control_transport_family = _methods_browser_control._CLOUD_TRANSPORT_FAMILY
@@ -1539,43 +1562,6 @@ def _env_model_seed() -> str:
     return (os.environ.get("HERMES_MODEL", "") or os.environ.get("HERMES_INFERENCE_MODEL", "")).strip()
 
 
-def _resolve_model() -> str:
-    if env := _env_model_seed():
-        return env
-    cfg = _load_cfg()
-    route = _default_route(cfg)
-    if route is not None and route.model:
-        return route.model
-    m = cfg.get("model", "")
-    if isinstance(m, dict):
-        return str(m.get("default", "") or "").strip()
-    if isinstance(m, str) and m:
-        return m.strip()
-    # No env seed / config preference: the cost-safe silent default (cache-only read), never an unpicked flagship.
-    with contextlib.suppress(Exception):
-        from hermes_cli.models import get_preferred_silent_default_model
-        return get_preferred_silent_default_model()
-    return "z-ai/glm-5.2"
-
-
-def _default_route(cfg: dict):
-    """Concrete default route, or None when the config has no preset to resolve.
-
-    A literal ``@cf/...`` model id is not a preset reference and stays as written.
-    An unknown preset fails open here: startup still has the raw config to read.
-    """
-    with contextlib.suppress(Exception):
-        from hermes_cli.model_preset_runtime import resolve_default_route
-        from hermes_cli.model_presets import ModelPresetError
-        try:
-            route = resolve_default_route(cfg)
-        except ModelPresetError:
-            return None
-        if route.model:
-            return route
-    return None
-
-
 def _resolve_session_platform() -> str:
     """``HERMES_DESKTOP=1`` without ``HERMES_DESKTOP_TERMINAL`` → "desktop" (chat panel; the agent then
     suggests TUI-only slash commands), else "tui" (embedded terminal pane or standalone ``hermes --tui``)."""
@@ -1591,25 +1577,6 @@ def _resolve_session_source(explicit: str | None) -> str:
 
 def _resolve_agent_platform(source: str | None) -> str:
     return _resolve_session_source(source)
-
-
-def _config_model_target() -> tuple[str, str]:
-    """(model, provider) selected by config.yaml — and ONLY config: the HERMES_MODEL launch seed fed into
-    the per-turn sync would be replayed as a /model switch and persisted globally, or pin the session so
-    dashboard/CLI model changes never reach an open chat. Empty model = "no preference" → no-op sync.
-
-    ``@name`` and ``{model_preset: name}`` resolve to the preset's model and provider.
-    """
-    cfg = _load_cfg()
-    route = _default_route(cfg)
-    if route is not None and route.name and route.model:
-        provider = route.provider
-        return route.model, "" if provider.lower() == "auto" else provider
-    cfg_model = cfg.get("model")
-    if isinstance(cfg_model, dict):
-        provider = str(cfg_model.get("provider") or "").strip()
-        return str(cfg_model.get("default", "") or "").strip(), "" if provider.lower() == "auto" else provider
-    return (cfg_model.strip() if isinstance(cfg_model, str) else ""), ""
 
 
 def _resolve_startup_runtime() -> tuple[str, str | None]:
@@ -1701,6 +1668,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # gateway last ran) before the TUI's top-level keys, then a routable ``billing_provider`` (#125942).
     from hermes_state import SessionDB
     route = SessionDB.session_gateway_runtime(row)
+    if not route.get("provider"):
+        route = {"provider": row.get("billing_provider"), "base_url": row.get("billing_base_url"),
+                 "api_mode": model_config.get("api_mode")}
     provider, base_url, api_mode = (str(route.get(k) or "").strip() for k in ("provider", "base_url", "api_mode"))
     service_tier = str(model_config.get("service_tier") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
@@ -1722,21 +1692,21 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             provider = healed
             base_url = ""  # the healed identity owns a registered endpoint; the snapshot URL must not override it
         else:
-            provider = ""
+            # The route is gone with its endpoint and wire: on the default provider they would send
+            # that provider's credentials to the stored URL.
+            provider = base_url = api_mode = ""
     if model:
         # Same dict-shaped override live /model switches use, so a DB-restored session keeps custom endpoint
         # metadata across resume and rebuilds (/new). Raw api_key is never persisted/restored.
         overrides["model_override"] = {
             "model": model, "provider": provider or None, "base_url": base_url or None, "api_mode": api_mode or None}
-    if provider:
+    if provider and provider.lower() not in _BARE_BILLING_PROVIDERS:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
     return overrides
-
-
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     """Merge the agent's CURRENT runtime identity onto the row's persisted ``model_config``. Falsy agent
     attributes DELETE the key rather than skip the write: resume reads provider/endpoint from this JSON
@@ -2248,6 +2218,10 @@ def _get_usage(agent) -> dict:
             for _key, _val in (("avg_latency_s", _total_lat / _n), ("avg_tps", _avg_vel)):
                 if _val is not None and _val == _val and 0 < _val < 1e6:  # guard NaN/negative/absurd provider timings
                     usage[_key] = round(float(_val), 1)
+    # Window plans only: the desktop status bar's allowance (the canonical feed carries the same one).
+    from gateway.session_usage import plan_gauge
+    if (gauge := plan_gauge(agent)) is not None:
+        usage["plan_gauge"] = gauge
     # Live count of background/async subagents (CLI status bar ⛓ parity, same async_delegation registry).
     with contextlib.suppress(Exception):
         from tools.async_delegation import active_count as _async_active_count
@@ -2757,9 +2731,10 @@ def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | Non
         if db is not None:
             row = db.get_session(key) if hasattr(db, "get_session") else None
             if row and _resumable_stored_cwd(row.get("cwd"), profile_home):
-                # An ssh session's stored cwd is its workspace: explicit, so the remote terminal uses it instead of
-                # the profile's ~. Other backends keep main's semantics (resolved outside the sessions lock: I/O).
-                remote = _cwd_is_remote(profile_home)
+                # An ssh or sandbox session's stored cwd is its workspace: explicit, so the remote terminal uses it
+                # instead of the backend default (an unpicked launch dir is never persisted for them). Host backends
+                # keep main's semantics (resolved outside the sessions lock: I/O).
+                remote = not _host_cwd_is_terminal_cwd(profile_home)
                 with _sessions_lock:
                     if sid in _sessions:
                         _sessions[sid]["cwd"] = row["cwd"]
@@ -3675,6 +3650,7 @@ from .mcp_rpc_helpers import summarize_server as _mcp_summarize_server
 # ── Split @method handler modules (see method_ctx.py): imported last so every global the handlers close
 # over exists; register() rebinds them onto this namespace.
 from . import (
+    session_registry as _session_registry, agent_factory as _agent_factory,
     methods_voice as _methods_voice, methods_browser as _methods_browser, methods_slash as _methods_slash,
     methods_complete_helpers as _methods_complete_helpers, session_auto_continue as _session_auto_continue,
     plugin_inject as _plugin_inject,
@@ -3699,7 +3675,10 @@ from . import (
     methods_onboarding as _methods_onboarding, methods_i18n as _methods_i18n, methods_machine as _methods_machine,
     methods_shared_metrics as _methods_shared_metrics, methods_plugin_catalog as _methods_plugin_catalog)
 
+_server_stored_session_runtime_overrides = _stored_session_runtime_overrides
+
 for _m in (
+    _session_registry, _agent_factory,
     _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
     _session_compression, _change_watcher, _tool_progress, _session_notifications,
     _prompt_attachments, _session_history, _agent_callbacks, _session_auto_continue, _plugin_inject, _rpc_dispatch,
@@ -3712,3 +3691,6 @@ for _m in (
     _methods_i18n, _methods_machine, _methods_shared_metrics, _methods_plugin_catalog):
     _m.register(sys.modules[__name__])
 del _m
+
+# Keep the server's persisted-route reader visible after module registration binds factory names.
+_stored_session_runtime_overrides = _server_stored_session_runtime_overrides

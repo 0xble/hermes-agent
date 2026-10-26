@@ -104,8 +104,10 @@ any DM sender, including bots and non-owners, independently of the env path.
 
 Role assignment is bound to a turn, not to its starting config snapshot. Busy
 topic edits and bulk conversions take effect next turn, even before the current
-turn's first API request. Gateway turn assembly captures assignment synchronously
-and supplies it to TurnRunner. Callback-only construction does not read routing
+turn's first API request. Durable role and concrete picks hydrate under their
+shared route lock before gateway turn assembly captures the assignment
+synchronously and supplies it to TurnRunner. Worker initialization and request
+callbacks use that same assignment. Callback-only construction does not read routing
 state. At each real request,
 the current assignment follows fresh model, provider and reasoning config from
 the owning profile through the existing preset loaders. An empty `@attended`

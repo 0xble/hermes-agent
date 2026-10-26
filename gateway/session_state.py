@@ -42,6 +42,9 @@ class TurnState:
     # token for their own generation, so a displaced turn's unwind frees only its own lease and
     # never a successor's (an evicted turn and its replacement may both hold one briefly).
     lease_tokens: dict[int, Any] = field(default_factory=dict)
+    # Agents taken out of the cache while this turn still ran them (a one-turn ``model_override``
+    # agent): ``_release_running_agent_state`` releases them once the slot clears.
+    retired_agents: list[Any] = field(default_factory=list)
 
     def clear(self) -> None:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
@@ -86,6 +89,8 @@ class ConversationState:
     # Wall-clock start of the most recent turn of any kind. A routine completion result arriving
     # within the batch window of it is held for fan-in rather than waking the session again.
     last_turn_started_at: float = 0.0
+    # One notice per compression-in-flight episode, reset when the lock is absent.
+    compression_deferred_notice_sent: bool = False
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name == "reasoning_override":

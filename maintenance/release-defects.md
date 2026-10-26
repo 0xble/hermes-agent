@@ -727,6 +727,241 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - When a release payload had shipped optional dependencies but PM had no facts or frozen feature inventory yet, the first on-demand extra sync selected only the requested extra and replaced the payload environment. Infer concrete shipped extras from the payload's site-packages before creating the first PM generation, while excluding umbrella aliases that share anchors with their member extras.
 - Guard: `tests/pm/test_environment_build.py` (`test_first_on_demand_extra_preserves_payload_extras`).
 
+## v0.22.5 merge integration
+
+- Recall's read-only open must translate SQLite open errors to the shared
+  database-unavailable result, including absent canonical storage, without
+  initializing it. Its lifecycle double patches the opener rather than replacing
+  the SessionDB type used by main's independent-reader scope. Main's running-agent
+  lifetime fixture supplies the successor's display config and keyword-only
+  fallback-policy argument, retaining every retirement assertion and timeout.
+  Guards: session-search, read-only search, search-isolation review and running-agent
+  eviction-memory suites. The proxy silence nodes require the declared aiohttp
+  environment and run in Linux alongside the existing scope checks.
+- Integrating main's affected-group display fold requires beginning the fold inside
+  each compaction transaction, before mutation, including the successor's extracted
+  on-connection entry point. Preserve carrier-by-UID identity and prune-history
+  slots in the off-lock plan, affected groups and full-fold oracle. Keep the
+  independent recall scope around both discovery and hydration, including managed
+  worker and cross-profile read-only handles. Guards: display-fold incremental,
+  one-step, summary-carrier, prune restart-safety and search-isolation suites.
+- The successor extracted session creation into `tui_gateway/session_registry.py`,
+  which replaced main #779's facade factories at registration time. Port its
+  creation-time publisher into both extracted factories, so even a single-peer,
+  stdio or compute-host session retains one ordered mailbox through membership
+  changes and graceful final-event draining. Keep atomic prepare/admission,
+  burst batching, bounded overflow resume notices and physical flush unchanged.
+  Guards: unchanged session-event-publication, multi-client fanout, fanout burst
+  batching and gateway session-events-overflow suites.
+- Immutable release retention probes the executable and cwd of real processes.
+  Its source and tests are unchanged from fork main `39358bac528d`, where the
+  same 3 retention tests fail on macOS when a live process uses a release under
+  the real Hermes home. The home I/O guard correctly rejects that metadata
+  resolution. Treat this as parent-inherited host contamination, not fanout or
+  extras-carry merge fallout. Keep the guard and tests intact and qualify the
+  release-retention suite in disposable Linux without live-home mounts.
+- The hosted-room and secondary-route scope suites import `aiohttp` at
+  collection. An isolated core/dev/test environment without a messaging or
+  slack extra cannot collect them. Use a disposable PM-built declared-extra
+  environment to exercise these contracts, not a production dependency install
+  or a test skip.
+
+- The classic gateway goal proxy reuses the completion-history renderer added by
+  autonomous goals. `/goal`, `/goal status` and `/goal show` remain local reads of
+  mirrored gateway state, with no judge call or state write. Without the binding,
+  status dispatch raised `AttributeError` before emitting any output while goal
+  continuations kept running. Regression coverage exercises all 3 read spellings
+  and verifies completion-refusal history, unchanged state and no gateway call.
+  The existing Linux/tmux goal-status expectation and timeout remain unchanged.
+  Linux Python 3.14.9 with the selected test environment and tmux required:
+  old proxy reproduces the live timeout and 3 new read-command failures, then
+  gateway automation, classic live chat, autonomy and goal dispatch pass 146 tests.
+  Upstream preflight: guidance at `930e5ed557ed` and related goal-status issues
+  preserve visible status reads. This is a fork #800 adapter omission, not a
+  routing or pacing change, so the existing proxy read path remains the owner.
+
+- The serve maintenance test waits for the completed consolidation-off summary,
+  not the early run-count checkpoint plus a fixed delay. Linux reproduction
+  delayed report writing after the checkpoint and observed the final summary in
+  the same isolated home. Pause, active-turn suppression and exactly-once count
+  assertions remain unchanged.
+- Canonical compression fixtures bind authority profile IDs to their isolated
+  database home instead of the relative placeholder `owned`. Real post-compaction
+  plugin discovery initializes that profile and previously seeded `owned/SOUL.md`
+  in the checkout. The live-memory-hook test now observes the actual background
+  hook's home while still running discovery, so this isolation defect fails at
+  its source without changing the CI modified-source guard.
+
+- Completion-batch retry narrowing removes the original primary event, not the
+  authority-only metadata copy. Already-admitted siblings are removed after their
+  lost-ACK settlement too, so successful batches do not falsely request a retry.
+  Guards: automation retry, completion admission and completion delivery suites,
+  78 passing tests on Linux Python 3.14.9.
+
+- Service identity fixtures use account-native home naming. Detached restart mocks only
+  the gateway launch, leaving process scans real. The vanished-file race probes preflight
+  directly before reopening because upstream serializes startup preflight and quarantine.
+
+- Post-turn goal/loop bookkeeping retains the owner's failed-result fence even for text-only
+  refusal returns. Soft eviction honors the memory manager's teardown claim during a reset's
+  pre-extraction flush and cleanup captures its transcript before eviction clears the agent.
+  The compression-lock fixture holds the lock until transport retry instead of exhausting
+  a call-count list after the upstream added another pre-model fence.
+
+- Compaction hook fixtures mark discovery complete before synchronous dispatch, matching
+  the upstream plugin observer contract. Cron runner delivery assertions follow
+  `cron/executions.py:750-763`, which intentionally projects terminal receipts into
+  `delivery_outcome` for detached owners as well as gateways. The tmux requirement follows the fork's Python/e2e shard
+  workflow and explicitly requires the TUI environment and verifies tmux before the shard.
+- Integration fixtures supply the actual memory warning sink and retired-agent turn state.
+  The 1Password service-account stub returns the exact revealed JSON item, preserving vault
+  identity and purpose-selected password validation. Drain assertions follow upstream background
+  delegation wording, including the worker PID, while retaining both fork timeout knobs.
+  Guards: synthetic prompt, vault backends, drain report and model reset suites (1,410 passed).
+
+- Local history preparation offloads receipt restoration and its guarded session-store lock.
+  The synchronous snapshot re-reads the receipt target without repeating restoration under the
+  viewer event lock, preserving live-row and deletion races. History, side-question and preview
+  RPCs likewise resolve their target off-loop. The loop-thread guard stays unchanged.
+  Guards: local recovery, compression resume, display-history race coverage, canonical history
+  and fresh CLI first-message suites (26 passed, 13 platform skips), including a guarded-loop
+  attach regression. Hosted qualification remains required.
+
+- Worker route commits acknowledge the owner-loop state handoff before agent construction
+  reads the decision and the expiry notice. Fire-and-forget activity receipts retain their
+  monotonic merge. Guards: 274 tests across model-pick expiry and attended-model suites.
+- The public replace seam now forwards to the extracted bootstrap implementation, restoring
+  the durable ownership-refusal stamp while retaining process-slot PID isolation. Its scoped-lock
+  release uses the canonical source module, not the removed status export.
+  Guard: the complete replace-ownership suite, including stamp durability and no-signal refusal.
+- Fork patch identity: `v0225-merge-integration`.
+- Integrating fork main through #818 keeps atomic fanout prepare/stamp/admission alongside
+  overflow resume notices and their physical-drain barrier. Routing replacement performs its
+  diff and retirement-fence check in SQLite and returns only rejected route keys, without
+  fetching the live index under the writer lock. Residual compaction phase metrics retain the
+  successor's held-row CAS and schema-32 display-only carrier projection. Active-release
+  extras carry and candidate acknowledgement are inherited intact from #784.
+  Guards: fanout burst/publication, routing diff and retirement scope, compaction metrics,
+  carrier display/inspection and immutable-release extras suites.
+- Memory-provider eviction resolves the shutdown handoff under the shutdown lock.
+  A worker that captured the manager owns session-end and shutdown, while eviction
+  detaches its claimed reference without taking that ownership back. Reset's
+  pre-flush still retains the manager until the worker captures it.
+  Guards: both `test_agent_cache_memory_lifetime.py` and
+  `test_agent_cache_memory_lifecycle.py`, 18 passing tests on Linux Python 3.14.7.
+- Linux service-identity fixtures bind both the account-native default and the
+  process fallback to the simulated sudo home. Detached-launch mocks recognize
+  the isolated bootstrap's embedded module name while leaving process scans real.
+  Guards: gateway-service and no-unit-restart suites, including actual unit-home
+  adoption and exact pinned launch arguments. The live-system guard is unchanged.
+- Merging upstream `v0.22.5`, current fork main and the installed display-fold fix (#765) left five bindings that Git merged cleanly but that no longer resolved. Exact-head CI caught them on the first hosted run.
+  - `gateway/run_inbound.py` kept the fork's `metadata=_UNSET` default on `_transcribe_and_echo_pending_voice` but lost the `from gateway.run_common import _UNSET` import that upstream's side never had. Every `gateway.run` import raised `NameError`, which accounted for most failures in the first run.
+  - `hermes_state_messages.py` raised `CompressionLeaseLostError` from the compaction lease check without importing it.
+  - `hermes_state_messages.py` `_with_removed_identities` received a copy of an `ORDER BY {...}` f-string expression as a plain literal, sending `{` to SQLite on every display read that includes removed rows. The removed-row query orders by plain `id` as on upstream.
+  - `hermes_cli/cli_model_switch_mixin.py` kept upstream's trailing `restore_reasoning(...)` call after the fork had replaced that local with `_restore_reasoning()`, which already reapplies the snapshot after `switch_model`.
+  - The desktop slash-session test imported in an order `perfectionist/sort-imports` rejects.
+- Guard: `uvx pyflakes` over the merged tree reports no undefined name that is absent on both parents, plus exact-head hosted CI for `gateway.run` import and the display-read suites.
+- The next hosted run exposed attribute and projection losses not visible to undefined-name scans:
+  - Display-fold projections omitted the summary-carrier UID and flag. Both the off-lock plan and
+    its stale-row fallback now use the same carrier identity and retained-slot rule as the full fold.
+    After folding, display reads unwrap an assistant's composite carrier back to its original reply,
+    while model reads retain the summary verbatim. Otherwise the selected carrier hides the reply
+    as synthetic context even though the original row remains durably archived. Conversation
+    display and atomic resume share this projection. Physical SQL message reads and exports
+    retain the original carrier, and web history supplies its unwrapped reply via
+    `display_content` without rewriting inspection/export `content`. Linux guards cover the
+    complete transcript ledger (10 passed), manual compression (29), planned/full carrier folding
+    (2), compacted reads (47), off-writer folding (26) and stale held-generation fences (7).
+  - The fork turn mixin lost the upstream persistence mixin base, hiding usage-window wording and
+    response-before-limit-offer methods. Existing fork overrides still win in the restored MRO.
+  - Prune rewrite calls the shared upstream transcript transaction helper, retaining rollback row
+    snapshots and the explicit session target rather than a removed private method.
+  - Primary-runtime snapshot reads optional reasoning configuration once, after the guarded lookup.
+  - `/allow` reads authorization environment names from the shared registry rather than removed maps.
+  - Native startup recovery runs once per profile and offloads session-store reads, preserving the
+    event-loop blocking guard. ACP unknown-state refresh uses per-input dict identities consistently.
+  - Managed workers expose the upstream automatic-title collision read through a scoped, receipted
+    owner operation. Only a boolean is returned and exclusion stays bound to the assigned session.
+  - Fixtures follow the real `session_db` constructor, `_Batch` dataclass, blocked-goal hook, and
+    authored max-iteration config. The deleted importer wrapper's config-write refusal is exercised
+    on its unchanged shared `atomic_yaml_write` implementation. No assertion is relaxed.
+  - Gateway contract, command-parity document and prompt-surface snapshots use their generators.
+  - Fork turn overrides retained pre-extraction behavior after upstream moved shared phases into
+    `run_turn_persistence`: restore local-viewer reasoning ownership, finite-turn footer suppression,
+    interrupted tool-tail closure, and the extracted worker tracker without dropping fork overrides.
+    Voice acknowledgement resolves the answering adapter rather than the default bot. Bind hygiene
+    helpers through their owning seam. A second ACP voice-stop path uses the same dict cancellation
+    identity, and the initial runtime snapshot tolerates reasoning config before initialization.
+- Guards: display-fold off-lock and carrier suites, managed-store surface parity with Unicode
+  collision and cross-session refusal coverage, usage-limit delivery, runtime bootstrap, ACP
+  cancellation, provider fork contracts and retry/recovery admission tests, plus exact-head CI.
+- Delegation child construction again supplies an empty request-override mapping, as on fork
+  parent `9ac6acc2`, instead of `None`. Route-field fixtures explicitly opt into tier inheritance
+  and set the parent's effective mode, preserving every route and wire-leak assertion.
+  Guards: `test_delegation_route_fields.py` (15 passed) and `test_delegate_by_parent.py` (11 passed).
+- Restore the fork's post-extraction inbound bindings: canonical `/learn` and `/plan` commands
+  enter durable admission, queued command turns are not enqueued twice, and `/stop`/`/new`
+  fence uncommitted arrivals while retaining paused unknown-turn followers. Turn preparation
+  uses `session_opening_pending`, binds the event's turn origin, preserves FIFO lease waits,
+  and defers behind detached compression ownership. The recovered-topic fixture patches the
+  renamed lobby helper, with all opening-turn assertions unchanged.
+  Guards: attended opening (12 passed), messaging slash FIFO (22), native arrival order (10),
+  steer overwrite (2), busy anchors (13), and turn leases (12), via the canonical runner.
+- The cron isolation fixture disables optional diagnostic audits on its synthetic repository before
+  checking maintenance eligibility. Upstream's audit hook otherwise starts unrelated work while
+  the fixture is proving that maintenance uses an isolated worktree. The real subprocess and
+  maintenance assertions remain unchanged. Guard: `test_worktree_maintenance_isolation.py`
+  passed in the canonical runner (`r5-fixtures.log`, 1 passed).
+- Route fork plugin-command effects through the upstream shared handler so opt-in source,
+  session ID, live-message bindings and choices survive without dropping the loop-wake fence.
+  Cron script tests bind the canonical registered store and admitted execution instead of
+  booting an external gateway client. Guards: session env, exec quick commands and cron
+  script propagation (19 passed). The live-system subprocess guard is unchanged.
+- Keep MCP serve in the agent-command registry and restore inline discovery for commands
+  without a dedicated startup owner, while preserving gateway-owned discovery for chat.
+  Release-hold isolation explicitly permits dropping the synthetic main branch so the
+  independent runtime-format downgrade refusal is the path under test. Guards: bounded MCP
+  startup and release-channel holds (26 passed).
+- Batched pruning retains upstream on-session-delete hooks after each committed batch,
+  before filesystem cleanup. Rewind fixtures assert the structured API error field/detail
+  separately from storage exceptions, and routing-diff fixtures use serialized JSON objects.
+  Guards: session-delete hooks, runtime rewind and routing replace-diff (15 passed).
+- Retry parking retains the atomic process-notification owner hold until routing or shutdown
+  requeue, including duplicate replacement. Keep wait-policy observations isolated per synthetic
+  registry and preserve the bounded wait requirement when automatic notification is unavailable.
+  Cleanup tests no longer patch the upstream-removed scratch reaper. Guards: process wait,
+  polling ergonomics, interrupt cleanup, detached keepalive and refusal backoff (51 passed,
+  2 platform skips, including duplicate parked-hold regression).
+- Preserve the reserved multiplex home set after parking profiles and route drain-time notices
+  through an active session authority before falling back to the adapter pending queue.
+  Contract fixtures use the real JSON batch result, positional runtime config, authored pinned
+  overrides and depth-derived role budget. Retry clocks stay monotonic across watcher runs,
+  worktree fixtures isolate host process discovery and drive the actual boot-delay gate.
+  Guards: provider fork contracts, completion delivery, watch-reset pins, worktree pushed tier,
+  parked-profile refusal and startup-recovery parking (120 passed across the focused runs).
+- The high-fd PTY regression waits for the complete marker line before checking idle-read
+  timing. A legitimate split between the marker and CRLF otherwise makes pending output look
+  like a failed idle wait. Native and forced-split variants retain the fd, output, timeout
+  and EMFILE fallback assertions. Guard: `test_drain_high_fd.py` passes 3 tests on Linux, and
+  the forced split reproduces the original pending-CRLF failure with the old boundary.
+- Real gateway test children retain `HERMES_DISABLE_LAZY_INSTALLS=1`. The environment allowlist
+  dropped that parent policy, so `voice.record` could enter PM's `audio-io` dependency sync on a
+  selected CI venv and exceed the RPC deadline. Foreign test interpreters refuse that sync,
+  hiding the escape in earlier Linux reproductions. The session voice-mode assertions and
+  20-second RPC deadline remain unchanged, and an explicit child-environment regression binds
+  the hermetic policy independently of the caller's environment.
+- Classic CLI fixtures explicitly set `gateway.completion_notification_batch_window_seconds=0`
+  in their synthetic profile. The fork intentionally holds successful background results for
+  300 seconds by default (`maintenance/goal-lifecycle.md`), while the upstream live-session E2E
+  expects immediate completion cards and has a 300-second total file deadline. Linux tracing
+  proved the child had completed and persisted its result before the test's 90-second card wait
+  expired. Keep the real fan-in floor, delivery assertions and all timeouts unchanged.
+- The merge resurrected upstream's `tests/ci/test_cache_report_collection.py` without its
+  `scripts/ci/timings_report.py` dependency. Fork main had already retired both with its cache-report
+  CI tooling (`d77a654d8605` and retirement), so the orphan test is removed consistently with main.
+  No remaining successor source imports `timings_report`.
+- Retire once the next release sync no longer carries these merge points.
+
 ## v0.21.6 merge integration
 
 - Fork patch identity: `v0216-merge-integration`.

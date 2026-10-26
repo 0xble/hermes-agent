@@ -29,7 +29,7 @@ def running_turn(monkeypatch):
     runner._session_db = None
     runner._agent_cache_cap = lambda: 8
     runner._refresh_fallback_model = lambda: None
-    runner._fallback_baseline_model = lambda *_: "primary"
+    runner._fallback_baseline_model = lambda session_key, source, agent, *, policy_model=None: "primary"
     runner._is_intentional_model_switch = lambda *_: False
     runner._get_proxy_url = lambda: None
     runner._session_state(key).persistent.run_generation = 1
@@ -89,7 +89,7 @@ def running_turn(monkeypatch):
         post_started.set()
         await post_resume.wait()
 
-    display = SimpleNamespace(_native_slack_task_cards=False, needs_progress_queue=False,
+    display = SimpleNamespace(user_config={}, _native_slack_task_cards=False, needs_progress_queue=False,
                               log_mode_enabled=False)
     runner._run_agent_display_settings = lambda *_: display
     runner._run_agent_build_turn_context = lambda *a, **kw: (ctx, SimpleNamespace(run_sync=run_sync), None)

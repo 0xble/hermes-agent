@@ -42,7 +42,6 @@ def homes_and_spawn(tmp_path):
     def spawn(home) -> subprocess.Popen:
         proc = subprocess.Popen(argv, env={**os.environ, "HERMES_HOME": str(home)})
         procs.append(proc)
-
         def metadata_ready():
             try:
                 child = psutil.Process(proc.pid)

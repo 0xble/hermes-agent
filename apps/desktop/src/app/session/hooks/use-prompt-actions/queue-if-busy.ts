@@ -1,10 +1,11 @@
-import { enqueueQueuedPrompt } from '@/store/composer-queue'
+import { enqueueQueuedPrompt, serverOwnsComposerQueue } from '@/store/composer-queue'
 import { $sessions, resolveComposerSessionKey } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
 
 import { isTargetSessionBusy } from './utils'
 
 export interface QueueIfBusyInput {
+  id?: string
   /** Runtime session the command was resolved against. */
   sessionId: string
   /** Stored session the composer queue is keyed by; defaults to the runtime id
@@ -30,20 +31,21 @@ export function queueKickoffIfSessionBusy({
   displayText,
   foregroundBusy = false,
   moaToken,
+  id,
   sessionId,
   storedSessionId,
   text
 }: QueueIfBusyInput): 'busy' | 'idle' | 'queued' {
   const states = $sessionStates.get()
 
-  if (!moaToken && !isTargetSessionBusy(states, sessionId, foregroundBusy)) {
+  if (serverOwnsComposerQueue(sessionId) || (!moaToken && !isTargetSessionBusy(states, sessionId, foregroundBusy))) {
     return 'idle'
   }
 
   const stored = storedSessionId ?? states[sessionId]?.storedSessionId ?? null
   const queueKey = resolveComposerSessionKey(stored, $sessions.get()) || stored || sessionId
 
-  return enqueueQueuedPrompt(queueKey, { attachments: [], displayText, ...(moaToken ? { moaToken } : {}), text })
+  return enqueueQueuedPrompt(queueKey, { attachments: [], displayText, ...(moaToken ? { moaToken } : {}), id, text })
     ? 'queued'
     : 'busy'
 }

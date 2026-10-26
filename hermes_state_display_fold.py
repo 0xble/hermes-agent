@@ -18,7 +18,9 @@ _VISIBLE = " AND (active = 1 OR compacted = 1)"
 _DISPLAY_FOLD_COLUMNS = ("id", "role", "content", "timestamp", "tool_call_id", "tool_calls", "tool_name",
                          "display_kind", "display_metadata", "display_order", "display_identity")
 _DISPLAY_FOLD_COLUMNS_SQL = f"SELECT {', '.join(_DISPLAY_FOLD_COLUMNS)} FROM messages"
-_DISPLAY_FOLD_SCAN_SQL = (_DISPLAY_FOLD_COLUMNS_SQL + " INDEXED BY idx_messages_session_id "
+_CARRIER_FOLD_COLUMNS = (*_DISPLAY_FOLD_COLUMNS, "message_uid", "_compressed_summary")
+_CARRIER_FOLD_COLUMNS_SQL = f"SELECT {', '.join(_CARRIER_FOLD_COLUMNS)} FROM messages"
+_DISPLAY_FOLD_SCAN_SQL = (_CARRIER_FOLD_COLUMNS_SQL + " INDEXED BY idx_messages_session_id "
                          "WHERE session_id = ? AND id > ?" + _VISIBLE + " ORDER BY id LIMIT 1000")
 # The plan's one-step pages hold the page as JSON too (up to ~5x a fetchall, ~17x for control
 # characters), so they stay small enough for memory and SQLITE_MAX_LENGTH; ~85 steps per 17k rows.
@@ -62,10 +64,11 @@ def one_step_rows(conn: sqlite3.Connection, select_sql: str, params, columns: tu
     return rows
 
 
-def fold_rows(conn: sqlite3.Connection, select_sql: str, params) -> list[dict]:
+def fold_rows(conn: sqlite3.Connection, select_sql: str, params,
+              columns: tuple[str, ...] = _DISPLAY_FOLD_COLUMNS) -> list[dict]:
     """Rows of a ``_DISPLAY_FOLD_COLUMNS_SQL`` query as dicts in id order, in one SQLite step."""
-    rows = [dict(zip(_DISPLAY_FOLD_COLUMNS, row))
-            for row in one_step_rows(conn, select_sql, params, _DISPLAY_FOLD_COLUMNS)]
+    rows = [dict(zip(columns, row))
+            for row in one_step_rows(conn, select_sql, params, columns)]
     rows.sort(key=lambda row: row["id"])
     return rows
 
@@ -91,7 +94,8 @@ class _FoldPlan(dict[int, tuple[bytes | None, bytes, int | None]]):
     def finish(self):
         first: dict[bytes, int] = {}
         for row_id, (stored, canonical, order) in self.items():
-            minimum = first.setdefault(canonical, row_id)
+            kept = order if stored == canonical and order is not None and order <= row_id else row_id
+            minimum = first.setdefault(canonical, kept)
             if stored is not None:
                 self.aliases.setdefault(canonical, set()).add(stored)
             if stored != canonical or order != minimum:
@@ -145,13 +149,15 @@ class DisplayFoldMixin:
                 conn.execute("BEGIN")
                 try:
                     last_id = 0
+                    uid_identity: dict[str, bytes] = {}
                     while True:
-                        rows = fold_rows(conn, _DISPLAY_PLAN_PAGE_SQL, (session_id, last_id))
+                        rows = fold_rows(conn, _DISPLAY_PLAN_PAGE_SQL, (session_id, last_id), _CARRIER_FOLD_COLUMNS)
                         if not rows:
                             break
                         for row in rows:
                             plan[row["id"]] = (
-                                row["display_identity"], self._display_identity(self._display_dedupe_key(row)),
+                                row["display_identity"], self._fold_summary_carrier(
+                                    row, self._display_identity(self._display_dedupe_key(row)), uid_identity),
                                 row["display_order"])
                         last_id = rows[-1]["id"]
                 finally:
@@ -214,6 +220,7 @@ class DisplayFoldMixin:
                 return
         with write_phase("display_full_fold"):
             first_id: dict[bytes, int] = {}
+            uid_identity: dict[str, bytes] = {}
             last_id = 0
             while True:
                 # Streams: this no-plan fallback must retain identities, not a page of payloads.
@@ -222,8 +229,10 @@ class DisplayFoldMixin:
                 updates = []
                 for row in rows:
                     last_id = row["id"]
-                    identity = self._display_identity(self._display_dedupe_key(row))
-                    order = first_id.setdefault(identity, last_id)
+                    identity = self._fold_summary_carrier(
+                        row, self._display_identity(self._display_dedupe_key(row)), uid_identity)
+                    kept = row["display_order"] if row["display_identity"] == identity else None
+                    order = first_id.setdefault(identity, min(last_id, kept) if kept is not None else last_id)
                     if order != row["display_order"] or identity != row["display_identity"]:
                         updates.append((order, identity, last_id))
                 rows.close()
@@ -241,8 +250,17 @@ class DisplayFoldMixin:
         with write_phase("display_stale_decode"):
             for start in range(0, len(stale), 500):
                 chunk = stale[start:start + 500]
-                for row in conn.execute(f"{_DISPLAY_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})", chunk):
-                    fresh[row["id"]] = self._display_identity(self._display_dedupe_key(row))
+                for row in conn.execute(f"{_CARRIER_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})", chunk):
+                    identity = self._display_identity(self._display_dedupe_key(row))
+                    if row["message_uid"] and row["_compressed_summary"]:
+                        original = conn.execute(
+                            _CARRIER_FOLD_COLUMNS_SQL + " WHERE session_id = "
+                            "(SELECT session_id FROM messages WHERE id = ?) AND message_uid = ? "
+                            "AND id < ?" + _VISIBLE + " ORDER BY id LIMIT 1",
+                            (row["id"], row["message_uid"], row["id"])).fetchone()
+                        if original is not None:
+                            identity = self._display_identity(self._display_dedupe_key(original))
+                    fresh[row["id"]] = identity
         return {row_id: fresh[row_id] if row_id in fresh else plan[row_id][1]
                 for row_id, _stored, _order in visible}
 
@@ -255,7 +273,10 @@ class DisplayFoldMixin:
         updates = []
         for row_id, stored, order in visible:
             identity = identities[row_id]
-            folded = first_id.setdefault(identity, row_id)
+            # Pruning keeps an archived original and its rewritten live row in one historical slot.
+            # Preserve a valid earlier slot, but repair future/foreign slots just like the full fold.
+            kept = order if stored == identity and order is not None and order <= row_id else row_id
+            folded = first_id.setdefault(identity, kept)
             if folded != order or identity != stored:
                 updates.append((folded, identity, row_id))
         if updates:

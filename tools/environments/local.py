@@ -83,19 +83,39 @@ def cleanup_terminal_temp_cache(max_age_hours: float = TERMINAL_TEMP_MAX_IDLE_HO
         if m := _BG_GROUP_RE.match(f.name):
             group_newest[m.group(1)] = max(group_newest.get(m.group(1), 0.0), mt)
 
+    def group_touched(stem: str) -> bool:
+        # Re-stat every member right before each delete: the snapshot above is a candidate
+        # list, and a session that writes its .log after it must keep the whole group.
+        for sfx in ("log", "pid", "exit"):
+            try:
+                if (root / f"{stem}.{sfx}").stat().st_mtime >= cutoff:
+                    return True
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+        return False
+
     removed = 0
-    for f, mt in mtimes.items():
+    for f in mtimes:
         m = _BG_GROUP_RE.match(f.name)
         if m:
-            if group_newest[m.group(1)] >= cutoff:
+            if group_newest[m.group(1)] >= cutoff or group_touched(m.group(1)):
                 continue
         elif subtree_touched_since(f, cutoff):
             continue
         try:
             shutil.rmtree(f, ignore_errors=True) if f.is_dir() else f.unlink()
-            removed += 1
         except OSError:
             continue
+        # rmtree ignores errors: only a path that is really gone counts as removed, and only
+        # an explicit lstat proves absence (lexists() swallows OSError from lstat).
+        try:
+            os.lstat(f)
+        except FileNotFoundError:
+            removed += 1
+        except OSError:
+            pass
     return removed
 
 
@@ -314,8 +334,8 @@ def _finalize_child_env(env: dict) -> dict:
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
     """Filter each ``(items, unwrap_force)`` in *parts* into one env, rewrite PATH via
-    *fix_path* (always prepending the hermes install dir so bare ``hermes`` resolves
-    for children of a systemd/cron-launched gateway), then apply the shared guards."""
+    *fix_path* (keeping the Hermes install dir available without masking a client
+    session's selected toolchain), then apply the shared guards."""
     out: dict[str, str] = {}
     for items, unwrap_force in parts:
         _filter_secret_env(items, out, unwrap_force=unwrap_force, plugin_strip=plugin_strip)
@@ -678,13 +698,21 @@ def _resolve_hermes_bin_dir() -> str | None:
 
 
 def _prepend_hermes_bin_dir(existing_path: str) -> str:
-    """Prepend the hermes install dir to ``existing_path`` if missing. A sealed payload's
-    launcher dir moves to the front even when already listed: a login PATH can list
-    another install's ``hermes`` ahead of it."""
+    """Keep Hermes available without masking the toolchain selected for a client.
+
+    A sealed payload's launcher still moves first: another install's redirector
+    may not run. Bound client sessions keep their selected PATH, including its
+    gateway fallback. Unbound service jobs keep the install-dir-first behavior.
+    """
     bin_dir = _resolve_hermes_bin_dir()
     if bin_dir and _HERMES_BIN_DIR_IS_PAYLOAD:
         rest = [entry for entry in existing_path.split(os.pathsep) if entry and entry != bin_dir]
         return os.pathsep.join([bin_dir, *rest])
+    if bin_dir:
+        from agent.session_client_env import bound_client_env
+        if bound_client_env() is not None:
+            entries = [entry for entry in existing_path.split(os.pathsep) if entry]
+            return os.pathsep.join(dict.fromkeys([*entries, bin_dir]))
     return _prepend_missing_path_entries(existing_path, [bin_dir] if bin_dir else [])
 
 
@@ -777,9 +805,12 @@ def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping. The process env is
     the LAUNCH profile's; under a routed home override its ``.env`` residue is dropped first
     (``strip_launch_profile_env``, a no-op for the launch profile) so the backend's own ``env``
-    and the served profile's declared passthrough names are what the child sees."""
+    and the served profile's declared passthrough names are what the child sees. A local session's
+    client toolchain (PATH, venv, nvm/pyenv/conda: ``agent.session_client_env``) replaces the daemon's
+    beneath the backend's own ``env``."""
+    from agent.session_client_env import toolchain_environ
     run_env = _scrubbed_env(
-        [(dict(strip_launch_profile_env(os.environ.copy()) | env), True)],
+        [(dict(toolchain_environ(strip_launch_profile_env(os.environ.copy())) | env), True)],
         frozenset(),
         lambda p: _user_tools_first(_append_missing_sane_path_entries(p)),
     )
@@ -1019,7 +1050,7 @@ class LocalEnvironment(BaseEnvironment):
     the session snapshot preserves exported env vars across calls (unless
     ``persistent=False``); CWD persists via the stdout marker."""
 
-    _sudo_nopasswd_probe_supported = True
+    _passwordless_sudo_probe_supported = True
     _profile_scoped_passthrough = True
     # Commands run on the Hermes host itself — controller-side platform behavior
     # (macOS TCC pruning, etc.) legitimately applies here.
@@ -1109,14 +1140,36 @@ class LocalEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
-        # Login invocations (init_session's env snapshot) source the user's rc /
-        # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
+        run_env = _make_run_env(self.env)
+        # Login invocations still load shell functions and custom init files. A login
+        # profile may reset PATH, so carry the selected toolchain separately through it.
         if login:
+            if not _IS_WINDOWS:
+                from agent.session_client_env import bound_client_env
+                run_env['_HERMES_LOCAL_LAUNCH_PATH'] = run_env.get('PATH', '')
+                if bound_client_env() is not None or 'PATH' in self.env:
+                    path_script = 'export PATH="$_HERMES_LOCAL_LAUNCH_PATH"\n'
+                else:
+                    # Unbound shells retain login-selected precedence (nvm/asdf/pyenv),
+                    # but must not lose tools inherited from the gateway's launcher.
+                    path_script = '''while [ -n "$_HERMES_LOCAL_LAUNCH_PATH" ]; do
+    __hermes_path_entry=${_HERMES_LOCAL_LAUNCH_PATH%%:*}
+    case ":$PATH:" in
+        *":$__hermes_path_entry:"*) ;;
+        *) export PATH="${PATH:+$PATH:}$__hermes_path_entry" ;;
+    esac
+    case $_HERMES_LOCAL_LAUNCH_PATH in
+        *:*) _HERMES_LOCAL_LAUNCH_PATH=${_HERMES_LOCAL_LAUNCH_PATH#*:} ;;
+        *) break ;;
+    esac
+done
+'''
+                cmd_string = path_script + 'unset _HERMES_LOCAL_LAUNCH_PATH __hermes_path_entry\n' + cmd_string
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
         proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,

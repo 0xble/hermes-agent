@@ -48,6 +48,8 @@ def silence_retry_prompt(agent: Any, ctx: "TurnContext"):
             except AttributeError:
                 pass
 
+from agent.session_activity import AwakeIdleMeter
+
 
 @dataclass
 class TurnWorker:
@@ -90,6 +92,8 @@ class TurnContext:
     repeat_count: list = field(default_factory=lambda: [0])
     long_tool_hint_fired: list = field(default_factory=lambda: [False])
     agent_holder: list = field(default_factory=lambda: [None])
+    # Turn-scoped so the poll loop and stale-agent eviction both discount host sleep from idle.
+    awake_idle: AwakeIdleMeter = field(default_factory=AwakeIdleMeter)
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _status_delivery: Any = None

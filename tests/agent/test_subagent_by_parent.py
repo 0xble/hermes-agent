@@ -35,6 +35,23 @@ def _launch(parent, **kwargs):
     return agent.call_args.kwargs
 
 
+def test_lifecycle_launch_reaches_the_shared_fork_builder_with_selected_reasoning(config_file):
+    from tools import delegate_tool
+
+    raw = _authored()
+    raw["delegation"]["max_iterations"] = 19
+    config_file(raw)
+    parent = _parent()
+    parent.session_id = "parent-plugin"
+    with patch.object(delegate_tool, "_build_child_agent", wraps=delegate_tool._build_child_agent) as builder:
+        built = _launch(parent)
+    assert builder.call_count == 1
+    selected = builder.call_args.kwargs["reasoning_cfg"]
+    assert "provider" not in selected and "model" not in selected
+    assert selected["max_iterations"] == 19
+    assert built["reasoning_config"] == MEDIUM
+
+
 def test_lifecycle_inherits_venice_route_chain_and_reasoning(config_file):
     parent = _parent()
     parent.session_id = "parent-plugin"

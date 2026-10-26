@@ -7,6 +7,7 @@ cli-level names through ``from cli import ...`` at call time so facade monkeypat
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 
 # Log-record parity with the origin module.
@@ -39,13 +40,19 @@ def _run_state_db_auto_maintenance(session_db) -> None:
             if meta_key == "ghost_session_prune_v1" and not deletion_window_open():
                 continue
             try:
-                if not session_db.get_meta(meta_key):
-                    count = repair()
-                    session_db.set_meta(meta_key, "1")
-                    if count:
-                        logger.info(done_msg, count)
-            except Exception as _exc:
-                logger.debug(skip_msg, _exc)
+                if session_db.get_meta(meta_key):
+                    continue
+                count = repair()
+            # Every SessionDB refusal: sqlite/IO, RuntimeStoreError (ValueError), and the
+            # hermes_state_errors busy/replaced family (RuntimeError).
+            except (sqlite3.Error, OSError, ValueError, RuntimeError) as _exc:
+                # Latched below regardless: a repair this store refuses (live ledger work,
+                # locked file) must surface once, not retry silently on every start.
+                logger.warning(skip_msg, _exc)
+                count = 0
+            session_db.set_meta(meta_key, "1")
+            if count:
+                logger.info(done_msg, count)
 
         cfg = (_load_full_config().get("sessions") or {})
 

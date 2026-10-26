@@ -109,21 +109,31 @@ def _truncate_snapshot(snapshot_text: str, max_chars: Optional[int] = None) -> s
 
 
 def _redact_browser_output(value: Any, *,
-                           vault_tab: str = "default", vault_origin: str = "") -> Any:
-    """Redact browser data under the active tab/origin rule."""
-    from agent.redact import redact_sensitive_text
+                           vault_tab: str = "default", vault_origin: str = "", _depth: int = 0) -> Any:
+    """Redact browser data under the active tab/origin rule.
 
+    ``_depth`` stops a page-controlled tree from raising RecursionError. The
+    unread remainder is replaced, not returned raw.
+    """
+    from agent.redact import (
+        REDACT_WALK_DEPTH_MARKER,
+        REDACT_WALK_MAX_DEPTH,
+        redact_sensitive_text,
+    )
+
+    if _depth >= REDACT_WALK_MAX_DEPTH:
+        return REDACT_WALK_DEPTH_MARKER
     if isinstance(value, str):
         return redact_sensitive_text(value, force=True,
                                      vault_tab=vault_tab, vault_origin=vault_origin)
     if isinstance(value, list):
-        return [_redact_browser_output(item, vault_tab=vault_tab, vault_origin=vault_origin) for item in value]
+        return [_redact_browser_output(item, vault_tab=vault_tab, vault_origin=vault_origin, _depth=_depth + 1) for item in value]
     if isinstance(value, tuple):
-        return tuple(_redact_browser_output(item, vault_tab=vault_tab, vault_origin=vault_origin) for item in value)
+        return tuple(_redact_browser_output(item, vault_tab=vault_tab, vault_origin=vault_origin, _depth=_depth + 1) for item in value)
     if isinstance(value, dict):
         return {
-            _redact_browser_output(key, vault_tab=vault_tab, vault_origin=vault_origin):
-            _redact_browser_output(item, vault_tab=vault_tab, vault_origin=vault_origin)
+            _redact_browser_output(key, vault_tab=vault_tab, vault_origin=vault_origin, _depth=_depth + 1):
+            _redact_browser_output(item, vault_tab=vault_tab, vault_origin=vault_origin, _depth=_depth + 1)
             for key, item in value.items()
         }
     from agent.redact import redact_registered_vault_number

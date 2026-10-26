@@ -1,5 +1,6 @@
 """Agent cron fires require persistence before gates can acknowledge work."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -41,10 +42,33 @@ def agent_runtime(monkeypatch):
     return agent_class, acquire
 
 
+@pytest.fixture
+def owner_db(monkeypatch, tmp_path):
+    """Run agent jobs inside the owner's cron execution, as the gateway admission does.
+
+    Only the client transport (``run_canonical_job``) is replaced. The owner's store is the
+    one handle ``_open_cron_session_db`` accepts, so tests hand it back from ``acquire``.
+    """
+    from gateway import session_cron
+
+    owner = SimpleNamespace(db=MagicMock(db_path=tmp_path / "state.db"))
+
+    def run(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
+        token = session_cron._execution.set((owner, "owner-session", job["id"], execution_id))
+        try:
+            return scheduler.run_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
+                                     execution_id=execution_id)
+        finally:
+            session_cron._execution.reset(token)
+
+    monkeypatch.setattr("cron.scheduler_authority.run_canonical_job", run)
+    return owner.db
+
+
 @pytest.mark.parametrize("recover", [False, True])
-def test_agent_requires_handle_after_timeout_and_exception(agent_runtime, recover):
+def test_agent_requires_handle_after_timeout_and_exception(agent_runtime, owner_db, recover):
     agent_class, acquire = agent_runtime
-    handle = MagicMock() if recover else None
+    handle = owner_db if recover else None
     acquire.side_effect = [TimeoutError(), OSError("locked"), handle]
     success, output, final, error = scheduler.run_job({
         "id": "required-store",
@@ -65,7 +89,7 @@ def test_agent_requires_handle_after_timeout_and_exception(agent_runtime, recove
 @pytest.mark.parametrize("no_agent", [False, True])
 @pytest.mark.parametrize("schedule", ["in 30m", "every 5m"])
 def test_store_failure_preserves_one_shot_and_wake_gate(
-    agent_runtime, monkeypatch, no_agent, schedule
+    agent_runtime, owner_db, monkeypatch, no_agent, schedule
 ):
     from cron.executions import list_executions
     from cron.incidents import list_incidents
@@ -79,12 +103,14 @@ def test_store_failure_preserves_one_shot_and_wake_gate(
     monkeypatch.setattr(monitor, "_run_monitor_source", monitor_source)
     delivered = MagicMock(return_value=None)
     monkeypatch.setattr(scheduler, "_deliver_result", delivered)
+    # The notice target is a fixture: no gateway credentials exist for preflight to find.
+    monkeypatch.setattr(scheduler, "_preflight_job_config", lambda *_: None)
     job = jobs.create_job(
         prompt="Generate a report",
         schedule=schedule,
         script="gate.py",
         no_agent=no_agent,
-        deliver="local",
+        deliver="telegram:123",
         repeat=1,
     )
     if not no_agent:
@@ -109,6 +135,8 @@ def test_store_failure_preserves_one_shot_and_wake_gate(
         assert current["repeat"]["completed"] == 0
         assert current["enabled"] and current["state"] == "scheduled"
         assert not current["fire_claim"] and not current.get("run_claim")
+        # The failure notice rides the durable queue; the gateway drain performs it.
+        assert scheduler.drain_delivery_queue({}, None) == 1
         delivered.assert_called_once()
         assert delivered.call_args.kwargs["for_failure"] is True
         executions = list_executions(job_id=job["id"])
@@ -124,7 +152,7 @@ def test_store_failure_preserves_one_shot_and_wake_gate(
         )
         assert [due["id"] for due in jobs.get_due_jobs()] == [job["id"]]
         acquire.side_effect = None
-        handle = MagicMock()
+        handle = owner_db
         acquire.return_value = handle
         retry = jobs.claim_job_for_fire(job["id"], return_job=True)
         assert scheduler.run_one_job(retry)

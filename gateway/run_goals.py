@@ -15,6 +15,7 @@ import time
 from contextlib import nullcontext, suppress
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+from gateway.config import Platform
 from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 from gateway.run_background_admission import BACKGROUND_RESERVATION_ATTR
 from gateway.run_loop_wake import GatewayLoopWakeMixin
@@ -184,6 +185,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         ``reply_expected=False`` marks a gateway-authored wake that may end silently (a goal
         continuation on a no-change tick). A typed message absorbed into the same turn still
         restores the human contract through ``MessageEvent.absorb_reply_expected``.
+        ``replace_source`` keeps the receiving-adapter provenance native admission reads.
         """
         metadata = {}
         if goal_continuation:
@@ -201,11 +203,14 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 ),
                 "goal_continuation_created_at": time.time(),
             }
-        source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
+        if getattr(source, "message_id", None):
+            from gateway.session_identity import replace_source
+            source = replace_source(source, message_id=None)
         return MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
             reply_expected=reply_expected,
             metadata=metadata,
+            inherit_channel_pin=True,
         )
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
@@ -240,6 +245,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             watch[quick_key] = (source, session_id)
         adapter = self._delivery_adapter_for(source)
         if adapter is None or not adapter._message_handler:
+            return
+        if getattr(self, 'session_authority', None) is not None:
+            from gateway.run_heartbeat_acceptance import admit_heartbeat
+            await admit_heartbeat(self, adapter, source, session_id, quick_key)
             return
         if (
             self._is_session_running(quick_key)
@@ -382,6 +391,17 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         self, source: Any, message: str, *, notice_kind: Optional[str] = None,
     ) -> None:
         """Send a /goal judge status line without holding the turn open for flood recovery."""
+        if getattr(source, "platform", None) == Platform.LOCAL:
+            # The local adapter's send is a no-op (viewers read the event stream): main's TUI
+            # painted the verdict from ``status.update {kind: goal}``.
+            from gateway.session_authorities import active_authority
+            authority = active_authority(self)
+            live = authority.sessions.get(source.chat_id) if authority is not None else None
+            if live is not None:
+                live.event_stream.publish(
+                    source.chat_id, {"kind": "goal", "text": message}, event_type="status.update",
+                )
+            return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
@@ -636,6 +656,15 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
             return
+        if getattr(source, "platform", None) == Platform.LOCAL:
+            # A local session's adapter FIFO has no reader: its turns are authority admissions.
+            # Commit the continuation there, as main's TUI chained it after the turn.
+            from gateway.session_automation import admit_route_wake
+            try:
+                await admit_route_wake(self, self._delivery_adapter_for(source), source, prompt, "goal-continuation")
+            except Exception:  # health: allow BLE001 -- best-effort like the FIFO enqueue below; traceback logged
+                logger.debug("goal continuation: local admission failed", exc_info=True)
+            return
         # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
         try:
             adapter = self._delivery_adapter_for(source)
@@ -655,9 +684,13 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
+        from gateway.session_authorities import active_authority
+        from gateway.session_viewer_automation import viewer_driven
+        if viewer_driven(active_authority(self), getattr(source, "chat_id", None)):
+            return  # the classic CLI viewer judges and continues through ``session.automation``
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         from hermes_cli.goal_turn_outcome import is_successful_goal_turn
-        successful = is_successful_goal_turn(
+        successful = not self._turn_failed() and is_successful_goal_turn(
             agent_result, final_text, succeeded=getattr(event, "_agent_turn_succeeded", None),
         )
         if not successful:
@@ -744,11 +777,30 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         for label, hook, hook_kwargs in hooks:
             try:
                 await hook(
-                    session_entry=session_entry, source=source, final_response=final_text,
+                    session_entry=session_entry, source=source, final_response=final_text if successful else "",
                     **hook_kwargs,
                 )
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
+        self._publish_local_control(source, only_if_present=True)
+
+    def _publish_local_control(self, source: Any, *, only_if_present: bool = False) -> None:
+        """A local (Desktop/Ink) session's goal or loop state just moved here: repaint its viewers' cards,
+        whose loop countdown runs off the snapshot's ``next_due_at``."""
+        if getattr(source, "platform", None) != Platform.LOCAL:
+            return
+        from gateway.session_authorities import active_authority
+        from gateway.session_control_actions import publish
+        publish(active_authority(self), source.chat_id, only_if_present=only_if_present)
+
+    @staticmethod
+    def _turn_failed() -> bool:
+        """Whether the owner recorded this turn's result as failed (``session_ingress`` captures it
+        around ``_handle_message``; turns outside an owner capture nothing)."""
+        from gateway.session_results import execution_result
+        captured = execution_result.get() or {}
+        result = captured.get('terminal_result', captured.get('result'))
+        return isinstance(result, dict) and bool(result.get('failed'))
 
     @staticmethod
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:
@@ -1078,48 +1130,54 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             )
             # The tick is already durably started before any adapter/turn preparation. Lightweight
             # native/plugin doubles without the adapter receipt surface retain the direct path.
-            from gateway.wake import admit_internal_event
-            has_admission_receipt = "_message_handler" in getattr(adapter, "__dict__", {})
-            if has_admission_receipt:
-                await admit_internal_event(adapter, event)
-            else:
-                # Lightweight/plugin adapters predate the explicit admission-receipt surface, but
-                # they still need the same compression/control fence before handling a wake, and
-                # the same receipt rule as admit_internal_event: MessageEvent defaults the receipt
-                # to False, so a handler that never confirms admission is a refusal and the started
-                # tick is left for skip-only recovery.
-                from hermes_cli.session_controls import internal_wake_is_current
-                if not await self._run_in_executor_with_context(
-                    functools.partial(internal_wake_is_current, event)
-                ):
-                    raise RuntimeError("loop wake superseded before direct adapter admission")
-                await adapter.handle_message(event)
-                if getattr(event, "_gateway_accepted", False) is not True:
-                    raise RuntimeError("loop wake not accepted by direct adapter")
-            rebound_sid = (event.metadata or {}).get("loop_wakeup_session_id")
-            if rebound_sid and rebound_sid != sid:
-                def _rebound_fence():
-                    child = LoopManager(session_id=rebound_sid).state
-                    if child is None or (child.created_at, child.ticks_fired) != tick:
-                        return None
-                    return int(getattr(child, "control_generation", 0) or 0)
-                rebound_control = await self._run_in_executor_with_context(_rebound_fence)
-                if rebound_control is None:
-                    raise RuntimeError("loop wake continuation missing its started tick")
-                event._gateway_loop_execution_fence = (
-                    rebound_sid, tick, generation, rebound_control,
-                )
-            # Native adapters settle command-only ticks at the handled-command boundary;
-            # rewriting commands retain their claim until the model-turn hooks run. Legacy
-            # direct adapters have no dispatch lifecycle, so preserve their inline settlement.
-            if ((not has_admission_receipt or getattr(event, "_gateway_inline_command_handled", False))
-                    and is_command
-                    and getattr(event, "_gateway_accepted", None) is True):
-                settled_sid = (event.metadata or {}).get("loop_wakeup_session_id", sid)
-                settled_mgr = mgr if settled_sid == sid else LoopManager(session_id=settled_sid)
-                await self._run_in_executor_with_context(
-                    functools.partial(settled_mgr.complete_tick, "", tick=tick)
-                )
+            from gateway.session_automation import admit_route_wake
+            # Authority-backed routes commit to the canonical FIFO; slash commands and legacy
+            # adapters retain the fork's strict admission-receipt path.
+            if wakeup.lstrip().startswith("/") or not await admit_route_wake(
+                self, adapter, source, wakeup, "loop-tick",
+            ):
+                from gateway.wake import admit_internal_event
+                has_admission_receipt = "_message_handler" in getattr(adapter, "__dict__", {})
+                if has_admission_receipt:
+                    await admit_internal_event(adapter, event)
+                else:
+                    # Lightweight/plugin adapters predate the explicit admission-receipt surface, but
+                    # they still need the same compression/control fence before handling a wake, and
+                    # the same receipt rule as admit_internal_event: MessageEvent defaults the receipt
+                    # to False, so a handler that never confirms admission is a refusal and the started
+                    # tick is left for skip-only recovery.
+                    from hermes_cli.session_controls import internal_wake_is_current
+                    if not await self._run_in_executor_with_context(
+                        functools.partial(internal_wake_is_current, event)
+                    ):
+                        raise RuntimeError("loop wake superseded before direct adapter admission")
+                    await adapter.handle_message(event)
+                    if getattr(event, "_gateway_accepted", False) is not True:
+                        raise RuntimeError("loop wake not accepted by direct adapter")
+                rebound_sid = (event.metadata or {}).get("loop_wakeup_session_id")
+                if rebound_sid and rebound_sid != sid:
+                    def _rebound_fence():
+                        child = LoopManager(session_id=rebound_sid).state
+                        if child is None or (child.created_at, child.ticks_fired) != tick:
+                            return None
+                        return int(getattr(child, "control_generation", 0) or 0)
+                    rebound_control = await self._run_in_executor_with_context(_rebound_fence)
+                    if rebound_control is None:
+                        raise RuntimeError("loop wake continuation missing its started tick")
+                    event._gateway_loop_execution_fence = (
+                        rebound_sid, tick, generation, rebound_control,
+                    )
+                # Native adapters settle command-only ticks at the handled-command boundary;
+                # rewriting commands retain their claim until the model-turn hooks run. Legacy
+                # direct adapters have no dispatch lifecycle, so preserve their inline settlement.
+                if ((not has_admission_receipt or getattr(event, "_gateway_inline_command_handled", False))
+                        and is_command
+                        and getattr(event, "_gateway_accepted", None) is True):
+                    settled_sid = (event.metadata or {}).get("loop_wakeup_session_id", sid)
+                    settled_mgr = mgr if settled_sid == sid else LoopManager(session_id=settled_sid)
+                    await self._run_in_executor_with_context(
+                        functools.partial(settled_mgr.complete_tick, "", tick=tick)
+                    )
         except Exception as exc:
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
             # Do not refund a started tick after delivery failure. Recovery skips it and schedules
@@ -1129,6 +1187,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                     await self._run_in_executor_with_context(
                         mgr.abandon_tick, tick=tick, owns_turn=_turn_owner_exists,
                     )
+        # Viewers swap the countdown for "running now" (or re-anchor it after a slash tick settled).
+        self._publish_local_control(source)
 
     async def _goal_wakeup_fire_one(self, sid: str) -> None:
         """Resume one idle parked /goal whose wait barrier has lifted.

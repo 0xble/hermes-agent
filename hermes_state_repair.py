@@ -534,7 +534,19 @@ def _backup_db_file(db_path: Path) -> tuple[Optional[Path], Optional[str]]:
         return None, f"backup copy failed: {exc}"
 
 
-def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> None:
+def _rw_or_vanished(p: Path) -> bool:
+    """True when *p* is read-write for this user OR no longer exists.
+
+    The preflight lists the files first and checks them after, and a live sibling connection's last ``close()``
+    unlinks ``-wal``/``-shm`` in between (a concurrent quarantine can rename ``state.db`` aside the same way).
+    ``os.access`` on the vanished path returns False, which is "gone", not "read-only". The final re-check covers
+    a sidecar that vanished and was recreated by the next opener before ``exists()`` ran.
+    """
+    mode = os.R_OK | os.W_OK
+    return os.access(p, mode) or not p.exists() or os.access(p, mode)
+
+
+def preflight_db_writability(db_path: Path, *, db_label: str = "state.db", directory_only: bool = False) -> None:
     """Refuse-or-repair read-only DB files BEFORE the first connection opens.
 
     A stray read-only ``state.db`` / ``-wal`` / ``-shm`` (sudo run, restored backup, copied dotfiles) otherwise
@@ -553,8 +565,9 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> No
         home = Path(get_hermes_home()).resolve()
     # SQLite needs a writable directory in every journal mode (WAL/SHM sidecars, or the DELETE-mode journal).
     sidecars = (db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm"))
-    for p, is_dir in [(db_path.parent, True), *((p, False) for p in (db_path, *sidecars) if p.is_file())]:
-        if (is_dir and not p.is_dir()) or os.access(p, os.R_OK | os.W_OK):
+    files = () if directory_only else tuple((p, False) for p in (db_path, *sidecars) if p.is_file())
+    for p, is_dir in [(db_path.parent, True), *files]:
+        if (is_dir and not p.is_dir()) or _rw_or_vanished(p):
             continue
         x = "x" if is_dir else ""
         in_scope = False
@@ -880,16 +893,6 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> dict[str, A
     if not db_path.exists():
         report["error"] = f"{db_path} does not exist"
         return report
-    # Cross-restart cap: the in-memory claim bounds one process, but unhealable b-tree damage used to re-run
-    # surgery + a fresh backup on EVERY restart.
-    # Cross-restart attempt cap (#86747): the in-memory claim bounds one process, but a corruption class the
-    # strategies below cannot heal (b-tree page damage) previously re-ran the whole surgery — and took a
-    # fresh multi-hundred-MB forensic backup — on EVERY restart, forever. After
-    # _MAX_PERSISTENT_REPAIR_ATTEMPTS failures against the same damaged file, stop retrying and surface a
-    # terminal, actionable error.
-    if _persistent_repair_attempts_exhausted(db_path):
-        return _repair_skip(report, "skipped", _persistent_repair_exhausted_error(db_path))
-
     with _cross_process_repair_lock(db_path) as holding_lock:
         if not holding_lock:
             # Another process holds the lock (or the lock file was unopenable); it may have healed the file
@@ -902,8 +905,9 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> dict[str, A
             return report
 
         result = report
-        # Recheck exhaustion after acquisition: a queued repairer can have recorded the final failure while
-        # this process waited.
+        # The cross-restart cap (#86747) must be checked under the repair lock: fingerprinting opens the
+        # database, so a pre-lock probe makes a queued repairer look like a foreign holder to its sibling.
+        # This also sees any failure recorded while waiting, before a backup or strategy can run.
         if _persistent_repair_attempts_exhausted(db_path):
             _repair_skip(report, "skipped", _persistent_repair_exhausted_error(db_path))
         # WAL-holder preflight: fail closed for active readers before a backup is taken. Not the race defence — the

@@ -474,6 +474,15 @@ def docs_python() -> Path:
     return STATE / 'docs-venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
 
 
+def fork_commit_emails(base: str, release: str | None) -> list[str]:
+    """Return author emails from the fork's first-parent history after the baseline."""
+    args = ['log', '--first-parent', f'{base}..HEAD']
+    if release:
+        args.append(f'^{release}')
+    args += ['--format=%ae', '--no-merges']
+    return git(*args).splitlines()
+
+
 def history_policy() -> None:
     spec = importlib.util.spec_from_file_location('dependency_bounds', ROOT / 'scripts/ci/check_dependency_bounds.py')
     bounds = importlib.util.module_from_spec(spec)
@@ -489,8 +498,7 @@ def history_policy() -> None:
     sys.path.insert(0, str(ROOT / 'scripts/ci'))
     from release_baseline import accepted_release_baseline
     release = accepted_release_baseline(ROOT)
-    emails = git('log', f'{base}..HEAD', *([f'^{release}'] if release else []),
-                 '--format=%ae', '--no-merges').splitlines()
+    emails = fork_commit_emails(base, release)
     legacy = (ROOT / 'scripts/release.py').read_text(encoding='utf-8-sig')
     missing = []
     for email in sorted(set(emails)):

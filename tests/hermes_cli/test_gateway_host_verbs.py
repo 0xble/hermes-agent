@@ -61,19 +61,40 @@ def _write_record(pid: int, home: Path, profiles: tuple[str, ...]) -> None:
 @pytest.fixture
 def host_owner(tmp_path, monkeypatch):
     """A REAL live process published as the host gateway, answering identify for three profiles."""
+    from tests.waiting import wait_until
+
     monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    ready = tmp_path / "host-owner-ready"
+    code = '''
+import sys
+from pathlib import Path
+from gateway import host_rendezvous as hr
+assert hr.claim_host_lock(hr.ROLE_GATEWAY)[0] is hr.HostLockOutcome.ACQUIRED
+try:
+    Path(sys.argv[1]).touch()
+    sys.stdin.read()
+finally:
+    hr.release_host_lock(hr.ROLE_GATEWAY)
+'''
+    # The publishing process owns the flock, so killing it releases the actual reservation.
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(ready)],
+        cwd=Path(__file__).resolve().parents[2],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     home = tmp_path / "root"
-    _write_record(child.pid, home, ("default", "ops", "coder"))
-    monkeypatch.setattr(
-        "gateway.control_socket.identify_gateway",
-        lambda dialled, **kw: {"pid": child.pid, "hermes_home": str(home),
-                               "served_profiles": ["default", "ops", "coder"]})
     try:
+        wait_until(lambda: ready.exists() or child.poll() is not None,
+                   what="host owner acquired its lock")
+        assert ready.exists(), child.communicate(timeout=10)
+        _write_record(child.pid, home, ("default", "ops", "coder"))
+        monkeypatch.setattr(
+            "gateway.control_socket.identify_gateway",
+            lambda dialled, **kw: {"pid": child.pid, "hermes_home": str(home),
+                                   "served_profiles": ["default", "ops", "coder"]})
         yield SimpleNamespace(pid=child.pid, home=home, proc=child)
     finally:
         child.terminate()
-        child.wait(timeout=10)
+        child.communicate(timeout=10)
 
 
 def test_start_all_never_sweeps_a_live_host_multiplexer(host_owner, monkeypatch, capsys):
@@ -208,7 +229,7 @@ def test_named_profile_restart_all_with_host_down_restarts_the_default_root(monk
     assert len(spawned) == 1
     cmd, kwargs = spawned[0]
     assert cmd[-3:] == ["gateway", "run", "--replace"]
-    assert "--profile" not in cmd
+    assert cmd[-5:-3] == ["--profile", "default"] and "leinad" not in cmd
     env = kwargs["env"]
     assert Path(env["HERMES_HOME"]) == root
     assert env.get("DISCORD_BOT_TOKEN") == "root-discord"
@@ -271,7 +292,7 @@ def test_named_profile_restart_all_reaches_the_all_aware_branch(monkeypatch):
     monkeypatch.setattr(gw, "_guard_named_profile_under_multiplexer",
                         lambda **k: pytest.fail("the generic guard pre-empted the --all branch"))
     called: list[bool] = []
-    monkeypatch.setattr(gw, "_restart_all", lambda system: called.append(True))
+    monkeypatch.setattr(gw, "_restart_all", lambda system, detach=False: called.append(True))
 
     gw._cmd_restart(SimpleNamespace(system=False, all=True, force=False))
 

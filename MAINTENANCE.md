@@ -6,9 +6,9 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v0.22.2`, `d923a5eb487a17c0a68801bba9ef0f56c81040a8`.
-The prior baseline `v0.22.0` (`e06df9c2eae6901f4c88f464e0ae6e753c0428b8`)
-remains an ancestor. The earlier `v0.21.6` baseline
+`v0.22.5`, `bf0203a794a07aac3ff764972ab9087baa4e4f4e`.
+The prior baselines `v0.22.2` (`d923a5eb487a17c0a68801bba9ef0f56c81040a8`) and
+`v0.22.0` (`e06df9c2eae6901f4c88f464e0ae6e753c0428b8`) remain ancestors. The earlier `v0.21.6` baseline
 (`818c13be1dc4fd28987e1e881a9408224afd4535`) also remains an ancestor.
 Brian waived only the 24-hour release-age wait for `v0.21.6` on 2026-10-08;
 every other sync gate applied. The earlier baseline,
@@ -70,6 +70,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Build store dependencies | Resolve package hook dependencies from the caller-owned build store, with scoped cleanup and ordinary sealed-store fallback | PM install lifecycle, dependency lookup, archived web builds, or ARM64 Windows ripgrep staging | [Build store dependencies](maintenance/build-store-dependencies.md) |
 | Documents extra | Opt-in, platform-gated document toolchain extra that bundles never preinstall and PM detects once installed | Optional extras, opt-in or platform gates, extra anchors, or document toolchain pins | [Documents extra](maintenance/documents-extra.md) |
 | TTS discovery without installation | Defer optional SDK installation until TTS use instead of blocking unrelated turns | TTS capability registration, lazy SDK imports, or tool-schema discovery changes | [TTS discovery](maintenance/tts-discovery-no-install.md) |
+| KittenTTS wheel integrity | Keep the optional KittenTTS wheel URL pinned to its verified SHA-256 while preserving platform gates and the lock | KittenTTS dependency URL, wheel hash, platform marker, or lock refresh changes | [KittenTTS wheel integrity](maintenance/kittentts-wheel-integrity.md) |
 | Autonomous goals | Opt-in contract-preserving agent controls, recorded completion proof and timed blocker recovery | Goal tools, judging, revisions, approval or idle wake changes | [Autonomous goals](maintenance/goal-autonomy.md) |
 | Goal lifecycle | Complete judge criteria, conversational recovery of blocker pauses, and durable command authority during judging | Goal judging, admission, continuation, or concurrent goal-command changes | [Goal lifecycle](maintenance/goal-lifecycle.md) |
 | Loop lifecycle | Versioned agent-authorized /loop revisions preserve user authority, cadence state, and cross-surface wakeup persistence | LoopManager revisions, loop wakeup prompts, stale loop-manager caches, or loop receipts | [Loop lifecycle](maintenance/loop-lifecycle.md) |

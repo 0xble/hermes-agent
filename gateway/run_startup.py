@@ -73,6 +73,21 @@ def recover_left_core_at_gateway_start() -> None:
         recover_left_core_in(root)
 
 
+def _own_policy_envs(platform) -> Optional[tuple]:
+    """Return the platform's declared authorization environment names, if any.
+
+    The registry lookup is intentionally resolved at call time so plugin-provided
+    authorization policy remains effective even when a platform is loaded lazily.
+    """
+    from gateway.platform_env import authz_field
+    from gateway.platform_registry import platform_registry
+    entry = platform_registry.get(platform.value)
+    own = authz_field(platform.value, "own_policy_env", entry)
+    if not own:
+        return None
+    return (*own, authz_field(platform.value, "allow_all_env", entry))
+
+
 class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
 
@@ -791,8 +806,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     @staticmethod
     def _build_startup_resume_event(source: SessionSource, resume_marker: Optional[str]) -> MessageEvent:
         """Build the exact internal event used to auto-continue one restart marker."""
+        # This turn continues the original platform message, not a synthetic producer identity.
         event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
-                             message_id=getattr(source, "message_id", None), internal=True)
+                             message_id=getattr(source, "message_id", None), internal=True,
+                             reply_anchor_override=getattr(source, "message_id", None))
         if resume_marker:
             # Keep the transport reply anchor for threading, but admit each interruption marker
             # under its own outbox identity so one marker resumes at most once.
@@ -844,7 +861,6 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         try:
             _queue_current_profile()
             from gateway.run import _multiplex_profile_homes, _profile_runtime_scope
-            from hermes_cli.profiles import get_active_profile_name
             active = get_active_profile_name() or "default"
             for profile_name, profile_home in _multiplex_profile_homes(self.config):
                 if profile_name == active:
@@ -1102,6 +1118,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         return service
 
     async def _ensure_hosted_room_worker(self):
+        if getattr(self, 'session_authority', None) is not None:
+            from gateway.session_hosted_service import ensure_hosted_service
+            return await ensure_hosted_service(self)
         return await asyncio.to_thread(self._start_hosted_room_worker_sync)
 
     async def _hosted_room_worker_watcher(self, interval: float = 1.0) -> None:
@@ -1112,6 +1131,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
 
     async def _stop_hosted_room_worker(self, timeout: float = 5.0) -> bool:
         """Pause room execution durably without interrupting accepted turns."""
+        if getattr(self, 'session_authority', None) is not None:
+            from gateway.session_hosted_service import stop_hosted_service
+            return await stop_hosted_service(self, timeout=timeout)
         from tui_gateway import methods_groups
         return await asyncio.to_thread(methods_groups.stop_hosted_room_service, timeout=timeout)
 
@@ -1283,14 +1305,18 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     def _start_check_access_policy(self) -> bool:
         """Warn about missing allowlists; return True when startup must be refused."""
         from gateway.run import (
-            _OWN_POLICY_OPEN_ENV, _own_policy_open_startup_violation, _write_runtime_status_quiet
+            _own_policy_open_startup_violation, _write_runtime_status_quiet
         )
         # Plugin platforms declare their own allowed_users_env / allow_all_env.
         allowed_vars = list(self._BUILTIN_ALLOWED_USERS_VARS)
         allow_all_vars = ["GATEWAY_ALLOW_ALL_USERS", *self._BUILTIN_ALLOW_ALL_VARS]
         with suppress(Exception):
             from gateway.platform_registry import platform_registry
-            entries = platform_registry.plugin_entries()
+            # Enabled plugin platforms were materialized by the config passes; an unconfigured
+            # adapter's allowlist var cannot gate anything, so never import one just to read it.
+            entries = [e for e in (*platform_registry.loaded_entries(), *filter(None, (
+                platform_registry.get(p.value) for p, cfg in self.config.platforms.items() if cfg.enabled)))
+                if e.source == "plugin"]
             allowed_vars += [e.allowed_users_env for e in entries if e.allowed_users_env]
             allow_all_vars += [e.allow_all_env for e in entries if e.allow_all_env]
         # An API-server/webhook/local-only gateway has no messaging sender to gate, so the
@@ -1311,9 +1337,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         reason = _own_policy_open_startup_violation(self.config)
         if reason:
             platform_value = reason.split(":", 1)[0]
-            allow_all_env = next(
-                (env[2] for p, env in _OWN_POLICY_OPEN_ENV.items() if p.value == platform_value), None
-            )
+            allow_all_env = (_own_policy_envs(Platform(platform_value)) or (None, None, None))[2]
             logger.error(
                 "Refusing to start: %s has dm_policy/group_policy set to 'open' "
                 "but neither GATEWAY_ALLOW_ALL_USERS nor %s is enabled.", platform_value,
@@ -1373,8 +1397,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     def _register_config_hooks(fail_fmt: str, *fail_args, level: int = logging.DEBUG) -> None:
         """Register declarative shell hooks + outbound webhooks from the CURRENT scope's config.
 
-        Gateway has no TTY, so consent must come from --accept-hooks, HERMES_ACCEPT_HOOKS, or
-        hooks_auto_accept: true; ``accept_hooks=False`` lets register_from_config resolve env + config.
+        The gateway never prompts (register_from_config defaults to ``interactive=False``), even
+        when a hidden console makes stdin look like a TTY, so consent must come from the allowlist,
+        --accept-hooks, HERMES_ACCEPT_HOOKS, or hooks_auto_accept: true; ``accept_hooks=False`` lets
+        register_from_config resolve env + config.
         Never raises (logged at ``level``).
         """
         try:
@@ -1460,6 +1486,11 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             recovered += self._recover_secondary_process_checkpoints(process_registry)
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
+        # The gateway owns delegation state: replay durable completions the previous
+        # process never delivered. Explicit here, never at tools import (clients).
+        with _log_suppressed(logging.WARNING, "Could not restore async delegation completions: %s"):
+            from tools.async_delegation import restore_undelivered_completions
+            restore_undelivered_completions(process_registry.completion_queue)
         # Recover the turns the last process left marked (in flight, or reply not yet ledgered).
         # SKIP after a clean exit — the previous process already drained.
         _clean_marker = _hermes_home / ".clean_shutdown"
@@ -1981,6 +2012,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             candidates=candidates, allow_resume=not breaker_tripped, start_scheduler=False,
         )
         await self._finish_startup_restore()
+        from gateway.run_runtime import recover_gateway_native_sessions
+        await recover_gateway_native_sessions(self)
         # Queue bounded parent-facing recovery notices after adapters/session restore are ready.
         # The async delegation watcher performs the route/authorization preflight and durable
         # trigger claim; this startup hook never reconstructs a child process.
@@ -2033,6 +2066,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             self._spawn_reconnect_watcher()
         for method in self._POST_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
+        from gateway.runtime_downgrade_exit import runtime_downgrade_watcher
+        self._spawn_supervised(lambda: runtime_downgrade_watcher(self), "runtime_downgrade_watcher")
         # Scale-to-zero watcher ONLY when opted in, messaging is relay-only/absent, and a wakeUrl exists.
         try:
             if self._scale_to_zero_should_arm():

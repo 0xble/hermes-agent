@@ -230,8 +230,8 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
             backfills[patch_id] = identity.strip()
     # Classify fork commits after the floor, excluding the verified upstream release
     # ancestry. A release merge introduces upstream commits without fork trailers.
-    raw = _git_raw("log", "--reverse", "--no-merges", "--format=%H%x00%s%x00%B%x00",
-                   revision, f"^{start}", f"^{baseline}").rstrip("\n")
+    raw = _git_raw("log", "--reverse", "--first-parent", "--no-merges",
+                   "--format=%H%x00%s%x00%B%x00", revision, f"^{start}", f"^{baseline}").rstrip("\n")
     fields = raw.split("\0") if raw else []
     if fields and fields[-1] == "":
         fields.pop()
@@ -241,7 +241,7 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
         short = sha[:12]
         identities = [m.group("identity").strip() for m in _TRAILER.finditer(body)]
         if not identities and backfills:
-            patch = _git("show", "--pretty=format:", "--no-ext-diff", sha)
+            patch = _git("-c", "diff.algorithm=histogram", "show", "--pretty=format:", "--no-ext-diff", sha)
             result = subprocess.run(["git", "patch-id", "--stable"], input=patch,
                                     capture_output=True, text=True, check=True).stdout.split()
             if result and result[0] in backfills:

@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_state_common import (
     AUTO_VACUUM_MIN_FREELIST_RATIO, _id_chunks, _non_continuation_child_sql, _placeholders, _sql_session_last_active,
-    escape_like as _escape_like
+    escape_like as _escape_like, emit_session_deleted,
 )
 from hermes_startup_watchdog import report_startup_progress
 
@@ -124,12 +124,17 @@ class SessionMaintenanceMixin:
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id
                   )
             """, (cutoff,)).fetchall()]
+            from hermes_state_mutation_retirement import retire_prunable
+            ids = retire_prunable(conn, ids)
             for chunk in _id_chunks(ids):
                 conn.execute(f"DELETE FROM sessions WHERE id IN ({_placeholders(chunk)})", chunk)
             if ids:
                 self._delete_unreferenced_system_prompts(conn)
             return ids
         removed_ids = self._execute_write(_do) or []
+        emit_session_deleted(self, removed_ids, reason="ghost_prune", sessions_dir=sessions_dir)
+        from hermes_state_media import collect_retired_media
+        collect_retired_media(self)
         for sid in removed_ids if sessions_dir else ():
             self._remove_session_files(sessions_dir, sid)
         return len(removed_ids)
@@ -222,7 +227,7 @@ class SessionMaintenanceMixin:
 
     @staticmethod
     def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool = False,
-                            lineage_tips_only: bool = False, **filters) -> tuple[str, list]:
+                            lineage_tips_only: bool = False, include_open: bool = False, **filters) -> tuple[str, list]:
         """Shared WHERE clause for bulk prune/archive selection (alias ``s``): ``_PRUNE_FILTERS``
         AND together, only ended sessions are ever candidates, ``archived`` is tri-state
         (None = both), ``*_like`` are case-insensitive substrings, the rest exact.
@@ -233,7 +238,7 @@ class SessionMaintenanceMixin:
         if unknown:
             raise TypeError("SessionMaintenanceMixin._prune_filter_where() got an unexpected "
                             f"keyword argument {min(unknown)!r}")
-        clauses = ["s.ended_at IS NOT NULL"]
+        clauses = [] if include_open else ["s.ended_at IS NOT NULL"]
         if lineage_tips_only:
             clauses.append("COALESCE(s.end_reason, '') <> 'compression'")
         params: list = []
@@ -294,6 +299,8 @@ class SessionMaintenanceMixin:
     def count_open_prune_matches(self, older_than_days: Optional[float] = None, source: str | None = None,
                                  **filters) -> int:
         """Count open sessions a matching prune skips (``ended_at`` guard inverted); visibility-only."""
+        if filters.get("include_open"):
+            return 0
         where, params = self._prune_where(older_than_days, source, filters)
         ended_guard = "s.ended_at IS NOT NULL"
         if not where.startswith(ended_guard):
@@ -330,7 +337,7 @@ class SessionMaintenanceMixin:
 
     def prune_sessions(self, older_than_days: Optional[float] = 90, source: str | None = None,
                        sessions_dir: Optional[Path] = None, exclude_active_write_guards: bool = False,
-                       **filters) -> int:
+                       deleted_ids: Optional[list] = None, **filters) -> int:
         """Delete ended sessions inactive for ``older_than_days`` (an explicit ``started_before`` /
         ``last_active_before`` overrides it; None = no implicit bound) matching the filters.
         Children outside the window are orphaned (parent NULLed), not cascade-deleted.  With
@@ -338,7 +345,10 @@ class SessionMaintenanceMixin:
         ``exclude_active_write_guards`` (automatic maintenance) skips rows under a live turn lease
         or compression lock while expired/dead holders are reclaimed and fenced.  A compression
         ancestor is deleted only together with every continuation after it (``whole_lineages``)."""
+        if filters.get("include_open"):
+            raise ValueError("prune_sessions() never deletes open sessions: include_open is archive-only")
         where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True)
+        removed_ids: list[str] = []
         # Select outside the write transaction.  The old implementation selected and deleted every
         # victim inside one BEGIN IMMEDIATE, so a large FTS cascade could hold every foreground writer
         # out for minutes.  Each short transaction rechecks the full predicate and the active guards;
@@ -349,6 +359,10 @@ class SessionMaintenanceMixin:
         candidate_rows = self._read_all(
             f"SELECT s.id FROM sessions s WHERE {where} ORDER BY s.started_at DESC", where_params)
         candidate_ids = [str(row["id"]) for row in candidate_rows]
+        # Tombstones are retained on a separate retry horizon from transcript retention.  A
+        # prune pass must advance that horizon even when no session row matches its age window.
+        from hermes_state_mutation_retirement import prune_retired_tombstones
+        self._execute_write(lambda conn: prune_retired_tombstones(conn))
         removed_count = 0
 
         # Keep each transaction small enough that message/FTS triggers release the WAL write lock
@@ -387,6 +401,9 @@ class SessionMaintenanceMixin:
                         str(row["root"]) for row in lineage_rows if str(row["id"]) in guarded
                     }
                     session_ids = [sid for sid in session_ids if sid not in guarded_roots]
+                from hermes_state_mutation_retirement import prune_retired_tombstones, retire_prunable
+                session_ids = retire_prunable(conn, sorted(session_ids))
+                prune_retired_tombstones(conn)
                 if not session_ids:
                     return []
                 ph = _placeholders(session_ids)
@@ -395,10 +412,13 @@ class SessionMaintenanceMixin:
                     session_ids)
                 conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", session_ids)
                 conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", session_ids)
+                removed_ids.extend(session_ids)
                 return session_ids
 
             batch_removed = self._execute_write(_do) or []
             removed_count += len(batch_removed)
+            if batch_removed:
+                emit_session_deleted(self, batch_removed, reason="prune", sessions_dir=sessions_dir)
             for sid in batch_removed:
                 self._remove_session_files(sessions_dir, sid)
             if batch_index + 1 < len(batches):
@@ -410,7 +430,43 @@ class SessionMaintenanceMixin:
                     lambda conn: self._delete_unreferenced_system_prompts(conn, limit=100))
                 if not deleted_prompts or deleted_prompts < 100:
                     break
+        if removed_count:
+            from hermes_state_media import collect_retired_media
+            collect_retired_media(self)
+        if deleted_ids is not None:
+            deleted_ids.extend(removed_ids)
         return removed_count
+
+    def maybe_auto_archive(
+        self, idle_days: float = 3, min_interval_hours: int = 24, exclude_pinned: bool = True,
+    ) -> dict[str, Any]:
+        """Idempotent, non-destructive auto-archive of sessions idle for ``idle_days``; state_meta
+        ``last_auto_archive`` gates runs within ``min_interval_hours``. Never raises."""
+        result: dict[str, Any] = {"skipped": False, "archived": 0}
+        try:
+            now = time.time()
+            try:
+                last = float(self.get_meta("last_auto_archive") or 0.0)
+            except (TypeError, ValueError):
+                last = 0.0  # corrupt meta; treat as no prior run
+            if last and now - last < min_interval_hours * 3600:
+                result["skipped"] = True
+                return result
+            # Startup-watchdog lease: the archive sweep is I/O-bound (near-zero CPU),
+            # which the watchdog's CPU fallback misreads as a parked deadlock.
+            # No-op when the watchdog is not armed; never raises.
+            report_startup_progress(900.0, phase="state_db_auto_archive")
+            archived = result["archived"] = self.archive_stale_sessions(idle_days, exclude_pinned=exclude_pinned)
+            # Record even a zero-archive run so we don't re-sweep every call.
+            self.set_meta("last_auto_archive", str(now))
+            if archived > 0:
+                logger.info(
+                    "state.db auto-archive: archived %d session(s) idle >= %s days", archived, idle_days,
+                )
+        except Exception as exc:
+            logger.warning("state.db auto-archive failed: %s", exc)
+            result["error"] = str(exc)
+        return result
 
     def _page_pragmas(self, names: tuple[str, ...], fail_msg: str) -> Optional[list]:
         """Integer PRAGMAs over the existing connection (never a byte probe); None + debug log on failure."""

@@ -39,7 +39,8 @@ def observed_prune(repo):
 
 worktree_ops._prune_stale_worktrees = observed_prune
 scheduler._worktree_maintenance_repos = lambda: [sys.argv[1]]
-scheduler._last_worktree_maintenance_at = None  # due now, not after the boot delay
+scheduler._last_worktree_maintenance_at = None
+scheduler._worktree_maintenance_boot_started -= scheduler._WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS + 1
 import hermes_cli.maintenance_window as maintenance_window
 maintenance_window.deletion_window_open = lambda at=None: True  # any time of day the suite runs
 scheduler._maybe_run_worktree_maintenance()

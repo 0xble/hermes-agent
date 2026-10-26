@@ -344,7 +344,9 @@ class OnePasswordLoginBackend(LoginBackend):
                        timeout_message="op timed out", stdin=subprocess.DEVNULL)
         if proc.returncode != 0:
             err = _scrub(proc.stderr or "")
-            if "session" in err.lower() or "sign in" in err.lower() or "not signed in" in err.lower():
+            # A service account never holds a session, so an auth failure there is not a lock to undo:
+            # surface op's own error instead of an unlock prompt that reports "already unlocked".
+            if not self._service_token and any(w in err.lower() for w in ("session", "sign in", "not signed in")):
                 _unlock.lock(self.name)
                 raise UnlockRequired(self)
             raise RuntimeError(f"op failed: {err[:200]}")
