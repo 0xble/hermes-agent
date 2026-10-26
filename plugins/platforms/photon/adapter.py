@@ -1254,7 +1254,7 @@ class PhotonAdapter(BasePlatformAdapter):
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
-            async with reaction_operation(self, chat_id, message_id, start=True):
+            async with reaction_operation(self, chat_id, message_id, start=True, event=event):
                 await self._add_reaction(chat_id, message_id, "\U0001f440")
 
     # base.on_processing_complete swaps 👀 for 👍/👎 (remove-then-add keeps the sidecar's

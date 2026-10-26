@@ -6823,7 +6823,7 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
-            async with reaction_operation(self, chat_id, message_id, start=True):
+            async with reaction_operation(self, chat_id, message_id, start=True, event=event):
                 await self._set_reaction(chat_id, message_id, "\U0001f440")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
@@ -6833,7 +6833,7 @@ class TelegramAdapter(BasePlatformAdapter):
         message_id = getattr(event, "message_id", None)
         if not (chat_id and message_id):
             return
-        async with reaction_operation(self, chat_id, message_id, complete=True) as state:
+        async with reaction_operation(self, chat_id, message_id, complete=True, event=event) as state:
             if state.explicit:
                 return
             if not self._reactions_enabled():

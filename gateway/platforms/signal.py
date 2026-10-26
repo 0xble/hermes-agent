@@ -984,7 +984,7 @@ class SignalAdapter(BasePlatformAdapter):
         """React with 👀 when processing begins."""
         if self._reactions_enabled(event) and (target := self._extract_reaction_target(event)):
             async with reaction_operation(
-                self, event.source.chat_id, str(target[1]), author=target[0], start=True,
+                self, event.source.chat_id, str(target[1]), author=target[0], start=True, event=event,
             ):
                 await self.send_reaction(event.source.chat_id, "👀", *target)
 
@@ -993,7 +993,7 @@ class SignalAdapter(BasePlatformAdapter):
         if not (target := self._extract_reaction_target(event)):
             return
         async with reaction_operation(
-            self, event.source.chat_id, str(target[1]), author=target[0], complete=True,
+            self, event.source.chat_id, str(target[1]), author=target[0], complete=True, event=event,
         ) as state:
             if state.explicit or outcome == ProcessingOutcome.CANCELLED or not self._reactions_enabled(event):
                 return

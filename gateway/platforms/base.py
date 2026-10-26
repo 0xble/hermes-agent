@@ -3187,7 +3187,7 @@ class BasePlatformAdapter(ABC):
         message_id = getattr(event, "message_id", None)
         if not (chat_id and message_id):
             return
-        async with reaction_operation(self, chat_id, message_id, complete=True) as state:
+        async with reaction_operation(self, chat_id, message_id, complete=True, event=event) as state:
             if state.explicit:
                 return
             add: Any = getattr(self, "_add_reaction", None)
