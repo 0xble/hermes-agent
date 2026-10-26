@@ -114,7 +114,7 @@ def test_a_recorded_but_empty_home_is_never_matched_only_a_pre_home_entry_is(hom
 
 @pytest.mark.platforms("linux")
 @pytest.mark.spawns_gateway_lookalike
-@pytest.mark.parametrize("initial_metadata", ["empty-cmdline", "partial-cmdline", "missing-home"])
+@pytest.mark.parametrize("initial_metadata", ["empty-cmdline", "partial-cmdline", "missing-home", "never"])
 def test_spawn_waits_for_child_metadata(homes_and_spawn, monkeypatch, initial_metadata):
     home_a, _, spawn = homes_and_spawn
     real_cmdline, real_environ = psutil.Process.cmdline, psutil.Process.environ
@@ -134,6 +134,18 @@ def test_spawn_waits_for_child_metadata(homes_and_spawn, monkeypatch, initial_me
             return {}
         return real_environ(proc)
 
+    if initial_metadata == "never":
+        real_wait_until = wait_until
+
+        def no_wait(predicate, **kwargs):
+            return real_wait_until(predicate, timeout=0, what=kwargs["what"])
+
+        monkeypatch.setattr(sys.modules[__name__], "wait_until", no_wait)
+        monkeypatch.setattr(psutil.Process, "cmdline", lambda proc: [])
+        with pytest.raises(AssertionError, match="child .*cmdline.*HERMES_HOME"):
+            spawn(home_a)
+        return
+
     monkeypatch.setattr(psutil.Process, "cmdline", cmdline)
     monkeypatch.setattr(psutil.Process, "environ", environ)
     child = spawn(home_a)
@@ -142,18 +154,3 @@ def test_spawn_waits_for_child_metadata(homes_and_spawn, monkeypatch, initial_me
         f"recorded argv={argv!r}, live argv={real_cmdline(psutil.Process(child.pid))!r}"
     )
     assert psutil.Process(child.pid).environ()["HERMES_HOME"] == home_a
-
-
-@pytest.mark.platforms("linux")
-@pytest.mark.spawns_gateway_lookalike
-def test_spawn_fails_loudly_when_child_metadata_never_appears(homes_and_spawn, monkeypatch):
-    home_a, _, spawn = homes_and_spawn
-    from tests.waiting import wait_until as real_wait_until
-
-    def no_wait(predicate, **kwargs):
-        return real_wait_until(predicate, timeout=0, what=kwargs["what"])
-
-    monkeypatch.setattr(sys.modules[__name__], "wait_until", no_wait, raising=False)
-    monkeypatch.setattr(psutil.Process, "cmdline", lambda proc: [])
-    with pytest.raises(AssertionError, match="child .*cmdline.*HERMES_HOME"):
-        spawn(home_a)
