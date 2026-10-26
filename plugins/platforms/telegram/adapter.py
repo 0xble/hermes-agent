@@ -5059,7 +5059,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         if (
             not finalize
             and utf16_len(content) <= self.MAX_MESSAGE_LENGTH
-            and (self._chat_budget().interim_blocked(chat_id) or self._daily_sheds(chat_id, OUTBOUND_PROGRESS))
+            and (self._chat_budget().interim_blocked(chat_id)
+                 or self._daily_sheds(chat_id, current_outbound_class() or OUTBOUND_PROGRESS))
         ):
             logger.debug(
                 "[%s] skipping interim edit for chat %s (shared send+edit budget: slot busy)",
