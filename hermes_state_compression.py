@@ -891,8 +891,7 @@ class SessionCompressionMixin:
         branch/delegate/tool children and prefer children that continue the chain or are still live over
         stale closed siblings such as ``ws_orphan_reap``."""
         def step(current: str):
-            with self._read_ctx() as conn:
-                return conn.execute(_CHAIN_STEP_SQL, (current,)).fetchone()
+            return self._read_one(_CHAIN_STEP_SQL, (current,))
         return _walk_compression_chain(session_id, step)
 
     def get_compression_tip(self, session_id: str) -> Optional[str]:

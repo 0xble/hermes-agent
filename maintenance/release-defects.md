@@ -729,6 +729,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- Integrating main's affected-group display fold requires beginning the fold inside
+  each compaction transaction, before mutation, including the successor's extracted
+  on-connection entry point. Preserve carrier-by-UID identity and prune-history
+  slots in the off-lock plan, affected groups and full-fold oracle. Keep the
+  independent recall scope around both discovery and hydration, including managed
+  worker and cross-profile read-only handles. Guards: display-fold incremental,
+  one-step, summary-carrier, prune restart-safety and search-isolation suites.
 - The successor extracted session creation into `tui_gateway/session_registry.py`,
   which replaced main #779's facade factories at registration time. Port its
   creation-time publisher into both extracted factories, so even a single-peer,

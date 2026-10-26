@@ -211,6 +211,19 @@ class TestSpillPruning:
         self._join_prune()
         assert len(scans) == 2
 
+    @pytest.mark.platforms("linux", "macos")
+    def test_fork_while_gate_held_leaves_child_able_to_prune(self):
+        gate = base_output._spill_prune_gate
+        assert gate.acquire(blocking=False)
+        try:
+            pid = os.fork()
+            if pid == 0:  # child: only os._exit, never return into pytest
+                os._exit(0 if base_output._spill_prune_gate.acquire(blocking=False) else 1)
+        finally:
+            gate.release()
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0, "child inherited a held prune gate"
+
     def test_old_spills_are_still_pruned_and_fresh_ones_kept(self, tmp_path, monkeypatch):
         spill_dir, _ = self._setup(tmp_path, monkeypatch)
         stale = spill_dir / "out-1-2-dead.log"

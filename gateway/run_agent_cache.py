@@ -1108,7 +1108,8 @@ class GatewayAgentCacheMixin:
                 evicted = _cache.pop(session_key, None)
         agent = _first_agent(evicted)
         # Never tear down an agent that's mid-turn — its client, sandbox and child subagents are in use.
-        # Not covered yet: fallback drift and mid-turn /model evict a running agent and return here (leak).
+        # Running fallback drift and mid-turn /model pop the cache entry here; the turn worker owns
+        # the exact instance and releases it only after both the worker and outer turn have drained.
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
             return
         if id(agent) in self._running_agent_ids():
@@ -1254,14 +1255,81 @@ class GatewayAgentCacheMixin:
         except Exception:
             logger.warning("Evicted agent memory shutdown failed", exc_info=True)
 
+    def _pop_cached_agent_for_eviction(self, session_key: str) -> Any:
+        """Pop under the caller's cache lock, deferring blocking soft release until after unlock."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        evicted = self._agent_cache.pop(session_key, None)
+        agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
+        return agent if agent and agent is not _AGENT_PENDING_SENTINEL else None
+
+    @staticmethod
+    def _pop_for_session_end(cache: Any, key: str) -> None:
+        """Pop a session-ending sweep entry. Its commit key stays on the agent for an unfinished turn
+        that drains after this pop and therefore owns the soft release."""
+        agent = _first_agent(cache.pop(key, None))
+        if agent is not None:
+            with suppress(AttributeError):  # Slotted doubles and the pending sentinel carry no key.
+                agent._gateway_session_end_key = key
+
+    def _turn_lifetime_drained(self, agent: Any) -> bool:
+        """True when this exact agent has no unfinished turn, or both turn stages have drained."""
+        lifetime = getattr(agent, "_gateway_turn_lifetime", None)
+        if not isinstance(lifetime, tuple) or len(lifetime) != 2:
+            return True
+        return all(getattr(stage, "is_set", lambda: False)() is True for stage in lifetime)
+
+    def _claim_soft_release(self, agent: Any) -> bool:
+        """Claim this exact agent's soft release once. An unfinished turn owns the later claim."""
+        from agent.memory_manager import memory_handoff_lock
+        try:
+            lock = memory_handoff_lock(agent)
+        except (AttributeError, TypeError):  # Slotted doubles cannot retain a handoff lock.
+            lock = nullcontext()
+        with lock:
+            if not self._turn_lifetime_drained(agent):
+                return False
+            if getattr(agent, "_gateway_soft_release_started", None) is True:
+                return False
+            try:
+                agent._gateway_soft_release_started = True
+            except AttributeError:  # Slotted doubles cannot retain the release claim.
+                return True
+            return True
+
+    def _release_finished_turn_agent(self, turn_ctx: Any, worker: Any) -> None:
+        """Soft-release an exact agent popped while running, once its worker and turn have drained."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        if not (
+            getattr(worker.worker_done, "is_set", lambda: False)()
+            and getattr(worker.turn_done, "is_set", lambda: False)()
+        ):
+            return
+        holder = getattr(turn_ctx, "agent_holder", None)
+        agent = holder[0] if holder else None
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return
+        session_key = getattr(turn_ctx, "session_key", None)
+        cache = getattr(self, "_agent_cache", None)
+        lock = getattr(self, "_agent_cache_lock", None)
+        with lock if lock is not None else nullcontext():
+            if _first_agent(cache.get(session_key) if cache is not None else None) is agent:
+                return
+        self._spawn_release_thread(
+            self._release_evicted_agent_soft, (agent,),
+            f"agent-turn-release-{str(session_key)[:24]}", inline_fallback=True, session_key=session_key,
+        )
+
     def _release_evicted_agent_soft(self, agent: Any, *, retired: Optional[list] = None,
                                     commit_key: Optional[str] = None, boundary: bool = False) -> None:
         """Soft cleanup for cache-evicted agents: unlike _cleanup_agent_resources, the session may
         resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance.
         With ``retired``, the detached memory manager is appended for the caller to shut down. With
         ``commit_key``, end-of-session memory is committed atomically with the detach."""
-        if agent is None:
+        if agent is None or not self._claim_soft_release(agent):
             return
+        if commit_key is None:
+            deferred = getattr(agent, "_gateway_session_end_key", None)
+            commit_key = deferred if isinstance(deferred, str) else None
         manager = self._detach_memory_manager(agent, commit_key, boundary)
         if manager is not None:
             if retired is not None:
@@ -1355,7 +1423,7 @@ class GatewayAgentCacheMixin:
                 protect_recent=bounds.protect_recent,
             )
             for key, _ in plan:
-                _cache.pop(key, None)
+                self._pop_for_session_end(_cache, key)
         if not plan:
             _mid_turn = sum(1 for _, a in ordered if a is not None and id(a) in running_ids)
             _unflushed = sum(1 for _, a in ordered if _is_live(a) and not transcript_persistence_caught_up(a))
@@ -1434,7 +1502,7 @@ class GatewayAgentCacheMixin:
         candidates = [(key, _tuple_agent(_cache.get(key))) for key in list(_cache.keys())[:max(0, len(_cache) - cap)]]
         evict_plan = [(key, agent) for key, agent in candidates if agent is None or id(agent) not in running_ids]
         for key, _ in evict_plan:
-            _cache.pop(key, None)
+            self._pop_for_session_end(_cache, key)
         remaining_over_cap = len(_cache) - cap
         if remaining_over_cap > 0:
             logger.warning(
@@ -1471,7 +1539,7 @@ class GatewayAgentCacheMixin:
                     continue
                 to_evict.append((key, agent))
             for key, _ in to_evict:
-                _cache.pop(key, None)
+                self._pop_for_session_end(_cache, key)
         for key, agent in to_evict:
             logger.info("Agent cache idle-TTL evict: session=%s (idle=%.0fs)", key, now - getattr(agent, "_last_activity_ts", now))
             self._spawn_release_thread(self._commit_then_release_soft, (agent, key), f"agent-cache-idle-{key[:24]}",

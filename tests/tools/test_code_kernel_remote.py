@@ -399,12 +399,17 @@ class TestSharedHostLockdown(RemoteKernelBase):
                         if p and "kernel.env" in c)
         env_content = base64.b64decode(env_ship).decode()
         self.assertIn(f"HERMES_RPC_TOKEN={kernel.rpc_token}", env_content)
-        # Fail closed on a failed cell ship: the checked write raises and the
-        # kernel is evicted, so the next call cannot reuse a kernel whose
-        # state silently missed this cell.
+        # Fail closed on a failed cell ship. The transport cannot prove whether
+        # the atomic publish happened, so return an error instead of raising
+        # into the caller's per-call fallback and potentially replaying the cell.
+        # Retire the kernel so the next call cannot reuse uncertain state.
         env.handlers.insert(0, ("cell_req_", lambda c: {"output": "ENOSPC", "returncode": 1}))
-        with self.assertRaises(RuntimeError):
-            _run(env, timeout=1)
+        failed = _run(env, timeout=1)
+        assert failed is not None, "A failed cell ship must not return the fail-open sentinel"
+        self.assertEqual(failed["status"], "error", failed)
+        self.assertTrue(failed["kernel"]["ended"])
+        self.assertTrue(failed["kernel"]["state_lost"])
+        self.assertIn("may have run", failed["error"])
         self.assertEqual(len(_REMOTE_KERNELS), 0)
         # Fail closed on a failed dir setup: nothing (env file, runner) is
         # shipped into a dir that may still be missing or permissive.

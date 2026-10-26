@@ -118,14 +118,6 @@ def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
 # Slack click handler shows on a dead entry).
 def _clarify_expired_notice() -> str:
     return t("gateway.clarify.expired")
-
-
-# run_conversation result keys the gateway projection carries verbatim so a finite viewer's
-# `-z --usage-file` ledger (hermes_cli/oneshot._USAGE_KEYS) reads what the in-process path did.
-_LEDGER_PASSTHROUGH_KEYS = (
-    "estimated_cost_usd", "cost_status", "cost_source", "cache_read_tokens", "cache_write_tokens",
-    "reasoning_tokens", "total_tokens", "provider", "turn_exit_reason", "service_tier",
-)
 # Beside ``failure_reason`` and ``error``: what ``agent.error_surface.build_error_surface_from_result`` reads,
 # so the authority's ``message.complete`` carries the same error card the TUI path builds;
 # ``usage_window_message`` also marks a window-plan refusal for the chat rewording.
@@ -1038,15 +1030,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 count = row.get("message_count", 0)
         return count
 
-    def _pop_cached_agent_for_eviction(self):
-        """Evict under the lock but DEFER release (release_clients can block on memory-provider /
-        socket teardown while the idle sweeper waits on this lock). The turn rebuilds a fresh agent, so
-        the caller does a SOFT release that keeps sandbox / browser / bg processes."""
-        from gateway.run import _AGENT_PENDING_SENTINEL
-        evicted = self._runner._agent_cache.pop(self._ctx.session_key, None)
-        agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
-        return agent if agent and agent is not _AGENT_PENDING_SENTINEL else None
-
     def _lookup_cached_agent(self, sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count):
         ctx = self._ctx
         out = self._CachedAgentLookup()
@@ -1058,7 +1041,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 return out
             if cached[1] != sig:
                 # Overwriting the slot would orphan the old instance's memory workers.
-                out.evicted = self._pop_cached_agent_for_eviction()
+                out.evicted = self._runner._pop_cached_agent_for_eviction(ctx.session_key)
                 return out
             # cached[2] = message_count at cache time (stale when a second process appended rows);
             # cached[3] = the session_id the snapshot was taken for.
@@ -1085,6 +1068,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 )
             else:
                 out.agent = cached[0]
+                self._ctx.bind_agent_lifetime(out.agent)
                 # Refresh LRU order so cap enforcement evicts truly-oldest entries.
                 if hasattr(cache, "move_to_end"):
                     with suppress(KeyError):
@@ -1095,7 +1079,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 logger.debug("Reusing cached agent for session %s", ctx.session_key)
                 out.reused = True
                 return out
-            out.evicted = self._pop_cached_agent_for_eviction()
+            out.evicted = self._runner._pop_cached_agent_for_eviction(ctx.session_key)
         return out
 
     def _release_evicted_agent(self, agent) -> None:
@@ -1148,6 +1132,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             agent = self._build_fresh_agent(
                 turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr, skip_context_files,
             )
+            self._ctx.bind_agent_lifetime(agent)
             if cache_lock and cache is not None:
                 with cache_lock:
                     # Record the snapshot's session_id with message_count so the cross-process guard
