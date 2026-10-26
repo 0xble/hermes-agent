@@ -26,7 +26,7 @@ ban-free days with 3112 and 4157. Edits and typing created no messages, so backg
 (10116 of the 19875). ``call_soft_ceiling`` (``daily_call_soft_ceiling``) bounds every metered call:
 - Background cosmetic traffic is shed at ``BACKGROUND_CALL_FRACTION`` of it.
 - At the ceiling, typed turns shed typing, interim edits and drafts, and background notices
-  are shed. Enabled tool-progress bubbles, typed notices and every final still go out.
+  are shed. The initial tool-progress bubble, typed notices and every final still go out.
 - For ``STRICT_WINDOW_SECS`` after a penalty of ``STRICT_PENALTY_SECS`` or more, the call ceiling
   is scaled by ``STRICT_FACTOR``: the 36261s ban arrived at fewer calls than the ban before it,
   15 hours later, so a recent ban lowers the safe volume.
@@ -192,7 +192,7 @@ class DailyQuota:
     def sheds(self, chat_key: str, kind: Optional[str], trigger: Optional[str] = None) -> bool:
         """Whether a call of this outbound class must be shed now. Finals (``None``) never are.
 
-        Typed turns keep enabled tool progress and notices. Their typing, draft and interim text
+        Typed turns keep the initial tool bubble and notices. Their typing, draft and interim text
         traffic is shed when the day's call budget is spent. Background producers shed cosmetics at
         half the call budget or at the message rule, and notices at the full budget.
         """

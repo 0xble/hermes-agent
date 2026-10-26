@@ -622,37 +622,246 @@ async def test_typed_turn_at_the_call_ceiling_drops_typing_but_keeps_its_final_e
         reset_trigger(token)
 
 
-@pytest.mark.asyncio
-async def test_typed_tool_progress_survives_daily_pressure_without_restoring_typing(tmp_path):
+def _progress_runner(adapter, grouping="edit"):
+    import queue
     from gateway.run_turn_runner import TurnRunner
+
+    runner = TurnRunner.__new__(TurnRunner)
+    runner._ctx = SimpleNamespace(
+        source=SimpleNamespace(chat_id=CHAT), _progress_reply_to=None,
+        _progress_metadata={"thread_id": "42"}, progress_queue=queue.Queue(),
+        last_progress_msg=[None], repeat_count=[0], progress_grouping=grouping,
+        stream_consumer_holder=[None], _cleanup_progress=False,
+    )
+    return runner, runner._progress_edit_state(adapter)
+
+
+def _tool_line(runner, state, text="Reading files"):
+    runner._progress_emit(text)
+    return runner._progress_absorb(state, runner._ctx.progress_queue.get_nowait())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("used", [0, 10])
+async def test_tool_progress_edits_follow_daily_budget_without_restoring_typing(tmp_path, used):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(adapter._daily_quota(), used)
+    runner, state = _progress_runner(adapter)
+    _tool_line(runner, state)
+    _tool_line(runner, state)  # dedup must preserve the real-tool marker
+    token = bind_trigger(SimpleNamespace(text="show me the tool progress"))
+    try:
+        await runner._progress_send_or_edit(state, state.progress_lines[-1])
+        assert state.progress_msg_id
+        edited = await runner._edit_progress_message(state, state.progress_msg_id, "Reading files\nRunning checks")
+        assert edited.success
+        assert bool((edited.raw_response or {}).get("skipped")) is bool(used)
+        adapter._bot.send_message.assert_awaited_once()
+        assert adapter._bot.edit_message_text.await_count == (0 if used else 1)
+        if used:
+            await adapter.send_typing(CHAT)
+            adapter._bot.send_chat_action.assert_not_awaited()
+    finally:
+        reset_trigger(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("used", [0, 10])
+@pytest.mark.parametrize("path", ["reset", "overflow", "separate"])
+async def test_only_first_tool_bubble_is_protected_even_if_it_precedes_pressure(tmp_path, used, path):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(adapter._daily_quota(), used)
+    runner, state = _progress_runner(adapter, "separate" if path == "separate" else "edit")
+    token = bind_trigger(SimpleNamespace(text="run the checks"))
+    try:
+        await runner._progress_send_or_edit(state, _tool_line(runner, state))
+        assert state.progress_msg_id
+        _spend_calls(adapter._daily_quota(), 10)
+        if path == "reset":
+            runner._reset_progress_bubble(state)
+            runner._ctx._progress_metadata = {"thread_id": "43"}
+        elif path == "overflow":
+            state._PROGRESS_TEXT_LIMIT = len(state.progress_lines[0])
+
+        for i in range(3):
+            line = _tool_line(runner, state, f"Checking step {i}")
+            if path == "overflow":
+                assert await runner._roll_progress_overflow_if_needed(state)
+            else:
+                await runner._progress_send_or_edit(state, line)
+        adapter._bot.send_message.assert_awaited_once()
+    finally:
+        reset_trigger(token)
+
+
+@pytest.mark.asyncio
+async def test_permanent_edit_failure_does_not_rearm_tool_bubble_under_pressure(tmp_path):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+    from telegram.error import BadRequest
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    runner, state = _progress_runner(adapter)
+
+    async def dead_bubble(**_kwargs):
+        _spend_calls(adapter._daily_quota(), 10)
+        raise BadRequest("Message to edit not found")
+
+    adapter._bot.edit_message_text.side_effect = dead_bubble
+    token = bind_trigger(SimpleNamespace(text="run the checks"))
+    try:
+        await runner._progress_send_or_edit(state, _tool_line(runner, state))
+        await runner._progress_send_or_edit(state, _tool_line(runner, state, "Running checks"))
+        assert state.reanchored and state.progress_msg_id is None
+        await runner._progress_send_or_edit(state, _tool_line(runner, state, "Finishing checks"))
+        adapter._bot.edit_message_text.assert_awaited_once()
+        adapter._bot.send_message.assert_awaited_once()
+    finally:
+        reset_trigger(token)
+
+
+@pytest.mark.asyncio
+async def test_normal_budget_keeps_continuations_and_separate_tool_sends(tmp_path):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=100, profile_dir=tmp_path)
+    token = bind_trigger(SimpleNamespace(text="run the checks"))
+    try:
+        runner, state = _progress_runner(adapter)
+        await runner._progress_send_or_edit(state, _tool_line(runner, state))
+        runner._reset_progress_bubble(state)
+        await runner._progress_send_or_edit(state, _tool_line(runner, state, "Running checks"))
+        state._PROGRESS_TEXT_LIMIT = len(state.progress_lines[0])
+        _tool_line(runner, state, "Checking another file")
+        assert await runner._roll_progress_overflow_if_needed(state)
+        state.can_edit = False
+        await runner._progress_send_or_edit(state, _tool_line(runner, state, "Finishing checks"))
+        assert adapter._bot.send_message.await_count == 4
+    finally:
+        reset_trigger(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("used", [0, 10])
+async def test_initial_tool_bubble_does_not_exempt_adapter_split_continuations(tmp_path, used):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(adapter._daily_quota(), used)
+    runner, state = _progress_runner(adapter)
+    token = bind_trigger(SimpleNamespace(text="show the verbose tool arguments"))
+    try:
+        await runner._progress_send_or_edit(state, _tool_line(runner, state, "Reading " + "x" * 9000))
+        assert state.progress_msg_id
+        assert (adapter._bot.send_message.await_count == 1) is bool(used)
+        assert not used or state.tool_progress_sent
+    finally:
+        reset_trigger(token)
+
+
+@pytest.mark.asyncio
+async def test_partial_initial_tool_send_also_spends_the_protected_slot(tmp_path, monkeypatch):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+    from telegram.error import RetryAfter
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    adapter._bot.send_message.side_effect = [SimpleNamespace(message_id=1), RetryAfter(600)]
+    runner, state = _progress_runner(adapter)
+    token = bind_trigger(SimpleNamespace(text="show the verbose tool arguments"))
+    try:
+        partial = await runner._send_progress_text(state, _tool_line(runner, state, "Reading " + "x" * 9000))
+        assert not partial.success and partial.raw_response["partial_overflow"]
+        assert state.tool_progress_sent
+        _spend_calls(adapter._daily_quota(), 10)
+        monkeypatch.setattr(adapter, "_send_flood_cooldown_remaining", lambda _chat: None)
+        runner._reset_progress_bubble(state)
+        await runner._progress_send_or_edit(state, _tool_line(runner, state, "Continuing checks"))
+        assert adapter._bot.send_message.await_count == 2
+    finally:
+        reset_trigger(token)
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_tool_send_can_retry_but_only_accepts_one_bubble(tmp_path, monkeypatch):
     from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
 
     adapter = _adapter(tmp_path)
     adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
     _spend_calls(adapter._daily_quota(), 10)
-    import queue
-
-    ctx = SimpleNamespace(source=SimpleNamespace(chat_id=CHAT), _progress_reply_to=None,
-                          _progress_metadata={"thread_id": "42"}, progress_queue=queue.Queue(),
-                          last_progress_msg=[None], repeat_count=[0])
-    runner = SimpleNamespace(_ctx=ctx, _track_progress_result=lambda result: None, _stream_consumer=lambda: None)
-    state = SimpleNamespace(adapter=adapter, _edit_accepts_metadata=True, progress_lines=[])
-    TurnRunner._progress_emit(runner, "Reading files")
-    TurnRunner._progress_absorb(runner, state, ctx.progress_queue.get_nowait())
-    TurnRunner._progress_emit(runner, "Reading files")
-    TurnRunner._progress_absorb(runner, state, ctx.progress_queue.get_nowait())
-    token = bind_trigger(SimpleNamespace(text="show me the tool progress"))
+    runner, state = _progress_runner(adapter, "separate")
+    token = bind_trigger(SimpleNamespace(text="run the checks"))
     try:
-        sent = await TurnRunner._send_progress_text(runner, state, "Reading files")
-        assert sent.success
-        edited = await TurnRunner._edit_progress_message(runner, state, sent.message_id, "Reading files\nRunning checks")
-        assert edited.success and not (edited.raw_response or {}).get("skipped")
+        monkeypatch.setattr(adapter, "_send_flood_cooldown_remaining", lambda _chat: 600)
+        refused = await runner._send_progress_text(state, _tool_line(runner, state))
+        assert not refused.success and refused.retry_after == 600
+        assert not state.tool_progress_sent
+        adapter._bot.send_message.assert_not_awaited()
+        monkeypatch.setattr(adapter, "_send_flood_cooldown_remaining", lambda _chat: None)
+        for i in range(3):
+            await runner._progress_send_or_edit(state, _tool_line(runner, state, f"Checking step {i}"))
         adapter._bot.send_message.assert_awaited_once()
-        adapter._bot.edit_message_text.assert_awaited_once()
-        await adapter.send_typing(CHAT)
-        adapter._bot.send_chat_action.assert_not_awaited()
-        assert adapter._daily_sheds(CHAT, OUTBOUND_PROGRESS)
+        next_turn, next_state = _progress_runner(adapter, "separate")
+        await next_turn._progress_send_or_edit(next_state, _tool_line(next_turn, next_state))
+        assert adapter._bot.send_message.await_count == 2
     finally:
+        reset_trigger(token)
+
+
+@pytest.mark.asyncio
+async def test_deferred_initial_tool_send_spends_slot_and_preserves_native_replay_class(tmp_path, monkeypatch):
+    import gateway.outbox as outbox
+    from gateway.platforms.base import OUTBOUND_TOOL_PROGRESS
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter.gateway_runner = SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=True))
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(adapter._daily_quota(), 10)
+    clock = Wall(_utc("2026-10-25 12:00:00"))
+    monkeypatch.setattr(outbox.time, "time", clock)
+    monkeypatch.setattr(outbox, "_schedule_retry", AsyncMock())
+    monkeypatch.setattr(adapter, "_send_flood_cooldown_remaining", lambda _chat: 600)
+    runner, state = _progress_runner(adapter, "separate")
+    token = bind_trigger(SimpleNamespace(text="run the checks"))
+    outbox.bind_turn(tmp_path, "typed-tool-turn")
+    try:
+        deferred = await runner._send_progress_text(state, _tool_line(runner, state))
+        assert deferred.success and deferred.deferred and deferred.message_id is None
+        assert state.tool_progress_sent
+        monkeypatch.setattr(adapter, "_send_flood_cooldown_remaining", lambda _chat: None)
+        runner._reset_progress_bubble(state)
+        await runner._send_progress_text(state, _tool_line(runner, state, "Running checks"))
+        await runner._edit_progress_message(state, "1", "Checking results")
+        adapter._bot.send_message.assert_not_awaited()
+        outbox.clear_turn()
+        clock.t += 601
+        store = outbox.Outbox(tmp_path)
+        rows = store.all_rows()
+        assert [(row.type, row.payload["_outbound_class"]) for row in rows] == [
+            ("send", OUTBOUND_TOOL_PROGRESS), ("send", OUTBOUND_PROGRESS), ("edit_message", OUTBOUND_PROGRESS),
+        ]
+        assert all(row.payload["metadata"] == {"thread_id": "42"} for row in rows)
+        assert [row.state for row in rows] == ["pending", "failed_unsent", "delivered"]
+        for row in rows[1:]:
+            store.enqueue("recovery-check", row.type, row.payload)
+        # Native replay restores each persisted class, not the class of the recovery caller.
+        with outbound_class(OUTBOUND_NOTICE):
+            await outbox.recover(store, adapter)
+        adapter._bot.send_message.assert_awaited_once()
+        adapter._bot.edit_message_text.assert_not_awaited()
+        assert not store.pending()
+        assert not store.ambiguous()
+    finally:
+        outbox.clear_turn()
         reset_trigger(token)
 
 
@@ -677,23 +886,48 @@ def test_background_tool_progress_keeps_daily_message_and_call_limits(tmp_path, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("event", [
+    SimpleNamespace(text="[Continuing toward your standing goal]"),
+    SimpleNamespace(text="[/loop wakeup]"),
+    SimpleNamespace(text="scheduled cron work", internal=True),
+    None,
+])
+async def test_background_tool_bubbles_still_shed_through_runner_and_adapter(tmp_path, event):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(soft_ceiling=10, call_soft_ceiling=10, profile_dir=tmp_path)
+    for _ in range(10):
+        adapter._daily_quota().record(CHAT, "sendMessage")
+    runner, state = _progress_runner(adapter)
+    token = bind_trigger(event) if event else None
+    try:
+        await runner._progress_send_or_edit(state, _tool_line(runner, state))
+        assert not state.tool_progress_sent
+        adapter._bot.send_message.assert_not_awaited()
+        assert (await adapter.send(CHAT, "The final answer")).success
+        adapter._bot.send_message.assert_awaited_once()
+    finally:
+        if token is not None:
+            reset_trigger(token)
+
+
+@pytest.mark.asyncio
 async def test_thinking_only_progress_still_sheds_at_daily_call_ceiling(tmp_path):
-    from gateway.run_turn_runner import TurnRunner
     from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
 
     adapter = _adapter(tmp_path)
     adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
     _spend_calls(adapter._daily_quota(), 10)
-    runner = SimpleNamespace(_ctx=SimpleNamespace(source=SimpleNamespace(chat_id=CHAT),
-                            _progress_reply_to=None, _progress_metadata={"thread_id": "42"}),
-                            _track_progress_result=lambda result: None)
-    state = SimpleNamespace(adapter=adapter, _edit_accepts_metadata=True, progress_lines=[])
-    TurnRunner._progress_absorb(runner, state, "Thinking about the answer")
+    runner, state = _progress_runner(adapter)
+    runner._progress_absorb(state, "Thinking about the answer")
     token = bind_trigger(SimpleNamespace(text="explain it"))
     try:
-        sent = await TurnRunner._send_progress_text(runner, state, state.progress_lines[0])
+        sent = await runner._send_progress_text(state, state.progress_lines[0])
         assert sent.error == "daily_budget_shed"
         adapter._bot.send_message.assert_not_awaited()
         adapter._bot.edit_message_text.assert_not_awaited()
+        await runner._progress_send_or_edit(state, _tool_line(runner, state))
+        adapter._bot.send_message.assert_awaited_once()
     finally:
         reset_trigger(token)
