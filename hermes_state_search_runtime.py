@@ -1,7 +1,7 @@
-"""Bounded, reader-only admission and timings for a complete recall operation.
+"""Reader-only admission, query budgets and timings for a complete recall operation.
 
-No SQL deadline: admission may fail explicitly, but an admitted query runs to
-completion. Existing descriptor permits remain the only connection budget.
+Query-bearing recall has one cooperative SQLite deadline after admission.
+Queryless browse/read/scroll retain their existing behavior and reader budget.
 """
 
 from contextlib import contextmanager
@@ -16,6 +16,7 @@ import weakref
 
 logger = logging.getLogger("hermes_state")
 _READER_WAIT_S = 5.0
+_QUERY_BUDGET_S = 30.0
 _MAX_WAITERS = 64
 _local = threading.local()
 _queues_lock = threading.Lock()
@@ -104,11 +105,45 @@ class SearchOperation:
     sort: object = None
     query: str = ""
     stage_depth: dict = field(default_factory=dict)
+    query_deadline: float | None = None
+    query_budget_expired: bool = False
 
 
 def current_search(db):
     operation = getattr(_local, "operation", None)
     return operation if operation is not None and operation.db is db else None
+
+
+def set_search_path(db, path):
+    operation = current_search(db)
+    if operation is not None:
+        operation.path = path
+
+
+@contextmanager
+def _query_budget(operation, query):
+    # A queryless outer scope may start discovery later. Never renew its budget
+    # for nested MATCH, LIKE fallbacks, metadata reads or hydration.
+    if operation.query_deadline is None and isinstance(query, str) and query.strip():
+        operation.query_deadline = time.monotonic() + _QUERY_BUDGET_S
+
+        def progress():
+            if time.monotonic() >= operation.query_deadline:
+                operation.query_budget_expired = True
+                return 1
+            return 0
+
+        operation.connection.set_progress_handler(progress, 1000)
+    try:
+        yield
+    except sqlite3.OperationalError as exc:
+        operation.rows = "err"
+        if operation.query_budget_expired and "interrupt" in str(exc).lower():
+            raise sqlite3.OperationalError(
+                f"search too broad, refine the query or add source/time filters "
+                f"({_QUERY_BUDGET_S:g}s query budget exceeded)"
+            ) from exc
+        raise
 
 
 @contextmanager
@@ -117,7 +152,8 @@ def search_operation(db, *, caller="other", query="", sort=None, filters=None):
     if existing is not None:
         existing.query, existing.sort = query, sort
         existing.filters.update(filters or {})
-        yield existing
+        with _query_budget(existing, query):
+            yield existing
         return
     operation = SearchOperation(db, caller, query=query, sort=sort, filters=filters or {})
     previous = getattr(_local, "operation", None)
@@ -129,10 +165,13 @@ def search_operation(db, *, caller="other", query="", sort=None, filters=None):
         finally:
             operation.reader_queue_ms = (time.monotonic() - queued) * 1000
         _local.operation = operation
-        yield operation
+        with _query_budget(operation, query):
+            yield operation
     finally:
         _local.operation = previous
         if operation.connection is not None:
+            if operation.query_deadline is not None:
+                operation.connection.set_progress_handler(None, 0)
             db._return_read_conn(operation.connection)
             with admission.condition:
                 admission.condition.notify_all()
@@ -152,7 +191,7 @@ def search_operation(db, *, caller="other", query="", sort=None, filters=None):
 
 @contextmanager
 def browse_deadline(db, conn, timeout_seconds):
-    """Keep ordinary recent browsing bounded, but never interrupt admitted recall."""
+    """Keep ordinary browsing bounded without replacing a recall scope's budget."""
     if current_search(db) is not None:
         yield
         return
