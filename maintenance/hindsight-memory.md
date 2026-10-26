@@ -2,6 +2,59 @@
 
 **Patch identity:** `hindsight-retain-visibility` and `evict-memory-shutdown`.
 
+## Read-Only Writer Census
+
+The gateway control verb `writer-census` independently enumerates live
+`hindsight-writer` threads and reconciles object identities against providers in
+the agent cache, session turn holders, deferred workers, API-server active-agent
+and parked-manager registries, and recognized release-thread argument containers.
+It reports cached idle, unfinished turn, release in progress, named other owner,
+and writerless-provider populations. Unaccounted writers, duplicate provider
+owners and shutdown-but-alive writers remain separate unhealthy populations.
+
+Use the existing `gateway.control_socket.query_gateway_control(home,
+"writer-census")` client, as with `handover-status`. No monitor, service, cache,
+drain or additional socket is introduced. Owners and providers are never retained
+after the call. Observation references are weak and output is sorted scalar data.
+Session keys are hashed. Process-start fingerprints reuse gateway status, while
+2 monotonic scalar timestamps distinguish recycled provider IDs and replacement
+writer threads. Missing timestamps on older/external providers are null and
+`identity_complete` is false, never invented from the observation time.
+
+This is a bounded observation, not a stop-the-world snapshot. Busy locks,
+detected container or writer changes, and inaccessible stack-only retirement
+owners mark it incomplete. In particular, pressure-batch current locals and a
+manager detached into a release method's stack cannot be inspected without a
+frame/heap walk. Their writers remain visibly unaccounted unless another existing
+owner exposes them. The diagnostic never uses a writer's bound target or atexit
+callback to force ownership totals to match. Parked and checked-out API managers
+are named under `other_owner`, asynchronous API retirement under
+`release_in_progress`.
+
+Native IDs are validated by `test_native_id_matches_os_thread_inventory`:
+Linux compares `/proc/<pid>/task` directory names, macOS compares libproc
+`proc_pidinfo(PROC_PIDLISTTHREADIDS)` (flavor 28), the system thread IDs that
+`threading.native_id` and `/usr/bin/sample` report. `PROC_PIDLISTTHREADS` (6) returns thread
+handles instead. macOS `ps -M` lists thread rows but does not
+print their numeric thread IDs, so it cannot establish numeric equality.
+
+Focused proof: `scripts/run_tests.sh tests/gateway/test_writer_census.py
+tests/gateway/test_control_socket.py tests/gateway/test_agent_cache_memory_lifetime.py
+tests/gateway/test_running_agent_eviction_memory.py`.
+Retire this `evict-memory-shutdown` diagnostic when the maintained upstream
+control surface provides equivalent identity-independent writer accounting.
+Rollback by reverting the census module, verb registration and timestamp fields
+together. It changes no lifecycle policy or persisted state.
+
+Upstream guidance checked at `ff294849385e433dd40a993b4f07673abb95c6f5`:
+extend the existing local control surface rather than adding a model tool.
+Related [issue #64278](https://github.com/NousResearch/hermes-agent/issues/64278)
+and [PR #64284](https://github.com/NousResearch/hermes-agent/pull/64284)
+address soft-eviction teardown, not independent writer accounting. This fork-only
+observer preserves those lifecycle boundaries rather than attempting another fix.
+
+## Provider Lifetime
+
 Soft agent-cache eviction must drain and shut down the agent's memory manager
 (including Hindsight's writer and the mem-sync executor), then release clients
 off the gateway event loop. Eviction removes the cache entry first, so a refetched
