@@ -26,7 +26,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'replacing. Never use complete or replace to escape constraints, failing checks or unsolved work. Use '
               'goal_set complete only with an evidence mapping from EVERY verification criterion to concrete recorded '
               'tool output. Never clear a goal. If nothing material changed, reply exactly [SILENT].',
-  'source_commits': ('b2628bda1a8279dbb74e7bd6ecc82fb2e077e865', '0295c3b67d17fc24939cdb695083bfd0fbc3d3c7')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '0295c3b67d17fc24939cdb695083bfd0fbc3d3c7')},
  {'formatter': 'plain',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -57,7 +57,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward this goal. Take the next concrete step. If you believe the goal is complete, '
               'state so explicitly, cite the proof (exact identifiers or output lines from tool results, in '
               'backticks), and stop. If you are blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
  {'formatter': 'plain',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -123,7 +123,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward this goal. Take the next concrete step. If you believe the goal is complete, '
               'state so explicitly, cite the proof (exact identifiers or output lines from tool results, in '
               'backticks), and stop. If you are blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '511d3b72b438b4a9005c8b9d171fd6b5d649175e')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '511d3b72b438b4a9005c8b9d171fd6b5d649175e')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -176,7 +176,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'section that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run '
               'ids, URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or '
               'are otherwise blocked and need user input, say so clearly and stop.',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -201,7 +201,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, '
               'URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or are '
               'otherwise blocked and need user input, say so clearly and stop.',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '1ceabf68cabce7f42d80f4d77e86b259fb7d4ce2')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '1ceabf68cabce7f42d80f4d77e86b259fb7d4ce2')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -354,7 +354,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, '
               'URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or are '
               'otherwise blocked and need user input, say so clearly and stop.',
-  'source_commits': ('ecf9e5a9eb7026ecc63708ee04af9965a36171e6', '511d3b72b438b4a9005c8b9d171fd6b5d649175e')},
+  'source_commits': ('deb018da2e4c71906ec9f532cdf74b15feaca6c2', '511d3b72b438b4a9005c8b9d171fd6b5d649175e')},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -424,7 +424,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'or output lines from tool results in backticks (commit SHAs, run ids, URLs, `N passed` lines), so the '
               'runtime can locate them. If you hit the stated stop condition or are otherwise blocked and need user '
               'input, say so clearly and stop.',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b',)},
+  'source_commits': ('b2628bda1a8279dbb74e7bd6ecc82fb2e077e865',)},
  {'formatter': 'contract',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -460,7 +460,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, URLs, `N '
               'passed` lines), so the runtime can locate them. If you hit the stated stop condition or are otherwise '
               'blocked and need user input, say so clearly and stop.',
-  'source_commits': ('working-tree',)},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b',)},
  {'formatter': 'subgoals',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -490,7 +490,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward the goal AND all additional criteria. Take the next concrete step. If you '
               'believe the goal and every additional criterion are complete, state so explicitly and stop. If you are '
               'blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '11aa16592efeec426e9869e8fc5b3b23f2d9a400')},
  {'formatter': 'subgoals',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -565,7 +565,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'Continue working toward the goal AND all additional criteria. Take the next concrete step. If you '
               'believe the goal and every additional criterion are complete, state so explicitly and stop. If you are '
               'blocked and need input from the user, say so clearly and stop.',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '511d3b72b438b4a9005c8b9d171fd6b5d649175e')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '511d3b72b438b4a9005c8b9d171fd6b5d649175e')},
  {'formatter': 'gate_failed',
   'template': '[Continuing toward your standing goal — a quality gate failed]\n'
               'Goal: {goal}\n'
@@ -581,7 +581,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               '\n'
               'Fix the underlying problem so this gate passes, then re-run it to confirm. Do not declare the goal '
               'complete while any gate fails. If the gate itself is wrong or cannot pass, say so clearly and stop.',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '6e041d524439b69ddfec73398816f8a7b01edfa0')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '6e041d524439b69ddfec73398816f8a7b01edfa0')},
  {'formatter': 'revisions',
   'template': '\n'
               '\n'
@@ -589,7 +589,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'message cited for that revision plainly instructs that specific change. When in doubt, honor the '
               'earlier requirement.\n'
               '{revision_lines}',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', 'c6721afec7b627430f6b43c322539cb85eb176a6')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', 'c6721afec7b627430f6b43c322539cb85eb176a6')},
  {'formatter': 'revisions',
   'template': '\n'
               '\n'
@@ -654,17 +654,17 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
   'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', '47afd1c2e0009b4b519180e55ef0b0a572b0c848')},
  {'formatter': 'barrier_lift',
   'template': '[Goal wait lifted: ',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '847864a02221e4cbbe6f722db9c09af51dcf4d9f')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '847864a02221e4cbbe6f722db9c09af51dcf4d9f')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: pid {note_field_0} has exited. Verify its result before continuing.]',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: pid {note_field_0} is still running after Check its progress before waiting again.]',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '5022441c66a78d8c7a563c241f9a315695fed752')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '5022441c66a78d8c7a563c241f9a315695fed752')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} is still running after Check its progress before '
               'waiting again.]',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '5022441c66a78d8c7a563c241f9a315695fed752')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '5022441c66a78d8c7a563c241f9a315695fed752')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: pid {note_field_0} is still running after {note_field_1} minutes. Check its progress '
               'before waiting again.]',
@@ -676,11 +676,11 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} finished ({note_field_1}, exit {note_field_2}). '
               'Read its output with the process tool before continuing.]',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} is no longer tracked and its outcome is unknown. '
               'Check its output or artifacts and verify the real state before rerunning; do not assume it succeeded.]',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '2cdfc5934d369ed84736915b7da12795d4cfaeae')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '2cdfc5934d369ed84736915b7da12795d4cfaeae')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} is no longer tracked, most likely because the '
               'gateway restarted. Its outcome is unknown; verify the real state before relying on it and do not assume '
@@ -690,7 +690,7 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
   'template': '[Goal wait lifted: background process {note_field_0} {note_field_1} before it finished (exit '
               '{note_field_2}). Its result is incomplete; check it with the process tool and verify the real state '
               'before deciding whether to rerun that work.]',
-  'source_commits': ('9cb5068945488ffbdfa2d481c84c1243a0a45e1b', '2cdfc5934d369ed84736915b7da12795d4cfaeae')},
+  'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '2cdfc5934d369ed84736915b7da12795d4cfaeae')},
  {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} was killed by {note_field_1} before it finished '
               '(exit {note_field_2}). Its result is incomplete; check it with the process tool and verify the real '
@@ -1620,4 +1620,29 @@ SCANNED_GOAL_PROMPT_COMMITS: Final[tuple[str, ...]] = ('9cb5068945488ffbdfa2d481
  'cd07e74ff3fa33b38657685eeeccd915e76b2ecf',
  '2f907325d9424654b4b6106c76a2480f49711e66',
  '1f76f1e7dba6b76d245fde223c473bcb2b5e0732',
- '0295c3b67d17fc24939cdb695083bfd0fbc3d3c7')
+ '0295c3b67d17fc24939cdb695083bfd0fbc3d3c7',
+ '20202751b2c641d8a2572df06c2052ca481bb8bf',
+ '557665444e8118a0e3643a787334da641906e71e',
+ 'c28ef4e9ef05d9f3499c633767622d31ffcd035d',
+ '89b40ca2dd596ec8c5da782b014c01f96a82420f',
+ '07095e2044da368da0b90ed5ac7796c0ddccc5e6',
+ '9a39f1e24cbee4ac4a26e45578490dfa5befe67c',
+ '0e8613ca7a5792097df0bde2dd66918a71f3d43b',
+ '4795b6253cae51601615a63c25f1b34d1f49a212',
+ '583a9132164404a974e00638084a15f01507e919',
+ '16d478e49de1825f8f76d0eb0f000c93f6472569',
+ '2829819ba657cc21d369d46a699b4655a16fec55',
+ 'b9409e9df58b464bfa187c403d4bc58a02dd3e96',
+ 'f22e0ce567f8b46ff3dd3f1c4e74cdf0e1807310',
+ '0e8ee202a70e44d782f1b7e64f4dbaf60f63f387',
+ 'fb8dc7d55965d9b12530914b65e22ea9208e6344',
+ '2a15f88b50a6b5bbce56201cb7c78c40e236998f',
+ 'b9a58b2c6bbebc1c094e3dcc6dcad3c4fb0b5175',
+ '961a1b7bd4bcbf6414abb016c9f94cb3d62f3d25',
+ 'efcc8b9f564eaf09953950bf44bec3b9aa809cc0',
+ 'fd5b7942171bb530cb1c9e8b60d6bbf41b1cb531',
+ '9bc48d6d581e969a6f7e2624f75887fbbc4d04ef',
+ '3b0f37546b4f086c83ec7b1a188e8b9605c8de82',
+ '7cda8c02a8053b17ca139e9a320ef126b815f3d8',
+ '02752d9f92e53b210af963bede45be9d52fbc00b',
+ 'a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b')

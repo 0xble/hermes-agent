@@ -119,8 +119,28 @@ async def automatic_route_available(runner: Any, source: Any) -> bool:
         logger.debug("automatic wake: topic availability lookup failed", exc_info=True)
         return True
     if deleted:
-        logger.debug("automatic wake: skipping deleted Telegram topic %s", source.thread_id)
+        logger.info(
+            "automatic wake: exact lookup found no Telegram topic chat=%s thread=%s; "
+            "preserving saved work and skipping wake", source.chat_id, source.thread_id,
+        )
     return not deleted
+
+
+async def automatic_event_is_current(runner: Any, event: Any) -> bool:
+    """Recheck automatic wake freshness and route before event admission."""
+    from gateway.platforms.event import is_goal_continuation_event
+    from hermes_cli.session_controls import (
+        LOOP_WAKE_METADATA_KEY, internal_wake_is_current, is_gateway_wake,
+    )
+
+    if is_gateway_wake(event) and not await runner._run_in_executor_with_context(
+        internal_wake_is_current, event,
+    ):
+        return False
+    metadata = getattr(event, "metadata", None) or {}
+    if not (is_goal_continuation_event(event) or metadata.get(LOOP_WAKE_METADATA_KEY)):
+        return True
+    return await automatic_route_available(runner, event.source)
 
 
 async def admit_internal_event(adapter: Any, event: Any) -> None:

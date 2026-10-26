@@ -1233,6 +1233,68 @@ def _topic_lookup(runner, monkeypatch, topics):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("goal_state", ["absent", "paused", "superseded"])
+async def test_ineligible_goal_does_not_probe_topic_after_turn(state, monkeypatch, goal_state):
+    from hermes_cli.goals import GoalManager
+
+    runner = _runner(state)
+    manager = GoalManager("target")
+    if goal_state != "absent":
+        manager.set("finish the requested work")
+        if goal_state == "paused":
+            manager.pause()
+    before = manager.state.to_json() if manager.state is not None else None
+    runner._goal_max_turns_from_config = lambda: 50
+    runner._goal_min_continuation_gap_from_config = lambda: 0
+    runner._defer_goal_status_notice_after_delivery = AsyncMock()
+    runner._session_key_for_source = lambda source: runner.target.session_key
+    runner._enqueue_fifo = lambda key, event, adapter: adapter._pending_messages.update({key: event})
+    lookup = _topic_lookup(runner, monkeypatch, [{"id": 42, "closed": False}])
+
+    with patch("hermes_cli.goals.judge_goal") as judge:
+        await runner._post_turn_goal_continuation(
+            session_entry=runner.target, source=runner.target.origin, final_response="ordinary reply",
+            goal_instance=-1 if goal_state == "superseded" else None,
+        )
+
+    lookup.assert_not_awaited()
+    judge.assert_not_called()
+    saved = GoalManager("target").state
+    assert (saved.to_json() if saved is not None else None) == before
+    assert runner.adapter._pending_messages == {} and runner.adapter.sends == []
+    runner.adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deferred", ["not_due", "busy", "in_flight"])
+async def test_deferred_loop_does_not_probe_topic_on_scan(state, monkeypatch, deferred):
+    from hermes_cli.loops import LoopManager
+
+    runner = _loop_fire_runner(_runner(state))
+    runner._build_process_event_source = lambda evt: runner.target.origin
+    manager = LoopManager("target")
+    manager.set("check the queue", interval_seconds=300, route={
+        "platform": "telegram", "chat_id": "target", "chat_type": "dm",
+        "thread_id": "42", "user_id": "1",
+    })
+    manager.state.next_due_at = 300 if deferred == "not_due" else 0
+    manager._save()
+    if deferred == "in_flight":
+        manager.fire_tick()
+    runner._is_session_running = lambda key: deferred != "not_due"
+    before = manager.state.to_json()
+    lookup = _topic_lookup(runner, monkeypatch, [{"id": 42, "closed": False}])
+
+    await runner._loop_wakeup_fire_one("target", manager.state, 299, set())
+
+    lookup.assert_not_awaited()
+    runner.adapter.handle_message.assert_not_awaited()
+    assert LoopManager("target").state.to_json() == before
+    assert runner.adapter.sends == []
+    runner.adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_retired_topic_post_turn_preserves_goal_without_judging(state, monkeypatch):
     from hermes_cli.goals import GoalManager
 
