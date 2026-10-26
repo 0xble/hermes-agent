@@ -42,6 +42,8 @@ from gateway.platforms.signal_rate_limit import (
 from gateway.platforms._shared import get_scoped_secret as _sig_secret
 from utils import TRUTHY_STRINGS
 
+from gateway.platforms.reaction_lifecycle import reaction_operation
+
 logger = logging.getLogger(__name__)
 
 SIGNAL_MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024  # 100 MB
@@ -940,7 +942,10 @@ class SignalAdapter(BasePlatformAdapter):
             timestamp = int(message_id)
             if timestamp <= 0:
                 return False
-            return await self.send_reaction(chat_id, emoji, author, timestamp)
+            async with reaction_operation(self, chat_id, str(timestamp), author=author) as state:
+                delivered = await self.send_reaction(chat_id, emoji, author, timestamp)
+                state.explicit |= delivered
+                return delivered
         except (TypeError, ValueError):
             return False
         except Exception as exc:
@@ -979,17 +984,23 @@ class SignalAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """React with 👀 when processing begins."""
         if self._reactions_enabled(event) and (target := self._extract_reaction_target(event)):
-            await self.send_reaction(event.source.chat_id, "👀", *target)
+            async with reaction_operation(
+                self, event.source.chat_id, str(target[1]), author=target[0], start=True,
+            ):
+                await self.send_reaction(event.source.chat_id, "👀", *target)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap 👀 for ✅/❌; on CANCELLED the 👀 stays to keep reflecting "in progress" (matches Telegram)."""
-        if outcome == ProcessingOutcome.CANCELLED or not self._reactions_enabled(event):
-            return
         if not (target := self._extract_reaction_target(event)):
             return
-        await self.remove_reaction(event.source.chat_id, *target)
-        if emoji := _OUTCOME_REACTION.get(outcome):
-            await self.send_reaction(event.source.chat_id, emoji, *target)
+        async with reaction_operation(
+            self, event.source.chat_id, str(target[1]), author=target[0], complete=True,
+        ) as state:
+            if state.explicit or outcome == ProcessingOutcome.CANCELLED or not self._reactions_enabled(event):
+                return
+            await self.remove_reaction(event.source.chat_id, *target)
+            if emoji := _OUTCOME_REACTION.get(outcome):
+                await self.send_reaction(event.source.chat_id, emoji, *target)
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Get information about a chat/contact."""

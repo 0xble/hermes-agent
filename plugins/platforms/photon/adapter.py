@@ -54,6 +54,8 @@ from .sidecar_paths import dir_writable as _dir_writable
 from hermes_constants import find_node_executable, with_hermes_node_path
 import contextlib
 
+from gateway.platforms.reaction_lifecycle import reaction_operation
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SIDECAR_PORT = 8789
@@ -1393,7 +1395,10 @@ class PhotonAdapter(BasePlatformAdapter):
         target = message_id or self._last_inbound_by_chat.get(self._normalize_chat_key(chat_id))
         if not target:
             return False
-        return await self._add_reaction(chat_id, target, emoji)
+        async with reaction_operation(self, chat_id, target) as state:
+            delivered = await self._add_reaction(chat_id, target, emoji)
+            state.explicit |= delivered
+            return delivered
 
     async def remove_reaction(self, chat_id: str, message_id: Optional[str] = None) -> dict[str, Any]:
         """Retract our tapback from a message (best-effort)."""
@@ -1411,7 +1416,8 @@ class PhotonAdapter(BasePlatformAdapter):
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
-            await self._add_reaction(chat_id, message_id, "\U0001f440")
+            async with reaction_operation(self, chat_id, message_id, start=True):
+                await self._add_reaction(chat_id, message_id, "\U0001f440")
 
     # base.on_processing_complete swaps 👀 for 👍/👎 (remove-then-add keeps the sidecar's
     # reaction-handle slot coherent); CANCELLED leaves it unreacted.
