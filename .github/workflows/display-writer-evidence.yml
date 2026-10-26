@@ -8,9 +8,6 @@ jobs:
   qualify:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      TMPDIR: ${{ runner.temp }}/display-fold-scratch
-      HERMES_HOME: ${{ runner.temp }}/hermes-test-home
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -22,7 +19,10 @@ jobs:
           version: '0.12.13'
       - name: Prepare isolated test environment
         run: |
+          export TMPDIR="$RUNNER_TEMP/display-fold-scratch"
+          export HERMES_HOME="$RUNNER_TEMP/hermes-test-home"
           mkdir -p "$TMPDIR" "$HERMES_HOME"
+          printf 'TMPDIR=%s\nHERMES_HOME=%s\n' "$TMPDIR" "$HERMES_HOME" >> "$GITHUB_ENV"
           uv python install 3.14.7
           uv run --no-project --python 3.14.7 python -m pm.build_env --source . --out .venv --group dev --group test
       - name: State regression suite
