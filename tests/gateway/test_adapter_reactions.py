@@ -25,7 +25,7 @@ async def test_unsupported_adapter_reactions_are_false():
 ])
 async def test_public_reaction_delivers_exact_target_and_reports_failure(monkeypatch, platform, class_name):
     monkeypatch.setenv(f"{platform.upper()}_REACTIONS", "false")
-    module_name = "gateway.platforms.signal" if platform == "signal" else f"plugins.platforms.{platform}.adapter"
+    module_name = f"plugins.platforms.{platform}.adapter"
     module = import_module(module_name)
     adapter = object.__new__(getattr(module, class_name))
     adapter.platform = SimpleNamespace(value=platform)
@@ -143,7 +143,7 @@ async def test_public_reaction_delivers_exact_target_and_reports_failure(monkeyp
 @pytest.mark.asyncio
 async def test_signal_inbound_id_and_author_are_usable_reaction_targets():
     from gateway.config import PlatformConfig
-    from gateway.platforms.signal import SignalAdapter
+    from plugins.platforms.signal.adapter import SignalAdapter
 
     config = PlatformConfig(extra={"account": "+15550002222"})
     adapter = SignalAdapter(config)

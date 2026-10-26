@@ -137,7 +137,7 @@ async def _command(runner, adapter, event, *, lane="inline"):
 @pytest.mark.parametrize("platform", [Platform.SLACK, Platform.TELEGRAM])
 @pytest.mark.parametrize("lane", ["inline", "background"])
 @pytest.mark.parametrize("command,key,value", [
-    ("/verbose", "tool_progress", "new"),
+    ("/verbose", "tool_progress", "verbose"),
     ("/busy queue", "busy_input_mode", "queue"),
     ("/footer", "footer", True),
 ])
