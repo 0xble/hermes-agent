@@ -44,7 +44,7 @@ const electronNative: TestProjectConfiguration = {
     // runner, so vitest's 5s default timed the Windows marker judge out.
     // Only these contracts need the Hermes test interpreter; resolving it may
     // sync the Python environment, which UI-only runs must not wait for.
-    globalSetup: ['./vitest.hermes-python.ts']
+    globalSetup: ['./vitest.hermes-python.ts', './vitest.electron-runtime.ts']
   }
 }
 
