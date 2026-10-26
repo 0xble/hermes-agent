@@ -474,6 +474,7 @@ class SignalAdapter(BasePlatformAdapter):
             (mt for prefix, mt in _MEDIA_TYPE_BY_MIME_PREFIX if any(m.startswith(prefix) for m in media_types)),
             MessageType.DOCUMENT)
         ts_ms = envelope_data.get("timestamp", 0)  # milliseconds since epoch
+        source.message_id = str(ts_ms) if ts_ms else None
         timestamp = datetime.now(tz=timezone.utc)
         if ts_ms:
             with suppress(ValueError, OSError):
@@ -481,7 +482,7 @@ class SignalAdapter(BasePlatformAdapter):
         # raw_message keeps sender + timestamp_ms so processing hooks can build sendReaction targets.
         event = MessageEvent(
             source=source, text=text or "", message_type=msg_type, media_urls=media_urls,
-            media_types=media_types, timestamp=timestamp,
+            media_types=media_types, timestamp=timestamp, message_id=str(ts_ms) if ts_ms else None,
             raw_message={"sender": sender, "timestamp_ms": ts_ms, "quote": quote_data if quote_data else None},
             reply_to_message_id=reply_to_id, reply_to_text=quote_data.get("text"),
             reply_to_author_id=reply_to_author,
@@ -925,7 +926,24 @@ class SignalAdapter(BasePlatformAdapter):
     async def _send_reaction_rpc(self, chat_id: str, params: Dict[str, Any]) -> bool:
         """Route a ``sendReaction`` RPC to *chat_id* (no UUID upgrade — author IDs come from the envelope)."""
         await self._with_target(params, chat_id, resolve=False)
-        return await self._rpc("sendReaction", params) is not None
+        result = await self._rpc("sendReaction", params)
+        return result is not None and self._validate_send_result(result)[0]
+
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        # Signal timestamps identify a target only together with its author.
+        author = routing.get("target_author") or routing.get("user_id")
+        if not author:
+            return False
+        try:
+            timestamp = int(message_id)
+            if timestamp <= 0:
+                return False
+            return await self.send_reaction(chat_id, emoji, author, timestamp)
+        except (TypeError, ValueError):
+            return False
+        except Exception as exc:
+            logger.debug("Signal: reaction add failed: %s", exc)
+            return False
 
     async def send_reaction(self, chat_id: str, emoji: str, target_author: str, target_timestamp: int) -> bool:
         """React to the message (author number/UUID, Signal ms timestamp) via signal-cli RPC."""
