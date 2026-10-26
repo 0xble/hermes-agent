@@ -620,3 +620,80 @@ async def test_typed_turn_at_the_call_ceiling_drops_typing_but_keeps_its_final_e
         adapter._bot.edit_message_text.assert_awaited()
     finally:
         reset_trigger(token)
+
+
+@pytest.mark.asyncio
+async def test_typed_tool_progress_survives_daily_pressure_without_restoring_typing(tmp_path):
+    from gateway.run_turn_runner import TurnRunner
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(adapter._daily_quota(), 10)
+    import queue
+
+    ctx = SimpleNamespace(source=SimpleNamespace(chat_id=CHAT), _progress_reply_to=None,
+                          _progress_metadata={"thread_id": "42"}, progress_queue=queue.Queue(),
+                          last_progress_msg=[None], repeat_count=[0])
+    runner = SimpleNamespace(_ctx=ctx, _track_progress_result=lambda result: None, _stream_consumer=lambda: None)
+    state = SimpleNamespace(adapter=adapter, _edit_accepts_metadata=True, progress_lines=[])
+    TurnRunner._progress_emit(runner, "Reading files")
+    TurnRunner._progress_absorb(runner, state, ctx.progress_queue.get_nowait())
+    TurnRunner._progress_emit(runner, "Reading files")
+    TurnRunner._progress_absorb(runner, state, ctx.progress_queue.get_nowait())
+    token = bind_trigger(SimpleNamespace(text="show me the tool progress"))
+    try:
+        sent = await TurnRunner._send_progress_text(runner, state, "Reading files")
+        assert sent.success
+        edited = await TurnRunner._edit_progress_message(runner, state, sent.message_id, "Reading files\nRunning checks")
+        assert edited.success and not (edited.raw_response or {}).get("skipped")
+        adapter._bot.send_message.assert_awaited_once()
+        adapter._bot.edit_message_text.assert_awaited_once()
+        await adapter.send_typing(CHAT)
+        adapter._bot.send_chat_action.assert_not_awaited()
+        assert adapter._daily_sheds(CHAT, OUTBOUND_PROGRESS)
+    finally:
+        reset_trigger(token)
+
+
+@pytest.mark.parametrize("trigger", ["goal", "loop", "cron", "untagged"])
+def test_background_tool_progress_keeps_daily_message_and_call_limits(tmp_path, trigger):
+    from gateway.platforms.base import OUTBOUND_TOOL_PROGRESS
+
+    quota = DailyQuota(soft_ceiling=10, call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(quota, 10)
+    for _ in range(10):
+        quota.record(CHAT, "sendMessage")
+    assert quota.sheds(CHAT, OUTBOUND_TOOL_PROGRESS, trigger)
+    assert not quota.sheds(CHAT, OUTBOUND_TOOL_PROGRESS, "typed")
+
+    import json
+    from gateway.outbox import _outbound_class_for_payload, _replay_outbound_class
+    with outbound_class(OUTBOUND_TOOL_PROGRESS):
+        payload = {"metadata": {"thread_id": "42"}, "_outbound_class": _outbound_class_for_payload({})}
+    replayed = _replay_outbound_class(json.loads(json.dumps(payload)))
+    assert replayed == OUTBOUND_TOOL_PROGRESS
+    assert quota.sheds(CHAT, replayed, trigger)
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_progress_still_sheds_at_daily_call_ceiling(tmp_path):
+    from gateway.run_turn_runner import TurnRunner
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(adapter._daily_quota(), 10)
+    runner = SimpleNamespace(_ctx=SimpleNamespace(source=SimpleNamespace(chat_id=CHAT),
+                            _progress_reply_to=None, _progress_metadata={"thread_id": "42"}),
+                            _track_progress_result=lambda result: None)
+    state = SimpleNamespace(adapter=adapter, _edit_accepts_metadata=True, progress_lines=[])
+    TurnRunner._progress_absorb(runner, state, "Thinking about the answer")
+    token = bind_trigger(SimpleNamespace(text="explain it"))
+    try:
+        sent = await TurnRunner._send_progress_text(runner, state, state.progress_lines[0])
+        assert sent.error == "daily_budget_shed"
+        adapter._bot.send_message.assert_not_awaited()
+        adapter._bot.edit_message_text.assert_not_awaited()
+    finally:
+        reset_trigger(token)

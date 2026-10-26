@@ -236,10 +236,10 @@ def _outbound_class_for_payload(payload: dict[str, Any]) -> str:
 
 def _replay_outbound_class(payload: dict[str, Any]) -> str:
     """Rebind replayed rows explicitly; legacy rows default to the protected final class."""
-    from gateway.platforms.base import OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS
+    from gateway.platforms.base import OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS, OUTBOUND_TOOL_PROGRESS
 
     kind = payload.get("_outbound_class")
-    if kind in {OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS}:
+    if kind in {OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS, OUTBOUND_TOOL_PROGRESS}:
         return kind
     metadata = payload.get("metadata")
     if isinstance(metadata, dict) and metadata.get("_interim_send"):
