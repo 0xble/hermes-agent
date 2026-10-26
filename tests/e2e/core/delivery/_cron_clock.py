@@ -572,6 +572,10 @@ class ReplicaHost:
 
 
 def _replica_main(control: Control) -> None:
+    import faulthandler
+    # A stalled peer must leave its stack in stderr before the parent's barrier
+    # deadline, so a failed contention test identifies the blocked phase.
+    faulthandler.dump_traceback_later(DEADLINE_SECONDS / 2, repeat=True)
     install(VirtualClock(control.clock_file), control)
     install_claim_barrier(control)
     provider = replica_scheduler()

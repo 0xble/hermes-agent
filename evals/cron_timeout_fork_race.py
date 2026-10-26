@@ -70,11 +70,20 @@ def main():
         owned = psutil.Process().children(recursive=True)
         try:
             ids = json.loads(marker.read_text(encoding="utf-8"))
-            for pid in ids:
-                try:
-                    states[pid] = psutil.Process(pid).status()
-                except psutil.NoSuchProcess:
-                    states[pid] = "gone"
+            # SIGKILL delivery is asynchronous. Observe exit, rather than racing
+            # the kernel immediately after the parent has been reaped.
+            deadline = time.monotonic() + 2
+            while True:
+                for pid in ids:
+                    try:
+                        states[pid] = psutil.Process(pid).status()
+                    except psutil.NoSuchProcess:
+                        states[pid] = "gone"
+                if all(state in ("gone", psutil.STATUS_ZOMBIE) for state in states.values()):
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.005)
             print(json.dumps({"result": result, "elapsed": elapsed, "states": states,
                               "real_snapshot_sizes": schedules}), flush=True)
             assert result[1].startswith("Script timed out after 2s:"), result

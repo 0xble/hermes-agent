@@ -150,8 +150,14 @@ async def test_complete_preview_survives_long_flood_fallback_failure(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_telegram_long_flood_result_keeps_retry_after():
+async def test_telegram_long_flood_result_keeps_retry_after(monkeypatch):
     """The real adapter contract preserves the server delay for consumers."""
+    import asyncio
+
+    # Deadline arithmetic at an arbitrary clock epoch can add float noise.
+    # Control the epoch so this test asserts the exact advertised server delay.
+    monkeypatch.setattr(asyncio.get_running_loop(), "time", lambda: 100.0)
+
     class FloodError(Exception):
         retry_after = 30.0
 

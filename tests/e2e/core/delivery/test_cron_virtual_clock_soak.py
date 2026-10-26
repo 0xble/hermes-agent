@@ -667,9 +667,14 @@ def test_two_replicas_contend_for_every_fire(soak_env):
             peer.request(rnd, job_id)
 
             def both_claimed():
+                peer._check()
                 return [c for c in H.read_jsonl(control.claims) if c["round"] == rnd][1:]
 
-            H.wait_until(both_claimed, f"round {rnd}: both replicas' claim outcome")
+            try:
+                H.wait_until(both_claimed, f"round {rnd}: both replicas' claim outcome")
+            except AssertionError as exc:
+                details = (control.replica / "stderr.log").read_text(encoding="utf-8")
+                raise AssertionError(f"{exc}\nReplica stderr:\n{details[-8000:]}") from exc
             entered = control.gates / f"{name}.entered"
             H.wait_until(entered.exists, f"round {rnd}: the winner's run to start")
             hold.unlink()

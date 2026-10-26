@@ -865,7 +865,7 @@ def test_prepare_venv_identical_lock_still_builds_in_place(tmp_path, monkeypatch
     assert called == [new]
 
 
-def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
+def test_retention_protects_real_process_cwd_and_receipt(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     release_paths = [home / "releases" / str(i) for i in range(9)]
     for i, path in enumerate(release_paths):
@@ -890,6 +890,11 @@ def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
             time.sleep(.02)
         else:
             pytest.fail("worker did not publish its release cwd before retention")
+        # Test this owned worker's real identity. Unrelated unreadable processes
+        # correctly pin every release, covered by the separate fail-closed test.
+        process_iter = psutil.process_iter
+        monkeypatch.setattr(psutil, "process_iter", lambda attrs: (
+            proc for proc in process_iter(attrs) if proc.pid == worker.pid))
         assert release_paths[0].resolve() in releases._live_process_pins(home)
         removed = releases.retain(home)
         assert release_paths[0].exists() and release_paths[1].exists()
