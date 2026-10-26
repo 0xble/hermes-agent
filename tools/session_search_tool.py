@@ -704,7 +704,11 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int =
         return tool_error(f"Search failed: {exc}", success=False)
     finally:
         for owned_db in reversed(owned_dbs):
-            _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
+            # Cleanup must not discard a finished result: _quiet re-raises sqlite errors for reads.
+            try:
+                release_or_close(owned_db)
+            except Exception:
+                logging.debug("Failed to close session_search SessionDB", exc_info=True)
 
 
 def check_session_search_requirements() -> bool:

@@ -103,7 +103,7 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     # (possibly wrapped for a dashboard sidecar), rather than a headless fallback sink.
     if (evt.get("type") == "async_delegation" and evt.get("startup_replay")
             and not (_session_has_live_transport(session)
-                     or (_stdio_is_rpc_channel and session.get("transport") is _stdio_transport))):
+                     or (_stdio_is_rpc_channel and _session_transport_contains(session, _stdio_transport)))):
         return False
     if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
         return True

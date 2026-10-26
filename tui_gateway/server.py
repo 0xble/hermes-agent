@@ -1378,7 +1378,12 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             # App-global backends multiplex profiles: prefer the live session's own home.
             profile = profile_name_for_home(sess.get("profile_home")) or profile
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
-            identity = getattr(sess.get("transport"), "auth_identity", None)
+            transport = sess.get("transport")
+            peers = transport.transports() if isinstance(transport, FanoutTransport) else [transport]
+            # Sessions publish through a fan-out mailbox; the authenticated identity lives on a peer.
+            identity = next((getattr(peer, "auth_identity", None) for peer in peers
+                             if _methods_browser_control._is_authenticated_identity(
+                                 getattr(peer, "auth_identity", None))), None)
             if _methods_browser_control._is_authenticated_identity(identity):
                 browser_control_principal = _methods_browser_control._principal_digest(identity)
                 browser_control_transport_family = _methods_browser_control._CLOUD_TRANSPORT_FAMILY

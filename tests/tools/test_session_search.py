@@ -302,6 +302,23 @@ class TestBrowseShape:
         assert result["success"] is True
         assert db.released == 1
 
+    def test_failed_release_keeps_the_finished_result(self, monkeypatch):
+        import sqlite3
+
+        class _DB:
+            def list_recent_sessions_bounded(self, **_kwargs):
+                return []
+
+        def _release(_db):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr("tools.session_search_tool._open_current_db", lambda: _DB())
+        monkeypatch.setattr("hermes_state_registry.release_or_close", _release)
+
+        result = json.loads(session_search())
+
+        assert result["success"] is True
+
     def test_cross_profile_database_is_closed_but_shared_database_is_not(
         self, monkeypatch
     ):

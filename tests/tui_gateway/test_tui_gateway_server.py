@@ -5784,11 +5784,13 @@ def test_claim_or_reuse_live_winner_cancels_pending_reap(monkeypatch):
         server._pending_ws_reaps.pop("winner-sid", None)
 
 
-def test_superseded_runtime_finalized_without_reclaimed_broadcast(monkeypatch):
+@pytest.mark.parametrize("parked", ["legacy_sentinel", "empty_mailbox"])
+def test_superseded_runtime_finalized_without_reclaimed_broadcast(monkeypatch, parked):
     """When a resume mints a fresh runtime for a stored id whose prior runtime
-    is sentinel-parked, the old record is finalized quietly with end_reason
+    is parked, the old record is finalized quietly with end_reason
     superseded_by_resume — no session.reclaimed broadcast, and its pending
-    reap Timer is cancelled (storm killer, part 2)."""
+    reap Timer is cancelled (storm killer, part 2). Live sessions park as an
+    empty fan-out mailbox; the disconnected-WS sentinel is the legacy shape."""
     cancelled = []
     broadcasts = []
     torn_down = []
@@ -5818,10 +5820,12 @@ def test_superseded_runtime_finalized_without_reclaimed_broadcast(monkeypatch):
     monkeypatch.setattr(server, "_register_session_cwd", lambda _s: None)
 
     old_agent = types.SimpleNamespace(session_id="stored-super")
+    parked_transport = (server._detached_ws_transport if parked == "legacy_sentinel"
+                        else server.FanoutTransport())
     old = _session(
         agent=old_agent,
         session_key="stored-super",
-        transport=server._detached_ws_transport,
+        transport=parked_transport,
         running=False,
     )
     server._sessions["old-sid"] = old

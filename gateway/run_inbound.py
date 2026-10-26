@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import inspect
 import concurrent.futures
 import dataclasses
 import json
@@ -1453,9 +1454,26 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 from hermes_cli.plugins import get_plugin_command_handler
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
-                    started, result = await self._invoke_loop_wake_effect(
-                        event, self._hm_run_plugin_handler, plugin_handler, event, source,
-                    )
+                    async def _fenced(call, is_coroutine):
+                        # Enter the effect through the loop-wake fence with no await between the
+                        # check and the handler; a sync handler is re-fenced inside its worker.
+                        if is_coroutine:
+                            return await self._invoke_loop_wake_effect(event, call)
+                        started, result = await self._run_in_executor_with_context(
+                            self._invoke_loop_wake_sync_effect, event, call)
+                        if started and inspect.isawaitable(result):
+                            pending = result
+
+                            async def _await_pending():
+                                return await pending
+
+                            started, result = await self._invoke_loop_wake_effect(event, _await_pending)
+                            if not started and asyncio.iscoroutine(pending):
+                                pending.close()
+                        return started, result
+
+                    started, result = await self._hm_run_plugin_handler(
+                        plugin_handler, event, source, invoke=_fenced)
                     if not started:
                         return _CommandDispatch.SUPPRESSED, None, command
                     return True, result, command

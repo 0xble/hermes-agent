@@ -263,12 +263,18 @@ class GatewayInboundHooksMixin:
         return False, None, command
 
     async def _hm_run_plugin_handler(
-        self, plugin_handler, event: MessageEvent, source: SessionSource, session_entry=None, args=None
+        self, plugin_handler, event: MessageEvent, source: SessionSource, session_entry=None, args=None,
+        *, invoke=None,
     ) -> Optional[str]:
         """Run a resolved plugin command handler for *source* → its reply text or None; raises what
         the handler raises (``gateway/session_commands.py`` resolves the exact registered name).
         *args* is the argument as typed (a local session's command); otherwise the message's
-        command arguments, with the messaging dash repair of ``get_command_args``."""
+        command arguments, with the messaging dash repair of ``get_command_args``.
+
+        *invoke* wraps the handler call itself: ``async invoke(call, is_coroutine) -> (started,
+        result)``. A loop wake passes its execution fence there, so every await before the handler
+        (the session lookup) happens before the fence is checked, never between check and effect.
+        With *invoke*, the return is ``(started, reply)``."""
         # The agent-turn path binds HERMES_SESSION_* via _set_session_env; this dispatch
         # sits before it, so a handler reading get_session_env() would see an empty or a
         # foreign (cron agent's os.environ) session (#108698). A local session's command
@@ -296,6 +302,9 @@ class GatewayInboundHooksMixin:
         # ctx.ask_choice asks it with the clarify prompt.
         with (self._session_env_scope(_plugin_context), bind_live_source(source),
               chat_choices(self, source, self._session_key_for_source(source))):
+            if invoke is not None:
+                started, result = await invoke(call, inspect.iscoroutinefunction(plugin_handler))
+                return started, (str(result) if result else None)
             if inspect.iscoroutinefunction(plugin_handler):
                 result = await call()
             else:

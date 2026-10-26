@@ -45,7 +45,11 @@ def _session(notification_env, monkeypatch, kind):
     monkeypatch.setattr(server, "_stdio_transport", stdio)
     monkeypatch.setattr(server, "_stdio_is_rpc_channel", kind == "stdio")
     transport = {"stdio": stdio, "websocket": WSTransport(None, loop),
-                 "detached": server._detached_ws_transport}[kind]
+                 "detached": server._detached_ws_transport,
+                 # Live sessions publish through a fan-out mailbox around their peer.
+                 "stdio_mailbox": server._new_session_publisher(stdio)}[kind]
+    if kind == "stdio_mailbox":
+        monkeypatch.setattr(server, "_stdio_is_rpc_channel", True)
     session = {"session_key": "chat", "transport": transport, "profile_home": str(home),
                "history_lock": threading.RLock(), "running": False, "_finalized": False}
     server._sessions["ui1"] = session
@@ -83,6 +87,7 @@ def _completion(home, *, via):
     ("detached", "startup", False),  # the reported shape: no client, lease survived the restart
     ("websocket", "startup", True),  # live WS peer
     ("stdio", "startup", True),      # this process's real TUI stdio RPC channel
+    ("stdio_mailbox", "startup", True),  # the same channel inside the session's fan-out mailbox
     ("detached", "sweep", True),     # in-process orphan sweep keeps its routing
 ])
 def test_startup_replay_requires_a_live_consumer(notification_env, monkeypatch, kind, via, owns):
