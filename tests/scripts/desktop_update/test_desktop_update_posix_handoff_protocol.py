@@ -41,10 +41,11 @@ MARKER_SH = POSIX.with_name("marker.sh")
 
 
 def _proc_is_live(stat_path: Path) -> bool:
-    # /proc can disappear between checking existence and reading the state.
+    # /proc can disappear between checking existence and reading the state. Linux reports a
+    # process that exits mid-read as ESRCH (ProcessLookupError) rather than ENOENT.
     try:
         state = stat_path.read_text(encoding="utf-8").rsplit(") ", 1)[1][:1]
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     return state != "Z"
 
@@ -65,6 +66,14 @@ def test_proc_is_live_preserves_states_and_handles_disappearance(tmp_path, monke
         patch.setattr(Path, "read_text", disappearing_read)
         assert _proc_is_live(stat) is False
     assert _proc_is_live(stat) is False
+
+
+def test_proc_is_live_treats_a_process_exiting_mid_read_as_gone(tmp_path, monkeypatch):
+    def exiting_read(path, **kwargs):
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(Path, "read_text", exiting_read)
+    assert _proc_is_live(tmp_path / "stat") is False
 
 
 @pytest.mark.parametrize("error", [PermissionError, OSError])
