@@ -16,7 +16,7 @@ from agent import session_activity
 import gateway.run as gateway_run
 from gateway.run import GatewayRunner, _watch_gateway_turn_inactivity
 from gateway.session_state import TurnState
-from gateway.turn_context import TurnContext
+from gateway.turn_context import TurnContext, TurnWorker
 
 TIMEOUT_S = 1800.0
 SLEEP_S = 2000.0
@@ -110,9 +110,9 @@ async def test_turn_poll_loop_ignores_host_sleep(clock, monkeypatch):
     monkeypatch.setattr(asyncio, "wait", _poll_without_waiting)
     monkeypatch.setattr(
         gateway_run, "_abandon_timed_out_gateway_turn", lambda **_kw: fired_at_read.append(agent.reads))
-    worker = GatewayRunner._RunAgentWorker(
+    worker = TurnWorker(
         agent_timeout=TIMEOUT_S, agent_warning=900.0, task_id="t", process_baseline=None,
-        worker_done=threading.Event(), timeout_fired=threading.Event(),
+        worker_done=threading.Event(), turn_done=threading.Event(), timeout_fired=threading.Event(),
         cleanup_lock=threading.Lock(), is_current=lambda: True)
     worker.executor_task = object()
 

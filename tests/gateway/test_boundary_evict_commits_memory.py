@@ -79,6 +79,10 @@ def test_evicts_with_nothing_to_notify_only_release(monkeypatch):
     runner._evict_cached_agent_at_boundary('route')
     assert calls == [('release', None)]
     calls.clear()
+    # A fresh agent: soft release is claimed once per agent instance (#709), so re-evicting the
+    # agent released above would correctly be a no-op rather than exercise the resource evict.
+    agent = _agent(calls)
+    agent._memory_manager = None
     agent.context_compressor = MagicMock()
     runner._agent_cache['route'] = (agent, 'sig')
     runner._evict_cached_agent('route')
