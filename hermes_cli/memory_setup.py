@@ -409,9 +409,12 @@ def cmd_status(args) -> None:
                 print("  Status:    available ✓")
             else:
                 print("  Status:    not available ✗")
+                reason = getattr(provider, "unavailable_reason", lambda: "")()
+                if reason:
+                    print(f"  Reason:    {reason}")
                 # All fields with env_var (secret and non-secret)
                 required_fields = [f for f in _schema_of(provider) if f.get("env_var")]
-                if required_fields:
+                if required_fields and not reason:
                     print("  Missing:")
                     for f in required_fields:
                         env_var = f.get("env_var", "")
@@ -421,8 +424,9 @@ def cmd_status(args) -> None:
                         if url and not is_set:
                             line += f"  → {url}"
                         print(line)
-                print("  Note: systemd/gateway services do not inherit ~/.hermes/.env —")
-                print("        set any variables above in the service environment.")
+                if not reason:
+                    print("  Note: systemd/gateway services do not inherit ~/.hermes/.env —")
+                    print("        set any variables above in the service environment.")
         else:
             print("\n  Plugin:    NOT installed ✗")
             install = _catalog_install_hint(provider_name)
