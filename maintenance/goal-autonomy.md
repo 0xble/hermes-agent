@@ -2,7 +2,7 @@
 
 ## Contract And Source Ownership
 
-Fork patch identity: `goal-autonomy`.
+Fork patch identities: `goal-autonomy`, `background-turn-admission`.
 
 `goals.autonomy` defaults to `false`. The existing judge, approval and continuation
 behavior remains the default. When explicitly enabled, native goal management
@@ -90,6 +90,11 @@ legacy migration, profile selection, and default-off behavior. Historical prompt
 classification runs in `tests/agent/test_synthetic_prompt_legacy_goals.py`.
 The companion plugin tests drive the registered goal_set handler through the
 native managers and durable readbacks.
+
+The preserved Meridian runtime carries the `background-turn-admission` fixture
+correction for restart-resume identity coverage. Its ownership covers only the
+native lazy session-state fixture, not a new admission implementation. Control
+receipt regressions exercise the shipped `goals.notices` switch in both states.
 
 Default-install worktrees can place their shared Git metadata inside the real
 Hermes home. Startup recovery must apply its existing pytest checkout exclusion
