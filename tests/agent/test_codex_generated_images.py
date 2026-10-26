@@ -76,6 +76,22 @@ def test_completed_image_does_not_hide_text_or_function_calls():
     assert message.tool_calls[0].function.name == "test_tool"
 
 
+def test_corrupt_png_checksum_does_not_hide_usable_text():
+    item = _image_item()
+    raw = bytearray(base64.b64decode(item.result))
+    data_index = raw.index(b"IDAT")
+    chunk_size = int.from_bytes(raw[data_index - 4:data_index], "big")
+    raw[data_index + 4 + chunk_size] ^= 1
+    item.result = base64.b64encode(raw).decode("ascii")
+    text = NS(type="message", status="completed", phase="final_answer", role="assistant",
+              content=[NS(type="output_text", text="Priya leads the company.")])
+    message, finish = _normalize_codex_response(_response(item, text))
+    assert finish == "stop"
+    assert "could not attach" in message.content
+    assert "Priya leads the company." in message.content
+    assert "MEDIA:" not in message.content
+
+
 def test_image_cache_failure_is_truthful_not_empty(monkeypatch):
     from agent import provider_media
 

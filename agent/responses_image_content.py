@@ -31,7 +31,7 @@ def generated_image_content(item: Any) -> str:
         path = provider_media.save_bytes(
             "generated/images", raw, prefix="responses", extension=extension,
         )
-    except (binascii.Error, ValueError, OSError, Image.DecompressionBombError) as exc:
+    except (binascii.Error, ValueError, OSError, SyntaxError, Image.DecompressionBombError) as exc:
         # Provider payloads and filesystem exception text can contain private data.
         logger.warning("Could not attach Responses image (%s).", type(exc).__name__)
         return "The provider returned an image-generation result, but Hermes could not attach the image."
