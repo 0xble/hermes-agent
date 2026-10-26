@@ -79,7 +79,19 @@ _DISPLAY_IDENTITY_INDEX_SQL = ("SELECT id, display_identity, display_order FROM 
 _DISPLAY_BACKFILL_INDEX_SQL = ("SELECT id, display_identity, display_order FROM messages "
                               "INDEXED BY idx_messages_display_backfill WHERE session_id = ? "
                               "AND (display_order IS NULL OR display_identity IS NULL)" + _VISIBLE)
-_SET_DISPLAY_FOLD_SQL = "UPDATE messages SET display_order = ?, display_identity = ? WHERE id = ?"
+
+
+def _apply_display_updates(conn, updates):
+    # One SQLite step per page, not per UPDATE. Bound parameters below the legacy
+    # 999-variable limit. UPDATE FROM preserves BLOB identities without JSON/text coercion.
+    for start in range(0, len(updates), 200):
+        page = updates[start:start + 200]
+        values = ",".join("(?,?,?)" for _ in page)
+        cursor = conn.execute(
+            "UPDATE messages SET display_order = repairs.column1, display_identity = repairs.column2 "
+            f"FROM (VALUES {values}) AS repairs WHERE messages.id = repairs.column3",
+            tuple(value for row in page for value in row))
+        add_write_rows("display_reconciled", cursor.rowcount)
 
 
 class _FoldPlan(dict[int, tuple[bytes | None, bytes, int | None]]):
@@ -223,8 +235,9 @@ class DisplayFoldMixin:
             uid_identity: dict[str, bytes] = {}
             last_id = 0
             while True:
-                # Streams: this no-plan fallback must retain identities, not a page of payloads.
-                rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
+                # Bound payload materialization like the off-lock plan. Streaming a row at a
+                # time releases/reacquires the GIL for every retained historical message.
+                rows = fold_rows(conn, _DISPLAY_PLAN_PAGE_SQL, (session_id, last_id), _CARRIER_FOLD_COLUMNS)
                 batch_start = last_id
                 updates = []
                 for row in rows:
@@ -235,11 +248,9 @@ class DisplayFoldMixin:
                     order = first_id.setdefault(identity, min(last_id, kept) if kept is not None else last_id)
                     if order != row["display_order"] or identity != row["display_identity"]:
                         updates.append((order, identity, last_id))
-                rows.close()
                 if last_id == batch_start:
                     break
-                cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
-                add_write_rows("display_reconciled", cursor.rowcount)
+                _apply_display_updates(conn, updates)
 
     def _resolve_display_identities(self, conn, visible, plan):
         """Stored equality validates payload reuse, not membership or presentation metadata."""
@@ -248,9 +259,10 @@ class DisplayFoldMixin:
         fresh: dict[int, bytes] = {}
         add_write_rows("display_stale", len(stale))
         with write_phase("display_stale_decode"):
-            for start in range(0, len(stale), 500):
-                chunk = stale[start:start + 500]
-                for row in conn.execute(f"{_CARRIER_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})", chunk):
+            for start in range(0, len(stale), 200):
+                chunk = stale[start:start + 200]
+                for row in fold_rows(conn, f"{_CARRIER_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})",
+                                     chunk, _CARRIER_FOLD_COLUMNS):
                     identity = self._display_identity(self._display_dedupe_key(row))
                     if row["message_uid"] and row["_compressed_summary"]:
                         original = conn.execute(
@@ -281,8 +293,7 @@ class DisplayFoldMixin:
                 updates.append((folded, identity, row_id))
         if updates:
             with write_phase("display_updates"):
-                cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
-                add_write_rows("display_reconciled", cursor.rowcount)
+                _apply_display_updates(conn, updates)
 
     @timed_write_phase("display_freshness")
     def _begin_display_fold(self, conn, plan):
@@ -306,10 +317,10 @@ class DisplayFoldMixin:
             return
         for start in range(0, len(row_ids), 500):
             chunk = row_ids[start:start + 500]
-            rows = list(conn.execute(
+            rows = one_step_rows(conn,
                 "SELECT id, display_identity, display_order FROM messages "
                 f"WHERE session_id = ? AND id IN ({_placeholders(chunk)})" + _VISIBLE,
-                (session_id, *chunk)))
+                (session_id, *chunk), ("id", "display_identity", "display_order"))
             add_write_rows("display_preimage_rows", len(rows))
             identities = self._resolve_display_identities(conn, rows, selection.plan)
             selection.keys.update(identities.values())
@@ -352,23 +363,24 @@ class DisplayFoldMixin:
 
         # Actual stored values, not input dict keys or copied raw clone identities.
         with write_phase("display_new_enumerate", thread_cpu=True):
-            rows = list(conn.execute(
+            rows = one_step_rows(conn,
                 "SELECT id, display_identity, display_order FROM messages "
                 "INDEXED BY idx_messages_session_id WHERE session_id = ? AND id > ?" + _VISIBLE,
-                (session_id, selection.insert_after)))
+                (session_id, selection.insert_after), ("id", "display_identity", "display_order"))
             add_write_rows("display_new_rows", len(rows))
             include(rows)
         with write_phase("display_backfill_enumerate", thread_cpu=True):
-            rows = list(conn.execute(_DISPLAY_BACKFILL_INDEX_SQL, (session_id,)))
+            rows = one_step_rows(conn, _DISPLAY_BACKFILL_INDEX_SQL, (session_id,),
+                                 ("id", "display_identity", "display_order"))
             add_write_rows("display_backfill_rows", len(rows))
             include(rows)
         with write_phase("display_identity_enumerate", thread_cpu=True):
             while pending:
                 batch = [pending.pop() for _ in range(min(500, len(pending)))]
                 queried.update(batch)
-                rows = list(conn.execute(
+                rows = one_step_rows(conn,
                     _DISPLAY_IDENTITY_INDEX_SQL + f" AND display_identity IN ({_placeholders(batch)})",
-                    (session_id, *batch)))
+                    (session_id, *batch), ("id", "display_identity", "display_order"))
                 add_write_rows("display_identity_rows", len(rows))
                 include(rows)
         with write_phase("display_materialize", thread_cpu=True):
