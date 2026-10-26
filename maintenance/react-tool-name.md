@@ -12,7 +12,7 @@ Upstream inspected at `e5f2b15300a3d04978e4c07cc64adc7bcf8e7b1c` still registers
 
 ## Verification
 
-Run `scripts/run_tests.sh tests/tools/test_react_tool.py tests/tools/test_reaction_session_identity.py tests/tools/test_display_toggles.py tests/tui_gateway/test_gui_surface_toolsets.py tests/hermes_cli/test_shared_metrics_signals.py tests/hermes_cli/test_shared_metrics_harness.py tests/hermes_cli/test_shared_metrics_efficiency.py`. Run the desktop turn-activity and render-weight tests for current and historical tool names. Regenerate gateway contracts and prompt-surface snapshots with the repository generators.
+Run `scripts/run_tests.sh tests/gateway/test_session_policy.py tests/tools/test_react_tool.py tests/tools/test_reaction_session_identity.py tests/tools/test_display_toggles.py tests/tui_gateway/test_gui_surface_toolsets.py tests/hermes_cli/test_shared_metrics_signals.py tests/hermes_cli/test_shared_metrics_harness.py tests/hermes_cli/test_shared_metrics_efficiency.py`. Run the desktop turn-activity and render-weight tests for current and historical tool names. Regenerate gateway contracts and prompt-surface snapshots with the repository generators.
 
 ## Rollback and Retirement
 
