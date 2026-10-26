@@ -606,6 +606,12 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
     from hermes_state import SessionDB
     from hermes_state_search_runtime import search_operation, search_stage
 
+    after_ts = before_ts = None
+    if not (isinstance(session_id, str) and session_id.strip()) and isinstance(query, str) and query.strip():
+        try:
+            after_ts, before_ts = _parse_iso_bound(after), _parse_iso_bound(before)
+        except ValueError as e:
+            return tool_error(str(e), success=False)
     filters = dict(role_filter=role_filter, after=after, before=before,
                    exclude_session_ids=exclude_session_ids, detail=detail, limit=limit)
     scope = (search_operation(db, caller="session_search tool", query=query, sort=sort, filters=filters)
@@ -624,10 +630,6 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
                 result = _list_recent_sessions(db, _clamp_int(limit, 3, 1, 10), current_session_id, link_profile=profile)
             else:
                 sort_norm = sort.strip().lower() if isinstance(sort, str) else None
-                try:
-                    after_ts, before_ts = _parse_iso_bound(after), _parse_iso_bound(before)
-                except ValueError as e:
-                    return tool_error(str(e), success=False)
                 return _discover(
                     db=db, query=query.strip(), limit=_clamp_int(limit, 3, 1, 10),
                     sort=sort_norm if sort_norm in ("newest", "oldest") else None,
