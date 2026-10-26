@@ -405,7 +405,8 @@ def test_allocation_lock_is_released_once_xvnc_claims_the_number(in_process_runt
     # X lock at once, env file only much later: the lock must be free in between.
     (scratch / "launcher.sh").write_text(
         '#!/usr/bin/env bash\necho $$ > "$HERMES_BD_XLOCK_DIR/.X${HERMES_BD_DISPLAY_NUM}-lock"\n'
-        'sleep 1.5\n: > "$HERMES_BD_SOCKET"\nprintf \'DISPLAY=:%s\\n\' "$HERMES_BD_DISPLAY_NUM" > "$HERMES_BD_ENV_FILE"\nsleep 30\n',
+        'sleep 1.5\n: > "$HERMES_BD_SOCKET"\nprintf \'DISPLAY=:%s\\n\' "$HERMES_BD_DISPLAY_NUM" > "$HERMES_BD_ENV_FILE.tmp"\n'
+        'mv "$HERMES_BD_ENV_FILE.tmp" "$HERMES_BD_ENV_FILE"\nsleep 30\n',
         encoding="utf-8")
     seen: dict = {}
 
