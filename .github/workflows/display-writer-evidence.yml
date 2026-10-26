@@ -1,0 +1,44 @@
+name: Display Writer Hold Evidence
+on:
+  push:
+    branches: [perf/db-lock-hold-evidence]
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TMPDIR: ${{ runner.temp }}/display-fold-scratch
+      HERMES_HOME: ${{ runner.temp }}/hermes-test-home
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ce23aafa20c6acfd6a2ac00508efbba6d72dab2c
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: '0.12.13'
+      - name: Prepare isolated test environment
+        run: |
+          mkdir -p "$TMPDIR" "$HERMES_HOME"
+          uv python install 3.14.7
+          uv run --no-project --python 3.14.7 python -m pm.build_env --source . --out .venv --group dev --group test
+      - name: State regression suite
+        env:
+          HERMES_PYTHON: ${{ github.workspace }}/.venv/bin/python
+        run: scripts/run_tests.sh tests/hermes_state -q
+      - name: Load benchmark smoke
+        if: always()
+        run: .venv/bin/python scripts/bench_display_writer_hold.py --baseline 82cfb861e2b6487c7b92f0fef4b3d7780a599572 --rows 40 --rounds 1 --output evidence/smoke.json
+      - name: Alternating 100-pair load benchmark
+        if: always()
+        run: .venv/bin/python scripts/bench_display_writer_hold.py --baseline 82cfb861e2b6487c7b92f0fef4b3d7780a599572 --rows 400 --rounds 100 --output evidence/p99.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: display-writer-hold-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 7
