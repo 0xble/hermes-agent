@@ -10,7 +10,7 @@ import pytest
 from gateway.config import Platform
 from gateway.update_notifications import _failure_cause, final_outcome
 from tests.gateway.update_fixtures import (
-    RELEASE, SOURCE, _make_runner, _release, fail_immutable_update, finalize_update, pending,
+    RELEASE, SOURCE, _make_runner, _release, fail_immutable_update, finalize_update, immutable_source, pending,
 )
 from tests.hermes_cli.test_update_target_identity import update_tree  # fixture
 
@@ -41,12 +41,17 @@ def notification_checkout(tmp_path, monkeypatch):
 async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
     tmp_path, immutable, exit_code, stop_reason,
 ):
+    from tests.hermes_cli.test_update_target_identity import git
+
     data = pending(tmp_path, reason=False)
     data["updating_notified"] = True
     (tmp_path / ".update_pending.json").write_text(json.dumps(data))
+    expected_sha = SOURCE
     if immutable:
-        _release(tmp_path)
-        fail_immutable_update(tmp_path)
+        source = immutable_source(tmp_path)
+        expected_sha = git(source, "rev-parse", "HEAD")
+        _release(tmp_path, sha=expected_sha)
+        fail_immutable_update(tmp_path, source)
     else:
         finalize_update(tmp_path, outcome="failed", noop=True)
     path = tmp_path / "logs" / "update_receipts" / "latest.json"
@@ -63,7 +68,7 @@ async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
 
     text = adapter.send.call_args.args[1]
     assert text.startswith("❌ Update Failed\n\nNothing changed. Still on ")
-    assert (RELEASE if immutable else SOURCE)[:12] in text
+    assert expected_sha[:12] in text
     assert "Cause:" in text and len(text.splitlines()[-1]) < 400
     assert "Traceback" not in text and "RuntimeError" not in text
     assert "unverified" not in text
@@ -306,7 +311,7 @@ def test_immutable_build_failure_has_untouched_source_proof(update_tree, tmp_pat
 
     home = tmp_path / "home"
     home.mkdir()
-    release = _release(home)
+    release = _release(home, sha=update_tree.base)
     source = update_tree.clone
     if dirty:
         (source / "content.txt").write_text("local edits\n")
@@ -319,7 +324,7 @@ def test_immutable_build_failure_has_untouched_source_proof(update_tree, tmp_pat
     assert git(source, "status", "--porcelain") == before
     assert git(source, "rev-parse", "HEAD") == update_tree.base
     assert final_outcome(home, request) == (
-        False, f"Nothing changed. Still on {RELEASE[:12]}. Cause: candidate build failed",
+        False, f"Nothing changed. Still on {release.name[:12]}. Cause: candidate build failed",
     )
     receipt["steps"].append({"name": "immutable_source_untouched", "ok": False})
     latest = home / "logs/update_receipts/latest.json"
@@ -450,17 +455,12 @@ def test_immutable_notice_checks_recovery_in_journal_bound_source(
     from hermes_cli import update_host_obligation as obligation
     from hermes_cli._early_recovery import interrupted_pull_marker
     from hermes_cli.venv_sync import completion_pending_path
+    from tests.hermes_cli.test_update_target_identity import git
 
     # Start fresh rather than reinitializing the autouse fixture's synthetic gitdir.
     # A real source identity keeps the immutable resolver's git validation in the test.
-    source = tmp_path / "immutable-source"
-    subprocess.run(["git", "-c", "init.defaultBranch=main", "init", str(source)],
-                   check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c",
-                    "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
-                    "commit", "--allow-empty", "-m", "source"],
-                   check=True, capture_output=True)
-    release = _release(tmp_path)
+    source = immutable_source(tmp_path)
+    release = _release(tmp_path, sha=git(source, "rev-parse", "HEAD"))
     (tmp_path / "release-layout.json").write_text(json.dumps({"source": str(source)}))
     monkeypatch.setattr("gateway.update_notifications.__file__", str(release / "gateway" / "update_notifications.py"))
     # The updater runs from the source, while the gateway imports its release copy.
@@ -475,7 +475,7 @@ def test_immutable_notice_checks_recovery_in_journal_bound_source(
     }
     owed = markers[marker]
     if marker == "host":
-        assert obligation.write_host_obligation(expected_sha=RELEASE)
+        assert obligation.write_host_obligation(expected_sha=release.name)
         assert owed.is_file()
         assert not (tmp_path / "fleet_restart_pending").exists()
         assert not markers["legacy_host"].exists()
@@ -493,5 +493,5 @@ def test_immutable_notice_checks_recovery_in_journal_bound_source(
 
     owed.unlink()
     assert final_outcome(tmp_path, data) == (
-        False, f"Nothing changed. Still on {RELEASE[:12]}. Cause: candidate build failed",
+        False, f"Nothing changed. Still on {release.name[:12]}. Cause: candidate build failed",
     )
