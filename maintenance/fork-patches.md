@@ -28,6 +28,13 @@ passes on the selected upstream release without the local implementation.
 | Backup and state | `tests/hermes_cli/test_backup.py`, `scripts/schema_rehearsal.py` | Adopted backup fixes plus local integrity/rehearsal tooling. Verify on copies, including fork-only rows. |
 | Maintenance tooling | `scripts/{sync_fork_candidate,check_fork_patches,install_candidate_extensions}.py`, `scripts/rollback_fork_runtime.sh` | Fork-specific tooling, not an upstream runtime feature. Exercise rollback failure recovery and native update receipt checks before promotion. |
 
+The intentional-reaction identity is `gateway-intentional-message-reactions`.
+The same unit also owns identity `intentional-reactions` for the lifecycle
+follow-up series. `tests/gateway/test_reaction_lifecycle_ownership.py` verifies
+that confirmed explicit reactions on Signal, Telegram and Photon survive status
+completion, including repeated completion and in-flight delivery. Failed or
+unrelated reactions retain existing status behavior and enablement settings.
+
 For rows without a linked contribution, no upstream submission is recorded here.
 Reassess the contribution route when changing that behavior rather than treating
 absence of a submission as evidence that upstream lacks it. Source rollback is a
