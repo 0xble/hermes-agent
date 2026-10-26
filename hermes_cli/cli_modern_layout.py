@@ -288,12 +288,19 @@ def top_rule_fragments(cli) -> list:
     busy = getattr(cli, "_agent_running", False) or getattr(cli, "_command_running", False)
     left: list = []
     if busy:
+        activity = activity_text(cli)
+        # A pending answer is a preview, not status chrome. Resize recovery may keep an
+        # uncertain row to avoid erasing real transcript. Keep the preview's leading ellipsis
+        # and no frame, as in the classic spinner, so that row cannot masquerade as an answer.
+        preview = activity.startswith("… ")
         frame = _SPIN[int(time.monotonic() * 10) % len(_SPIN)]
-        left = [(rule, "── "), (accent, frame + " "), ("", activity_text(cli))]
+        left = [("", activity)] if preview else [(rule, "── "), (accent, frame + " "), ("", activity)]
         # Classic's spinner suffix: turn time and the streamed-token count (``↓ 547 tok``).
         for extra in (_turn_elapsed(cli), cli._spinner_token_flow()):
             if extra:
                 left.append(("class:status-bar-dim bg:default", f" · {extra}"))
+        if preview:
+            return _fit(cli, left, width)
         left.append((rule, " "))
     title = cli._get_status_bar_session_title()
     right = [(rule, " "), (f"fg:{_skin_hex('ui_label', '#DAA520')}", title), (rule, " ─")] if title else []
