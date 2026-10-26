@@ -21,6 +21,11 @@ its optional icon, and the durable alias can be observed through one Telegram to
   omits `name`, so Telegram keeps the visible name; resending the saved session title
   reverted an earlier `--title` rename. Manual icon ownership is
   preserved when configured, and successful automatic writes record state and history.
+- Legacy topic-icon schema rebuilds stay inside the `SessionDB` writer transaction.
+  A failure rebuilding either icon table, creating later indexes, or writing the
+  schema-version marker must roll back the exact pre-migration schema and rows.
+  Retrying preserves manual icon ownership and profile isolation. Patch identity:
+  `slice-16-topic-icons`.
 - Icon choice favors relevance, with variety only among relevant icons. The model is always
   offered the whole catalog; withholding recently used icons made the obvious icon unavailable and
   forced unrelated picks. The model returns up to three ranked icons (`icons`, with the older
@@ -123,6 +128,9 @@ its ledger rows in the same reviewed change.
 ## Verify and recover
 
 Run the focused title, icon, gateway, and state tests through `scripts/run_tests.sh`.
+`tests/hermes_state/test_telegram_icon_migration.py` injects failures at both
+legacy icon-table drops, a later index, and the schema-version write, then checks
+exact rollback and successful retry.
 Run `python scripts/check_fork_patches.py` against the worktree HEAD, `git diff --check`,
 and `ruff check` on changed Python files. If rollback is required, revert the landed
 squash commit (found by its `Fork-Patch:` trailer) as one unit and retain the two icon tables
