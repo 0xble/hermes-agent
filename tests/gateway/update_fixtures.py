@@ -58,18 +58,29 @@ def _release(home, sha=RELEASE):
     return path
 
 
+def immutable_source(home):
+    """Create a real source commit for immutable release identity checks."""
+    from tests.hermes_cli.test_update_target_identity import git
+
+    source = home / "immutable-source"
+    source.mkdir()
+    git(source, "init", "-q", "-b", "main")
+    git(source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "source")
+    return source
+
+
 def fail_immutable_update(home, source=None):
     """Fail at the build boundary, retaining the real immutable apply's receipt facts."""
     from hermes_cli import main, update_cmd, update_receipt
     from tests.hermes_cli.test_update_target_identity import git
 
     if source is None:
-        source = home / "immutable-source"
-        source.mkdir()
-        git(source, "init", "-q", "-b", "main")
-        git(source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-            "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "source")
-    git(source, "fetch", "--no-tags", ".", "HEAD")
+        source = immutable_source(home)
+    # Fetch a real descendant without moving HEAD or touching the source index.
+    target = git(source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                 "-c", "commit.gpgsign=false", "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "downloaded update")
+    git(source, "fetch", "--no-tags", ".", target)
     (home / "release-layout.json").write_text(json.dumps({"source": str(source)}))
     with patch.dict("os.environ", {"HERMES_HOME": str(home)}), \
          patch.object(main, "PROJECT_ROOT", source), \

@@ -2222,16 +2222,17 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
         raise RuntimeError("current is not a release; remove the obsolete source pointer before updating")
     if current is not None and not _release_is_ready(current, current.name):
         raise RuntimeError("current release is not ready; refusing to activate from an invalid pointer")
-    # Capture migration metadata and the source plist transactionally at activation,
-    # not at staging/handoff. Promote a deferred candidate on the next normal update
-    # even when the remote has not advanced beyond it.
+    from hermes_cli.update_cmd_candidate import select_update_target
+    fetched, selected_branch = select_update_target(source, home, current, fetched, branch, args)
+    # Capture migration metadata and the source plist transactionally at activation, not at
+    # staging/handoff. Promote a deferred candidate even when the remote has not advanced.
     if current is not None and current.name == fetched:
         _catch_up_immutable_release(defer=opts.no_gateway_restart, sha=fetched, source=source)
         _apply_pending_fleet_restart_catchup(defer=opts.no_gateway_restart)
         return
-    # stage_release archives FETCH_HEAD itself, builds web and its own locked
-    # environment in a build-aside directory, then atomically publishes it.
-    candidate, _ = stage_release(source, home, sha=fetched)
+    # stage_release archives the selected target (FETCH_HEAD or a local carry-forward merge),
+    # builds web and its own locked environment in a build-aside directory, then publishes it.
+    candidate, _ = stage_release(source, home, sha=fetched, branch=selected_branch)
     if candidate != paths.release(fetched) or not _release_is_ready(candidate, fetched):
         raise RuntimeError("staged release does not match fetched commit")
     _write_fleet_restart_pending_marker(
@@ -2279,10 +2280,9 @@ _POST_SWAP_FORWARDED_FLAGS = (
 
 def _post_swap_argv_tail(args) -> list[str]:
     tail = [flag for attr, flag in _POST_SWAP_FORWARDED_FLAGS if getattr(args, attr, False)]
+    # Selection-only flags stay behind: the child runs the target's parser, which may predate them.
     branch = getattr(args, "branch", None)
-    if branch:
-        tail += ["--branch", str(branch)]
-    return tail
+    return tail + (["--branch", str(branch)] if branch else [])
 
 
 def _post_swap_payload(
