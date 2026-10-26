@@ -10,8 +10,6 @@ one pass per session at a time (durable lock) but sessions run concurrently, so 
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
-
 import concurrent.futures
 import contextlib
 import contextvars
@@ -3912,6 +3910,7 @@ def _announce_compression_start(
             message_count=message_count, model=agent.model, focus_topic=focus_topic,
         )
     if status:
+        from gateway.notice_style import ContextNotice
         agent._emit_status(ContextNotice(status))
     return _CompactionLifecycle(agent, bool(status))
 

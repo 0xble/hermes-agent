@@ -8,8 +8,6 @@ A loop stops when the agent ends a wakeup reply with ``LOOP_COMPLETE`` on its ow
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
-
 import hashlib
 import json
 import logging
@@ -1168,6 +1166,7 @@ class LoopManager(LoopRevisionsMixin):
         Caps count ticks, not response content, so a revise cannot excuse them: they are always
         judged against the current stored definition, never the fired version."""
         if state.times and state.ticks_fired >= state.times:
+            from gateway.notice_style import ContextNotice
             return ("done", f"completed the requested {state.times} runs",
                     ContextNotice(f"✓ Loop finished — ran {state.times}/{state.times} times."))
         if state.max_ticks and state.ticks_fired >= state.max_ticks:
@@ -1184,6 +1183,8 @@ class LoopManager(LoopRevisionsMixin):
         definition while the tick was being evaluated, the verdict no longer describes the loop:
         settle the tick as a normal continue instead, and the next tick judges the new definition.
         """
+        from gateway.notice_style import ContextNotice
+
         s = self._state
         superseded = False
 
@@ -1454,6 +1455,8 @@ def dispatch_loop_command(
     ``output`` is printed/sent verbatim by each surface. ``route`` is stored on new loops so the
     gateway's idle watcher can inject wakeups into the right chat; CLI/TUI pass None.
     """
+    from gateway.notice_style import ContextNotice
+
     arg = (args or "").strip()
     control = _CONTROL_COMMANDS.get(arg.lower())
     if control is not None:
