@@ -1080,7 +1080,7 @@ class GatewaySlashCommandsMixin(
         description = t(f"gateway.verbose.mode_{new_mode}")
         try:
             _write_raw_config_leaf(config_path, ("display", "platforms", platform_key, "tool_progress"), new_mode)
-            return f"{description}\n" + t("gateway.verbose.saved_suffix", platform=platform_key)
+            return ContextNotice(f"{description}\n" + t("gateway.verbose.saved_suffix", platform=platform_key))
         except Exception as e:
             logger.warning("Failed to save tool_progress mode: %s", e)
             return f"{description}\n" + t("gateway.verbose.save_failed", error=e)
@@ -1116,7 +1116,7 @@ class GatewaySlashCommandsMixin(
         adapter = self._delivery_adapter_for(event.source)
         if adapter is not None:
             adapter._busy_text_mode = self._effective_busy_text_mode(event.source)
-        return EphemeralReply(t("gateway.busy.set", mode=arg, behavior=t(_BUSY_MODE_BEHAVIOR[arg][1])))
+        return EphemeralReply(ContextNotice(t("gateway.busy.set", mode=arg, behavior=t(_BUSY_MODE_BEHAVIOR[arg][1]))))
 
     async def _handle_footer_command(self, event: MessageEvent) -> str:
         """Handle /footer command — toggle the runtime-metadata footer."""
@@ -1156,7 +1156,7 @@ class GatewaySlashCommandsMixin(
                 fields=effective.get("fields") or ["model", "context_pct", "cwd"])
             if preview:
                 example = t("gateway.footer.example_line", preview=preview)
-        return t("gateway.footer.saved", state=_state(new_state), example=example)
+        return ContextNotice(t("gateway.footer.saved", state=_state(new_state), example=example))
 
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reload-mcp — reconnect MCP servers and rebuild the cached agent. Reloading

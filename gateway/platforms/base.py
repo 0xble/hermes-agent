@@ -1867,6 +1867,7 @@ class EphemeralReply(CommandReply):
     def __new__(cls, text: str, ttl_seconds: Optional[int] = None):
         instance = super().__new__(cls, text)
         instance.ttl_seconds = ttl_seconds
+        instance.notice_style = getattr(text, "notice_style", None)
         return instance
 
     @property
@@ -3901,7 +3902,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             ttl = _or_default(lambda: int(self._get_ephemeral_system_ttl_default()), 0, Exception)
         if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
             ttl = 0
-        return response.text, int(ttl or 0)
+        text = response.text
+        if response.notice_style is not None:
+            text = as_command_reply(text)
+            text.notice_style = response.notice_style
+        return text, int(ttl or 0)
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and

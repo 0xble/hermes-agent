@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from agent.i18n import t
+from gateway.notice_style import ContextNotice
 from gateway.platforms.event import MessageEvent, MessageType
 
 # Log-record parity with gateway/run.py and the origin module.
@@ -150,12 +151,12 @@ class GatewayGoalCommandsMixin:
             if state is None:
                 return t("gateway.heartbeat.no_resume")
             _watch()
-            return t("gateway.heartbeat.resumed", interval=format_interval(state.interval_seconds), prompt=state.prompt)
+            return ContextNotice(t("gateway.heartbeat.resumed", interval=format_interval(state.interval_seconds), prompt=state.prompt))
         if lower in {"clear", "stop", "off"}:
             had = await run(mgr.clear)
             if quick_key:
                 self._unregister_heartbeat_watch(quick_key)
-            return t("gateway.heartbeat.cleared") if had else t("gateway.heartbeat.none_set")
+            return ContextNotice(t("gateway.heartbeat.cleared")) if had else t("gateway.heartbeat.none_set")
 
         # Set: `/heartbeat every 10m <prompt>` (also accepts `10m <prompt>`).
         tokens = args.split(None, 2)
@@ -177,7 +178,7 @@ class GatewayGoalCommandsMixin:
         if err:
             return err
         _watch()
-        return t("gateway.heartbeat.set", interval=format_interval(state.interval_seconds), prompt=state.prompt)
+        return ContextNotice(t("gateway.heartbeat.set", interval=format_interval(state.interval_seconds), prompt=state.prompt))
 
     def _idle_cached_agent_or_error(self, event: MessageEvent, verb: str):
         """``(session_key, cached_agent, None)`` for /refine and /review, or ``(_, _, error_text)``:
@@ -280,19 +281,19 @@ class GatewayGoalCommandsMixin:
             removed, err = _mgr_call(
                 "/subgoal remove", mgr.remove_subgoal, idx, errors=(IndexError, RuntimeError)
             )
-            return err or t("gateway.subgoal.removed", index=idx, text=removed)
+            return err or ContextNotice(t("gateway.subgoal.removed", index=idx, text=removed))
         if verb == "clear":
             prev, err = _mgr_call("/subgoal clear", mgr.clear_subgoals, errors=(RuntimeError,))
             if err:
                 return err
             if not prev:
                 return t("gateway.subgoal.none_to_clear")
-            return t("gateway.subgoal.cleared_one" if prev == 1 else "gateway.subgoal.cleared_other", count=prev)
+            return ContextNotice(t("gateway.subgoal.cleared_one" if prev == 1 else "gateway.subgoal.cleared_other", count=prev))
         text, err = _mgr_call("/subgoal", mgr.add_subgoal, args)
         if err:
             return err
         idx = len(mgr.state.subgoals) if mgr.state else 0
-        return t("gateway.subgoal.added", index=idx, text=text)
+        return ContextNotice(t("gateway.subgoal.added", index=idx, text=text))
 
     async def _handle_loop_command(self, event: MessageEvent) -> str:
         """Handle /loop — recurring in-session wakeups, via ``dispatch_loop_command`` (CLI mirror)."""
