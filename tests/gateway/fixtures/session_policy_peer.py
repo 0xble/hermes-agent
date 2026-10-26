@@ -145,7 +145,11 @@ async def probe(peer):
             assert ('desktop_ui' in agent.enabled_toolsets) == (source == 'gui')
             from toolsets import resolve_toolset
             desktop_names = resolve_toolset('desktop_ui')
-            surface_on_wire = any(name in json.dumps(requests[0]['tools']) for name in desktop_names)
+            # Count tool identifiers, not arbitrary prose such as "react to mid-run".
+            catalog = next((t['function'].get('description', '') for t in requests[0]['tools']
+                            if t['function']['name'] == 'tool_search'), '')
+            listed_names = {line[2:].split(': ', 1)[0] for line in catalog.splitlines() if line.startswith('- ')}
+            surface_on_wire = bool(set(desktop_names) & (names | listed_names))
             assert surface_on_wire == (source == 'gui'), (source, desktop_names, names)
             await ws.close()
             reconnected = await connect()

@@ -142,7 +142,7 @@ TOOLSETS = {
         "Desktop GUI affordances — in-app terminal/browser panes, pane focus, "
         "reactions, appearance (GUI sessions only)",
         ["read_terminal", "close_terminal", "desktop_preview", "drive_preview",
-         "annotate_preview", "read_window_below", "focus_pane", "react_to_message",
+         "annotate_preview", "read_window_below", "focus_pane", "react",
          "gui_tour", "show_tip", "set_theme"],
     ),
     "onboarding": _ts("First-run onboarding cards; folded in only for the onboarding chat (tui_gateway/methods_onboarding.py)",

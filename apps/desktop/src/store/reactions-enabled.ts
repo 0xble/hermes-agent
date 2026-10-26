@@ -30,6 +30,6 @@ if (typeof window !== 'undefined') {
   $reactionsEnabled.listen(enabled => persistString(KEY, enabled ? 'on' : 'off'))
 }
 
-// The backend gates the agent's react_to_message tool and the model-context
+// The backend gates the agent's react tool and the model-context
 // annotation on display.message_reactions, so this toggle is the one lever.
 mirrorDisplayToggle('display.message_reactions', KEY, $reactionsEnabled)

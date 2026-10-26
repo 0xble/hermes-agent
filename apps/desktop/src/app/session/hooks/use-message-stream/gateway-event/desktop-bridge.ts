@@ -56,7 +56,7 @@ const DESKTOP_BRIDGE_HANDLERS: Record<string, (ctx: GatewayEventContext) => void
 
   'message.reaction': ({ payload, isActiveEvent, fromActiveSource, event }) => {
     // The agent reacted to a message via the desktop-gated
-    // react_to_message tool. Already persisted — this only paints it now
+    // react tool. Already persisted — this only paints it now
     // instead of at the next resume. Fresh ChatMessage object per change:
     // the runtime repository caches normalized ThreadMessages in a WeakMap
     // keyed by ChatMessage identity. Active session only (same gate as

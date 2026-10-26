@@ -21,7 +21,7 @@ def _open_session_db():
         return None
 
 
-def react_to_message_tool(emoji: str, message_row_id=None, messages_back=None) -> str:
+def react_tool(emoji: str, message_row_id=None, messages_back=None) -> str:
     """Attach (or with an empty ``emoji`` retract) the agent's reaction."""
     emoji = (emoji or "").strip()
     # Routing keys identify a channel; message rows belong to the live durable session.
@@ -64,8 +64,8 @@ def check_react_requirements() -> bool:
     return desktop_ui.user_enabled("message_reactions", default=False)
 
 
-REACT_TO_MESSAGE_SCHEMA = {
-    "name": "react_to_message",
+REACT_SCHEMA = {
+    "name": "react",
     "description": (
         "React to a message with a single emoji, the way you'd tapback in iMessage. "
         "Reach for it when a reaction is what a person would do: something funny gets "
@@ -111,9 +111,9 @@ REACT_TO_MESSAGE_SCHEMA = {
 
 
 registry.register(
-    name="react_to_message", toolset="desktop_ui", schema=REACT_TO_MESSAGE_SCHEMA,
-    handler=lambda args, **kw: react_to_message_tool(
+    name="react", toolset="desktop_ui", schema=REACT_SCHEMA,
+    handler=lambda args, **kw: react_tool(
         emoji=args.get("emoji", ""), message_row_id=args.get("message_row_id"),
         messages_back=args.get("messages_back")),
-    check_fn=check_react_requirements, emoji="💛",
+    check_fn=check_react_requirements, emoji="👍",
 )

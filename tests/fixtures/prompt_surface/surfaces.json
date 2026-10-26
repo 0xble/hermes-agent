@@ -293,7 +293,7 @@
       "stable": 1579,
       "volatile": 1814
     },
-    "tool_tokens": 15732,
+    "tool_tokens": 15726,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -319,7 +319,7 @@
       "manage_connections",
       "memory",
       "patch",
-      "react_to_message",
+      "react",
       "read_file",
       "search_files",
       "skill_manage",

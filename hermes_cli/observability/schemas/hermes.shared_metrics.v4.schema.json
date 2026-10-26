@@ -4662,6 +4662,7 @@
                 "memory",
                 "patch",
                 "process_manage",
+                "react",
                 "react_to_message",
                 "read_file",
                 "read_terminal",

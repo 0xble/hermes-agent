@@ -25,7 +25,7 @@ GUI_TOOLS = {
     "focus_pane",
     "read_terminal",
     "read_window_below",
-    "react_to_message",
+    "react",
     "show_tip",
     "gui_tour",
 }

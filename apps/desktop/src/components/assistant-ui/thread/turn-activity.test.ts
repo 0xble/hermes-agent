@@ -50,6 +50,7 @@ describe('toolNarratesWait', () => {
 
   it('does not defer to silent tools, which render nothing to narrate with', () => {
     expect(toolNarratesWait([call('todo', false)])).toBe(false)
+    expect(toolNarratesWait([call('react', false)])).toBe(false)
     expect(toolNarratesWait([call('react_to_message', false)])).toBe(false)
   })
 

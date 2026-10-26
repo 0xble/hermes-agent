@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock
 
-from tools import react_to_message_tool as reactions
+from tools import react_tool as reactions
 
 
 def test_reaction_database_closes_when_write_fails(monkeypatch):
@@ -16,7 +16,7 @@ def test_reaction_database_closes_when_write_fails(monkeypatch):
         lambda _name, _default="": "session-1",
     )
 
-    result = reactions.react_to_message_tool("👍")
+    result = reactions.react_tool("👍")
 
     assert "write failed" in result
     db.close.assert_called_once()
