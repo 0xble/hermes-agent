@@ -729,6 +729,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## v0.22.5 merge integration
 
+- Recall's read-only open must translate SQLite open errors to the shared
+  database-unavailable result, including absent canonical storage, without
+  initializing it. Its lifecycle double patches the opener rather than replacing
+  the SessionDB type used by main's independent-reader scope. Main's running-agent
+  lifetime fixture supplies the successor's display config and keyword-only
+  fallback-policy argument, retaining every retirement assertion and timeout.
+  Guards: session-search, read-only search, search-isolation review and running-agent
+  eviction-memory suites. The proxy silence nodes require the declared aiohttp
+  environment and run in Linux alongside the existing scope checks.
 - Integrating main's affected-group display fold requires beginning the fold inside
   each compaction transaction, before mutation, including the successor's extracted
   on-connection entry point. Preserve carrier-by-UID identity and prune-history

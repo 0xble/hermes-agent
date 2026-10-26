@@ -291,7 +291,7 @@ class TestBrowseShape:
                 return []
 
         db = _DB()
-        monkeypatch.setattr("hermes_state.SessionDB", lambda **kwargs: db)
+        monkeypatch.setattr("tools.session_search_tool._open_current_db", lambda: db)
         monkeypatch.setattr(
             "hermes_state_registry.release_or_close",
             lambda _: setattr(db, "released", db.released + 1),

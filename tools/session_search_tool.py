@@ -580,6 +580,13 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
               "means you've hit that end of the session."), **extra)
 
 
+def _open_current_db():
+    """Open recall's existing database without initializing canonical storage."""
+    from hermes_constants import get_hermes_home
+    from hermes_state import SessionDB
+    return SessionDB(db_path=get_hermes_home() / "state.db", read_only=True)
+
+
 def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
               around_message_id, window, sort, profile, detail,
               after=None, before=None, exclude_session_ids=None) -> str:
@@ -652,8 +659,7 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int =
                    platform: str | None = None) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
-    from hermes_constants import get_hermes_home
-    from hermes_state import SessionDB, format_session_db_unavailable
+    from hermes_state import format_session_db_unavailable
     from hermes_state_registry import release_or_close
     owned_dbs: list[Any] = []
     # A raw `@session:<profile>/<id>` link as session_id: ids never contain "/", so
@@ -682,10 +688,10 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int =
     if isinstance(db, RuntimeSessionStore):
         db = None
     if db is None:
-        db = _quiet(
-            lambda: SessionDB(db_path=get_hermes_home() / "state.db", read_only=True),
-            None, "SessionDB unavailable for session_search",
-        )
+        try:
+            db = _quiet(_open_current_db, None, "SessionDB unavailable for session_search")
+        except sqlite3.Error:
+            return tool_error(format_session_db_unavailable(), success=False)
         if db is None:
             return tool_error(format_session_db_unavailable(), success=False)
         owned_dbs.append(db)
