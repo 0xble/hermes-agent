@@ -617,7 +617,7 @@ async def test_autonomous_goal_outbox_attributes_both_notices_to_autonomy(
     from hermes_cli.goals import GoalManager
 
     get_hermes_home().joinpath("config.yaml").write_text(
-        f"goals:\n  autonomy: true\n  auto_notices: {str(notices).lower()}\n", encoding="utf-8",
+        f"goals:\n  autonomy: true\n  notices: {str(notices).lower()}\n", encoding="utf-8",
     )
     manager = GoalManager("target")
     manager.set("old objective")
