@@ -725,7 +725,7 @@ event("pane.reveal", PaneRevealPayload, doc="Focus / reveal a named desktop pane
 
 
 class MessageReactionPayload(Payload):
-    """``tools/react_to_message_tool.py``."""
+    """``tools/react_tool.py``."""
 
     row_id: int
     reactions: list[MessageReaction]

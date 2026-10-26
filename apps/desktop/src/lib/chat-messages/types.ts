@@ -200,7 +200,7 @@ export type GatewayEventPayload = {
   amount?: number
   to?: string
   max?: number
-  // message.reaction (agent reacting via the react_to_message tool) — the
+  // message.reaction (agent reacting via the react tool) — the
   // durable messages.id, that row's full reaction list after the write, and
   // the row's role so a live (not-yet-round-tripped) message can be matched.
   row_id?: number

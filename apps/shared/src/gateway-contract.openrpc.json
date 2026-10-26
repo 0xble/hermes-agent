@@ -24024,7 +24024,7 @@
       },
       "MessageReactionPayload": {
         "additionalProperties": false,
-        "description": "``tools/react_to_message_tool.py``.",
+        "description": "``tools/react_tool.py``.",
         "properties": {
           "row_id": {
             "title": "Row Id",
