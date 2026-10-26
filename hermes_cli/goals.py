@@ -8,6 +8,8 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import asyncio
 import hashlib
 import json
@@ -2756,6 +2758,8 @@ def _judge_outage_notice(*, failed: bool) -> str:
 
 
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
+    if verdict == "done":
+        message = ContextNotice(message)
     return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
             "verdict": verdict, "reason": reason, "message": message}
 
@@ -2814,14 +2818,8 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
         # recover it. The manager holds no state (no continuation, judge, or revive) and remembers
         # why; writes still re-read the live row and refuse to overwrite it.
         self._unreadable: Optional[GoalPersistenceError] = None
-        try:
-            self._state: Optional[GoalState] = (
-                load_goal(session_id) if cursor is None else load_goal(session_id, cursor=cursor)
-            )
-        except GoalPersistenceError as exc:
-            logger.warning("GoalManager: goal for %s is unreadable; treating it as inert: %s", session_id, exc)
-            self._state = None
-            self._unreadable = exc
+        self._state: Optional[GoalState] = None
+        self.refresh()
 
     def refresh(self) -> None:
         """Re-read state from the DB (another writer, e.g. a tool, moved it)."""

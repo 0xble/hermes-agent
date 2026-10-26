@@ -20,7 +20,10 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 from gateway.platforms.base import SendResult
+from gateway.config import Platform
 from gateway.relay.egress import EGRESS_DECLINE_CODE
+from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
 
 CODE_ONLY_DECLINE: dict[str, Any] = {"success": False, "code": EGRESS_DECLINE_CODE}
 
@@ -55,13 +58,12 @@ def _runner(adapter: _Adapter):
     """A TurnRunner driven through its real _approval_notify_sync."""
     from gateway.run_turn_runner import TurnRunner
 
-    ctx = SimpleNamespace(
+    ctx = TurnContext(
         _status_adapter=adapter,
         _status_chat_id="C1",
         _status_thread_metadata={},
-        _session_key="sk1",
         session_key="sk1",
-        source=SimpleNamespace(chat_id="C1", platform="discord", session_key="sk1"),
+        source=SessionSource(platform=Platform.DISCORD, chat_id="C1"),
     )
     runner = TurnRunner(SimpleNamespace(), ctx)
 
@@ -205,7 +207,7 @@ def _card_runner(adapter: _CardAdapter):
 def _card_state(adapter: _CardAdapter):
     return SimpleNamespace(
         tasks=[{"text": "step"}],
-        native_failed=False,
+        native_failed=False, native_retry_at=0.0, native_retry_delay=2.0,
         publication_suppressed=False,
         visible_tasks=lambda: [{"text": "step"}],
         fallback_text=lambda: "step",

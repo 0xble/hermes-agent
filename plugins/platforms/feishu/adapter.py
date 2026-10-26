@@ -2536,6 +2536,9 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] %s reaction %s on %s raised", verb, ident, message_id, exc_info=True)
         return None
 
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        return bool(await self._add_reaction(message_id, emoji))
+
     async def _add_reaction(self, message_id: str, emoji_type: str) -> Optional[str]:
         """Return the reaction_id on success, else None. The id is needed later for deletion."""
         if not self._client or not message_id or not emoji_type:

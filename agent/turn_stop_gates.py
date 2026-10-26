@@ -12,6 +12,8 @@ module level (cycle).
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import logging
 import os
 from dataclasses import dataclass
@@ -209,8 +211,8 @@ def apply_stop_gates(
             os.environ.get("HERMES_KANBAN_TASK", ""),
         )
         agent._emit_diagnostic_status(
-            "⚠️ Kanban worker tried to exit without a terminal board call "
-            "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"
+            ContextNotice("⚠️ Kanban worker tried to exit without a terminal board call "
+            "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"),
         )
         return verdict
     return StopGateVerdict(

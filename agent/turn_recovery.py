@@ -9,6 +9,8 @@ mutate ``agent`` / ``messages`` / ``api_messages`` in place. Logger name stays
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import logging
 import locale
 import math
@@ -1485,7 +1487,7 @@ def compute_error_backoff(
         # A 5xx Retry-After can reach the cap; buffering it would leave the user silent for minutes.
         _announce_now = _retry_after is not None and _retry_after > LIVE_RETRY_WAIT_CAP_S
     if _announce_now:
-        agent._emit_diagnostic_status(_status)
+        agent._emit_diagnostic_status(ContextNotice(_status))
     else:
         agent._buffer_diagnostic_status(_status)
     # The buffered line replays only if every retry fails; the live status line is transient

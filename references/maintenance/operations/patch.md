@@ -9,6 +9,29 @@
 - **Verification:** `scripts/run_tests.sh tests/hermes_cli/test_release_ack_environment.py tests/hermes_cli/test_immutable_gateway_ack.py tests/hermes_cli/test_immutable_no_gateway_restart.py` passes all 11 tests. Run with disposable `HOME` and `HERMES_HOME` roots. Include inherited-path recovery and non-isolated rejection regressions. Broader reconciliation tests initially hit the real-home metadata guard in this checkout location, then exceeded the observation timeout with an isolated OS home. Real launchd integration remains separately gated by operator authorization.
 - **Rollback and retirement:** Revert only this launcher environment qualification and its regression changes. No state format or dependency change. Retire with the owning immutable-release patch when upstream provides its complete observed-activation contract.
 
+## slack-progress-card-recovery
+
+- **Status:** Draft candidate, not landed or activated.
+- **Contract:** Retry transient append failures on the existing stream, coalescing the latest projection even while tools are idle. Honor Retry-After. Retry a start only after a positive rate-limit rejection. Suppress ambiguous starts and SDK connection retries instead of creating a duplicate card or fallback. Permanent failures log and use human-readable tool labels, never executable previews.
+- **Source surfaces:** `gateway/run_task_card_progress.py`, `gateway/run_turn_runner.py`, `plugins/platforms/slack/adapter.py`, `plugins/platforms/slack/task_card_stream.py`; [behavior record](../../../maintenance/slack-progress-card-recovery.md).
+- **Root cause:** `_task_card_publish` latched `native_failed` after every unsuccessful SendResult, ignoring retryable transport failures. Base `fdcba2ab110d`; timeout logs immediately precede the fallback warning. A retryable failure that did not latch this flag would falsify the diagnosis.
+- **Upstream findings:** Related [#137803](https://github.com/NousResearch/hermes-agent/pull/137803) handles explicit stream expiry, not ambiguous start or transient append timeouts. [#103197](https://github.com/NousResearch/hermes-agent/pull/103197) addressed incompatible payloads, a distinct cause. No matching transient recovery repair found in the scoped searches.
+- **Verification:** Regression against base production modules: 12 failed, exit 1. Candidate regression: 12 passed. Affected gateway tests and exact-head results are recorded in the draft PR. Repository-wide static failures are inherited: shebangs, oversized AGENTS.md, and Ruff.
+- **Outbound budget:** Retry gaps 2,4,8,16,30 seconds give attempts at 0,2,6,14,30,60. At most 5 logical attempts in a half-open 60-second window, or 10 HTTP append attempts with the SDK connection retry, versus appendStream Tier 3 floor 50/min (20%). Later retries are at most 4 HTTP attempts/min (8%). Positive start rejection uses Retry-After, startStream has no SDK retry. Existing successful native progress, reply and typing paths lack shared admission, so aggregate per-conversation budget compliance is not established. Keep draft pending qualification.
+- **Rollback and retirement:** Revert this patch and matching presentation assertions. No schema, dependency or config change. Retire when upstream preserves the same retry, ambiguity and clean-fallback contract.
+
+## attended-switch-notice-transition
+
+- **Status:** Candidate.
+- **Contract:** Announce an attended-model switch only when the session transitions to that route. Queued follow-ups and repeated API-boundary resolution on an already-selected attended model do not announce another switch. Preserve genuine idle-to-attended transitions, first-session silence, fallback ownership and idle return behavior.
+- **Source surfaces:** `gateway/run_turn.py`, `gateway/run_turn_runner.py`, `tests/gateway/test_attended_turn_runner.py`.
+- **Independent hypothesis (2026-10-25):** Turn-start resolution can compare a stale `last_resolved_model` snapshot even though the durable committed attended-route marker is already true. API-boundary resolution also announces a changed desired key without requiring a changed live route. Reuse the committed marker during turn-start staging and require a real model/provider/API-mode transition at the boundary. An intervening idle API call before the duplicate notice would falsify this incident explanation. The incident logs instead show the queued follow-up stayed on the attended model.
+- **Upstream findings:** Local-only attended-routing overlay. No upstream implementation to backport, so the upstream discussion-search exception applies.
+- **Verification:** `HERMES_PYTHON="$PWD/.venv/bin/python" bash scripts/run_tests.sh tests/gateway/test_attended_turn_runner.py tests/gateway/test_attended_model.py tests/gateway/test_attended_busy_activity.py tests/gateway/test_attended_session_opening.py tests/gateway/test_attend_command.py` passes: 287 tests, 0 failures. The new cases cover stale-model queued staging with committed active/inactive routes and no-op API-boundary resolutions with absent/stale decision keys.
+- **Outbound budget:** Removes redundant uses of the existing persistent notice rail. Adds no API calls, retries, timers, limiters or platform-specific send path. Existing shared egress budgeting is unchanged and worst-case notice traffic cannot increase.
+- **Rollback:** Revert the committed-route guard in turn-start resolution and the route-equality guard in API-boundary emission, plus their matching tests. No configuration, schema, dependency or state migration.
+- **Retirement:** Remove when the shared routing owner derives switch announcements solely from committed route transitions and equivalent regressions pass upstream.
+
 ## mcp-verbatim-tool-labels
 
 - **Status:** Candidate.

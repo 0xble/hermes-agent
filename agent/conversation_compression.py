@@ -10,6 +10,8 @@ one pass per session at a time (durable lock) but sessions run concurrently, so 
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import concurrent.futures
 import contextlib
 import contextvars
@@ -2253,7 +2255,9 @@ def replay_compression_warning(agent: Any) -> None:
         # Replayed as a classified diagnostic so every sink applies its own policy snapshot.
         from gateway.warning_notifications import DiagnosticText
         with contextlib.suppress(Exception):
-            agent.status_callback("lifecycle", DiagnosticText(msg))
+            text = DiagnosticText(msg)
+            text.notice_style = getattr(msg, "notice_style", None)
+            agent.status_callback("lifecycle", text)
 
 
 def conversation_history_after_compression(
@@ -3908,7 +3912,7 @@ def _announce_compression_start(
             message_count=message_count, model=agent.model, focus_topic=focus_topic,
         )
     if status:
-        agent._emit_status(status)
+        agent._emit_status(ContextNotice(status))
     return _CompactionLifecycle(agent, bool(status))
 
 

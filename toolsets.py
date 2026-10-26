@@ -21,7 +21,7 @@ _HERMES_CORE_TOOLS = [
     "browser_vault",  # rides with the browser; deferred by default (tools.tool_search.defer)
     "browser_vault_list",  # explicit list surface retained for browser toolset discovery
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
-    "text_to_speech",
+    "text_to_speech", "react_to_message",
     "todo_list", "memory", "compact_context",
     "session_search",
     "clarify",
@@ -138,6 +138,7 @@ TOOLSETS = {
     # GUI-renderer affordances, enabled per desktop-sourced SESSION by the GUI
     # gateway (tui_gateway/server.py::_load_enabled_toolsets) — never by a
     # process env var, which is blind to a desktop client on a remote backend.
+    "reactions": _ts("React to the triggering messaging-platform message or a desktop message", ["react_to_message"]),
     "desktop_ui": _ts(
         "Desktop GUI affordances — in-app terminal/browser panes, pane focus, "
         "reactions, appearance (GUI sessions only)",
@@ -472,6 +473,17 @@ def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[
     """*disabled* plus every platform-gated toolset a session on *platform* does not get. An agent stores
     this as its ``disabled_toolsets``, so the tool list, the tool_search listing and bridge, MCP refreshes
     and delegate children (which inherit it) all subtract the gated tools in ``_select_tool_names``."""
+    from gateway.config import Platform
+
+    try:
+        # Platform resolves registered plugins as well as built-in gateway adapters.
+        is_gateway = Platform(platform) != Platform.LOCAL
+    except ValueError:
+        is_gateway = False
+    if not is_gateway:
+        from tools.react_to_message_tool import check_react_requirements
+        if not check_react_requirements():
+            disabled = [*(disabled or ()), "reactions"]
     gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items()
              if platform not in platforms and name not in (disabled or ())]
     return [*(disabled or ()), *gated] if gated else disabled

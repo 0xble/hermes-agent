@@ -385,10 +385,12 @@ class AgentNotice:
     ttl_ms: Optional[int] = None   # honored only when kind == "ttl"
     key: Optional[str] = None      # dedupe / fired-once-latch / clear key
     id: Optional[str] = None
+    notice_style: Optional[str] = None  # producer-owned presentation, never inferred from text
 
 
-def _sticky_notice(text: str, level: str, key: str) -> AgentNotice:
-    return AgentNotice(text=text, level=level, kind=CREDITS_NOTICE_KIND, key=key, id=key)
+def _sticky_notice(text: str, level: str, key: str, *, context: bool = False) -> AgentNotice:
+    return AgentNotice(text=text, level=level, kind=CREDITS_NOTICE_KIND, key=key, id=key,
+                       notice_style="context" if context else None)
 
 
 def _is_nous_welcome_route(base_url: str) -> bool:
@@ -481,7 +483,7 @@ def evaluate_credits_notices(state: CreditsState, latch: dict, *, model_is_free:
             lim = state.subscription_limit_micros or 0
             used_usd = f"{max(0, min(lim, lim - state.subscription_micros)) / 1_000_000:.2f}" if lim else "?"
             text = f"{'⚠' if level == 'warn' else '•'} You've used ${used_usd} of your ${state.subscription_limit_usd or '?'} cap"
-            to_show.append(_sticky_notice(text, level, CREDITS_USAGE_KEY))
+            to_show.append(_sticky_notice(text, level, CREDITS_USAGE_KEY, context=True))
             active.add(CREDITS_USAGE_KEY)
         latch["usage_band"] = target_band
 
@@ -493,7 +495,7 @@ def evaluate_credits_notices(state: CreditsState, latch: dict, *, model_is_free:
         state.denominator_kind == "subscription_cap" and uf is not None and uf >= 1.0 and state.purchased_micros > 0
     )
     if grant_cond and "credits.grant_spent" not in active and latch.get("seen_grant_unspent", False):
-        to_show.append(_sticky_notice(f"• Grant spent · ${state.purchased_usd} top-up left", "info", "credits.grant_spent"))
+        to_show.append(_sticky_notice(f"• Grant spent · ${state.purchased_usd} top-up left", "info", "credits.grant_spent", context=True))
         active.add("credits.grant_spent")
         latch["seen_grant_unspent"] = False
     elif "credits.grant_spent" in active and not grant_cond:
@@ -512,7 +514,7 @@ def evaluate_credits_notices(state: CreditsState, latch: dict, *, model_is_free:
         if not depleted_cond:  # genuine recovery only — a free-model switch while depleted is NOT "restored"
             to_show.append(AgentNotice(
                 text="✓ Credit access restored", level="success", kind="ttl",
-                ttl_ms=CREDITS_RESTORED_TTL_MS, key="credits.restored", id="credits.restored",
+                ttl_ms=CREDITS_RESTORED_TTL_MS, key="credits.restored", id="credits.restored", notice_style="context",
             ))
     return (to_show, to_clear)
 

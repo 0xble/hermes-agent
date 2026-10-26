@@ -293,11 +293,13 @@ def _build_child_agent(
             routing_cfg=routing_cfg, override_reasoning_effort=override_reasoning_effort,
         )
         rt["service_tier"] = override_service_tier or _resolve_child_service_tier(
-            parent_agent if profile_home is None else None, override_request_overrides)
+            parent_agent if profile_home is None else None, override_request_overrides,
+            child_model=rt.get("model"), child_provider=rt.get("provider"),
+            child_base_url=rt.get("base_url"), child_api_key=rt.get("api_key"))
         request_overrides = _resolve_child_request_overrides(
             parent_agent if profile_home is None else None,
             child_model=rt.get("model"), child_provider=rt.get("provider"),
-            child_base_url=rt.get("base_url"), explicit_overrides=override_request_overrides,
+            child_base_url=rt.get("base_url"), child_api_key=rt.get("api_key"), explicit_overrides=override_request_overrides,
             inherit_parent_route=profile_home is None and not override_provider and not override_base_url,
         )
         parent_sid = getattr(parent_agent, "session_id", None)

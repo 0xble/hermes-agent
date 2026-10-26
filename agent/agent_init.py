@@ -2216,7 +2216,8 @@ def _emit_compression_summary(agent, cs):
 
     # status_callback isn't wired yet: stash for replay on the first turn; mark shown so
     # repeated inits stay silent.
-    agent._compression_warning = _autoraise_notice
+    from gateway.notice_style import ContextNotice
+    agent._compression_warning = ContextNotice(_autoraise_notice) if _autoraise_notice else None
     if _autoraise_notice:
         _record_codex_gpt55_autoraise_notice(_autoraise)
     # Feasibility check deferred to the first turn near threshold (eager costs ~400ms cold).

@@ -17,7 +17,7 @@ def _source(thread_id="224426"):
 
 
 @pytest.mark.asyncio
-async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
+async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path, caplog):
     """Synthetic resumes share their reply anchor but not their durable admission identity."""
     import sqlite3
 
@@ -36,13 +36,6 @@ async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
     )
     runner._resume_pending_candidates = lambda _platform=None: entries
     runner._auto_resume_ready = lambda _entry: (adapter, source)
-    # The fixture's own state map. ``_session_states`` is a runner method (the background-turn
-    # gate reads its load through it), so an instance attribute of that name would shadow it.
-    fixture_states = {}
-    runner._session_state = lambda key: fixture_states.setdefault(
-        key, SimpleNamespace(turn=SimpleNamespace(agent=None, started_ts=None))
-    )
-    runner._peek_session_state = runner._session_state
     runner._release_running_agent_state = lambda key: setattr(
         runner._session_state(key).turn, "agent", None
     )
@@ -61,12 +54,20 @@ async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
             event._agent_turn_succeeded = True
 
     adapter = _Adapter()
+    caplog.set_level("INFO", logger="gateway.run")
     scheduled = runner._schedule_resume_pending_sessions()
     assert scheduled == 2
-    await asyncio.gather(*tasks)
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+    finally:
+        await runner._get_replay_scheduler().close()
 
     with sqlite3.connect(tmp_path / "gateway-outbox.db") as db:
         admitted = sorted(row[0] for row in db.execute(
             "SELECT transport_event_id FROM admissions"
         ))
     assert admitted == ["resume:resume-0", "resume:resume-1"]
+    assert runner._restart_resume_outcomes == {entry.session_key for entry in entries}
+    outcomes = [record.args for record in caplog.records
+                if record.msg == "Restart recovery outcome: session=%s outcome=%s"]
+    assert sorted(outcomes) == sorted((entry.session_key, "resumed") for entry in entries)

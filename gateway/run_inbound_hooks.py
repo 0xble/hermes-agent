@@ -304,11 +304,11 @@ class GatewayInboundHooksMixin:
               chat_choices(self, source, self._session_key_for_source(source))):
             if invoke is not None:
                 started, result = await invoke(call, inspect.iscoroutinefunction(plugin_handler))
-                return started, (str(result) if result else None)
+                return started, ((result if isinstance(result, str) else str(result)) if result else None)
             if inspect.iscoroutinefunction(plugin_handler):
                 result = await call()
             else:
                 result = await self._run_in_executor_with_context(call)
                 if inspect.isawaitable(result):
                     result = await result
-        return str(result) if result else None
+        return (result if isinstance(result, str) else str(result)) if result else None

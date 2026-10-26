@@ -91,18 +91,22 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        from agent.turn_usage import log_response_service_tier
+
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
         if _use_streaming:
-            return agent._interruptible_streaming_api_call(
+            result = agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
             )
+            log_response_service_tier(agent, result, next_api_kwargs)
+            return result
         from agent import relay_llm
 
-        return relay_llm.execute(
+        result = relay_llm.execute(
             next_api_kwargs,
             agent._interruptible_api_call,
             session_id=str(agent.session_id or ""),
@@ -122,6 +126,8 @@ def perform_api_call(
             },
             defer_logical_completion=True,
         )
+        log_response_service_tier(agent, result, next_api_kwargs)
+        return result
 
     from hermes_cli.middleware import run_llm_execution_middleware
 
