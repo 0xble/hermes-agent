@@ -1,6 +1,6 @@
 """Native updater receipt fixtures built through its real persistence boundary."""
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -42,7 +42,7 @@ def _make_runner():
 def pending(home, *, reason=True):
     data = {"platform": "telegram", "chat_id": "42", "thread_id": "77", "chat_type": "dm",
             "session_key": "agent:main:telegram:dm:42:thread:77",
-            "timestamp": datetime.now(timezone.utc).isoformat()}
+            "timestamp": datetime.now(UTC).isoformat()}
     if reason:
         data["reason"] = "Activating the delegation-label fix."
     launch_native_update(home=home, hermes_cmd=["hermes"], pending=data, spawn=Mock())

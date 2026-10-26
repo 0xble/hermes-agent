@@ -6,7 +6,7 @@ import os
 import re
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 _MARKER_LOCK = threading.RLock()
@@ -43,7 +43,7 @@ def same_update(path: Path, pending: dict) -> bool:
         current = json.loads(path.read_text(encoding="utf-8-sig"))
         if pending.get("request_id") or current.get("request_id"):
             return bool(pending.get("request_id") and current.get("request_id") == pending["request_id"])
-        current.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())
+        current.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat())
         return current.get("timestamp") == pending.get("timestamp") and current.get("reason") == pending.get("reason")
     except (OSError, ValueError, AttributeError):
         return False
@@ -55,7 +55,7 @@ def read_pending(home: Path) -> tuple[Path, dict] | None:
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(data, dict):
-                data.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())
+                data.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat())
                 return path, data
         except (OSError, ValueError):
             continue
@@ -185,6 +185,7 @@ def _update_recovery_pending(home: Path) -> bool:
 
     root = update_source_checkout(home, Path(__file__).resolve().parents[1])
     if root is None:
+        # ZIP/non-git installs cannot rule out source-keyed recovery debt.
         return True
     host_record = host_obligation_path(root)
     return any(path.exists() for path in (
