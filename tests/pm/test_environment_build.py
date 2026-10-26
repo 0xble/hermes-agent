@@ -683,7 +683,9 @@ def test_explicit_environment_installs_locked_members_without_live_selection(loc
          "print(json.dumps([sys.base_prefix, member_dep.__version__, "
          "importlib.util.find_spec('other_dep') is None]))"], cwd=tmp_path, env=env,
     ))
-    assert result == [sys.base_prefix, "1.0", True]
+    # uv may canonicalize a version alias while preserving the same interpreter.
+    assert Path(result[0]).samefile(sys.base_prefix)
+    assert result[1:] == ["1.0", True]
     assert (source / "uv.lock").read_bytes() == before_lock
     assert not (source / ".venv").exists()
     assert not (Path(env["HERMES_HOME"])).exists()

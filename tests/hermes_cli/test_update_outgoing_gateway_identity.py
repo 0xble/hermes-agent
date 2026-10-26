@@ -20,6 +20,9 @@ def test_socket_verified_outgoing_gateway_survives_cleanup_scan_exclusion(monkey
     )
 
     def process_listing(argv, **kwargs):
+        # macOS resolves process ownership through ps too, not /proc.
+        if argv == ["ps", "-o", "uid=", "-p", str(outgoing_pid)]:
+            return SimpleNamespace(returncode=0, stdout=str(gateway.os.geteuid()))
         assert argv == ["ps", "-Aww", "-o", "pid=,command="]
         return SimpleNamespace(returncode=0, stdout=f"{outgoing_pid} python -m hermes_cli.main gateway run\n")
 

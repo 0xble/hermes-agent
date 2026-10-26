@@ -163,13 +163,13 @@ def test_release_identity_runs_the_shared_sequence(build_fixture, identity):
     (repo / "termux-build").mkdir()
     (repo / "termux-build/payload").symlink_to(payload, target_is_directory=True)
     tools = log.parent / "tools"
-    (tools / "python3").symlink_to(sys.executable)
+    (tools / "python3").symlink_to(getattr(sys, "_base_executable", sys.executable))
     env.update(HERMES_BUILD_COMMIT=identity[1] if identity[0] == "--commit" else "",
                HERMES_PAYLOAD_TAG=identity[1] if identity[0] == "--tag" else "")
     result = subprocess.run(
         [sys.executable, str(DRIVER), '--repo', str(repo), '--payload', str(payload),
          '--out', str(repo / 'termux-build/deb'), *identity],
-        cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     calls = recorded_calls(log)
     assert [Path(call["args"][0]).name for call in calls] == [
@@ -190,7 +190,7 @@ def test_builder_image_identity_covers_all_inputs(tmp_path, changed_input):
     shutil.copytree(ROOT / "pm", repo / "pm", ignore=shutil.ignore_patterns("__pycache__"))
     tools = tmp_path / "tools"
     tools.mkdir()
-    (tools / "python3").symlink_to(sys.executable)
+    (tools / "python3").symlink_to(getattr(sys, "_base_executable", sys.executable))
     # Only inspect an already-published image; any build/push call is a failure.
     command = 'docker() { [[ "$1 $2" == "manifest inspect" ]]; }; export -f docker; bash "$1"'
     env = {**os.environ, "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",

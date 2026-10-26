@@ -19,6 +19,7 @@ glue layer simultaneously.
 from __future__ import annotations
 
 import asyncio
+import socket
 
 import pytest
 
@@ -257,7 +258,10 @@ class TestRegistryResolution:
 class TestFirecrawlScrapeTimeout:
     """Verify the server-side scrape timeout matches the asyncio deadline."""
 
-    def test_extract_passes_timeout_ms_to_scrape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("address, content", [("93.184.216.34", "content"), ("198.18.4.8", "")])
+    def test_extract_passes_timeout_ms_to_scrape(
+        self, monkeypatch: pytest.MonkeyPatch, address: str, content: str,
+    ) -> None:
         """scrape() must receive timeout=60000 (ms) so the server-side
         deadline matches the 60 s asyncio.wait_for deadline.  Without this
         the API uses its 30 s default, causing SCRAPE_TIMEOUT."""
@@ -284,6 +288,12 @@ class TestFirecrawlScrapeTimeout:
             firecrawl_provider, "check_website_access", lambda url: None
         )
 
+        # Exercise real URL validation with deterministic public and private answers.
+        def resolve(host, *args, **kwargs):
+            assert host == "example.com"
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, 443))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", resolve)
         p = firecrawl_provider.FirecrawlWebSearchProvider()
         results = asyncio.run(p.extract(["https://example.com"]))
 
@@ -297,4 +307,9 @@ class TestFirecrawlScrapeTimeout:
         # Verify the result was processed correctly
         assert len(results) == 1
         assert results[0]["url"] == "https://example.com"
-        assert results[0]["content"] == "content"
+        assert results[0]["content"] == content
+        if not content:
+            assert results[0]["error"] == "Blocked: URL targets a private or internal network address"
+            assert results[0]["raw_content"] == ""
+        else:
+            assert "error" not in results[0]
