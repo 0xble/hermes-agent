@@ -45,7 +45,7 @@ def _key_hash(key):
 def _unfinished(agent):
     lifetime = getattr(agent, "_gateway_turn_lifetime", None)
     return (isinstance(lifetime, tuple) and len(lifetime) == 2
-            and not all(stage.is_set() for stage in lifetime))
+            and not all(getattr(stage, "is_set", lambda: True)() for stage in lifetime))
 
 
 def _agent_owner(agent, structure, key, category, add_manager):
@@ -147,15 +147,23 @@ def writer_census(runner: Any) -> dict[str, Any]:
     def add_manager(manager, structure, key, category, shutdown=False, agent_id=None):
         if manager is None:
             return
-        source = getattr(manager, "_providers", ())
-        before = tuple(source)
+        source = getattr(manager, "_providers", None) or ()
+        try:
+            before = tuple(source)
+        except TypeError:
+            raced.add("memory_manager:providers_unreadable")
+            return
         for provider in before:
             if getattr(provider, "name", None) != "hindsight":
                 continue
             previous = observed.get(id(provider))
             if previous is not None and previous() is not provider:
                 raced.add("provider:object_id_reused_during_snapshot")
-            observed[id(provider)] = weakref.ref(provider)
+            try:
+                observed[id(provider)] = weakref.ref(provider)
+            except TypeError:
+                # Not weakly referenceable: its identity cannot be checked across the snapshot.
+                raced.add("provider:not_weakly_referenceable")
             writer = getattr(provider, "_writer_thread", None)
             event = getattr(provider, "_shutting_down", None)
             stopped = shutdown or getattr(manager, "_shutdown_started", False) is True
@@ -175,7 +183,8 @@ def writer_census(runner: Any) -> dict[str, Any]:
             row["shutdown"] |= bool(stopped)
             if row["writer_id"] != (id(writer) if writer is not None else None):
                 raced.add("provider:writer_changed_during_snapshot")
-            if writer is None:
+            if writer is None or not getattr(writer, "is_alive", lambda: False)():
+                # Never started, or exited (shutdown() keeps the handle): no live writer owned here.
                 row["writerless"] = True
         if tuple(id(p) for p in source) != tuple(id(p) for p in before):
             raced.add("memory_manager:providers_changed_during_snapshot")

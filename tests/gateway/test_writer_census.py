@@ -161,6 +161,33 @@ def test_busy_lock_and_container_race_are_incomplete_not_retried(writers):
     assert "PRIVATE" not in json.dumps(result)
 
 
+def test_exited_writer_handle_is_writerless_not_a_live_owner(writers):
+    # shutdown() keeps `_writer_thread` set after the thread exits.
+    exited = threading.Thread(target=lambda: None, name="hindsight-writer")
+    exited.start()
+    exited.join(timeout=5)
+    runner = NS(_agent_cache={"k": (agent(provider(exited, shutdown=True)), "signature", 0)}, _sessions={})
+    result = request(runner)
+    assert result["counts"]["writerless_provider"] == 1
+    assert result["counts"]["cached_idle"] == 0
+
+
+def test_off_shape_owners_mark_incomplete_instead_of_failing(writers):
+    class Slotted:
+        __slots__ = ("name", "_writer_thread")
+
+        def __init__(self):
+            self.name, self._writer_thread = "hindsight", None
+
+    off_lifetime = NS(_memory_manager=NS(_providers=[Slotted()]), _gateway_turn_lifetime=(object(), object()))
+    runner = NS(_agent_cache={"a": (off_lifetime,), "b": (NS(_memory_manager=NS(_providers=None)),),
+                              "c": (NS(_memory_manager=NS(_providers=7)),)}, _sessions={})
+    result = request(runner)
+    assert "provider:not_weakly_referenceable" in result["raced"]
+    assert "memory_manager:providers_unreadable" in result["raced"]
+    assert result["incomplete"]
+
+
 def test_real_release_thread_arguments_and_api_parked_manager(writers):
     start, threads = writers
     p, parked = provider(start()), provider(start())

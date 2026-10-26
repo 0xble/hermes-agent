@@ -33,7 +33,9 @@ are named under `other_owner`, asynchronous API retirement under
 
 Native IDs are validated by `test_native_id_matches_os_thread_inventory`:
 Linux compares `/proc/<pid>/task` directory names, macOS compares libproc
-`proc_pidinfo(PROC_PIDLISTTHREADS)`. macOS `ps -M` lists thread rows but does not
+`proc_pidinfo(PROC_PIDLISTTHREADIDS)` (flavor 28), the system thread IDs that
+`threading.native_id` and `/usr/bin/sample` report. `PROC_PIDLISTTHREADS` (6) returns thread
+handles instead. macOS `ps -M` lists thread rows but does not
 print their numeric thread IDs, so it cannot establish numeric equality.
 
 Focused proof: `scripts/run_tests.sh tests/gateway/test_writer_census.py
