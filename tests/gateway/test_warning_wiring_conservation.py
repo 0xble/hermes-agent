@@ -2,6 +2,7 @@
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
+from gateway import run
 from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
 from gateway.config import Platform
@@ -18,10 +19,10 @@ def test_concrete_gateway_sinks_hide_all_freeform_muted_turn_output():
         holder = NS(_ctx=ctx, _status_live=lambda: True,
             _schedule=lambda coro, *args: scheduled.append(coro),
             _status_delivery=NS(send=lambda *args: "status-send"),
-            _runner=NS(_deliver_platform_notice=lambda *args: "notice-send"))
-        with patch("gateway.run._prepare_gateway_status_message", lambda *args: "prepared"), \
-             patch("gateway.run._send_or_update_status_coro", lambda *args: "status-send"), \
-             patch("gateway.run.render_notice_line", lambda notice: notice.text):
+            _runner=NS(_deliver_platform_notice=lambda *args, **kwargs: "notice-send"))
+        with patch.object(run, "_prepare_gateway_status_message", lambda *args: "prepared"), \
+             patch.object(run, "_send_or_update_status_coro", lambda *args: "status-send"), \
+             patch.object(run, "render_notice_line", lambda notice: notice.text):
             TurnRunner._status_callback_sync(holder, "lifecycle", "ordinary progress")
             TurnRunner._status_callback_sync(holder, "warn", "warning")
             TurnRunner._notice_callback_sync(holder, NS(level="info", text="info"))

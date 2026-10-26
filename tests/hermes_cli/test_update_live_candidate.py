@@ -161,7 +161,8 @@ def test_explicit_replace_drops_only_named_candidate(installed):
     assert not (active / "candidate.txt").exists()
     assert update_receipt._current.get().data["replaced_candidate"] == installed.live
     args = installed.parser.parse_args(["update", "--replace-candidate", installed.live])
-    assert update_cmd._post_swap_argv_tail(args) == ["--replace-candidate", installed.live]
+    # The post-swap child runs the target's parser, which may predate the flag.
+    assert update_cmd._post_swap_argv_tail(args) == []
 
 
 @pytest.mark.parametrize("replacement", ["wrong", "short"])
@@ -331,7 +332,7 @@ def test_landing_evidence_uses_origin_pr_record(installed, monkeypatch, origin, 
     pr = {"base": {"ref": "main", "repo": {"full_name": "example/hermes-agent"}},
           "head": {"sha": installed.live}, "state": "open", "merged_at": None}
     if state == "merged":
-        pr.update(state="closed", merged_at="2026-10-24T12:00:00Z")
+        pr.update(state="closed", merged_at="2026-10-24T12:00:00Z", merge_commit_sha=installed.target)
     urls = []
 
     def request(url):
@@ -339,11 +340,13 @@ def test_landing_evidence_uses_origin_pr_record(installed, monkeypatch, origin, 
         return json.dumps([] if state == "unknown" else [pr])
 
     monkeypatch.setattr(source_check, "_request", request)
-    assert _real_landing_status(installed.source, installed.live, base_branches={"main"}) == state
+    assert _real_landing_status(installed.source, installed.live, base_branches={"main"},
+                                target=installed.target) == state
     assert urls == [f"https://api.github.com/repos/example/hermes-agent/commits/{installed.live}/pulls?per_page=100&page=1"]
 
 
-@pytest.mark.parametrize("case", ["offline", "malformed", "no-pr", "closed", "moved-head", "other-base", "other-repo", "non-github", "no-origin"])
+@pytest.mark.parametrize("case", ["offline", "malformed", "no-pr", "closed", "moved-head", "other-base", "other-repo",
+                                  "non-github", "no-origin", "merged-outside-target", "merged-unknown-commit"])
 def test_uncertain_landing_evidence_is_unknown(installed, monkeypatch, case):
     from hermes_cli import source_check
 
@@ -352,14 +355,18 @@ def test_uncertain_landing_evidence_is_unknown(installed, monkeypatch, case):
     if case != "no-origin":
         origin = "https://example.com/example/hermes-agent.git" if case == "non-github" else "https://github.com/example/hermes-agent.git"
         git(installed.source, "remote", "add", "origin", origin)
-    if case == "closed":
-        pr["state"] = "closed"
-    elif case == "moved-head":
-        pr["head"]["sha"] = installed.target
-    elif case == "other-base":
-        pr["base"]["ref"] = "unrelated"
-    elif case == "other-repo":
-        pr["base"]["repo"]["full_name"] = "other/hermes-agent"
+    mutate = {
+        "closed": lambda: pr.update(state="closed"),
+        "moved-head": lambda: pr["head"].update(sha=installed.target),
+        "other-base": lambda: pr["base"].update(ref="unrelated"),
+        "other-repo": lambda: pr["base"]["repo"].update(full_name="other/hermes-agent"),
+        # Merged elsewhere (or after this fetch): returning the bare target would drop it.
+        "merged-outside-target": lambda: pr.update(
+            state="closed", merged_at="2026-10-24T12:00:00Z", merge_commit_sha=installed.live),
+        "merged-unknown-commit": lambda: pr.update(
+            state="closed", merged_at="2026-10-24T12:00:00Z", merge_commit_sha="f" * 40),
+    }
+    mutate.get(case, lambda: None)()
 
     def request(url):
         if case == "offline":
@@ -369,7 +376,8 @@ def test_uncertain_landing_evidence_is_unknown(installed, monkeypatch, case):
         return json.dumps([] if case == "no-pr" else [pr])
 
     monkeypatch.setattr(source_check, "_request", request)
-    assert _real_landing_status(installed.source, installed.live, base_branches={"main"}) == "unknown"
+    assert _real_landing_status(installed.source, installed.live, base_branches={"main"},
+                                target=installed.target) == "unknown"
 
 
 @pytest.mark.parametrize("last_page", ["merged", "failure", "empty", "incomplete"])
@@ -389,11 +397,13 @@ def test_landing_evidence_reads_all_pages_before_carry(installed, monkeypatch, l
             raise OSError("page unavailable")
         if last_page == "empty":
             return "[]"
-        return json.dumps([{**pr, "state": "closed", "merged_at": "2026-10-24T12:00:00Z"}])
+        return json.dumps([{**pr, "state": "closed", "merged_at": "2026-10-24T12:00:00Z",
+                            "merge_commit_sha": installed.target}])
 
     monkeypatch.setattr(source_check, "_request", request)
     expected = {"merged": "merged", "failure": "unknown", "empty": "unmerged", "incomplete": "unknown"}[last_page]
-    assert _real_landing_status(installed.source, installed.live, base_branches={"main", "stable"}) == expected
+    assert _real_landing_status(installed.source, installed.live, base_branches={"main", "stable"},
+                                target=installed.target) == expected
     assert len(urls) == (10 if last_page == "incomplete" else 2)
 
 
@@ -468,6 +478,9 @@ def test_old_carry_receipt_does_not_misidentify_target_branch_as_candidate(insta
         "argv": ["hermes", "update", "--branch", "main"],
         "release_transition": {"to_sha": combined}, "carried_candidates": [installed.live],
     }))
+    # Newest-first scanning meets unreadable receipts first; they are not provenance.
+    (receipts / "update_zz_corrupt.json").write_text("{")
+    (receipts / "update_zz_shape.json").write_text(json.dumps({"release_transition": "unexpected"}))
     git(installed.source, "remote", "add", "origin", ".")
     commit_file(installed.source, "next.txt", "next target\n")
     git(installed.source, "fetch", ".", "main")
@@ -492,3 +505,16 @@ def test_activation_prunes_unneeded_carry_refs_but_retains_rollback(installed):
     assert first.name not in refs
     releases.activate_release(installed.home, second, operation="rollback")
     assert set(git(installed.source, "for-each-ref", "--format=%(objectname)", "refs/hermes/carry-forward/").split()) == {second.name, third.name}
+
+
+def test_failed_ref_prune_still_finishes_activation(installed, monkeypatch, capsys):
+    (installed.home / "release-layout.json").write_text(json.dumps({"source": str(installed.source)}))
+
+    def locked(*_):
+        raise subprocess.CalledProcessError(128, ["git", "update-ref"], stderr="ref lock held")
+
+    monkeypatch.setattr(releases, "prune_carry_forward_refs", locked)
+    active = apply(installed)
+    assert releases.read_pointer(installed.home / "current") == active
+    assert not (installed.home / "release-txn.json").exists()
+    assert "carry-forward refs" in capsys.readouterr().err

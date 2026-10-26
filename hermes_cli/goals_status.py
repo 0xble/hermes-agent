@@ -2,6 +2,8 @@
 
 from hermes_cli.lifecycle_snapshot import snapshot_control
 
+from gateway.notice_style import ContextNotice
+
 
 class GoalStatusMixin:
     @snapshot_control
