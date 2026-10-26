@@ -1334,8 +1334,6 @@ class TurnRunner:
                 return
             if line:
                 style = getattr(notice, "notice_style", None)
-                if str(getattr(notice, "key", "") or "").startswith("credits.") and getattr(notice, "level", None) in {"info", "success"}:
-                    style = "context"
                 self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line, notice_style=style), "notice_callback delivery scheduling error")
         render_notification(present, platform=self._ctx.source.platform,
                             user_config=self._ctx.user_config, diagnostic=diagnostic)
