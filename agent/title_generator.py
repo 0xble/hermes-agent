@@ -528,14 +528,14 @@ def _title_link_context(user_message: str, title_preview: str | None) -> Optiona
         return None
 
 
-def is_titleable_user_message(user_message: str) -> bool:
-    """False for machine-authored openers and turns that reduce to nothing once scaffolding is stripped."""
+def is_titleable_user_message(user_message: str, title_preview: str | None = None) -> bool:
+    """Reject machine openers and scaffolding, allowing a paste's usable title-only preview."""
     return (isinstance(user_message, str) and bool(user_message.strip()) and not user_message.lstrip().startswith(_MACHINE_PREFIXES)
             and bool(_summarize_user_message(user_message).strip())
-            # An attachment-only opener (manual attach, no paste preview) is a
-            # file drop, not a request: deriving its "title" from the message
-            # names the session after the truncated file path (#92068).
-            and not _attachment_only_opener(user_message))
+            # A manual file drop has no subject (#92068), but a paste-only opener
+            # carries its subject in the explicit preview, not the generated path.
+            and (not _attachment_only_opener(user_message)
+                 or (isinstance(title_preview, str) and is_titleable_user_message(title_preview))))
 
 
 def derive_title(user_message: str, title_preview: str | None = None) -> Optional[str]:
@@ -996,7 +996,7 @@ def apply_instant_title(
     if not session_db or not session_id:
         return None
     try:
-        title = derive_title(user_message, title_preview) if is_titleable_user_message(user_message) else None
+        title = derive_title(user_message, title_preview) if is_titleable_user_message(user_message, title_preview) else None
         persisted = _persist_session_title(session_db, session_id, title, source="derived", dedupe=False) if title else None
         if persisted:
             _notify_title(
@@ -1203,56 +1203,6 @@ def defer_title_completion_retry(
     return spawn_context_thread(retry_with_reply, name="auto-title-reply")
 
 
-def defer_title_completion_retry(
-    upgrade: threading.Thread, session_db, session_id: str, user_message: str, **title_kwargs,
-) -> Optional[threading.Thread]:
-    """Return the unstarted upgrade, or one bounded opening-turn retry for finalization.
-
-    Eager attempts can abstain even when the opener passes the cheap subject heuristic.
-    Wait off the turn's critical path for that attempt, then reuse the completed reply.
-    """
-    if upgrade.ident is None:
-        return upgrade
-    history = title_kwargs.get("conversation_history")
-    if not _hold_until_reply_enabled() or _real_user_turns(history) > 1:
-        return None
-
-    def retry_with_reply():
-        upgrade.join()
-        if _has_upgraded_title(session_db, session_id) or not _latest_assistant_excerpt(history):
-            return
-        logger.info("Retrying opening title after reply: session=%s", session_id)
-        auto_title_session(session_db, session_id, user_message, **title_kwargs)
-
-    from agent.memory_provider import spawn_context_thread
-    return spawn_context_thread(retry_with_reply, name="auto-title-reply")
-
-
-def defer_title_completion_retry(
-    upgrade: threading.Thread, session_db, session_id: str, user_message: str, **title_kwargs,
-) -> Optional[threading.Thread]:
-    """Return the unstarted upgrade, or one bounded opening-turn retry for finalization.
-
-    Eager attempts can abstain even when the opener passes the cheap subject heuristic.
-    Wait off the turn's critical path for that attempt, then reuse the completed reply.
-    """
-    if upgrade.ident is None:
-        return upgrade
-    history = title_kwargs.get("conversation_history")
-    if not _hold_until_reply_enabled() or _real_user_turns(history) > 1:
-        return None
-
-    def retry_with_reply():
-        upgrade.join()
-        if _has_upgraded_title(session_db, session_id) or not _latest_assistant_excerpt(history):
-            return
-        logger.info("Retrying opening title after reply: session=%s", session_id)
-        auto_title_session(session_db, session_id, user_message, **title_kwargs)
-
-    from agent.memory_provider import spawn_context_thread
-    return spawn_context_thread(retry_with_reply, name="auto-title-reply")
-
-
 def maybe_auto_title(
     session_db,
     session_id: str,
@@ -1292,7 +1242,7 @@ def maybe_auto_title(
             if persisted:
                 _notify_title(title_callback, persisted, "llm", "Kanban task title")
         return None
-    if not is_titleable_user_message(user_message):
+    if not is_titleable_user_message(user_message, title_preview):
         return None
     if not _auto_title_enabled():  # config read after the cheap guards so the file isn't touched every turn
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
