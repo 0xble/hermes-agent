@@ -70,3 +70,54 @@ currency. Preserve this release policy when applying generic maintenance guidanc
 - For separately authorized activation, use the runtime support file's host-specific
   acceptance and recovery requirements. Preserve unresolved acceptance gaps until
   demonstrated behavior closes them.
+
+## Deploy-Base Qualification Repairs
+
+Fork patch identities: `lpg-backport-qualification`, `lpg-provider-credentials`.
+These repairs are scoped to the LPG deploy base in [PR #790](https://github.com/0xble/hermes-agent/pull/790).
+Subprocess output uses explicit UTF-8 decoding, inherited contributor Baris Sencan
+is mapped to `isair`, and the complete existing CI runs on standard hosted runners.
+The canonical runner partitions the full discovered Python suite into 10 slices.
+The existing aggregate rejects cancelled dependencies and is required by `qualification`.
+The contributor collision guard verifies preserved exact filenames and content on
+case-insensitive filesystems.
+
+models.dev listing a provider must not hide credentials already declared by its
+registered plugin. Resolution keeps catalog and plugin key names plus the existing
+overlay, without changing endpoint/transport precedence. The existing CommandCode
+resolution assertion and `tests/hermes_cli/test_provider_catalog_credentials.py`
+guard this. Retire the patch when upstream resolution preserves the same union.
+
+Fork patch identity: `lpg-qualification-fixtures`. The inherited nested-emphasis
+renderer fix had not regenerated the Telegram conformance vectors. Regenerate
+with `scripts/generate_conformance_vectors.py`, retaining the unchanged corpus
+and all parity assertions. The bare Slack adapter test double must initialize
+its constructor-owned channel-type cache. Local quickstart sequencing tests use
+the existing deterministic preflight fixture, preserving both successful setup
+leg assertions and the separate refusal tests. Guards: `tests/conformance/test_vector_generator.py`,
+`tests/gateway/test_slack_mention.py`, and `tests/hermes_cli/test_local_quickstart.py`.
+
+The inherited `fallback.min_switch_reset_seconds` setting also needs its
+`fallback` category folded into the existing agent tab through `_CATEGORY_MERGE`.
+The existing `test_no_single_field_categories` contract remains unchanged.
+
+The concurrent cron/profile isolation fixture must accept `compute_next_run`'s
+existing third timezone argument. Only the stub signature changes. Its concurrent
+write ordering and both profile-store isolation assertions remain unchanged.
+Guard: `tests/hermes_cli/test_web_server_cron_profiles.py`.
+
+JS/TS and bootstrap-installer checks also use standard hosted runners. Their
+large-runner labels inherited from upstream are unavailable to this fork. All
+existing commands and acceptance checks remain in both jobs.
+
+The desktop Local Models pane fixture must return the jobs seeded by each test
+from its backend poll mock. Returning an empty registry erased the running
+quickstart job when a poll from the preceding test fired. The unchanged progress,
+setup-button, download, and completion-navigation assertions remain the guard in
+`apps/desktop/src/app/settings/local-models-settings.test.tsx`.
+
+The notice policy also gates CLI/TUI judge, automatic resume, and lifted-wait
+output. Judging and queued follow-ups remain active. Explicit controls and
+compression-failure recovery warnings remain visible. Guards:
+`tests/hermes_cli/test_goal_notice_surfaces.py` and
+`tests/tui_gateway/test_goal_notice_surfaces.py`.

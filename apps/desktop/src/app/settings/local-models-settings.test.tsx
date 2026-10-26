@@ -127,7 +127,9 @@ beforeEach(() => {
   mocked.getLocalModelsStatus.mockResolvedValue(BASE_STATUS)
   mocked.getLocalHardware.mockResolvedValue(BASE_HARDWARE)
   mocked.getLocalCatalog.mockResolvedValue({ models: [FITTING_MODEL, SPILLED_MODEL, REFUSED_MODEL] })
-  mocked.getLocalModelsJobs.mockResolvedValue({ jobs: [] })
+  // Pane tests seed the app-level store. The backend poll must report the
+  // same jobs, rather than deleting a running job on an unrelated timer.
+  mocked.getLocalModelsJobs.mockImplementation(async () => ({ jobs: [...$localRuntimeJobs.get()] }))
   $localRuntimeJobs.set([])
 })
 
