@@ -1770,13 +1770,14 @@ OUTBOUND_FINAL = "final"
 SEND_SHED_BY_BUDGET = "daily_budget_shed"
 OUTBOUND_NOTICE = "notice"
 OUTBOUND_PROGRESS = "progress"
+OUTBOUND_TOOL_PROGRESS = "tool_progress"
 _OUTBOUND_CLASS: "_contextvars.ContextVar[Optional[str]]" = _contextvars.ContextVar(
     "gateway_outbound_class", default=None)
 
 
 @contextlib.contextmanager
 def outbound_class(kind: str):
-    """Label sends made inside this block as ``notice`` or ``progress``."""
+    """Label sends and edits as notices, tool progress, or expendable cosmetic progress."""
     token = _OUTBOUND_CLASS.set(kind)
     try:
         yield

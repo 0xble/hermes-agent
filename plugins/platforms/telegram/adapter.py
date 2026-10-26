@@ -33,7 +33,7 @@ from plugins.platforms.telegram.daily_quota import DailyQuota, quota_from_platfo
 from plugins.platforms.telegram.session_control_cards import session_control_outcome
 from plugins.platforms.telegram.chat_budget import (
     EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
-    current_trigger, keep_trigger, reset_trigger)
+    current_trigger, keep_trigger, reset_trigger, skip_progress_edit)
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -163,7 +163,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len, in_ingress_consumer,
-    OUTBOUND_NOTICE, OUTBOUND_PROGRESS, SEND_SHED_BY_BUDGET, current_outbound_class,
+    OUTBOUND_NOTICE, OUTBOUND_PROGRESS, OUTBOUND_TOOL_PROGRESS, SEND_SHED_BY_BUDGET, current_outbound_class,
 )
 
 # Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
@@ -4891,14 +4891,16 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
     async def _send_chunks(
         self, chat_id: str, chunks: List[str], delivered: List[str], reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]], error_types: tuple) -> SendResult:
-        """Deliver formatted ``chunks`` in order, appending each landed message id to ``delivered``
-        (pre-seeded with the ids of an earlier partial send when resuming — the chunk index used for
-        reply routing continues from there). A mid-loop refusal returns the ``partial_overflow`` result."""
+        """Send chunks in order, extending ``delivered`` (including pre-seeded ids on resume).
+        A definite refusal returns ``partial_overflow`` for the unsent remainder."""
         thread_id = self._metadata_thread_id(metadata)
         requested_thread_id = self._message_thread_id_for_send(thread_id)
         used_thread_fallback = False
         prior = len(delivered)
         for chunk in chunks:
+            if (delivered and current_outbound_class() == OUTBOUND_TOOL_PROGRESS
+                    and self._daily_sheds(chat_id, OUTBOUND_PROGRESS)):
+                break  # Only the first bubble is protected, not its cosmetic split tail.
             outcome = await self._send_chunk_with_retries(
                 chat_id, chunk, len(delivered), reply_to, metadata, thread_id, used_thread_fallback, error_types)
             if isinstance(outcome, SendResult):
@@ -5048,19 +5050,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                 "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing edit without an API call",
                 self.name, chat_id, _edit_cooldown)
             return _flood_cap_result(_edit_cooldown)
-        # Shared per-chat budget (#116312): an interim (preview) edit is SKIPPED when the slot is busy —
-        # the text it would show is shown by the next edit anyway, so a burst of edits can't trip flood
-        # control. A final edit is never skipped (the completed answer is always delivered) but waits
-        # for its slot below. Over-cap interim edits are exempt: the saturated-preview dedup
-        # below already throttles them to one real edit per ~4096-char growth. Consumed only when the
-        # edit actually fires. The skip is flagged in raw_response so the stream consumer does not
-        # record never-shown text as the visible prefix (a later flood fallback would then drop the
-        # tail the user never saw).
-        if (
-            not finalize
-            and utf16_len(content) <= self.MAX_MESSAGE_LENGTH
-            and (self._chat_budget().interim_blocked(chat_id) or self._daily_sheds(chat_id, OUTBOUND_PROGRESS))
-        ):
+        # Flag skipped previews so the consumer does not record never-shown text as visible.
+        if skip_progress_edit(self, chat_id, content, finalize):
             logger.debug(
                 "[%s] skipping interim edit for chat %s (shared send+edit budget: slot busy)",
                 self.name, chat_id)
