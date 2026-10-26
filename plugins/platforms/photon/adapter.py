@@ -1225,16 +1225,13 @@ class PhotonAdapter(BasePlatformAdapter):
     # -- Agent-facing reactions (send_message action="react"): deliberate intents, so NOT
     # gated by PHOTON_REACTIONS.
 
-    async def add_reaction(self, chat_id: str, emoji: str, message_id: Optional[str] = None) -> Dict[str, Any]:
-        """Tapback ``emoji`` onto a message (default: the chat's latest inbound). iMessage
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        """Tapback ``emoji`` onto a message (empty ID uses the chat's latest inbound). iMessage
         maps ❤️👍👎😂‼️❓ to native tapbacks; anything else is a custom-emoji reaction."""
         target = message_id or self._last_inbound_by_chat.get(self._normalize_chat_key(chat_id))
         if not target:
-            return {"success": False, "error": "no message to react to — pass message_id (no "
-                    "inbound message seen in this chat since the gateway started)"}
-        if not await self._add_reaction(chat_id, target, emoji):
-            return {"success": False, "error": "reaction failed (see gateway debug log)"}
-        return {"success": True, "message_id": target}
+            return False
+        return await self._add_reaction(chat_id, target, emoji)
 
     async def remove_reaction(self, chat_id: str, message_id: Optional[str] = None) -> Dict[str, Any]:
         """Retract our tapback from a message (best-effort)."""

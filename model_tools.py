@@ -269,8 +269,9 @@ def _tool_defs_cache_key(
         cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
+    from tools.react_to_message_tool import check_react_requirements
     return (
-        registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+        check_react_requirements(), registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
@@ -331,6 +332,9 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
     # disabled toolset are strictly stripped out. See issue #17309.
     if disabled_toolsets:
         _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
+    from tools.react_to_message_tool import check_react_requirements
+    if not check_react_requirements():
+        tools.discard("react_to_message")
     return tools
 
 

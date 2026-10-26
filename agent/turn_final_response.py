@@ -80,8 +80,15 @@ def finish_text_response(
     # BEFORE the ladder. ``length`` (cut off mid-thought) stays on the continuation path,
     # and the promoted text is persisted as ordinary content so the next turn replays it.
     _content = assistant_message.content
+    from gateway.session_context import current_message_reaction_acknowledged
+    reaction_only_stop = (
+        not (_content or "").strip() and finish_reason in (None, "stop")
+        and not assistant_message.tool_calls and not truncated_response_parts
+        and current_message_reaction_acknowledged()
+    )
     if (
         finish_reason == "stop"
+        and not reaction_only_stop
         and not assistant_message.tool_calls
         and (_content is None or (isinstance(_content, str) and not _content.strip()))
     ):
@@ -98,7 +105,7 @@ def finish_text_response(
     agent._mute_post_response = False
 
     # Think-block-only / empty content: recovery path.
-    if not agent._has_content_after_think_block(final_response):
+    if not agent._has_content_after_think_block(final_response) and not reaction_only_stop:
         _ev = recover_empty_response(
             agent, assistant_message, response, finish_reason, final_response=final_response,
             messages=messages, api_messages=api_messages, conversation_history=conversation_history,
@@ -137,11 +144,12 @@ def finish_text_response(
         intent_ack_continuation_mode, trailing_continue_intent
     )
 
-    _ack_mode = intent_ack_continuation_mode(agent)
+    _ack_mode = "off" if reaction_only_stop else intent_ack_continuation_mode(agent)
     # Said-continue-but-stopped guard: no tool calls but the short reply TAILS with an
     # announced next action. Reuses the SAME bounded continuation counter (max 2 per turn).
     _stall_continue_intent = (
-        bool(getattr(agent, "_stall_guards", True))
+        not reaction_only_stop
+        and bool(getattr(agent, "_stall_guards", True))
         and agent.valid_tool_names
         and codex_ack_continuations < 2
         and trailing_continue_intent(agent._strip_think_blocks(final_response or ""))
