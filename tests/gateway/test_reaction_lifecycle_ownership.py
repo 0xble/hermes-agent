@@ -110,6 +110,12 @@ async def test_completion_preserves_only_a_confirmed_intentional_target(reaction
     if preserved:
         assert calls[before_complete - 1][2] == "😁"
 
+    # Cleanup errors can invoke completion again on the same event.
+    before_repeat = len(calls)
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+    expected_repeat = [] if preserved or not enabled else _ordinary_completion(platform, ProcessingOutcome.FAILURE)
+    assert [call[2] for call in calls[before_repeat:]] == expected_repeat
+
     # Reprocessing the same target is a new lifecycle, not a permanent mute.
     control.fail = control.raises = False
     await adapter.on_processing_start(event)

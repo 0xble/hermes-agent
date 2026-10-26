@@ -16,7 +16,7 @@ class ProcessingReaction:
 @asynccontextmanager
 async def reaction_operation(
     adapter: Any, chat_id: str, message_id: str, *, author: str = "",
-    start: bool = False, complete: bool = False,
+    start: bool = False, complete: bool = False, event: Any = None,
 ) -> AsyncIterator[ProcessingReaction]:
     """Serialize status and explicit writes to one target, retaining only active turns.
 
@@ -28,10 +28,17 @@ async def reaction_operation(
     key = (normalize(chat_id), str(message_id), str(author))
     states = adapter.__dict__.setdefault("_processing_reaction_states", {})
     state = states.get(key)
+    previous = getattr(event, "_processing_reaction_state", None)
+    if state is None and not start and previous and previous[0] is adapter and previous[1] == key:
+        state = previous[2]
     if state is None:
         state = ProcessingReaction()
         if start:
             states[key] = state
+    if event is not None:
+        # Completion may run again after a post-delivery cleanup error. The event
+        # retains its receipt until it dies, without retaining historical targets.
+        event._processing_reaction_state = (adapter, key, state)
     try:
         async with state.lock:
             yield state
