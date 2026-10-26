@@ -46,6 +46,43 @@ async def _run_one_iteration(r, *, interval=0.01, settle=0.1):
     await asyncio.wait_for(task, timeout=2)
 
 
+async def _run_until_abandoned(r, monkeypatch, *, interval=0.01, timeout=2.0):
+    """Run the watcher until its real abort cleanup has returned, then stop and join it.
+
+    A fixed settle races the watcher's own startup and interval timers: a loop stall that
+    covers both lets the stop land before the first iteration, so an abort assertion would
+    read the initial state. Waiting on the real ``_scale_to_zero_abandon_suspend`` returning
+    proves the abort ran before anything is asserted about it."""
+    abandoned = asyncio.Event()
+    real_abandon = r._scale_to_zero_abandon_suspend
+
+    def abandon_then_signal():
+        real_abandon()
+        abandoned.set()
+
+    monkeypatch.setattr(r, "_scale_to_zero_abandon_suspend", abandon_then_signal, raising=False)
+    task = asyncio.create_task(r._scale_to_zero_watcher(interval=interval))
+    try:
+        await asyncio.wait_for(abandoned.wait(), timeout=timeout)
+    finally:
+        r._running = False
+        try:
+            await asyncio.wait_for(task, timeout=2)
+        except asyncio.TimeoutError:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise
+
+
+def _stall_event_loop(seconds):
+    """Block the loop once, early, as a descheduled CI runner does; both the watcher's first
+    timer and any fixed settle timer expire inside the stall."""
+    if not seconds:
+        return None
+    return asyncio.get_running_loop().call_later(0.005, time.sleep, seconds)
+
+
 async def _noop_async(*a, **k):
     return None
 
@@ -322,22 +359,46 @@ async def test_in_guest_fence_releases_at_once_after_a_resume(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_abort_sets_a_cooldown_so_it_does_not_retry_every_tick(monkeypatch):
+@pytest.mark.parametrize("stall", [0.0, 0.15], ids=["prompt", "stalled-loop"])
+async def test_abort_sets_a_cooldown_so_it_does_not_retry_every_tick(monkeypatch, stall):
     r, adapter = _runner_with(monkeypatch, idle=True, brokered=True)
-    adapter.hold_redial = lambda: False
+    holds = []
 
-    await _run_one_iteration(r)
+    def refuse_hold():
+        holds.append(1)
+        return False
+
+    adapter.hold_redial = refuse_hold
+
+    blocker = _stall_event_loop(stall)
+    try:
+        await _run_until_abandoned(r, monkeypatch)
+    finally:
+        if blocker is not None:
+            blocker.cancel()
 
     assert r._scale_to_zero_cooldown_until > time.time()
+    # The cooldown stopped the retry: one refused hold, no unprotected dormant, fail awake.
+    assert holds == [1]
+    assert adapter.go_dormant_calls == 0
+    assert r.states == ["draining", "running"]
 
 
 @pytest.mark.asyncio
-async def test_abort_never_resurrects_a_shutting_down_gateway(monkeypatch):
+@pytest.mark.parametrize("stall", [0.0, 0.15], ids=["prompt", "stalled-loop"])
+async def test_abort_never_resurrects_a_shutting_down_gateway(monkeypatch, stall):
     """A real shutdown drain must win: `running` here would clobber it."""
     r, _ = _runner_with(monkeypatch, idle=True, brokered=True, ack=False, draining=True)
 
-    await _run_one_iteration(r)
+    blocker = _stall_event_loop(stall)
+    try:
+        await _run_until_abandoned(r, monkeypatch)
+    finally:
+        if blocker is not None:
+            blocker.cancel()
 
+    # The abort really ran (it set the cooldown) and still left the shutdown state alone.
+    assert r._scale_to_zero_cooldown_until > time.time()
     assert "running" not in r.states
 
 
