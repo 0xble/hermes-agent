@@ -135,5 +135,39 @@ def test_ts_shell_linter_runs_when_no_ancestor_tsconfig(tmp_path):
     assert exec_mock.called, "tsc should run when there's no project tsconfig"
 
 
+_needs_gofmt = pytest.mark.skipif(not __import__("shutil").which("gofmt"), reason="gofmt not installed")
+
+
+def _go_lint(path):
+    fops = _make_fops()
+    with patch.object(fops, "_lsp_will_handle", return_value=False):
+        return fops._check_lint(str(path))
+
+
+@_needs_gofmt
+def test_go_file_using_a_sibling_type_is_not_flagged(tmp_path):
+    """The per-file Go check sees one file. A type defined in a sibling file of the same
+    package is valid code, not ``undefined`` (package vet/lint/tests own type checking)."""
+    (tmp_path / "go.mod").write_text("module example.com/p\n\ngo 1.22\n")
+    (tmp_path / "options.go").write_text("package p\n\ntype RunOptions struct{ N int }\n")
+    test_file = tmp_path / "run_test.go"
+    test_file.write_text("package p\n\nfunc defaults() RunOptions { return RunOptions{N: 1} }\n")
+
+    result = _go_lint(test_file)
+
+    assert result.success is True and not result.skipped, result.output
+
+
+@_needs_gofmt
+def test_go_syntax_error_is_reported(tmp_path):
+    bad = tmp_path / "bad.go"
+    bad.write_text("package p\n\nfunc broken( {\n")
+
+    result = _go_lint(bad)
+
+    assert result.success is False and not result.skipped
+    assert "bad.go:3" in result.output
+
+
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])
