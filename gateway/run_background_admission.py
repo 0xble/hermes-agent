@@ -4,7 +4,8 @@ Restart resumes, goal and loop wakes, delegation retries and process or delegati
 start new agent turns on their own. Unbounded, a restart or a busy hour starts a hundred of them
 at once and every typed message then waits minutes on the shared state.db writer and event loop.
 One ``BackgroundTurnGate`` (owned by the replay scheduler) admits them only while fewer than
-``gateway.background_turn_concurrency`` turns nobody typed run. Typed input never asks the gate.
+``gateway.background_turn_concurrency`` gated turns run. Ungated origins do not consume these
+slots, and typed input never asks the gate.
 
 Restart resumes wait in the scheduler's priority queue. A wake is never made to wait: when the
 gate is full it is refused with ``WakeNotAccepted`` and its caller keeps its durable claim (lifted
@@ -97,12 +98,18 @@ class GatewayBackgroundAdmissionMixin:
         )
 
     def _background_turn_keys(self) -> set[str]:
-        """Sessions whose running turn nobody typed: the gate's live load."""
+        """Live gated turns, including startup resumes until their full turn finishes.
+
+        Ungated relays/cron never acquire a slot, so counting them could permanently block
+        every gated wake. Resumes have unknown origin and use their existing lifecycle owner.
+        """
         from gateway.platforms.event import turn_origin_for_event
+        resumes = getattr(self, "_startup_resume_inflight", set())
         return {
             key for key, state in list(self._session_states().items())
             if state.turn.agent is not None and state.turn.event is not None
-            and turn_origin_for_event(state.turn.event) != "user"
+            and (turn_origin_for_event(state.turn.event) in _GATED_ORIGINS
+                 or (key in resumes and turn_origin_for_event(state.turn.event) != "user"))
         }
 
     def _turn_started_since(self, session_key: Any, since: float) -> bool:
