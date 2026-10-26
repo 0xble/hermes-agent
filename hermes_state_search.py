@@ -14,7 +14,7 @@ from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_errors import is_malformed_db_error, is_sqlite_lock_error, is_fts_query_syntax_error
-from hermes_state_search_runtime import search_operation, hydration_stage, search_stage
+from hermes_state_search_runtime import search_operation, hydration_stage, search_stage, set_search_path
 from hermes_state_common import (
     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
@@ -1045,6 +1045,10 @@ class SessionSearchMixin:
         lock, so only writer/reopen/maintenance paths own that recovery.
         """
         sql, params = self._fts_match_sql(table, match_query, order_by_sql, **kwargs)
+        set_search_path(self, {
+            "messages_fts": "fts5", "messages_fts_cjk": "fts_cjk",
+            "messages_fts_trigram": "trigram",
+        }[table])
         try:
             return [dict(row) for row in self._read_all(sql, params)]
         except sqlite3.OperationalError as exc:
@@ -1057,6 +1061,7 @@ class SessionSearchMixin:
     def _like_rows(self, where: list[str], params: list, *, order_by: str, limit_sql: str) -> list[dict[str, Any]]:
         """Canonical-table LIKE scan; ``params[0]`` is the snippet anchor term."""
         sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", where, order_by, limit_sql)
+        set_search_path(self, "like_scan_fts_stale" if self._fts_stale else "like_scan")
         return [dict(row) for row in self._read_all(sql, params)]
 
     @staticmethod
