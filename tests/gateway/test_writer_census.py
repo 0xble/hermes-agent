@@ -278,7 +278,9 @@ def test_native_id_matches_os_thread_inventory(writers):
                                         ctypes.c_void_p, ctypes.c_int]
         libproc.proc_pidinfo.restype = ctypes.c_int
         buf = (ctypes.c_uint64 * 4096)()
-        size = libproc.proc_pidinfo(os.getpid(), 6, 0, buf, ctypes.sizeof(buf))
+        # PROC_PIDLISTTHREADIDS (28) lists system thread IDs, the ones `threading.native_id`
+        # and `/usr/bin/sample` report. PROC_PIDLISTTHREADS (6) lists thread handles instead.
+        size = libproc.proc_pidinfo(os.getpid(), 28, 0, buf, ctypes.sizeof(buf))
         assert size > 0
         tids = set(buf[:size // ctypes.sizeof(ctypes.c_uint64)])
     else:
