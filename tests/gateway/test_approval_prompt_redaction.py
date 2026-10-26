@@ -67,6 +67,9 @@ class TestApprovalCommandWiring:
         import asyncio
         from types import SimpleNamespace
         from gateway.run_turn_runner import TurnRunner
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        from gateway.turn_context import TurnContext
 
         async def exercise():
             for card_success in (True, False):
@@ -84,7 +87,8 @@ class TestApprovalCommandWiring:
                         sent.append(text)
                         return SimpleNamespace(success=True)
 
-                ctx = SimpleNamespace(_status_adapter=Adapter(), _status_chat_id='fixture',
+                ctx = TurnContext(source=SessionSource(platform=Platform.TELEGRAM, chat_id='fixture'),
+                    _status_adapter=Adapter(), _status_chat_id='fixture',
                     _status_thread_metadata=None, session_key='redaction-fixture',
                     _loop_for_step=asyncio.get_running_loop(), stream_consumer_holder=[None])
                 turn = TurnRunner(SimpleNamespace(), ctx)

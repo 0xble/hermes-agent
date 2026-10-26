@@ -55,6 +55,8 @@ def test_api_author_is_admission_scoped_not_session_identity(api, owner):
     from gateway.session_api_turn import prepare_api_execution
     from gateway.run_turn_runner import TurnRunner
     from gateway.turn_context import TurnContext
+    from gateway.config import Platform
+    from gateway.session import SessionSource
     from hermes_state_runtime import RuntimeStoreError
     author = {'id': 'bot:peer', 'name': 'Peer', 'is_bot': True}
     args = dict(session_id='author', request_id='one', user_message='hello', conversation_history=[], turn_author=author)
@@ -73,7 +75,8 @@ def test_api_author_is_admission_scoped_not_session_identity(api, owner):
     agent = SimpleNamespace(run_conversation=run)
     turn = TurnRunner(SimpleNamespace(session_authority=None, _consume_pending_native_image_paths=lambda key: []),
                       TurnContext(message='hello', session_id=ref.session_id, session_key='api',
-                                  source=SimpleNamespace(user_id='authenticated', user_name='Owner', is_bot=False)))
+                                  source=SessionSource(platform=Platform.API_SERVER, chat_id='api',
+                                                       user_id='authenticated', user_name='Owner', is_bot=False)))
     for payload in (row['payload'], {'text': 'human'}):
         prepared = prepare_api_execution(owner, ref, payload)
         token = api_execution.set(prepared)

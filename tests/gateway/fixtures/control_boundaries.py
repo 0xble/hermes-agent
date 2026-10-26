@@ -42,7 +42,11 @@ async def exercise_control_boundaries(tmp_path, monkeypatch):
             return SimpleNamespace(success=True)
 
     adapter = NativeCard()
-    ctx = SimpleNamespace(session_id='s', session_key='boundary-route', _status_adapter=adapter,
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    from gateway.turn_context import TurnContext
+    ctx = TurnContext(source=SessionSource(platform=Platform.TELEGRAM, chat_id='chat'),
+                          session_id='s', session_key='boundary-route', _status_adapter=adapter,
                           _status_chat_id='chat', _status_thread_metadata=None,
                           _loop_for_step=asyncio.get_running_loop(), stream_consumer_holder=[None])
     turn = TurnRunner(SimpleNamespace(session_authority=authority), ctx)
