@@ -21,7 +21,7 @@ _HERMES_CORE_TOOLS = [
     "browser_vault",  # rides with the browser; deferred by default (tools.tool_search.defer)
     "browser_vault_list",  # explicit list surface retained for browser toolset discovery
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
-    "text_to_speech", "react_to_message",
+    "text_to_speech", "react",
     "todo_list", "memory", "compact_context",
     "session_search",
     "clarify",
@@ -138,12 +138,12 @@ TOOLSETS = {
     # GUI-renderer affordances, enabled per desktop-sourced SESSION by the GUI
     # gateway (tui_gateway/server.py::_load_enabled_toolsets) — never by a
     # process env var, which is blind to a desktop client on a remote backend.
-    "reactions": _ts("React to the triggering messaging-platform message or a desktop message", ["react_to_message"]),
+    "reactions": _ts("React to the triggering messaging-platform message or a desktop message", ["react"]),
     "desktop_ui": _ts(
         "Desktop GUI affordances — in-app terminal/browser panes, pane focus, "
         "reactions, appearance (GUI sessions only)",
         ["read_terminal", "close_terminal", "desktop_preview", "drive_preview",
-         "annotate_preview", "read_window_below", "focus_pane", "react_to_message",
+         "annotate_preview", "read_window_below", "focus_pane", "react",
          "gui_tour", "show_tip", "set_theme"],
     ),
     "onboarding": _ts("First-run onboarding cards; folded in only for the onboarding chat (tui_gateway/methods_onboarding.py)",
@@ -481,7 +481,7 @@ def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[
     except ValueError:
         is_gateway = False
     if not is_gateway:
-        from tools.react_to_message_tool import check_react_requirements
+        from tools.react_tool import check_react_requirements
         if not check_react_requirements():
             disabled = [*(disabled or ()), "reactions"]
     gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items()

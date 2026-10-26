@@ -6,7 +6,7 @@ import pytest
 
 from gateway.session_context import clear_session_vars, set_session_vars
 from hermes_state import SessionDB
-from tools import react_to_message_tool as reactions
+from tools import react_tool as reactions
 
 
 @pytest.mark.parametrize("routing_key", ["agent:main:local:dm:chat-a", "chat-b"])
@@ -28,10 +28,11 @@ def test_reaction_uses_durable_session_with_routing_key(tmp_path, monkeypatch, r
     tokens = set_session_vars(session_key=routing_key, session_id="chat-a")
     try:
         def react(**args):
-            return json.loads(reactions.registry.dispatch("react_to_message", args))
+            return json.loads(reactions.registry.dispatch("react", args))
 
         result = react(emoji="👍")
         assert result.get("success"), result
+        assert reactions.registry.get_emoji("react") == "👍"
         assert result["row_id"] == latest
         assert react(emoji="❤️", messages_back=1)["row_id"] == earlier
         assert react(emoji="😂", message_row_id=earlier)["success"]
@@ -62,7 +63,7 @@ def test_reaction_keeps_legacy_key_fallback_and_empty_session(tmp_path, monkeypa
     monkeypatch.setattr(reactions.desktop_ui, "emit", lambda *args: emitted.append(args))
     tokens = set_session_vars(session_key="legacy", session_id="missing")
     try:
-        result = json.loads(reactions.registry.dispatch("react_to_message", {"emoji": "👍"}))
+        result = json.loads(reactions.registry.dispatch("react", {"emoji": "👍"}))
         assert "No user message" in result["error"]
         assert emitted == []
     finally:
@@ -71,8 +72,8 @@ def test_reaction_keeps_legacy_key_fallback_and_empty_session(tmp_path, monkeypa
         assert db.get_message_reactions("legacy", row) == []
     tokens = set_session_vars(session_key="legacy", session_id="")
     try:
-        assert json.loads(reactions.registry.dispatch("react_to_message", {"emoji": "👍"}))["success"]
+        assert json.loads(reactions.registry.dispatch("react", {"emoji": "👍"}))["success"]
     finally:
         clear_session_vars(tokens)
-    result = json.loads(reactions.registry.dispatch("react_to_message", {"emoji": "👍"}))
+    result = json.loads(reactions.registry.dispatch("react", {"emoji": "👍"}))
     assert "No active session" in result["error"]

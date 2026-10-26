@@ -335,8 +335,13 @@ def _abort_zip_update_if_dirty_tree() -> None:
     from hermes_cli.update_cmd import _m
     # Settle an interrupted swap first: only its journal tells its staging/backup siblings apart from a
     # user's lookalike file, and once settled none are left to refuse the retry on.
-    restore_interrupted_zip_swap(_m().PROJECT_ROOT)
-    reason = _zip_overlay_block_reason(_m().PROJECT_ROOT)
+    root = _m().PROJECT_ROOT
+    if (root / ZIP_SWAP_JOURNAL).exists():
+        from hermes_cli.update_receipt import record_step
+        # Recovery can rewrite source before the new swap starts, even if it later fails.
+        record_step("zip_source_swap", False, "unverified: interrupted ZIP swap recovery", replace=True)
+    restore_interrupted_zip_swap(root)
+    reason = _zip_overlay_block_reason(root)
     if reason is None:
         return
     print(f"✗ ZIP fallback refused: {reason}.")

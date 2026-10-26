@@ -8,7 +8,7 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from model_tools import get_tool_definitions
-from tools import react_to_message_tool as reactions
+from tools import react_tool as reactions
 from toolsets import session_disabled_toolsets
 
 
@@ -46,7 +46,7 @@ def test_gateway_reaction_selection(config, override, expected_enabled, expected
         disabled_toolsets=session_disabled_toolsets(disabled, source.platform.value),
         quiet_mode=True, skip_tool_search_assembly=True,
     )
-    assert ("react_to_message" in {tool["function"]["name"] for tool in tools}) is expected_enabled
+    assert ("react" in {tool["function"]["name"] for tool in tools}) is expected_enabled
 
 
 @pytest.mark.parametrize("platform_name", ["photon", "buzz", "runtime-reactions"])
@@ -75,4 +75,4 @@ def test_plugin_gateway_exposes_reaction_without_desktop_opt_in(platform_name, s
         enabled_toolsets=enabled, disabled_toolsets=disabled,
         quiet_mode=True, skip_tool_search_assembly=True,
     )
-    assert "react_to_message" in {tool["function"]["name"] for tool in tools}
+    assert "react" in {tool["function"]["name"] for tool in tools}

@@ -41,6 +41,18 @@ def no_desktop_env(monkeypatch):
 
 class TestDesktopUiToolset:
 
+    def test_reactions_share_the_gateway_registration(self):
+        """Reactions work on messaging gateways too, unlike GUI-only affordances."""
+        from toolsets import _HERMES_CORE_TOOLS, resolve_toolset
+        from tools.react_tool import registry
+
+        assert "react" in resolve_toolset("desktop_ui")
+        assert "react" in resolve_toolset("reactions")
+        assert "react" in _HERMES_CORE_TOOLS
+        assert registry.get_toolset_for_tool("react") == "reactions"
+        assert registry.get_emoji("react") == "👍"
+        assert registry.get_entry("react_to_message") is None
+
     def test_stays_off_the_core_tool_list(self):
         """Core ships on every API call — a GUI-only tool must not be there."""
         from toolsets import _HERMES_CORE_TOOLS

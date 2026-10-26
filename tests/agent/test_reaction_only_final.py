@@ -16,7 +16,7 @@ from gateway.session_context import (
 def test_empty_final_after_reaction_is_a_clean_stop(monkeypatch, delivered, finish_reason):
     agent = SimpleNamespace(
         platform="slack", model="test", provider="test", api_mode="chat_completions",
-        valid_tool_names={"react_to_message"}, quiet_mode=True,
+        valid_tool_names={"react"}, quiet_mode=True,
         _strip_think_blocks=lambda text: text or "",
         _has_content_after_think_block=lambda text: bool(text),
         _build_assistant_message=lambda message, reason: {"role": "assistant", "content": message.content},

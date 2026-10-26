@@ -8,7 +8,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.session_context import clear_session_vars, reaction_acknowledgement, set_session_vars
-from tools import react_to_message_tool as reactions
+from tools import react_tool as reactions
 from tools.registry import registry
 
 
@@ -30,7 +30,7 @@ async def test_registered_reaction_runs_on_gateway_loop(monkeypatch, platform, d
     tokens = set_session_vars(platform=platform, chat_id="chat", message_id="message", scope_id="workspace", user_id="sender")
     try:
         with reaction_acknowledgement() as receipts:
-            result = json.loads(await asyncio.to_thread(registry.dispatch, "react_to_message", {"emoji": "👍"}))
+            result = json.loads(await asyncio.to_thread(registry.dispatch, "react", {"emoji": "👍"}))
             assert bool(result.get("success")) is delivered
             assert receipts == ({(platform, "chat", "message")} if delivered else set())
         assert len(calls) == 1
@@ -49,7 +49,7 @@ def test_unsupported_platform_does_not_acknowledge(monkeypatch):
     tokens = set_session_vars(platform="email", chat_id="chat", message_id="message")
     try:
         with reaction_acknowledgement() as receipts:
-            result = json.loads(reactions.react_to_message_tool("👍"))
+            result = json.loads(reactions.react_tool("👍"))
             assert "does not support" in result["error"]
             assert not receipts
     finally:
@@ -63,9 +63,9 @@ def test_gateway_reaction_error_does_not_acknowledge(monkeypatch):
     tokens = set_session_vars(platform="telegram", chat_id="chat", message_id="message")
     try:
         with reaction_acknowledgement() as receipts:
-            assert "denied" in json.loads(reactions.react_to_message_tool("👍"))["error"]
+            assert "denied" in json.loads(reactions.react_tool("👍"))["error"]
             assert not receipts
-        assert "desktop-only" in reactions.react_to_message_tool("👍", messages_back=1)
+        assert "desktop-only" in reactions.react_tool("👍", messages_back=1)
     finally:
         clear_session_vars(tokens)
 
@@ -82,6 +82,22 @@ def test_gateway_reaction_requirements_do_not_leak_to_desktop(monkeypatch):
     tools = get_tool_definitions(enabled_toolsets=["hermes-telegram"],
                                  disabled_toolsets=session_disabled_toolsets([], "telegram"),
                                  quiet_mode=True, skip_tool_search_assembly=True)
-    assert "react_to_message" in {tool["function"]["name"] for tool in tools}
+    assert "react" in {tool["function"]["name"] for tool in tools}
     monkeypatch.setattr(reactions.desktop_ui, "user_enabled", lambda *a, **kw: True)
     assert "reactions" not in (session_disabled_toolsets([], "desktop") or [])
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_desktop_reaction_schema_follows_opt_in(monkeypatch, enabled):
+    from model_tools import get_tool_definitions
+    from toolsets import session_disabled_toolsets
+
+    monkeypatch.setattr(reactions.desktop_ui, "user_enabled", lambda *a, **kw: enabled)
+    tools = get_tool_definitions(
+        enabled_toolsets=["desktop_ui"],
+        disabled_toolsets=session_disabled_toolsets([], "desktop"),
+        quiet_mode=True, skip_tool_search_assembly=True,
+    )
+    names = [tool["function"]["name"] for tool in tools]
+    assert names.count("react") == int(enabled)
+    assert "react_to_message" not in names

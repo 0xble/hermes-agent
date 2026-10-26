@@ -5976,7 +5976,7 @@ export interface PaneRevealPayload {
   pane: string
   [key: string]: unknown
 }
-/** ``tools/react_to_message_tool.py``. */
+/** ``tools/react_tool.py``. */
 export interface MessageReactionPayload {
   row_id: number
   reactions: MessageReaction[]

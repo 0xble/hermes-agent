@@ -11,9 +11,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli import main, update_cmd, update_cmd_maint, update_receipt
+from hermes_cli import main, update_cmd, update_cmd_maint, update_cmd_stash, update_receipt
 from hermes_cli.immutable_releases import ReleasePaths
 from hermes_cli.immutable_update_handoff import detach_update_receipt
+
+
+@pytest.fixture(autouse=True)
+def reset_update_state():
+    update_cmd_stash._pending_autostash = None
+    update_receipt._current.set(None)
+    yield
+    update_cmd_stash._pending_autostash = None
+    update_receipt._current.set(None)
 
 
 @pytest.fixture
@@ -44,8 +53,7 @@ def post_swap_candidate(tmp_path, monkeypatch):
     }
     handoff = tmp_path / "post_swap.json"
     handoff.write_text(json.dumps(payload), encoding="utf-8")
-    yield home, paths, previous, candidate, handoff
-    update_receipt._current.set(None)
+    return home, paths, previous, candidate, handoff
 
 
 def _latest(home):

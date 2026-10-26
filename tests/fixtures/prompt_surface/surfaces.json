@@ -341,7 +341,7 @@
       "stable": 1349,
       "volatile": 1814
     },
-    "tool_tokens": 15540,
+    "tool_tokens": 15535,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -367,7 +367,7 @@
       "manage_connections",
       "memory",
       "patch",
-      "react_to_message",
+      "react",
       "read_file",
       "search_files",
       "skill_manage",
@@ -390,7 +390,7 @@
       "stable": 1418,
       "volatile": 1815
     },
-    "tool_tokens": 15591,
+    "tool_tokens": 15585,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -416,7 +416,7 @@
       "manage_connections",
       "memory",
       "patch",
-      "react_to_message",
+      "react",
       "read_file",
       "search_files",
       "skill_manage",
