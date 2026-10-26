@@ -66,8 +66,9 @@ async def test_receipts_cross_worker_contexts_but_not_turns_or_sessions():
     await asyncio.gather(run("chat-1"), run("chat-2"))
 
 
+@pytest.mark.parametrize("capture_usage", [False, True])
 @pytest.mark.parametrize("target", ["trigger", "older-message"])
-def test_turn_runner_rebinds_queued_message_and_restores_enclosing_turn(monkeypatch, target):
+def test_turn_runner_rebinds_queued_message_and_restores_enclosing_turn(monkeypatch, target, capture_usage):
     source = SessionSource(platform=Platform.SLACK, chat_id="chat", user_id="sender")
     ctx = TurnContext(source=source, message="thanks", history=[], session_id="sid", session_key="key",
                       event_message_id="trigger", inbound_message_id="trigger")
@@ -80,13 +81,21 @@ def test_turn_runner_rebinds_queued_message_and_restores_enclosing_turn(monkeypa
     turn._tool_progress_callbacks_for_turn = lambda *_: (None, None)
 
     class Agent:
+        session_prompt_tokens = 7
+        session_completion_tokens = 3
+
         def run_conversation(self, *args, **kwargs):
             from gateway.session_context import get_session_env
             assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "trigger"
             assert get_session_env("HERMES_SESSION_USER_ID") == "sender"
             acknowledge_current_message_reaction()
+            self.session_prompt_tokens += 11
+            self.session_completion_tokens += 5
             return {"final_response": "", "api_calls": 1}
 
+    from gateway.session_results import execution_result
+    captured = {} if capture_usage else None
+    result_token = execution_result.set(captured)
     tokens = set_session_vars(platform="slack", chat_id="chat", message_id=target, user_id="older-sender")
     try:
         result = turn._run_conversation_with_approval(Agent(), [], None, "thanks", None)
@@ -94,5 +103,8 @@ def test_turn_runner_rebinds_queued_message_and_restores_enclosing_turn(monkeypa
         assert result["acknowledged_by_reaction"] is True
         assert get_session_env("HERMES_SESSION_MESSAGE_ID") == target
         assert get_session_env("HERMES_SESSION_USER_ID") == "older-sender"
+        if capture_usage:
+            assert captured["usage"] == {"input_tokens": 11, "output_tokens": 5, "total_tokens": 16}
     finally:
         clear_session_vars(tokens)
+        execution_result.reset(result_token)
