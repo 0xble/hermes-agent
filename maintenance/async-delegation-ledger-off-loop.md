@@ -21,6 +21,25 @@ from asynchronous gateway code.
   and the post-handoff thread refund use the separately copied `release_ctx`, so
   claim-local ContextVar mutations cannot redirect the release. Refund failures
   log a warning with exception details while caller cancellation still propagates.
+- A batch claim that fails partway refunds the sibling claims it already took, in the worker,
+  before the error propagates (`_PartialClaimsError`).
+- `settle_durable_claims(on_settled=...)` runs the callback exactly once, in the worker after
+  the last settle, never at caller cancellation. With the default executor gone it settles on a
+  dedicated non-daemon thread; when no thread can start, nothing settled and the callback does
+  not run.
+- Cancellation of a delivery is a refund boundary: the primary and every sibling claim
+  `defer` instead of `release`, so repeated shutdowns cannot spend attempts. The batch keeps
+  ownership of sibling claims until the delivery coroutine starts
+  (`_deliver_completion_with_sibling_cleanup`), and a delivery held by `/stop` defers the
+  siblings the batch already claimed.
+- A primary that never proceeds past pre-flight with no result (claim lost or dropped) defers
+  its siblings: the batch requeues them unattempted. Siblings of an attempted, failed injection
+  still `release`.
+- Admission claims are published (`_pending_completion_acks`) before the turn can start and
+  unpublished only from the settle worker. A turn that cannot confirm the owner while the ack is
+  still in flight passes that claim to `requeue_admitted_completion`, which reopens the
+  still-pending row and clears the claim, so the late acknowledgement is a no-op. Primary and
+  sibling identities are marked delivered before the awaited acknowledgement.
 
 ## 2026-10-05 incident
 
@@ -68,6 +87,18 @@ proofs in the same file are `test_cancelled_claim_refunds_during_executor_shutdo
 `tests/gateway/test_claim_refund_context.py` additionally proves both refund paths
 use the caller's copied release context even if the claim mutates ContextVars,
 log release failures with their exception, and keep the teardown thread non-daemon.
+
+The upstream-PR refresh of 2026-10-22 added the last 5 behaviours above (fork port from the
+lost-work recovery, fork PR 864). Proofs: `tests/gateway/test_completion_delivery.py`
+(`test_cancelled_primary_delivery_refunds_all_claimed_batch_rows`,
+`test_primary_claim_failure_defers_already_claimed_batch_siblings`,
+`test_lost_primary_claim_refunds_requeued_batch_siblings`,
+`test_sibling_claim_failure_refunds_prior_partial_claims`, the `test_settle_callback_*` cases),
+`tests/gateway/test_completion_owner_retry.py`
+(`test_unconfirmed_owner_while_admission_ack_is_pending_offers_the_completion_again`,
+`test_cancelled_delivery_keeps_admission_claim_until_its_ack_finishes`) and
+`tests/tools/test_async_delegation_requeue.py`. The upstream PR head is still `7f07e97465`
+(2026-10-16): refreshing it onto current upstream is a public action that needs the owner's OK.
 
 **Retire** the shared part once an upstream release includes the contribution and passes
 that regression. Keep only the fork-only auto-resume hops.
