@@ -110,3 +110,31 @@ async def test_incorporated_steer_promotes_all_reply_contract_readers(route):
     assert (opener.reply_expected, ctx.reply_expected, agent._turn_reply_expected) == (False, False, False)
     assert "Please answer" in _incorporate(agent)
     assert (opener.reply_expected, ctx.reply_expected, agent._turn_reply_expected) == (True, True, True)
+
+
+@pytest.mark.asyncio
+async def test_coalesced_human_and_silent_relay_keep_human_obligation():
+    runner, agent, opener, ctx, source = _running()
+    human = MessageEvent(text="Please answer", source=source)
+    relay = MessageEvent(text="[relay from=agent@example.com receipt=r2]\nFYI", source=source,
+                         reply_expected=False)
+    for event in (human, relay):
+        outcome = await runner._resolve_busy_steer_or_redirect(event, "key", "steer", agent)
+        assert outcome.steered
+    assert opener.reply_expected is False
+    delivered = _incorporate(agent)
+    assert "Please answer" in delivered and "FYI" in delivered
+    assert (opener.reply_expected, ctx.reply_expected, agent._turn_reply_expected) == (None, None, None)
+
+
+def test_withdrawn_ticket_never_reports_delivery():
+    from unittest.mock import Mock
+
+    _, agent, _, _, _ = _running()
+    delivered = Mock()
+    assert agent.steer("queued", ticket="admission", on_delivered=delivered)
+    assert agent.withdraw_steer("admission")
+    messages = [{"role": "tool", "content": "done", "tool_call_id": "t1"}]
+    apply_pending_steer_to_tool_results(agent, messages, 1)
+    assert len(messages) == 1
+    delivered.assert_not_called()
