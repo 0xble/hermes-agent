@@ -81,8 +81,9 @@ def goal_loop(hermes_home, monkeypatch):
         goal = goals.GoalManager(session_id=sid)
         goal.set("finish the migration")
         loop = loops.LoopManager(session_id=sid)
-        loop.set("check the queue", interval_seconds=interval_seconds, route=route)
+        loop.set("check the queue", interval_seconds=interval_seconds or None, route=route)
         assert loop.state is not None
+        assert loop.state.mode == ("interval" if interval_seconds else "self_paced")
         interval = interval_seconds or loops.self_paced_floor_seconds()
         if not interval_seconds:
             # A quiet self-paced loop may already be at its ceiling. Goal deferral still uses
