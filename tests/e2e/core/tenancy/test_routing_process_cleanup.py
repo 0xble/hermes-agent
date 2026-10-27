@@ -64,38 +64,19 @@ def test_owner():
                 child.wait(timeout=10)
             return
         if os.environ["CLEANUP_MODE"] == "tui":
-            import json
-            import time
+            import psutil
             client = TuiGateway(home)
             try:
                 created = client.call("session.create", {"cols": 100})
                 sid = created["result"]["session_id"]
-                holder = {}
-
-                def run_turn():
-                    done = client.turn(sid, "hello")
-                    holder["done"] = done
-                    holder["ok"] = bool(client.event("message.complete", sid)(done))
-
-                import threading
-                threading.Thread(target=run_turn, daemon=True).start()
-                deadline = time.monotonic() + 60
-                while time.monotonic() < deadline and "pid" not in holder:
-                    try:
-                        state = json.loads((home / ".hermes/gateway_state.json").read_text())
-                    except (OSError, ValueError):
-                        state = {}
-                    if state.get("gateway_state") == "running" and state.get("pid"):
-                        holder["pid"] = int(state["pid"])
-                        (home / "tui.pid").write_text(str(holder["pid"]))
-                        break
-                    time.sleep(0.05)
-                if "pid" not in holder:
-                    raise AssertionError("routing gateway did not publish a pid")
-                turn_deadline = time.monotonic() + 90
-                while "ok" not in holder and time.monotonic() < turn_deadline:
-                    time.sleep(0.05)
-                assert holder.get("ok"), holder.get("done")
+                # The stdio backend executes turns in-process. It is the guardian's
+                # worker, not a messaging gateway publishing gateway_state.json.
+                workers = psutil.Process(client.proc.pid).children()
+                assert len(workers) == 1, workers
+                assert workers[0].pid != client.proc.pid
+                (home / "tui.pid").write_text(str(workers[0].pid))
+                done = client.turn(sid, "hello")
+                assert client.event("message.complete", sid)(done), done
             finally:
                 client.close()
             return
