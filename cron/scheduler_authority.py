@@ -109,6 +109,17 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             if cancel_event is not None and cancel_event.is_set():
                 await call('cancel', receipt)
             state = await call('status', receipt)
+            from cron.detached_authority import owns_detached_execution, run_detached
+            if state['status'] == 'started' and owns_detached_execution(job['id'], request_id):
+                # The admitted policy, not the firer's mutable snapshot, owns
+                # execution inputs just as it does for gateway-hosted cron.
+                state = await call('recover', params)
+                if state['status'] != 'started':
+                    continue
+                value = await asyncio.to_thread(run_detached, dict(state['job']), receipt, state, record, save,
+                    execution_id=request_id, extra_prompt=params['extra_prompt'], cancel_event=cancel_event)
+                job.update(record['worker_result']['job_flags'])
+                return value
             if state.get('progress_at') not in (None, progress):
                 # The owner's agent is still working: refresh OUR ledger row (the owner's stamp is
                 # fenced to the row's owner), once per owner stamp, so the stale-claim sweep measures
@@ -141,6 +152,8 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 observe(lambda op, data: operation(authority, op, data)), loop).result()
         return asyncio.run(remote())
     except Exception as exc:
+        if record.get('worker_result') is not None:
+            return tuple(record['worker_result']['result'])
         if attempted:
             raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
         error = f'{type(exc).__name__}: {exc}'

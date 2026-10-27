@@ -10,7 +10,32 @@ The gateway's in-process dedupe claim is owned by the detached worker waiter unt
 
 This is a core scheduler/dispatch invariant; a plugin or skill cannot atomically own cron's claim, worker handoff and recovery. Revert this unit's dispatch selection and regression when an upstream release proves the same launchd restart-survival contract. The Linux transient-scope worker and delivery queue are upstream-owned infrastructure reused here.
 
+Canonical admission does not move inference back into the gateway. A durable
+`owner_kind=detached` assignment selects the existing external executor, including
+when that executor subsequently dies. The gateway only observes it, never falls
+back to a second execution. The external PID registers its already-started cron
+admission through the birth-fenced worker protocol and uses `RuntimeSessionStore`
+for canonical persistence. It never opens the owner's `state.db`. Owner loss
+pauses persistence until authenticated epoch adoption, without replaying inference
+or tools. Explicit cron cancellation uses the admission's durable cancellation
+marker. Gateway shutdown is not that cancellation.
+
+The existing admission journal captures the worker's result until the canonical
+owner commits the same admission's terminal receipt. A live detached assignment
+is excluded from unattended interruption recovery. A dead executor with no
+completion receipt is reconciled interrupted, never resubmitted. Admission,
+execution and delivery identities are unchanged, and release/activation holds
+and the zero-drain policy remain authoritative.
+
 ## Proof and limitation
+
+`tests/cron/test_canonical_detached_survival.py` additionally exercises real
+canonical RPC and an actual loopback-provider agent tool in a disposable macOS
+profile with a fake `ai.hermes-test.*` identity. Its process-ancestry witness must
+contain the detached worker PID and exclude the gateway PID. It kills the gateway
+and dispatch observer mid-tool, then verifies exactly 1 effect and 1 admission
+across replacement owners. Its dead-worker case verifies interruption without
+tool or inference replay. A surviving observer alone is not proof of this contract.
 
 Run `tests/cron/test_restart_safe_worker.py`, `tests/cron/test_bounded_worker_recovery.py`, `tests/cron/test_delivery_queue.py`, `tests/cron/test_hard_wall_real_path.py`, `tests/cron/test_double_fork_sweep.py` and `tests/cron/test_hard_wall_completion_race.py` on macOS, then `./bin/ci preflight` and the exact-SHA `gate`. The SQLite execution row is the sole completion fence: worker output is composed and, for gateway-queued notices, an idempotent gated queue item is admitted before the terminal result commits. The gateway cannot claim a gated item until that result commits with a matching outcome. At the cap the watchdog CAS-writes failed(timeout) only if the row remains running. A pre-committed success notice is suppressed when timeout wins, and the occurrence is never retried. When completion won, the watchdog grants a config-derived, finite post-commit allowance (up to 60s including descendant cleanup), then exits with the recorded result. An abandoned executor never disarms the cap. Once a queue receipt exists its status projects onto the execution row; an eligible delivery survives a worker exit after terminal commit and drains once. Only unprojected terminal queue receipts/tombstones are reconciled, in one indexed scan and one execution-ledger connection per drain. The E2E uses a disposable profile, script and fake `ai.hermes-test.*` identity; never touch the live gateway job. The real-path test's default synthetic watchdog cap is 10 seconds, not the production profile cap; its completion-versus-delivery fence case uses 30 seconds because it tests terminal arbitration rather than timeout ownership. The watchdog starts before `run_one_job`, so native macOS process/import/SQLite startup consumes the same budget. A 3-second test cap passed in isolation but flaked under the nightly's four-file concurrency (runs `38548768361`, `38717597758`, and `38765700954`); keep the default test budget at or above 10 seconds unless the worker startup contract changes.
 

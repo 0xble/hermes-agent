@@ -32,7 +32,9 @@ def _open_cron_session_db(job: dict):
     from gateway.session_cron import current_execution
 
     owner = current_execution()
-    from agent.runtime_session_store import WorkerPersistenceError, is_worker_process
+    from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError, is_worker_process
+    if owner is not None and isinstance(owner[0].db, RuntimeSessionStore):
+        return owner[0].db
     if owner is None and is_worker_process():
         # Worker assignments must bind their canonical owner store before running billed inference.
         raise WorkerPersistenceError("worker_cron_registration_required")
