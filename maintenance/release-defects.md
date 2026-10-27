@@ -1200,3 +1200,19 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   global fallback.
 - Guards: `tests/gateway/test_api_drain_owner.py` (both drain flags, no-import boundary) and
   `tests/gateway/test_api_admission_off_loop.py`.
+
+## Delegation model-rejected banner on finished work
+
+- Fork patch identity: `delegation-model-rejected-banner`.
+- `tools/process_registry_notifications.py::_delegation_model_not_found` matched the
+  configured model name plus any model-not-found phrase (`does not exist`, `unknown model`,
+  ...) anywhere in a result's summary, including a task that finished normally. A completed
+  worker whose answer named its own model and said a file "does not exist" therefore raised
+  "SUBAGENT MODEL REJECTED … Every task in this batch failed … before doing any work".
+  Only results that did not finish normally (`exit_reason != "completed"`, set by
+  `tools/delegate_tool_child_run.py`) count, and the banner states the real share
+  (`N of M tasks`) unless every task was rejected.
+- Guards: `tests/tools/test_process_registry_model_not_found.py`, including
+  `test_model_not_found_notice_absent_for_a_normally_finished_task` and
+  `test_model_not_found_notice_counts_only_rejected_tasks`; `tests/tools/test_async_delegation.py`
+  model-rejection notices (a real rejection that exhausts iterations still raises it).
