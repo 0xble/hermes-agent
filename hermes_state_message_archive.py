@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from hermes_state_common import _placeholders
+from hermes_state_identity import _carried_tail_slots, _compaction_messages, _unrepresented_tail_rows
 from hermes_state_write_metrics import add_write_rows, write_phase
 
 if TYPE_CHECKING:
@@ -31,6 +32,18 @@ def archive_message_rows(conn, session_id: str, rewind_ids: list[int], *, exclud
         add_write_rows("archived", cursor.rowcount)
 
 
+def clone_tail_survivors(db, conn, tail_ids: list[int], *, session_id: str | None = None) -> tuple[int, int]:
+    """Clone the concurrent tail's newest generation per ``message_uid`` that the compaction handoff did
+    not already insert into the target, returning ``(cloned, tool_calls)`` for the session counters."""
+    from hermes_state_messages import _tool_calls_len
+
+    rows = _unrepresented_tail_rows(conn, tail_ids, session_id) if tail_ids else []
+    if not rows:
+        return 0, 0
+    db._clone_message_rows(conn, [int(row["id"]) for row in rows], session_id=session_id)
+    return len(rows), sum(_tool_calls_len(row["tool_calls"]) for row in rows)
+
+
 def archive_named_rows(
     db, conn, session_id: str, compacted_messages: list[dict[str, Any]], covered: list[int], *,
     tail_count: int, carried_messages: list[dict[str, Any]] | None, patched_model_config: Any,
@@ -53,8 +66,10 @@ def archive_named_rows(
         unseen = [row_id for row_id in active_ids if row_id not in covered_set]
         covered_active = [row_id for row_id in active_ids if row_id in covered_set]
         rewind_ids = list(carried_ids)
-        if tail_count > 0:
-            rewind_ids += db._tail_originals(covered_active, tail_count, merged_away)
+        # Tail slots carried from unseen (concurrent) rows never consume a positional rewind below them.
+        tail_below = tail_count - _carried_tail_slots(conn, unseen, compacted_messages, tail_count)
+        if tail_below > 0:
+            rewind_ids += db._tail_originals(covered_active, tail_below, merged_away)
         rewind_ids += unseen
         rewind_ids = list(dict.fromkeys(rewind_ids))
     db._seed_display_removals(conn, session_id, fold_plan, rewind_ids)
@@ -64,15 +79,10 @@ def archive_named_rows(
     # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
     with write_phase("archive_timestamp_carry"):
         db._carry_parent_timestamps(conn, session_id, compacted_messages)
-    inserted, tool_calls_total = db._insert_message_rows(conn, session_id, compacted_messages)
+    inserted, tool_calls_total = db._insert_message_rows(conn, session_id, _compaction_messages(compacted_messages))
     if unseen:
-        with write_phase("archive_enumerate"):
-            _ids, unseen_tool_calls = db._tail_rows_after_watermark(
-                conn,
-                f"SELECT id, tool_calls FROM messages WHERE id IN ({_placeholders(unseen)}) ORDER BY id",
-                tuple(unseen))
-        db._clone_message_rows(conn, unseen)
-        inserted += len(unseen)
+        cloned, unseen_tool_calls = clone_tail_survivors(db, conn, unseen)
+        inserted += cloned
         tool_calls_total += unseen_tool_calls
     # A carried copy whose stored identity was computed differently lands in its own
     # display_order group and would project twice; re-fold before publishing (#122167).

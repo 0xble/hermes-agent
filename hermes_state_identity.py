@@ -6,11 +6,70 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple
+import sqlite3
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple, TypeVar
 
-from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, TOOL_CALL_UID, TOOL_CALL_UIDS, uid_list
+from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, TOOL_CALL_UID, TOOL_CALL_UIDS, stamp_message_uid, uid_list
 from agent.message_sanitization import coalesce_tool_call_id
-from hermes_state_common import _json_or
+from hermes_state_common import _json_or, _placeholders
+
+
+_MessageRow = TypeVar("_MessageRow", dict[str, Any], sqlite3.Row)
+
+
+def _compaction_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for message in messages:
+        stamp_message_uid(message)
+    return _newest_message_uid_rows(messages)
+
+
+def _newest_message_uid_rows(rows: Sequence[_MessageRow]) -> list[_MessageRow]:
+    """Keep the last position of each durable uid. Unidentified legacy rows remain distinct.
+
+    Input order is transcript order (stored rows are ordered by id), not timestamp order.
+    This is logical identity only, never content or platform-message-id deduplication.
+    """
+    seen: set[str] = set()
+    kept = []
+    for row in reversed(rows):
+        uid = row[MESSAGE_UID] if MESSAGE_UID in row.keys() else None
+        if isinstance(uid, str) and uid:
+            if uid in seen:
+                continue
+            seen.add(uid)
+        kept.append(row)
+    return kept[::-1]
+
+
+def _carried_tail_slots(
+    conn: sqlite3.Connection, tail_ids: list[int], messages: list[dict[str, Any]], tail_count: int,
+) -> int:
+    """Tail slots whose originals are ABOVE the watermark, never positional rewinds below it."""
+    if not tail_ids or tail_count <= 0:
+        return 0
+    uids = {row[0] for row in conn.execute(
+        f"SELECT message_uid FROM messages WHERE id IN ({_placeholders(tail_ids)})", tail_ids) if row[0]}
+    return sum(1 for message in messages[-tail_count:]
+               if isinstance(message.get(MESSAGE_UID), str) and message[MESSAGE_UID] in uids)
+
+
+def _unrepresented_tail_rows(
+    conn: sqlite3.Connection, tail_ids: list[int], session_id: Optional[str] = None,
+) -> list[sqlite3.Row]:
+    """Newest tail generations not already inserted into the target by the compaction handoff.
+
+    The handoff wins an overlap: it can carry an intentional prune of that logical message.
+    The caller has already archived the source rows, except when cloning into a rotation child.
+    """
+    rows = conn.execute(
+        f"SELECT id, session_id, message_uid, tool_calls FROM messages "
+        f"WHERE id IN ({_placeholders(tail_ids)}) ORDER BY id", tail_ids).fetchall()
+    targets = {session_id or row["session_id"] for row in rows}
+    represented = {(row["session_id"], row[MESSAGE_UID]) for row in conn.execute(
+        f"SELECT session_id, message_uid FROM messages WHERE session_id IN ({_placeholders(targets)}) "
+        "AND active = 1", tuple(targets)).fetchall()} if targets else set()
+    return [row for row in _newest_message_uid_rows(rows)
+            if not row[MESSAGE_UID] or (session_id or row["session_id"], row[MESSAGE_UID]) not in represented]
 
 
 def _live_or_column(msg: Mapping[str, Any], live_key: str, column: str) -> Any:

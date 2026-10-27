@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from agent.message_metadata import DB_ROW_SNAPSHOT, MESSAGE_UID
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import _placeholders
 from hermes_state_messages import _parse_tool_calls
@@ -262,3 +263,53 @@ class SessionCoverageMixin:
             if need <= width or width >= len(covered_active):
                 return window
             width = need
+
+    def _raise_if_unheld_summary(self, conn, session_id: str, held_messages: list[dict[str, Any]]) -> None:
+        """Raise ``StaleHeldHistory`` when an active summary row is missing from *held_messages*.
+
+        Every summary-producing compaction leaves its summary active, and a history loaded after that
+        commit carries it. A lease-less rewrite whose history lacks it was built from the generation the
+        compaction replaced. Prefer the durable row identity and CAS snapshot carried by gateway-loaded
+        messages; only legacy rows without those fields fall back to role and loaded-view content. This
+        prevents repeated identical summaries from making a stale generation look current."""
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE session_id = ? AND active = 1 AND _compressed_summary = 1",
+            (session_id,)).fetchall()
+        if not rows:
+            return
+        def _view(role: Any, content: Any) -> Any:
+            return self._loaded_view_content(str(role or "unknown"), content)
+
+        held_dicts = [message for message in held_messages if isinstance(message, dict)]
+        held_ids = {message.get("_row_id") for message in held_dicts}
+        held = {
+            (message.get("role"), _view(message.get("role"), message["content"]))
+            for message in held_dicts
+            if isinstance(message.get("content"), str)
+        }
+        held_durable = set()
+        for message in held_dicts:
+            uid = message.get(MESSAGE_UID)
+            snapshot = message.get(DB_ROW_SNAPSHOT)
+            if isinstance(uid, str) and uid and isinstance(snapshot, str) and snapshot:
+                held_durable.add((message.get("role"), uid, snapshot))
+
+        # A gateway projection has durable identity/version for every loaded row. If the active row has
+        # that identity but no exact held version, content equality is not evidence: a newer generation may
+        # carry the same summary text. Legacy projections without identity/version retain the content fallback.
+        from agent.transcript_repair import transcript_row_snapshot
+        def _held_row(row: Any) -> bool:
+            if row["id"] in held_ids:
+                return True
+            uid = row["message_uid"]
+            if isinstance(uid, str) and uid:
+                if (row["role"], uid, transcript_row_snapshot(row)) in held_durable:
+                    return True
+                if held_durable:
+                    return False
+            return (row["role"], _view(row["role"], self._decode_content(row["content"]))) in held
+
+        if any(not _held_row(row) for row in rows):
+            from agent.context_compressor import StaleHeldHistory
+            raise StaleHeldHistory(
+                f"session {session_id} has a compaction summary the held history does not carry")
