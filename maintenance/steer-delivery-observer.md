@@ -1,6 +1,6 @@
 # Steer Routing
 
-Identity: `steer-delivery-observer`
+Identities: `steer-delivery-observer`, `busy-input-auto`
 
 ## Divergence
 
