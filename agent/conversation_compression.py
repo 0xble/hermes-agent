@@ -10,8 +10,6 @@ one pass per session at a time (durable lock) but sessions run concurrently, so 
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
-
 import concurrent.futures
 import contextlib
 import contextvars
@@ -37,14 +35,14 @@ from agent.context_engine import automatic_compaction_status_message, sanitize_m
 from agent.conversation_compression_boundary import _reset_read_dedup_caches, mark_context_loss_boundary  # noqa: F401
 from agent.conversation_compression_codex import _compress_context_via_codex_app_server
 from agent.conversation_compression_deadline import resolve_context_compression_timeouts
-from agent.conversation_compression_telemetry import (
-    _emit_aborted_attempt_telemetry, _emit_blocked_attempt_telemetry, _emit_bypassed_attempt_telemetry,
-    _emit_compression_attempt_telemetry, _record_committed_attempt_effect, _snapshot_compression_effect_input,
-)
+from agent.conversation_compression_telemetry import (_emit_aborted_attempt_telemetry, _emit_blocked_attempt_telemetry,
+    _emit_bypassed_attempt_telemetry, _emit_compression_attempt_telemetry, _record_committed_attempt_effect,
+    _snapshot_compression_effect_input)
 from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 from agent.usage_anchor import set_usage_anchor
+from gateway.notice_style import ContextNotice
 from hermes_state_ids import new_session_id as mint_session_id
 from hermes_state_pidns import holder_namespace_token
 from agent.conversation_compression_watermark import held_archive_watermark
@@ -2255,9 +2253,7 @@ def replay_compression_warning(agent: Any) -> None:
         # Replayed as a classified diagnostic so every sink applies its own policy snapshot.
         from gateway.warning_notifications import DiagnosticText
         with contextlib.suppress(Exception):
-            text = DiagnosticText(msg)
-            text.notice_style = getattr(msg, "notice_style", None)
-            agent.status_callback("lifecycle", text)
+            agent.status_callback("lifecycle", DiagnosticText(msg))  # carries msg's notice_style
 
 
 def conversation_history_after_compression(

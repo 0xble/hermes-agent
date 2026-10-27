@@ -24,6 +24,7 @@ from gateway.attended_model import (
     format_attended_switch_back_notice, format_attended_switch_notice, parse_attended_config,
 )
 from gateway.config import Platform
+from gateway.notice_style import notice_metadata
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typing_after_prompt, typing_metadata_for_source
@@ -553,10 +554,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             return
 
         def present() -> None:
-            self._schedule(
-                self._runner._deliver_platform_notice(ctx.source, message, notice_style="context"),
-                "attended notice delivery scheduling error",
-            )
+            self._schedule(self._runner._deliver_platform_notice(ctx.source, message, notice_style="context"),
+                           "attended notice delivery scheduling error")
 
         render_notification(
             present,
@@ -584,11 +583,9 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
                 self._publish_execution("status.update", {"kind": _viewer_status_kind(event_type, prepared),
                                                           "text": prepared})
                 return
-            from gateway.notice_style import notice_metadata
             self._schedule(
-                self._status_delivery.send(ctx._status_adapter, ctx._status_chat_id, event_type, prepared,
-                    notice_metadata(ctx._status_thread_metadata, platform=ctx.source.platform,
-                                    style=getattr(message, "notice_style", None))),
+                self._status_delivery.send(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, notice_metadata(
+                    ctx._status_thread_metadata, platform=ctx.source.platform, style=getattr(message, "notice_style", None))),
                 f"status_callback ({event_type}) scheduling error",
             )
         render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
@@ -878,8 +875,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
                 logger.debug("render_notice_line failed", exc_info=True)
                 return
             if line:
-                style = getattr(notice, "notice_style", None)
-                self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line, notice_style=style), "notice_callback delivery scheduling error")
+                self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line, notice_style=getattr(notice, "notice_style", None)), "notice_callback delivery scheduling error")
         render_notification(present, platform=self._ctx.source.platform,
                             user_config=self._ctx.user_config, diagnostic=diagnostic)
 
@@ -903,11 +899,9 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
                     live.event_stream.publish(session_id, {"text": str(message)}, event_type="review.summary")
                 return
             if self._status_live():
-                from gateway.notice_style import notice_metadata
                 self._send_status_text(
                     message,
-                    notice_metadata(_interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
-                                    platform=ctx.source.platform, style="context"),
+                    notice_metadata(_interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)), platform=ctx.source.platform, style="context"),
                     "background_review_callback scheduling error",
                 )
 

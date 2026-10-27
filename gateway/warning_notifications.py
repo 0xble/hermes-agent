@@ -11,6 +11,12 @@ class DiagnosticText(str):
     """
     notice_style = None
 
+    def __new__(cls, text=""):
+        instance = super().__new__(cls, text)
+        if getattr(text, "notice_style", None) is not None:
+            instance.notice_style = text.notice_style  # a re-wrapped ContextNotice keeps its style
+        return instance
+
 
 def is_warning_status(event_type: str, message: str) -> bool:
     return event_type == "warn" or isinstance(message, DiagnosticText)

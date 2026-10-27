@@ -8,8 +8,6 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
-
 import asyncio
 import hashlib
 import json
@@ -28,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from collections.abc import Mapping
 
+from gateway.notice_style import ContextNotice
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.goals_contract_commands import GoalContractCommandsMixin
 from hermes_cli.goals_legacy_prompts import (
@@ -36,8 +35,7 @@ from hermes_cli.goals_legacy_prompts import (
     _PRE_531_ADDITIVE_CONTRACT_TEMPLATE,
 )
 from hermes_cli.goals_contract_items import (
-    _migrate_legacy_revision_requirements, contract_remove_aliases, goal_remove_usage,
-    render_removable_contract_items,
+    _migrate_legacy_revision_requirements, contract_remove_aliases, goal_remove_usage, render_removable_contract_items,
 )
 from hermes_cli.goal_evidence import (
     JUDGE_EVIDENCE_BLOCK_TEMPLATE as JUDGE_EVIDENCE_BLOCK_TEMPLATE,
@@ -2750,10 +2748,8 @@ def _judge_outage_notice(*, failed: bool) -> str:
 
 
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
-    if verdict == "done":
-        message = ContextNotice(message)
     return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
-            "verdict": verdict, "reason": reason, "message": message}
+            "verdict": verdict, "reason": reason, "message": ContextNotice(message) if verdict == "done" else message}
 
 
 _JUDGE_CONFIG_HINT = (
