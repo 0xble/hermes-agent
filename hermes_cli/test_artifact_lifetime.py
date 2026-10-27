@@ -34,20 +34,25 @@ def pytest_tmp_home(path: str) -> bool:
 
 def owner_pid_from_home(home: str) -> int | None:
     """The pytest pid recorded above ``home``, if that marker is still there."""
+    record = _owner_record(home)
+    return _positive_pid(record[0]) if record else None
+
+
+def _owner_record(home: str) -> list[str]:
     if not home:
-        return None
+        return []
     try:
         current = Path(home).resolve()
     except OSError:
-        return None
+        return []
     for parent in (current, *current.parents):
         marker = parent / OWNER_MARKER
         if marker.is_file():
             try:
-                return _positive_pid(marker.read_text(encoding="utf-8-sig").strip())
+                return marker.read_text(encoding="utf-8-sig").splitlines()
             except OSError:
-                return None
-    return None
+                return []
+    return []
 
 
 def register_tmux_server(*, listener: str | None = None, socket: str | None = None) -> None:
@@ -72,7 +77,9 @@ def install_session_custody(basetemp: Path) -> None:
     root = Path(basetemp)
     root.mkdir(parents=True, exist_ok=True)
     owner = os.getpid()
-    (root / OWNER_MARKER).write_text(f"{owner}\n", encoding="utf-8")
+    # Hermetic child environments deliberately strip HERMES_* settings. Keep
+    # their shared lifetime next to the owner so those children retain the cap.
+    (root / OWNER_MARKER).write_text(f"{owner}\n{_lifetime_s()}\n", encoding="utf-8")
     os.environ["HERMES_PYTEST_CUSTODY"] = str(root)
     os.environ["HERMES_TEST_OWNER_PID"] = str(owner)
     if os.name != "posix":
@@ -163,6 +170,9 @@ def _owner_pid(home: str) -> int | None:
 
 def _lifetime_s() -> float:
     raw = os.environ.get("HERMES_TEST_MAX_LIFETIME", "")
+    if not raw:
+        record = _owner_record(os.environ.get("HERMES_HOME", ""))
+        raw = record[1] if len(record) > 1 else ""
     if not raw:
         return float(DEFAULT_LIFETIME_S)
     try:
