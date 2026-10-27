@@ -277,6 +277,161 @@ def require_checkout_venv_isolation() -> None:
         )
 
 
+# One 3-slot wave is about 6 GiB of per-checkout installs after download caches
+# are shared. 2 GiB of headroom keeps that wave off a full volume.
+DEFAULT_FREE_SPACE_FLOOR_BYTES = (6 + 2) * 1024 ** 3
+SETUP_GENERATED_RELATIVE = ('.venv', 'node_modules', 'website/node_modules', '.ci', '.ci/cargo-target')
+
+
+def host_ci_download_cache(root: Path = ROOT) -> Path:
+    """Dedicated host download cache on the checkout's volume.
+
+    Not ``~/.cache/uv``, not the checkout, and not the disposable HOME.
+    ``UV_LINK_MODE=clone`` can only share a cache on the same volume.
+    """
+    override = os.environ.get('HERMES_CI_CACHE_DIR')
+    cache = Path(override).expanduser() if override else Path.home() / '.local' / 'state' / 'hermes-ci-downloads'
+    cache.mkdir(parents=True, exist_ok=True)
+    cache = cache.resolve()
+    root_resolved = root.resolve()
+    if cache == root_resolved or root_resolved in cache.parents:
+        raise RuntimeError(f'CI download cache must live outside the checkout: {cache}')
+    if cache.stat().st_dev != root_resolved.stat().st_dev:
+        raise RuntimeError(
+            f'CI download cache {cache} is not on the same volume as {root_resolved}; '
+            'refusing a cross-volume cache that cannot clone'
+        )
+    return cache
+
+
+def uv_link_mode(cache: Path) -> str:
+    """Pin clone, or copy where clonefile is unavailable. Never hardlink or symlink."""
+    forced = os.environ.get('HERMES_CI_UV_LINK_MODE')
+    if forced:
+        if forced not in ('clone', 'copy'):
+            raise RuntimeError(f'HERMES_CI_UV_LINK_MODE must be clone or copy, not {forced}')
+        return forced
+    return 'clone' if _clonefile_supported(cache) else 'copy'
+
+
+def _clonefile_supported(directory: Path) -> bool:
+    source = directory / '.clone-probe'
+    dest = directory / '.clone-probe-copy'
+    try:
+        source.write_bytes(b'x')
+        command = ['cp', '-c', str(source), str(dest)] if sys.platform == 'darwin' else [
+            'cp', '--reflink=always', str(source), str(dest)]
+        return subprocess.run(command, capture_output=True).returncode == 0 and dest.is_file()
+    except OSError:
+        return False
+    finally:
+        for path in (source, dest):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def free_space_floor_bytes() -> int:
+    raw = os.environ.get('HERMES_CI_FREE_SPACE_FLOOR_BYTES')
+    if raw is None or raw == '':
+        return DEFAULT_FREE_SPACE_FLOOR_BYTES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f'HERMES_CI_FREE_SPACE_FLOOR_BYTES must be an integer byte count, not {raw!r}'
+        ) from exc
+    if value < 0:
+        raise RuntimeError('HERMES_CI_FREE_SPACE_FLOOR_BYTES must be >= 0')
+    return value
+
+
+def volume_free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def setup_space_paths(root: Path = ROOT) -> list[Path]:
+    return [root / relative for relative in SETUP_GENERATED_RELATIVE]
+
+
+def common_repo_root(start: Path = ROOT) -> Path:
+    common = subprocess.check_output(
+        ['git', '-C', str(start), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+        text=True,
+    ).strip()
+    return Path(common).resolve().parent
+
+
+def worktree_safety_script() -> Path | None:
+    """Locate the existing worktree-safety helper. An explicit path does not fall through."""
+    override = os.environ.get('HERMES_WORKTREE_SAFETY')
+    if override is not None:
+        path = Path(override).expanduser()
+        return path if path.is_file() else None
+    home = Path.home()
+    for candidate in (
+        home / '.local/share/agentkit/skills/hermes/worktrees/scripts/worktrees/worktree-safety',
+        home / 'Repos/agents/sources/skills/worktrees/scripts/worktrees/worktree-safety',
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def reclaim_finished_generated_dirs() -> list[str]:
+    """Call worktree_gc to drop generated dirs from finished worktrees only."""
+    script = worktree_safety_script()
+    if script is None:
+        return []
+    module_path = ROOT / 'hermes_cli' / 'worktree_gc.py'
+    name = 'hermes_ci_worktree_gc'
+    cached = sys.modules.get(name)
+    if cached is not None and getattr(cached, '__file__', None) == str(module_path):
+        module = cached
+    else:
+        spec = importlib.util.spec_from_file_location(name, module_path)
+        if spec is None or spec.loader is None:
+            return []
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return module.reclaim_finished_generated(
+        str(common_repo_root(ROOT)),
+        safety_script=str(script),
+        exclude=[str(ROOT.resolve())],
+    )
+
+
+def ensure_setup_free_space() -> None:
+    """Refuse setup only when one wave will not fit after reclaiming finished trees.
+
+    No host-wide install lock: a lock would serialize setups and slow concurrent
+    work. The check is a backstop, not an admission queue. Hosted runners are
+    ephemeral and do not accumulate worktrees, so the local wave floor does not
+    apply there unless HERMES_CI_FREE_SPACE_FLOOR_BYTES is set.
+    """
+    if os.environ.get('GITHUB_ACTIONS') == 'true' and 'HERMES_CI_FREE_SPACE_FLOOR_BYTES' not in os.environ:
+        return
+    floor = free_space_floor_bytes()
+    free = volume_free_bytes(ROOT)
+    if free >= floor:
+        return
+    reclaimed = reclaim_finished_generated_dirs()
+    free = volume_free_bytes(ROOT)
+    if free >= floor:
+        return
+    short = floor - free
+    paths = '\n'.join(f'  {path}' for path in setup_space_paths())
+    reclaimed_note = '\n'.join(f'  {path}' for path in reclaimed) or '  (none)'
+    raise RuntimeError(
+        f'Refusing CI setup: {free} bytes free, floor is {floor}, '
+        f'{short} more bytes required.\n'
+        f'Paths that still need space:\n{paths}\n'
+        f'Reclaimed:\n{reclaimed_note}'
+    )
+
+
 def environment(home: Path) -> dict[str, str]:
     require_checkout_venv_isolation()
     # Allowlist location variables only. No API keys, NODE_OPTIONS, pytest selectors,
@@ -288,6 +443,9 @@ def environment(home: Path) -> dict[str, str]:
         # That discovery can cost ~18 s per child. An empty value still loads
         # PowerShell's built-in modules; preserve a caller's explicit value.
         env['PSModulePath'] = os.environ.get('PSModulePath', '')
+    downloads = host_ci_download_cache(ROOT)
+    for name in ('uv', 'npm', 'mise', 'mise-downloads'):
+        (downloads / name).mkdir(parents=True, exist_ok=True)
     env.update({
         'HOME': str(home), 'USERPROFILE': str(home),
         'PATH': os.pathsep.join((str(ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')),
@@ -295,9 +453,12 @@ def environment(home: Path) -> dict[str, str]:
                                  env.get('PATH', ''))),
         'TMPDIR': str(home / 'tmp'), 'TEMP': str(home / 'tmp'), 'TMP': str(home / 'tmp'),
         'XDG_CACHE_HOME': str(STATE / 'cache'), 'XDG_CONFIG_HOME': str(home / 'config'),
-        'UV_CACHE_DIR': str(STATE / 'cache/uv'), 'UV_PYTHON_INSTALL_DIR': str(STATE / 'python'),
+        'UV_CACHE_DIR': str(downloads / 'uv'), 'UV_LINK_MODE': uv_link_mode(downloads),
+        'UV_PYTHON_INSTALL_DIR': str(STATE / 'python'),
         'UV_PROJECT_ENVIRONMENT': str(ROOT / '.venv'),
-        'npm_config_cache': str(STATE / 'cache/npm'), 'npm_config_userconfig': str(home / 'npmrc'),
+        'npm_config_cache': str(downloads / 'npm'), 'npm_config_userconfig': str(home / 'npmrc'),
+        'MISE_CACHE_DIR': str(downloads / 'mise'),
+        'MISE_DOWNLOADS_DIR': str(downloads / 'mise-downloads'),
         'CARGO_HOME': str(STATE / 'cargo'), 'CARGO_TARGET_DIR': str(STATE / 'cargo-target'),
         'CARGO_BUILD_JOBS': '2',
         'TZ': 'UTC', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'PYTHONHASHSEED': '0',
@@ -457,6 +618,7 @@ def provision_rg(env: dict[str, str]) -> None:
 
 
 def setup(env: dict[str, str]) -> None:
+    ensure_setup_free_space()
     require_checkout_venv_isolation()
     require_tools(('uv', 'node'), env)
     provision_npm(env)

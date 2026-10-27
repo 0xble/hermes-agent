@@ -862,6 +862,196 @@ with ci.checkout_lock():
             self.assertNotEqual(bad.returncode, 0)
             self.assertIn('positive', bad.stderr)
 
+    def test_shared_download_cache_stays_outside_checkout_and_disposable_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            cache = base / 'host-cache'
+            checkout = base / 'checkout'
+            home = base / 'disposable-home'
+            checkout.mkdir()
+            with patch.object(ci, 'ROOT', checkout), patch.object(ci, 'STATE', checkout / '.ci'), \
+                    patch.dict(os.environ, {
+                        'HERMES_CI_CACHE_DIR': str(cache),
+                        'UV_LINK_MODE': 'symlink',
+                        'HERMES_CI_UV_LINK_MODE': 'clone',
+                    }, clear=False):
+                env = ci.environment(home)
+            self.assertEqual(env['UV_CACHE_DIR'], str((cache / 'uv').resolve()))
+            self.assertEqual(env['npm_config_cache'], str((cache / 'npm').resolve()))
+            self.assertEqual(env['MISE_CACHE_DIR'], str((cache / 'mise').resolve()))
+            self.assertEqual(env['MISE_DOWNLOADS_DIR'], str((cache / 'mise-downloads').resolve()))
+            self.assertEqual(env['UV_LINK_MODE'], 'clone')
+            self.assertEqual(env['UV_PROJECT_ENVIRONMENT'], str(checkout / '.venv'))
+            self.assertEqual(env['CARGO_TARGET_DIR'], str(checkout / '.ci' / 'cargo-target'))
+            self.assertEqual(env['HOME'], str(home))
+            for key in ('UV_CACHE_DIR', 'npm_config_cache', 'MISE_CACHE_DIR', 'MISE_DOWNLOADS_DIR'):
+                path = Path(env[key])
+                self.assertFalse(path.is_relative_to(checkout.resolve()))
+                self.assertFalse(path.is_relative_to(home.resolve()))
+                self.assertNotEqual(path, Path.home() / '.cache' / 'uv')
+            with patch.object(ci, 'ROOT', checkout), patch.dict(os.environ, {
+                    'HERMES_CI_CACHE_DIR': str(checkout / 'inside')}, clear=False):
+                with self.assertRaisesRegex(RuntimeError, 'outside the checkout'):
+                    ci.environment(home)
+
+    def test_two_checkouts_share_one_download_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            cache = base / 'shared'
+            envs = []
+            for name in ('first', 'second'):
+                checkout = base / name
+                checkout.mkdir()
+                with patch.object(ci, 'ROOT', checkout), patch.object(ci, 'STATE', checkout / '.ci'), \
+                        patch.dict(os.environ, {'HERMES_CI_CACHE_DIR': str(cache)}, clear=False):
+                    envs.append(ci.environment(base / f'{name}-home'))
+            self.assertEqual(envs[0]['UV_CACHE_DIR'], envs[1]['UV_CACHE_DIR'])
+            self.assertEqual(envs[0]['npm_config_cache'], envs[1]['npm_config_cache'])
+            self.assertEqual(envs[0]['MISE_CACHE_DIR'], envs[1]['MISE_CACHE_DIR'])
+            self.assertNotEqual(envs[0]['UV_PROJECT_ENVIRONMENT'], envs[1]['UV_PROJECT_ENVIRONMENT'])
+            self.assertNotEqual(envs[0]['CARGO_TARGET_DIR'], envs[1]['CARGO_TARGET_DIR'])
+            uv_cache = Path(envs[0]['UV_CACHE_DIR'])
+
+            def cache_bytes() -> int:
+                return sum(path.stat().st_size for path in uv_cache.rglob('*') if path.is_file())
+
+            before = cache_bytes()
+            (uv_cache / 'first-wheel').write_bytes(b'x' * 4096)
+            after_first = cache_bytes()
+            self.assertEqual(after_first - before, 4096)
+            self.assertEqual(Path(envs[1]['UV_CACHE_DIR']), uv_cache)
+            self.assertEqual(cache_bytes(), after_first)
+
+    def test_floor_reclaims_finished_fixture_then_proceeds(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            base = Path(directory)
+            repo = base / 'repo'
+            finished = repo / '.worktrees' / 'finished'
+            busy = repo / '.worktrees' / 'busy'
+            outside = base / 'outside-venv'
+            outside.mkdir()
+            for tree, payload in ((finished, b'finished'), (busy, b'busy')):
+                (tree / '.ci').mkdir(parents=True)
+                (tree / '.ci' / 'blob').write_bytes(payload)
+                (tree / 'node_modules').mkdir()
+                (tree / 'target').mkdir()
+                (tree / 'keep.py').write_text('source\n', encoding='utf-8')
+            finished_venv = finished / '.venv'
+            finished_venv.symlink_to(outside, target_is_directory=True)
+            (busy / '.venv').mkdir()
+            script = base / 'safety'
+            script.write_text(
+                '#!/usr/bin/env python3\n'
+                'import json, sys\n'
+                'from pathlib import Path\n'
+                'worktree = sys.argv[sys.argv.index("--worktree") + 1]\n'
+                'report = json.loads(Path(sys.argv[0] + ".json").read_text())\n'
+                'report["worktree"] = worktree\n'
+                'if Path(worktree).name != "finished":\n'
+                '    report["active_cwd"] = True\n'
+                '    report["reasons"] = ["a process is running from inside the worktree"]\n'
+                'print(json.dumps(report))\n'
+                'raise SystemExit(0 if report.get("verdict") == "safe-to-remove" else 10)\n',
+                encoding='utf-8',
+            )
+            script.chmod(0o755)
+            (Path(str(script) + '.json')).write_text(
+                '{"verdict":"preserve","reasons":["ignored work remains"],'
+                '"ignored_entries":[".ci/blob","node_modules/pkg/index.js",".venv/pyvenv.cfg","target/debug/x"],'
+                '"dirty_entries":[],"active_cwd":false,"locked":false,"linked_worktree":true,'
+                '"integrated_or_patch_equivalent":true,"nested_repos":[],"inbound_live_symlinks":[]}\n',
+                encoding='utf-8',
+            )
+            floor = 1000
+            free = iter((floor - 1, floor))
+            stack.enter_context(patch.dict(os.environ, {
+                'HERMES_WORKTREE_SAFETY': str(script),
+                'HERMES_CI_FREE_SPACE_FLOOR_BYTES': str(floor),
+            }, clear=False))
+            stack.enter_context(patch.object(ci, 'common_repo_root', return_value=repo))
+            stack.enter_context(patch.object(ci, 'volume_free_bytes', side_effect=lambda path: next(free)))
+            stack.enter_context(patch.object(ci, 'require_tools'))
+            stack.enter_context(patch.object(ci, 'provision_npm'))
+            stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
+            stack.enter_context(patch.object(ci, 'provision_rg'))
+            run = stack.enter_context(patch.object(ci, 'run'))
+            ci.setup({})
+            self.assertFalse((finished / '.ci').exists())
+            self.assertFalse((finished / 'node_modules').exists())
+            self.assertFalse((finished / 'target').exists())
+            self.assertFalse(finished_venv.exists())
+            self.assertTrue(outside.is_dir())
+            self.assertEqual((finished / 'keep.py').read_text(encoding='utf-8'), 'source\n')
+            self.assertTrue((busy / '.ci' / 'blob').is_file())
+            self.assertTrue((busy / '.venv').is_dir())
+            run.assert_called()
+
+    def test_floor_refuses_with_paths_when_nothing_is_reclaimable(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            base = Path(directory)
+            repo = base / 'repo'
+            finished = repo / '.worktrees' / 'open'
+            (finished / '.ci').mkdir(parents=True)
+            (finished / '.ci' / 'blob').write_bytes(b'keep')
+            script = base / 'safety'
+            script.write_text(
+                '#!/usr/bin/env python3\n'
+                'import json\n'
+                'print(json.dumps({"verdict":"preserve","reasons":["a process is running from inside the worktree"],'
+                '"ignored_entries":[],"dirty_entries":[],"active_cwd":true,"locked":false,'
+                '"linked_worktree":true,"integrated_or_patch_equivalent":true,"nested_repos":[],'
+                '"inbound_live_symlinks":[]}))\n'
+                'raise SystemExit(10)\n',
+                encoding='utf-8',
+            )
+            script.chmod(0o755)
+            floor = 5000
+            free = 100
+            stack.enter_context(patch.dict(os.environ, {
+                'HERMES_WORKTREE_SAFETY': str(script),
+                'HERMES_CI_FREE_SPACE_FLOOR_BYTES': str(floor),
+            }, clear=False))
+            stack.enter_context(patch.object(ci, 'common_repo_root', return_value=repo))
+            stack.enter_context(patch.object(ci, 'volume_free_bytes', return_value=free))
+            with self.assertRaisesRegex(RuntimeError, 'Refusing CI setup') as caught:
+                ci.setup({})
+            message = str(caught.exception)
+            self.assertIn(f'{free} bytes free', message)
+            self.assertIn(f'floor is {floor}', message)
+            self.assertIn(f'{floor - free} more bytes required', message)
+            for relative in ci.SETUP_GENERATED_RELATIVE:
+                self.assertIn(str(ci.ROOT / relative), message)
+            self.assertTrue((finished / '.ci' / 'blob').is_file())
+
+    def test_floor_does_nothing_when_free_space_is_above_it(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            repo = Path(directory) / 'repo'
+            finished = repo / '.worktrees' / 'finished'
+            (finished / '.venv').mkdir(parents=True)
+            floor = 1000
+            stack.enter_context(patch.dict(os.environ, {
+                'HERMES_CI_FREE_SPACE_FLOOR_BYTES': str(floor),
+                'HERMES_WORKTREE_SAFETY': str(directory) + '/missing-safety',
+            }, clear=False))
+            stack.enter_context(patch.object(ci, 'volume_free_bytes', return_value=floor))
+            stack.enter_context(patch.object(
+                ci, 'reclaim_finished_generated_dirs', side_effect=AssertionError('reclaim on a roomy volume')))
+            stack.enter_context(patch.object(ci, 'require_tools'))
+            stack.enter_context(patch.object(ci, 'provision_npm'))
+            stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
+            stack.enter_context(patch.object(ci, 'provision_rg'))
+            run = stack.enter_context(patch.object(ci, 'run'))
+            ci.setup({})
+            self.assertTrue((finished / '.venv').is_dir())
+            run.assert_called()
+
+    def test_hosted_runner_skips_the_local_wave_floor(self):
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}, clear=False), \
+                patch.object(ci, 'volume_free_bytes', return_value=0), \
+                patch.object(ci, 'reclaim_finished_generated_dirs', side_effect=AssertionError('hosted reclaim')):
+            os.environ.pop('HERMES_CI_FREE_SPACE_FLOOR_BYTES', None)
+            ci.ensure_setup_free_space()
+
 
 if __name__ == '__main__':
     unittest.main()

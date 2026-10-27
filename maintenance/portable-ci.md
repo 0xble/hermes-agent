@@ -50,9 +50,17 @@ checks a committed revision instead. Plugin admission fetches exact pins and
 executes dependency validation, so run catalog changes in a disposable,
 credentialless environment. The required runner already provides that isolation.
 
-Mutable state lives in the current worktree: `.venv`, `node_modules`,
-`website/node_modules`, and ignored `.ci/` caches and Cargo targets. Temporary
-homes live outside the checkout in invocation-owned system temporary directories.
+Mutable installs stay in the current worktree: `.venv`, `node_modules`,
+`website/node_modules`, and the Cargo target under ignored `.ci/`. uv, npm,
+and mise download caches are the exception. They are content-addressed, so
+they live in one dedicated host directory on the same volume as the checkout,
+outside the checkout and outside the disposable HOME. That directory is not
+`~/.cache/uv`. `UV_LINK_MODE` is `clone` when the volume supports copy-on-write
+and `copy` otherwise, so a shared cache cannot fall back to hardlinks or
+symlinks. Before setup, a free-space floor sized for one 3-slot wave plus
+headroom reclaims generated directories from finished worktrees and refuses,
+naming the paths and the bytes still required, only when space is still short.
+There is no host-wide install lock. Fork patch identity: `ci-shared-download-caches`. Temporary homes live outside the checkout in invocation-owned system temporary directories.
 When Linux makes the normal disk-backed Python scratch path read-only, Python
 fixtures use a unique directory under the runner's original disk-backed HOME,
 outside the isolated child HOME. Temporary parents with Git or Node dependency

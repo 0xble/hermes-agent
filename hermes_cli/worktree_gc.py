@@ -8,11 +8,13 @@ untracked scratch (archived first) and branches whose content is on upstream.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -382,6 +384,131 @@ def _size_note(record: TreeRecord) -> str:
     if record.size_mb is None:
         return f": archives ~{record.archive_mb}M"
     return f": frees ~{max(record.size_mb - record.archive_mb, 0)}M, archives ~{record.archive_mb}M"
+
+
+# Generated directories the free-space floor may delete from a finished worktree.
+# Source, branches, and anything outside this set stay. ``.ci`` covers the
+# checkout-local Cargo target portable CI writes at ``.ci/cargo-target``.
+_GENERATED_RECLAIM_RELATIVE = (
+    ".ci",
+    ".venv",
+    "node_modules",
+    "website/node_modules",
+    "target",
+)
+_GENERATED_RECLAIM_NAMES = frozenset({".ci", ".venv", "node_modules", "target"})
+_IGNORED_GENERATED_REASON = "ignored work remains"
+
+
+def _generated_reclaim_path(path: str) -> bool:
+    """True when *path* is inside a directory this floor plan deletes."""
+    return any(part in _GENERATED_RECLAIM_NAMES for part in path.rstrip("/").split("/"))
+
+
+def _disposable_ignored(path: str) -> bool:
+    """Ignored output the floor may delete, including files under ``.ci``."""
+    directory = path if path.endswith("/") else path + "/"
+    return _generated_reclaim_path(path) or _regenerable(path, ignored=True) or _regenerable(directory, ignored=True)
+
+
+def _report_allows_generated_reclaim(report: dict) -> bool:
+    """True when worktree-safety's only preserve reason is disposable output.
+
+    The safety helper is the classifier. A missing field fails closed. Ignored
+    generated directories do not block this plan; any other preserve reason does.
+    """
+    if any(report.get(key) is not False for key in ("active_cwd", "locked")):
+        return False
+    if report.get("linked_worktree") is not True or report.get("integrated_or_patch_equivalent") is not True:
+        return False
+    if report.get("dirty_entries") or report.get("inbound_live_symlinks"):
+        return False
+    nested = report.get("nested_repos")
+    ignored = report.get("ignored_entries")
+    reasons = report.get("reasons")
+    if not isinstance(nested, list) or not isinstance(ignored, list) or not isinstance(reasons, list):
+        return False
+    if any(isinstance(item, dict) and item.get("unresolved") for item in nested):
+        return False
+    if any(not isinstance(entry, str) or not _disposable_ignored(entry) for entry in ignored):
+        return False
+    return all(reason == _IGNORED_GENERATED_REASON for reason in reasons)
+
+
+def _path_present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _unlink_generated(path: Path, root: Path) -> bool:
+    """Remove one generated path. A symlink is unlinked, never followed."""
+    if not _path_present(path):
+        return False
+    if path.is_symlink():
+        path.unlink()
+        return True
+    if not path.is_dir():
+        return False
+    resolved = path.resolve()
+    if resolved != root.resolve() and root.resolve() not in resolved.parents:
+        return False
+    shutil.rmtree(path)
+    return True
+
+
+def reclaim_finished_generated(
+    repo_root: str,
+    *,
+    safety_script: str,
+    integration_ref: str = "origin/main",
+    exclude: Optional[List[str]] = None,
+    timeout: int = 20,
+) -> List[str]:
+    """Delete generated dirs from finished worktrees. Does not delete source.
+
+    Calls ``safety_script`` (the worktree-safety helper) for each linked tree
+    under ``repo_root/.worktrees`` that still has generated directories. A tree
+    is finished only when that helper reports it integrated, clean, idle, and
+    unlocked, or preserved solely because ignored generated output remains.
+    Returns removed paths. Returns nothing when the helper is missing: the
+    caller must refuse rather than guess.
+    """
+    script = Path(safety_script)
+    if not script.is_file():
+        return []
+    managed = Path(repo_root) / ".worktrees"
+    if not managed.is_dir():
+        return []
+    excluded = {os.path.realpath(path) for path in (exclude or [])}
+    removed: List[str] = []
+    for entry in sorted(managed.iterdir()):
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        real = os.path.realpath(entry)
+        if real in excluded:
+            continue
+        if not any(_path_present(entry / relative) for relative in _GENERATED_RECLAIM_RELATIVE):
+            continue
+        try:
+            result = _run(
+                [sys.executable, str(script), "inspect", "--worktree", str(entry),
+                 "--integration-ref", integration_ref, "--json"],
+                timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode not in (0, 10) or not result.stdout.strip():
+            continue
+        try:
+            report = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(report, dict) or not _report_allows_generated_reclaim(report):
+            continue
+        for relative in _GENERATED_RECLAIM_RELATIVE:
+            target = entry / relative
+            if _unlink_generated(target, entry):
+                removed.append(str(target))
+    return removed
 
 
 def reclaim_worktrees(
