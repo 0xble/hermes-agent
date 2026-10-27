@@ -1736,6 +1736,36 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return _transport.adapter
         return next((a for p, a in adapters.items() if p.value == platform_name), None)
 
+    def _platform_adapter_for_unproven_relay(self, platform_name: str, source, evt: dict):
+        """Platform adapter for a relay-flagged pre-ledger route, else None.
+
+        Missing relay connector plus no committed envelope is a counted refusal,
+        not a silent retry. An envelope-backed relay route keeps waiting.
+        """
+        from copy import copy
+
+        probe = copy(source)
+        probe.delivered_via_upstream_relay = False
+        platform_adapter = self._resolve_injection_adapter(platform_name, probe)
+        if platform_adapter is None:
+            return None
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        session_key = str(evt.get("session_key") or "").strip()
+        if authority is None or not session_key:
+            return None
+        try:
+            self.session_store._ensure_loaded()
+            entry = self.session_store._entries.get(session_key)
+        except Exception:
+            return None
+        if entry is None:
+            return None
+        from gateway.session_automation import committed_route_envelope
+        if committed_route_envelope(authority, entry) is not None:
+            return None
+        return platform_adapter
+
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict, *, raise_not_accepted: bool = False,
     ) -> Optional[bool]:
@@ -1777,6 +1807,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # A route-only served profile owns no adapter map; the shared listener wakes exactly the
             # session that profile's store owns (proven in ``_self_post_api_server``), fail-closed.
             adapter = self.adapters.get(Platform.API_SERVER)
+        if not adapter and getattr(source, "delivered_via_upstream_relay", False) is True:
+            # A persisted relay flag is not a connector. A pre-ledger route must
+            # still reach admission so the unproven grant is refused and counted.
+            # A committed envelope waits for the relay adapter.
+            adapter = self._platform_adapter_for_unproven_relay(platform_name, source, evt)
         if not adapter:
             return False
         if not adapter_supports_push(adapter):
