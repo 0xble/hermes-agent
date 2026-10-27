@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+from typing import Any, cast
 import shlex
 import sqlite3
 import subprocess
@@ -14,25 +15,40 @@ import time
 import websockets
 from tests.gateway.test_normal_runtime_boot import control
 from tests.waiting import async_wait_until
-from local_recovery_probe import websocket, rpc
+from tests.gateway.fixtures.local_recovery_probe import websocket, rpc
+
+
+class AutomationServer(ThreadingHTTPServer):
+    requests: list[dict[str, Any]]
+    blocked: threading.Event
+    release: threading.Event
+    hold_completion: bool
+    completion_blocked: threading.Event
+    completion_release: threading.Event
+    gate: Path
 
 
 class Model(BaseHTTPRequestHandler):
-    def log_message(self, *args):
+    def log_message(self, format: str, *args: Any) -> None:
         pass
 
     def do_POST(self):
+        server = cast(AutomationServer, self.server)
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         messages = body.get('messages', [])
         if messages:
-            self.server.requests.append(body)
+            server.requests.append(body)
         last = next((m.get('content', '') for m in reversed(messages) if m['role'] == 'user'), '')
         if 'HOLD_AUTOMATION' in str(last):
-            self.server.blocked.set()
-            self.server.release.wait(120)
-        message = {'role': 'assistant', 'content': 'AUTOMATION_ACK'}
+            server.blocked.set()
+            server.release.wait(120)
+        if (getattr(server, 'hold_completion', False)
+                and 'REAL_TERMINAL_COMPLETION' in str(last)):
+            server.completion_blocked.set()
+            server.completion_release.wait(120)
+        message: dict[str, Any] = {'role': 'assistant', 'content': 'AUTOMATION_ACK'}
         if 'SPAWN_AUTOMATION' in str(last) and messages[-1]['role'] != 'tool':
-            code = ('import pathlib,time; p=pathlib.Path(' + repr(str(self.server.gate)) + '); '
+            code = ('import pathlib,time; p=pathlib.Path(' + repr(str(server.gate)) + '); '
                     '\nwhile not p.exists(): time.sleep(.02)\nprint("REAL_TERMINAL_COMPLETION",flush=True)')
             command = shlex.join([sys.executable, '-c', code])
             message = {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'terminal-spawn',
@@ -45,7 +61,7 @@ class Model(BaseHTTPRequestHandler):
         kind = 'application/json'
         if body.get('stream'):
             if message.get('tool_calls'):
-                message['tool_calls'][0]['index'] = 0
+                cast(dict[str, Any], message['tool_calls'][0])['index'] = 0
             payload = ('data: ' + json.dumps({'id': 'local', 'choices': [
                 {'index': 0, 'delta': message, 'finish_reason': finish}]}) + '\n\ndata: [DONE]\n\n').encode()
             kind = 'text/event-stream'
@@ -74,9 +90,11 @@ async def _identify_until_ready(home, seconds):
 async def probe(root, base, mode):
     home, user = base / 'state', base / 'user'
     home.mkdir(); user.mkdir()
-    model = ThreadingHTTPServer(('127.0.0.1', 0), Model)
+    model = AutomationServer(('127.0.0.1', 0), Model)
     model.requests = []
     model.blocked, model.release = threading.Event(), threading.Event()
+    model.hold_completion = mode.startswith('restart-')
+    model.completion_blocked, model.completion_release = threading.Event(), threading.Event()
     model.gate = home / 'release-terminal'
     threading.Thread(target=model.serve_forever, daemon=True).start()
     ready = asyncio.Queue()
@@ -110,7 +128,8 @@ async def probe(root, base, mode):
     try:
         async with websockets.serve(connector, '127.0.0.1', 0) as relay:
             url = f'http://127.0.0.1:{model.server_port}/v1'
-            cfg = {'gateway': {'multiplex_profiles': False, 'completion_notification_batch_window_seconds': 0},
+            cfg = {'gateway': {'multiplex_profiles': False, 'completion_notification_batch_window_seconds': 0,
+                               'restart_resume_policy': 'continue'},
                 'model': {'provider': 'custom', 'default': 'local-fixture', 'base_url': url},
                 'streaming': {'enabled': False}, 'terminal': {'cwd': str(home)},
                 'approvals': {'mode': 'off'},
@@ -119,7 +138,7 @@ async def probe(root, base, mode):
             env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
             env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
                 OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url, PYTHONUNBUFFERED='1',
-                GATEWAY_RELAY_URL=f'ws://127.0.0.1:{relay.sockets[0].getsockname()[1]}/relay',
+                GATEWAY_RELAY_URL=f'ws://127.0.0.1:{next(iter(relay.sockets)).getsockname()[1]}/relay',
                 GATEWAY_RELAY_PLATFORMS='telegram', GATEWAY_RELAY_BOT_IDS='{"telegram":"fixture-bot"}',
                 GATEWAY_RELAY_ID='fixture-gateway', GATEWAY_RELAY_SECRET='fixture-secret')
             with (home / 'daemon.log').open('w+') as log:
@@ -133,9 +152,9 @@ async def probe(root, base, mode):
                         await ws.send(json.dumps({'type': 'inbound', 'event': {'text': text,
                             'message_id': identity, 'source': {'platform': 'telegram', 'chat_id': 'automation-chat',
                             'chat_type': 'dm', 'user_id': 'fixture-user'}}}) + '\n')
-                    await send('spawn', 'SPAWN_AUTOMATION' if mode == 'terminal' else 'WARM_AUTOMATION')
+                    await send('spawn', 'SPAWN_AUTOMATION' if mode != 'heartbeat' else 'WARM_AUTOMATION')
                     await wait_for(lambda: any(r['request_id'] == 'spawn' and r['status'] == 'terminal' for r in rows()))
-                    if mode == 'terminal':
+                    if mode != 'heartbeat':
                         assert 'REAL_TERMINAL_COMPLETION' in json.dumps(model.requests), 'model did not request real terminal'
                     else:
                         await send('timer-config', '/heartbeat every 1m TIMER_AUTOMATION')
@@ -143,6 +162,68 @@ async def probe(root, base, mode):
                     sid = rows()[0]['target_session_id']
                     async with websocket(home, desc) as observer:
                         assert 'result' in await rpc(observer, 'session.resume', session_id=sid)
+                    if mode.startswith('restart-'):
+                        model.gate.touch()
+                        assert await asyncio.to_thread(model.completion_blocked.wait, 20)
+                        automatic = [r for r in rows() if r['principal_id'].startswith('automation:')]
+                        assert len(automatic) == 1 and automatic[0]['status'] == 'started', rows()
+                        await send('human-follower', 'HUMAN_FIFO_FOLLOWER')
+                        await wait_for(lambda: any(r['request_id'] == 'human-follower' for r in rows()))
+                        old_pid, old_epoch = proc.pid, desc['authority_epoch']
+                        sent_before_restart = len(outgoing)
+                        proc.kill()
+                        await asyncio.to_thread(proc.wait, 10)
+                        model.hold_completion = False
+                        model.completion_release.set()
+                        if mode == 'restart-denied':
+                            env['GATEWAY_RELAY_SECRET'] = 'changed-fixture-secret'
+                        proc = await asyncio.to_thread(subprocess.Popen,
+                            [sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+                        ws = await asyncio.wait_for(ready.get(), 35)
+                        desc = await _identify_until_ready(home, 35)
+                        assert desc.get('state') == 'ready', desc
+                        assert proc.pid != old_pid and desc['authority_epoch'] > old_epoch
+                        if mode == 'restart-denied':
+                            ledger = rows()
+                            recovered = [r for r in ledger if r['principal_id'].startswith('automation:')]
+                            assert len(recovered) == 1 and recovered[0]['outcome'] == 'interrupted', ledger
+                            assert recovered[0]['admission_id'] == automatic[0]['admission_id']
+                            assert next(r for r in ledger if r['request_id'] == 'human-follower')['status'] == 'queued'
+                            verdicts = [line for line in (home / 'logs/gateway.log').read_text().splitlines()
+                                if 'Native session startup recovery' in line and sid in line]
+                            assert any('profile_mismatch' in line for line in verdicts), verdicts
+                            texts = [next((m.get('content', '') for m in reversed(r['messages'])
+                                if m['role'] == 'user'), '') for r in model.requests if r.get('messages')]
+                            assert sum('REAL_TERMINAL_COMPLETION' in str(t) for t in texts) == 1, texts
+                            assert not any('HUMAN_FIFO_FOLLOWER' in str(t) for t in texts), texts
+                            print(json.dumps({'ledger': ledger, 'model_inputs': texts, 'recovery_verdicts': verdicts}))
+                            return
+                        await wait_for(lambda: all(r['status'] == 'terminal' for r in rows()))
+                        recovered = [r for r in rows() if r['principal_id'].startswith('automation:')]
+                        assert len(recovered) == 1 and recovered[0]['outcome'] == 'interrupted', rows()
+                        assert recovered[0]['admission_id'] == automatic[0]['admission_id']
+                        await wait_for(lambda: len(outgoing) > sent_before_restart)
+                        revived_sends = [f['action'] for f in outgoing[sent_before_restart:]
+                            if f.get('type') == 'outbound' and f.get('action', {}).get('op') == 'send'
+                            and f['action'].get('content') == 'AUTOMATION_ACK']
+                        assert len(revived_sends) == 1, outgoing[sent_before_restart:]
+                        assert revived_sends[0].get('metadata', {}).get('user_id') == 'fixture-user', revived_sends
+                        await send('after-recovery', 'AFTER_RECOVERY')
+                        await wait_for(lambda: any(r['request_id'] == 'after-recovery'
+                            and r['status'] == 'terminal' for r in rows()))
+                        texts = [next((m.get('content', '') for m in reversed(r['messages'])
+                            if m['role'] == 'user'), '') for r in model.requests if r.get('messages')]
+                        assert sum('REAL_TERMINAL_COMPLETION' in str(t) for t in texts) == 1, texts
+                        assert sum('HUMAN_FIFO_FOLLOWER' in str(t) for t in texts) == 1, texts
+                        assert sum('AFTER_RECOVERY' in str(t) for t in texts) == 1, texts
+                        with sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True) as db:
+                            notices = db.execute("SELECT content FROM messages WHERE session_id=? AND role='assistant'",
+                                                 (sid,)).fetchall()
+                        assert any('interrupt' in str(n).lower() for n in notices), notices
+                        print(json.dumps({'old_pid': old_pid, 'new_pid': proc.pid, 'ledger': rows(),
+                                          'model_inputs': texts, 'interruption_notices': notices}))
+                        return
                     await send('held', 'HOLD_AUTOMATION')
                     assert await asyncio.to_thread(model.blocked.wait, 15)
                     await send('human-follower', 'HUMAN_FIFO_FOLLOWER')
@@ -172,11 +253,21 @@ async def probe(root, base, mode):
                     print(json.dumps({'daemon_pid': proc.pid, 'ledger': rows(), 'model_inputs': texts,
                                       'observer_closed_before_completion': True}))
                 except BaseException:
-                    print((home / 'daemon.log').read_text()[-10000:], file=sys.stderr)
+                    if (home / 'state.db').exists():
+                        print(json.dumps({'ledger_at_failure': rows(), 'outgoing': outgoing,
+                            'model_inputs': [next((m.get('content', '') for m in reversed(r['messages'])
+                                if m['role'] == 'user'), '') for r in model.requests if r.get('messages')]}),
+                            file=sys.stderr)
+                    print((home / 'daemon.log').read_text()[-24000:], file=sys.stderr)
+                    for name in ('logs/gateway.log', 'sessions/sessions.json', 'sessions.json'):
+                        diagnostic = home / name
+                        if diagnostic.is_file():
+                            print(name + '\n' + diagnostic.read_text()[-24000:], file=sys.stderr)
                     raise
     finally:
         model.gate.touch()
         model.release.set()
+        model.completion_release.set()
         if proc is not None:
             proc.kill(); proc.wait(timeout=10)
         model.shutdown(); model.server_close()

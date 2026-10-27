@@ -595,7 +595,7 @@ class SessionAuthority:
     async def recover_native_sessions(self, bindings):
         """Bind only server-observed native routes; unknown work stays paused."""
         from collections import Counter
-        from gateway.session_envelope import check_native_route
+        from gateway.session_envelope import check_native_route, restore_native_source
         bindings = list(bindings)
         counts = Counter(sid for sid, _, _ in bindings)
         results = {}
@@ -607,6 +607,11 @@ class SessionAuthority:
                 native = [row for row in rows if 'native_text_v1' in row['payload']]
                 if not native:
                     raise RuntimeStoreError('not_found')
+                if adapter is None:
+                    # Durable origins omit live transport proof. Rebind only through the native
+                    # envelope's current-credential provenance before selecting its adapter.
+                    restored = restore_native_source(native[-1]['payload'], self.runner)
+                    adapter = self.runner._adapter_for_source(restored)
                 target = self.physical_target(SessionRef(self.profile_id, sid))
                 source, route = await check_native_route(self.runner, native[-1]['payload'], target,
                                                     available_source, adapter)
@@ -626,6 +631,10 @@ class SessionAuthority:
                 self.sessions.setdefault(sid, LiveSession(source, route))
                 if any(row['status'] == 'unknown' for row in rows):
                     raise RuntimeStoreError('unknown_execution')
+                prime = getattr(adapter, 'prime_routing_cache', None)
+                if callable(prime):
+                    from gateway.platforms.event import MessageEvent
+                    prime(MessageEvent(text='', source=source))
                 self._schedule(SessionRef(self.profile_id, sid))
                 results[sid] = 'ready'
             except RuntimeStoreError as exc:

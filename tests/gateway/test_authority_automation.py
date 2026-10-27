@@ -22,3 +22,11 @@ def test_terminal_completion_commits_while_ordinary_daemon_model_is_held(tmp_pat
 
 def test_heartbeat_timer_commits_while_ordinary_daemon_model_is_held(tmp_path):
     _probe(tmp_path, 'heartbeat')
+
+
+def test_started_completion_is_interrupted_without_replay_after_owner_kill(tmp_path):
+    _probe(tmp_path, 'restart-started')
+
+
+def test_owner_replacement_rejects_stale_relay_provenance(tmp_path):
+    _probe(tmp_path, 'restart-denied')
