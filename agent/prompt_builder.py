@@ -11,6 +11,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -28,7 +29,7 @@ from agent.skill_utils import (
     skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
-from utils import atomic_json_write, file_signature
+from utils import atomic_json_write, file_signature, filesystem_poll_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -1113,6 +1114,8 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
     """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE.clear()
+    with _MANIFEST_POLL_LOCK:
+        _MANIFEST_POLL.clear()
     try:
         if clear_snapshot:
             _skills_prompt_snapshot_path().unlink(missing_ok=True)
@@ -1120,8 +1123,33 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
         logger.debug("Could not remove skills prompt snapshot: %s", e)
 
 
+# Reuse a skills-tree manifest across prompt builds. The walk lstats every entry
+# (followlinks), and a gateway rebuilds prompts far more often than skills change.
+# An install is visible on the next build after this interval, or immediately after
+# clear_skills_system_prompt_cache. Tests keep the interval at 0.
+_MANIFEST_POLL_S = 5.0
+_MANIFEST_POLL: dict[str, tuple[float, dict[str, list[int]]]] = {}
+_MANIFEST_POLL_LOCK = threading.Lock()
+
+
 def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     """File-signature manifest of every SKILL.md and DESCRIPTION.md."""
+    key = str(skills_dir)
+    now = time.monotonic()
+    poll = filesystem_poll_seconds(_MANIFEST_POLL_S)
+    if poll > 0:
+        with _MANIFEST_POLL_LOCK:
+            hit = _MANIFEST_POLL.get(key)
+            if hit is not None and now - hit[0] < poll:
+                return hit[1]
+    manifest = _walk_skills_manifest(skills_dir)
+    if poll > 0:
+        with _MANIFEST_POLL_LOCK:
+            _MANIFEST_POLL[key] = (now, manifest)
+    return manifest
+
+
+def _walk_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     manifest: dict[str, list[int]] = {}
     skills_dir_str = str(skills_dir)
     prefix_len = len(os.path.join(skills_dir_str, ""))

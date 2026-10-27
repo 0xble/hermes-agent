@@ -37,6 +37,17 @@ def env_var_enabled(name: str, default: str = "") -> bool:
     return is_truthy_value(os.getenv(name, default), default=False)
 
 
+def filesystem_poll_seconds(default: float) -> float:
+    """How long a hot path may reuse a filesystem signature without stating again.
+
+    A long-lived gateway must not stat the skills tree or ``config.yaml`` on every
+    event. Tests keep a zero interval so a write is visible on the next read.
+    """
+    if default <= 0 or os.environ.get("PYTEST_CURRENT_TEST"):
+        return 0.0
+    return default
+
+
 def file_signature(st: os.stat_result) -> tuple[int, int, int, int]:
     """Change-detection key for a stat result: ``(st_mtime_ns, st_size, st_ino, st_ctime_ns)``.
 

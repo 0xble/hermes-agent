@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -200,21 +201,39 @@ _RAW_CONFIG_CACHE_MAX = 128
 # Guards every cache read/publish/evict: concurrent tool threads share it, and an unlocked
 # ``pop(next(iter(...)))`` races another thread's insert (RuntimeError) or pop (KeyError).
 _RAW_CONFIG_CACHE_LOCK = threading.Lock()
+# Last config.yaml signature, reused so a hot caller does not stat the file on every
+# lookup. Clearing this cache, or the poll expiring, sees the new file. Tests keep
+# the interval at 0.
+_CONFIG_STAT_POLL_S = 1.0
+_CONFIG_STAT_MEMO: dict[str, tuple[float, tuple]] = {}
 
 
 def _raw_config_cache_clear() -> None:
     """Test hook — drop the shared raw config cache."""
     with _RAW_CONFIG_CACHE_LOCK:
         _RAW_CONFIG_CACHE.clear()
+        _CONFIG_STAT_MEMO.clear()
 
 
 def _config_cache_key(config_path: Path) -> Optional[tuple[str, int, int, int, int]]:
     """``(path, *file_signature)`` identity of config.yaml, or None when unreadable/absent."""
+    from utils import file_signature, filesystem_poll_seconds
+    path = str(config_path)
+    now = time.monotonic()
+    poll = filesystem_poll_seconds(_CONFIG_STAT_POLL_S)
+    if poll > 0:
+        with _RAW_CONFIG_CACHE_LOCK:
+            hit = _CONFIG_STAT_MEMO.get(path)
+            if hit is not None and now - hit[0] < poll:
+                return hit[1]
     try:
-        from utils import file_signature
-        return (str(config_path), *file_signature(config_path.stat()))
+        key = (path, *file_signature(config_path.stat()))
     except OSError:
         return None
+    if poll > 0:
+        with _RAW_CONFIG_CACHE_LOCK:
+            _CONFIG_STAT_MEMO[path] = (now, key)
+    return key
 
 
 def _load_raw_config() -> dict[str, Any]:
@@ -225,9 +244,9 @@ def _load_raw_config() -> dict[str, Any]:
     if snapshot is not None:
         return snapshot
     config_path = get_config_path()
-    if not config_path.exists():
-        return {}
     cache_key = _config_cache_key(config_path)
+    if cache_key is None:
+        return {}
     with _RAW_CONFIG_CACHE_LOCK:
         cached = _RAW_CONFIG_CACHE.get(cache_key) if cache_key is not None else None
     if cached is not None:
