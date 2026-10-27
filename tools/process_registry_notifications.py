@@ -146,30 +146,49 @@ def _delegation_config() -> dict:
         return {}
 
 
-def _delegation_model_not_found(results, config) -> bool:
-    """True when a result reflects a config-level model_not_found rejection: needs a
-    model-not-found phrase AND the currently-configured model name in the same text,
-    so a stale task failing on a removed model is not mis-attributed to the config."""
+def _rejected_by_model(result, model, patterns) -> bool:
+    """One result whose own failure text names the configured model with a
+    model-not-found phrase. A task that finished normally (``exit_reason ==
+    "completed"``) returned its own answer, not a provider error: a summary that
+    discusses the model or says something "does not exist" is no rejection. A real
+    rejection never reaches a normal finish (it errors or exhausts its iterations)."""
+    if result.get("exit_reason") == "completed":
+        return False
+    text = " ".join(str(x) for x in (result.get("error"), result.get("summary")) if x).lower()
+    return model in text and any(p in text for p in patterns)
+
+
+def _delegation_model_rejections(results, config) -> int:
+    """How many results reflect a config-level model_not_found rejection: a failed task
+    whose failure text has a model-not-found phrase AND the currently-configured model
+    name, so a stale task failing on a removed model is not mis-attributed to the config."""
     model = str((config or {}).get("model") or "").lower()
     if not model:
-        return False
+        return 0
     patterns = _model_not_found_patterns()
-    texts = (" ".join(str(x) for x in (r.get("error"), r.get("summary")) if x).lower() for r in results or [])
-    return any(model in text and any(p in text for p in patterns) for text in texts)
+    return sum(_rejected_by_model(r, model, patterns) for r in results or [])
+
+
+def _delegation_model_not_found(results, config) -> bool:
+    return _delegation_model_rejections(results, config) > 0
 
 
 def _delegation_model_not_found_notice(results) -> list[str] | None:
     """Config-level model_not_found notice lines, or None (fail-open) — once per batch."""
     config = _delegation_config()
-    if not _delegation_model_not_found(results, config):
+    rejected = _delegation_model_rejections(results, config)
+    if not rejected:
         return None
     model = config.get("model") or "?"
     provider = config.get("provider") or "configured provider"
+    total = len(results or [])
+    scope = ("Every task in this batch failed" if rejected == total
+             else f"{rejected} of {total} tasks in this batch failed")
     lines = [
         "⚠ SUBAGENT MODEL REJECTED: the configured Subagent Model "
         f'"{model}" was rejected by provider "{provider}" '
         "(HTTP 400: not a valid model ID).",
-        "Every task in this batch failed for this reason before doing any work.",
+        f"{scope} for this reason before doing any work.",
         "Check Settings → Advanced → Subagent Model (or: hermes config get delegation.model)."]
     with suppress(Exception):
         from hermes_cli.fallback_config import get_fallback_chain
