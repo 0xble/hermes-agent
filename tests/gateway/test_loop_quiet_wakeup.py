@@ -218,6 +218,45 @@ async def test_goal_loop_deferral_logs_once_per_interval(goal_loop, caplog):
     assert len(env.adapter.events) == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval_seconds", [300, 0], ids=["fixed", "self-paced"])
+async def test_full_background_gate_deferral_is_logged_once_per_interval(
+    goal_loop, caplog, monkeypatch, interval_seconds,
+):
+    import logging
+
+    from hermes_cli import loops
+
+    env = goal_loop(interval_seconds)
+    env.goal.wait_for_seconds(3_600, reason="waiting on CI")
+    occupied = {f"busy-{n}" for n in range(env.runner.config.background_turn_concurrency)}
+    monkeypatch.setattr(env.runner, "_background_turn_keys", lambda: occupied)
+    gate = env.runner._get_replay_scheduler().gate
+    assert gate.load() == gate.limit == 8
+    due_at = env.loop.state.next_due_at
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        for elapsed in (0, 1, env.interval - 1, env.interval):
+            env.clock.now = due_at + elapsed
+            await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+
+    records = [record for record in caplog.records if "deferred by full background gate" in record.message]
+    assert len(records) == 2, "a full gate should be visible without logging every scan"
+    assert all(record.levelno == logging.INFO and env.sid in record.message for record in records)
+    assert env.adapter.events == []
+    unchanged = loops.load_loop(env.sid)
+    assert unchanged is not None
+    assert unchanged.ticks_fired == 0
+    assert unchanged.next_due_at == due_at
+    assert unchanged.awaiting_response is False
+
+    occupied.clear()
+    await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+    assert len(env.adapter.events) == 1, "the unclaimed tick stays eligible when capacity returns"
+    fired = loops.load_loop(env.sid)
+    assert fired is not None and fired.ticks_fired == 1
+
+
 class _ShapeRunner(GatewayTurnMixin):
     def __init__(self):
         self.async_session_store = SimpleNamespace(clear_resume_pending=self._noop)
@@ -277,7 +316,7 @@ async def test_fired_loop_wakeup_asks_for_silence_and_its_silent_reply_is_not_de
         # The loop DB writer is intentionally asynchronous under the test/bootstrap path; the
         # gateway's scanner would already hold the state it loaded, so use this manager's state.
         state = mgr.state
-    import hermes_cli.loops as loops
+    from hermes_cli import loops
     monkeypatch.setattr(loops, "LoopManager", lambda session_id: mgr)
     runner = _runner(adapter)
     runner._adapters_for_profile = lambda profile: {Platform.TELEGRAM: adapter}
@@ -331,7 +370,7 @@ async def test_fired_loop_wake_is_dropped_once_its_tick_is_no_longer_running(
     mgr._save()
 
     adapter = _Adapter()
-    import hermes_cli.loops as loops
+    from hermes_cli import loops
     monkeypatch.setattr(loops, "LoopManager", lambda session_id: mgr)
     runner = _runner(adapter)
     runner._adapters_for_profile = lambda profile: {Platform.TELEGRAM: adapter}
@@ -405,7 +444,7 @@ async def test_busy_loop_tick_defers_until_active_turn_releases_session(hermes_h
     key = adapter._event_session_key(MessageEvent(text="", message_type=MessageType.TEXT, source=source))
     runner_owner = object()  # installed below once the runner exists
 
-    import hermes_cli.loops as loops
+    from hermes_cli import loops
     monkeypatch.setattr(loops, "LoopManager", lambda session_id: mgr)
     runner = _runner(adapter)
     runner._adapters_for_profile = lambda profile: {Platform.TELEGRAM: adapter}
