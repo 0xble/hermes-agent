@@ -198,7 +198,11 @@ clears the goal once with one short notice, before dispute pause or timed backof
   `goals_prompt_registry.py`. Regenerate it with
   `python scripts/dev/snapshot_goal_prompt_history.py`, which walks the full goal
   formatter history of `origin/main` and the current branch without importing
-  historical code. The synthetic-prompt classifier registers every wording; a
+  historical code. It also retains frozen compatibility rows from both registries
+  when their defining commits leave both histories, preserving their recorded
+  provenance. Discovered committed history replaces stale row labels, while the
+  local and main scanned-commit inventories are retained together.
+  The synthetic-prompt classifier registers every wording; a
   guard test rejects missing current constants or inline barrier notes. Persisted
   rows stay out of both recall and retention while a provably separate human
   suffix survives. Unframed legacy revision appendices remain fail-closed through

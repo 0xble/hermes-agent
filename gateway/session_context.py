@@ -124,6 +124,22 @@ def bound_session_key() -> str:
     return "" if value is _UNSET else value
 
 
+@contextmanager
+def preserved_session_context() -> Iterator[None]:
+    """Restore an inline caller after a fresh turn clears and rebinds its own scope."""
+    from agent.runtime_cwd import reset_session_cwd, scoped_session_cwd, set_session_cwd
+
+    variables = (*_VAR_MAP.values(), _SESSION_ASYNC_DELIVERY, _SESSION_HISTORY_DELIVERY)
+    tokens = [(var, var.set(var.get())) for var in variables]
+    cwd_token = set_session_cwd(scoped_session_cwd())
+    try:
+        yield
+    finally:
+        reset_session_cwd(cwd_token)
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
 def source_route_metadata(source: Any, metadata: dict | None) -> dict | None:
     """Keep inbound route anchors for durable deliveries after the source is gone."""
     anchors = {key: str(value) for key in ("scope_id", "parent_chat_id")

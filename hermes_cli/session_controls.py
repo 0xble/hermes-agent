@@ -48,18 +48,20 @@ def _db():
 # never saw.
 REPLACEMENT_MAX_CHARS = 1500
 
+# Quoted and approved replacements preserve omitted contract fields, additive subgoals
+# and the existing turn budget. Plugins use this semantic capability, not signatures alone.
+PRESERVES_GOAL_REPLACEMENT_REQUIREMENTS = True
+
 
 _REPLACE_PAYLOAD_KEYS = frozenset({"goal", "contract", "max_turns"})
 
 
 def replacement_contract(payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    """The contract a replacement installs (missing fields are empty: the old contract is dropped)."""
+    """Explicit replacement contract edits. Omitted fields retain their current values."""
     from hermes_cli.goals import _CONTRACT_FIELDS
     raw = (payload or {}).get("contract")
     raw = raw.to_dict() if hasattr(raw, "to_dict") else dict(raw or {})
-    from hermes_cli.goals_autonomy import goal_autonomy_enabled
-    return {f: str(raw.get(f) or "").strip() for f in _CONTRACT_FIELDS
-            if f in raw or not goal_autonomy_enabled()}
+    return {f: str(raw[f] or "").strip() for f in _CONTRACT_FIELDS if f in raw}
 
 
 def _check_payload(kind: str, action: str, payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -435,7 +437,7 @@ def _quote_matches_control(kind: str, action: str, target_sid: str, requester_si
         if (not contract.stop_when
                 and stop_condition_only(load_goal(target_sid, cursor=cursor),
                                         goal=str(edit.get("goal") or "").strip(),
-                                        contract=contract, max_turns=edit.get("max_turns"))):
+                                        contract=edit.get("contract"), max_turns=edit.get("max_turns"))):
             return True
     if kind == "goal" and action == "replace":
         link = next((n for n, w in enumerate(all_words) if w in _REPLACE_LINKS), len(all_words))

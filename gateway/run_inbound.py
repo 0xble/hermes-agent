@@ -325,9 +325,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return None
 
         # Adapter admission can precede this task by an arbitrary delay on an idle lane.
-        from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
-        if is_gateway_wake(event) and not await self._run_in_executor_with_context(
-                internal_wake_is_current, event):
+        from gateway.wake import automatic_event_is_current
+
+        if not await automatic_event_is_current(self, event):
             return None
         if is_internal:
             await _admit_outbox_event(self, event, source)
@@ -1784,11 +1784,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return False
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from agent.delegation_context import top_level_delegation_context
         from gateway.outbox import scoped_turn_entry, restore_turn, store_for
         token = scoped_turn_entry()
         result = None
         try:
-            result = await self._handle_admitted_message(event)
+            with top_level_delegation_context():
+                result = await self._handle_admitted_message(event)
             return result
         finally:
             turn_id = getattr(event, "_outbox_turn_id", None)
