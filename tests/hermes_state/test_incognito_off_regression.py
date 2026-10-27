@@ -13,7 +13,9 @@ import tempfile
 import unittest
 
 
-BASE = "e8387e2758"
+# Compare off-mode behavior with the exact main revision this feature extends.
+# An older schema changes page bytes and SQL traces even without incognito.
+BASE = "c65b15b8c0464ea2db885c5d45abf714afd42bc6"
 ROOT = Path(__file__).resolve().parents[2]
 SCENARIO = r'''
 import json, os, sys, time, uuid

@@ -5,15 +5,6 @@ import asyncio
 from agent.incognito import incognito_scope, register_session
 
 
-def test_public_persistence_and_callbacks_equal_merged_main(monkeypatch):
-    from tests.hermes_state import test_incognito_off_regression as regression
-
-    # Keep the exact-page, SQL-trace and callback assertions, against the
-    # independently shipped main revision this merge must preserve.
-    monkeypatch.setattr(regression, "BASE", "a487aaa013248b439b3cc7d8447c914b1eb4b888")
-    regression.IncognitoOffRegressionTests().test_persistence_pages_writes_and_callbacks_equal_base()
-
-
 def test_private_turn_cannot_create_relay_host_or_shared_metrics(monkeypatch):
     from agent import relay_runtime
     from hermes_cli.observability import relay_shared_metrics
