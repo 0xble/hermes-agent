@@ -229,6 +229,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Deferred local tool_call batching | Multi-entry local `tool_call` batches run losslessly, bounded and interruptible through each entry's ordinary pipeline, with entry-indexed, non-misleading errors | Tool Search bridge, `tool_call` batching, local batch splitter, or connector batch dispatch changes | [Deferred local batch](maintenance/deferred-local-batch.md) |
 | Unicode TAG character stripping | Strip invisible plane-14 TAG characters from model-facing skill, web, browser, MCP, and read_file results | Tool-result construction, Unicode tag stripping, or those tool output paths | [Unicode TAG character stripping](maintenance/unicode-tag-strip.md) |
 | Go write lint scope | Post-write lint for `.go` files checks syntax with `gofmt -e`, leaving type, vet and lint checks to package-level gates and the Go LSP | Post-write shell linters, Go lint commands, or LSP redundancy rules in `tools/file_operations_lint.py` | [Go write lint scope](maintenance/go-write-lint.md) |
+| Embedded cua-driver lifetime | Keep each `cua-driver serve --embedded` process and its `hc-` socket from outliving the Hermes process that spawned it, including macOS `open` detachment | Embedded daemon spawn, stop, session release, or gateway/CLI startup | [Embedded cua-driver lifetime](maintenance/cua-driver-lifetime.md) |
 
 ## Active patch record: state.db prune lock batching
 
