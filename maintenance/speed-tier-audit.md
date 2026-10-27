@@ -10,7 +10,7 @@ Each completed `codex_responses` or `chat_completions` model response emits one 
 speed tier: session=<id> model=<wire-model> provider=<provider> route=<api-mode> requested=<tier|none> served=<tier|unreported>
 ```
 
-The request value comes from the execution middleware's outgoing kwargs, after Responses preflight, not `agent.service_tier`. SDK `extra_body.service_tier` takes precedence over the top-level field. A missing echo is `unreported`, not the requested tier. Logging happens before response validation and usage accounting, including replies without token usage and responses that will be retried.
+The request value comes from the final provider-callback kwargs, after execution middleware, Responses preflight and Relay interception, not `agent.service_tier`. Relay captures these kwargs in request-local context shared with its worker callbacks, including nested Codex streams. SDK `extra_body.service_tier` takes precedence over the top-level field. A missing echo is `unreported`, not the requested tier. Logging happens before response validation and usage accounting, including replies without token usage and responses that will be retried.
 
 `agent.usage_pricing.with_served_service_tier` is the canonical served-value normalizer. `agent.turn_usage.record_response_usage` already uses it for pricing. Codex streaming reads the terminal `response.service_tier` in `agent.codex_runtime._CodexResponseAssembler` and preserves it on the completed response. Chat streaming preserves it from both ordinary and usage-only frames, including Relay's separately accumulated final response.
 
