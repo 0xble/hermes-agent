@@ -1812,7 +1812,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return None
         from gateway.incognito import event_scope, transition_pending, slash_refusal
         from gateway.outbox import scoped_turn_entry, restore_turn, store_for
-        with event_scope(self, event):
+        async with event_scope(self, event):
             from agent.delegation_context import top_level_delegation_context
             refusal = slash_refusal(event)
             if refusal is not None:

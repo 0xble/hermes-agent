@@ -64,6 +64,44 @@ def test_private_interval_is_volatile_and_restart_keeps_only_prefix(tmp_path, me
     register_session(key, False)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("private", [False, True])
+async def test_async_ingress_scopes_real_store_without_blocking_gateway_loop(tmp_path, private):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    from agent.incognito import is_incognito
+    from gateway.incognito import private_ingress, private_topic
+    from hermes_loop_guard import set_loop_thread
+
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="loop-ingress", thread_id="23")
+    entry = store.get_or_create_session(source)
+    key = entry.session_key
+    if private:
+        store.set_incognito(key, True)
+    owner = SimpleNamespace(session_store=store, _session_key_for_source=lambda source: key)
+    seen = []
+
+    @private_ingress
+    async def receive(self, event):
+        await asyncio.sleep(0)
+        seen.append((threading.get_ident(), is_incognito(), private_topic()))
+        assert await asyncio.to_thread(is_incognito) is private
+
+    loop_thread = threading.get_ident()
+    set_loop_thread(loop_thread)
+    try:
+        await receive(owner, SimpleNamespace(source=source))
+        assert seen == [(loop_thread, private, key)]
+        assert not is_incognito() and private_topic() is None
+    finally:
+        set_loop_thread(None)
+        register_session(key, False)
+        register_session(entry.session_id, False)
+
+
 def test_new_drops_private_history_and_starts_normal(tmp_path):
     store = SessionStore(tmp_path / "sessions", GatewayConfig())
     entry = store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="18"))

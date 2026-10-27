@@ -245,6 +245,57 @@ def test_observed_conversation_refuses_only_mismatched_command_lane(adapter, mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["handler", "application"])
+@pytest.mark.parametrize("private", [False, True])
+async def test_native_async_ingress_resolves_guarded_store_off_loop(adapter, boundary, private):
+    import asyncio
+    import threading
+
+    from hermes_loop_guard import LoopGuardedLock, set_loop_thread
+    from plugins.platforms.telegram.private_ingress import private_application_class
+
+    key = key_for(adapter, message())
+    lock = LoopGuardedLock("session-store lock")
+    seen = []
+    lookup_threads = []
+
+    def enabled(session_key):
+        with lock:
+            lookup_threads.append(threading.get_ident())
+            assert session_key == key
+            return private
+
+    adapter.session_store = SimpleNamespace(incognito_enabled=enabled)
+
+    async def receive(*args):
+        await asyncio.sleep(0)
+        seen.append((threading.get_ident(), is_incognito(), private_topic()))
+        assert await asyncio.to_thread(is_incognito) is private
+
+    class Application:
+        def __init__(self):
+            self.adapter = adapter
+
+        async def process_update(self, incoming):
+            await receive(incoming)
+
+    loop_thread = threading.get_ident()
+    set_loop_thread(loop_thread)
+    try:
+        incoming = update(message(text="FIXTURE_INGRESS_TEXT"))
+        if boundary == "handler":
+            adapter._prepare_text_event = AsyncMock(side_effect=receive)
+            await adapter._handle_text_message(incoming, None)
+        else:
+            await private_application_class(Application)().process_update(incoming)
+        assert seen == [(loop_thread, private, key)]
+        assert lookup_threads and all(thread != loop_thread for thread in lookup_threads)
+        assert not is_incognito() and private_topic() is None
+    finally:
+        set_loop_thread(None)
+
+
+@pytest.mark.asyncio
 async def test_application_boundary_scopes_native_plugins_tasks_and_errors(adapter, private_lane, tmp_path):
     import asyncio
     from plugins.platforms.telegram.private_ingress import private_application_class

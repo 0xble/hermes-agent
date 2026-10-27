@@ -1,5 +1,5 @@
 """Establish the gateway privacy boundary before Telegram preprocesses an update."""
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from functools import wraps
 import logging
 from types import SimpleNamespace
@@ -94,33 +94,56 @@ def _callback_session_key(adapter, update):
     return key if isinstance(key, str) else None
 
 
+def _update_routing_scope(adapter, update):
+    key = _callback_session_key(adapter, update)
+    data = getattr(getattr(update, "callback_query", None), "data", None)
+    unmatched_picker = isinstance(data, str) and picker_callback(data) is not None and key is None
+    event = None if unmatched_picker else _routing_event(adapter, update)
+    if key is not None and event is not None:
+        # Keep retry/results stores on the prompt's lane even when another user taps it.
+        owner = SimpleNamespace(_session_key_for_source=lambda source: key,
+                                session_store=getattr(adapter, "session_store", None))
+        return event_scope(owner, event)
+    if key is not None:
+        return incognito_scope(is_incognito(key), key)
+    if event is not None:
+        return event_scope(adapter, event)
+    # Missing topics or unmatched picker IDs cannot establish a public lane.
+    return unattributed_event_scope()
+
+
+def _refuse_preparation(adapter):
+    # PTB may log the raw Update when an exception escapes preparation.
+    with incognito_scope(True):
+        logger.warning("Telegram privacy routing unavailable; update not dispatched")
+    failed = getattr(adapter, "_fail_update_preparation", None)
+    if callable(failed):
+        failed()
+
+
 @contextmanager
 def telegram_update_scope(adapter, update):
     with ExitStack() as stack:
         try:
-            key = _callback_session_key(adapter, update)
-            data = getattr(getattr(update, "callback_query", None), "data", None)
-            unmatched_picker = isinstance(data, str) and picker_callback(data) is not None and key is None
-            event = None if unmatched_picker else _routing_event(adapter, update)
-            if key is not None and event is not None:
-                # Keep retry/results stores on the prompt's lane even when another user taps it.
-                owner = SimpleNamespace(_session_key_for_source=lambda source: key,
-                                        session_store=getattr(adapter, "session_store", None))
-                stack.enter_context(event_scope(owner, event))
-            elif key is not None:
-                stack.enter_context(incognito_scope(is_incognito(key), key))
-            elif event is not None:
-                stack.enter_context(event_scope(adapter, event))
-            else:
-                # Missing topics or unmatched picker IDs cannot establish a public lane.
-                stack.enter_context(unattributed_event_scope())
+            stack.enter_context(_update_routing_scope(adapter, update))
         except Exception:
-            # PTB may log the raw Update when an exception escapes preparation.
-            with incognito_scope(True):
-                logger.warning("Telegram privacy routing unavailable; update not dispatched")
-            failed = getattr(adapter, "_fail_update_preparation", None)
-            if callable(failed):
-                failed()
+            _refuse_preparation(adapter)
+            yield False
+            return
+        yield True
+
+
+@asynccontextmanager
+async def async_telegram_update_scope(adapter, update):
+    async with AsyncExitStack() as stack:
+        try:
+            scope = _update_routing_scope(adapter, update)
+            if isinstance(scope, AbstractAsyncContextManager):
+                await stack.enter_async_context(scope)
+            else:
+                stack.enter_context(scope)
+        except Exception:
+            _refuse_preparation(adapter)
             yield False
             return
         yield True
@@ -130,7 +153,7 @@ def private_telegram_ingress(fn):
     """Scope preprocessing and direct handler calls using canonical routing."""
     @wraps(fn)
     async def scoped(self, update, *args, **kwargs):
-        with telegram_update_scope(self, update) as admitted:
+        async with async_telegram_update_scope(self, update) as admitted:
             if admitted:
                 return await fn(self, update, *args, **kwargs)
     return scoped
@@ -142,7 +165,7 @@ def private_application_class(base):
         __slots__ = ()
 
         async def process_update(self, update):
-            with telegram_update_scope(self.adapter, update) as admitted:
+            async with async_telegram_update_scope(self.adapter, update) as admitted:
                 if admitted:
                     return await super().process_update(update)
 

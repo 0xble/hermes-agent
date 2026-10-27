@@ -1,6 +1,7 @@
 """Ingress scoping and RAM-only equivalents for gateway durability stores."""
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -8,6 +9,7 @@ import inspect
 import json
 import sqlite3
 import threading
+from typing import Callable
 
 from agent.incognito import any_incognito_sessions, incognito_scope, is_incognito, register_session
 
@@ -91,26 +93,63 @@ def _routing_records() -> dict:
     return records
 
 
-@contextmanager
-def unattributed_event_scope():
-    """Unknown updates cannot establish that they are outside a private interval."""
-    enabled = any_incognito_sessions() or bool(_TRANSITIONING) or bool(_routing_records())
-    with incognito_scope(enabled):
-        yield
+class _IngressScope:
+    """Resolve blocking routing off-loop, but enter ContextVars in the calling task."""
+
+    def __init__(self, resolve: Callable[[], tuple[str | None, bool] | None]):
+        self._resolve = resolve
+        self._scope = None
+
+    def _enter(self, decision):
+        self._scope = _decision_scope(decision)
+        return self._scope.__enter__()
+
+    def __enter__(self):
+        return self._enter(self._resolve())
+
+    def __exit__(self, *exc):
+        assert self._scope is not None
+        return self._scope.__exit__(*exc)
+
+    async def __aenter__(self):
+        return self._enter(await asyncio.to_thread(self._resolve))
+
+    async def __aexit__(self, *exc):
+        return self.__exit__(*exc)
 
 
 @contextmanager
-def event_scope(owner, event):
-    source = getattr(event, "source", None)
-    if source is None:
+def _decision_scope(decision):
+    if decision is None:
         yield
         return
+    key, enabled = decision
+    token = _TOPIC.set(key or private_topic())
+    try:
+        with incognito_scope(enabled or transition_pending(key), key):
+            yield
+    finally:
+        _TOPIC.reset(token)
+
+
+def _unattributed_decision():
+    # Unknown updates cannot establish that they are outside a private interval.
+    return None, any_incognito_sessions() or bool(_TRANSITIONING) or bool(_routing_records())
+
+
+def unattributed_event_scope():
+    return _IngressScope(_unattributed_decision)
+
+
+def _event_decision(owner, event):
+    source = getattr(event, "source", None)
+    if source is None:
+        return None
     canonicalize = getattr(owner, "_canonicalize", None)
     if callable(canonicalize):
         canonicalize(source)
     if getattr(source, "profile_route_rejected", False) is True:
-        yield
-        return
+        return None
     key_for = getattr(owner, "_session_key_for_source", None) or getattr(owner, "_source_session_key", None)
     key = key_for(source) if callable(key_for) else None
     enabled = is_incognito(key) if isinstance(key, str) else False
@@ -128,14 +167,11 @@ def event_scope(owner, event):
     # The entry command and its confirmation must also avoid normal admission/result stores.
     command = getattr(event, "get_command", None)
     entering = callable(command) and command() == "incognito"
-    if not isinstance(key, str):
-        key = None
-    token = _TOPIC.set(key or private_topic())
-    try:
-        with incognito_scope(enabled or entering or transition_pending(key), key):
-            yield
-    finally:
-        _TOPIC.reset(token)
+    return key if isinstance(key, str) else None, enabled or entering
+
+
+def event_scope(owner, event):
+    return _IngressScope(lambda: _event_decision(owner, event))
 
 
 def slash_refusal(event) -> str | None:
@@ -159,7 +195,7 @@ def private_ingress(fn):
     if inspect.iscoroutinefunction(fn):
         @wraps(fn)
         async def async_scoped(self, event, *args, **kwargs):
-            with event_scope(self, event):
+            async with event_scope(self, event):
                 return await fn(self, event, *args, **kwargs)
         return async_scoped
     @wraps(fn)
