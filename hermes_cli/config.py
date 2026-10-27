@@ -36,6 +36,7 @@ import hermes_yaml as yaml
 from hermes_cli.cli_output import line_input
 from hermes_cli.colors import Colors, color
 from hermes_cli import managed_scope
+from hermes_cli.config_errors import ConfigValidationError
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
 from hermes_cli.secret_prompt import masked_secret_prompt
 # Managed-mode, container and HERMES_UID/GID policy live in hermes_constants (import-safe);
@@ -70,7 +71,7 @@ def format_unsupported_install_warning(method: str) -> str:
     return ""
 
 
-class InvalidUserConfigError(RuntimeError):
+class InvalidUserConfigError(RuntimeError, ConfigValidationError):
     """Raised when a run that cannot repair config finds invalid user YAML."""
 
 
@@ -2067,6 +2068,22 @@ def _omitted_config_paths(
     return omitted
 
 
+def validate_config_for_write(data: dict[str, Any]) -> None:
+    """Validate the authored candidate before ANY config bytes can be replaced.
+
+    Presets are expanded only on a disposable copy. The caller still writes its
+    raw document, never the resolved validation view. ``--force`` is not an
+    escape hatch for an unusable config.
+    """
+    from hermes_cli.model_presets import expand_model_presets
+
+    resolved = expand_model_presets(_expand_env_vars(copy.deepcopy(data)))
+    errors = [issue.message for issue in validate_config_structure(resolved)
+              if issue.severity == "error"]
+    if errors:
+        raise ConfigValidationError("; ".join(errors))
+
+
 def _write_config_state(
     config_path: Path, data: dict[str, Any], *, allow_omissions: bool,
     extra_content_on_create: Optional[str] = None,
@@ -2092,6 +2109,7 @@ def _write_config_state(
                 "Pass the complete current config, or use atomic_config_replace() only when "
                 "deletion by omission is deliberate.",
             ) from exc
+    validate_config_for_write(data)
     atomic_roundtrip_yaml_save(config_path, data, extra_content_on_create=extra_content_on_create)
 
 
@@ -2142,9 +2160,9 @@ def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
 def write_platform_config_field(
     platform_key: str, field_key: str, value: Any, *, raw: bool = False) -> None:
     """Persist one scalar field under ``platforms.<platform_key>``.
-    ``raw=True`` (CLI setup flows) edits only the user's raw file; dashboard routes use the
-    default loaded-config path to keep their profile-scoped ``load_config`` behavior."""
-    config = read_raw_config() if raw else load_config()
+    Always round-trip the profile-scoped raw document. ``raw`` is retained for
+    callers of the older setup API, but runtime expansion is never a write source."""
+    config = read_raw_config()
     platforms = _ensure_dict(config, "platforms")
     _ensure_dict(platforms, platform_key)[field_key] = value
     save_config(config)
@@ -3543,7 +3561,10 @@ def set_config_value(key: str, value: str, force: bool = False):
         user_config = _normalize_root_model_keys(user_config)
         key = "model.base_url"
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
-    _write_user_config(config_path, user_config)
+    try:
+        _write_user_config(config_path, user_config)
+    except ConfigValidationError as exc:
+        _exit_invalid(f"✗ {exc}")
 
     # Keep .env in sync: terminal_tool reads TERMINAL_ENV etc. directly from env vars.
     env_var = terminal_config_env_var_for_key(key)
