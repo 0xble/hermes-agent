@@ -64,7 +64,8 @@ from hermes_loop_guard import LoopGuardedLock, check as check_loop_thread
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
-    _watched_sqlite_sidecar_paths, has_invalid_sqlite_header_preopen, is_zeroed_state_db, quarantine_cross_process_lock,
+    _watched_sqlite_sidecar_paths, has_invalid_sqlite_header_preopen, has_valid_sqlite_header_preopen,
+    is_zeroed_state_db, quarantine_cross_process_lock,
     quarantine_invalid_state_db,
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
 )
@@ -736,9 +737,9 @@ class SessionDB(
         # still holding the profile's route would otherwise re-scaffold it on the next turn (#94590).
         mkdir_under_hermes_home(self.db_path.parent)
         try:
-            # Serialize zero-byte check, quarantine, connect and schema commit so concurrent
-            # openers don't race the absent-path -> schema-commit window.
-            if not self.db_path.exists() or has_invalid_sqlite_header_preopen(self.db_path):
+            # Only a positively observed SQLite header can bypass startup serialization.
+            # Permission repair can reveal a damaged header after an indeterminate probe.
+            if not has_valid_sqlite_header_preopen(self.db_path):
                 # The directory must be writable before the lock file can be created in it; the
                 # directory never vanishes mid-quarantine, so checking it unlocked is race-free.
                 preflight_db_writability(self.db_path, db_label="state.db", directory_only=True)

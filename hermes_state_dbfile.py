@@ -763,6 +763,12 @@ def is_zeroed_state_db(path: Path, *, probe_bytes: int = 100, force: bool = Fals
     return head is not None and not head.startswith(b"SQLite format 3") and all(b == 0 for b in head)
 
 
+def has_valid_sqlite_header_preopen(path: Path) -> bool:
+    """Require an observed SQLite header, not an unreadable or deliberately skipped probe."""
+    head = _preopen_header(path, 100, False)
+    return head is not None and head.startswith(b"SQLite format 3")
+
+
 def has_invalid_sqlite_header_preopen(path: Path, *, probe_bytes: int = 100, force: bool = False) -> bool:
     """A pre-existing state.db whose first page is not SQLite: 0-byte, NUL, or clobbered page 0
     (#102198).  Zeroed files are the subset :func:`is_zeroed_state_db` names."""
