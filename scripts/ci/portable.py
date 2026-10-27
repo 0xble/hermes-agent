@@ -98,6 +98,8 @@ def python_shard(env: dict[str, str], workers: int, index: int, count: int) -> N
 FILE_TIMEOUTS = {
     # Hosted shard runs took 179-295 s against 300 s (gate runs 37707869254, 37705343675).
     'tests/e2e/core/delivery/test_cron_virtual_clock_soak.py': 600,
+    # This sequential CLI session hit 300 s twice in hosted run 40577849470.
+    'tests/e2e/core/cli_tmux/test_classic_cli_live_session.py': 600,
 }
 
 
