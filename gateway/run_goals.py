@@ -1084,9 +1084,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             if check_paused("loop", logger):
                 return None, False, 0
             mgr = LoopManager(session_id=sid)
-            if not mgr.is_due(now):
+            state = mgr.state
+            if state is None or not mgr.is_due(now):
                 return None, False, 0
-            interval = mgr.state.interval_seconds or self_paced_floor_seconds()
+            interval = state.interval_seconds or self_paced_floor_seconds()
             return mgr, goal_blocks_loop_tick(sid), interval
 
         mgr, goal_blocks, interval = await self._run_in_executor_with_context(_due_manager)
