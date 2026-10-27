@@ -17,7 +17,7 @@ def _source(thread_id="224426"):
 
 
 @pytest.mark.asyncio
-async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
+async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path, caplog):
     """Synthetic resumes share their reply anchor but not their durable admission identity."""
     import sqlite3
 
@@ -61,12 +61,20 @@ async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
             event._agent_turn_succeeded = True
 
     adapter = _Adapter()
+    caplog.set_level("INFO", logger="gateway.run")
     scheduled = runner._schedule_resume_pending_sessions()
     assert scheduled == 2
-    await asyncio.gather(*tasks)
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+    finally:
+        await runner._get_replay_scheduler().close()
 
     with sqlite3.connect(tmp_path / "gateway-outbox.db") as db:
         admitted = sorted(row[0] for row in db.execute(
             "SELECT transport_event_id FROM admissions"
         ))
     assert admitted == ["resume:resume-0", "resume:resume-1"]
+    assert runner._restart_resume_outcomes == {entry.session_key for entry in entries}
+    outcomes = [record.args for record in caplog.records
+                if record.msg == "Restart recovery outcome: session=%s outcome=%s"]
+    assert sorted(outcomes) == sorted((entry.session_key, "resumed") for entry in entries)

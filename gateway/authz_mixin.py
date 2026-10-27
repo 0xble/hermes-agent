@@ -292,6 +292,10 @@ class GatewayAuthorizationMixin:
             return self._primary_adapters().get(platform) if platform else None
         return None
 
+    def _adapter_for_source(self, source):
+        """Return the delivery adapter that owns a session source."""
+        return self._delivery_adapter_for(source)
+
     def _delivery_adapter_for(self, source: Optional[SessionSource]):
         """The adapter that ANSWERS *source*: sends, edits, typing, progress, pickers, pending slots.
 

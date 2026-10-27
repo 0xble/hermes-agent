@@ -1252,13 +1252,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Persist the gateway drain start on every nonterminal API run."""
         return _api_runs._mark_shutdown_requested(self)
 
-    @staticmethod
-    def _gateway_is_draining() -> bool:
+    def _gateway_is_draining(self) -> bool:
         """Whether the owning gateway currently refuses new agent turns."""
         try:
             from gateway.platforms.api_server_fire_startup import runner_is_draining
-            from gateway.run import _gateway_runner_ref
-            runner = _gateway_runner_ref()
+            runner = self.gateway_runner
+            if runner is None:
+                from gateway.run import _gateway_runner_ref
+                runner = _gateway_runner_ref()
             return bool(runner) and runner_is_draining(runner)
         except Exception:
             return False

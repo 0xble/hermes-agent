@@ -13,6 +13,7 @@ import time
 import pytest
 
 from tools import async_delegation as ad
+from tools import async_delegation_completion as execution_checkpoints
 from tools import delegation_resume as dr
 
 
@@ -327,7 +328,7 @@ def _orphan(delegation_id):
 def test_lost_owner_after_single_child_durably_completed_is_not_rerun(monkeypatch):
     did = _dispatch("deleg_done_then_owner_died")
     _orphan(did)
-    ad.record_unit_child(did, {"task_index": 0, "status": "completed", "summary": "model rebuilt", "error": None})
+    execution_checkpoints.record_unit_child(did, {"task_index": 0, "status": "completed", "summary": "model rebuilt", "error": None})
     monkeypatch.setattr(ad, "_owner_liveness", lambda: (lambda pid, started: False))
     assert ad.recover_abandoned_delegations() == 1
     row = _row(did)
@@ -341,7 +342,7 @@ def test_lost_owner_after_single_child_durably_completed_is_not_rerun(monkeypatc
 def test_recovered_completion_with_dropped_delivery_still_reaches_the_user(monkeypatch):
     did = _dispatch("deleg_recovered_then_dropped")
     _orphan(did)
-    ad.record_unit_child(did, {"task_index": 0, "status": "completed", "summary": "model rebuilt", "error": None})
+    execution_checkpoints.record_unit_child(did, {"task_index": 0, "status": "completed", "summary": "model rebuilt", "error": None})
     monkeypatch.setattr(ad, "_owner_liveness", lambda: (lambda pid, started: False))
     assert ad.recover_abandoned_delegations() == 1
     assert dr.schedule_retry(did, now=T0 + 120) is None
@@ -404,12 +405,16 @@ def test_queued_user_cancel_keeps_its_trusted_stop_reason():
     assert _row(did)["retry_state"] == "none"
 
 
-def test_successful_result_with_dropped_delivery_still_reaches_the_user():
+@pytest.mark.parametrize("sealed", [False, True])
+def test_successful_result_with_dropped_delivery_still_reaches_the_user(sealed):
     did = _dispatch("deleg_done_dropped")
     _terminal(did, "completed", results=[{"task_index": 0, "status": "completed", "summary": "done"}])
     assert dr.schedule_retry(did, now=T0 + 120) is None
     assert dr.sweep_retries(now=T0 + 130) == []  # delivered: nothing owed
     with ad._DB_LOCK, ad._transaction() as conn:
+        if sealed:
+            conn.execute("UPDATE async_delegations SET task_json=json_set(task_json, '$.execution_sealed_at', ?) "
+                         "WHERE delegation_id=?", (T0 + 131, did))
         conn.execute("UPDATE async_delegations SET delivery_state='dropped' WHERE delegation_id=?", (did,))
     (action,) = dr.sweep_retries(now=T0 + 140)
     assert action["kind"] == "terminal"

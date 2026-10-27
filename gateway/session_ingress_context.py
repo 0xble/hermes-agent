@@ -84,6 +84,9 @@ def carry_callback(event, rewritten):
     """Gateway code that rebuilds a callback's event (a ``pre_gateway_dispatch`` rewrite, the
     ``/retry`` re-send) keeps the callback's provenance, but only on the source object the callback
     authenticated: a new event with a swapped source carries nothing (#139045, #139040)."""
+    from gateway.session_synthetic import is_synthetic, mark_synthetic
+    if rewritten.source is event.source and is_synthetic(event):
+        mark_synthetic(rewritten)
     for bound_var in (_callback, _relay_callback):
         bound = bound_var.get()
         if bound is not None and bound[1] is event and rewritten.source is event.source:

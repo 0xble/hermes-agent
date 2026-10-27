@@ -584,9 +584,10 @@ class GatewayAgentCacheMixin:
             role = await asyncio.to_thread(self.session_store.get_model_role, session_key)
             if role:
                 await self._set_session_model_role_locked(session_key, None)
-        self._clear_conversation_scope(session_key, reason=reason)
+        self._clear_conversation_scope(session_key, reason=reason, persist_yolo=False)
+        await asyncio.to_thread(self._persist_boundary_yolo_clear, session_key)
 
-    def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
+    def _clear_conversation_scope(self, session_key: str, *, reason: str, persist_yolo: bool = True) -> None:
         """THE single conversation-boundary funnel (/new, /resume, suspension replacement,
         compression-exhausted reset). New conversation-scoped dicts go in _CONVERSATION_SCOPED_STATE
         so every boundary picks them up. Turn-scoped state (_running_agents/_ts, slot leases, turn-
@@ -618,11 +619,14 @@ class GatewayAgentCacheMixin:
             store = getattr(self, attr, None)
             if isinstance(store, dict):
                 store.pop(session_key, None)
-        self._clear_session_boundary_security_state(session_key)
+        self._clear_session_boundary_security_state(session_key, persist_yolo=persist_yolo)
         logger.debug("Cleared conversation scope for %s (%s)", session_key, reason)
 
-    def _clear_session_boundary_security_state(self, session_key: str) -> None:
-        """Clear per-session control state that must not survive a boundary switch."""
+    def _clear_session_boundary_security_state(self, session_key: str, *, persist_yolo: bool = True) -> None:
+        """Clear per-session control state that must not survive a boundary switch.
+
+        Loop callers pass ``persist_yolo=False`` and await :meth:`_persist_boundary_yolo_clear` in a
+        thread: it takes the session-store lock, which a turn worker holds across state.db writes."""
         if not session_key:
             return
         pending_skills_reload_notes = getattr(self, "_pending_skills_reload_notes", None)
@@ -643,6 +647,10 @@ class GatewayAgentCacheMixin:
                 clear(session_key)
             except Exception as e:
                 logger.debug("Failed to clear %s state for session boundary %s: %s", what, session_key, e)
+        if persist_yolo:
+            self._persist_boundary_yolo_clear(session_key)
+
+    def _persist_boundary_yolo_clear(self, session_key: str) -> None:
         # The persisted /yolo copy dies with the in-memory one, or the next turn's restore revives it. None, not
         # False: the next conversation follows its launch policy again (seeded once per boundary), and a
         # toggle-less chat stays off.

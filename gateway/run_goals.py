@@ -207,12 +207,15 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if getattr(source, "message_id", None):
             from gateway.session_identity import replace_source
             source = replace_source(source, message_id=None)
-        return MessageEvent(
+        event = MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
             reply_expected=reply_expected,
             metadata=metadata,
             inherit_channel_pin=True,
         )
+        from gateway.session_synthetic import mark_synthetic
+        mark_synthetic(event)
+        return event
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""
@@ -413,6 +416,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
+        from agent.notice_style import notice_metadata
+        metadata = notice_metadata(metadata, platform=source.platform, style=getattr(message, "notice_style", None))
         from gateway.platforms.base import outbound_class
         try:
             with outbound_class(_goal_notice_outbound_class(message, notice_kind)):
@@ -603,8 +608,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             if mgr is None:
                 return
             try:
+                from agent.notice_style import ContextNotice
                 await self._send_goal_status_notice(
-                    source, f"▶ Goal resumed: {mgr.state.goal}", notice_kind="resumed",
+                    source, ContextNotice(f"▶ Goal resumed: {mgr.state.goal}"), notice_kind="resumed",
                 )
             except Exception as exc:
                 logger.debug("goal recovery notice failed: %s", exc)

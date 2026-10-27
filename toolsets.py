@@ -21,7 +21,7 @@ _HERMES_CORE_TOOLS = [
     "browser_vault",  # rides with the browser; deferred by default (tools.tool_search.defer)
     "browser_vault_list",  # explicit list surface retained for browser toolset discovery
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
-    "text_to_speech",
+    "text_to_speech", "react",
     "todo_list", "memory", "compact_context",
     "session_search",
     "clarify",
@@ -138,6 +138,7 @@ TOOLSETS = {
     # GUI-renderer affordances, enabled per desktop-sourced SESSION by the GUI
     # gateway (tui_gateway/server.py::_load_enabled_toolsets) — never by a
     # process env var, which is blind to a desktop client on a remote backend.
+    "reactions": _ts("React to the triggering messaging-platform message or a desktop message", ["react"]),
     "desktop_ui": _ts(
         "Desktop GUI affordances — in-app terminal/browser panes, pane focus, "
         "reactions, appearance (GUI sessions only)",
@@ -472,6 +473,20 @@ def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[
     """*disabled* plus every platform-gated toolset a session on *platform* does not get. An agent stores
     this as its ``disabled_toolsets``, so the tool list, the tool_search listing and bridge, MCP refreshes
     and delegate children (which inherit it) all subtract the gated tools in ``_select_tool_names``."""
+    from gateway.config import Platform
+    from gateway.platform_registry import platform_registry
+
+    # Tool selection must not discover manifests (notably in safe mode). Gateway
+    # sources already have a resolved enum identity or a registered adapter.
+    name = str(getattr(platform, "value", platform) or "").strip().lower()
+    is_gateway = name != Platform.LOCAL.value and (
+        name in {member.value for member in Platform.__members__.values()}
+        or platform_registry.is_registered(name)
+    )
+    if not is_gateway:
+        from tools.react_tool import check_react_requirements
+        if not check_react_requirements():
+            disabled = [*(disabled or ()), "reactions"]
     gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items()
              if platform not in platforms and name not in (disabled or ())]
     return [*(disabled or ()), *gated] if gated else disabled

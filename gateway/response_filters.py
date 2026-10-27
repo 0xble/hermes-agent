@@ -507,9 +507,18 @@ def is_autonomous_silence_response(response: Any) -> bool:
     )
 
 
+def reaction_answered(agent_result: dict | None) -> bool:
+    """A delivered reaction answers a completed turn, never hides an execution failure."""
+    return bool(isinstance(agent_result, dict) and agent_result.get("acknowledged_by_reaction")
+                and not any(agent_result.get(key) for key in ("failed", "partial", "interrupted", "error"))
+                and agent_result.get("completed") is not False)
+
+
 def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
-    """Silence markers suppress delivery only for successful agent turns."""
-    return isinstance(agent_result, dict) and not agent_result.get("failed") and is_intentional_silence_response(response)
+    """Silence markers or reaction-only replies suppress successful turn delivery."""
+    return isinstance(agent_result, dict) and not agent_result.get("failed") and (
+        is_intentional_silence_response(response)
+        or (reaction_answered(agent_result) and not (response or "").strip()))
 
 
 def display_kind_for_event(event: Any) -> str | None:

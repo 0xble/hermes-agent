@@ -24,6 +24,7 @@ from gateway.attended_model import (
     format_attended_switch_back_notice, format_attended_switch_notice, parse_attended_config,
 )
 from gateway.config import Platform
+from agent.notice_style import notice_metadata
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typing_after_prompt, typing_metadata_for_source
@@ -82,21 +83,6 @@ _LEDGER_PASSTHROUGH_KEYS = (
     "estimated_cost_usd", "cost_status", "cost_source", "cache_read_tokens", "cache_write_tokens",
     "reasoning_tokens", "total_tokens", "provider", "turn_exit_reason", "service_tier",
 )
-
-
-def _settle_api_runtime_lock(agent, result, captured):
-    """Settle a confirmed API runtime lock against the runtime that served the turn."""
-    from gateway.session_api_turn import api_runtime_locked
-    api = api_runtime_locked()
-    if api is None or not isinstance(result, dict):
-        return
-    settings = api["settings"]
-    try:
-        captured["usage"]["runtime"] = api["adapter"]._turn_runtime_metadata(
-            agent, route=settings.get("route"), requested_runtime=settings.get("requested_runtime"),
-            route_source=settings.get("route_source") or "", confirmed_runtime_lock=True)
-    except RuntimeError as exc:
-        result.update(final_response="", failed=True, completed=False, error=str(exc))
 
 
 def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
@@ -553,10 +539,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             return
 
         def present() -> None:
-            self._schedule(
-                self._runner._deliver_platform_notice(ctx.source, message),
-                "attended notice delivery scheduling error",
-            )
+            self._schedule(self._runner._deliver_platform_notice(ctx.source, message, notice_style="context"),
+                           "attended notice delivery scheduling error")
 
         render_notification(
             present,
@@ -585,7 +569,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
                                                           "text": prepared})
                 return
             self._schedule(
-                self._status_delivery.send(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
+                self._status_delivery.send(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, notice_metadata(
+                    ctx._status_thread_metadata, platform=ctx.source.platform, style=getattr(message, "notice_style", None))),
                 f"status_callback ({event_type}) scheduling error",
             )
         render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
@@ -875,7 +860,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
                 logger.debug("render_notice_line failed", exc_info=True)
                 return
             if line:
-                self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line), "notice_callback delivery scheduling error")
+                self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line, notice_style=getattr(notice, "notice_style", None)), "notice_callback delivery scheduling error")
         render_notification(present, platform=self._ctx.source.platform,
                             user_config=self._ctx.user_config, diagnostic=diagnostic)
 
@@ -901,7 +886,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             if self._status_live():
                 self._send_status_text(
                     message,
-                    _interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
+                    notice_metadata(_interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)), platform=ctx.source.platform, style="context"),
                     "background_review_callback scheduling error",
                 )
 
@@ -1719,18 +1704,23 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             if persist_id is not None:
                 kwargs["persist_user_platform_id"] = str(persist_id)
             from agent.notification_presentation import notification_turn
+            from gateway.session_context import (
+                current_message_reaction_acknowledged, reaction_acknowledgement, scoped_turn_message,
+            )
             from gateway.session_results import execution_result
             captured = execution_result.get()
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx):
+            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx), scoped_turn_message(ctx.source, ctx.inbound_message_id or getattr(ctx.source, "message_id", None)), reaction_acknowledgement():
                 result = agent.run_conversation(api_message, **kwargs)
+                result["acknowledged_by_reaction"] = current_message_reaction_acknowledged()
             if captured is not None:
                 incoming = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
                 outgoing = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
                 captured['usage'] = {'input_tokens': incoming, 'output_tokens': outgoing,
                                      'total_tokens': incoming + outgoing}
-                _settle_api_runtime_lock(agent, result, captured)
+                from gateway.session_api_turn import settle_api_runtime_lock
+                settle_api_runtime_lock(agent, result, captured)
             return result
         finally:
             unregister_gateway_notify(session_key)
@@ -2110,6 +2100,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "recovered_reply": result.get("recovered_reply", False),
+            "acknowledged_by_reaction": result.get("acknowledged_by_reaction", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
             # The returned `messages` replaced the transcript, so a stored receipt keeps it whole.

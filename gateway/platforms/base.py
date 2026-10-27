@@ -29,6 +29,8 @@ from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _sh
 from gateway.copy_blocks import (
     protect_inline_copy_bodies, restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
 
+from gateway.platforms.reaction_lifecycle import reaction_operation
+
 logger = logging.getLogger(__name__)
 
 
@@ -1843,11 +1845,18 @@ class CommandReply(str):
     """Gateway-authored reply (slash-command output), not agent output. Bare local paths in it
     stay text: a goal or title that names ``~/plan.md`` must not upload that file. Explicit
     ``MEDIA:`` tags still deliver."""
+    notice_style: Optional[str] = None
 
 
 def as_command_reply(value: Any) -> Any:
     """Mark a plain-string handler result as :class:`CommandReply`; other values pass through."""
-    return CommandReply(value) if type(value) is str else value
+    if isinstance(value, CommandReply):
+        return value
+    if type(value) is str or (isinstance(value, str) and getattr(value, "notice_style", None) == "context"):
+        reply = CommandReply(value)
+        reply.notice_style = getattr(value, "notice_style", None)
+        return reply
+    return value
 
 
 class EphemeralReply(CommandReply):
@@ -1860,6 +1869,7 @@ class EphemeralReply(CommandReply):
     def __new__(cls, text: str, ttl_seconds: Optional[int] = None):
         instance = super().__new__(cls, text)
         instance.ttl_seconds = ttl_seconds
+        instance.notice_style = getattr(text, "notice_style", None)
         return instance
 
     @property
@@ -2962,6 +2972,15 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         when content is unchanged."""
         return SendResult(success=False, error="Not supported")
 
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        """Add an explicit reaction, returning False if unsupported or delivery fails.
+
+        ``routing`` carries platform context such as team_id, thread_id and user_id
+        (the target author on Signal). Explicit reactions are independent of the
+        automatic processing-status reaction setting and do not mark a turn answered.
+        """
+        return False
+
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a sent message; True on success (platforms without a deletion API return False and
         callers leave it). Used by the stream consumer's fresh-final cleanup to remove stale
@@ -3831,19 +3850,23 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         platform replaces or stacks a sender's reactions. CANCELLED leaves it unreacted."""
         if self._OK_EMOJI is None and self._FAIL_EMOJI is None:
             return
-        add: Any = getattr(self, "_add_reaction", None)
-        remove: Any = getattr(self, "_remove_reaction", None)
-        enabled = getattr(self, "_reactions_enabled", None)
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
-        if (not callable(add) or not callable(remove) or (callable(enabled) and not enabled())
-                or not chat_id or not message_id):
+        if not (chat_id and message_id):
             return
-        await remove(chat_id, message_id)
-        emoji = {ProcessingOutcome.SUCCESS: self._OK_EMOJI,
-                 ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
-        if emoji:
-            await add(chat_id, message_id, emoji)
+        async with reaction_operation(self, chat_id, message_id, complete=True, event=event) as state:
+            if state.explicit:
+                return
+            add: Any = getattr(self, "_add_reaction", None)
+            remove: Any = getattr(self, "_remove_reaction", None)
+            enabled = getattr(self, "_reactions_enabled", None)
+            if not callable(add) or not callable(remove) or (callable(enabled) and not enabled()):
+                return
+            await remove(chat_id, message_id)
+            emoji = {ProcessingOutcome.SUCCESS: self._OK_EMOJI,
+                     ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
+            if emoji:
+                await add(chat_id, message_id, emoji)
 
     def _shared_burst_pending(self, event: MessageEvent, session_key: str) -> bool:
         from gateway.session_ingress_burst import holds_busy_burst
@@ -3894,7 +3917,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             ttl = _or_default(lambda: int(self._get_ephemeral_system_ttl_default()), 0, Exception)
         if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
             ttl = 0
-        return response.text, int(ttl or 0)
+        text = response.text
+        if response.notice_style is not None:
+            text = as_command_reply(text)
+            text.notice_style = response.notice_style
+        return text, int(ttl or 0)
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and
@@ -3986,6 +4013,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
+        from agent.notice_style import notice_metadata
+        metadata = notice_metadata(metadata, platform=self.platform, style=getattr(content, "notice_style", None))
         result = await self._send_with_retry_body(
             chat_id, content, reply_to=reply_to, metadata=metadata,
             max_retries=max_retries, base_delay=base_delay)
@@ -5393,7 +5422,10 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                from agent.notice_style import notice_metadata
+                _final_thread_metadata = notice_metadata(
+                    _mark_notify_metadata(_thread_metadata), platform=self.platform,
+                    style=getattr(response, "notice_style", None))
                 _tts_paths, _tts_requested_path = [], None
                 _spoken_text = self._spoken_reply_text(extracted)
                 if self._wants_auto_tts(

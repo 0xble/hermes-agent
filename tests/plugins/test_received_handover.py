@@ -235,7 +235,7 @@ async def test_failed_sibling_restores_all_served_pollers(failure, monkeypatch, 
         runner.stop.assert_not_called()
     finally:
         # Lock I/O is confined to the test's own rendezvous directory.
-        from gateway.status import release_scoped_lock
+        from gateway.status_scoped_locks import release_scoped_lock
         for name in ("first", "second"):
             release_scoped_lock("telegram", name)
 
@@ -541,8 +541,8 @@ async def test_failed_popped_batch_cannot_report_successful_idle(kind, failure, 
     adapter.handle_message = fail_dispatch
     await _enqueue(adapter, kind, event)
     await _ready(popped)
-    batches = [*adapter._pending_text_batch_tasks.values(), *adapter._pending_photo_batch_tasks.values(),
-               *adapter._media_group_tasks.values()]
+    batches = list(adapter._committed_flush_tasks.values())
+    assert len(batches) == 1
     request_handover(runner, asyncio.get_running_loop())
     try:
         if failure == "cancel":
@@ -580,7 +580,8 @@ async def test_pending_ptb_stop_owns_token_until_reconnect_can_start(failure, se
     import time
 
     from telegram.ext import Updater
-    from gateway.status import _get_scope_lock_path, _read_json_file, release_scoped_lock
+    from gateway.status import _get_scope_lock_path, _read_json_file
+    from gateway.status_scoped_locks import release_scoped_lock
 
     runner = _runner(monkeypatch, tmp_path)
     monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
@@ -701,10 +702,11 @@ async def test_pending_ptb_stop_owns_token_until_reconnect_can_start(failure, se
             # pytest is intentionally not a gateway command. Identify this known
             # test owner only; PID/start-time checks and lock I/O remain real.
             "import gateway.status as s; import json,os; "
+            "from gateway.status_scoped_locks import release_scoped_lock; "
             "s._looks_like_gateway_process=lambda pid: pid==os.getppid(); "
             "ok,_=s.acquire_scoped_lock('telegram','retirement-test',metadata={'nonce':'foreign'}); "
             "print(json.dumps(ok)); "
-            "s.release_scoped_lock('telegram','retirement-test') if ok else None",
+            "release_scoped_lock('telegram','retirement-test') if ok else None",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), 5)

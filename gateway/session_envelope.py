@@ -65,13 +65,19 @@ def _adapter_event(event, **changes):
     """An adapter's event at the envelope boundary: an absent media list (``None``) is no media.
     Any other non-list still reaches ``_validate_native`` and refuses."""
     changes.update({name: [] for name in _MEDIA_FIELDS if getattr(event, name) is None})
-    return replace(event, **changes) if changes else event
+    projected = replace(event, **changes) if changes else event
+    from gateway.session_synthetic import is_synthetic, mark_synthetic
+    if is_synthetic(event):
+        mark_synthetic(projected)
+    return projected
 
 
 def _refuse(event, reason, clause):
     """Name the refused clause in gateway.log and on the error; the wire reason stays stable."""
     source = event.source
-    logger.warning('Native admission refused: %s (%s) platform=%s chat=%s message=%s', reason, clause,
+    from gateway.session_refusals import internal_input
+    log = logger.debug if internal_input(event) else logger.warning
+    log('Native admission refused: %s (%s) platform=%s chat=%s message=%s', reason, clause,
                    getattr(getattr(source, 'platform', None), 'value', None), getattr(source, 'chat_id', None),
                    event.message_id)
     raise RuntimeStoreError(reason, field=clause)
@@ -123,6 +129,21 @@ def _event_clause(runner, event, provenance, fresh_roles):
 
 
 def _validate_native(runner, event, provenance=None, fresh_roles=False):
+    from gateway.session_synthetic import is_synthetic
+    if is_synthetic(event):
+        if type(event.internal) is not bool:
+            _refuse(event, 'invalid_params', 'internal')
+        if not isinstance(event.metadata, dict):
+            _refuse(event, 'invalid_params', 'metadata')
+        try:
+            json.dumps(event.metadata, allow_nan=False)
+        except (TypeError, ValueError):
+            _refuse(event, 'invalid_params', 'metadata')
+        # Validate source/auth/content normally. Only the private producer capability may move
+        # internal semantics and routing metadata into the synthetic envelope descriptor.
+        from gateway.session_synthetic import mark_synthetic
+        event = replace(event, internal=False, metadata={})
+        mark_synthetic(event)
     source = event.source
     if (clause := _event_clause(runner, event, provenance, fresh_roles)) is not None:
         _refuse(event, 'invalid_params', clause)
@@ -232,7 +253,10 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
                               if getattr(event, name) is not None})
     if event.inherit_channel_pin is True:  # synthetic goal/resume turn reuses the session's pins (#126109)
         envelope['event']['inherit_channel_pin'] = True
-    if metadata := _native_metadata(event):
+    from gateway.session_synthetic import project_synthetic
+    if synthetic := project_synthetic(event):
+        envelope['synthetic'] = synthetic
+    elif metadata := _native_metadata(event):
         envelope['event']['metadata'] = metadata
     # COMMAND that passed admission is path text (``/Users/x is broken``): replay it as text.
     if event.message_type not in (MessageType.TEXT, MessageType.COMMAND):
@@ -288,6 +312,9 @@ def restore_native(payload, runner=None):
                         message_type=MessageType(envelope.get('message_type', 'text')),
                         media_urls=restore_native_media(envelope.get('media', [])),
                         **deepcopy(envelope['event']))
+    if 'synthetic' in envelope:
+        from gateway.session_synthetic import restore_synthetic
+        restore_synthetic(event, envelope['synthetic'])
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):
@@ -297,6 +324,8 @@ def restore_native(payload, runner=None):
         from gateway.session_automation import automation_display_metadata, automation_notification_metadata
         event.metadata.update(automation_notification_metadata(envelope['automation']))
         event.metadata.update(automation_display_metadata(envelope['automation']))
+        from gateway.session_automation import automation_retry_metadata
+        event.metadata.update(automation_retry_metadata(envelope['automation']))
     return event
 
 

@@ -30,10 +30,10 @@ from agent.message_sanitization import (
 from agent.thinking_timeout_guidance import build_thinking_timeout_guidance, is_thinking_timeout
 from agent.vision_message_prep import _provider_model_key
 from agent.turn_failure_copy import (
-    CONTENT_POLICY_NEXT_STEPS, content_policy_copy, exhausted_copy, limit_reset_copy, nonretryable_copy,
-    provider_label_for, site_copy, stamp_failure,
+    CONTENT_POLICY_NEXT_STEPS, content_policy_copy, exhausted_copy, limit_reset_copy, nonretryable_copy, provider_label_for, site_copy, stamp_failure,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.notice_style import ContextNotice
 from agent.turn_recovery_codex import _is_codex_token_expired, _recover_stale_codex_reasoning
 from hermes_constants import display_hermes_home
 from utils import base_url_host_matches
@@ -1485,7 +1485,7 @@ def compute_error_backoff(
         # A 5xx Retry-After can reach the cap; buffering it would leave the user silent for minutes.
         _announce_now = _retry_after is not None and _retry_after > LIVE_RETRY_WAIT_CAP_S
     if _announce_now:
-        agent._emit_diagnostic_status(_status)
+        agent._emit_diagnostic_status(ContextNotice(_status))
     else:
         agent._buffer_diagnostic_status(_status)
     # The buffered line replays only if every retry fails; the live status line is transient

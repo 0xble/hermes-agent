@@ -211,11 +211,12 @@ class GatewaySessionControlsMixin:
 
         metadata = dict(self._thread_metadata_for_source(source) or {})
         metadata["session_control_request_id"] = request_id
+        from agent.notice_style import notice_metadata
+        message = self._control_notice(record)
+        metadata = notice_metadata(metadata, platform=source.platform, style=getattr(message, "notice_style", None))
         from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
         with outbound_class(OUTBOUND_NOTICE):
-            result = await adapter.send(
-                source.chat_id, self._control_notice(record), metadata=metadata
-            )
+            result = await adapter.send(source.chat_id, message, metadata=metadata)
         if _send_succeeded(result):
             return await self._mark_and_finish(
                 session_controls, record, "target_notice_sent"
@@ -463,10 +464,16 @@ class GatewaySessionControlsMixin:
         }.get(action, action)
         change = (f"\n{cls._change_text(record)}"
                   if action == "replace" and record.get("affected_text") else "")
+        from agent.notice_style import ContextNotice
+        # Only committed no-action control outcomes opt in. Pending, pause and failures stay full.
+        receipt = ContextNotice if status == "applied" and (kind, action) in {
+            ("goal", "replace"), ("goal", "resume"), ("goal", "clear"),
+            ("loop", "resume"), ("loop", "stop"),
+        } else str
         authority = record.get("authority") or {}
         if authority.get("via") == "session":
             session_id = cls._clip(str(authority.get("session_id") or requester_id), 120)
-            return (
+            return receipt(
                 f"⊘ {kind.title()} {verb} by {requester} "
                 f"(applied by session {session_id} without approval){change}"
             )
@@ -475,9 +482,9 @@ class GatewaySessionControlsMixin:
             full = (f"\nFull message: \"{cls._clip(message, 1200)}\""
                     if message and message != quote else "")
             quote = cls._clip(quote, 300)
-            return f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\"){change}{full}"
+            return receipt(f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\"){change}{full}")
         how, _ = cls._approval_notice(authority)
-        return f"⊘ {kind.title()} {verb} by {requester} ({how}){change}"
+        return receipt(f"⊘ {kind.title()} {verb} by {requester} ({how}){change}")
 
     @classmethod
     def _requester_notice(cls, record: dict) -> str:

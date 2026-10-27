@@ -2388,7 +2388,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         # silent; any other human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
-        if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
+        from gateway.response_filters import reaction_answered
+        if _intentional_silence and not (reaction_answered(agent_result) or silence_allowed(_silence_kind, _silence_reply_expected)):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
@@ -3671,7 +3672,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 images, text_content = adapter.extract_images(response)
                 text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
+                content = header + text_content
+                if source.platform == Platform.SLACK and not (result or {}).get("error"):
+                    from agent.notice_style import notice_metadata
+                    await adapter.send(chat_id=source.chat_id, content=header,
+                                       metadata=notice_metadata(_thread_metadata, platform=source.platform, style="context"))
+                    content = text_content
+                await adapter.send(chat_id=source.chat_id, content=content, metadata=_thread_metadata)
             for copy_block in copy_blocks:
                 copy_metadata = dict(_thread_metadata or {})
                 copy_metadata["copy_block"] = True
@@ -4985,7 +4992,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # Runtime provenance describes the continuation row, not the original human's silence
             # contract. A queued successor must not make the retry's second marker silently legal.
             silence_kind = None if getattr(turn_ctx, "silence_retry", False) else turn_ctx.persist_user_display_kind
-            if silence_allowed(silence_kind, turn_ctx.reply_expected):
+            from gateway.response_filters import reaction_answered
+            if reaction_answered(_delivery_result) or silence_allowed(silence_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",

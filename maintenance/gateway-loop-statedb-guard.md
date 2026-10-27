@@ -80,6 +80,11 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
 - Each write's replaced/WAL-generation probe (stat of state.db and its sidecars, header pread)
   first runs lock-free; only a doubtful result runs the authoritative probe under `self._lock`
   (#105567's close race stays inside). 11:52: the lock holder sat in a kernel-stalled stat().
+- Conversation boundaries clear the persisted `/yolo` off the loop: the async funnel
+  (`_clear_conversation_scope_locked_async`) and `/branch` clear memory on the loop and await
+  `_persist_boundary_yolo_clear` in a thread. Codex app-server hygiene records its failure
+  cooldown and resets its streak through `asyncio.to_thread`. Found by arming the guard on every
+  test event loop (2026-10-26).
 - A full routing-index save (`replace_gateway_routing_entries`) writes only the difference,
   with unchanged full-replace semantics; it used to rewrite every row of the scope per update.
   The diff runs inside SQLite (two statements over one `json_each` parameter), never as rows

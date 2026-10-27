@@ -79,12 +79,22 @@ _ROUTES: list[tuple[str, str, str]] = [
 ]
 _COMPILED = [(m, re.compile(f"^{p}$"), n) for m, p, n in _ROUTES]
 
+# The fake has no implicit throttle. Advertise available capacity as Discord does:
+# without headers discord.py assumes a 1-token bucket and refreshes after every
+# request. Cancelling progress during that refresh strands the bucket until the
+# SDK's 30-second recovery wait, preventing the final reply from reaching us.
+_RATE_LIMIT_HEADERS = {
+    "X-RateLimit-Limit": "1000",
+    "X-RateLimit-Remaining": "999",
+    "X-RateLimit-Reset-After": "1",
+}
+
 
 def _json(obj: Any, status: int = 200, headers: Optional[dict[str, str]] = None) -> web.Response:
     """Discord answers ``Content-Type: application/json`` exactly; discord.py's ``json_or_text`` compares
     the header verbatim, so aiohttp's ``json_response`` (``; charset=utf-8``) would arrive as a str."""
     return web.Response(body=json.dumps(obj).encode(), status=status,
-                        headers={"Content-Type": "application/json", **(headers or {})})
+                        headers={"Content-Type": "application/json", **_RATE_LIMIT_HEADERS, **(headers or {})})
 
 
 def _iso(ts: Optional[float] = None) -> str:
@@ -254,7 +264,7 @@ class DiscordStandin(StandinServer):
             return _json(body, status=500)
         self.record(name, params, result, faulted=status >= 400)
         if status == 204:
-            return web.Response(status=204)
+            return web.Response(status=204, headers=_RATE_LIMIT_HEADERS)
         return _json(result, status=status)
 
     # REST handlers: each returns (status, json) -------------------------------------------------

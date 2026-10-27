@@ -29,6 +29,9 @@ adapter state — so it is trivially unit-testable.
 from __future__ import annotations
 
 import re
+
+from .rich_media import (RICH_BLOCK_SANITIZERS, emit_presentation, fenced_block,
+                         presentation_line, record_native_images, sanitize_section_accessory)
 from typing import Any, Dict, List, Optional, Tuple
 
 # Slack Block Kit hard limits (https://docs.slack.dev/reference/block-kit/blocks)
@@ -378,13 +381,17 @@ def _render_table(rows: list[str]) -> str:
 # ----------------------------------------------------------------------------
 
 
-def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
+def render_blocks(
+    markdown: str, mrkdwn_fn=None, *, native_image_lines: Optional[set[int]] = None
+) -> Optional[list[Block]]:
     """Convert agent markdown to a Slack Block Kit ``blocks`` list.
     Args:
         markdown: The agent's response text (standard markdown).
         mrkdwn_fn: Optional callable converting a markdown paragraph to Slack
             mrkdwn for ``section`` blocks (the adapter passes
             ``format_message``).  When ``None``, the raw paragraph text is used.
+        native_image_lines: Optional output set of zero-based source lines whose
+            image occurrence was emitted natively. Populated only on success.
 
     Returns:
         A list of Block Kit block dicts, or ``None`` when the content is empty,
@@ -396,6 +403,7 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
 
     try:
         blocks: list[Block] = []
+        image_lines: set[int] = set()
         lines = markdown.replace("\r\n", "\n").split("\n")
         i = 0
         n = len(lines)
@@ -416,6 +424,12 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
         while i < n:
             line = lines[i]
 
+            special = presentation_line(line, fmt)
+            if special:
+                emit_presentation(blocks, special, line, bool(para), flush_para, image_lines, i)
+                i += 1
+                continue
+
             # Blank line: paragraph boundary
             if not line.strip():
                 flush_para()
@@ -433,7 +447,8 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
                     body.append(lines[i])
                     i += 1
                 i += 1  # consume closing fence
-                blocks.append(_preformatted_block("\n".join(body)))
+                text = "\n".join(body)
+                blocks.append(fenced_block(fence.group(2), text, fmt, _preformatted_block))
                 continue
 
             # Horizontal rule → divider
@@ -466,10 +481,7 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
                 # Prefer a native Block Kit table; fall back to aligned
                 # monospace when it exceeds Slack's table limits or won't parse.
                 table = _table_block(trows, sep_line)
-                if table is not None:
-                    blocks.append(table)
-                else:
-                    blocks.append(_preformatted_block(_render_table(trows)))
+                blocks.append(table if table is not None else _preformatted_block(_render_table(trows)))
                 continue
 
             # Blockquote group
@@ -551,6 +563,7 @@ def render_blocks(markdown: str, mrkdwn_fn=None) -> Optional[list[Block]]:
             # Too structurally complex to express safely — let the caller fall
             # back to plain text rather than truncating and losing content.
             return None
+        record_native_images(native_image_lines, image_lines)
         return blocks
     except Exception:
         # Never let a rendering bug drop a message.
@@ -639,7 +652,12 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
                 continue
             btype = block["type"]
 
-            if btype == "section":
+            if btype in RICH_BLOCK_SANITIZERS:
+                block = RICH_BLOCK_SANITIZERS[btype](block)
+                if not block:
+                    continue
+            elif btype == "section":
+                block = sanitize_section_accessory(block)
                 text_obj = block.get("text")
                 has_body = bool(block.get("fields")) or bool(block.get("accessory"))
                 if isinstance(text_obj, dict):
@@ -662,20 +680,6 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
                 if clamped is not text_obj:
                     block = dict(block)
                     block["text"] = clamped
-            elif btype == "context":
-                elements = block.get("elements") or []
-                if not elements:
-                    continue
-                clamped_els = [
-                    _clamp_text_obj(el, MAX_SECTION_TEXT)
-                    if isinstance(el, dict)
-                    and el.get("type") in ("mrkdwn", "plain_text")
-                    else el
-                    for el in elements
-                ]
-                if any(c is not e for c, e in zip(clamped_els, elements)):
-                    block = dict(block)
-                    block["elements"] = clamped_els
             elif btype in ("rich_text", "actions", "context_actions"):
                 if not block.get("elements"):
                     continue
