@@ -1,6 +1,7 @@
 """Receipt-to-confirmed-text logs do not borrow another message's clock."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +42,22 @@ def event(adapter, message_id, thread_id=None):
     source = adapter.build_source(chat_id="chat", user_id="human")
     source.thread_id = thread_id
     return MessageEvent(text="question", source=source, message_id=message_id)
+
+
+@pytest.mark.parametrize("identified", [False, True])
+def test_receipt_accepts_events_without_optional_transport_identifiers(caplog, identified):
+    caplog.set_level("INFO", logger="gateway.reply_latency")
+    source = SimpleNamespace(platform=Platform.TELEGRAM, chat_id="chat")
+    incoming = SimpleNamespace(text="question", source=source, internal=False)
+    if identified:
+        incoming.message_id = source.thread_id = 0
+    receipt = record_received(incoming)
+    assert receipt is not None
+    assert record_received(incoming) is receipt
+    assert receipt.identity["message_id"] == ("0" if identified else None)
+    assert receipt.identity["thread_id"] == ("0" if identified else None)
+    assert receipt.identity["turn_id"] == ("chat:chat:message:0" if identified else None)
+    assert [r["event"] for r in records(caplog)] == ["received"]
 
 
 @pytest.mark.parametrize("transport", ["send", "draft", "native", "edit", "fallback"])

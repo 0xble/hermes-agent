@@ -53,16 +53,18 @@ def record_received(event: Any) -> ReplyReceipt | None:
     source = getattr(event, "source", None)
     if source is None:
         return None
+    message_id = getattr(event, "message_id", None)
+    thread_id = getattr(source, "thread_id", None)
     receipt = ReplyReceipt({
         # Reuse transport identity already known at receipt. An outbox admission/active
         # token assigned later cannot identify the original queue wait without a new ID.
         "turn_id": transport_id(event),
-        "message_id": str(event.message_id) if event.message_id is not None else None,
+        "message_id": str(message_id) if message_id is not None else None,
         "platform": str(getattr(source.platform, "value", source.platform)),
         "origin": turn_origin_for_event(event),
         "profile": str(getattr(source, "profile", None) or current_profile_name("default")),
         "chat_id": str(source.chat_id),
-        "thread_id": str(source.thread_id) if source.thread_id is not None else None,
+        "thread_id": str(thread_id) if thread_id is not None else None,
     })
     event._reply_latency_receipt = receipt
     _emit(receipt, "received", stamp)
