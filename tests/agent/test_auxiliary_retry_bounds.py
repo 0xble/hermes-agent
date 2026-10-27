@@ -107,3 +107,60 @@ def test_compression_timeout_is_profile_local_and_frozen_policy_wins(transport, 
         with session_auxiliary_scope({"compression": {"timeout": 25}}):
             aux.call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
             assert transport.chat.completions.create.call_args.kwargs["timeout"] == 25
+
+
+def _call_compression(transport):
+    transport.chat.completions.create.return_value = {"summary": "ok"}
+    aux.call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
+    return transport.chat.completions.create.call_args.kwargs["timeout"]
+
+
+def test_frozen_worker_snapshot_timeout_beats_live_file(transport, monkeypatch):
+    import agent.safe_worker_policy as policy
+
+    (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(
+        {"auxiliary": {"compression": {"timeout": 45}}}), encoding="utf-8")
+    monkeypatch.setattr(policy, "worker_config_snapshot", lambda: {
+        "auxiliary": {"compression": {"timeout": 200}}})
+    assert _call_compression(transport) == 200
+
+
+def test_default_config_snapshot_does_not_pin_the_compression_floor(transport, monkeypatch):
+    import json
+    import agent.safe_worker_policy as policy
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(
+        {"auxiliary": {"compression": {"timeout": 45}}}), encoding="utf-8")
+    # The worker bind json-round-trips the frozen copy of DEFAULT_CONFIG.
+    snapshot = json.loads(json.dumps(DEFAULT_CONFIG))
+    monkeypatch.setattr(policy, "worker_config_snapshot", lambda: snapshot)
+    assert _call_compression(transport) == 300.0
+
+
+def test_bypass_worker_has_no_authored_compression_timeout(transport, monkeypatch):
+    import agent.safe_worker_policy as policy
+
+    (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(
+        {"auxiliary": {"compression": {"timeout": 45}}}), encoding="utf-8")
+    monkeypatch.setattr(policy, "worker_ignores_user_config", lambda: True)
+    monkeypatch.setattr(policy, "worker_config_snapshot", lambda: {
+        "auxiliary": {"compression": {"timeout": 200}}})
+    assert _call_compression(transport) == 300.0
+
+
+def test_env_expanded_timeout_is_explicit(transport, monkeypatch):
+    monkeypatch.setenv("AUX_COMPRESSION_TIMEOUT", "45")
+    (get_hermes_home() / "config.yaml").write_text(
+        "auxiliary:\n  compression:\n    timeout: ${AUX_COMPRESSION_TIMEOUT}\n", encoding="utf-8")
+    assert _call_compression(transport) == 45.0
+
+
+def test_managed_overlay_timeout_is_explicit(transport, monkeypatch, tmp_path):
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text(yaml.safe_dump(
+        {"auxiliary": {"compression": {"timeout": 77}}}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    (get_hermes_home() / "config.yaml").write_text("{}\n", encoding="utf-8")
+    assert _call_compression(transport) == 77.0

@@ -130,27 +130,75 @@ def _transient_retry_count() -> int:
         return _DEFAULT_TRANSIENT_RETRIES
 
 
-def _user_set_task_timeout(task: str) -> float | None:
-    """User-pinned positive seconds, without DEFAULT_CONFIG's merged timeout.
-
-    Adapted from upstream #127083. A session's frozen policy takes precedence over disk.
-    """
-    aux = _SESSION_AUXILIARY.get()
-    if aux is None:
-        try:
-            import hermes_yaml as yaml
-            from hermes_cli.config import get_config_path
-
-            raw_config = yaml.safe_load(get_config_path().read_text(encoding="utf-8-sig")) or {}
-            aux = raw_config.get("auxiliary", {}) if isinstance(raw_config, dict) else {}
-        except Exception:  # health: allow BLE001 -- absent/unreadable config keeps the default budget
-            return None
-    task_config = aux.get(str(task), {}) if isinstance(aux, dict) else {}
-    raw = task_config.get("timeout") if isinstance(task_config, dict) else None
-    if raw is None:
+def _positive_timeout(raw: Any) -> float | None:
+    if raw is None or isinstance(raw, bool):
         return None
     try:
         seconds = float(raw)
     except (TypeError, ValueError):
         return None
     return seconds if seconds > 0 else None
+
+
+def _shipped_task_block(task: str) -> dict | None:
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    block = (DEFAULT_CONFIG.get("auxiliary") or {}).get(str(task))
+    return block if isinstance(block, dict) else None
+
+
+def _explicit_task_timeout(task: str, task_config: Any) -> float | None:
+    """A positive timeout the caller authored, or None.
+
+    A task block identical to the shipped default was copied from
+    ``DEFAULT_CONFIG`` (bypass sessions freeze that copy) and is not a pin.
+    A user who writes only ``timeout: 120`` has a different block and still pins.
+    """
+    if not isinstance(task_config, dict) or "timeout" not in task_config:
+        return None
+    shipped = _shipped_task_block(task)
+    if shipped is not None and task_config == shipped:
+        return None
+    return _positive_timeout(task_config.get("timeout"))
+
+
+def _authored_auxiliary() -> dict:
+    """The session's authored auxiliary section, without ``DEFAULT_CONFIG``.
+
+    An ordinary frozen worker snapshot is that authored config and wins over the
+    live profile file. A bypass worker freezes a copy of ``DEFAULT_CONFIG`` and
+    has no authored file. With no snapshot, the effective reader applies the
+    managed overlay and ``${VAR}`` expansion and is already cached on the file
+    signature.
+    """
+    from agent.safe_worker_policy import worker_config_snapshot, worker_ignores_user_config
+
+    if worker_ignores_user_config():
+        return {}
+    snapshot = worker_config_snapshot()
+    if snapshot is None:
+        from hermes_cli.config_effective import load_user_config_effective
+
+        try:
+            snapshot = load_user_config_effective()
+        except Exception:  # health: allow BLE001 -- absent/unreadable config keeps the default budget
+            return {}
+    if not isinstance(snapshot, dict):
+        return {}
+    aux = snapshot.get("auxiliary", {})
+    return aux if isinstance(aux, dict) else {}
+
+
+def _user_set_task_timeout(task: str) -> float | None:
+    """Positive seconds the session authored for this task, or None when unset.
+
+    Explicitness is the presence of ``auxiliary.<task>.timeout`` in the session's
+    authored config, not in ``DEFAULT_CONFIG`` and not in a live file a frozen
+    worker must ignore. A session auxiliary scope still wins when one is set.
+    """
+    aux = _SESSION_AUXILIARY.get()
+    if aux is None:
+        aux = _authored_auxiliary()
+    if not isinstance(aux, dict):
+        return None
+    return _explicit_task_timeout(task, aux.get(str(task), {}))
