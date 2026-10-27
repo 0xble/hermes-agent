@@ -115,13 +115,20 @@ def defer_message(agent, args: dict) -> dict:
                 if not receipt.handoff():
                     raise RuntimeError("host queue did not accept the original message")
             except Exception as exc:
-                logger.warning("Auto-steer deferral failed: %s", exc)
+                logger.warning("Auto-steer deferral failed: %s", exc, exc_info=True)
                 return {"accepted": False, "message_id": message_id,
                         "error": f"Queue handoff failed: {exc}. The original steer is still actionable."}
             receipt.deferred = True
     # This tool result is the append-only deferred marker. Never edit the steered user row.
     return {"accepted": True, "message_id": message_id, "status": "deferred",
             "instruction": "Do not act on or answer this message in the current turn. It will run next."}
+
+
+def drain_leftover_steer(agent) -> str:
+    """Close auto admission, drain the post-turn steer and return auto originals to their hosts."""
+    close_auto_steer(agent)
+    leftover = (getattr(agent, "_drain_leftover_steer", None) or agent._drain_pending_steer)()
+    return requeue_undelivered_steers(agent, leftover) if leftover else leftover
 
 
 def requeue_undelivered_steers(agent, pending: str) -> str:

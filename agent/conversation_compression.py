@@ -4107,20 +4107,8 @@ def compress_context(
         # next render drops it from the surface (#118900). It runs FIRST: the
         # todo fold rewrites the trailing user row, and both later passes place themselves around the tail, so the
         # reply has to be back in its chronological slot before they look.
-        from agent.conversation_compression_reply_anchor import _ensure_compressed_keeps_last_assistant_reply
-
-        # `/compress here N` hands only the HEAD in as `messages` and carries the kept tail
-        # separately: the head's last assistant is an OLD reply the user explicitly asked to
-        # fold, not the just-delivered one (which lives in the verbatim tail), so the guard
-        # must not undo the compression it was asked for.
-        reinserted_reply = None if verbatim_tail else _ensure_compressed_keeps_last_assistant_reply(
-            messages, compressed, session_id=agent.session_id,
-        )
-        if reinserted_reply is not None:
-            logger.info(
-                "Compression: engine folded away the just-delivered assistant reply; reinserted it into the "
-                "active set (session=%s).", agent.session_id or "none",
-            )
+        from agent.conversation_compression_reply_anchor import keep_last_reply_live
+        reinserted_reply = keep_last_reply_live(agent, messages, compressed, verbatim_tail=verbatim_tail)
         _fold_todo_snapshot(agent, compressed)
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(messages, compressed)
         from agent.steer_deferral import preserve_steer_receipts

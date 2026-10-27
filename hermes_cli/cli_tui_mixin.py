@@ -1494,7 +1494,8 @@ class CLITuiMixin:
                 try:
                     _cprint("  Queued after this.")
                 except Exception:
-                    pass
+                    import logging
+                    logging.getLogger(__name__).debug("Auto-steer queue notice failed", exc_info=True)
                 return True
 
             if (not images and text and not text.lstrip().startswith("/")

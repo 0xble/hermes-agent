@@ -378,21 +378,6 @@ def _is_copilot_provider(agent: Any) -> bool:
         }
 
 
-def _is_stale_copilot_credential_error(status_code: Optional[int], error_message: str) -> bool:
-    """Detect a Copilot 400 that is really a STALE / DEGRADED credential (status 400 AND an
-    integrator/model-not-supported marker, so a wrong model name never triggers the
-    single-shot re-exchange). Caller enforces scoping/guard."""
-    lowered = (error_message or "").lower()
-    if status_code != 400 and "error code: 400" not in lowered:
-        return False
-    return any(marker in lowered for marker in (
-        "model_not_available_for_integrator",
-        "not available for integrator",
-        "model_not_supported",
-        "the requested model is not supported",
-    ))
-
-
 def _pressure_with_real_floor(compressor: Any, rough_tokens: int) -> int:
     """Floor the ROUGH pre-API pressure estimate at the last REAL prompt size.
 
