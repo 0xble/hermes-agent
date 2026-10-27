@@ -21427,7 +21427,7 @@ def test_prompt_submit_row_id_resolves_via_db_when_memory_lacks_stamps(monkeypat
 
 
 def test_prompt_submit_row_id_real_sessiondb_resolve_without_memory_stamps(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, _submit_truncation_only
 ):
     """#82959 production path: real SessionDB insert → live history without
     _row_id (turn rewrite) → truncate_before_row_id cuts durable + memory.
@@ -21463,13 +21463,10 @@ def test_prompt_submit_row_id_real_sessiondb_resolve_without_memory_stamps(
     sid = "real-db-row-trunc-sid"
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
     try:
         # Cut before second user turn (row_ids[2]) — leave first exchange only.
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",
@@ -21625,7 +21622,7 @@ def test_prompt_submit_row_id_misaligned_memory_refuses_content_swap(
 
 
 def test_prompt_submit_row_id_misaligned_memory_role_shift_targets_real_turn(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, _submit_truncation_only
 ):
     """#82959 heal-path guard: equal-length but role-misaligned live memory
     must not be positionally stamped. The content-verified DB fallback still
@@ -21660,12 +21657,9 @@ def test_prompt_submit_row_id_misaligned_memory_role_shift_targets_real_turn(
     sid = "misalign-role-sid"
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
     try:
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",
