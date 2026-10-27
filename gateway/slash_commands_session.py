@@ -1371,7 +1371,8 @@ class GatewaySessionCommandsMixin:
         )
         if not new_entry:
             return t("gateway.branch.switch_failed")
-        self._clear_session_boundary_security_state(dest_key)
+        self._clear_session_boundary_security_state(dest_key, persist_yolo=False)
+        await asyncio.to_thread(self._persist_boundary_yolo_clear, dest_key)
         self._evict_cached_agent(dest_key)
         msg_count = len([m for m in history if m.get("role") == "user"])
         if in_place:
