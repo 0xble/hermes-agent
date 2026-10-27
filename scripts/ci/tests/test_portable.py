@@ -870,6 +870,7 @@ with ci.checkout_lock():
             home = base / 'disposable-home'
             checkout.mkdir()
             with patch.object(ci, 'ROOT', checkout), patch.object(ci, 'STATE', checkout / '.ci'), \
+                    patch.object(ci, '_clonefile_supported', return_value=True), \
                     patch.dict(os.environ, {
                         'HERMES_CI_CACHE_DIR': str(cache),
                         'UV_LINK_MODE': 'symlink',
@@ -894,6 +895,44 @@ with ci.checkout_lock():
                 with self.assertRaisesRegex(RuntimeError, 'outside the checkout'):
                     ci.environment(home)
 
+    def test_unusable_host_download_cache_falls_back_to_checkout_local_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            checkout = base / 'checkout'
+            checkout.mkdir()
+            personal = base / 'personal'
+            stat = Path.stat
+            for override in (False, True):
+                cache = base / 'host-cache' if override else personal / '.local/state/hermes-ci-downloads'
+                cache.mkdir(parents=True, exist_ok=True)
+                for cross_volume in (False, True):
+                    with self.subTest(override=override, cross_volume=cross_volume):
+                        def cache_stat(path, *args, **kwargs):
+                            result = stat(path, *args, **kwargs)
+                            if cross_volume and path == cache:
+                                fields = list(result)
+                                fields[2] += 1  # st_dev differs from the checkout's volume.
+                                return os.stat_result(fields)
+                            return result
+
+                        source = {'PATH': os.defpath}
+                        if override:
+                            source['HERMES_CI_CACHE_DIR'] = str(cache)
+                        with patch.object(ci, 'ROOT', checkout), patch.object(ci, 'STATE', checkout / '.ci'), \
+                                patch.dict(os.environ, source, clear=True), patch.object(Path, 'home', return_value=personal), \
+                                patch.object(Path, 'stat', cache_stat), \
+                                patch.object(ci, '_clonefile_supported', side_effect=lambda path: cross_volume and path == cache), \
+                                patch('builtins.print') as log:
+                            env = ci.environment(base / 'disposable-home')
+                        for key, name in (
+                            ('UV_CACHE_DIR', 'uv'), ('npm_config_cache', 'npm'),
+                            ('MISE_CACHE_DIR', 'mise'), ('MISE_DOWNLOADS_DIR', 'mise-downloads'),
+                        ):
+                            self.assertEqual(Path(env[key]), checkout / '.ci/cache' / name)
+                            self.assertTrue(Path(env[key]).is_dir())
+                        self.assertEqual(env['UV_LINK_MODE'], 'copy')
+                        self.assertTrue(any('using checkout-local cache' in str(call) for call in log.call_args_list))
+
     def test_two_checkouts_share_one_download_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -903,6 +942,7 @@ with ci.checkout_lock():
                 checkout = base / name
                 checkout.mkdir()
                 with patch.object(ci, 'ROOT', checkout), patch.object(ci, 'STATE', checkout / '.ci'), \
+                        patch.object(ci, '_clonefile_supported', return_value=True), \
                         patch.dict(os.environ, {'HERMES_CI_CACHE_DIR': str(cache)}, clear=False):
                     envs.append(ci.environment(base / f'{name}-home'))
             self.assertEqual(envs[0]['UV_CACHE_DIR'], envs[1]['UV_CACHE_DIR'])

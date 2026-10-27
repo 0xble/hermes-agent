@@ -284,10 +284,10 @@ SETUP_GENERATED_RELATIVE = ('.venv', 'node_modules', 'website/node_modules', '.c
 
 
 def host_ci_download_cache(root: Path = ROOT) -> Path:
-    """Dedicated host download cache on the checkout's volume.
+    """Share downloads only when the host cache supports same-volume APFS clones.
 
-    Not ``~/.cache/uv``, not the checkout, and not the disposable HOME.
-    ``UV_LINK_MODE=clone`` can only share a cache on the same volume.
+    Other hosts retain the checkout-local cache rather than making the shared
+    cache optimization a prerequisite for portable CI.
     """
     override = os.environ.get('HERMES_CI_CACHE_DIR')
     cache = Path(override).expanduser() if override else Path.home() / '.local' / 'state' / 'hermes-ci-downloads'
@@ -297,11 +297,14 @@ def host_ci_download_cache(root: Path = ROOT) -> Path:
     if cache == root_resolved or root_resolved in cache.parents:
         raise RuntimeError(f'CI download cache must live outside the checkout: {cache}')
     if cache.stat().st_dev != root_resolved.stat().st_dev:
-        raise RuntimeError(
-            f'CI download cache {cache} is not on the same volume as {root_resolved}; '
-            'refusing a cross-volume cache that cannot clone'
-        )
-    return cache
+        reason = f'host cache {cache} is not on the same volume as {root_resolved}'
+    elif not _clonefile_supported(cache):
+        reason = f'host cache {cache} does not support APFS clones'
+    else:
+        return cache
+    fallback = root_resolved / '.ci' / 'cache'
+    print(f'portable CI: {reason}; using checkout-local cache {fallback}', file=sys.stderr)
+    return fallback
 
 
 def uv_link_mode(cache: Path) -> str:
@@ -315,12 +318,13 @@ def uv_link_mode(cache: Path) -> str:
 
 
 def _clonefile_supported(directory: Path) -> bool:
+    if sys.platform != 'darwin':
+        return False
     source = directory / '.clone-probe'
     dest = directory / '.clone-probe-copy'
     try:
         source.write_bytes(b'x')
-        command = ['cp', '-c', str(source), str(dest)] if sys.platform == 'darwin' else [
-            'cp', '--reflink=always', str(source), str(dest)]
+        command = ['cp', '-c', str(source), str(dest)]
         return subprocess.run(command, capture_output=True).returncode == 0 and dest.is_file()
     except OSError:
         return False

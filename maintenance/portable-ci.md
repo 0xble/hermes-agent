@@ -52,12 +52,14 @@ credentialless environment. The required runner already provides that isolation.
 
 Mutable installs stay in the current worktree: `.venv`, `node_modules`,
 `website/node_modules`, and the Cargo target under ignored `.ci/`. uv, npm,
-and mise download caches are the exception. They are content-addressed, so
-they live in one dedicated host directory on the same volume as the checkout,
-outside the checkout and outside the disposable HOME. That directory is not
-`~/.cache/uv`. `UV_LINK_MODE` is `clone` when the volume supports copy-on-write
-and `copy` otherwise, so a shared cache cannot fall back to hardlinks or
-symlinks. Before setup, a free-space floor sized for one 3-slot wave plus
+and mise download caches are the exception on same-volume APFS hosts. They are
+content-addressed, so they live in one dedicated host directory outside the
+checkout and outside the disposable HOME. That directory is not `~/.cache/uv`.
+If it is on another volume or APFS cloning is unavailable, CI logs the reason
+and retains the previous checkout-local `.ci/cache` paths instead of failing.
+`UV_LINK_MODE` is `clone` when the selected volume supports APFS copy-on-write
+and `copy` otherwise, so caches cannot fall back to hardlinks or symlinks.
+Before setup, a free-space floor sized for one 3-slot wave plus
 headroom reclaims generated directories from finished worktrees and refuses,
 naming the paths and the bytes still required, only when space is still short.
 There is no host-wide install lock. Fork patch identity: `ci-shared-download-caches`. Temporary homes live outside the checkout in invocation-owned system temporary directories.
