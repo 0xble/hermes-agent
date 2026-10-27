@@ -22,6 +22,16 @@ from agent.lsp.protocol import LSPProtocolError, LSPRequestError
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 
+def _descendant_alive(child) -> bool:
+    """True while the child still runs. Exited, zombie or already-reaped all count as gone."""
+    import psutil
+
+    try:
+        return child.is_running() and child.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False  # Reaped between the liveness check and the status read.
+
+
 def _kill_live_descendant(child) -> None:
     """A killed child may remain a zombie after its launcher exits, until init reaps it."""
     import psutil
@@ -54,6 +64,19 @@ def test_descendant_cleanup_only_signals_live_children(state):
     else:
         _kill_live_descendant(child)
     assert child.kill.call_count == (1 if state in {"live", "exits_on_kill", "guard_rejected"} else 0)
+
+
+@pytest.mark.parametrize("state", ["live", "zombie", "gone", "reaped"])
+def test_descendant_wait_treats_a_reaped_child_as_gone(state):
+    """The termination wait ends, rather than erroring, when init reaps the child mid-check."""
+    import psutil
+
+    child = Mock(spec=psutil.Process)
+    child.is_running.return_value = state != "gone"
+    child.status.return_value = psutil.STATUS_ZOMBIE if state == "zombie" else psutil.STATUS_SLEEPING
+    if state == "reaped":
+        child.status.side_effect = psutil.NoSuchProcess(123)
+    assert _descendant_alive(child) is (state == "live")
 
 
 @pytest.mark.platforms("linux")
@@ -236,7 +259,7 @@ async def test_cancelled_start_hard_kills_sigterm_ignoring_descendant(tmp_path: 
             await asyncio.wait_for(start, timeout=0.05)
 
         deadline = asyncio.get_running_loop().time() + 15.0
-        while child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+        while _descendant_alive(child):
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.01)
         assert client.state == "error"
