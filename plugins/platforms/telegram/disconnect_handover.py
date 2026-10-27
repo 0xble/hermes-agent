@@ -89,6 +89,8 @@ async def resume_handover_polling(adapter, ownership) -> None:
             await adapter._start_polling_resilient(
                 drop_pending_updates=False, error_callback=adapter._polling_error_callback_ref)
         except Exception:
+            # Any restoration failure must reach gateway recovery; keep its traceback.
+            logger.warning("[%s] handover polling restoration failed", adapter.name, exc_info=True)
             await adapter._go_fatal_network(
                 "Telegram handover polling restoration failed; rebuilding via gateway recovery.",
                 "[%s] %s", adapter.name, "handover polling restoration failed")
