@@ -110,6 +110,7 @@ async def _wait_for_dispatch_settle(adapter, app) -> None:
         tasks = [task for name in (
             "_pending_text_batch_tasks", "_pending_photo_batch_tasks", "_media_group_tasks"
         ) for task in (getattr(adapter, name, {}) or {}).values() if not task.done()]
+        tasks.extend(task for task in getattr(adapter, "_committed_flush_tasks", {}).values() if not task.done())
         redispatch = getattr(adapter, "_held_inbound_redispatch_task", None)
         if redispatch is not None and not redispatch.done():
             tasks.append(redispatch)
