@@ -1133,3 +1133,23 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   clock fix. Preserve equivalent past/future-clock coverage during that sync.
 - **Rollback:** Revert the commits carrying `Fork-Patch: install-run-clock`; keep the
   wall-clock-disagreement regression with the active patch.
+
+## Bot receipt read straddling its settlement commit
+
+- Fork patch identity: `bot-receipt-settled-race`.
+- `gateway/session_bot.py::_admission_outcome` read the admission row, then its
+  result. When the settlement worker committed between those reads, the stale
+  `started` row (no outcome) was projected through the terminal map as `failed`
+  with the completed reply as its error, and `remember_receipt` then dropped the
+  key from the wake index, so the delivery could never recover. Hosted run
+  40424222149 failed `test_paused_receipt_rearms_on_resume_without_polling_rpc`
+  twice on it. Re-read a nonterminal row whenever its result is present: the
+  result and terminal outcome commit together.
+- Upstream already carries the same fix in
+  [NousResearch/hermes-agent#144881](https://github.com/NousResearch/hermes-agent/pull/144881)
+  (`f62121e133baa525555db08abf23e785316f2efc`). Adapt only that fix; the next
+  upstream sync absorbs it as already present.
+- Guard: `tests/gateway/test_bot_mailbox_async.py::test_receipt_read_straddling_the_settlement_commit_projects_the_reply`
+  forces the interleave through real SQLite settlement and `refresh_receipt` and
+  expects `settled` with reply `pong`. The paused-resume contract and its timeout
+  are unchanged.
