@@ -17,7 +17,7 @@ from __future__ import annotations
 import shlex
 
 # Canonical command -> mirror(cli, arg) run after the owner applied it (None: nothing local).
-_BUSY_MODES = frozenset({"queue", "steer", "interrupt"})
+_BUSY_MODES = frozenset({"queue", "steer", "interrupt", "auto"})
 
 
 def _mirror_busy(cli, arg):

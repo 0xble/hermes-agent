@@ -118,6 +118,8 @@ class GatewayBusySessionMixin:
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
             return
+        from gateway.busy_auto import stamp_busy_arrival
+        stamp_busy_arrival(queued_event)
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         elif overflow := self._overflow_queue(session_key):
@@ -438,7 +440,7 @@ class GatewayBusySessionMixin:
         "retirement_generation",
     )
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent, *, preserve_event: bool = False) -> bool:
         """Return whether this event actually entered the adapter slot or FIFO."""
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(event.source)
@@ -450,12 +452,21 @@ class GatewayBusySessionMixin:
         if isinstance(debounce, dict) and (buffer := debounce.pop(session_key, None)) is not None:
             buffer.cancel_timer()
             self._enqueue_fifo(session_key, buffer.event, adapter)
+        # Queue preservation belongs to the retained envelope, not just this admission call. Keep it
+        # off ``metadata``: durable native admission refuses any non-adapter metadata key.
+        if preserve_event:
+            event._preserve_queue_envelope = True
+        preserve_event = getattr(event, "_preserve_queue_envelope", False) is True
         # FIFO so each follow-up gets its own turn in arrival order (the single pending slot used to
         # be silently OVERWRITTEN). Photo bursts still merge into the head slot (album semantics).
         pending_slot = getattr(adapter, "_pending_messages", None)
         # #28503 — Previously this called ``merge_pending_message_event`` with the default
         # ``merge_text=False``, which silently OVERWROTE the single pending slot when consecutive text
         # messages arrived in ``busy_input_mode: queue``.
+        if preserve_event and not isinstance(pending_slot, dict):
+            return False
+        from gateway.busy_auto import stamp_busy_arrival
+        stamp_busy_arrival(event)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
         same_security_context = existing is not None and (
             getattr(existing, "internal", False) == getattr(event, "internal", False)
@@ -478,7 +489,9 @@ class GatewayBusySessionMixin:
             getattr(event, "message_type", None),
         }
         if (
-            same_security_context
+            not preserve_event
+            and getattr(existing, "_preserve_queue_envelope", False) is not True
+            and same_security_context
             and not any(getattr(candidate, "_gateway_compression_deferred", False)
                         for candidate in (existing, event))
             and MessageType.PHOTO in merge_types
@@ -754,7 +767,11 @@ class GatewayBusySessionMixin:
         plain_text = (
             event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
         )
-        if effective_mode == "steer":
+        if effective_mode == "auto":
+            from gateway.busy_auto import try_auto_steer
+            steered = await try_auto_steer(self, event, session_key, running_agent)
+            effective_mode = "steer" if steered else "queue"
+        elif effective_mode == "steer":
             steer_text = await self._prepare_busy_steer_text(event)
             # Steerable: plain text, OR every attachment is voice media folded into steer_text.
             # A follow-up qualifies for steering when it is plain text, OR when every attachment is
@@ -1062,7 +1079,7 @@ class GatewayBusySessionMixin:
         if (
             event.message_type == MessageType.TEXT
             and self._effective_busy_text_mode(event.source) == "queue"
-            and effective_mode != "steer"
+            and effective_mode not in {"steer", "auto"}
         ):
             # A retained head cannot absorb a debounce buffer. Keep every arrival
             # in the existing FIFO, including the lock-release/backoff boundary.
@@ -1100,9 +1117,9 @@ class GatewayBusySessionMixin:
         return True
 
     def _queue_during_drain_enabled(self, busy_input_mode: Optional[str] = None) -> bool:
-        # "queue"/"steer" mean messages survive a restart (queued for the new process); "interrupt" drops.
+        # "queue"/"steer"/"auto" mean messages survive a restart (queued for the new process); "interrupt" drops.
         mode = busy_input_mode or self._busy_input_mode
-        return self._restart_requested and mode in {"queue", "steer"}
+        return self._restart_requested and mode in {"queue", "steer", "auto"}
 
     def _defer_past_exhaustion_reset(
         self, result: Any, adapter: Any, source: SessionSource, session_key: str, pending_event: MessageEvent,

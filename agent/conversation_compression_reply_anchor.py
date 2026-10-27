@@ -15,6 +15,25 @@ from agent.model_metadata import estimate_messages_tokens_rough
 
 logger = logging.getLogger(__name__)
 
+def keep_last_reply_live(agent: Any, messages: list, compressed: list, *, verbatim_tail: Any) -> Optional[dict]:
+    """Reinsert the just-delivered reply the engine folded away (#118900), or None.
+
+    `/compress here N` hands only the HEAD in as `messages` and carries the kept tail
+    separately: the head's last assistant is an OLD reply the user explicitly asked to
+    fold, not the just-delivered one (which lives in the verbatim tail), so the guard
+    must not undo the compression it was asked for.
+    """
+    if verbatim_tail:
+        return None
+    reinserted = _ensure_compressed_keeps_last_assistant_reply(messages, compressed, session_id=agent.session_id)
+    if reinserted is not None:
+        logger.info(
+            "Compression: engine folded away the just-delivered assistant reply; reinserted it into the "
+            "active set (session=%s).", agent.session_id or "none",
+        )
+    return reinserted
+
+
 def _ensure_compressed_keeps_last_assistant_reply(
     original_messages: list, compressed: list, *, session_id: Optional[str] = None,
 ) -> Optional[dict]:

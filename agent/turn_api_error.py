@@ -246,6 +246,21 @@ def exceeds_retry_wait_cap(agent: Any, api_error: Any) -> bool:
     return retry_after is not None and retry_after > cap
 
 
+def _is_stale_copilot_credential_error(status_code: Optional[int], error_message: str) -> bool:
+    """Detect a Copilot 400 that is really a STALE / DEGRADED credential (status 400 AND an
+    integrator/model-not-supported marker, so a wrong model name never triggers the
+    single-shot re-exchange). Caller enforces scoping/guard."""
+    lowered = (error_message or "").lower()
+    if status_code != 400 and "error code: 400" not in lowered:
+        return False
+    return any(marker in lowered for marker in (
+        "model_not_available_for_integrator",
+        "not available for integrator",
+        "model_not_supported",
+        "the requested model is not supported",
+    ))
+
+
 def _is_local_validation_error(api_error: Any) -> bool:
     """ValueError/TypeError are local bugs, except: UnicodeEncodeError (surrogate recovery
     path), json.JSONDecodeError / provider stream-parse ValueErrors (transient provider/network failure, must retry),
@@ -288,9 +303,7 @@ def settle_unrecovered_error(
     terminal result), max-retries exhaustion (primary transport recovery -> fallback -> terminal
     result), else the interruptible error backoff. ``FailoverReason.billing`` (402) is deliberately
     treated as non-retryable (#31273)."""
-    from agent.conversation_loop import (
-        _arm_fallback_restart, _is_copilot_provider, _is_stale_copilot_credential_error
-    )
+    from agent.conversation_loop import _arm_fallback_restart, _is_copilot_provider
 
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> UnrecoveredErrorVerdict:
         return UnrecoveredErrorVerdict(

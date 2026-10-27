@@ -168,6 +168,10 @@ class CLIModalMixin:
             return
 
         if self._agent_running:
+            if self.busy_input_mode == "auto":
+                self._tui_enter_while_busy(text, [], text)
+                _done()
+                return
             # Agent busy → honour the configured busy-input behaviour (interrupt/steer remain
             # reachable via the normal Enter path).
             if self.busy_input_mode == "interrupt":

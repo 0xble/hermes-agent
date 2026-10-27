@@ -1039,6 +1039,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
             self._queue_or_replace_pending_event(_quick_key, event)
             return None
+        if effective_busy_input_mode == "auto":
+            from gateway.busy_auto import try_auto_steer
+            if not await try_auto_steer(self, event, _quick_key, running_agent):
+                self._queue_or_replace_pending_event(_quick_key, event)
+            return None
         if effective_busy_input_mode == "steer":
             self._hm_busy_steer(event, running_agent, _quick_key)
             return None

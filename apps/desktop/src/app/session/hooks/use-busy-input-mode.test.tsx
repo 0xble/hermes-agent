@@ -1,7 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
 
-import { $busyInputConfig } from '@/store/busy-input-mode'
+import { $busyInputConfig, normalizeBusyInputMode } from '@/store/busy-input-mode'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $connection, $gatewayState } from '@/store/session'
 
@@ -23,6 +23,12 @@ afterEach(() => {
   $busyInputConfig.set(null)
   $activeGatewayProfile.set('default')
   $gatewayState.set('closed')
+})
+
+it('keeps backend auto input lossless instead of interrupting', () => {
+  expect(normalizeBusyInputMode('auto')).toBe('queue')
+  expect(normalizeBusyInputMode(' Auto ')).toBe('queue')
+  expect(normalizeBusyInputMode('bogus')).toBe('interrupt')
 })
 
 it('canonical busy policy is session scoped even with a cached global mode', async () => {

@@ -350,6 +350,10 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
         append_message(messages, {"role": "assistant", "content": visible} if visible else hidden_interrupt_placeholder_row())
     # Transcript shows the user's own words; the provider replays the scaffolded form.
     append_message(messages, {"role": "user", "content": text, "api_content": correction})
+    from agent.steer_deferral import auto_messages_for_delivery
+    if auto_messages_for_delivery(agent, text):
+        from agent.steer_delivery import report_steer_delivered
+        report_steer_delivered(agent, text)
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.
@@ -372,21 +376,6 @@ def _is_copilot_provider(agent: Any) -> bool:
             "github-copilot",
             "github",
         }
-
-
-def _is_stale_copilot_credential_error(status_code: Optional[int], error_message: str) -> bool:
-    """Detect a Copilot 400 that is really a STALE / DEGRADED credential (status 400 AND an
-    integrator/model-not-supported marker, so a wrong model name never triggers the
-    single-shot re-exchange). Caller enforces scoping/guard."""
-    lowered = (error_message or "").lower()
-    if status_code != 400 and "error code: 400" not in lowered:
-        return False
-    return any(marker in lowered for marker in (
-        "model_not_available_for_integrator",
-        "not available for integrator",
-        "model_not_supported",
-        "the requested model is not supported",
-    ))
 
 
 def _pressure_with_real_floor(compressor: Any, rough_tokens: int) -> int:
