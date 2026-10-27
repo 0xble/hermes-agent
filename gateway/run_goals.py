@@ -207,12 +207,15 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if getattr(source, "message_id", None):
             from gateway.session_identity import replace_source
             source = replace_source(source, message_id=None)
-        return MessageEvent(
+        event = MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
             reply_expected=reply_expected,
             metadata=metadata,
             inherit_channel_pin=True,
         )
+        from gateway.session_synthetic import mark_synthetic
+        mark_synthetic(event)
+        return event
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""

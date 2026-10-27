@@ -964,6 +964,43 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   No remaining successor source imports `timings_report`.
 - Retire once the next release sync no longer carries these merge points.
 
+## Native Admission Synthetic Metadata
+
+- Fork patch identity: `native-admission-synthetic-metadata`.
+- Upstream native admission (`78646003aeab0`) rejects ordinary inbound metadata. The
+  v0.22.5 fork integration retained gateway-authored goal prompts with routing and
+  continuation metadata, but did not project that producer state into the durable
+  codec. Goals intentionally have `internal=False` so their turns still evaluate
+  goals. Changing that flag would hide the defect by breaking goal lifecycle.
+- Only gateway producer entry points mint private synthetic provenance. The native
+  envelope carries its metadata and internal semantics separately, and restores
+  them before execution. Source, authorization, content and route validation still
+  run. Ordinary user metadata and the WhatsApp-only projection are unchanged.
+- Admission refusals for producer/internal inputs are silent in chat. Internal
+  refusals share one operator warning per 600-second window, with clause counts
+  logged at debug level and summarized in the next window's warning. Human refusal
+  notices are limited per authority/platform/chat/reason to one every 600 seconds,
+  including all threads of that chat. Suppressed attempts log their count.
+- Delegation retry claims and boot-recovery notices have distinct stable producer
+  identities, separate from final delegation results. Retry notices persist only
+  the validated `delegation_retry_notice` cancellation stamp through native and
+  local snapshots and replay. Unknown metadata remains closed. Refusals identify
+  producer-identity, event-shape and unknown-metadata clauses.
+- Guards: `tests/gateway/test_watch_automation_admission.py` drives real watch,
+  process, heartbeat and delegation producers through automation admission,
+  including retry settlement, persisted cancellation fencing, boot-notice dedupe,
+  native/local retry round trips, malformed stamps and unknown-key refusal.
+- Guards: `tests/gateway/test_synthetic_native_admission.py`, including the real
+  lifted-barrier and watch-pattern producer paths, durable restore, source/route
+  revalidation, foreign human metadata, internal silence, and per-chat notice windows.
+  Refusal and callback-rewrite cases use a stored active goal instance so the
+  goal-currency fence admits them to the boundary under test. Unbacked or stale
+  continuations must still be dropped before admission. The user-refusal case also
+  drives a 47-message transport burst and verifies the 599/600-second boundary.
+- Roll back as one source unit. No config, schema, state migration or new alert
+  system is involved. Retire when a released upstream provides equivalent producer
+  projection and refusal presentation guards.
+
 ## v0.21.6 merge integration
 
 - Fork patch identity: `v0216-merge-integration`.
