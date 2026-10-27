@@ -50,6 +50,16 @@ receive the original string, image tuple, or voice sentinel. Queue edits retain
 that metadata. A successful insertion commits the handoff, so a later display
 failure cannot reopen its receipt or enqueue the original input again.
 
+The gateway marks a deferred envelope with an event attribute, never
+`metadata`: durable native admission has a closed metadata contract and refuses
+any other key, so a metadata marker would turn every drained deferral into an
+`invalid_params` refusal. The deferral returns the original to the adapter
+pending slot that main's own steer and interrupt fallbacks use. Under a session
+authority it reaches the durable FIFO when that slot drains, so its position
+relative to rows the authority admitted directly, such as `/queue`, follows
+that drain rather than the original arrival stamp. Desktop has no deferral path
+and treats backend `auto` as `queue`.
+
 The Ask Tracking consumer update must be qualified with the compatible core
 before enabling auto mode. Optional `manual_text` and `auto_messages` are
 host-owned input boundaries. The consumer observes successful deferrals through

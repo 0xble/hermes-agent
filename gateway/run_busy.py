@@ -452,11 +452,11 @@ class GatewayBusySessionMixin:
         if isinstance(debounce, dict) and (buffer := debounce.pop(session_key, None)) is not None:
             buffer.cancel_timer()
             self._enqueue_fifo(session_key, buffer.event, adapter)
-        # Queue preservation belongs to the retained envelope, not just this admission call.
-        # Metadata also survives pending-event recovery before a later photo can arrive.
+        # Queue preservation belongs to the retained envelope, not just this admission call. Keep it
+        # off ``metadata``: durable native admission refuses any non-adapter metadata key.
         if preserve_event:
-            event.metadata = {**(event.metadata or {}), "_preserve_queue_envelope": True}
-        preserve_event = bool((event.metadata or {}).get("_preserve_queue_envelope"))
+            event._preserve_queue_envelope = True
+        preserve_event = getattr(event, "_preserve_queue_envelope", False) is True
         # FIFO so each follow-up gets its own turn in arrival order (the single pending slot used to
         # be silently OVERWRITTEN). Photo bursts still merge into the head slot (album semantics).
         pending_slot = getattr(adapter, "_pending_messages", None)
@@ -490,7 +490,7 @@ class GatewayBusySessionMixin:
         }
         if (
             not preserve_event
-            and not (getattr(existing, "metadata", None) or {}).get("_preserve_queue_envelope")
+            and getattr(existing, "_preserve_queue_envelope", False) is not True
             and same_security_context
             and not any(getattr(candidate, "_gateway_compression_deferred", False)
                         for candidate in (existing, event))

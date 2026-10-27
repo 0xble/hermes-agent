@@ -165,6 +165,9 @@ async def test_later_photo_does_not_merge_into_deferred_original_envelope(monkey
     assert runner._queue_or_replace_pending_event("key", photo)
     assert adapter._pending_messages.pop("key") is original
     assert original.text == "deferred question" and original.media_urls == []
+    # The drained original still passes durable native admission's closed metadata contract.
+    from gateway.session_envelope import _event_clause
+    assert not original.metadata and _event_clause(runner, original, None, False) is None
     assert runner._promote_queued_event("key", adapter, None) is photo
     assert photo.message_id == "photo caption" and photo.media_urls == ["photo.jpg"]
     assert runner._promote_queued_event("key", adapter, None) is None
