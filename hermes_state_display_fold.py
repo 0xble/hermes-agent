@@ -20,11 +20,6 @@ _DISPLAY_FOLD_COLUMNS = ("id", "role", "content", "timestamp", "tool_call_id", "
 _DISPLAY_FOLD_COLUMNS_SQL = f"SELECT {', '.join(_DISPLAY_FOLD_COLUMNS)} FROM messages"
 _CARRIER_FOLD_COLUMNS = (*_DISPLAY_FOLD_COLUMNS, "message_uid", "_compressed_summary")
 _CARRIER_FOLD_COLUMNS_SQL = f"SELECT {', '.join(_CARRIER_FOLD_COLUMNS)} FROM messages"
-_DISPLAY_FOLD_SCAN_SQL = (_CARRIER_FOLD_COLUMNS_SQL + " INDEXED BY idx_messages_session_id "
-                         "WHERE session_id = ? AND id > ?" + _VISIBLE + " ORDER BY id LIMIT 1000")
-# The plan's one-step pages hold the page as JSON too (up to ~5x a fetchall, ~17x for control
-# characters), so they stay small enough for memory and SQLITE_MAX_LENGTH; ~85 steps per 17k rows.
-_DISPLAY_PLAN_PAGE_SQL = _DISPLAY_FOLD_SCAN_SQL.replace("LIMIT 1000", "LIMIT 200")
 
 
 def _exact_cell(column: str) -> str:
@@ -79,7 +74,63 @@ _DISPLAY_IDENTITY_INDEX_SQL = ("SELECT id, display_identity, display_order FROM 
 _DISPLAY_BACKFILL_INDEX_SQL = ("SELECT id, display_identity, display_order FROM messages "
                               "INDEXED BY idx_messages_display_backfill WHERE session_id = ? "
                               "AND (display_order IS NULL OR display_identity IS NULL)" + _VISIBLE)
-_SET_DISPLAY_FOLD_SQL = "UPDATE messages SET display_order = ?, display_identity = ? WHERE id = ?"
+
+
+_PAYLOAD_PAGE_BYTES = 1024 * 1024
+_PAYLOAD_SIZE_SQL = " + ".join(
+    f"COALESCE(length(CAST(m.{column} AS BLOB)), 0)" for column in _CARRIER_FOLD_COLUMNS)
+
+
+def _payload_page(conn, where_sql, params, *, by_session=True):
+    # Retain only ids and byte counts in SQLite. Stop before reading another payload
+    # once the budget is consumed, but always admit one oversized row. Materializing
+    # 200 multi-MB messages at once regresses legacy display reads' memory bound.
+    index = "INDEXED BY idx_messages_session_id " if by_session else ""
+    page = json.loads(conn.execute(
+        "WITH RECURSIVE eligible(id) AS MATERIALIZED ("
+        "SELECT id FROM messages " + index + "WHERE " + where_sql +
+        " ORDER BY id LIMIT 200), page(id, size) AS ("
+        f"SELECT m.id, {_PAYLOAD_SIZE_SQL} FROM messages m "
+        "WHERE m.id = (SELECT MIN(id) FROM eligible) UNION ALL "
+        f"SELECT m.id, page.size + {_PAYLOAD_SIZE_SQL} FROM page JOIN messages m "
+        "ON m.id = (SELECT MIN(id) FROM eligible WHERE id > page.id) "
+        f"WHERE page.size + {_PAYLOAD_SIZE_SQL} <= ?) "
+        "SELECT json_group_array(json_array(id, size)) FROM page",
+        (*params, _PAYLOAD_PAGE_BYTES)).fetchone()[0])
+    if not page:
+        return []
+    ids = [row[0] for row in page]
+    if len(page) == 1 and page[0][1] > _PAYLOAD_PAGE_BYTES:
+        # Do not expand one very large string/BLOB through JSON just to batch one row.
+        row = conn.execute(_CARRIER_FOLD_COLUMNS_SQL + " WHERE id = ?", ids).fetchone()
+        return [dict(row)]
+    return fold_rows(conn, f"{_CARRIER_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(ids)})",
+                     ids, _CARRIER_FOLD_COLUMNS)
+
+
+def _stale_payload_rows(conn, row_ids):
+    row_ids = sorted(row_ids)
+    for start in range(0, len(row_ids), 200):
+        pending = row_ids[start:start + 200]
+        while pending:
+            rows = _payload_page(conn, f"id IN ({_placeholders(pending)})", pending, by_session=False)
+            if not rows:
+                break
+            yield from rows
+            pending = [row_id for row_id in pending if row_id > rows[-1]["id"]]
+
+
+def _apply_display_updates(conn, updates):
+    # One SQLite step per page, not per UPDATE. Bound parameters below the legacy
+    # 999-variable limit. UPDATE FROM preserves BLOB identities without JSON/text coercion.
+    for start in range(0, len(updates), 200):
+        page = updates[start:start + 200]
+        values = ",".join("(?,?,?)" for _ in page)
+        cursor = conn.execute(
+            "UPDATE messages SET display_order = repairs.column1, display_identity = repairs.column2 "
+            f"FROM (VALUES {values}) AS repairs WHERE messages.id = repairs.column3",
+            tuple(value for row in page for value in row))
+        add_write_rows("display_reconciled", cursor.rowcount)
 
 
 class _FoldPlan(dict[int, tuple[bytes | None, bytes, int | None]]):
@@ -151,7 +202,7 @@ class DisplayFoldMixin:
                     last_id = 0
                     uid_identity: dict[str, bytes] = {}
                     while True:
-                        rows = fold_rows(conn, _DISPLAY_PLAN_PAGE_SQL, (session_id, last_id), _CARRIER_FOLD_COLUMNS)
+                        rows = _payload_page(conn, "session_id = ? AND id > ?" + _VISIBLE, (session_id, last_id))
                         if not rows:
                             break
                         for row in rows:
@@ -223,8 +274,9 @@ class DisplayFoldMixin:
             uid_identity: dict[str, bytes] = {}
             last_id = 0
             while True:
-                # Streams: this no-plan fallback must retain identities, not a page of payloads.
-                rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
+                # Bound payload materialization like the off-lock plan. Streaming a row at a
+                # time releases/reacquires the GIL for every retained historical message.
+                rows = _payload_page(conn, "session_id = ? AND id > ?" + _VISIBLE, (session_id, last_id))
                 batch_start = last_id
                 updates = []
                 for row in rows:
@@ -235,11 +287,9 @@ class DisplayFoldMixin:
                     order = first_id.setdefault(identity, min(last_id, kept) if kept is not None else last_id)
                     if order != row["display_order"] or identity != row["display_identity"]:
                         updates.append((order, identity, last_id))
-                rows.close()
                 if last_id == batch_start:
                     break
-                cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
-                add_write_rows("display_reconciled", cursor.rowcount)
+                _apply_display_updates(conn, updates)
 
     def _resolve_display_identities(self, conn, visible, plan):
         """Stored equality validates payload reuse, not membership or presentation metadata."""
@@ -248,19 +298,17 @@ class DisplayFoldMixin:
         fresh: dict[int, bytes] = {}
         add_write_rows("display_stale", len(stale))
         with write_phase("display_stale_decode"):
-            for start in range(0, len(stale), 500):
-                chunk = stale[start:start + 500]
-                for row in conn.execute(f"{_CARRIER_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})", chunk):
-                    identity = self._display_identity(self._display_dedupe_key(row))
-                    if row["message_uid"] and row["_compressed_summary"]:
-                        original = conn.execute(
-                            _CARRIER_FOLD_COLUMNS_SQL + " WHERE session_id = "
-                            "(SELECT session_id FROM messages WHERE id = ?) AND message_uid = ? "
-                            "AND id < ?" + _VISIBLE + " ORDER BY id LIMIT 1",
-                            (row["id"], row["message_uid"], row["id"])).fetchone()
-                        if original is not None:
-                            identity = self._display_identity(self._display_dedupe_key(original))
-                    fresh[row["id"]] = identity
+            for row in _stale_payload_rows(conn, stale):
+                identity = self._display_identity(self._display_dedupe_key(row))
+                if row["message_uid"] and row["_compressed_summary"]:
+                    original = conn.execute(
+                        _CARRIER_FOLD_COLUMNS_SQL + " WHERE session_id = "
+                        "(SELECT session_id FROM messages WHERE id = ?) AND message_uid = ? "
+                        "AND id < ?" + _VISIBLE + " ORDER BY id LIMIT 1",
+                        (row["id"], row["message_uid"], row["id"])).fetchone()
+                    if original is not None:
+                        identity = self._display_identity(self._display_dedupe_key(original))
+                fresh[row["id"]] = identity
         return {row_id: fresh[row_id] if row_id in fresh else plan[row_id][1]
                 for row_id, _stored, _order in visible}
 
@@ -281,8 +329,7 @@ class DisplayFoldMixin:
                 updates.append((folded, identity, row_id))
         if updates:
             with write_phase("display_updates"):
-                cursor = conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
-                add_write_rows("display_reconciled", cursor.rowcount)
+                _apply_display_updates(conn, updates)
 
     @timed_write_phase("display_freshness")
     def _begin_display_fold(self, conn, plan):
@@ -306,10 +353,10 @@ class DisplayFoldMixin:
             return
         for start in range(0, len(row_ids), 500):
             chunk = row_ids[start:start + 500]
-            rows = list(conn.execute(
+            rows = one_step_rows(conn,
                 "SELECT id, display_identity, display_order FROM messages "
                 f"WHERE session_id = ? AND id IN ({_placeholders(chunk)})" + _VISIBLE,
-                (session_id, *chunk)))
+                (session_id, *chunk), ("id", "display_identity", "display_order"))
             add_write_rows("display_preimage_rows", len(rows))
             identities = self._resolve_display_identities(conn, rows, selection.plan)
             selection.keys.update(identities.values())
@@ -352,23 +399,24 @@ class DisplayFoldMixin:
 
         # Actual stored values, not input dict keys or copied raw clone identities.
         with write_phase("display_new_enumerate", thread_cpu=True):
-            rows = list(conn.execute(
+            rows = one_step_rows(conn,
                 "SELECT id, display_identity, display_order FROM messages "
                 "INDEXED BY idx_messages_session_id WHERE session_id = ? AND id > ?" + _VISIBLE,
-                (session_id, selection.insert_after)))
+                (session_id, selection.insert_after), ("id", "display_identity", "display_order"))
             add_write_rows("display_new_rows", len(rows))
             include(rows)
         with write_phase("display_backfill_enumerate", thread_cpu=True):
-            rows = list(conn.execute(_DISPLAY_BACKFILL_INDEX_SQL, (session_id,)))
+            rows = one_step_rows(conn, _DISPLAY_BACKFILL_INDEX_SQL, (session_id,),
+                                 ("id", "display_identity", "display_order"))
             add_write_rows("display_backfill_rows", len(rows))
             include(rows)
         with write_phase("display_identity_enumerate", thread_cpu=True):
             while pending:
                 batch = [pending.pop() for _ in range(min(500, len(pending)))]
                 queried.update(batch)
-                rows = list(conn.execute(
+                rows = one_step_rows(conn,
                     _DISPLAY_IDENTITY_INDEX_SQL + f" AND display_identity IN ({_placeholders(batch)})",
-                    (session_id, *batch)))
+                    (session_id, *batch), ("id", "display_identity", "display_order"))
                 add_write_rows("display_identity_rows", len(rows))
                 include(rows)
         with write_phase("display_materialize", thread_cpu=True):
