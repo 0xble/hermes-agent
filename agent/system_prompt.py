@@ -475,6 +475,7 @@ def _slack_rich_blocks_enabled() -> bool:
         enabled = lambda key: str(extra.get(key, "")).strip().lower() in {"1", "true", "yes", "on"}
         return enabled("rich_blocks") and not enabled("markdown_blocks")
     except Exception:
+        logger.debug("slack rich_blocks flag read failed; keeping the legacy hint", exc_info=True)
         return False
 
 
