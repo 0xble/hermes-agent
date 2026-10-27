@@ -61,6 +61,7 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_slash_lane import SlashHandoffLanes
     from .adapter_slash_payload import slash_command_text, slash_thread_id
     from .adapter_native_stop import handle_agent_session_stopped
+    from .thread_cleanup import process_changed_message
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
@@ -68,6 +69,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
     from adapter_native_stop import handle_agent_session_stopped  # type: ignore
+    from thread_cleanup import process_changed_message
 
 
 logger = logging.getLogger(__name__)
@@ -4439,9 +4441,10 @@ class SlackAdapter(BasePlatformAdapter):
         from .message_changes import log_message_ingress
         log_message_ingress(event, payload)
         if event.get("subtype") == "message_changed":
-            event = self._normalize_changed_message(event)
-            if event is None:
+            normalized_event = await process_changed_message(self, event, payload)
+            if normalized_event is None:
                 return None
+            event = normalized_event
         # Socket Mode redelivers after reconnects. Scope by workspace: ts is only unique per team.
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777) Scope the dedup id by
         # workspace: Slack event ts values are only unique within one workspace, so two teams' events with
