@@ -20,7 +20,6 @@ from gateway.session import SessionSource, SessionStore, build_session_key
 def home(tmp_path, monkeypatch):
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from hermes_cli import goals
-    import gateway.run as gateway_run
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -28,7 +27,8 @@ def home(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
     from hermes_state_registry import acquire
     goals._DB_CACHE[str(tmp_path)] = acquire(tmp_path / "state.db")
-    (tmp_path / "config.yaml").write_text("display:\n  tool_progress_command: true\n")
+    # Pin the starting progress mode: /verbose cycles from it, and tier defaults differ by platform.
+    (tmp_path / "config.yaml").write_text('display:\n  tool_progress_command: true\n  tool_progress: "off"\n')
     yield tmp_path
     from hermes_state_registry import release_or_close
     for db in goals._DB_CACHE.values():
