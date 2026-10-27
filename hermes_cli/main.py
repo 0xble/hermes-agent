@@ -2354,26 +2354,30 @@ from hermes_cli.release_config_owner import updater_owns_config_writes
 @updater_owns_config_writes()
 def cmd_update(args):
     """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""
+    global PROJECT_ROOT
+    release_source = None
     if not (getattr(args, "post_swap", None) or getattr(args, "rollback", False)) and not (PROJECT_ROOT / ".git").exists():
-        from hermes_cli.immutable_releases import resolved_release, source_checkout_python, update_source_checkout
+        from hermes_cli.immutable_releases import resolved_release, update_source_checkout
         home = get_hermes_home()
         source = update_source_checkout(home, PROJECT_ROOT)
         if source is None and resolved_release(home) == PROJECT_ROOT.resolve():
             raise RuntimeError(f"Cannot resolve the source checkout for release-origin update in {home}; "
                                "repair release-layout.json and retry.")
         if source is not None:
-            python = source_checkout_python(home, source)
-            # Re-enter before acquiring the update lock or opening a receipt.
-            # The release code and venv remain untouched throughout the update.
-            script = "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('hermes_cli.main',run_name='__main__')"
-            os.execv(str(python), [str(python), "-c", script, str(source), *sys.argv[1:]])
+            # The journal binds Git authority, not updater code. The source is
+            # frozen at migration and cannot learn new candidate build policy.
+            # Keep this running release's updater and dependencies, targeting
+            # only the journal-bound source for fetch/transaction operations.
+            release_source = source
+            PROJECT_ROOT = source
     # Marks this frame as the CURRENT updater for
     # _old_updater.in_historical_update(); historical on-disk updaters do not
     # declare this local, so only they hand off through retired shims.
     _hermes_current_updater_frame = True
     from hermes_cli.update_owning_install import retarget_to_owning_install
 
-    retarget_to_owning_install(PROJECT_ROOT)
+    if release_source is None:
+        retarget_to_owning_install(PROJECT_ROOT)
     if _update_preflight_handled(args):
         return
     gateway_mode = getattr(args, "gateway", False)

@@ -3069,8 +3069,8 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
 
 
 def _resolve_update_hermes_bin(home: Path | None = None) -> Optional[list[str]]:
-    """Use the migration-bound source interpreter when running from a release."""
-    from hermes_cli.immutable_releases import resolved_release, source_checkout_python, update_source_checkout
+    """Keep release updater code current, with journal-bound source Git authority."""
+    from hermes_cli.immutable_releases import resolved_release, update_source_checkout
     root = Path(__file__).parent.parent.resolve()
     if (root / ".git").exists():
         return _resolve_hermes_bin()
@@ -3082,11 +3082,8 @@ def _resolve_update_hermes_bin(home: Path | None = None) -> Optional[list[str]]:
             raise RuntimeError(f"Cannot resolve the source checkout for release-origin /update in {active_home}; "
                                "repair release-layout.json and retry.")
         return None
-    python = source_checkout_python(active_home, source)
-    # -c inserts the trusted checkout ahead of the running release even when
-    # the detached process inherits its cwd or PYTHONPATH from the gateway.
-    script = "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('hermes_cli.main',run_name='__main__')"
-    return [str(python), "-c", script, str(source)]
+    from hermes_cli._launchers import runtime_command
+    return runtime_command(root, python=sys.executable)
 
 
 _PROFILE_ID_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")

@@ -60,6 +60,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
 | Reaction tool name | Expose `react` with a thumbs-up progress icon, retaining silent rendering of saved legacy calls | Reaction tool registration, progress identity or desktop classification changes | [Reaction tool name](maintenance/react-tool-name.md) |
+| CLI streaming preview framing | Keep pending-answer previews distinct from committed transcript while preserving activity chrome | Modern-composer status rendering, streaming previews, or resize-scrollback changes | [CLI streaming preview framing](maintenance/cli-stream-preview.md) |
 | Compaction display-fold writer cost | Reuse snapshot identities without historical metadata rereads, preserve live presentation and stale-row invalidation | Display-fold planning, reconciliation or timing changes | [Compaction display fold](maintenance/compaction-write-amplification.md) |
 | Browser vault alias authorization | Retain alias refusals independently of prompt preferences and revalidate aliases before resolution and injection | Alias consent, vault fill, or OTP authorization changes | [Browser vault alias authorization](maintenance/browser-vault-alias-authorization.md) |
 | Busy turn queue | Preserve admitted user input across same-key generation overlap and session-lease contention | Gateway lease waits, generation cleanup or pending-input recovery changes | [Busy turn queue](maintenance/busy-turn-queue.md) |

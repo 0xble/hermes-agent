@@ -158,12 +158,18 @@ def _failure_cause(receipt: dict, exit_code: int) -> str:
     for reason in (receipt.get("stop_reason"), (receipt.get("gateway_restart") or {}).get("phase_error")):
         if not isinstance(reason, str):
             continue
+        explanation = []
         for line in reason.splitlines():
             line = line.strip()
             if line.startswith("Traceback (most recent call last):") or re.fullmatch(r"sys\.exit\(-?\d+\)", line):
                 break
             if line:
-                return line[:240].rstrip()
+                explanation.append(line)
+        if explanation:
+            # A pip-check report starts with progress, not the offending
+            # requirement. Prefer the actual conflicts, within the same bound.
+            conflicts = [line for line in explanation if line.startswith("The package `")]
+            return (" ".join(conflicts) if conflicts else explanation[0])[:240].rstrip()
     stop_class = receipt.get("stop_class")
     if isinstance(stop_class, str) and stop_class.strip():
         explanations = {
