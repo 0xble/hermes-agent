@@ -1117,9 +1117,9 @@ class GatewayBusySessionMixin:
         return True
 
     def _queue_during_drain_enabled(self, busy_input_mode: Optional[str] = None) -> bool:
-        # "queue"/"steer" mean messages survive a restart (queued for the new process); "interrupt" drops.
+        # "queue"/"steer"/"auto" mean messages survive a restart (queued for the new process); "interrupt" drops.
         mode = busy_input_mode or self._busy_input_mode
-        return self._restart_requested and mode in {"queue", "steer"}
+        return self._restart_requested and mode in {"queue", "steer", "auto"}
 
     def _defer_past_exhaustion_reset(
         self, result: Any, adapter: Any, source: SessionSource, session_key: str, pending_event: MessageEvent,

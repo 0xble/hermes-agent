@@ -317,7 +317,7 @@ def hint_pairs(cli) -> list[tuple[str, str]]:
             "_slash_confirm_state", "_model_picker_state", "_command_palette_state")):
         return []
     if getattr(cli, "_agent_running", False):
-        enter = {"steer": "steer", "queue": "queue"}.get(getattr(cli, "busy_input_mode", ""), "interrupt")
+        enter = {"steer": "steer", "auto": "steer", "queue": "queue"}.get(getattr(cli, "busy_input_mode", ""), "interrupt")
         pairs = [("enter", t(f"cli.modern.hint_{enter}"))]
         if enter != "queue":
             pairs.append(("tab", t("cli.modern.hint_queue")))

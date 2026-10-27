@@ -5,6 +5,12 @@ export type BusyInputMode = 'interrupt' | 'queue' | 'steer'
 export function normalizeBusyInputMode(value: unknown): BusyInputMode {
   const mode = typeof value === 'string' ? value.trim().toLowerCase() : ''
 
+  // Backend `auto` absorbs or defers busy text. Desktop has no deferral path, so it keeps the
+  // input lossless and never interrupts, matching the TUI's fallback for unknown modes.
+  if (mode === 'auto') {
+    return 'queue'
+  }
+
   return mode === 'steer' || mode === 'queue' ? mode : 'interrupt'
 }
 
