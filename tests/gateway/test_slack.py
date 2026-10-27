@@ -383,10 +383,10 @@ class TestAppMentionHandler:
         assert "reaction_removed" in registered_events
         assert "assistant_thread_started" in registered_events
         assert "assistant_thread_context_changed" in registered_events
-        # Slack slash commands are registered via a single regex matcher
-        # covering every COMMAND_REGISTRY entry (e.g. /hermes, /btw, /stop,
-        # /model, ...) so users get native-slash parity with Discord and
-        # Telegram. Verify the regex matches the key expected slashes.
+        assert "agent_session_stopped" in registered_events
+        # Slack slash commands are registered via a single regex matcher covering every
+        # COMMAND_REGISTRY entry (e.g. /hermes, /btw, /stop, /model, ...) so users get
+        # native-slash parity with Discord and Telegram. Verify it matches the key slashes.
         assert (
             len(registered_commands) == 1
         ), f"expected 1 combined slash matcher, got {registered_commands!r}"
