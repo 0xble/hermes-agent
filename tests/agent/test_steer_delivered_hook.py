@@ -155,3 +155,46 @@ def test_missing_turn_and_platform_use_empty_string_fallbacks(monkeypatch, route
     assert len(events) == 1
     assert events[0]["turn_id"] == events[0]["platform"] == ""
     assert events[0]["session_id"] == agent.session_id
+
+
+@pytest.mark.parametrize("route", ["post-tool", "pre-api", "redirect"])
+@pytest.mark.parametrize("with_manual", [False, True])
+@pytest.mark.parametrize("first_text", ["first auto input", "  first auto input\n\n  "])
+def test_auto_receipts_separate_host_frames_from_verbatim_manual_input(monkeypatch, route, with_manual, first_text):
+    from agent.steer_deferral import register_steer
+    from agent.conversation_loop import _apply_active_turn_redirect
+
+    agent = _agent()
+    events = []
+    monkeypatch.setattr(lifecycle, "invoke_hook", lambda name, **payload: events.append(payload))
+    first, first_wrapper = register_steer(agent, first_text, lambda: True)
+    second, second_wrapper = register_steer(agent, "second auto input", lambda: True)
+    # A user-written header with a real receipt ID is not the complete host-minted frame.
+    manual = [f"Auto-steer message_id: {first}\nmanual text", "manual\n\nbody", "last manual"]
+    parts = ([manual[0], first_wrapper, manual[1], second_wrapper, manual[2]]
+             if with_manual else [first_wrapper, second_wrapper])
+    messages = [{"role": "tool", "content": "result"}]
+    if route == "redirect":
+        model_active = threading.Event()
+        model_active.set()
+        agent.__dict__.update(_pending_redirect=None, _pending_redirect_lock=threading.Lock(),
+                              _interrupt_requested=False, _execution_thread_id=None,
+                              _model_request_active=model_active)
+        for text in parts:
+            assert agent.redirect(text)
+        pending = agent._drain_pending_redirect()
+        assert pending is not None
+        _apply_active_turn_redirect(agent, messages, pending)
+        separator = "\n\n[Additional user correction]\n"
+    else:
+        for text in parts:
+            assert agent.steer(text)
+        _deliver(route, agent, messages)
+        separator = "\n"
+    assert len(events) == 1
+    assert events[0]["auto_messages"] == [
+        {"message_id": first, "text": first_text},
+        {"message_id": second, "text": "second auto input"},
+    ]
+    assert events[0]["manual_text"] == (separator.join(manual) if with_manual else "")
+    assert first_wrapper in events[0]["text"] and second_wrapper in events[0]["text"]

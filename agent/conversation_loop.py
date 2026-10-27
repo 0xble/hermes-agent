@@ -350,6 +350,10 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
         append_message(messages, {"role": "assistant", "content": visible} if visible else hidden_interrupt_placeholder_row())
     # Transcript shows the user's own words; the provider replays the scaffolded form.
     append_message(messages, {"role": "user", "content": text, "api_content": correction})
+    from agent.steer_deferral import auto_messages_for_delivery
+    if auto_messages_for_delivery(agent, text):
+        from agent.steer_delivery import report_steer_delivered
+        report_steer_delivered(agent, text)
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.

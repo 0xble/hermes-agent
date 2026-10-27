@@ -44,6 +44,7 @@ _ROLLBACK_SKIP_LINES = (("skipped_user_edits", "gateway.rollback.kept_user_edits
 
 # /busy input modes -> (status-card behavior key, set-confirmation behavior key); text via t().
 _BUSY_MODE_BEHAVIOR = {
+    "auto": ("gateway.busy.behavior_auto_short", "gateway.busy.behavior_auto_long"),
     "queue": ("gateway.busy.behavior_queue_short", "gateway.busy.behavior_queue_long"),
     "steer": ("gateway.busy.behavior_steer_short", "gateway.busy.behavior_steer_long"),
     "interrupt": ("gateway.busy.behavior_interrupt_short", "gateway.busy.behavior_interrupt_long"),

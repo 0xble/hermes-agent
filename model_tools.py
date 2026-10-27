@@ -611,7 +611,7 @@ def _resolve_active_context_length() -> int:
 # =============================================================================
 
 # Intercepted by the agent loop (need agent-level state); dispatch returns a stub error.
-_AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task", "compact_context"}
+_AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task", "compact_context", "defer_message"}
 
 # Legacy tool-name aliases accepted at every dispatch seam (old sessions/saved
 # prompts keep working); schemas advertise only new names.

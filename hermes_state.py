@@ -302,8 +302,9 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
         try:
             os.chmod(path, 0o600)
         except FileNotFoundError:
-            # SQLite's last holder can unlink a sidecar after the lstat.
-            continue
+            # SQLite may unlink sidecars at checkpoint/close between lstat and chmod.
+            if path == main_path:
+                raise
 
 
 # Openings of the background-review harness prompts (agent/background_review.py).

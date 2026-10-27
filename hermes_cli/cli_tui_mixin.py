@@ -17,6 +17,7 @@ import time
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.commands_completion import SlashCommandAutoSuggest, SlashCommandCompleter
+from hermes_cli.pending_input import PendingInputQueue, capture_input
 from pathlib import Path
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import FileHistory
@@ -1512,6 +1513,25 @@ class CLITuiMixin:
         from cli import CLI_CONFIG, _ACCENT, _DIM, _RST, _cprint, _hermes_home
         _effective_mode = self.busy_input_mode
         redirected = False
+        if _effective_mode == "auto":
+            from agent.steer_deferral import offer_auto_steer
+            original = capture_input(payload)
+
+            def handoff():
+                self._pending_input.put(original)
+                # Queue insertion commits the handoff. Presentation failure must not reopen it.
+                try:
+                    _cprint("  Queued after this.")
+                except Exception:
+                    pass
+                return True
+
+            if (not images and text and not text.lstrip().startswith("/")
+                    and offer_auto_steer(self.agent, text, handoff)):
+                preview = text[:80] + ("..." if len(text) > 80 else "")
+                _cprint(f"  {_ACCENT}{t('cli.tui.steered', preview=preview)}{_RST}")
+                return
+            _effective_mode = "queue"
         if _effective_mode == "steer":
             if images or not text:
                 _effective_mode = "queue"
@@ -1841,7 +1861,7 @@ class CLITuiMixin:
     def _tui_init_run_state(self):
         """Reset the per-run REPL state (queues, modal states, voice state, config watcher)."""
         self._agent_running = False
-        self._pending_input = queue.Queue()     # normal input (commands + new queries)
+        self._pending_input = PendingInputQueue()  # normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # messages typed while the agent is running
         # Seeded -q handoff: main() can't put directly into _pending_input (this reinit would
         # discard it), so the seeded first message rides in on an attribute and is enqueued here.

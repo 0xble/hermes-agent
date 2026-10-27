@@ -4211,6 +4211,8 @@ def compress_context(
             )
         _fold_todo_snapshot(agent, compressed)
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(messages, compressed)
+        from agent.steer_deferral import preserve_steer_receipts
+        preserve_steer_receipts(agent, compressed)
         new_system_prompt = _rebuild_system_prompt_at_boundary(agent, system_message)
         from agent.conversation_compression_publication import _commit_compaction
         commit = _commit_compaction(

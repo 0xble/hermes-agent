@@ -454,7 +454,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
 | `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
-| [`post_steer_delivered`](#post_steer_delivered) | Observer | After native mid-turn steer-row insertion at either drain site; return ignored, timeout fails open. | `session_id`, `turn_id`, `platform`, `text`, `delivery_id`, `ordinal` | `text` is raw user text and may contain private content or secrets; it is not redacted. |
+| [`post_steer_delivered`](#post_steer_delivered) | Observer | After native mid-turn steer-row insertion at either drain site; return ignored, timeout fails open. | `session_id`, `turn_id`, `platform`, `text`, `delivery_id`, `ordinal`, `manual_text`, optional `auto_messages` | Text fields contain raw user text and may contain private content or secrets; it is not redacted. |
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | Full prompt, response, and history. |
 | `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
 | `pre_verify` | Directive/control | At the bounded edited-code verify gate; first valid continue/block-stop directive keeps the turn going. | `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, `changed_paths` | Draft response and changed paths. |
@@ -684,7 +684,8 @@ post-tool or pre-API drain site, under the active turn/profile scope.
 
 ```python
 def my_callback(session_id, turn_id: str, platform: str, text: str,
-                delivery_id: str, ordinal: int, **kwargs):
+                delivery_id: str, ordinal: int, manual_text: str = None,
+                auto_messages: list = None, **kwargs):
     ...
 ```
 
@@ -696,12 +697,21 @@ def my_callback(session_id, turn_id: str, platform: str, text: str,
 | `text` | `str` | Exact drained steer text, without the out-of-band marker frame. |
 | `delivery_id` | `str` | Host-minted UUID4 identifying this insertion. |
 | `ordinal` | `int` | 1-based insertion counter, reset each turn and shared across both drain sites. |
+| `manual_text` | `str` | Host-separated manual steer content. Empty for an auto-only delivery. Older hosts omit this field. |
+| `auto_messages` | `list[dict]` | Present when the inserted batch contains auto-steered messages. Each entry has the host-minted `message_id` and original `text`, including gateway origin context where supplied. |
 
 The existing `steer()` entry point strips each input and joins pending inputs
 with `\n`. The resulting batch is one delivery, not separate events for the
 original messages. No event fires for an empty drain, a requeue, or next-turn
 fallback; fallback becomes ordinary `user_message` on a new admitted turn.
 Retries and transcript replay do not emit delivery events.
+
+For auto-steered input, use `auto_messages` to capture each original message and
+`manual_text` for the manual remainder. Do not parse auto-steer wrappers or infer
+message identity from the combined `text`. A consumer supporting older hosts
+uses the whole `text` only when `manual_text` is absent. Deferral is a separate
+queue handoff, observable through the normal `post_tool_call` event for a successful
+`defer_message` result (`accepted: true`, `status: "deferred"`, `message_id`).
 
 **Return value:** Ignored. Callbacks cannot rewrite or veto the inserted row.
 Python callbacks use `plugins.hook_callback_timeout` (default 30 seconds;
@@ -710,7 +720,7 @@ joining it, later callbacks continue, and the agent turn proceeds. Exceptions
 also fail open. A timed-out callback may continue running in the background;
 keep callbacks fast and give their I/O its own timeout.
 
-**Privacy:** `text` carries raw user text, including any private content or
+**Privacy:** `text`, `manual_text`, and `auto_messages[].text` carry raw user text, including any private content or
 secrets supplied in the steer. It is not redacted. Avoid logging or exporting
 it without appropriate consent and handling.
 

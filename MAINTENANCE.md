@@ -61,7 +61,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 |---|---|---|---|
 | Browser vault alias authorization | Retain alias refusals independently of prompt preferences and revalidate aliases before resolution and injection | Alias consent, vault fill, or OTP authorization changes | [Browser vault alias authorization](maintenance/browser-vault-alias-authorization.md) |
 | Busy turn queue | Preserve admitted user input across same-key generation overlap and session-lease contention | Gateway lease waits, generation cleanup or pending-input recovery changes | [Busy turn queue](maintenance/busy-turn-queue.md) |
-| Delivered steer observer | Give native mid-turn insertions a stable plugin delivery identity | Steer insertion, turn identity or plugin lifecycle changes | [Steer delivery observer](maintenance/steer-delivery-observer.md) |
+| Steer Routing | Preserve auto-steer handoff and native insertion identities | Busy-input routing, steer insertion, turn identity, or plugin lifecycle changes | [Steer Routing](maintenance/steer-delivery-observer.md) |
 | Turn-origin provenance | Give plugins and session context a default-deny per-turn provenance value | Gateway turn identity, plugin hook context, or session environment changes | [Turn-origin provenance](maintenance/turn-origin-provenance.md) |
 | Fork CI | Reproducible patch proof surfaces, hermetic Git fixtures, and complete-suite access on bounded runners | CI, test harness, Git fixture, or proof-surface changes | [Fork CI](maintenance/fork-ci.md) |
 | CI toolchain pinning | Resolve local gate uv and Node binaries from the exact repository pins without changing hosted runner semantics | `scripts/ci/toolchain.json`, `scripts/ci/portable.py`, or local gate tool resolution changes | [CI toolchain pinning](maintenance/ci-toolchain-pin.md) |
@@ -526,8 +526,10 @@ Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the d
 
 Fork patch identity: `session-controls`. One session can pause, resume, clear or replace another session's goal, and pause, resume or stop another session's loop, authorized by a fresh verbatim user quote or a Telegram Approve/Deny press. See [the maintenance unit](maintenance/session-controls.md).
 
-## TUI Prompt Test Isolation
+## CLI and TUI Worker Test Isolation
 
 Fork patch identity: `test-isolation`. Fake-agent prompt-submit rewind tests share a containment fixture that stubs real build/turn/deferred execution and joins the submit dispatcher before their mocks and session mapping are removed. A prior deferred-run-only stub left an earlier dispatcher able to enter a real prompt after monkeypatch teardown and contaminate a later poller test. Preserve every rewind assertion, real-conversation rewind coverage and the poller's owner-session assertion. Production behavior is unchanged.
 
 Verify the complete `tests/tui_gateway/test_tui_gateway_server.py` through `scripts/run_tests.sh` with file retries disabled. Retire this test-only adaptation when the accepted upstream tests contain their dispatchers across teardown and retain equivalent rewind and notification-ownership coverage.
+
+The CLI model-switch threading test joins its exact confirmation worker before restoring patched dependencies, including when assertions fail. Observing the fake swap alone does not prove the summary and session persistence finished. Production threading remains unchanged. Upstream commit `e714c3659977deddeb5583bb2732020b1592796e` addresses the same shutdown race by joining newly observed threads. This test uses the confirmation's actual worker rather than joining unrelated threads. Verify `tests/hermes_cli/test_model_switch_confirm_thread.py` through `scripts/run_tests.sh`. Retire the CLI adaptation when the selected upstream release preserves worker completion and teardown cleanup without it.
