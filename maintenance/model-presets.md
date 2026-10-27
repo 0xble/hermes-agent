@@ -38,6 +38,14 @@ acceptance of the design. Reassess this divergence before adopting upstream work
   credentials. Derive the full state from raw config and merge through the
   shared round-trip writer, not a blind replacement of the `model:` block.
 - Unrelated saves preserve authored references, even after defaults merge.
+- Single-field platform writers round-trip raw YAML, not the runtime-expanded
+  dict. The shared config write boundary validates a disposable expansion before
+  replacing any bytes, including `config set --force`, `save_config`, and schema
+  migrations. A preset plus inline route fields must fail without changing the
+  file or stamping a newer schema version.
+- Guard: `tests/hermes_cli/test_config_write_guards.py` exercises raw round-trip,
+  every conflicting delegation field through the CLI setter, all shared writers,
+  and an invalid schema-step result.
 - Carry resolved main fallback entries to auxiliary request planning. Re-reading
   config per candidate can lose the selected route's reasoning effort.
 - `get_fallback_chain` is the shared preset-aware fallback boundary. Feed it the
