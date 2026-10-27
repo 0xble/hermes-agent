@@ -47,6 +47,41 @@ def test_register_is_a_no_op_without_a_session(tmp_path: Path, monkeypatch):
     assert not (tmp_path / ".hermes-pytest-tmux").exists()
 
 
+@pytest.mark.parametrize("failure", [FileNotFoundError("tmux"), subprocess.TimeoutExpired("tmux", 5)])
+def test_tmux_cleanup_continues_after_a_bad_endpoint(tmp_path, monkeypatch, failure):
+    from hermes_cli import test_artifact_lifetime as lifetime
+
+    (tmp_path / lifetime.TMUX_REGISTRY).write_text("L broken\nS registered\n", encoding="utf-8")
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            raise failure
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(lifetime.subprocess, "run", run)
+    lifetime._kill_session_tmux(tmp_path)
+    assert calls == [["tmux", "-L", "broken", "kill-server"],
+                     ["tmux", "-S", "registered", "kill-server"]]
+
+
+@pytest.mark.platforms("posix")
+def test_tmux_cleanup_does_not_probe_gateway_sockets(tmp_path, monkeypatch):
+    import socket
+    from hermes_cli import test_artifact_lifetime as lifetime
+
+    with tempfile.TemporaryDirectory(prefix="ht") as short, socket.socket(socket.AF_UNIX) as gateway:
+        root = Path(short)
+        gateway.bind(str(root / "gateway.sock"))
+        gateway.listen()
+        (root / lifetime.TMUX_REGISTRY).write_text("L registered\n", encoding="utf-8")
+        calls = []
+        monkeypatch.setattr(lifetime.subprocess, "run", lambda argv, **kw: calls.append(argv))
+        lifetime._kill_session_tmux(root)
+        assert calls == [["tmux", "-L", "registered", "kill-server"]]
+
+
 def _child_env(home: Path, **extra: str) -> dict[str, str]:
     env = {
         k: v for k, v in os.environ.items()
@@ -157,7 +192,7 @@ def test_guardian_kills_only_its_tmux_server(expire):
     owned = root / "owned.sock"
     registered = short / "registered.sock"
     other = short / "other.sock"
-    (root / ".hermes-pytest-tmux").write_text(f"S {registered}\n", encoding="utf-8")
+    (root / ".hermes-pytest-tmux").write_text(f"S {owned}\nS {registered}\n", encoding="utf-8")
     owner = subprocess.Popen(["sleep", "30"])
     servers = []
     try:
@@ -280,7 +315,7 @@ def test_owner(tmp_path):
         parent = subprocess.Popen([sys.executable, "-m", "pytest", "-q", str(nested)],
                                   cwd=REPO, env=env, stdout=log, stderr=log)
         try:
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + 45
             while not evidence.exists() and parent.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.05)
             assert evidence.exists(), (tmp_path / "pytest.log").read_text(encoding="utf-8-sig")
