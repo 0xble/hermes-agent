@@ -19,7 +19,7 @@ try:
     import aiohttp as _aiohttp
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-    from slack_sdk.web.async_client import AsyncWebClient
+    from plugins.platforms.slack.outbound_budget import BudgetedAsyncWebClient as AsyncWebClient
 
     aiohttp = _aiohttp
     SLACK_AVAILABLE = True
@@ -352,7 +352,7 @@ def check_slack_requirements() -> bool:
     def _import():
         from slack_bolt.async_app import AsyncApp
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-        from slack_sdk.web.async_client import AsyncWebClient
+        from plugins.platforms.slack.outbound_budget import BudgetedAsyncWebClient as AsyncWebClient
         import aiohttp
         return {
             "AsyncApp": AsyncApp, "AsyncSocketModeHandler": AsyncSocketModeHandler,
@@ -2081,7 +2081,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Start or update a Slack-native plan/task progress stream."""
         title = title or t("platform.slack.task_card.title")
         if not self._app:
-            return SendResult(success=False, error="Not connected")
+            return SendResult(success=False, error="Not connected", retryable=True, pre_send=True)
         if not tasks:
             return SendResult(success=False, error="No tasks")
         key = self._native_task_card_key(chat_id, reply_to, metadata)
@@ -2110,14 +2110,9 @@ class SlackAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     if not _slack_error_is(exc, "message_not_in_streaming_state"):
                         raise
-                    # Slack seals a native stream server-side after a few minutes of a long
-                    # turn (live-observed at ~5m20s, 2026-09-16; the lifetime is not
-                    # documented). The sealed message is a regular message now, so reopen a
-                    # fresh card in the same thread. Every frame already carries the FULL
-                    # visible projection, so nothing is lost; the user sees the card
-                    # continue instead of degrading to text bubbles. One reopen per update:
-                    # a second rejection is a real failure. Both card timestamps stay
-                    # tracked so end-of-turn cleanup also removes the expired card.
+                    # Slack can seal a stream mid-turn. Reopen in the same thread with the
+                    # full projection, once per update. A second rejection reaches the gateway.
+                    # Both card timestamps stay tracked so turn-end cleanup removes the expired card.
                     logger.info(
                         "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
                         "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts)
@@ -2127,8 +2122,18 @@ class SlackAdapter(BasePlatformAdapter):
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
-                logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
-                return SendResult(success=False, error=str(exc), retryable=True)
+                retryable = isinstance(exc, (TimeoutError, ConnectionError)) or self._is_retryable_upload_error(exc)
+                # A timed-out start may already have created a card. Only a positive
+                # rate-limit rejection proves it is safe to start again.
+                rate_limited = (_slack_error_is(exc, "ratelimited")
+                                or getattr(getattr(exc, "response", None), "status_code", None) == 429)
+                held = not stream.stream_ts and (
+                    (retryable and not rate_limited)
+                    or str(exc) == "Slack startStream returned no stream timestamp")
+                logger.error("[Slack] Native task-card progress error (%s): %r", type(exc).__name__, exc, exc_info=True)
+                return SendResult(success=False, error=f"{type(exc).__name__}: {exc}",
+                                  retryable=retryable and not held, held=held,
+                                  retry_after=self._retry_after_from_exc(exc) if retryable else None)
 
     async def _start_native_task_card_stream(
         self, client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]

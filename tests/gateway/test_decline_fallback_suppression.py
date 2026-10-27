@@ -207,7 +207,7 @@ def _card_runner(adapter: _CardAdapter):
 def _card_state(adapter: _CardAdapter):
     return SimpleNamespace(
         tasks=[{"text": "step"}],
-        native_failed=False,
+        native_failed=False, native_retry_at=0.0, native_retry_delay=2.0,
         publication_suppressed=False,
         visible_tasks=lambda: [{"text": "step"}],
         fallback_text=lambda: "step",

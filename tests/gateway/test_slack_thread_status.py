@@ -103,3 +103,40 @@ async def test_intermediate_delivery_restores_running_thread_status(adapter, del
     finally:
         owner.cancel()
         await asyncio.gather(owner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_recovered_native_card_start_restores_running_thread_status(adapter):
+    """Slack clears status when it posts the reopened card, so the recovery start reasserts it too."""
+    from tests.gateway.test_slack import _StreamExpiredError
+
+    md = {"thread_id": "parent_ts"}
+    starts = []
+
+    async def api_call(method, *, json):
+        if method == "chat.startStream":
+            starts.append(f"card-{len(starts) + 1}")
+            return {"ts": starts[-1]}
+        if method == "chat.appendStream" and json["ts"] == "card-1" and json["chunks"][1]["status"] == "complete":
+            raise _StreamExpiredError("expired", {"ok": False, "error": "message_not_in_streaming_state"})
+        return {"ok": True}
+
+    status = adapter._app.client.assistant_threads_setStatus = AsyncMock()
+    adapter._app.client.api_call = AsyncMock(side_effect=api_call)
+    adapter.set_status_text("D123", "gathering information", metadata=md)
+    owner = asyncio.create_task(asyncio.Event().wait())
+    adapter.__dict__.setdefault("_typing_refresh_owners", {})[adapter._typing_scope_key("D123", md)] = owner
+    try:
+        await adapter.send_typing("D123", metadata=md)
+        first = await adapter.send_native_task_card_progress(
+            "D123", [{"id": "tool", "title": "working"}], metadata=md)
+        before = status.await_count
+        second = await adapter.send_native_task_card_progress(
+            "D123", [{"id": "tool", "title": "working", "status": "complete"}], metadata=md)
+        assert first.success and second.success
+        assert starts == ["card-1", "card-2"]
+        assert status.await_count == before + 1
+        assert status.call_args == call(channel_id="D123", thread_ts="parent_ts", status="gathering information")
+    finally:
+        owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
