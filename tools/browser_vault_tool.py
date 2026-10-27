@@ -364,9 +364,37 @@ def _browser_account_refusal(backend, task_id: str) -> Optional[str]:
                                  f"account={required!r} in a new task first.")})
 
 
+def _list_two_factor_metadata(backend, meta, origin: Optional[str], unambiguous: bool) -> dict:
+    """Availability is a display hint, never fill or OTP authorization."""
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+
+    available = meta.has_otp
+    entry = {}
+    if meta.kind == "login":
+        if not available and isinstance(backend, OnePasswordLoginBackend):
+            available = backend.otp_availability(
+                meta.id, fetch=(origin is not None and unambiguous
+                                and origin in (meta.allowed_origins or (meta.origin,))))
+        elif not available and backend.needs_unlock:
+            available = None
+        entry["otp_available"] = available
+    if available:
+        entry["two_factor"] = "automatic"
+    elif meta.kind == "login" and available is False:
+        entry["two_factor"] = "No stored TOTP field; fetch the newest matching code from the intended mailbox or phone."
+    elif meta.kind == "login" or backend.needs_unlock:
+        entry["two_factor"] = ("automatic if the manager stores a TOTP seed, else fetch the newest matching code "
+                               "from the intended 1Password item, mailbox, or phone; ask the user only when no "
+                               "supported source exists")
+    return entry
+
+
 def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None) -> str:
     """List filtered vault handles + metadata across enabled backends. Passwords are never included.
 
+    Login ``otp_available`` is true/false when known, null when unknown. One
+    unambiguous origin-filtered CLI login may lazily inspect field metadata;
+    unfiltered listings only reuse cached availability.
     A locked external manager contributes no items; instead it is reported under ``locked`` so the
     agent knows to call browser_vault_fill (which prompts the user to unlock) or tell the user.
     """
@@ -404,23 +432,21 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
         except Exception as exc:
             errors.append({"backend": backend.name, "error": str(exc)[:200]})
             continue
+        metas = [meta for meta in metas
+                 if (kind is None or meta.kind == kind)
+                 and (origin is None or not (meta.origin or meta.allowed_origins)
+                      or origin in (meta.allowed_origins or (meta.origin,)))]
+        # One origin-selected login may need a detail lookup. An unfiltered or
+        # ambiguous listing must not turn into account-wide field reads.
+        selected_logins = [meta for meta in metas if meta.kind == "login"]
         for meta in metas:
-            if kind is not None and meta.kind != kind:
-                continue
-            if origin is not None and (meta.origin or meta.allowed_origins) and origin not in (
-                    meta.allowed_origins or (meta.origin,)):
-                continue
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
                      "origin": meta.origin,
                      # A manager's card has no origin of its own; it binds to the current page at fill time.
                      "available": meta.kind == "login" or bool(meta.origin) or (meta.kind == "payment" and backend.binds_cards_to_page)}
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
-            if meta.has_otp or backend.needs_unlock:
-                entry["two_factor"] = ("automatic" if meta.has_otp else
-                                        "automatic if the manager stores a TOTP seed, else fetch the newest matching code "
-                                        "from the intended 1Password item, mailbox, or phone; ask the user only when no "
-                                        "supported source exists")
+            entry.update(_list_two_factor_metadata(backend, meta, origin, len(selected_logins) == 1))
             if meta.identifier:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type

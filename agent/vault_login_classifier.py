@@ -161,6 +161,10 @@ _RE_OTP_CONTEXT = re.compile(
     r"\b(?:verification|security\s+code|one\s+time\s+code|2fa|mfa|authenticator|"
     r"two\s+factor|codigo\s+de\s+verificacion|code\s+de\s+verification|sicherheitscode)\b"
 )
+_RE_OTP_DELIVERY_OR_LIFETIME = re.compile(
+    r"\b(?:(?:sent|texted|delivered)\s+to\s+(?:your\s+)?(?:phone|mobile|telephone)|"
+    r"expires?\s+in\s+\d+\s+(?:seconds?|minutes?))\b"
+)
 _RE_NOT_OTP_CONTEXT = re.compile(
     r"\b(?:card|cc|cvv|cvc|csc|expir\w*|mm\s*yy|billing|phone|mobile|telephone|"
     r"date|day|month|year|address|zip|postal|coupon|promo|voucher|gift)\b"
@@ -179,7 +183,10 @@ def _anonymous_otp_group(controls: List[LoginControl], code_length: Optional[int
             or first.width > 100 or first.height > 100):
         return False
     context = _normalize_text(first.nearby_text)
-    if not _RE_OTP_CONTEXT.search(context) or _RE_NOT_OTP_CONTEXT.search(context):
+    # Delivery and code lifetime describe the challenge, not the input's
+    # purpose. Keep unrelated phone/date text and every card/postal veto.
+    purpose_context = _RE_OTP_DELIVERY_OR_LIFETIME.sub(" ", context)
+    if not _RE_OTP_CONTEXT.search(context) or _RE_NOT_OTP_CONTEXT.search(purpose_context):
         return False
     return all(
         c.type == first.type and c.type in ("text", "tel", "number")
