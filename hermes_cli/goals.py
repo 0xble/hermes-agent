@@ -2814,18 +2814,8 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
         # recover it. The manager holds no state (no continuation, judge, or revive) and remembers
         # why; writes still re-read the live row and refuse to overwrite it.
         self._unreadable: Optional[GoalPersistenceError] = None
-        try:
-            self._state: Optional[GoalState] = (
-                load_goal(session_id) if cursor is None else load_goal(session_id, cursor=cursor)
-            )
-        except GoalPersistenceError as exc:
-            logger.warning("GoalManager: goal for %s is unreadable; treating it as inert: %s", session_id, exc)
-            self._state = None
-            self._unreadable = exc
-
-    def refresh(self) -> None:
-        """Re-read state from the DB (another writer, e.g. a tool, moved it)."""
-        self._state = load_goal(self.session_id)
+        self._state: Optional[GoalState] = None
+        self.refresh()
 
     # --- introspection ------------------------------------------------
 

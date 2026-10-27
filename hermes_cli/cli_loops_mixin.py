@@ -734,7 +734,11 @@ class CLILoopsMixin:
             if not self._pending_input.empty():
                 return
             mgr = self._get_goal_manager()
-            if mgr is None or not mgr.is_parked():
+            if mgr is None:
+                return
+            # Tools write through separate managers while this CLI keeps its cached instance.
+            mgr.refresh()
+            if not mgr.is_parked():
                 return
             prompt = mgr.lifted_barrier_prompt()
             if prompt:
