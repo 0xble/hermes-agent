@@ -3902,7 +3902,10 @@ class BasePlatformAdapter(ABC):
         to a background task: the send waits for the chat's outbound budget, and a serial consumer
         awaiting it holds every later update (and the next poll) behind that wait."""
         thread_meta = _thread_metadata_for_event(event)
-        response = await self._message_handler(event)
+        from gateway.session_context import preserved_session_context
+        assert self._message_handler is not None
+        with preserved_session_context():
+            response = await self._message_handler(event)
         # The handler ran the command: that is this event's admission, whatever the reply's fate.
         # Scheduled command wakes (a /loop tick of /status) count their tick on this receipt.
         event._gateway_inline_command_handled = True

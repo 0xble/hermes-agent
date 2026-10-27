@@ -16,23 +16,26 @@ immediate-parent and chain-root bindings. New children created by the admitted
 turn inherit that turn's session as their parent and chain root. Executor work
 inherits the same scope.
 
-This reset never removes a genuine subprocess child marker. The lifecycle
+This reset never removes a genuine subprocess child marker. Compatible lifecycle
 plugins must check the core process-aware delegation predicate as well as the
 task-local flag, so a child process cannot gain `goal_set` or `loop_set` access by
-entering the gateway again. Both tools return `parent_only` in that process.
+entering the gateway again. The required result for both tools is `parent_only`
+in that process. The core reset alone does not enforce a plugin's permission check.
 
-When inline dispatch returns, raises or is cancelled, it restores the caller's
-session variables, delivery capabilities, task-local working directory and
-nested delegation bindings. The existing profile and Hermes-home scopes retain
-their own restoration. Clearing session variables inside a turn keeps its
-existing semantics.
+Fresh adapter tasks keep the handler's cleared session identity after success,
+errors or cancellation, rather than restoring an inherited identity or enabling
+the process-global environment mirror. The adapter's explicit inline-reply boundary
+restores the caller's bound session variables, delivery capabilities and task-local
+working directory. Unbound inline callers remain cleared. The delegation boundary
+restores nested delegation bindings, and the existing profile and Hermes-home scopes
+retain their own restoration.
 
 Core coverage is `tests/gateway/test_top_level_delegation_context.py` and the
-session-context, delegation-binding and subprocess-environment suites. Registered
-handler and real subprocess coverage is maintained with the lifecycle plugins in
-`agents` at `sources/plugins/goal-lifecycle/test_gateway_parent_tools.py`. Run that
-suite from a compatible core checkout with its own interpreter and disposable
-Hermes homes. The core lineage controls alone do not prove plugin permission.
+session-context, delegation-binding and subprocess-environment suites. Plugin
+compatibility additionally requires registered-handler and real-subprocess coverage
+against the lifecycle plugin sources selected for deployment, from a compatible core
+checkout with its own interpreter and disposable Hermes homes. Core test results do
+not certify the permissions of a separately installed plugin version.
 
 ## Required behavior
 

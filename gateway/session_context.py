@@ -126,7 +126,7 @@ def bound_session_key() -> str:
 
 @contextmanager
 def preserved_session_context() -> Iterator[None]:
-    """Restore an inline caller after a fresh turn clears and rebinds its own scope."""
+    """Restore an explicit inline caller, not a fresh adapter task's inherited identity."""
     from agent.runtime_cwd import reset_session_cwd, scoped_session_cwd, set_session_cwd
 
     variables = (*_VAR_MAP.values(), _SESSION_ASYNC_DELIVERY, _SESSION_HISTORY_DELIVERY)
@@ -138,6 +138,11 @@ def preserved_session_context() -> Iterator[None]:
         reset_session_cwd(cwd_token)
         for var, token in reversed(tokens):
             var.reset(token)
+        # An unbound caller has no identity to restore. _UNSET would re-enable
+        # get_session_env's last-writer-wins process mirror after this turn.
+        for var in _VAR_MAP.values():
+            if var.get() is _UNSET:
+                var.set("")
 
 
 def source_route_metadata(source: Any, metadata: dict | None) -> dict | None:

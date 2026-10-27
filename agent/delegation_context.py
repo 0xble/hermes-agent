@@ -33,14 +33,11 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 @contextmanager
 def top_level_delegation_context() -> Iterator[None]:
     """Isolate fresh gateway turns without removing genuine process child fences."""
-    from gateway.session_context import preserved_session_context
-
     child_token = _DELEGATED_CHILD_CONTEXT.set(False)
     parent_token = _DELEGATED_PARENT_SESSION_ID.set("")
     root_token = _DELEGATED_ROOT_SESSION_ID.set("")
     try:
-        with preserved_session_context():
-            yield
+        yield
     finally:
         _DELEGATED_ROOT_SESSION_ID.reset(root_token)
         _DELEGATED_PARENT_SESSION_ID.reset(parent_token)

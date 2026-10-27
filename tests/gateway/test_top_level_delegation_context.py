@@ -13,11 +13,21 @@ from agent.delegation_context import (
     is_delegated_child_context,
     is_delegated_child_process_context,
 )
-from gateway.config import GatewayConfig, Platform
+from agent.runtime_cwd import scoped_session_cwd
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
-from gateway.session_context import clear_session_vars, get_session_env, set_session_vars
+from gateway.session_context import (
+    _VAR_MAP,
+    async_delivery_supported,
+    clear_session_vars,
+    get_session_env,
+    reset_session_vars,
+    session_history_delivery_supported,
+    set_session_vars,
+)
 from hermes_constants import (
     get_hermes_home,
     reset_hermes_home_override,
@@ -34,6 +44,24 @@ def _identity():
         get_session_env("HERMES_SESSION_PROFILE"),
         get_hermes_home(),
     )
+
+
+def _session_scope():
+    return (
+        {name: get_session_env(name) for name in _VAR_MAP},
+        async_delivery_supported(),
+        session_history_delivery_supported(),
+        scoped_session_cwd(),
+    )
+
+
+def _inline_adapter(runner):
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.set_message_handler(runner._handle_message)
+    adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
+    return adapter
 
 
 def _runner(monkeypatch, dispatch):
@@ -141,6 +169,50 @@ async def test_admitted_turn_owns_new_child_lineage(monkeypatch, tmp_path, inter
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("inherited", [False, True], ids=["env-mirror", "inherited-context"])
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError],
+                         ids=["success", "error", "cancel"])
+async def test_adapter_task_does_not_restore_foreign_session(monkeypatch, inherited, failure):
+    monkeypatch.setenv("HERMES_SESSION_ID", "foreign-mirror")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "slack")
+    observed = {}
+
+    async def dispatch(event, source, key, _generation):
+        context = SessionContext(source, [], {}, session_key=key, session_id="target")
+        with runner._session_env_scope(context):
+            observed["during"] = get_session_env("HERMES_SESSION_ID")
+            if failure is not None:
+                raise failure()
+        return "handled"
+
+    async def adapter_task():
+        try:
+            if failure is None:
+                assert await runner._handle_message(_event()) == "handled"
+            else:
+                with pytest.raises(failure):
+                    await runner._handle_message(_event())
+        finally:
+            # Adapter media/TTS delivery continues in this task after the handler.
+            observed["after"] = (
+                get_session_env("HERMES_SESSION_ID"),
+                get_session_env("HERMES_SESSION_PLATFORM"),
+                get_session_env("HERMES_SESSION_PROFILE"),
+            )
+
+    runner = _runner(monkeypatch, dispatch)
+    reset_session_vars()
+    if inherited:
+        set_session_vars(session_id="foreign-producer", platform="telegram", profile="foreign")
+    try:
+        await asyncio.create_task(adapter_task())
+        assert observed["during"] == "target"
+        assert observed["after"] == ("", "", ""), "post-handler adapter borrowed a foreign session"
+    finally:
+        clear_session_vars([])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
     [None, RuntimeError, asyncio.CancelledError],
@@ -167,20 +239,57 @@ async def test_inline_dispatch_restores_callers_identity(monkeypatch, tmp_path, 
 
     runner = _runner(monkeypatch, dispatch)
     home_token = set_hermes_home_override(caller_home)
-    session_tokens = set_session_vars(session_id="caller", profile="caller-profile")
+    adapter = _inline_adapter(runner)
+    session_tokens = set_session_vars(
+        session_id="caller", profile="caller-profile", platform="telegram", source="gateway",
+        chat_id="caller-chat", thread_id="caller-thread", user_id="caller-user", chat_type="dm",
+        session_key="caller-key", message_id="caller-message", turn_origin="user",
+        cwd=str(tmp_path), async_delivery=False, session_history_delivery="1",
+    )
     try:
         with delegated_child_context("origin", parent_session_id="topic"):
             with delegated_child_context("origin-nested"):
                 before = _identity()
+                before_scope = _session_scope()
                 if failure is None:
-                    assert await runner._handle_message(_event()) == "handled"
+                    await adapter._dispatch_inline_reply(_event())
                 else:
                     with pytest.raises(failure):
-                        await runner._handle_message(_event())
+                        await adapter._dispatch_inline_reply(_event())
                 assert _identity() == before == (
                     True, "origin", "topic", "origin-nested", "caller-profile", caller_home,
                 )
+                assert _session_scope() == before_scope
         assert observed == [(False, "", "", "target", "routed", routed_home)]
     finally:
         clear_session_vars(session_tokens)
         reset_hermes_home_override(home_token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError],
+                         ids=["success", "error", "cancel"])
+async def test_inline_dispatch_does_not_restore_unbound_env_mirror(monkeypatch, failure):
+    for name in _VAR_MAP:
+        monkeypatch.setenv(name, "foreign-mirror")
+
+    async def dispatch(event, source, key, _generation):
+        context = SessionContext(source, [], {}, session_key=key, session_id="target")
+        with runner._session_env_scope(context):
+            assert get_session_env("HERMES_SESSION_ID") == "target"
+            if failure is not None:
+                raise failure()
+        return "handled"
+
+    runner = _runner(monkeypatch, dispatch)
+    adapter = _inline_adapter(runner)
+    reset_session_vars()
+    try:
+        if failure is None:
+            await adapter._dispatch_inline_reply(_event())
+        else:
+            with pytest.raises(failure):
+                await adapter._dispatch_inline_reply(_event())
+        assert all(get_session_env(name) == "" for name in _VAR_MAP)
+    finally:
+        clear_session_vars([])
