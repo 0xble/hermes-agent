@@ -20,10 +20,9 @@ from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import (
-    BasePlatformAdapter, ExecApprovalPrompt, SendResult,
-)
+from gateway.platforms.base import BasePlatformAdapter, ExecApprovalPrompt, SendResult
 from gateway.platforms.event import ProcessingOutcome
+from gateway.platforms.typing_state import resume_typing_after_prompt
 from agent.i18n import t
 from gateway.relay.adapter_discord_interaction import RelayDiscordInteractionMixin
 from gateway.relay.descriptor import CapabilityDescriptor
@@ -1568,7 +1567,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         # (rendered on assistant.threads.setStatus). Absent => omit content and the
         # connector uses its default heartbeat. NEVER send empty-string content here:
         # on Slack that is the CLEAR request.
-        phrase = getattr(self, "_status_text", {}).get(str(chat_id))
+        phrase = self.get_status_text(chat_id, metadata)
         await self._typing_frame(chat_id, metadata, str(phrase) if phrase else None, "send_typing")
 
     async def stop_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
@@ -2059,7 +2058,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         # connector's prompt message can't be edited cross-platform yet).
         self._send_lifecycle_ack(chat_id, label, ack_meta)
         if count:
-            self.resume_typing_for_chat(chat_id)
+            resume_typing_after_prompt(self, str(state.get("session_key") or ""), chat_id, ack_meta)
 
     async def _resolve_slash_confirm(self, state, option_id, chat_id, ack_meta) -> None:
         from tools import slash_confirm as slash_confirm_mod

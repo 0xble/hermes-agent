@@ -18,6 +18,7 @@ from agent.replay_cleanup import strip_stale_dangerous_confirmations
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.typing_state import call_typing_with_metadata, typing_metadata_for_source
 from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
@@ -243,10 +244,10 @@ class GatewayTurnProgressMixin:
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
                 from agent.display import build_status_phrase
-                adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
+                call_typing_with_metadata(adapter.set_status_text, ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None), metadata=typing_metadata_for_source(ctx.source, ctx.event_message_id))
             elif event_type == "tool.completed":
                 # Between tools the model is genuinely "thinking" again — revert to the static default.
-                adapter.set_status_text(ctx.source.chat_id, None)
+                call_typing_with_metadata(adapter.set_status_text, ctx.source.chat_id, None, metadata=typing_metadata_for_source(ctx.source, ctx.event_message_id))
         except Exception as err:
             logger.debug("live status update failed: %s", err)
 

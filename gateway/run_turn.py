@@ -30,6 +30,7 @@ from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, turn_origin_for_event
+from gateway.platforms.typing_state import call_typing_with_metadata
 from gateway.session_context import bound_turn_origin, set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
@@ -3852,7 +3853,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
             def _pause_typing_before_finalize(_adapter=adapter, _chat_id=source.chat_id) -> None:
-                _adapter.pause_typing_for_chat(_chat_id)
+                call_typing_with_metadata(_adapter.pause_typing_for_chat, _chat_id, metadata=self._thread_metadata_for_source(source))
         # Non-editing platforms (QQ, WeChat) skip streaming — the partial first message could never
         # be updated — unless they have a native-streaming transport (WeCom msgtype "stream").
         _adapter_supports_edit = getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)

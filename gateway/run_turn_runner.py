@@ -28,6 +28,7 @@ from gateway.attended_model import (
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typing_after_prompt, typing_metadata_for_source
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext, silence_retry_prompt
@@ -271,22 +272,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     platform=ctx.source.platform, user_config=ctx.user_config)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
-    def _progress_live_status(self, event_type: str, tool_name, args) -> None:
-        """Live status line (Slack assistant status): stash the tool phrase on the adapter; the
-        _keep_typing refresh renders it. Plain dict write, safe from the sync worker thread."""
-        ctx = self._ctx
-        adapter = ctx._live_status_adapter
-        if adapter is None or ctx._live_status_mode == "off" or tool_name == "_thinking":
-            return
-        try:
-            if event_type == "tool.started" and tool_name and ctx._run_still_current():
-                from agent.display import build_status_phrase
-                adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
-            elif event_type == "tool.completed":
-                # Between tools the model is genuinely "thinking" again — revert to the static default.
-                adapter.set_status_text(ctx.source.chat_id, None)
-        except Exception as err:
-            logger.debug("live status update failed: %s", err)
 
     def _progress_onboarding_hint(self, kwargs: dict) -> None:
         """First-touch onboarding: the first time a tool exceeds _LONG_TOOL_THRESHOLD_S while
@@ -1639,7 +1624,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Pause typing: a "thinking..." status must not obscure the prompt or block an "Other" reply
         # on platforms that disable input while typing (Slack Assistant).
         with suppress(Exception):
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            pause_typing_for_prompt(
+                ctx._status_adapter, ctx.session_key, ctx._status_chat_id,
+                typing_metadata_for_source(ctx.source, ctx.event_message_id))
         # Ordering barrier: flush buffered assistant prose BEFORE the poll, which goes out on a
         # separate agent-thread-blocking path and would otherwise render ABOVE its own explanation.
         # Best-effort + short timeout so the agent thread never hangs if the consumer isn't running.
@@ -1681,7 +1668,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 except Exception:
                     logger.debug("request_reopen_seed after clarify answer failed", exc_info=True)
             try:
-                ctx._status_adapter.resume_typing_for_chat(ctx._status_chat_id)
+                resume_typing_after_prompt(
+                    ctx._status_adapter, ctx.session_key, ctx._status_chat_id,
+                    typing_metadata_for_source(ctx.source, ctx.event_message_id))
             except Exception:
                 logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
         return response, answered
@@ -1710,7 +1699,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
-        adapter.pause_typing_for_chat(ctx._status_chat_id)
+        pause_typing_for_prompt(
+            adapter, ctx.session_key, ctx._status_chat_id,
+            typing_metadata_for_source(ctx.source, ctx.event_message_id))
         self._close_native_stream_boundary("Approval")
         # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
