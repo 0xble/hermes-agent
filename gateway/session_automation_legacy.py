@@ -20,6 +20,11 @@ def revalidate_legacy_route(authority, entry, adapter):
     registered, profile = runner._owning_profile(adapter, source.platform)
     if not registered or runner._delivery_adapter_for(source) is not adapter:
         raise RuntimeStoreError('not_found', field='automation_envelope_adapter')
+    # _binding can mint a relay seal, and the native validator can honor a live
+    # adapter's upstream-auth flag. Neither is proof of a legacy caller's grant.
+    if (source.role_authorized or source.delivered_via_upstream_relay or
+            runner._adapter_flag(source.platform, 'authorization_is_upstream', profile)):
+        raise RuntimeStoreError('permission_denied', field='automation_legacy_delegation')
     bound, _, runtime_home, provenance = _binding(runner, source, profile)
     if bound is not adapter or Path(runtime_home).resolve() != Path(authority.db.db_path).parent.resolve():
         raise RuntimeStoreError('profile_mismatch')

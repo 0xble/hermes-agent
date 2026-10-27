@@ -1032,8 +1032,8 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Pre-ledger native routes may authorize their first automation against the
   current registered transport, runtime home and direct allowlist. They do not
   require a fresh human turn merely to receive a queued process result. Persisted
-  origins are candidates, never connector grants. Relay and role delegation still
-  require private native provenance. No human admission is synthesized.
+  origins are candidates, never connector grants. Relay, role and upstream-only
+  delegation still require private native provenance. No human admission is synthesized.
 - Guards: `tests/gateway/test_automation_upgrade_admission.py` reloads a persisted
   pre-ledger route, initializes the real authority and injects its queued watch
   on Telegram topic and Discord routes, including lost transport, changed home,

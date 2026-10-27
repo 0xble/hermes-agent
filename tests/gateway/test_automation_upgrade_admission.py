@@ -142,7 +142,7 @@ async def test_missing_route_only_excludes_a_proven_gone_target(upgraded_chat, m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('changed', ['transport', 'runtime', 'roles', 'relay'])
+@pytest.mark.parametrize('changed', ['transport', 'runtime', 'roles', 'relay', 'upstream'])
 async def test_legacy_origin_cannot_borrow_unproven_connector_or_delegated_grants(upgraded_chat, monkeypatch, changed):
     runner, adapter, authority, entry, queued, turns, _ = upgraded_chat
     restored = runner.session_store.lookup_by_session_key(entry.session_key)
@@ -166,8 +166,16 @@ async def test_legacy_origin_cannot_borrow_unproven_connector_or_delegated_grant
             monkeypatch.setattr(session_ingress_context, '_binding', foreign_home)
         elif changed == 'roles':
             restored.origin.role_authorized = True
-        else:
+        elif changed == 'relay':
             restored.origin.delivered_via_upstream_relay = True
+        else:
+            original_flag = runner._adapter_flag
+            monkeypatch.setattr(runner, '_adapter_flag', lambda platform, name, profile=None:
+                                name == 'authorization_is_upstream' or original_flag(platform, name, profile))
+        if changed in {'roles', 'relay', 'upstream'}:
+            from gateway import session_ingress_context
+            monkeypatch.setattr(session_ingress_context, '_binding',
+                                lambda *args: pytest.fail('legacy route minted delegated provenance'))
         assert await runner._inject_watch_notification('Verifier READY', queued) is False
     assert turns == []
     assert len(admission_canary.snapshot()['refusals']) == 1
