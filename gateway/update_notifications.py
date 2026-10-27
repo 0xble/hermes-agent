@@ -152,24 +152,37 @@ def _finalized_receipt(home: Path, pending: dict, exit_path: Path) -> dict | Non
     return receipt
 
 
-def _failure_cause(receipt: dict, exit_code: int) -> str:
-    # Keep the explanation, never the traceback or its frame/source lines. The
-    # command boundary's sys.exit(N) safety net explains no underlying failure.
-    for reason in (receipt.get("stop_reason"), (receipt.get("gateway_restart") or {}).get("phase_error")):
-        if not isinstance(reason, str):
+def _failure_explanation(reason: str) -> str:
+    from hermes_cli.debug_redaction import redact_debug_support_text
+
+    explanation = []
+    for line in reason.splitlines():
+        line = line.strip()
+        # Nothing after either boundary explains the failure safely, including
+        # traceback frame/source lines and command-boundary exit-code wrappers.
+        if line.startswith("Traceback (most recent call last):") or re.fullmatch(r"sys\.exit\(-?\d+\)", line):
+            break
+        # PM can append progress to the exception head on the same line. Keep
+        # that head and the actual diagnostic, not timings or a generic retry hint.
+        line = re.sub(r"\b(?:Checked|Audited|Resolved|Installed) \d+ packages? in \S+$", "", line).rstrip()
+        if (not line or re.fullmatch(r"Found \d+ incompatibilit(?:y|ies)", line)
+                or line.startswith("— retry,")):
             continue
-        explanation = []
-        for line in reason.splitlines():
-            line = line.strip()
-            if line.startswith("Traceback (most recent call last):") or re.fullmatch(r"sys\.exit\(-?\d+\)", line):
-                break
-            if line:
-                explanation.append(line)
-        if explanation:
-            # A pip-check report starts with progress, not the offending
-            # requirement. Prefer the actual conflicts, within the same bound.
-            conflicts = [line for line in explanation if line.startswith("The package `")]
-            return (" ".join(conflicts) if conflicts else explanation[0])[:240].rstrip()
+        explanation.append(line)
+    summary = " ".join(explanation)
+    conflicts = [line for line in explanation if line.startswith("The package `")]
+    if conflicts:
+        # A verbose preamble must not push the offending requirement out of view.
+        head = redact_debug_support_text(explanation[0], max_chars=80) if explanation[0] not in conflicts else ""
+        summary = " ".join(part for part in (head, *conflicts) if part)
+    # Scrub before truncating, so a cut credential cannot evade the redactor.
+    return redact_debug_support_text(summary, max_chars=240).rstrip()
+
+
+def _failure_cause(receipt: dict, exit_code: int) -> str:
+    for reason in (receipt.get("stop_reason"), (receipt.get("gateway_restart") or {}).get("phase_error")):
+        if isinstance(reason, str) and (explanation := _failure_explanation(reason)):
+            return explanation
     stop_class = receipt.get("stop_class")
     if isinstance(stop_class, str) and stop_class.strip():
         explanations = {
