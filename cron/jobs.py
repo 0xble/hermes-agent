@@ -325,21 +325,27 @@ def _jobs_lock():
         # See #80703.
         _jobs_lock_state.load_stamp = None
         lock_fd = None
+        owner = None
+        from cron.lock_owner import clear_owner, describe_owner, write_owner
         try:
             try:
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
                         "it. Proceeding with in-process locking only "
-                        "so the scheduler stays alive (#60703).",
-                        _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file())
+                        "so the scheduler stays alive (#60703). %s",
+                        _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file(), describe_owner(lock_fd))
                     with contextlib.suppress(OSError):
                         lock_fd.close()
                     lock_fd = None
+                elif acquired is True:
+                    with contextlib.suppress(OSError):
+                        owner = write_owner(lock_fd, sys._getframe(2).f_code.co_name)
             except OSError as e:
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
@@ -348,6 +354,14 @@ def _jobs_lock():
                 yield
             finally:
                 if lock_fd is not None:
+                    if owner is not None:
+                        held = time.monotonic() - owner["started"]
+                        if held >= 5:
+                            logger.warning(
+                                "Cron jobs lock held for %.3fs by pid=%s command=%r operation=%r",
+                                held, owner["pid"], owner["command"], owner["operation"])
+                        with contextlib.suppress(OSError):
+                            clear_owner(lock_fd)
                     _release_flock(lock_fd)
         finally:
             _jobs_lock_state.depth = 0

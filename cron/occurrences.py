@@ -1,7 +1,9 @@
 """Exact scheduled identities, independent of mutable jobs.json dispatch stamps, plus the
 profile-local stale-schedule catch-up counter marker."""
 from datetime import datetime, timedelta, timezone, UTC
+from contextlib import closing
 import logging
+import sqlite3
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +21,40 @@ def scheduled_instant(value):
         return None
 
 
+def _completed_rows(job_id, instant):
+    """Read completion proof without the ledger's writer mutex or schema setup.
+
+    The due scan holds jobs.json's cross-process lock. Taking the execution writer
+    mutex here lets unrelated ledger work hold that global lock for an entire scan.
+    WAL readers need neither that mutex nor a fresh schema/PRAGMA pass per job.
+    Busy/unknown reads keep the existing fail-open policy in completed_occurrence.
+    """
+    from cron.executions import _db_path, _transaction
+
+    path = _db_path()
+    if not path.exists():
+        return []
+    query = (
+        "SELECT id, finished_at, claimed_at FROM executions "
+        "WHERE job_id=? AND scheduled_instant=? AND status='completed'"
+    )
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
+                                     timeout=0)) as conn:
+            conn.row_factory = sqlite3.Row
+            return conn.execute(query, (str(job_id), instant)).fetchall()
+    except sqlite3.OperationalError as exc:
+        # Preserve the legacy reader's lazy migration contract. Established ledgers
+        # never enter this writer path, and a missing/unreadable DB is not initialized.
+        if "no such column: scheduled_instant" not in str(exc):
+            raise
+        with _transaction() as conn:
+            return conn.execute(query, (str(job_id), instant)).fetchall()
+
+
 def completed_occurrence(job, instant):
     """Unknown/failed/pruned attempts cannot prove completion: keep them eligible."""
     from cron.constants import FIRE_CLAIM_SKEW_SECONDS
-    from cron.executions import _transaction
 
     instant = scheduled_instant(instant)
     if instant is None:
@@ -30,12 +62,7 @@ def completed_occurrence(job, instant):
     # A skewed early fire (see claim_job_for_fire) legitimately completes just before its slot.
     earliest_real = datetime.fromisoformat(instant) - timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS)
     try:
-        with _transaction() as conn:
-            rows = conn.execute(
-                "SELECT id, finished_at, claimed_at FROM executions "
-                "WHERE job_id=? AND scheduled_instant=? "
-                "AND status='completed'", (str(job['id']), instant)
-            ).fetchall()
+        rows = _completed_rows(job['id'], instant)
         for row in rows:
             completed_at = scheduled_instant(row["finished_at"] or row["claimed_at"])
             # Legacy or malformed timestamps remain proof; only positively identified poison
