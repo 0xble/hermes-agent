@@ -1906,6 +1906,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         ``started_at`` are delivered undeduplicated rather than risk suppressing a real completion.
         """
         evt_type = str(evt.get("type") or "")
+        if evt_type in {"delegation_retry", "delegation_auto_resume"}:
+            producer_id = str(evt.get("delegation_id") or "").strip()
+            claim = (str(evt.get("retry_notice_claim") or "").strip()
+                     if evt_type == "delegation_retry" else "boot")
+            if not producer_id or not claim:
+                return None
+            return (evt_type, producer_id, claim)
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
             if not producer_id:
@@ -2822,7 +2829,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 suppressed = authorized is None
                 if authorized is True:
                     accepted = await self._inject_watch_notification(
-                        action["text"], {**action, "retry_notice_claim": claim}) is True
+                        action["text"], {**action, "type": "delegation_retry", "retry_notice_claim": claim}) is True
             except Exception:
                 logger.debug("Delegation %s: retry notice injection failed", delegation_id, exc_info=True)
             settle = (dr.suppress_retry_notice if suppressed else

@@ -981,6 +981,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   logged at debug level and summarized in the next window's warning. Human refusal
   notices are limited per authority/platform/chat/reason to one every 600 seconds,
   including all threads of that chat. Suppressed attempts log their count.
+- Delegation retry claims and boot-recovery notices have distinct stable producer
+  identities, separate from final delegation results. Retry notices persist only
+  the validated `delegation_retry_notice` cancellation stamp through native and
+  local snapshots and replay. Unknown metadata remains closed. Refusals identify
+  producer-identity, event-shape and unknown-metadata clauses.
+- Guards: `tests/gateway/test_watch_automation_admission.py` drives real watch,
+  process, heartbeat and delegation producers through automation admission,
+  including retry settlement, persisted cancellation fencing, boot-notice dedupe,
+  native/local retry round trips, malformed stamps and unknown-key refusal.
 - Guards: `tests/gateway/test_synthetic_native_admission.py`, including the real
   lifted-barrier and watch-pattern producer paths, durable restore, source/route
   revalidation, foreign human metadata, internal silence, and per-chat notice windows.
