@@ -2817,10 +2817,6 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
         self._state: Optional[GoalState] = None
         self.refresh()
 
-    def refresh(self) -> None:
-        """Re-read state from the DB (another writer, e.g. a tool, moved it)."""
-        self._state = load_goal(self.session_id)
-
     # --- introspection ------------------------------------------------
 
     @property
