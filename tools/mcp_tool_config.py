@@ -687,8 +687,10 @@ def _portable_mcp_servers(safe_servers: dict[str, dict], rejected: frozenset[str
         logger.debug("Failed to load portable MCP servers", exc_info=True)
 
 
-def _load_mcp_config() -> dict[str, dict]:
-    """``mcp_servers`` from config.yaml as ``{name: config}`` (empty on error / safe mode), ``${VAR}`` interpolated."""
+def _load_mcp_config(*, strict: bool = False) -> dict[str, dict]:
+    """Load interpolated servers. ``strict`` raises on config errors so reconciliation
+    cannot mistake an unreadable/invalid document for an intentionally empty set.
+    Startup discovery retains its historical empty-on-error behavior."""
     from agent.safe_worker_policy import safe_worker_enabled
     if safe_worker_enabled():
         return {}
@@ -697,7 +699,19 @@ def _load_mcp_config() -> dict[str, dict]:
         from utils import env_var_enabled as _env_enabled
         if _env_enabled("HERMES_SAFE_MODE"):
             return {}
-        servers = load_config().get("mcp_servers")
+        if strict:
+            from hermes_cli.config import require_parseable_user_config, validate_config_for_write
+            require_parseable_user_config()
+        config = load_config()
+        if strict:
+            from hermes_cli.config import FailedConfigRead
+            from hermes_cli.config_errors import ConfigValidationError
+            if isinstance(config, FailedConfigRead):
+                raise ConfigValidationError("Could not read config.yaml") from config.error
+            validate_config_for_write(config)
+            if config.get("mcp_servers") is not None and not isinstance(config["mcp_servers"], dict):
+                raise ConfigValidationError("mcp_servers must be a mapping")
+        servers = config.get("mcp_servers")
         try:  # ensure .env vars are available for interpolation
             from hermes_cli.env_loader import load_hermes_dotenv
             load_hermes_dotenv()
@@ -717,5 +731,7 @@ def _load_mcp_config() -> dict[str, dict]:
         _portable_mcp_servers(safe_servers, rejected)
         return safe_servers
     except Exception as exc:
+        if strict:
+            raise
         logger.debug("Failed to load MCP config: %s", exc)
         return {}

@@ -672,7 +672,12 @@ def reconcile_mcp_servers_with_config() -> dict[str, list[str]]:
     is reported under ``"pending"`` so the caller retries. Returns
     ``{"removed": [...], "added": [...], "pending": [...]}``; a no-op when nothing changed."""
     with _owner_secret_scope():
-        servers = _config._load_mcp_config()
+        try:
+            servers = _config._load_mcp_config(strict=True)
+        except Exception as exc:
+            from hermes_cli.config_errors import log_config_error_once
+            log_config_error_once(logger, str(exc), context="MCP reconcile skipped, retaining current servers")
+            return {"removed": [], "added": [], "pending": []}
     wanted = {name for name, cfg in servers.items() if mcp_server_enabled(cfg)}
     scope = _core._mcp_registry_scope()
     with _core._lock:
