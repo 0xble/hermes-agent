@@ -47,6 +47,27 @@ def test_register_is_a_no_op_without_a_session(tmp_path: Path, monkeypatch):
     assert not (tmp_path / ".hermes-pytest-tmux").exists()
 
 
+@pytest.mark.parametrize("started", [1.0, 2.0])
+def test_watch_preserves_detached_artifacts_and_reused_pids(monkeypatch, started):
+    import psutil
+    from types import SimpleNamespace
+    from hermes_cli import test_artifact_lifetime as lifetime
+
+    running = iter([True, False])
+    process = SimpleNamespace(create_time=lambda: 1.0,
+                              is_running=lambda: next(running), status=lambda: psutil.STATUS_RUNNING)
+    monkeypatch.setattr(psutil, "Process", lambda pid: process)
+    monkeypatch.setattr(lifetime.os, "getppid", lambda: 123)
+    monkeypatch.setattr(lifetime, "_alive", lambda pid: pid == 456)
+    monkeypatch.setattr(lifetime.time, "sleep", lambda seconds: None)
+    killed = []
+    monkeypatch.setattr(lifetime, "_kill_artifact", killed.append)
+    # The launcher (789) is dead, but the pytest owner (456) is alive. A reused
+    # target pid (birth 1 != expected 2) must also be ignored before any signal.
+    lifetime.artifact_main(123, 456, 789, 60, started)
+    assert killed == []
+
+
 @pytest.mark.parametrize("failure", [FileNotFoundError("tmux"), subprocess.TimeoutExpired("tmux", 5)])
 def test_tmux_cleanup_continues_after_a_bad_endpoint(tmp_path, monkeypatch, failure):
     from hermes_cli import test_artifact_lifetime as lifetime

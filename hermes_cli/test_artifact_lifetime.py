@@ -97,11 +97,14 @@ def arm_test_artifact_lifetime() -> None:
     if not pytest_tmp_home(home) and owner_pid_from_home(home) is None:
         return
     owner = _owner_pid(home)
+    import psutil
+
+    started = psutil.Process().create_time()
     _armed = True
     if os.name == "posix":
         subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "artifact", str(os.getpid()),
-             str(owner or 0), str(os.getppid()), str(_lifetime_s())],
+             str(owner or 0), str(os.getppid()), str(_lifetime_s()), str(started)],
             start_new_session=True,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
@@ -110,22 +113,36 @@ def arm_test_artifact_lifetime() -> None:
         # watchdog still enforces the deadline even when the CLI's GIL is stuck.
         subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "artifact", str(os.getpid()),
-             str(owner or 0), "0", str(_lifetime_s())],
+             str(owner or 0), "0", str(_lifetime_s()), str(started)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
 
-def artifact_main(target: int, owner: int, parent: int, lifetime: float) -> None:
+def artifact_main(target: int, owner: int, parent: int, lifetime: float, started: float) -> None:
     """An independent process enforces the deadline even when the target is hung."""
+    import psutil
+
+    try:
+        process = psutil.Process(target)
+        if process.create_time() != started:
+            return
+    except psutil.NoSuchProcess:
+        return
     deadline = time.monotonic() + lifetime
-    while _alive(target):
+    while process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
         # On POSIX this watcher stays our child until exit. Once reparented, the
         # target exited, so never send a signal to a potentially reused target pid.
         if os.name == "posix" and os.getppid() != target:
             return
-        if ((owner and not _alive(owner)) or (parent > 1 and not _alive(parent))
+        if ((owner and not _alive(owner)) or (not owner and parent > 1 and not _alive(parent))
                 or time.monotonic() >= deadline):
-            _kill_artifact(target)
+            if os.name == "posix":
+                _kill_artifact(target)
+            else:
+                try:
+                    process.kill()  # psutil verifies creation time again before signalling.
+                except psutil.NoSuchProcess:
+                    pass
             return
         time.sleep(0.25)
 
@@ -233,8 +250,8 @@ def main(argv: list[str]) -> int:
     if len(argv) == 4 and argv[1] == "guardian":
         guardian_main(int(argv[2]), Path(argv[3]))
         return 0
-    if len(argv) == 6 and argv[1] == "artifact":
-        artifact_main(int(argv[2]), int(argv[3]), int(argv[4]), float(argv[5]))
+    if len(argv) == 7 and argv[1] == "artifact":
+        artifact_main(int(argv[2]), int(argv[3]), int(argv[4]), float(argv[5]), float(argv[6]))
         return 0
     arm_test_artifact_lifetime()
     return 0
