@@ -1526,12 +1526,17 @@ A fake-IP TUN proxy needs an explicit sentinel declaration, for example
 blocked like other private/reserved targets. Declared ranges are allowed only as DNS answers,
 not literal URL hosts. Loopback, RFC 1918, link-local, CGNAT, and cloud metadata stay blocked.
 
-Bare links and attachment-only openers wait for the first reply before the title upgrade.
-Prose openers are tried immediately. If the model abstains, returns a platform label, raw ID,
+Link and prose openers are tried immediately, with link metadata fetched only in the background.
+Empty and attachment-only openers wait for the first reply before the title upgrade.
+If the model abstains, returns a platform label, raw ID,
 generic word (`None`, `Investigation`, `Unspecified`), or another session's title (ignoring case
-and a trailing ` #N` on the stored name only), the session keeps its placeholder and retries at the next user turn,
-not again when the current turn ends. Retries can use a bounded excerpt of the latest assistant
-reply. At turn 3, rejected model names fall back to a title derived from the current user message. Provider failures
+and a trailing ` #N` on the stored name only), the session keeps its placeholder. An unsuccessful
+eager attempt retries once at opening-turn completion using a bounded excerpt of the assistant
+reply. A provisional title gets model retries through turn 3. At turn 3, rejected model names
+fall back to a title derived from the current user message. That final candidate must be substantive
+and non-colliding before it receives `llm` authority and replaces the instant placeholder once.
+Otherwise it stays provisional, and later user turns can supply a literal subject without more
+model calls or link fetches. Entirely untitled sessions retain their model retry eligibility. Provider failures
 and truncated output use the derived fallback immediately rather than holding. A manual `/title`
 always wins, and a real title is never renamed.
 Set `auxiliary.title_generation.hold_until_reply: false` to title from the opening message only.
