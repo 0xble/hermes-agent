@@ -1879,8 +1879,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return None
             if not raise_not_accepted:
                 evt["_refusal_permanent"] = exc.permanent  # the drain counts only permanent refusals
-            logger.warning("Watch notification not admitted for %s chat=%s: %s",
-                           platform_name, source.chat_id, exc)
+            from gateway.session_refusals import log_internal_refusal
+            cause = exc.__cause__
+            log_internal_refusal(self, source, exc.reason or str(exc), getattr(cause, 'field', None))
             # Durable callers refund the claim; ordinary watch callers just requeue.
             if raise_not_accepted:
                 raise

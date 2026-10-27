@@ -151,6 +151,8 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
     A background wake is refused while the gateway-wide turn limit is reached
     (``gateway/run_background_admission.py``); the caller keeps its claim and retries.
     """
+    from gateway.session_synthetic import mark_synthetic
+    mark_synthetic(event)
     event._gateway_accepted = False
     metadata = getattr(event, "metadata", None)
     runner = getattr(adapter, "gateway_runner", None)

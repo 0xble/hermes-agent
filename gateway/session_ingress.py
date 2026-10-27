@@ -33,6 +33,7 @@ QUEUE_FULL_REPLY = ('⏳ Too many messages are already waiting in this conversat
 
 
 async def admit_message(authority, event):
+    from gateway.session_refusals import internal_input, log_internal_refusal, user_notice_due
     from gateway.session_authority import messaging_admission
     accepted, committed = busy_acceptance.get(), busy_commit.get()
     busy_acceptance.set(None)  # the drain task this schedules must not inherit the busy caller's future
@@ -43,9 +44,14 @@ async def admit_message(authority, event):
         if committed is not None and not committed.done():
             committed.set_result(None)  # the row is durable (any status): a barrier may go on
     except RuntimeStoreError as exc:
+        if internal_input(event):
+            log_internal_refusal(authority.runner, event.source, exc.reason, exc.field)
+            return None
         if exc.reason == 'stale_generation' and exc.field == 'route':
             return None  # a later /stop or /new of the chat fenced it, as main cancels a queued row
         if exc.reason == 'invalid_params' and exc.field:
+            if not user_notice_due(authority, event, exc.reason):
+                return None
             # Refused before commit (_validate_native): a refusal notice instead of a generic turn error.
             # The reply reaches the whole chat, so only content clauses are named; trust and provenance
             # clauses (and any new one) stay generic, and gateway.log keeps the clause (``_refuse``).
@@ -55,7 +61,7 @@ async def admit_message(authority, event):
         if exc.reason != 'queue_full':
             raise
         # Nothing was committed (main's busy-queue cap): say so instead of a generic turn error.
-        return QUEUE_FULL_REPLY
+        return QUEUE_FULL_REPLY if user_notice_due(authority, event, exc.reason) else None
     finally:
         messaging_admission.reset(ingress)
     if receipt.status == 'terminal':
@@ -79,12 +85,16 @@ async def admit_message(authority, event):
             del authority.waiters[receipt.admission_id]
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
-        return None if status == 'terminal' else pause_notice(authority, receipt.ref, 'unknown_execution')
+        return (None if status == 'terminal' or internal_input(event)
+                else pause_notice(authority, receipt.ref, 'unknown_execution'))
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
         return await asyncio.shield(waiter)
     except RuntimeStoreError as exc:
+        if internal_input(event):
+            log_internal_refusal(authority.runner, event.source, exc.reason, exc.field)
+            return None
         return pause_notice(authority, receipt.ref, exc.reason)
     finally:
         if adopters.get(receipt.admission_id) is event:
