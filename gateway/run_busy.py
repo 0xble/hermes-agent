@@ -605,6 +605,7 @@ class GatewayBusySessionMixin:
         """Send a busy-path reply anchored to the event (thread metadata included)."""
         reply_anchor = self._reply_anchor_for_event(event)
         from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+        from gateway.notice_style import notice_metadata
 
         async def labelled_send():
             # A busy reply is a non-final notice: the first shed after cosmetics when the chat's
@@ -613,7 +614,8 @@ class GatewayBusySessionMixin:
                 return await adapter._send_with_retry(
                     chat_id=event.source.chat_id, content=content,
                     reply_to=reply_anchor if plain_anchor else self._busy_reply_to(event, reply_anchor),
-                    metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+                    metadata=notice_metadata(self._thread_metadata_for_source(event.source, reply_anchor),
+                                             platform=event.source.platform, style=getattr(content, "notice_style", None)),
                 )
 
         send = labelled_send()
@@ -947,7 +949,8 @@ class GatewayBusySessionMixin:
             head, tail = t("gateway.busy.queued_head"), t("gateway.busy.queued_tail")
         else:
             head, tail = t("gateway.busy.interrupting_head"), t("gateway.busy.interrupting_tail")
-        message = t("gateway.busy.ack", head=head, detail=status_detail, tail=tail)
+        from gateway.notice_style import ContextNotice
+        message = ContextNotice(t("gateway.busy.ack", head=head, detail=status_detail, tail=tail))
 
         # One-time onboarding hint about the queue/interrupt knob (flag persisted to config.yaml).
         try:
@@ -959,7 +962,7 @@ class GatewayBusySessionMixin:
                     else "redirect" if is_redirect_mode
                     else "interrupt"
                 )
-                message = f"{message}\n\n{busy_input_hint_gateway(_hint_mode)}"
+                message = ContextNotice(f"{message}\n\n{busy_input_hint_gateway(_hint_mode)}")
                 mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
         except Exception as _onb_err:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)

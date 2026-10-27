@@ -26,6 +26,7 @@ _UpdateTarget = Any
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
+from gateway.notice_style import ContextNotice, notice_metadata
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
@@ -82,9 +83,6 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
 
 # A failed /update leaves the previous version running; the full pip/git log stays on the host
 # (`hermes update` re-runs it in the terminal) and only a short tail is quoted in chat.
-def _update_failed_notice() -> str:
-    return t("gateway.update.failed_notice")
-
 # An update's completion notice waits for its target platform adapter to (re)connect before it
 # can be delivered. Nothing bounds that wait, so a marker naming a platform that is not
 # configured at all — no adapter will ever appear — would keep itself on disk and re-log a
@@ -128,11 +126,6 @@ def _bounded_update_notice(text: str) -> str:
     if len(text) <= _UPDATE_MAX_NOTICE_CHARS:
         return text
     return text[:_UPDATE_MAX_NOTICE_CHARS - 1].rstrip() + "…"
-
-
-def _update_output_tail(output: str, limit: int) -> str:
-    """Last ``limit`` chars of an update log, prefixed with an ellipsis when cut."""
-    return output if len(output) <= limit else "…" + output[-limit:]
 
 
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
@@ -418,7 +411,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         proven_session_id: str = ""  # session the pre-flight proved delivery reaches (a compression tip included)
         defer: bool = False  # unadmitted retry: settle without spending a delivery attempt
 
-    async def _deliver_platform_notice(self, source, content: str) -> bool:
+    async def _deliver_platform_notice(self, source, content: str, *, notice_style: Optional[str] = None) -> bool:
         """Deliver with platform privacy rules; return only an affirmative send receipt."""
         from gateway.run import _is_slack_ignored_channel
         adapter = self._delivery_adapter_for(source)
@@ -445,6 +438,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         # stream-is-the-message adapter would seal an open foreground draft with this notice.
         from gateway.run import _interim_metadata
         metadata = _interim_metadata(self._thread_metadata_for_source(source))
+        metadata = notice_metadata(metadata, platform=source.platform, style=notice_style or getattr(content, "notice_style", None))
         if notice_delivery == "private" and getattr(source, "user_id", None):
             with _log_suppressed(
                 logging.DEBUG, "[%s] send_private_notice failed, falling back to public",
@@ -1100,7 +1094,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             heading = "⬆️ Updating"
             detail = "The native update was started. Progress follows here."
         try:
-            result = await target.send(notice(heading, pending, detail))
+            result = await target.send(ContextNotice(notice(heading, pending, detail)))
             current = self._current_update(paths, original)
             if not current:
                 return False
@@ -1218,7 +1212,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             else:
                 heading, detail = "❌ Update Failed", detail
             detail = _bounded_previous_update_detail(detail, pending)
-            result = await target.send(_bounded_update_notice(notice(heading, pending, detail)))
+            text = _bounded_update_notice(notice(heading, pending, detail))
+            result = await target.send(ContextNotice(text) if success else text)
             current = self._current_update(paths, original)
             if not current:
                 return False
@@ -1280,7 +1275,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         metadata[field] = str(data[field])
             result = await transport.send(
                 platform, str(chat_id), t("gateway.startup.restarted"),
-                metadata=_non_conversational_metadata(metadata, platform=platform),
+                metadata=notice_metadata(_non_conversational_metadata(metadata, platform=platform),
+                                         platform=platform, style="context"),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found") and returns
             # SendResult(success=False) rather than raising, so inspect the result before claiming success.
@@ -1349,7 +1345,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     metadata["user_id"] = home.user_id
                 if home.scope_id:
                     metadata["scope_id"] = home.scope_id
-            send_metadata = _non_conversational_metadata(metadata, platform=platform)
+            send_metadata = notice_metadata(_non_conversational_metadata(metadata, platform=platform),
+                                            platform=platform, style=getattr(message, "notice_style", None))
             if send_metadata is not None or transport.is_relay:
                 result = await transport.send(platform, str(home.chat_id), message, metadata=send_metadata)
             else:
@@ -1416,7 +1413,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = t("gateway.startup.online")
+        message = ContextNotice(t("gateway.startup.online"))
         targets = list(self._served_home_channel_transports())
         # A chat already notified for ANOTHER profile is not notified again.
         notified_chats = {

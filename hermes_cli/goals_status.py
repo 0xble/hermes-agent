@@ -2,6 +2,8 @@
 
 from hermes_cli.lifecycle_snapshot import snapshot_control
 
+from gateway.notice_style import ContextNotice
+
 
 class GoalStatusMixin:
     @snapshot_control
@@ -40,20 +42,20 @@ class GoalStatusMixin:
         meta = f"{turns}{sub}{con}{gat}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
-                return f"⏳ Goal (parked on {s.waiting_reason or f'session {s.waiting_on_session}'}, {meta}): {s.goal}"
+                return ContextNotice(f"⏳ Goal (parked on {s.waiting_reason or f'session {s.waiting_on_session}'}, {meta}): {s.goal}")
             if s.waiting_on_pid and _pid_alive(s.waiting_on_pid):
-                return f"⏳ Goal (parked on {s.waiting_reason or f'pid {s.waiting_on_pid}'}, {meta}): {s.goal}"
+                return ContextNotice(f"⏳ Goal (parked on {s.waiting_reason or f'pid {s.waiting_on_pid}'}, {meta}): {s.goal}")
             if s.waiting_until and time.time() < s.waiting_until:
                 remaining = int(s.waiting_until - time.time())
                 wr = s.waiting_reason or f"{remaining}s"
-                return f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}"
+                return ContextNotice(f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}")
             if s.waiting_on_user_message:
                 return f"⏳ Goal (waiting for your message — {meta}): {s.goal}"
-            return f"⊙ Goal (active, {meta}): {s.goal}"
+            return ContextNotice(f"⊙ Goal (active, {meta}): {s.goal}")
         if s.status == "paused":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
             return f"⏸ Goal (paused, {meta}{extra}): {s.goal}"
         if s.status == "done":
-            return f"✓ Goal done ({meta}): {s.goal}"
+            return ContextNotice(f"✓ Goal done ({meta}): {s.goal}")
         return f"Goal ({s.status}, {meta}): {s.goal}"
 

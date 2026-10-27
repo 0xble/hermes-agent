@@ -6,6 +6,7 @@ parses subcommands and mutates goal state. It never changes conversation history
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from gateway.notice_style import ContextNotice
 import logging
 from typing import Callable
 
@@ -30,7 +31,9 @@ def _english(key, default, **values):
 
 def _status(mgr, arg, render):
     details = "\n".join(filter(None, (mgr.render_removable_items(), mgr.render_completion_history())))
-    return GoalCommandResult(mgr.status_line() + (f"\n{details}" if details else ""))
+    status = mgr.status_line()
+    output = status + (f"\n{details}" if details else "")
+    return GoalCommandResult(ContextNotice(output) if getattr(status, "notice_style", None) == "context" else output)
 
 
 def _show(mgr, arg, render):
@@ -45,7 +48,7 @@ def _replace(mgr, arg, render):
     if not result.get("ok"):
         return GoalCommandResult(result.get("error", "goal replacement failed"), error=True)
     return GoalCommandResult(
-        output=f"✓ Goal replaced: {arg.strip()}", clear_pending="replace",
+        output=ContextNotice(f"✓ Goal replaced: {arg.strip()}"), clear_pending="replace",
         prompt=mgr.next_continuation_prompt(),
     )
 
@@ -64,7 +67,7 @@ def _remove(mgr, arg, render):
     except (RuntimeError, ValueError, IndexError) as exc:
         return GoalCommandResult(f"/goal remove {kind}: {exc}", error=True)
     return GoalCommandResult(
-        output=f"✓ Removed {kind} {index}: {removed}", clear_pending="remove",
+        output=ContextNotice(f"✓ Removed {kind} {index}: {removed}"), clear_pending="remove",
         prompt=mgr.next_continuation_prompt(),
     )
 
@@ -82,7 +85,7 @@ def _resume(mgr, arg, render):
     state = mgr.resume()
     if state is None:
         return GoalCommandResult(render("gateway.goal.no_resume", "No goal to resume."))
-    return GoalCommandResult(render("gateway.goal.resumed", "▶ Goal resumed: {goal}", goal=state.goal),
+    return GoalCommandResult(ContextNotice(render("gateway.goal.resumed", "▶ Goal resumed: {goal}", goal=state.goal)),
                              prompt=mgr.next_continuation_prompt())
 
 
@@ -225,7 +228,7 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
         output += f"\n(replaced the previous goal)\n  was: {previous}"
         if authoring_findings:
             output += "\n" + goals.format_goal_authoring_warning(authoring_findings)
-        return GoalCommandResult(output, clear_pending="replace")
+        return GoalCommandResult(ContextNotice(output) if not authoring_findings else output, clear_pending="replace")
 
     state = mgr.set(goal_text, contract=contract)
     budget = "∞" if state.max_turns == 0 else str(state.max_turns)
@@ -247,7 +250,8 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
                    "exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.")
     if authoring_findings:
         output += "\n" + goals.format_goal_authoring_warning(authoring_findings)
-    return GoalCommandResult(output if goal_notices_enabled() else "",
+    output = output if goal_notices_enabled() else ""
+    return GoalCommandResult(ContextNotice(output) if output and not authoring_findings else output,
                              goals.goal_kick_prompt(state.goal, last_user_message), kickoff=True)
 
 

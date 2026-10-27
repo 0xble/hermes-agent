@@ -8,6 +8,8 @@ returns a ``TurnContext`` with only the locals the loop reads back.
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import logging
 import sys
 import threading
@@ -671,10 +673,9 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
         with suppress(Exception):
             if agent._cleanup_dead_connections():
                 agent._emit_diagnostic_status(
-                    "🔌 Detected stale connections from a previous provider "
+                    ContextNotice("🔌 Detected stale connections from a previous provider "
                     "issue — cleaned up automatically. Proceeding with fresh "
-                    "connection."
-                )
+                    "connection."))
     # A stale streak against a local server that has since recovered must not fail this turn on arrival.
     with suppress(Exception):
         from agent.chat_completion_local import retry_recovered_local_server
@@ -972,7 +973,7 @@ def _memory_turn_start_and_prefetch(
         with suppress(Exception):
             _recall_indicator = agent._memory_manager.describe_recall()
             if _recall_indicator:
-                agent._emit_status(_recall_indicator)
+                agent._emit_status(ContextNotice(_recall_indicator))
     return ext_prefetch_cache
 
 

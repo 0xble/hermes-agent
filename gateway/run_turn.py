@@ -3672,7 +3672,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 images, text_content = adapter.extract_images(response)
                 text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
+                content = header + text_content
+                if source.platform == Platform.SLACK and not (result or {}).get("error"):
+                    from gateway.notice_style import notice_metadata
+                    await adapter.send(chat_id=source.chat_id, content=header,
+                                       metadata=notice_metadata(_thread_metadata, platform=source.platform, style="context"))
+                    content = text_content
+                await adapter.send(chat_id=source.chat_id, content=content, metadata=_thread_metadata)
             for copy_block in copy_blocks:
                 copy_metadata = dict(_thread_metadata or {})
                 copy_metadata["copy_block"] = True

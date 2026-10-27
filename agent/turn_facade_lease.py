@@ -7,6 +7,8 @@ refresher, the turn-liveness watchdog wiring, and the lease-loss / stall interru
 timers run via the shared scheduler (``agent/periodic_scheduler.py``; timer thread orders,
 bodies run on per-handle workers), not per-turn threads.
 """
+
+from gateway.notice_style import ContextNotice
 import logging
 import os
 import threading
@@ -349,11 +351,10 @@ def admit_durable_turn_lease(
         nonlocal reload_needed, announced
         reload_needed = announced = True
         agent._emit_status(
-            "⏳ Another Hermes process is using this session; "
+            ContextNotice("⏳ Another Hermes process is using this session; "
             "waiting for it to finish before starting your turn..."
             if elapsed < 1.0 else
-            f"⏳ Still waiting for the other Hermes process on this session ({int(elapsed)}s)..."
-        )
+            f"⏳ Still waiting for the other Hermes process on this session ({int(elapsed)}s)..."))
 
     authority_floor = time.time()  # every acquisition attempt stamps its expiry after this instant
     if not db.acquire_session_turn_lease(
@@ -387,7 +388,7 @@ def admit_durable_turn_lease(
         # raising ends the turn.
         if reload_needed and durable is not False:
             if announced:
-                agent._emit_status("Session is free; loading the latest transcript...")
+                agent._emit_status(ContextNotice("Session is free; loading the latest transcript..."))
             # The holder may have compressed/rotated the session while we waited: reload only
             # AFTER admission; an immediate acquisition skips this (needless prompt-cache miss).
             latest_session_id = db.resolve_resume_session_id(session_id)

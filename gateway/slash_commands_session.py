@@ -6,6 +6,8 @@ the import cycle."""
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import asyncio
 import contextlib
 import dataclasses
@@ -1178,7 +1180,7 @@ class GatewaySessionCommandsMixin:
             return denied
         current_entry = await self.async_session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
-            return t("gateway.resume.already_on", name=name)
+            return ContextNotice(t("gateway.resume.already_on", name=name))
         self._release_running_agent_state(session_key)
         async with self._session_model_override_lock(session_key):
             new_entry = await self.async_session_store.switch_session(
@@ -1209,13 +1211,13 @@ class GatewaySessionCommandsMixin:
         if source.platform == Platform.MATRIX and allow_cross_room:
             msg_part = t("gateway.resume.msg_count_one" if msg_count == 1 else "gateway.resume.msg_count_other",
                          count=msg_count) if msg_count else ""
-            return t("gateway.resume.matrix_cross_room_success", title=title,
-                     room=source.chat_name or source.chat_id, msg_part=msg_part)
+            return ContextNotice(t("gateway.resume.matrix_cross_room_success", title=title,
+                     room=source.chat_name or source.chat_id, msg_part=msg_part))
         if not msg_count:
-            return t("gateway.resume.resumed_no_count", title=title)
+            return ContextNotice(t("gateway.resume.resumed_no_count", title=title))
         if msg_count == 1:
-            return t("gateway.resume.resumed_one", title=title, count=msg_count)
-        return t("gateway.resume.resumed_many", title=title, count=msg_count)
+            return ContextNotice(t("gateway.resume.resumed_one", title=title, count=msg_count))
+        return ContextNotice(t("gateway.resume.resumed_many", title=title, count=msg_count))
 
     def _resume_listing_reply(self, source, titled: list[dict], allow_all: bool) -> str:
         """Numbered /resume list; a non-admin ``--all`` falls back to same-origin scoping and says so

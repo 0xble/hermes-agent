@@ -7,6 +7,8 @@ re-prompt, scaffolding pop, stop gates, then the durable final flush. Extracted 
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 from dataclasses import dataclass
 import logging
 from typing import Any, Dict, Optional
@@ -371,9 +373,8 @@ def finish_text_response(
             agent._dropped_toolcall_retries, agent.model, agent.provider,
         )
         agent._emit_diagnostic_status(
-            "↻ Model signaled a tool call but sent none — "
-            f"re-prompting ({agent._dropped_toolcall_retries}/3)"
-        )
+            ContextNotice("↻ Model signaled a tool call but sent none — "
+            f"re-prompting ({agent._dropped_toolcall_retries}/3)"))
         # Both halves of the re-prompt pair are ephemeral scaffolding: never persisted,
         # and the finalization pop strips an unanswered tail pair.
         final_msg["_dropped_toolcall_nudge"] = True

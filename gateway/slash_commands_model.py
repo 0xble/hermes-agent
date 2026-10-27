@@ -8,6 +8,8 @@ the import cycle.
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import asyncio
 import contextlib
 import dataclasses
@@ -496,7 +498,8 @@ class GatewayModelCommandsMixin:
                 reply += "\n" + await self._apply_reasoning_selection_off_loop(
                     ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
                     persist_global=ctx.persist_global and global_error is None)
-        return reply + ("\n" + t("gateway.model.local_next_turn") if live is not None else "")
+        reply += ("\n" + t("gateway.model.local_next_turn") if live is not None else "")
+        return ContextNotice(reply) if global_error is None else reply
 
     def _model_switch_context(
         self, source, session_key: str, *, profile_home=None, **fields,
@@ -910,7 +913,7 @@ class GatewayModelCommandsMixin:
 
         async def commit_role():
             await self._set_session_model_role(session_key, role)
-            return t("gateway.model.role_set", role=role)
+            return ContextNotice(t("gateway.model.role_set", role=role))
 
         if route.model:
             ctx = self._model_switch_context(source, session_key, profile_home=profile_home,
@@ -964,7 +967,7 @@ class GatewayModelCommandsMixin:
                 return t("gateway.model.attended_migrated", converted=len(converted),
                          failures=len(failures), detail=detail)
             count = await self._reset_all_session_overrides()
-            return t("gateway.model.reset_all_done", count=count)
+            return ContextNotice(t("gateway.model.reset_all_done", count=count))
         if request.target.strip() == "@" or preset_ref_name(request.target):
             return await self._handle_model_role_command(event, request, source, session_key, profile_home)
 
@@ -990,7 +993,7 @@ class GatewayModelCommandsMixin:
             self._session_model_overrides.pop(session_key, None)
             conversation.model_override_scope = "session"
             self._evict_cached_agent(session_key)
-            return t("gateway.model.reset_done")
+            return ContextNotice(t("gateway.model.reset_done"))
         requested_global = request.is_global
         effective_global = resolve_persist_behavior(
             request.is_global, request.is_session, is_once=request.is_once,
@@ -1157,7 +1160,8 @@ class GatewayModelCommandsMixin:
                 self._evict_cached_agent(self._session_key_for_source(event.source))
             except Exception:
                 logger.debug("could not evict cached agent after codex-runtime change", exc_info=True)
-        return f"{'✓' if result.success else '✗'} {result.message}"
+        reply = f"{'✓' if result.success else '✗'} {result.message}"
+        return ContextNotice(reply) if result.success and new_value is not None else reply
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality — list or set a personality (hermes_cli.personality owns the state)."""
@@ -1196,8 +1200,8 @@ class GatewayModelCommandsMixin:
         if not persist_personality(name):
             return t("gateway.personality.save_failed", error=t("gateway.personality.err_config_write"))
         if not name:
-            return t("gateway.personality.cleared")
-        return t("gateway.personality.set_to", name=name)
+            return ContextNotice(t("gateway.personality.cleared"))
+        return ContextNotice(t("gateway.personality.set_to", name=name))
 
     # ----------------------------------------------------------- /reasoning, /fast
 
@@ -1268,13 +1272,13 @@ class GatewayModelCommandsMixin:
                 live.show_reasoning = show  # what this local session's viewers stream (config.get show_reasoning)
             self._save_gateway_config_key(f"display.platforms.{platform_key}.show_reasoning", show)
             key = "gateway.reasoning.display_set_on" if show else "gateway.reasoning.display_set_off"
-            return t(key, platform=platform_key)
+            return ContextNotice(t(key, platform=platform_key))
         if value == "reset":
             if persist_global:
                 return t("gateway.reasoning.reset_global_unsupported")
             self._set_reasoning_override(session_key, None)
             self._reasoning_config = self._load_reasoning_config()
-            return t("gateway.reasoning.reset_done")
+            return ContextNotice(t("gateway.reasoning.reset_done"))
 
         parsed = parse_reasoning_effort(value)
         if parsed is None:
@@ -1296,11 +1300,11 @@ class GatewayModelCommandsMixin:
                         "gateway.reasoning.preset_owns_effort",
                         preset="@" + route.name, preset_effort=route.reasoning_effort, effort=value,
                     )
-                return reply
+                return ContextNotice(reply)
             self._set_reasoning_override(session_key, parsed)
             return t("gateway.reasoning.set_global_save_failed", effort=value)
         self._set_reasoning_override(session_key, parsed, scope=scope)
-        return t("gateway.reasoning.set_session", effort=value)
+        return ContextNotice(t("gateway.reasoning.set_session", effort=value))
 
     async def _try_send_choice_picker(
         self, event: MessageEvent, session_key: str, title: str, choices: list, on_choice_selected,
@@ -1454,11 +1458,11 @@ class GatewayModelCommandsMixin:
             else:
                 self._set_session_service_tier_override(session_key, None, clear=True)  # global wins
             self._apply_live_service_tier(session_key, tier)
-            return t("gateway.fast.saved", label=label) + self._fast_route_ignored_note(session_key, tier)
+            return ContextNotice(t("gateway.fast.saved", label=label) + self._fast_route_ignored_note(session_key, tier))
         # Session override — also the fallback after a failed config write (as /reasoning --global).
         self._set_session_service_tier_override(session_key, tier)
         self._apply_live_service_tier(session_key, tier)
-        return t("gateway.fast.session_only", label=label) + self._fast_route_ignored_note(session_key, tier)
+        return ContextNotice(t("gateway.fast.session_only", label=label) + self._fast_route_ignored_note(session_key, tier))
 
     def _fast_route_ignored_note(self, session_key: str, tier: str | None) -> str:
         """A warning when the session's route never receives fast-mode params (a proxy): /fast is
@@ -1514,7 +1518,10 @@ class GatewayModelCommandsMixin:
             return reply + ("\n\n" + expiry_notice if expiry_notice else "")
         if args and args != "status":
             reply = self._apply_fast_selection(session_key, args, persist=persist_global)
-            return (expiry_notice + "\n\n" + reply) if expiry_notice else reply
+            if expiry_notice:
+                combined = expiry_notice + "\n\n" + reply
+                return ContextNotice(combined) if getattr(reply, "notice_style", None) == "context" else combined
+            return reply
         mode = service_tier_word(self._service_tier)
         status = {"fast": t("gateway.fast.status_fast"), "normal": t("gateway.fast.status_normal")}.get(mode, mode)
         expiry_at, _ = self._session_service_tier_expiry(session_key)

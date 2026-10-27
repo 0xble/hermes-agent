@@ -9,6 +9,8 @@ did and returns a ``CompactionOutcome``. Predicates/estimators that tests patch 
 
 from __future__ import annotations
 
+from gateway.notice_style import ContextNotice
+
 import logging
 import time
 from dataclasses import dataclass
@@ -202,7 +204,7 @@ def _idle_compaction(
         model=agent.model,
     )
     if _idle_status:
-        agent._emit_status(_idle_status)
+        agent._emit_status(ContextNotice(_idle_status))
     out.messages, out.active_system_prompt = agent._compress_context(
         messages, system_message, approx_tokens=_idle_tokens, task_id=effective_task_id, trigger="idle",
     )
@@ -414,7 +416,7 @@ def _run_preflight_passes(
         model=agent.model,
     )
     if _preflight_status:
-        agent._emit_status(_preflight_status)
+        agent._emit_status(ContextNotice(_preflight_status))
     _max_preflight_passes = max(1, int(getattr(agent, "max_compression_attempts", 3) or 3))
     for _pass in range(_max_preflight_passes):
         _preflight_input = out.messages

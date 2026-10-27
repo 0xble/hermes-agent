@@ -413,6 +413,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
+        from gateway.notice_style import notice_metadata
+        metadata = notice_metadata(metadata, platform=source.platform, style=getattr(message, "notice_style", None))
         from gateway.platforms.base import outbound_class
         try:
             with outbound_class(_goal_notice_outbound_class(message, notice_kind)):
@@ -603,8 +605,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             if mgr is None:
                 return
             try:
+                from gateway.notice_style import ContextNotice
                 await self._send_goal_status_notice(
-                    source, f"▶ Goal resumed: {mgr.state.goal}", notice_kind="resumed",
+                    source, ContextNotice(f"▶ Goal resumed: {mgr.state.goal}"), notice_kind="resumed",
                 )
             except Exception as exc:
                 logger.debug("goal recovery notice failed: %s", exc)

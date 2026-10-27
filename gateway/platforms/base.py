@@ -1845,11 +1845,18 @@ class CommandReply(str):
     """Gateway-authored reply (slash-command output), not agent output. Bare local paths in it
     stay text: a goal or title that names ``~/plan.md`` must not upload that file. Explicit
     ``MEDIA:`` tags still deliver."""
+    notice_style: Optional[str] = None
 
 
 def as_command_reply(value: Any) -> Any:
     """Mark a plain-string handler result as :class:`CommandReply`; other values pass through."""
-    return CommandReply(value) if type(value) is str else value
+    if isinstance(value, CommandReply):
+        return value
+    if type(value) is str or (isinstance(value, str) and getattr(value, "notice_style", None) == "context"):
+        reply = CommandReply(value)
+        reply.notice_style = getattr(value, "notice_style", None)
+        return reply
+    return value
 
 
 class EphemeralReply(CommandReply):
@@ -1862,6 +1869,7 @@ class EphemeralReply(CommandReply):
     def __new__(cls, text: str, ttl_seconds: Optional[int] = None):
         instance = super().__new__(cls, text)
         instance.ttl_seconds = ttl_seconds
+        instance.notice_style = getattr(text, "notice_style", None)
         return instance
 
     @property
@@ -3909,7 +3917,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             ttl = _or_default(lambda: int(self._get_ephemeral_system_ttl_default()), 0, Exception)
         if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
             ttl = 0
-        return response.text, int(ttl or 0)
+        text = response.text
+        if response.notice_style is not None:
+            text = as_command_reply(text)
+            text.notice_style = response.notice_style
+        return text, int(ttl or 0)
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and
@@ -4001,6 +4013,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
+        from gateway.notice_style import notice_metadata
+        metadata = notice_metadata(metadata, platform=self.platform, style=getattr(content, "notice_style", None))
         result = await self._send_with_retry_body(
             chat_id, content, reply_to=reply_to, metadata=metadata,
             max_retries=max_retries, base_delay=base_delay)
@@ -5408,7 +5422,10 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                from gateway.notice_style import notice_metadata
+                _final_thread_metadata = notice_metadata(
+                    _mark_notify_metadata(_thread_metadata), platform=self.platform,
+                    style=getattr(response, "notice_style", None))
                 _tts_paths, _tts_requested_path = [], None
                 _spoken_text = self._spoken_reply_text(extracted)
                 if self._wants_auto_tts(

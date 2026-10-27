@@ -9,6 +9,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.run import GatewayRunner
+import run_agent
+
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
@@ -26,7 +29,6 @@ def _make_event(text="/bg", platform=Platform.TELEGRAM,
 
 def _make_runner():
     """Create a bare GatewayRunner with minimal mocks."""
-    from gateway.run import GatewayRunner
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
     runner._voice_mode = {}
@@ -85,17 +87,18 @@ class TestRunBackgroundTask:
     """Tests for GatewayRunner._run_background_task (the actual execution)."""
 
     @pytest.mark.asyncio
-    async def test_successful_task_sends_result(self):
+    @pytest.mark.parametrize("platform", [Platform.TELEGRAM, Platform.SLACK])
+    async def test_successful_task_sends_result(self, platform):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Hello from background!"))
-        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        runner.adapters[platform] = mock_adapter
 
         source = SessionSource(
-            platform=Platform.TELEGRAM,
+            platform=platform,
             user_id="12345",
             chat_id="67890",
             user_name="testuser",
@@ -113,7 +116,7 @@ class TestRunBackgroundTask:
         }
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
              patch("gateway.run._load_gateway_config", return_value=checkpoint_config), \
-             patch("run_agent.AIAgent") as MockAgent:
+             patch.object(run_agent, "AIAgent") as MockAgent:
             mock_agent_instance = MagicMock()
             mock_agent_instance.shutdown_memory_provider = MagicMock()
             mock_agent_instance.close = MagicMock()
@@ -123,7 +126,10 @@ class TestRunBackgroundTask:
             await runner._run_background_task("say hello", source, "bg_test")
 
         # Should have sent the result
-        mock_adapter.send.assert_called_once()
+        assert mock_adapter.send.await_count == (2 if platform == Platform.SLACK else 1)
+        if platform == Platform.SLACK:
+            assert mock_adapter.send.await_args_list[0].kwargs["metadata"]["notice_style"] == "context"
+            assert "notice_style" not in (mock_adapter.send.await_args_list[1].kwargs["metadata"] or {})
         call_args = mock_adapter.send.call_args
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "Hello from background!" in content
