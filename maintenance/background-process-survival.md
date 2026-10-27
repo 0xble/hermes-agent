@@ -51,6 +51,11 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   expires, and immediately on spawn failure. Directory sweeps are throttled to
   at most once per minute per profile to bound registry-lock IO; in-memory result
   expiry still runs normally. Log polls read only a bounded tail.
+- The owning profile's effective `display.background_process_notifications: off`
+  suppresses gateway process completion turns, including explicit
+  `notify_on_complete=true` watchers. A suppressed survivor settles its delivery
+  marker without admission or a public send, so recovery does not replay it.
+  The retained process result remains available to `process(wait/log)`.
 - `gateway_shutdown` (both restart and an operator gateway stop) leaves opted-in
   processes running. Explicit operator stop paths (`process.kill`, `cli.stop`,
   `slash.stop`, and `process.stop`) still terminate them. This is the D3 operator-stop decision.

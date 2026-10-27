@@ -360,7 +360,7 @@ async def test_survivor_notification_acknowledges_only_successful_gateway_admiss
     registry._finished[session.id] = session
     runner, _ = make_restart_runner()
     runner._completion_event_scope = lambda _: contextlib.nullcontext()
-    runner._load_background_notifications_mode = lambda: "off"
+    runner._load_background_notifications_mode = lambda: "concise"
     runner._launching_turn_active = AsyncMock(return_value=False)
     attempts = []
 
@@ -505,7 +505,7 @@ async def test_survivor_watcher_does_not_admit_completion_claimed_by_live_peer(t
     assert peer._claim_survivor_delivery(peer._finished["proc_peer"]) is True
     runner, _ = make_restart_runner()
     runner._completion_event_scope = lambda _: contextlib.nullcontext()
-    runner._load_background_notifications_mode = lambda: "off"
+    runner._load_background_notifications_mode = lambda: "concise"
     runner._launching_turn_active = AsyncMock(return_value=False)
     admitted = []
     runner._enqueue_process_completion_notification = AsyncMock(side_effect=lambda *a, **k: admitted.append(a) or True)
@@ -524,8 +524,9 @@ async def test_survivor_watcher_does_not_admit_completion_claimed_by_live_peer(t
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["concise", "off"])
-async def test_survivor_text_watcher_acknowledges_after_presenting(tmp_path, monkeypatch, mode):
-    """The text-only watcher claims before sending and settles the claim after it."""
+@pytest.mark.parametrize("notify", [False, True])
+async def test_survivor_watcher_acknowledges_after_presenting_or_suppressing(tmp_path, monkeypatch, mode, notify):
+    """Both delivery paths settle once, including notifications deliberately suppressed by off."""
     import contextlib
     from tools.process_registry import ProcessRegistry, ProcessSession
     import tools.process_registry as registry_module
@@ -543,14 +544,19 @@ async def test_survivor_text_watcher_acknowledges_after_presenting(tmp_path, mon
     runner, _ = make_restart_runner()
     runner._completion_event_scope = lambda _: contextlib.nullcontext()
     runner._load_background_notifications_mode = lambda: mode
+    runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
+    runner._launching_turn_active = AsyncMock(return_value=False)
     sent = []
 
     async def send(*args):
         sent.append(json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["state"])
 
     runner._send_watcher_message = send
-    await runner._run_process_watcher({"session_id": "proc_text", "check_interval": 0.01})
-    assert sent == ([] if mode == "off" else ["claimed"])
+    await runner._run_process_watcher({
+        "session_id": "proc_text", "check_interval": 0.01, "notify_on_complete": notify,
+    })
+    assert sent == ([] if mode == "off" or notify else ["claimed"])
+    assert runner._enqueue_process_completion_notification.await_count == int(mode != "off" and notify)
     assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
 
 
