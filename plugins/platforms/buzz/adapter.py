@@ -856,6 +856,13 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Buzz has no typing indicator API — no-op."""
 
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        try:
+            return await self.send_reaction(chat_id, message_id, emoji)
+        except Exception as exc:
+            logger.debug("Buzz: reaction add failed: %s", exc, exc_info=True)
+            return False
+
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Best-effort reaction via buzz-cli; failures are logged, never raised."""
         if not self.cli_path or not emoji or not message_id:

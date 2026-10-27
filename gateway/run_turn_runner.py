@@ -84,21 +84,6 @@ _LEDGER_PASSTHROUGH_KEYS = (
 )
 
 
-def _settle_api_runtime_lock(agent, result, captured):
-    """Settle a confirmed API runtime lock against the runtime that served the turn."""
-    from gateway.session_api_turn import api_runtime_locked
-    api = api_runtime_locked()
-    if api is None or not isinstance(result, dict):
-        return
-    settings = api["settings"]
-    try:
-        captured["usage"]["runtime"] = api["adapter"]._turn_runtime_metadata(
-            agent, route=settings.get("route"), requested_runtime=settings.get("requested_runtime"),
-            route_source=settings.get("route_source") or "", confirmed_runtime_lock=True)
-    except RuntimeError as exc:
-        result.update(final_response="", failed=True, completed=False, error=str(exc))
-
-
 def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
     """True when the adapter class renders native approval buttons. BasePlatformAdapter subclasses
     say so through ``supports_exec_approval_buttons``; anything else (test doubles, relay-style
@@ -1719,18 +1704,23 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             if persist_id is not None:
                 kwargs["persist_user_platform_id"] = str(persist_id)
             from agent.notification_presentation import notification_turn
+            from gateway.session_context import (
+                current_message_reaction_acknowledged, reaction_acknowledgement, scoped_turn_message,
+            )
             from gateway.session_results import execution_result
             captured = execution_result.get()
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx):
+            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx), scoped_turn_message(ctx.source, ctx.inbound_message_id or getattr(ctx.source, "message_id", None)), reaction_acknowledgement():
                 result = agent.run_conversation(api_message, **kwargs)
+                result["acknowledged_by_reaction"] = current_message_reaction_acknowledged()
             if captured is not None:
                 incoming = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
                 outgoing = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
                 captured['usage'] = {'input_tokens': incoming, 'output_tokens': outgoing,
                                      'total_tokens': incoming + outgoing}
-                _settle_api_runtime_lock(agent, result, captured)
+                from gateway.session_api_turn import settle_api_runtime_lock
+                settle_api_runtime_lock(agent, result, captured)
             return result
         finally:
             unregister_gateway_notify(session_key)
@@ -2110,6 +2100,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "recovered_reply": result.get("recovered_reply", False),
+            "acknowledged_by_reaction": result.get("acknowledged_by_reaction", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
             # The returned `messages` replaced the transcript, so a stored receipt keeps it whole.

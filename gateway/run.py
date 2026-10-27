@@ -3248,6 +3248,9 @@ def _normalize_empty_agent_response(
         if api_calls == 0:
             return t("gateway.errors.interrupted_before_start")
         return response
+    from gateway.response_filters import reaction_answered
+    if reaction_answered(agent_result):
+        return response
     if api_calls > 0:
         # Hidden-reasoning-only retry exhaustion: the loop's sentinel text ("Codex response remained
         # incomplete after 3 continuation attempts") doubles as final_response, so it would be delivered
@@ -3459,10 +3462,6 @@ class GatewayRunner(
     GatewaySessionControlsMixin, GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin,
     GatewayBackgroundAdmissionMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
-
-    def _adapter_for_source(self, source):
-        """Return the delivery adapter that owns a session source."""
-        return self._delivery_adapter_for(source)
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
     _busy_input_mode: str = "interrupt"
