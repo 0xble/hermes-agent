@@ -891,13 +891,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 meta = replace(refreshed, origin=page_origin, allowed_origins=(page_origin,))
         if decision != "accept":
             assert retry_key is not None
-            _payment_retry_blocked(retry_key, refuse=True)
             _discard_fill_metadata()
-            return json.dumps({"success": False,
-                               "error_type": "payment_declined" if decision == "decline" else "payment_prompt_unanswered",
-                               "error": ("The user declined this payment card." if decision == "decline" else
-                                         "The payment card prompt went unanswered.") +
-                                        " Do not retry; hand card entry to the user."})
+            return _payment_fill_refusal(decision, retry_key)
         inspected = _inspect_page()
         if isinstance(inspected, str):
             _discard_fill_metadata()
@@ -1050,17 +1045,33 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     return json.dumps(out)
 
 
+def _payment_fill_refusal(decision: str, retry_key: tuple[str, str, str]) -> str:
+    if decision == "unavailable":
+        return json.dumps({"success": False, "error_type": "approval_unavailable", "error": (
+            "The payment approval channel is unavailable. No user decision was received and nothing was written. "
+            "Do not retry in this background task. Route the fill to the active top-level turn for fresh approval.")})
+    _payment_retry_blocked(retry_key, refuse=True)
+    return json.dumps({"success": False,
+                       "error_type": "payment_declined" if decision == "decline" else "payment_prompt_unanswered",
+                       "error": ("The user declined this payment card." if decision == "decline" else
+                                 "The payment card prompt went unanswered.") +
+                                " Do not retry; hand card entry to the user."})
+
+
 def _confirm_payment_fill(label: str, origin: str) -> str:
     """Human confirmation before a card is written into a page: a prompt injection that reaches a checkout
     must not be able to spend. Routes through the approval surface of the active session (gateway button
     round-trip or CLI panel); headless sessions cannot confirm and the fill is refused."""
-    from tools.approval_prompt import request_elicitation_consent
+    from tools.approval_prompt import ApprovalUnavailable, request_elicitation_consent
 
-    return request_elicitation_consent(
-        f"Fill payment card '{label}' on {origin}",
-        "The agent wants to enter your saved card details into this checkout page. The card number and "
-        "CVC never enter the conversation. Approve only if you intend to pay here.",
-        surface="vault-payment", title="Confirm payment card fill?")
+    try:
+        return request_elicitation_consent(
+            f"Fill payment card '{label}' on {origin}",
+            "The agent wants to enter your saved card details into this checkout page. The card number and "
+            "CVC never enter the conversation. Approve only if you intend to pay here.",
+            surface="vault-payment", title="Confirm payment card fill?")
+    except ApprovalUnavailable:
+        return "unavailable"
 
 
 def _alias_fill_revalidation_refusal(raw_meta: Any, page_origin: str) -> str | None:
