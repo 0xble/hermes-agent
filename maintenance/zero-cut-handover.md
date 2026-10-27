@@ -33,10 +33,12 @@ remains unchanged.
 
 Stop and settle every served Telegram adapter, including secondary profile bots.
 Join PTB's unfinished update queue because a dequeued update need not have entered
-the concurrent processor yet. Also join existing batch and held-redispatch tasks:
-text, photo and album dictionaries are popped before identity recovery or dispatch
-finishes. Adapter session guards count as outstanding work even before the runner
-has claimed an agent slot and while it delivers a final or starts a follow-up.
+the concurrent processor yet. Also join existing batch and held-redispatch tasks,
+including `_committed_flush_tasks` in both drain and failed-handover recovery:
+text, photo and album tasks leave their pending maps at the pop, before identity
+recovery or dispatch finishes. Adapter session guards count as outstanding work
+even before the runner has claimed an agent slot and while it delivers a final
+or starts a follow-up.
 Those old-owner tasks may finish after token transfer without being mistaken for
 fresh external admissions. Use the existing `_polling_teardown_started` fence while
 stopping polling, without setting the delayed-delivery drop guard. Otherwise 2
