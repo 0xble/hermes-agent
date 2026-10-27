@@ -42,6 +42,9 @@ def _goal_receipt_text(function_name: str, result: Any) -> str:
         return ""
     try:
         from hermes_cli.config import load_config_readonly
+        from hermes_cli.goal_notices import goal_notices_enabled
+        if function_name == "goal_set" and not goal_notices_enabled():
+            return ""
         config = load_config_readonly()
         if not (config.get(receipt_spec["config_section"]) or {}).get(receipt_spec["config_key"], True):
             return ""
