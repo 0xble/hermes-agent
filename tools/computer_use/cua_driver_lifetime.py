@@ -221,9 +221,9 @@ def driver_executables() -> set[str]:
     """Exact cua-driver binaries this user can have launched. Empty if none resolve."""
     found: set[str] = set()
     candidates = [_APP_BINARY, os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip()]
-    which = _which("cua-driver")
-    if which:
-        candidates.append(which)
+    selected = _selected_driver()
+    if selected:
+        candidates.append(selected)
     home_tools = os.path.expanduser("~/.hermes/tools")
     if os.path.isdir(home_tools):
         try:
@@ -243,9 +243,13 @@ def driver_executables() -> set[str]:
     return found
 
 
-def _which(name: str) -> str | None:
-    import shutil
-    return shutil.which(name)
+def _selected_driver() -> str | None:
+    # The PM-selected (or explicitly overridden) binary is the one Hermes launches.
+    try:
+        from tools.computer_use.cua_backend_driver import resolve_cua_driver_cmd
+        return resolve_cua_driver_cmd()
+    except Exception:
+        return None
 
 
 def default_temp_dirs() -> list[str]:
@@ -253,15 +257,14 @@ def default_temp_dirs() -> list[str]:
     if sys.platform == "darwin":
         try:
             out = subprocess.check_output(
-                ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], text=True, timeout=2, stderr=subprocess.DEVNULL,
+                ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], text=True, timeout=2, stdin=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             ).strip()
         except (OSError, subprocess.SubprocessError):
             out = ""
         if out:
             dirs.append(out)
     dirs.append(__import__("tempfile").gettempdir())
-    if os.path.isdir("/tmp"):
-        dirs.append("/tmp")
     unique: list[str] = []
     seen: set[str] = set()
     for raw in dirs:
