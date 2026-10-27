@@ -13,7 +13,7 @@ Sizing (community envelopes; Telegram publishes none and escalates repeat offenc
 ========  ===========  =======  ==========  ===========================
 class     ceiling/min  target   base gap    typing gap (share of gap)
 ========  ===========  =======  ==========  ===========================
-private   ~60          45/min   1.33s       4.0s (<=15/min of the 45)
+private   ~60          45/min   1.33s       4.5s (chat-wide cadence)
 group     ~20          15/min   4.0s        12.0s (<=5/min of the 15)
 ========  ===========  =======  ==========  ===========================
 
@@ -52,9 +52,9 @@ GROUP_CEILING_PER_MIN = 20.0
 HEADROOM = 0.75
 PRIVATE_GAP_SECS = 60.0 / (PRIVATE_CEILING_PER_MIN * HEADROOM)
 GROUP_GAP_SECS = 60.0 / (GROUP_CEILING_PER_MIN * HEADROOM)
-# Typing is a decaying ~5s lease rendered per thread; one chat-wide refresh every 4s keeps a single
-# active thread's bubble alive while capping the indicator at a third of the chat's budget.
-PRIVATE_TYPING_GAP_SECS = 4.0
+# Typing is a decaying ~5s lease rendered per thread. All turns and topics in a chat share
+# one 4.5s cadence, including post-send re-arms that fire between regular refreshes.
+PRIVATE_TYPING_GAP_SECS = 4.5
 GROUP_TYPING_GAP_SECS = 12.0
 # An interim edit or draft carries only the latest state, so spacing it costs a reader nothing:
 # superseded previews never fire faster than this per chat. Progress producers are tuned to it.
