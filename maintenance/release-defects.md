@@ -19,6 +19,32 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 `production-unused-imports` is a mechanical fork-only hygiene patch. Ruff's `F401` check is the guard for the four removed imports in `agent/agent_init.py`, `agent/codex_runtime.py`, and `agent/memory_manager.py`; retire this record if the imports return or upstream carries the equivalent cleanup.
 
+## Post-Install Admission Canary
+
+- Fork patch identity: `post-install-admission-canary`.
+- A healthy process identity does not prove native ingress works. After release
+  acknowledgement, update and guardian share a bounded refusal canary and the
+  existing guardian rollback, reload and previous-release health proof. Failure
+  persists counts, the dominant refusal clause and rollback health in a guardian
+  receipt, and fails the updater without sending chat notifications.
+- `gateway.guardian.admission_canary` defaults to `enabled: true`,
+  `window_seconds: 180` (10–300) and `refusal_threshold: 10` (5–1000).
+  10 refusals in 3 minutes catches broken ingress without treating isolated
+  invalid input or a quiet gateway as failure. `enabled: false` disables it.
+- `gateway.admission_canary.record_refusal` owns bounded, timestamped, content-free
+  runtime-status evidence. The authority's `admit_native` and `admit_automation`
+  boundaries count each refused attempt once with its source, reason and clause,
+  including internal wakes and suppressed user notices. Receipt-only producer
+  scope also covers pre-admission authorization, codec preparation and retry
+  conflicts. Nested scopes count once per task without suppressing later tasks.
+  Codec, gate and ledger refusals share this hook, not the deduplicated
+  presentation/logging paths.
+  Only events from the acknowledged PID/code identity within the post-ack window
+  count. `release-admission-canary.json` retains the terminal result across the
+  rollback, and the shared guardian lock prevents duplicate rollback attempts.
+- Guards: `tests/hermes_cli/test_admission_canary.py`,
+  `tests/gateway/test_admission_canary.py`, and existing guardian/release tests.
+
 ## Billing outage persistence and provider-wide classification
 
 - Fork patch identity: `billing-outage-recovery`.

@@ -16,6 +16,7 @@ import time
 import uuid
 import hermes_yaml as yaml
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
@@ -246,9 +247,43 @@ def _refuse_leftovers_before_launch(home: Path, deadline: float | None = None) -
     refuse_if_forward_only_leftovers(home, timeout_for=lambda cap: _bounded_timeout(cap, deadline))
 
 
+def _recover_switch(home: Path, plist: Path, label: str, current: Path,
+                    paths: ReleasePaths, switch: dict, canary: dict | None,
+                    domain: str, deadline: float) -> str:
+    from hermes_cli import admission_canary
+    from hermes_cli.immutable_releases import _verify_transaction
+    old = Path(switch["previous_intended"])
+    if (old != paths.previous.resolve() or old == current or old.parent != paths.releases.resolve() or
+            not _release_is_ready(old, old.name)):
+        receipt(home, "rollback", "alert", reason="previous release is not intact", candidate=str(current))
+        if canary is not None:
+            admission_canary.finish_rollback(home, canary, False)
+        return "alert"
+    if (home / "release-txn.json").exists():
+        _verify_transaction(paths, switch)
+    if _repair_count(home) >= MAX_REPAIRS:
+        receipt(home, "rollback", "capped", candidate=str(current))
+        if canary is not None:
+            admission_canary.finish_rollback(home, canary, False)
+        return "capped"
+    _refuse_leftovers_before_launch(home, deadline)
+    if canary is not None:
+        canary = admission_canary.save(home, canary, outcome="rolling_back", previous=str(old))
+    receipt(home, "rollback", "attempt", candidate=str(current), previous=str(old))
+    try:
+        ok = rollback_switch(home, plist, label, old, domain=domain, deadline=deadline)
+    except Exception:
+        if canary is not None:
+            admission_canary.finish_rollback(home, canary, False)
+        raise
+    receipt(home, "rollback", "rolled_back" if ok else "failed", candidate=str(current), previous=str(old))
+    if canary is not None:
+        admission_canary.finish_rollback(home, canary, ok)
+    return "rolled_back" if ok else "failed"
+
+
 def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
          deadline: float | None = None) -> str:
-    from hermes_cli.immutable_releases import _verify_transaction
     deadline = deadline or time.monotonic() + STARTUP_SECONDS
     if intent_path(home).exists():
         return "stopped"
@@ -272,32 +307,27 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     switch_state, switch = _switch(home, grace=grace)
     if switch_state == "waiting":
         return "waiting"
+    from hermes_cli import admission_canary
+    canary_status, canary_switch, canary = admission_canary.inspect(home)
+    canary_trip = canary_status in {"tripped", "rolling_back"}
+    if canary_trip:
+        switch = canary_switch
     domain = _gateway_domain(label, domain, deadline=deadline)
     state = _launch_state(domain, label, deadline=deadline)
-    if state == "loaded" and healthy(home, label, current, deadline):
+    if not canary_trip and state == "loaded" and healthy(home, label, current, deadline):
         pending = home / "release-txn.json"
         if pending.exists():
             record = json.loads(pending.read_text(encoding="utf-8-sig"))
             if record.get("operation") in {"rollback", "first-migration-rollback"}:
                 from hermes_cli.immutable_releases import acknowledge_running_release
                 acknowledge_running_release(home, probe_timeout=_bounded_timeout(10, deadline))
+        previous_canary = admission_canary.read_state(home)
+        if previous_canary.get("outcome") == "rolling_back" and previous_canary.get("previous") == str(current):
+            admission_canary.finish_rollback(home, previous_canary, True)
         return "healthy"
     if switch:
-        old = Path(switch["previous_intended"])
-        if (old != paths.previous.resolve() or old == current or old.parent != paths.releases.resolve() or
-                not _release_is_ready(old, old.name)):
-            receipt(home, "rollback", "alert", reason="previous release is not intact", candidate=str(current))
-            return "alert"
-        if (home / "release-txn.json").exists():
-            _verify_transaction(paths, switch)
-        if _repair_count(home) >= MAX_REPAIRS:
-            receipt(home, "rollback", "capped", candidate=str(current))
-            return "capped"
-        _refuse_leftovers_before_launch(home, deadline)
-        receipt(home, "rollback", "attempt", candidate=str(current), previous=str(old))
-        ok = rollback_switch(home, plist, label, old, domain=domain, deadline=deadline)
-        receipt(home, "rollback", "rolled_back" if ok else "failed", candidate=str(current), previous=str(old))
-        return "rolled_back" if ok else "failed"
+        return _recover_switch(home, plist, label, current, paths, switch,
+                               canary if canary_trip else None, domain, deadline)
     if state == "loaded":
         return "waiting"  # KeepAlive may be bringing up a registered job.
     if _repair_count(home) >= MAX_REPAIRS:
@@ -339,16 +369,28 @@ def _repair_count(home: Path) -> int:
     return count
 
 
-def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
-             domain: str | None = None) -> str:
+@contextmanager
+def inspection_lock(home: Path):
     import fcntl
-    home = Path(home)
     directory = home / "logs/guardian"
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "guardian.lock").open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            yield False
+        else:
+            try:
+                yield True
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
+             domain: str | None = None, deadline: float | None = None) -> str:
+    home = Path(home)
+    with inspection_lock(home) as acquired:
+        if not acquired:
             return "locked"
         try:
             # Stopped intent is authoritative and must short-circuit config loading: a
@@ -374,8 +416,13 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                 grace = (config.get("updates") or {}).get(
                     "release_acknowledgement_timeout_seconds", 180.0)
             assert grace is not None
-            return _run(home, Path(plist), label, grace=float(grace), domain=domain)
+            return _run(home, Path(plist), label, grace=float(grace), domain=domain,
+                        deadline=min(deadline, time.monotonic() + ROLLBACK_SECONDS) if deadline is not None else None)
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError, yaml.YAMLError) as exc:
+            from hermes_cli import admission_canary
+            canary = admission_canary.read_state(home)
+            if canary.get("outcome") in {"tripped", "rolling_back"}:
+                admission_canary.finish_rollback(home, canary, False)
             receipt(home, "inspect", "alert", reason=str(exc))
             return "alert"
 

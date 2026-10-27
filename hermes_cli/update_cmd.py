@@ -335,6 +335,8 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
                                     "inspect the launchd label and recorded plist; if no process starts, "
                                     "repair the service explicitly under operator control")
                 return False
+        from hermes_cli.admission_canary import observe as observe_admission_canary
+        observe_admission_canary(home, candidate)
         from hermes_cli.update_receipt import record_release_transition
         previous = result["previous"]
         from_sha = _previous_release_sha(paths, previous)
@@ -351,7 +353,11 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
         return True
     except Exception as exc:
         _record_update_step("immutable_release", False, str(exc))
-        logger.exception("Immutable release staging or activation failed; inspect current pointer and migration journal")
+        from hermes_cli.admission_canary import AdmissionCanaryError
+        if isinstance(exc, AdmissionCanaryError):
+            print(f"✗ {exc}")
+        else:
+            logger.exception("Immutable release staging or activation failed; inspect current pointer and migration journal")
         return False
 
 

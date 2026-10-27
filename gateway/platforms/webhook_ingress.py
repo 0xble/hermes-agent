@@ -38,7 +38,8 @@ async def producer_scope(adapter, event):
         _refuse_parked(runner, getattr(source, 'profile', None) or profile)
     if authority is None:
         raise RuntimeStoreError('profile_mismatch')
-    with native_callback(runner, event, home, profile):
+    from gateway.admission_canary import refusal_evidence
+    with refusal_evidence('native'), native_callback(runner, event, home, profile):
         async with _async_profile_runtime_scope(runtime_home):
             yield authority
 
