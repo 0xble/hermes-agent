@@ -43,6 +43,19 @@ acceptance of the design. Reassess this divergence before adopting upstream work
   replacing any bytes, including `config set --force`, `save_config`, and schema
   migrations. A preset plus inline route fields must fail without changing the
   file or stamping a newer schema version.
+- Every managed atomic config write admits the final serialized bytes through the complete
+  runtime normalization/defaults/preset/managed-overlay pipeline. `--force` cannot bypass it.
+  The shared auth advisory-lock primitive serializes writers by resolved path, including CLI
+  read-modify-write cycles. Raw and expanded snapshots carry an out-of-band revision and reject
+  stale rollbacks. A final revision check catches external edits during serialization.
+- Good backups and in-memory last-good state accept only semantic successes. Recovery scans
+  past invalid good snapshots and expands the first valid authored candidate. Snapshot copying
+  uses the exact admitted bytes, not a later reread of the source path.
+- `config get --raw` means authored YAML, without defaults, overlay or expansion. Keep
+  `--raw --expanded` for the historical unmasked runtime view. `.env` routing stays unchanged.
+- Guard: `tests/hermes_cli/test_config_write_transactions.py` covers force/unset/save and
+  low-level writers, byte preservation, stale expanded/raw/missing-file snapshots, 2-process
+  contention, lock ownership, external edits, valid-only retention and real raw CLI output.
 - Guard: `tests/hermes_cli/test_config_write_guards.py` exercises raw round-trip,
   every conflicting delegation field through the CLI setter, all shared writers,
   and an invalid schema-step result.
