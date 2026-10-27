@@ -114,3 +114,30 @@ def test_archive_payload_repair_pages_stay_bounded(tmp_path, monkeypatch, named)
         db._execute_write(lambda conn: db._reconcile_display_orders(conn, "s"))
         assert [tuple(r) for r in db._conn.execute(
             "SELECT id, display_identity, display_order FROM messages ORDER BY id")] == result
+
+
+def test_payload_budget_makes_progress_with_oversized_and_sparse_rows(tmp_path):
+    from hermes_state_display_fold import _payload_page, _stale_payload_rows, _PAYLOAD_PAGE_BYTES
+
+    contents = ["small", "\x00" * 1_200_000, "b" * 400_000, "c" * 400_000, "d" * 400_000]
+    with closing(SessionDB(tmp_path / "payload.sqlite")) as db:
+        db.create_session("s", source="test")
+        db.append_messages_batch("s", [
+            {"role": "assistant", "content": content, "timestamp": 1.7e9 + i}
+            for i, content in enumerate(contents)])
+        conn = db._conn
+        expected = list(conn.execute("SELECT id, content FROM messages ORDER BY id"))
+        ids = [row["id"] for row in expected]
+        got = []
+        last_id = 0
+        while True:
+            page = _payload_page(conn, "session_id = ? AND id > ?", ("s", last_id))
+            if not page:
+                break
+            assert len(page) == 1 or sum(len(row["content"].encode()) for row in page) <= _PAYLOAD_PAGE_BYTES
+            got.extend((row["id"], row["content"]) for row in page)
+            last_id = page[-1]["id"]
+        assert got == [tuple(row) for row in expected]
+        # Stale ids can come from an unordered preimage scan and can contain vanished ids.
+        stale = list(_stale_payload_rows(conn, [ids[-1], 10_000, *reversed(ids[:-1])]))
+        assert [(row["id"], row["content"]) for row in stale] == got
