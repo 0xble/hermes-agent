@@ -82,6 +82,9 @@ VALID_BUSY_POLICIES: frozenset[str] = frozenset({"dispatch", "reject", "interrup
 
 COMMAND_REGISTRY: list[CommandDef] = [
     # Session
+    CommandDef("incognito", "Toggle RAM-only private history for this topic", "Session",
+               gateway_only=True, args_hint="[on|off|status]", subcommands=("on", "off", "status"),
+               busy_policy="dispatch", desktop="messaging"),
     CommandDef("start", "Acknowledge platform start pings without a reply", "Session",
                gateway_only=True, busy_policy="dispatch", busy_handler="start"),
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",

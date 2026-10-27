@@ -232,6 +232,10 @@ class GatewaySessionCommandsMixin:
                 await self._run_in_executor_with_context(retire)
             await _retire_old_controls()
         await self._cleanup_old_agent_for_reset(session_key)
+        getattr(self, "_incognito_gateway_snapshots", {}).pop(session_key, None)
+        parked = getattr(self, "_incognito_parked_agents", {}).pop(session_key, None)
+        if parked is not None:
+            self._release_evicted_cached_agents([parked])
         self._evict_cached_agent(session_key)
         # Conversation boundary: ALL conversation-scoped per-session state + security state in one
         # funnel call (see _CONVERSATION_SCOPED_STATE in gateway/run.py).
@@ -836,9 +840,13 @@ class GatewaySessionCommandsMixin:
         makes the NEW session durable (already published, else rewritten) so the original stays searchable;
         persist BEFORE repointing so a failed write is fatal and old history stays reachable.
         In-place compaction already archived + inserted rows, and a rewrite would DELETE the
-        archive; an unchanged id without in-place means rotation FAILED."""
+        archive; an unchanged id without in-place means rotation FAILED. Incognito
+        deliberately keeps its id and commits only to the RAM transcript."""
         new_session_id = tmp_agent.session_id
-        if new_session_id != session_entry.session_id:
+        if session_entry.incognito:
+            if not await self.async_session_store.rewrite_transcript(session_entry.session_id, compressed):
+                raise RuntimeError("failed to update the incognito compression transcript")
+        elif new_session_id != session_entry.session_id:
             # Published child is already durable; a rewrite would drop rows cloned at publish.
             if not await self.async_session_store.persist_rotated_compression_child(
                     session_entry.session_id, new_session_id, compressed):

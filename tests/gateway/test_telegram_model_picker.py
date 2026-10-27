@@ -60,6 +60,7 @@ class TestTelegramModelPicker:
         query.data = "mb"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 42
         query.from_user = MagicMock()
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
@@ -116,7 +117,7 @@ async def test_group_model_picker_switch_follows_callback_allowlist(monkeypatch,
     query = SimpleNamespace(
         data="mm:0",
         message=SimpleNamespace(
-            chat_id=-100777, chat=SimpleNamespace(type="supergroup"), message_thread_id=None
+            chat_id=-100777, message_id=42, chat=SimpleNamespace(type="supergroup"), message_thread_id=None
         ),
         from_user=SimpleNamespace(id=int(tapper_id), first_name="Tapper"),
         answer=AsyncMock(),

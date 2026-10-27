@@ -132,7 +132,7 @@ class SessionMaintenanceMixin:
             if ids:
                 self._delete_unreferenced_system_prompts(conn)
             return ids
-        removed_ids = self._execute_write(_do) or []
+        removed_ids = self._execute_write(_do, skip_result=0) or []
         emit_session_deleted(self, removed_ids, reason="ghost_prune", sessions_dir=sessions_dir)
         from hermes_state_media import collect_retired_media
         collect_retired_media(self)
@@ -224,7 +224,7 @@ class SessionMaintenanceMixin:
                 f" WHERE id IN ({_placeholders(victims)}) AND ended_at IS NULL{scope_sql}",
                 (time.time(), *victims, *scope_params))
             return victims
-        return self._execute_write(_do) or []
+        return self._execute_write(_do, skip_result=[]) or []
 
     @staticmethod
     def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool = False,
@@ -413,7 +413,7 @@ class SessionMaintenanceMixin:
                 removed_ids.extend(session_ids)
                 return session_ids
 
-            batch_removed = self._execute_write(_do) or []
+            batch_removed = self._execute_write(_do, skip_result=0) or []
             removed_count += len(batch_removed)
             if batch_removed:
                 emit_session_deleted(self, batch_removed, reason="prune", sessions_dir=sessions_dir)
@@ -426,7 +426,7 @@ class SessionMaintenanceMixin:
         if removed_count:
             while True:
                 deleted_prompts = self._execute_write(
-                    lambda conn: self._delete_unreferenced_system_prompts(conn, limit=100))
+                    lambda conn: self._delete_unreferenced_system_prompts(conn, limit=100), skip_result=0)
                 if not deleted_prompts or deleted_prompts < 100:
                     break
         if removed_count:

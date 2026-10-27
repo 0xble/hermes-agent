@@ -83,6 +83,9 @@ def _write_payload(flush_dir: Path, payload: dict[str, Any], file_id: Optional[s
 
 def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
     """Serialise and write one pending value; return True when a payload was written."""
+    from agent.incognito import is_incognito
+    if is_incognito(session_key):
+        return False  # the live FIFO remains in RAM, restart intentionally drops it
     try:
         serialised = _serialise_value(value)
         if serialised is None or not has_user_content(serialised):
@@ -155,6 +158,9 @@ def spool_dropped_transcript_message(session_id: str, message: dict[str, Any]) -
     message under ``<hermes_home>/pending_messages/``), so a runtime cap rotation no longer silently
     discards user data while the process stays up (#78182).
     """
+    from agent.incognito import is_incognito
+    if is_incognito(session_id):
+        return None
     try:
         return _write_payload(_get_flush_dir(), {
             "session_key": session_id, "reason": TRANSCRIPT_CAP_DROP_REASON, "ts": int(time.time()),
@@ -222,18 +228,18 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
     return replayed, remaining
 
 
-def payload_media_urls(data: Dict[str, Any]) -> list:
+def payload_media_urls(data: dict[str, Any]) -> list:
     """Attachment paths from a pending payload; legacy ``media`` may hold one stringified value."""
     urls = data.get("media_urls") or data.get("media") or []
     return [urls] if isinstance(urls, str) else list(urls)
 
 
-def has_user_content(data: Dict[str, Any]) -> bool:
+def has_user_content(data: dict[str, Any]) -> bool:
     """A caption-less attachment is still a message; only text- and media-free slots are empty."""
     return bool(data.get("text")) or bool(payload_media_urls(data))
 
 
-def recovered_message_type(data: Dict[str, Any]):
+def recovered_message_type(data: dict[str, Any]):
     """Restore the spooled ``MessageType``; spools written before it was kept replay as TEXT."""
     from gateway.platforms.event import MessageType
     try:
@@ -426,7 +432,7 @@ def _order_flush_files(paths) -> list[Path]:
     return [path for path, _retained in _scan_flush_files(paths)[0]]
 
 
-def _payload_needs_ambient_db(payload: Dict[str, Any]) -> bool:
+def _payload_needs_ambient_db(payload: dict[str, Any]) -> bool:
     """Legacy session_id rows and transcript-cap drops replay into the shared default state.db."""
     data = payload.get("data")
     return payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON or bool(
@@ -531,7 +537,7 @@ def _drop_stale_followup(session_key: str) -> object:
     return DROP_PENDING
 
 
-def _upgrade_shutdown_follow_up(payload: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+def _upgrade_shutdown_follow_up(payload: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
     """Shutdown follow-ups are independent future turns even when the answered predecessor's
     resume marker was cleared by delivery recovery. Upgrade legacy spools at read time too:
     False from the deferral callback otherwise appends them to history and deletes the spool."""
@@ -541,7 +547,7 @@ def _upgrade_shutdown_follow_up(payload: Dict[str, Any], data: Dict[str, Any]) -
     return data
 
 
-def _drop_drain_deferred(path: Path, text: str, data: Dict[str, Any], *, keep_expired: bool = False) -> bool:
+def _drop_drain_deferred(path: Path, text: str, data: dict[str, Any], *, keep_expired: bool = False) -> bool:
     """An expired drain arrival, or a spooled built-in control command, is never replayed.
 
     With ``keep_expired`` an expired spool is flagged ``_recovery_stale`` instead, so its follow-up
@@ -653,7 +659,7 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
             return CLAIMED_FOLLOWUP
     # Keep a machinery notice machinery in the transcript too, so a later reader (crash-left
     # reply judgement, display filters) does not treat it as a human prompt.
-    row_display: Dict[str, Any] = {}
+    row_display: dict[str, Any] = {}
     if data.get("internal") is True:
         from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
         from gateway.warning_notifications import diagnostic_metadata

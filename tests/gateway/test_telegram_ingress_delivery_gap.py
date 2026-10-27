@@ -38,7 +38,9 @@ def _receive(adapter: TelegramAdapter, n: int, generation: int | None = None) ->
 
 async def _dispatch(adapter: TelegramAdapter, n: int) -> None:
     for _ in range(n):
-        await adapter._on_platform_update(MagicMock(), MagicMock())
+        await adapter._on_platform_update(
+            MagicMock(message=None, effective_message=None, callback_query=None), MagicMock(),
+        )
 
 
 def _heartbeats(adapter: TelegramAdapter, n: int) -> None:

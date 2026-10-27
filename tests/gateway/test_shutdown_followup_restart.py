@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
@@ -53,7 +53,7 @@ def test_recovered_internal_event_keeps_recovery_key_out_of_transport_identity(t
     )
     assert recovered.message_id is None
     assert recovered.source.message_id is None
-    assert getattr(recovered, "_hermes_recovery_id") == "hermes-recovery-test"
+    assert recovered._hermes_recovery_id == "hermes-recovery-test"
     assert _reply_anchor_for_event(recovered) is None
 
 
@@ -158,7 +158,7 @@ async def test_durable_turn_failed_followup_logs_after_predecessor_resumed(
     recovered = runner._startup_restore_queue[0]
     runner.session_store.append_to_transcript(entry.session_id, {
         "role": "user", "content": recovered.text,
-        "platform_message_id": getattr(recovered, "_hermes_recovery_id"),
+        "platform_message_id": recovered._hermes_recovery_id,
     })
 
     async def turn(recovered):
@@ -364,7 +364,7 @@ async def test_merged_internal_recovery_spool_retires_after_successor_input_is_d
         runner.session_store.append_to_transcript(
             entry.session_id, {
                 "role": "user", "content": consumed.text,
-                "platform_message_id": getattr(recovered, "_hermes_recovery_id"),
+                "platform_message_id": recovered._hermes_recovery_id,
             }
         )
         persisted.set()
@@ -526,6 +526,9 @@ async def test_recovered_followup_real_gateway_turn_persists_recovery_id_at_turn
             self._store = self
             self.rows = []
 
+        def incognito_enabled(self, _session_key):
+            return False
+
         async def append_to_transcript(self, _session_id, row, **_kwargs):
             self.rows.append(dict(row))
 
@@ -608,7 +611,7 @@ async def test_idless_recovered_followup_spool_retires_when_input_row_lands(tmp_
     recovered = runner._startup_restore_queue[0]
     assert recovered.message_id is None
     assert recovered.source.message_id is None
-    assert getattr(recovered, "_hermes_recovery_id") == recovery_id
+    assert recovered._hermes_recovery_id == recovery_id
     runner.session_store.append_to_transcript(entry.session_id, {
         "role": "user", "content": event.text, "platform_message_id": recovery_id,
     })
@@ -691,7 +694,7 @@ async def test_restored_followup_notice_is_sent_inside_its_profile_scope(tmp_pat
     """A multiplexed secondary profile's follow-up notice resolves that profile's runtime."""
     from gateway import run
 
-    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
     profile_home = tmp_path / "profiles" / "secondary"
     runner._resolve_profile_home_for_source = lambda _source: profile_home
     active = []
@@ -899,7 +902,7 @@ async def test_durable_followup_with_expired_resume_marker_gets_hedged_note(tmp_
     runner.session_store.mark_resume_pending(entry.session_key, turn_id="resume-old")
     with runner.session_store._lock:
         runner.session_store._entries[entry.session_key].last_resume_marked_at = (
-            datetime.now(timezone.utc) - timedelta(hours=2))
+            datetime.now(UTC) - timedelta(hours=2))
     event = MessageEvent(text="already handled", source=source, user_id=source.user_id, message_id="expired-1")
     assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
     runner.session_store.append_to_transcript(entry.session_id, {
@@ -1282,7 +1285,7 @@ def test_six_day_stale_followup_for_pruned_session_is_still_retained(tmp_path, m
 
 def test_stale_shutdown_followup_drop_logs_note_unavailable_outcome_once(
         tmp_path, monkeypatch, caplog):
-    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    _runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
     event = MessageEvent(text="stale question", source=source, user_id=source.user_id)
     assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
     spool, = (tmp_path / "pending_messages").glob("*.json")

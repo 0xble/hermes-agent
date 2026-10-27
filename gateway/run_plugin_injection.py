@@ -230,6 +230,9 @@ class GatewayPluginInjectionMixin:
         trusted producer admission (the heartbeat / completion seam) instead of running it on the
         in-process lane beside an admitted turn. ``None`` means no authority serves this scope and
         the caller keeps the standalone adapter path; a refused admission is ``False``, logged."""
+        from agent.incognito import is_incognito
+        if is_incognito(session_id):
+            return None
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
         if authority is None:

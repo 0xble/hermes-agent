@@ -1340,6 +1340,9 @@ def _reconcile_store_consent(store: SharedMetricsStore, send_enabled: bool) -> N
 
 def enabled() -> bool:
     """Return the shared-metrics policy for the active Hermes profile."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return False
     profile_key = relay_runtime.current_profile_key()
     try:
         config: Any = _raw_config()

@@ -396,6 +396,8 @@ class PluginManifest:
     # Language pack declaration: ids whose ``locales/<id>[.tui|.desktop].yaml`` the loader registers
     # automatically (no Python needed). ``locale_metadata`` carries the optional per-id
     # ``{endonym, rtl}`` from the mapping form of a ``provides_locales`` entry.
+    # Conversation content reaches callbacks only with an explicit YAML boolean opt-in.
+    incognito_safe: bool = False
     provides_locales: list[str] = field(default_factory=list)
     locale_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -548,7 +550,7 @@ def parse_manifest_file(
             "Parsed manifest: key=%s name=%s kind=%s source=%s path=%s", key, name, kind, source, plugin_dir)
         provides_locales, locale_metadata = parse_provides_locales(data.get("provides_locales"), key)
         return PluginManifest(
-            name=name, version=str(data.get("version", "")),
+            name=name, version=str(data.get("version", "")), incognito_safe=data.get("incognito_safe") is True,
             description=data.get("description", ""), author=_display_author(data.get("author", "")),
             requires_env=data.get("requires_env", []),
             provides_tools=data.get("provides_tools", []),

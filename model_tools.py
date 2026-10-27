@@ -978,6 +978,10 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    from agent.incognito import tool_refusal
+    refusal = tool_refusal(function_name, function_args)
+    if refusal:
+        return tool_error(refusal)
     trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)

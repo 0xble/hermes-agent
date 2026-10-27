@@ -258,9 +258,9 @@ class _DarwinFDScan(threading.Thread):
 
     def __init__(self):
         super().__init__(name="sqlite-sidecar-holder-scan", daemon=True)
-        self.targets: List[Tuple[int, str, Tuple[int, int]]] = []
+        self.targets: list[tuple[int, str, tuple[int, int]]] = []
         self.error: BaseException | None = None
-        self.cursor: Tuple[int | None, int | None, str] = (None, None, "proc_listpids")
+        self.cursor: tuple[int | None, int | None, str] = (None, None, "proc_listpids")
 
     def run(self):
         try:
@@ -350,7 +350,7 @@ def _iter_darwin_fd_targets():
             yield pid, fd, target, identity
 
 
-def _darwin_self_sidecar_holders(watched: Dict[str, str]) -> List[Tuple[int, str]]:
+def _darwin_self_sidecar_holders(watched: dict[str, str]) -> list[tuple[int, str]]:
     """Inspect our sidecars without stat-ing every unrelated open vnode.
 
     F_GETPATH retrieves the saved path without libproc's vn_stat of the vnode.
@@ -415,6 +415,11 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
         )
         return []
     if worker.error is not None:
+        # Rethrowing adds caller frames to the traceback. Do not keep those
+        # frames rooted by the process-wide cache after this failed scan ends.
+        with _DARWIN_FD_SCAN_LOCK:
+            if _DARWIN_FD_SCAN_WORKER is worker:
+                _DARWIN_FD_SCAN_WORKER = None
         raise worker.error
     return [(pid, target) for pid, target, _identity in tuple(worker.targets)
             if target.casefold() in watched]
@@ -457,15 +462,15 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> list[tuple[int, str]]:
 # unchanged pair means no generation was retired since the scan. One scan per path at a time.
 _HOLDER_SCAN_CLEAN_TTL_S = 10.0
 _holder_scan_lock = threading.Lock()
-_holder_scan_clean: Dict[str, Tuple[float, Dict[str, tuple]]] = {}
-_holder_scan_path_locks: Dict[str, threading.Lock] = {}
+_holder_scan_clean: dict[str, tuple[float, dict[str, tuple]]] = {}
+_holder_scan_path_locks: dict[str, threading.Lock] = {}
 
 
-def _deleted_sidecar_holders_for_open(db_path) -> List[Tuple[int, str]]:
+def _deleted_sidecar_holders_for_open(db_path) -> list[tuple[int, str]]:
     """:func:`iter_deleted_sqlite_sidecar_holders`, reusing a recent clean verdict for the same pair."""
     key = os.path.abspath(os.fspath(db_path))
 
-    def _reusable_clean() -> "Tuple[bool, Dict[str, tuple]]":
+    def _reusable_clean() -> tuple[bool, dict[str, tuple]]:
         sidecars = _stat_sqlite_sidecar_identity(Path(key))
         clean = _holder_scan_clean.get(key)
         hit = (len(sidecars) == 2 and clean is not None and clean[0] > time.monotonic()
