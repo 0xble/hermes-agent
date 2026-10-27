@@ -792,7 +792,7 @@ def _action_create(a: dict[str, Any]) -> str:
         _partial = exc.to_dict()
         return tool_error(_partial.pop("error"), success=False, **_partial)
     _create_message = " ".join(filter(None, (f"Cron job '{job['name']}' created.",
-        "Created PAUSED — resume to schedule, or explicitly run now." if not job.get("enabled", True) else None,
+        "Created PAUSED. Resume before scheduled or manual runs." if not job.get("enabled", True) else None,
         _local_delivery_notice(job, deliver))))
     # The builtin ticker lives in the gateway process: with no gateway running the job is stored
     # but never fires — tell the model (the CLI already warns).
@@ -1172,7 +1172,7 @@ def _cronjob_schema_overrides() -> dict:
 
 CRONJOB_SCHEMA = {
     "name": "cronjob_manage",
-    "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
+    "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires an enabled job immediately in the BACKGROUND (resume paused/disabled jobs first; returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
 
 Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless pinned.
 
@@ -1180,7 +1180,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
     "parameters": {
         "type": "object",
         "properties": {
-            "paused": {"type": "boolean", "description": "Create only: persist disabled atomically. Resume to schedule; explicit run remains available. Default false."},
+            "paused": {"type": "boolean", "description": "Create only: persist disabled atomically. Resume before scheduled or manual runs. Default false."},
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
             "action": {
                 "type": "string",
