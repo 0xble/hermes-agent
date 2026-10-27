@@ -6,6 +6,7 @@ import time
 import pytest
 
 from tools import async_delegation as ad
+from tools import async_delegation_completion as execution_checkpoints
 from tools import delegation_resume as dr
 from tools.delegate_tool_registry import _handle_control_action
 
@@ -204,7 +205,7 @@ def test_restart_runner_crash_resumes_only_children_unfinished_by_checkpoint(mon
     did, checkpointed, release = "deleg_restart_crash", threading.Event(), threading.Event()
 
     def runner():
-        ad.record_unit_child(did, {"task_index": 0, "status": "completed", "summary": "durable first"})
+        execution_checkpoints.record_unit_child(did, {"task_index": 0, "status": "completed", "summary": "durable first"})
         checkpointed.set()
         assert release.wait(5)
         raise RuntimeError("shutdown aggregation failed")
