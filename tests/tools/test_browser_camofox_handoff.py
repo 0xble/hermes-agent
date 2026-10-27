@@ -44,7 +44,8 @@ def test_no_park_retries_only_explicit_context_consent(handoff, monkeypatch, rel
     assert result["success"] is True
     assert "in-memory" in result["warning"]
     assert post.call_count == 2
-    assert post.call_args_list[0].args[1] == ({} if release else {"tabId": "owned-tab"})
+    # Release is scoped to the caller's tab; only a typed no-park refusal widens it.
+    assert post.call_args_list[0].args[1] == {"tabId": "owned-tab"}
     assert post.call_args_list[1].args[1] == consent
     assert post.call_args_list[0].kwargs == post.call_args_list[1].kwargs
     assert session["tab_id"] == "owned-tab"
@@ -72,7 +73,7 @@ def test_parked_path_never_requests_context_destruction(handoff, monkeypatch, re
     assert result["success"] is True
     assert "warning" not in result
     assert post.call_count == 1
-    assert post.call_args.args[1] == ({} if release else {"tabId": "owned-tab"})
+    assert post.call_args.args[1] == {"tabId": "owned-tab"}
     assert session["tab_id"] == "owned-tab"
 
 

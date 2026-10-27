@@ -30,16 +30,17 @@ def test_unbound_release_never_sends_unscoped_request(camofox):
     before = len(camofox.server.calls)
     result = _dispatch("browser_handoff", {"account": "brianle", "release": True}, "owner")
     assert not result["success"]
-    assert len(camofox.server.calls) == before
+    # Identity resolution may read the registry; nothing may be released or mutated.
+    assert [call for call in camofox.server.calls[before:] if call[0] != "GET"] == []
 
 
 def test_legacy_release_refusal_never_falls_back_to_account_wide(camofox, monkeypatch):
+    """A scoped-release refusal is an error, not consent. Only the typed no-park
+    ``context_close_required`` code may widen release (tests/tools/test_browser_camofox_handoff.py)."""
     session = navigate(camofox)
     response = requests.Response()
     response.status_code = 409
-    response._content = (
-        b'{"error": "Without a parking display release would close the whole identity and discard live tab state; '
-        b'close its tabs first or explicitly accept with all: true", "code": "context_close_required"}')
+    response._content = b'{"error": "tab is not owned by this caller", "code": "tab_not_owned"}'
     post = Mock(side_effect=requests.HTTPError(response=response))
     monkeypatch.setattr(camofox.cf, "_post", post)
     result = _dispatch("browser_handoff", {"account": "brianle", "release": True}, "owner")
