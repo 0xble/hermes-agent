@@ -15,6 +15,8 @@ def test_poll_interval_is_zero_while_pytest_owns_the_process():
 
 def test_poll_interval_is_the_default_outside_pytest(monkeypatch):
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("HERMES_FS_POLL", raising=False)
+    monkeypatch.setenv("HERMES_HOME", "/Users/brianle/.hermes")
     assert filesystem_poll_seconds(5.0) == 5.0
     assert filesystem_poll_seconds(0.0) == 0.0
 
@@ -92,60 +94,13 @@ def test_catalog_signature_walks_once_per_poll_and_clear_is_immediate(tmp_path, 
     assert walks["n"] == 2
 
 
-def _count_stat(monkeypatch, owner, target):
-    calls = {"n": 0}
-    real = owner.Path.stat
+def test_poll_stays_off_for_a_pytest_home_and_an_explicit_disable(monkeypatch):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("HERMES_HOME", "/var/tmp/hermes-pytest-1/pytest-of-ci/home")
+    assert filesystem_poll_seconds(5.0) == 0.0
+    monkeypatch.setenv("HERMES_HOME", "/Users/brianle/.hermes")
+    monkeypatch.setenv("HERMES_FS_POLL", "0")
+    assert filesystem_poll_seconds(5.0) == 0.0
+    monkeypatch.delenv("HERMES_FS_POLL")
+    assert filesystem_poll_seconds(5.0) == 5.0
 
-    def wrapped(self, *args, **kwargs):
-        if self == target:
-            calls["n"] += 1
-        return real(self, *args, **kwargs)
-
-    monkeypatch.setattr(owner.Path, "stat", wrapped)
-    return calls
-
-
-def test_config_signature_stats_once_per_poll_then_sees_a_replacement(tmp_path, monkeypatch):
-    from hermes_cli import config as config_mod
-
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text("model:\n  default: aaaa-route\n", encoding="utf-8")
-    clock = {"now": 10.0}
-    monkeypatch.setattr(config_mod, "filesystem_poll_seconds", lambda _default: 1.0)
-    monkeypatch.setattr(config_mod.time, "monotonic", lambda: clock["now"])
-    monkeypatch.setattr(config_mod.managed_scope, "get_managed_dir", lambda: None)
-    config_mod._CONFIG_STAT_MEMO.clear()
-    calls = _count_stat(monkeypatch, config_mod, cfg)
-
-    first = config_mod._load_config_cache_sig(cfg)
-    assert config_mod._load_config_cache_sig(cfg) == first
-    assert calls["n"] == 1
-
-    cfg.write_text("model:\n  default: bbbb-route\n", encoding="utf-8")
-    assert config_mod._load_config_cache_sig(cfg) == first
-    assert calls["n"] == 1
-
-    clock["now"] = 12.0
-    changed = config_mod._load_config_cache_sig(cfg)
-    assert changed != first
-    assert calls["n"] == 2
-
-
-def test_skill_config_key_stats_once_per_poll(tmp_path, monkeypatch):
-    import agent.skill_utils as su
-    import utils
-
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text("skills:\n  disabled: []\n", encoding="utf-8")
-    clock = {"now": 3.0}
-    monkeypatch.setattr(utils, "filesystem_poll_seconds", lambda _default: 1.0)
-    monkeypatch.setattr(su.time, "monotonic", lambda: clock["now"])
-    su._CONFIG_STAT_MEMO.clear()
-    calls = _count_stat(monkeypatch, su, cfg)
-
-    first = su._config_cache_key(cfg)
-    assert su._config_cache_key(cfg) == first
-    assert calls["n"] == 1
-    su._raw_config_cache_clear()
-    assert su._config_cache_key(cfg) == first
-    assert calls["n"] == 2

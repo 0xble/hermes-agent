@@ -4,15 +4,16 @@ Fork patch identity: `gateway-scan-poll`.
 
 ## Required behavior
 
-A long-lived gateway may reuse a skills-tree manifest, a catalog directory
-signature, and a config.yaml file signature for a few seconds instead of
-stating them on every prompt build, slash lookup, change-watcher tick, or
-hook. An install, removal, or config edit is visible on the next check after
-that interval. `clear_skills_system_prompt_cache`, `clear_skills_cache`, and
-`save_config` drop the matching memo so an explicit reload or in-process write
-is immediate. Tests keep the interval at zero, so a write is still visible on
-the next read in the suite. Refused watch events keep the bounded retry in
-`gateway/run_notifications.py`; this patch does not drop a completion.
+A long-lived gateway may reuse a skills-tree manifest and a catalog directory
+signature for a few seconds instead of walking them on every prompt build,
+slash lookup, or change-watcher tick. An install or removal is visible on the
+next check after that interval. `clear_skills_system_prompt_cache` and
+`clear_skills_cache` drop the memo so an explicit reload is immediate.
+`config.yaml` stays signature-checked on every load: a short memo hid an edit
+from a running gateway, including a fresh session and the dashboard.
+Tests and a gateway whose home is a pytest directory keep a zero interval.
+Refused watch events keep the bounded retry in `gateway/run_notifications.py`;
+this patch does not drop a completion.
 
 ## Provenance and adoption
 

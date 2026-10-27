@@ -46,7 +46,7 @@ from hermes_constants import (
     apply_secure_dir_policy, get_managed_system)
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home
-from utils import atomic_replace, fast_safe_load, file_signature, filesystem_poll_seconds, mkstemp_beside
+from utils import atomic_replace, fast_safe_load, file_signature, mkstemp_beside
 from hermes_cli.config_read_errors import (
     _CONFIG_PARSE_FAILURES, _FIX_PERMS, _FIX_YAML, FailedConfigRead, _backups_dir_display,
     _refuse_failed_read, _refuse_overwrite, _warn_config_parse_failure, _yaml_error_details,
@@ -177,12 +177,6 @@ _LAST_EXPANDED_CONFIG_BY_PATH: dict[str, Any] = {}
 # the config writer seam, which produces a fresh inode, so stat() sees a new signature and the next load
 # repopulates automatically — no explicit invalidation hook. See #58514.
 _LOAD_CONFIG_CACHE: dict[str, tuple[int, ...]] = {}
-# Last (user_sig, cache_sig) per path. The lock-free hit path stats config.yaml on every
-# call; a gateway hook does that hundreds of times a second. Reuse the signature for
-# _CONFIG_STAT_POLL_S. save_config drops the memo so an in-process write is immediate.
-# Tests keep the interval at 0, including a replacement that pins mtime and size.
-_CONFIG_STAT_POLL_S = 1.0
-_CONFIG_STAT_MEMO: dict[str, tuple[float, tuple]] = {}
 # path -> (mtime_ns, size, ino, ctime_ns, raw yaml dict) for read_raw_config() (no defaults merged in).
 _RAW_CONFIG_CACHE: dict[str, tuple[int, ...]] = {}
 
@@ -2259,13 +2253,6 @@ def _load_config_cache_sig(config_path: Path) -> tuple[Optional[tuple[int, int, 
     """Return ``(user_sig, cache_sig)`` for ``_LOAD_CONFIG_CACHE``.
     The managed config file's signature is folded in ((0, 0, 0, 0) = none) so editing it invalidates
     the merged result. ``cache_sig`` is None only when neither file exists (nothing to cache on)."""
-    path_key = str(config_path)
-    now = time.monotonic()
-    poll = filesystem_poll_seconds(_CONFIG_STAT_POLL_S)
-    if poll > 0:
-        hit = _CONFIG_STAT_MEMO.get(path_key)
-        if hit is not None and now - hit[0] < poll:
-            return hit[1]
     try:
         st = config_path.stat()
         user_sig: Optional[tuple[int, int, int, int]] = file_signature(st)
@@ -2278,12 +2265,8 @@ def _load_config_cache_sig(config_path: Path) -> tuple[Optional[tuple[int, int, 
     except OSError:
         managed_sig = (0, 0, 0, 0)
     if user_sig is None and managed_sig == (0, 0, 0, 0):
-        result = None, None
-    else:
-        result = user_sig, (*(user_sig or (0, 0, 0, 0)), *managed_sig)
-    if poll > 0 and result[1] is not None:
-        _CONFIG_STAT_MEMO[path_key] = (now, result)
-    return result
+        return None, None
+    return user_sig, (*(user_sig or (0, 0, 0, 0)), *managed_sig)
 
 
 def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[dict[str, Any]]:
@@ -2570,7 +2553,6 @@ def save_config(
         atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
-        _CONFIG_STAT_MEMO.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
     from hermes_cli.observability.shared_metrics_disabled import record_config_saved
     record_config_saved(_raw_for_paths, current_normalized)

@@ -40,10 +40,20 @@ def env_var_enabled(name: str, default: str = "") -> bool:
 def filesystem_poll_seconds(default: float) -> float:
     """How long a hot path may reuse a filesystem signature without stating again.
 
-    A long-lived gateway must not stat the skills tree or ``config.yaml`` on every
-    event. Tests keep a zero interval so a write is visible on the next read.
+    A long-lived gateway must not walk the skills tree on every prompt build.
+    The suite keeps a zero interval, including a gateway spawned into a pytest
+    home, so a write is visible on the next read. ``HERMES_FS_POLL=0`` disables
+    the poll explicitly.
     """
-    if default <= 0 or os.environ.get("PYTEST_CURRENT_TEST"):
+    if default <= 0:
+        return 0.0
+    forced = os.environ.get("HERMES_FS_POLL", "").strip().lower()
+    if forced in {"0", "off", "false"}:
+        return 0.0
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return 0.0
+    home = os.environ.get("HERMES_HOME", "")
+    if "pytest-" in home or "hermes-pytest" in home:
         return 0.0
     return default
 
