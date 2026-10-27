@@ -265,8 +265,18 @@ def _route_owner(authority, entry):
 def _owner(runner, event, authority):
     route = event.metadata.get('gateway_session_key') or runner.session_store._generate_session_key(event.source)
     entry = runner.session_store.lookup_by_session_key(route)
-    if entry is None or entry.suspended:
-        raise RuntimeStoreError('not_found')
+    if entry is None:
+        # A route not yet restored is not proof its work is stale. Only a known
+        # absent/ended durable target is safe to exclude from outage evidence.
+        expected = event.metadata.get('gateway_session_id')
+        tip = authority.db.get_compression_tip(expected) if expected else None
+        target = authority.db.get_session(tip or expected) if expected else None
+        field = ('automation_target_gone' if expected and
+                 (target is None or target.get('ended_at') is not None)
+                 else 'automation_route_unavailable')
+        raise RuntimeStoreError('not_found', field=field)
+    if entry.suspended:
+        raise RuntimeStoreError('not_found', field='automation_target_suspended')
     if runner.session_store._generate_session_key(event.source) != route:
         raise RuntimeStoreError('admission_conflict')
     expected = event.metadata.get('gateway_session_id')
@@ -378,12 +388,14 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     owner = captured[2] if captured is not None else authority.logical_owner(entry.session_id)
     envelope = captured[1] if captured is not None else committed_route_envelope(authority, entry)
     if envelope is None:
-        raise RuntimeStoreError('not_found')
-    # Persisted origins deliberately omit relay trust. Borrow only an exact
-    # committed source's private proof, revalidated against the live connector.
-    # Recheck only the source/provenance: a completed input's retained media is already released.
-    restored = restore_native({'text': event.text, 'native_text_v1': {
-        key: value for key, value in envelope.items() if key != 'media'}}, runner)
+        from gateway.session_automation_legacy import revalidate_legacy_route
+        restored, envelope = revalidate_legacy_route(authority, entry, adapter)
+    else:
+        # Persisted origins deliberately omit relay trust. Borrow only an exact
+        # committed source's private proof, revalidated against the live connector.
+        # A completed input's retained media is already released.
+        restored = restore_native({'text': event.text, 'native_text_v1': {
+            key: value for key, value in envelope.items() if key != 'media'}}, runner)
     # Synthetic wakes clear ``message_id`` (#52694, #123097) while the committed human source keeps
     # it, so compare the routing/provenance identity, never the platform reply anchor.
     if (_route_identity(restored.source) != _route_identity(event.source)
