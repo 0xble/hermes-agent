@@ -19,6 +19,31 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 `production-unused-imports` is a mechanical fork-only hygiene patch. Ruff's `F401` check is the guard for the four removed imports in `agent/agent_init.py`, `agent/codex_runtime.py`, and `agent/memory_manager.py`; retire this record if the imports return or upstream carries the equivalent cleanup.
 
+## Automation Runtime Refusal Retry
+
+- Fork patch identity: `automation-runtime-refusal-retry`.
+- A producer receipt acknowledges durable FIFO input, not successful inference. Runtime
+  configuration or credential resolution must not consume an internal delegation/process result
+  as a failed reply. Resolve before claiming queued automation, retain refusals in the existing
+  FIFO, and persist a bounded retry clock in `state_meta`: 10s, 20s, 40s, then 60s between attempts.
+  A long outage does not exhaust and drop the result. Restart uses the same queued identity and
+  deadline. There is no second payload store or new table.
+- The turn runner explicitly stamps resolution failures before agent construction. If runtime
+  resolution fails after the pre-claim check, native automation skips transcript/error delivery
+  and atomically requeues its same claimed row with the same backoff, fenced by epoch/generation.
+  Only results with no API calls, messages or tools qualify. Executed/unknown work is never replayed.
+- Guards: `tests/gateway/test_automation_runtime_retry.py` drives process and delegation results
+  through real native admission and the FIFO, including an actual conflicting preset config,
+  pre-claim refusal and post-claim refusal. A new authority/epoch resumes the persisted row,
+  waits for the saved deadline, and executes once. Reinjecting the producer identity is an ACK,
+  not another turn. Also run completion delivery, async delegation, session authority and runtime
+  model-preset tests.
+- Source: `gateway/session_automation_retry.py`, `gateway/session_authority.py`,
+  `gateway/session_ingress.py`, `gateway/run_turn.py`, `gateway/run_turn_runner.py`.
+- This does not change legacy rows already marked `delivered` in the delegation outbox. Startup
+  replay cannot infer their lost inference from that receipt. Historical redelivery needs a
+  separately authorized decision and a durable payload.
+
 ## Post-Install Admission Canary
 
 - Fork patch identity: `post-install-admission-canary`.

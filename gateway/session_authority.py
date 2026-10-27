@@ -1084,6 +1084,10 @@ class SessionAuthority:
                 # a claim now would hand this row to its busy path and settle it unrun. The head
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
                 return 'classic_busy', first
+            if first is not None:
+                from gateway.session_automation_retry import runtime_ready
+                if not await runtime_ready(self, ref, first):
+                    return 'automation_wait', first
             self._require_admission_open()
             from gateway.session_runtime_workers import tracked_write
             live.rescan = False  # a _schedule from here on may not be visible to this claim's read
@@ -1152,17 +1156,18 @@ class SessionAuthority:
                 await asyncio.sleep(backoff)
                 continue
             backoff = 0.0
-            if row != 'classic_busy':
+            if row not in ('classic_busy', 'automation_wait'):
                 return row, first
             if self._drain_stopping(ref, live):
                 return None
-            await asyncio.sleep(_CLAIM_RETRY_MIN_S)
+            await asyncio.sleep(1.0 if row == 'automation_wait' else _CLAIM_RETRY_MIN_S)
 
     async def _execute_claimed(self, ref, live, row):
         """Run the claimed admission: ``(response, outcome)``. The executing stamp clears the moment
         execution returns; a lost managed worker settles an automation turn (``settled_unknown``) or pauses
         the FIFO and re-raises ManagedExecutionUnknown."""
         from gateway.session_finite import execute_finite_admission
+        from gateway.session_automation_retry import AutomationRuntimeDeferred
         from gateway.session_managed_worker import ManagedExecutionUnknown
         review = getattr(live.review, '_background_review_run', None)
         if review is not None and not review.request_done.is_set():
@@ -1176,6 +1181,15 @@ class SessionAuthority:
             finally:
                 with live.event_stream.lock:
                     self.executing.pop(ref.session_id, None)
+        except AutomationRuntimeDeferred:
+            with live.event_stream.lock:
+                live.event_stream.execution = {}
+            self.pending_stops.pop(ref.session_id, None)
+            self.pending_stop_causes.pop(ref.session_id, None)
+            self.pending_steers.pop(ref.session_id, None)
+            self.adopted.pop(ref.session_id, None)
+            self._publish_pending(ref)
+            return None, 'deferred'
         except ManagedExecutionUnknown:
             with live.event_stream.lock:
                 live.event_stream.execution = {}
@@ -1228,7 +1242,7 @@ class SessionAuthority:
             admission_id = row['admission_id']
             try:
                 response, outcome = await self._execute_claimed(ref, live, row)
-                if outcome == 'settled_unknown':
+                if outcome in ('settled_unknown', 'deferred'):
                     self.deferred_resets.pop(live.route, None)  # no settlement follows, as below
                     continue
             except BaseException as exc:

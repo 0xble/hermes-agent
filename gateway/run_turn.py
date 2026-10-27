@@ -3346,6 +3346,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             if not started:
                 self._log_loop_wake_suppressed(event, "execution fence rejected the model run")
                 return
+            from gateway.session_automation_retry import held_runtime_refusal
+            if held_runtime_refusal(event, agent_result):
+                return None  # The FIFO retries this unexecuted input without a transcript apology.
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
