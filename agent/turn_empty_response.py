@@ -9,7 +9,7 @@ retries (budgeted, deterministic-empty short-circuit) → fallback provider → 
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 import logging
 import re

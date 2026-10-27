@@ -108,7 +108,7 @@ async def send_cron_store_notice(runner, event: str, record) -> None:
         async with scope:
             message = t(key, **fields)  # inside the owning profile's scope: its display.language
             if event == "recovered":
-                from gateway.notice_style import ContextNotice
+                from agent.notice_style import ContextNotice
                 message = ContextNotice(message)
             await present_notification(
                 lambda: runner._send_home_channel_message(

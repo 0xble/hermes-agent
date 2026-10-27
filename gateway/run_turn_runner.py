@@ -24,7 +24,7 @@ from gateway.attended_model import (
     format_attended_switch_back_notice, format_attended_switch_notice, parse_attended_config,
 )
 from gateway.config import Platform
-from gateway.notice_style import notice_metadata
+from agent.notice_style import notice_metadata
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typing_after_prompt, typing_metadata_for_source

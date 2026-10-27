@@ -8,7 +8,7 @@ A loop stops when the agent ends a wakeup reply with ``LOOP_COMPLETE`` on its ow
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 import hashlib
 import json

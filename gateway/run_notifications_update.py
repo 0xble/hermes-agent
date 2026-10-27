@@ -76,7 +76,7 @@ class GatewayUpdateNotificationsMixin:
             return _non_conversational_metadata(self.metadata, platform=self.platform)
 
         async def send(self, text: str):
-            from gateway.notice_style import notice_metadata
+            from agent.notice_style import notice_metadata
             metadata = notice_metadata(self.send_metadata(), platform=self.platform,
                                        style=getattr(text, "notice_style", None))
             return await self.adapter.send(self.chat_id, text, metadata=metadata)

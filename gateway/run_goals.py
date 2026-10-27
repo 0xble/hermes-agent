@@ -416,7 +416,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
-        from gateway.notice_style import notice_metadata
+        from agent.notice_style import notice_metadata
         metadata = notice_metadata(metadata, platform=source.platform, style=getattr(message, "notice_style", None))
         from gateway.platforms.base import outbound_class
         try:
@@ -608,7 +608,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             if mgr is None:
                 return
             try:
-                from gateway.notice_style import ContextNotice
+                from agent.notice_style import ContextNotice
                 await self._send_goal_status_notice(
                     source, ContextNotice(f"▶ Goal resumed: {mgr.state.goal}"), notice_kind="resumed",
                 )

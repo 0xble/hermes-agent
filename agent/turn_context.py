@@ -8,7 +8,7 @@ returns a ``TurnContext`` with only the locals the loop reads back.
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 import logging
 import sys

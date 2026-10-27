@@ -3674,7 +3674,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             if text_content:
                 content = header + text_content
                 if source.platform == Platform.SLACK and not (result or {}).get("error"):
-                    from gateway.notice_style import notice_metadata
+                    from agent.notice_style import notice_metadata
                     await adapter.send(chat_id=source.chat_id, content=header,
                                        metadata=notice_metadata(_thread_metadata, platform=source.platform, style="context"))
                     content = text_content

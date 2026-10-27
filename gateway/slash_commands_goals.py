@@ -7,7 +7,7 @@ import logging
 from typing import Any
 
 from agent.i18n import t
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 from gateway.platforms.event import MessageEvent, MessageType
 
 # Log-record parity with gateway/run.py and the origin module.

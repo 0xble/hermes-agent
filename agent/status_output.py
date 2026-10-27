@@ -9,7 +9,7 @@ import sys
 
 from agent.i18n import t
 from agent.session_activity import ActivityProvenance
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")

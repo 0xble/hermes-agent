@@ -5,7 +5,7 @@ the one-off commands.  run.py helpers are imported lazily."""
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 import asyncio
 import contextlib

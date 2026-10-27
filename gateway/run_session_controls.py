@@ -211,7 +211,7 @@ class GatewaySessionControlsMixin:
 
         metadata = dict(self._thread_metadata_for_source(source) or {})
         metadata["session_control_request_id"] = request_id
-        from gateway.notice_style import notice_metadata
+        from agent.notice_style import notice_metadata
         message = self._control_notice(record)
         metadata = notice_metadata(metadata, platform=source.platform, style=getattr(message, "notice_style", None))
         from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
@@ -464,7 +464,7 @@ class GatewaySessionControlsMixin:
         }.get(action, action)
         change = (f"\n{cls._change_text(record)}"
                   if action == "replace" and record.get("affected_text") else "")
-        from gateway.notice_style import ContextNotice
+        from agent.notice_style import ContextNotice
         # Only committed no-action control outcomes opt in. Pending, pause and failures stay full.
         receipt = ContextNotice if status == "applied" and (kind, action) in {
             ("goal", "replace"), ("goal", "resume"), ("goal", "clear"),
