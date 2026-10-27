@@ -589,6 +589,20 @@ def api_runtime_locked():
     return current if current and current['settings'].get('confirmed_runtime_lock') else None
 
 
+def settle_api_runtime_lock(agent, result, captured):
+    """Settle a confirmed API runtime lock against the runtime that served the turn."""
+    api = api_runtime_locked()
+    if api is None or not isinstance(result, dict):
+        return
+    settings = api["settings"]
+    try:
+        captured["usage"]["runtime"] = api["adapter"]._turn_runtime_metadata(
+            agent, route=settings.get("route"), requested_runtime=settings.get("requested_runtime"),
+            route_source=settings.get("route_source") or "", confirmed_runtime_lock=True)
+    except RuntimeError as exc:
+        result.update(final_response="", failed=True, completed=False, error=str(exc))
+
+
 def prepare_api_runtime(model, runtime_kwargs):
     current = api_execution.get()
     if current is None:
