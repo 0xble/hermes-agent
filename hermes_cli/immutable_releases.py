@@ -23,7 +23,7 @@ import tomllib
 import plistlib
 from functools import lru_cache
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence, Any
 
@@ -322,11 +322,21 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
 
 def _build_venv(release: Path, *, uv: str = "uv", extras: Sequence[str] = (),
                 python: Path | None = None) -> None:
-    # PM supplies its pinned Python ABI and locked build engine. The migration-bound
-    # source interpreter can remain 3.11 and is never a candidate build target.
-    from pm import build_environment
-    build_environment(source=release, out=release / ".venv", extras=extras,
-                      env=_release_subprocess_env(release), frozen=True, explicit=True)
+    # The updater's source checkout is frozen. Enter the candidate's PM before
+    # building: its lock may require policy the old updater does not understand.
+    # Bootstrap with the maintained updater, not the possibly older migration
+    # interpreter. Keep the legacy python argument ignored; PM selects its ABI.
+    command = [sys.executable, "-I", "-B", str(release / "pm" / "build_env.py"),
+               "--source", str(release), "--out", str(release / ".venv")]
+    for extra in extras:
+        command.extend(("--extra", extra))
+    result = subprocess.run(command, cwd=release, env=_release_subprocess_env(release),
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+        if "Traceback (most recent call last):" in detail:
+            detail = detail.splitlines()[-1]
+        raise RuntimeError(f"candidate dependency build failed: {detail}")
 
 
 def _active_distributions(python: Path) -> dict[str, str]:
@@ -934,7 +944,8 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
             if (_is_intended_gateway(process, intended_root, expected_python) and
                     (gateway_pid is None or _LOADED_CODE_ROOT == intended_root)):
                 _verify_transaction(paths, record)
-                record["reload_ack"] = {"plist_sha256": plist["intended_sha256"],
+                record["reload_ack"] = {"at": datetime.now(UTC).isoformat(),
+                                        "plist_sha256": plist["intended_sha256"],
                                         "launchd_pid": supervisor_pid,
                                         "gateway_pid": process.pid,
                                         "release_root": str(intended_root),
@@ -1267,7 +1278,7 @@ def _source_python_valid(python: Path, source: Path) -> bool:
 
 
 def source_checkout_python(home: Path, source: Path) -> Path:
-    """Resolve the migration-bound source interpreter for CLI and gateway re-entry."""
+    """Resolve the migration-bound source interpreter without rebuilding it."""
     journal = ReleasePaths.for_home(home).home / "release-layout.json"
     try:
         record = json.loads(journal.read_text(encoding="utf-8-sig"))

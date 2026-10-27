@@ -171,6 +171,9 @@ class GatewayApiServer:
                 "API_SERVER_ENABLED": "true", "API_SERVER_KEY": self.key,
                 "API_SERVER_HOST": "127.0.0.1", "API_SERVER_PORT": str(port)}.items()), encoding="utf-8")
             self._log = open(log_path, "a", encoding="utf-8")
+            # The log is shared across attempts; each attempt judges only its own output, so one
+            # genuine collision cannot make every later attempt look like it lost the race too.
+            self._attempt_offset = self._log.tell()
             self.proc = subprocess.Popen(
                 [sys.executable, "-m", "gateway.run"], cwd=str(sb.home), env=sb.env({"HERMES_HOME": str(hermes_home)}),
                 stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT, start_new_session=True,
@@ -192,10 +195,18 @@ class GatewayApiServer:
         except OSError:
             return ""
 
+    def _attempt_log(self) -> str:
+        try:
+            with open(self.log_path, "rb") as log:
+                log.seek(self._attempt_offset)
+                return log.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
     def _await_ready(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         while True:
-            if "already in use" in self.log_tail(20000):
+            if "already in use" in self._attempt_log():
                 return False
             if self.proc.poll() is not None:
                 raise AssertionError(f"gateway exited {self.proc.returncode} before ready\n{self.log_tail()}")

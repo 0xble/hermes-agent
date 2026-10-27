@@ -9,6 +9,13 @@ class DiagnosticText(str):
     String behavior and event kind stay unchanged for existing plugin renderers.
     Durable carriers must serialize their own category, not this in-memory marker.
     """
+    notice_style = None
+
+    def __new__(cls, text=""):
+        instance = super().__new__(cls, text)
+        if getattr(text, "notice_style", None) is not None:
+            instance.notice_style = text.notice_style  # a re-wrapped ContextNotice keeps its style
+        return instance
 
 
 def is_warning_status(event_type: str, message: str) -> bool:

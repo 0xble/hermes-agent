@@ -44,8 +44,8 @@ class ReplayItem:
 class BackgroundTurnGate:
     """Room for one more background turn while fewer than ``limit`` run.
 
-    Load is measured, not counted: ``running_keys`` returns the sessions whose live turn
-    nobody typed, so a turn that ends, crashes or is stopped frees its slot without any
+    Load is measured, not counted: ``running_keys`` returns sessions in the gated lanes,
+    so a turn that ends, crashes or is stopped frees its slot without any
     release bookkeeping. Each reservation is a token owned by one caller and counts its
     session until ``claimed_since`` reports a turn started there after the reservation (or
     ``reservation_s`` passes for an admission that never ran), so reservations made before

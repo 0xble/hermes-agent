@@ -171,7 +171,8 @@ def assemble_api_request(
 
         _heal_notice = consume_pending_sanitizer_heal_notice()
         if _heal_notice:
-            agent._emit_warning(_heal_notice)
+            from agent.notice_style import ContextNotice
+            agent._emit_warning(ContextNotice(_heal_notice))
     except Exception:
         logger.debug("sanitizer heal notice delivery failed", exc_info=True)
 

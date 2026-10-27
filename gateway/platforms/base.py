@@ -29,6 +29,8 @@ from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _sh
 from gateway.copy_blocks import (
     protect_inline_copy_bodies, restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
 
+from gateway.platforms.reaction_lifecycle import reaction_operation
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,6 +134,8 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     thread_id = getattr(source, "thread_id", None)
     platform = _platform_name(getattr(source, "platform", None))
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    if platform == "slack" and reply_to_message_id:
+        metadata["message_id"] = reply_to_message_id
     # Slack workspace identity is routing state: carry it so a multi-workspace Socket Mode
     # gateway never falls back to its primary WebClient.
     scope_id = getattr(source, "scope_id", None) if platform == "slack" else None
@@ -460,6 +464,9 @@ from gateway.platforms.base_exec_approval import (
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
 from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
+from gateway.platforms.typing_state import (
+    TypingStateMixin, call_typing_with_metadata, forget_typing_prompt_surface, typing_metadata_for_event,
+)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
@@ -1838,11 +1845,18 @@ class CommandReply(str):
     """Gateway-authored reply (slash-command output), not agent output. Bare local paths in it
     stay text: a goal or title that names ``~/plan.md`` must not upload that file. Explicit
     ``MEDIA:`` tags still deliver."""
+    notice_style: Optional[str] = None
 
 
 def as_command_reply(value: Any) -> Any:
     """Mark a plain-string handler result as :class:`CommandReply`; other values pass through."""
-    return CommandReply(value) if type(value) is str else value
+    if isinstance(value, CommandReply):
+        return value
+    if type(value) is str or (isinstance(value, str) and getattr(value, "notice_style", None) == "context"):
+        reply = CommandReply(value)
+        reply.notice_style = getattr(value, "notice_style", None)
+        return reply
+    return value
 
 
 class EphemeralReply(CommandReply):
@@ -1855,6 +1869,7 @@ class EphemeralReply(CommandReply):
     def __new__(cls, text: str, ttl_seconds: Optional[int] = None):
         instance = super().__new__(cls, text)
         instance.ttl_seconds = ttl_seconds
+        instance.notice_style = getattr(text, "notice_style", None)
         return instance
 
     @property
@@ -2006,7 +2021,7 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(ABC):
+class BasePlatformAdapter(TypingStateMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -2017,16 +2032,6 @@ class BasePlatformAdapter(ABC):
     # Platform adapters may override the regular typing heartbeat cadence. Telegram narrows this
     # from its own Bot API expiry window; every other adapter keeps the historical 2s default.
     typing_refresh_interval: float = 2.0
-
-    def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
-        """Set or clear (``None``) the live working-state phrase for a chat. In-memory only: the
-        next typing refresh renders it; a no-op store on adapters that never read
-        ``_status_text``."""
-        store = _lazy_attr(self, "_status_text", dict)
-        if text:
-            store[str(chat_id)] = text
-        else:
-            store.pop(str(chat_id), None)
 
     # Can wake a fresh turn AFTER a turn ends (detached-subagent completions); False for stateless
     # adapters (API server). Propagated to ``HERMES_SESSION_ASYNC_DELIVERY`` so tools never promise
@@ -2967,6 +2972,15 @@ class BasePlatformAdapter(ABC):
         when content is unchanged."""
         return SendResult(success=False, error="Not supported")
 
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        """Add an explicit reaction, returning False if unsupported or delivery fails.
+
+        ``routing`` carries platform context such as team_id, thread_id and user_id
+        (the target author on Signal). Explicit reactions are independent of the
+        automatic processing-status reaction setting and do not mark a turn answered.
+        """
+        return False
+
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a sent message; True on success (platforms without a deletion API return False and
         callers leave it). Used by the stream consumer's fresh-final cleanup to remove stale
@@ -3647,12 +3661,16 @@ class BasePlatformAdapter(ABC):
         timeout so one slow round-trip is abandoned before the next tick, not the bubble lapsing."""
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
         loop = asyncio.get_running_loop()
+        scope = self._typing_scope_key(chat_id, metadata)
+        # Discord and Signal own _typing_tasks for their transport-level loops.
+        tasks = self.__dict__.setdefault("_typing_refresh_owners", {})
+        tasks[scope] = asyncio.current_task()
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
                 deadline = loop.time() + interval if self._typing_tick_anchor_before_send() else None
-                if chat_id not in self._typing_paused:
+                if not self._typing_is_paused(chat_id, metadata):
                     retry_used = False
                     while True:
                         timed_out = failed = False
@@ -3677,7 +3695,7 @@ class BasePlatformAdapter(ABC):
                             break
                         retry_used = True
                         await asyncio.sleep(retry_delay)
-                        if (stop_event is not None and stop_event.is_set()) or chat_id in self._typing_paused:
+                        if (stop_event is not None and stop_event.is_set()) or self._typing_is_paused(chat_id, metadata):
                             break
                 if deadline is None:
                     deadline = loop.time() + interval
@@ -3694,25 +3712,35 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
-            cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
-            if cancel_retrigger is not None:
-                with contextlib.suppress(Exception):
-                    cancel_retrigger(chat_id, metadata)
-            # A send_typing after an outer stop_typing() may have recreated the platform loop.
-            await self._stop_typing_quietly(chat_id, metadata)
-            self._typing_paused.discard(chat_id)
-            # getattr-guard: tests build adapters via object.__new__ without _status_text.
-            getattr(self, "_status_text", {}).pop(str(chat_id), None)
+            # A retired owner leaves its live successor's status, pause, phrase and prompt intact.
+            if not self._typing_owner_retired(chat_id, metadata, asyncio.current_task()):
+                cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
+                if cancel_retrigger is not None:
+                    with contextlib.suppress(Exception):
+                        cancel_retrigger(chat_id, metadata)
+                # A send_typing after an outer stop_typing() may have recreated the platform loop.
+                await self._stop_typing_quietly(chat_id, metadata)
+                self._typing_paused.discard(scope)
+                if tasks.get(scope) is asyncio.current_task():
+                    tasks.pop(scope, None)
+                getattr(self, "_status_text", {}).pop(scope, None)
+                forget_typing_prompt_surface(self, chat_id, metadata)
 
     async def _stop_typing_refresh(
         self, chat_id: str, typing_task: asyncio.Task | None = None, *, metadata=None,
         timeout: float = 0.5, stop_attempts: int = 2) -> None:
         """Stop the refresh task and platform typing state as one operation."""
+        if self._typing_owner_retired(chat_id, metadata, typing_task):
+            # Only retire the stale task: the surface now belongs to a live successor.
+            typing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(typing_task), timeout=timeout)
+            return
         cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
         if cancel_retrigger is not None:
             with contextlib.suppress(Exception):
                 cancel_retrigger(chat_id, metadata)
-        self._typing_paused.add(chat_id)
+        call_typing_with_metadata(self.pause_typing_for_chat, chat_id, metadata=metadata)
         try:
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
@@ -3724,20 +3752,13 @@ class BasePlatformAdapter(ABC):
                     await asyncio.sleep(0)
                 await self._stop_typing_quietly(chat_id, metadata)
         finally:
-            self._typing_paused.discard(chat_id)
+            call_typing_with_metadata(self.resume_typing_for_chat, chat_id, metadata=metadata)
+            forget_typing_prompt_surface(self, chat_id, metadata)
 
     async def _stop_typing_quietly(self, chat_id: str, metadata=None) -> None:
         """Best-effort platform stop_typing; adapter errors are swallowed."""
         with contextlib.suppress(Exception):
             await self._stop_typing_with_metadata(chat_id, metadata)
-
-    def pause_typing_for_chat(self, chat_id: str) -> None:
-        """Pause typing for a chat (approval waits); GIL-safe from the sync agent thread."""
-        self._typing_paused.add(chat_id)
-
-    def resume_typing_for_chat(self, chat_id: str) -> None:
-        """Resume typing indicator for a chat after approval resolves."""
-        self._typing_paused.discard(chat_id)
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str, metadata=None) -> None:
         """Signal the active session loop to stop and clear typing immediately."""
@@ -3829,19 +3850,23 @@ class BasePlatformAdapter(ABC):
         platform replaces or stacks a sender's reactions. CANCELLED leaves it unreacted."""
         if self._OK_EMOJI is None and self._FAIL_EMOJI is None:
             return
-        add: Any = getattr(self, "_add_reaction", None)
-        remove: Any = getattr(self, "_remove_reaction", None)
-        enabled = getattr(self, "_reactions_enabled", None)
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
-        if (not callable(add) or not callable(remove) or (callable(enabled) and not enabled())
-                or not chat_id or not message_id):
+        if not (chat_id and message_id):
             return
-        await remove(chat_id, message_id)
-        emoji = {ProcessingOutcome.SUCCESS: self._OK_EMOJI,
-                 ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
-        if emoji:
-            await add(chat_id, message_id, emoji)
+        async with reaction_operation(self, chat_id, message_id, complete=True, event=event) as state:
+            if state.explicit:
+                return
+            add: Any = getattr(self, "_add_reaction", None)
+            remove: Any = getattr(self, "_remove_reaction", None)
+            enabled = getattr(self, "_reactions_enabled", None)
+            if not callable(add) or not callable(remove) or (callable(enabled) and not enabled()):
+                return
+            await remove(chat_id, message_id)
+            emoji = {ProcessingOutcome.SUCCESS: self._OK_EMOJI,
+                     ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
+            if emoji:
+                await add(chat_id, message_id, emoji)
 
     def _shared_burst_pending(self, event: MessageEvent, session_key: str) -> bool:
         from gateway.session_ingress_burst import holds_busy_burst
@@ -3892,7 +3917,11 @@ class BasePlatformAdapter(ABC):
             ttl = _or_default(lambda: int(self._get_ephemeral_system_ttl_default()), 0, Exception)
         if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
             ttl = 0
-        return response.text, int(ttl or 0)
+        text = response.text
+        if response.notice_style is not None:
+            text = as_command_reply(text)
+            text.notice_style = response.notice_style
+        return text, int(ttl or 0)
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and
@@ -3984,6 +4013,8 @@ class BasePlatformAdapter(ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
+        from agent.notice_style import notice_metadata
+        metadata = notice_metadata(metadata, platform=self.platform, style=getattr(content, "notice_style", None))
         result = await self._send_with_retry_body(
             chat_id, content, reply_to=reply_to, metadata=metadata,
             max_retries=max_retries, base_delay=base_delay)
@@ -5355,7 +5386,8 @@ class BasePlatformAdapter(ABC):
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
-        typing_task = review_capture.start_typing(self, event, interrupt_event, _thread_metadata)
+        _typing_metadata = typing_metadata_for_event(event)
+        typing_task = review_capture.start_typing(self, event, interrupt_event, _typing_metadata)
         from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
         turn_token = scoped_turn_entry()
         delivery_generation = None
@@ -5390,7 +5422,10 @@ class BasePlatformAdapter(ABC):
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                from agent.notice_style import notice_metadata
+                _final_thread_metadata = notice_metadata(
+                    _mark_notify_metadata(_thread_metadata), platform=self.platform,
+                    style=getattr(response, "notice_style", None))
                 _tts_paths, _tts_requested_path = [], None
                 _spoken_text = self._spoken_reply_text(extracted)
                 if self._wants_auto_tts(
@@ -5420,7 +5455,7 @@ class BasePlatformAdapter(ABC):
                 # measured to have no effect).
                 if text_content or extracted.copy_blocks or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
-                    self.pause_typing_for_chat(event.source.chat_id)
+                    call_typing_with_metadata(self.pause_typing_for_chat, event.source.chat_id, metadata=_typing_metadata)
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
@@ -5463,7 +5498,7 @@ class BasePlatformAdapter(ABC):
             if pending_event is not None:
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
-                await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
+                await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
@@ -5487,13 +5522,13 @@ class BasePlatformAdapter(ABC):
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
-            await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
+            await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
             if not (self._pending_messages.get(session_key) is event
                     and getattr(event, "_gateway_compression_deferred", False)):
                 await self._fire_post_delivery_callback(session_key, delivery_generation)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
-                event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
+                event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)

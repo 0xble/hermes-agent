@@ -197,7 +197,7 @@ def test_the_limit_line_and_the_heads_up_stay_off_messaging():
                       mute_notification_reply=False)
     holder = SimpleNamespace(_ctx=ctx, _status_live=lambda: True,
                              _schedule=lambda coro, *args: scheduled.append(coro),
-                             _runner=SimpleNamespace(_deliver_platform_notice=lambda *args: "notice-send"))
+                             _runner=SimpleNamespace(_deliver_platform_notice=lambda *args, **kwargs: "notice-send"))
     with patch("gateway.run.render_notice_line", lambda notice: notice.text):
         TurnRunner._notice_callback_sync(holder, SimpleNamespace(level="error", text="limit", key="credits.window_limit"))
         TurnRunner._notice_callback_sync(holder, SimpleNamespace(level="warn", text="91%", key="credits.window.day"))

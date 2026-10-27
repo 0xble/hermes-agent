@@ -42,6 +42,9 @@ def _goal_receipt_text(function_name: str, result: Any) -> str:
         return ""
     try:
         from hermes_cli.config import load_config_readonly
+        from hermes_cli.goal_notices import goal_notices_enabled
+        if function_name == "goal_set" and not goal_notices_enabled():
+            return ""
         config = load_config_readonly()
         if not (config.get(receipt_spec["config_section"]) or {}).get(receipt_spec["config_key"], True):
             return ""
@@ -70,7 +73,7 @@ def _emit_goal_receipt(agent, function_name: str, result: Any) -> None:
             # goal and contract); single-line drivers show only the headline.
             agent._emit_notice(AgentNotice(
                 text=text, level="info", kind="ttl", ttl_ms=CREDITS_RESTORED_TTL_MS,
-                key=notice_key, id=notice_key,
+                key=notice_key, id=notice_key, notice_style="context",
             ))
         else:
             agent._vprint(text, force=True)

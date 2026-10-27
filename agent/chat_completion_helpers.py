@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH, parse_reasoning_effort
+from agent.notice_style import ContextNotice
 from agent.error_classifier import (
     FailoverReason, PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE, PROVIDER_STREAM_NON_JSON_ERROR_CODE,
     _extract_status_code)
@@ -49,8 +50,7 @@ from agent.message_sanitization import (
     _sanitize_messages_surrogates, _sanitize_surrogates, _repair_tool_call_arguments,
     normalize_finish_reason as _normalize_finish_reason, sanitize_outbound_kwargs, strip_images_for_rejecting_model,
 )
-from agent.reasoning_summaries import (
-    append_streamed_reasoning_detail, separate_glued_reasoning_blocks, streamed_reasoning_detail_text)
+from agent.reasoning_summaries import append_streamed_reasoning_detail, separate_glued_reasoning_blocks, streamed_reasoning_detail_text
 from agent.local_prompt_progress import prompt_progress, with_prompt_progress
 from agent.repetition_guard import RunawayStreamWatch, is_repetition_dominated
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
@@ -2660,11 +2660,7 @@ def _relay_stream_identity(agent, name_default: str) -> dict:
         "model_name": str(getattr(agent, "model", "") or "")}
 
 
-def _relay_stream_metadata(agent, api_mode: str) -> dict:
-    call_role = ("delegated" if getattr(agent, "is_subagent", False)
-                 else "fallback" if int(getattr(agent, "_fallback_index", 0) or 0) > 0 else "primary")
-    return {"api_mode": api_mode, "api_request_id": getattr(agent, "_current_api_request_id", None),
-        "call_role": call_role}
+from agent.chat_completion_helpers_relay import _relay_stream_metadata, stream_service_tier
 
 
 def _stream_final_text(response) -> str:
@@ -3239,6 +3235,7 @@ class _StreamingCall(StreamingWaitMonitor):
         from agent.reasoning_carriers import StreamCarriers
         carriers = StreamCarriers()
         finish_reason = model_name = usage_obj = None
+        served_service_tier = None
         response_id = upstream_provider = None  # the provider's own id / serving upstream, from the chunks
         role = "assistant"
         _diag = self._new_diag()
@@ -3300,6 +3297,7 @@ class _StreamingCall(StreamingWaitMonitor):
                 continue
             model_name, response_id, upstream_provider = self._chunk_identity(
                 _diag, chunk, model_name, response_id, upstream_provider)
+            served_service_tier = stream_service_tier(chunk, served_service_tier)
             if not chunk.choices:
                 usage, finish_reason = self._choiceless_chunk(chunk, finish_reason)
                 usage_obj = usage or usage_obj
@@ -3411,6 +3409,7 @@ class _StreamingCall(StreamingWaitMonitor):
             "length" if runaway else finish_reason, model_name, usage_obj, flush_pending=_flush_pending_stream_text,
             response_id=response_id, upstream_provider=upstream_provider, reasoning_details=reasoning_details,
             refusal_parts=refusal_parts)
+        response.service_tier = served_service_tier
         carriers.apply(response)
         if runaway:
             # Cut, not finished: the length path ends the turn on this mark instead of continuing.
@@ -3730,9 +3729,9 @@ class _StreamingCall(StreamingWaitMonitor):
             # Durable channel, not _buffer_status: this recovery is expected to SUCCEED, and
             # buffered retry chatter is dropped on successful recovery. Fires at most once per
             # session (streaming is off from here on).
-            self.agent._emit_warning(
+            self.agent._emit_warning(ContextNotice(
                 "⚠️ Provider stream returned an empty keepalive frame — retrying this turn "
-                "without streaming (streaming stays off for this session).")
+                "without streaming (streaming stays off for this session)."))
             return
         from agent.anthropic_adapter import _is_stream_unavailable_error
         if not _is_stream_unavailable_error(e):

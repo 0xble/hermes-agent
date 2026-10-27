@@ -30,6 +30,7 @@ from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, turn_origin_for_event
+from gateway.platforms.typing_state import call_typing_with_metadata
 from gateway.session_context import bound_turn_origin, set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
@@ -503,9 +504,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         route = attended_runtime_route(decision)
         target_model = cfg.model or decision.model
         session_last_model = last_model or conversation.last_resolved_model or ""
+        if route_active is _NO_ATTENDED_ACTIVITY_STAMP:  # loop callers pass the off-loop snapshot's value
+            load_route_active = getattr(self, "_load_attended_route_active", None)
+            route_active = load_route_active(session_key) if callable(load_route_active) else None
         if (
             decision.reason != "role"
             and not decision.new_session
+            # Resolution probes can carry a stale model snapshot across worker handoffs.
+            # A committed attended API route is not another idle-to-attended switch.
+            and route_active is not True
             and (not session_last_model or session_last_model != target_model)
         ):
             # Async resolution supplies config-derived reasoning in the detached snapshot.  Do not
@@ -2381,7 +2388,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         # silent; any other human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
-        if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
+        from gateway.response_filters import reaction_answered
+        if _intentional_silence and not (reaction_answered(agent_result) or silence_allowed(_silence_kind, _silence_reply_expected)):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
@@ -3664,7 +3672,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 images, text_content = adapter.extract_images(response)
                 text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
+                content = header + text_content
+                if source.platform == Platform.SLACK and not (result or {}).get("error"):
+                    from agent.notice_style import notice_metadata
+                    await adapter.send(chat_id=source.chat_id, content=header,
+                                       metadata=notice_metadata(_thread_metadata, platform=source.platform, style="context"))
+                    content = text_content
+                await adapter.send(chat_id=source.chat_id, content=content, metadata=_thread_metadata)
             for copy_block in copy_blocks:
                 copy_metadata = dict(_thread_metadata or {})
                 copy_metadata["copy_block"] = True
@@ -3846,7 +3860,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
             def _pause_typing_before_finalize(_adapter=adapter, _chat_id=source.chat_id) -> None:
-                _adapter.pause_typing_for_chat(_chat_id)
+                call_typing_with_metadata(_adapter.pause_typing_for_chat, _chat_id, metadata=self._thread_metadata_for_source(source))
         # Non-editing platforms (QQ, WeChat) skip streaming — the partial first message could never
         # be updated — unless they have a native-streaming transport (WeCom msgtype "stream").
         _adapter_supports_edit = getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
@@ -4978,7 +4992,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # Runtime provenance describes the continuation row, not the original human's silence
             # contract. A queued successor must not make the retry's second marker silently legal.
             silence_kind = None if getattr(turn_ctx, "silence_retry", False) else turn_ctx.persist_user_display_kind
-            if silence_allowed(silence_kind, turn_ctx.reply_expected):
+            from gateway.response_filters import reaction_answered
+            if reaction_answered(_delivery_result) or silence_allowed(silence_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 
 from tools import async_delegation as ad
+from tools import async_delegation_completion as execution_checkpoints
 from tools import delegate_tool
 from tools import delegate_tool_dispatch as dispatch
 from tools import delegation_resume as dr
@@ -216,6 +217,116 @@ def test_stop_after_legacy_claim_cannot_admit_a_replacement(monkeypatch, reason)
     assert dr.retry_status(batch.live_deleg_id) is None
 
 
+@pytest.mark.parametrize("route,phase", [("schedule", "armed"), ("sweep", "armed"),
+                                         ("sweep", "scheduled"), ("sweep", "dispatching")])
+def test_execution_seal_prevents_retry_sweeper_claims_and_notices(route, phase):
+    now = time.time()
+
+    def row(did):
+        with sqlite3.connect(ad._db_path()) as conn:
+            return conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (did,)).fetchone()
+
+    def prepare(did, *, sealed):
+        _batch_row(did)
+        with ad._DB_LOCK, ad._transaction() as conn:
+            task = json.loads(conn.execute("SELECT task_json FROM async_delegations WHERE delegation_id=?",
+                                          (did,)).fetchone()[0])
+            if sealed:
+                task["execution_sealed_at"] = now
+            conn.execute("UPDATE async_delegations SET task_json=?, retry_state=?, retry_due_at=?, "
+                         "retry_claim=?, retry_claimed_at=?, delivery_state='delivered' WHERE delegation_id=?",
+                         (json.dumps(task), phase, now - 60,
+                          "stale-dispatch-claim" if phase == "dispatching" else None,
+                          now - dr.RETRY_CLAIM_TTL_S - dr.NOTICE_GRACE_S - 1, did))
+
+    def advance(did):
+        return dr.schedule_retry(did, now=now) if route == "schedule" else dr.sweep_retries(now=now)
+
+    control, sealed = "deleg_unsealed_sweep_control", "deleg_sealed_retry_sweep"
+    prepare(control, sealed=False)
+    control_before = row(control)
+    advance(control)
+    assert row(control) != control_before, "the unsealed control must exercise real due retry work"
+    prepare(sealed, sealed=True)
+    before = row(sealed)
+    actions = advance(sealed)
+    assert row(sealed) == before, "the retry sweeper must not classify, expire or claim sealed execution"
+    assert not actions, "sealed execution must create neither recovery notices nor terminal reports"
+    with sqlite3.connect(ad._db_path()) as conn:
+        assert conn.execute("SELECT * FROM async_delegation_child_recovery WHERE delegation_id=?",
+                            (sealed,)).fetchall() == []
+
+
+@pytest.mark.parametrize("shape", ["scalar", "batch"])
+@pytest.mark.parametrize("route", ["manual", "retry", "available"])
+def test_execution_seal_refuses_new_recovery_claim_without_mutating_ledger(shape, route):
+    did = _batch_row("deleg_sealed_new_claim")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        task = json.loads(conn.execute("SELECT task_json FROM async_delegations WHERE delegation_id=?",
+                                      (did,)).fetchone()[0])
+        if shape == "scalar":
+            task.update(goal="unfinished scalar", goals=["unfinished scalar"], task_indexes=None)
+            conn.execute("UPDATE async_delegations SET result_json=? WHERE delegation_id=?",
+                         (json.dumps({"results": [{"task_index": 0, "status": "interrupted"}]}), did))
+        conn.execute("UPDATE async_delegations SET task_json=?, retry_state=?, retry_due_at=? "
+                     "WHERE delegation_id=?", (json.dumps(task), "scheduled" if route == "retry" else "none",
+                                               time.time(), did))
+    assert dr.resume_available(did), "the unsealed fixture must be genuinely eligible"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        task["execution_sealed_at"] = time.time()
+        conn.execute("UPDATE async_delegations SET task_json=? WHERE delegation_id=?", (json.dumps(task), did))
+
+    def stored_rows():
+        with sqlite3.connect(ad._db_path()) as conn:
+            return (conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (did,)).fetchall(),
+                    conn.execute("SELECT * FROM async_delegation_child_recovery WHERE delegation_id=?", (did,)).fetchall())
+
+    before = stored_rows()
+    if route == "available":
+        assert not dr.resume_available(did), "a sealed execution cannot advertise another recovery"
+    else:
+        claim = dr.claim_retry_dispatch if route == "retry" else (
+            dr.claim_resume if shape == "scalar" else dr.claim_batch_resume)
+        record, reason = claim(did)
+        assert record is not None
+        assert reason == "execution_sealed", "a seal must reject new scalar, child and automatic recovery claims"
+    assert stored_rows() == before, "refusing a sealed execution must not create or consume a claim"
+
+
+@pytest.mark.parametrize("shape", ["tasks", "legacy"])
+def test_sealed_execution_refuses_previously_claimed_recovery(monkeypatch, shape):
+    from typing import cast
+
+    did, batch, _ = _legacy_batch(monkeypatch, shape=shape)
+    # A native seal may arrive after a caller takes its recovery brief. This
+    # admission fixture represents stopped executions, not successful outcomes.
+    with ad._DB_LOCK, ad._transaction() as conn:
+        row = conn.execute("SELECT task_json FROM async_delegations WHERE delegation_id=?", (did,)).fetchone()
+        task = json.loads(row[0])
+        finished_at = time.time()
+        task["child_execution"] = {
+            str(index): {"child_session_id": f"{did}-child-{index}",
+                         "checkpoint": "finished_child", "finished_at": finished_at}
+            for index in range(len(task["goals"]))
+        }
+        task["unit_execution"] = {"checkpoint": "finished_unit", "finished_at": finished_at}
+        task["execution_sealed_at"] = finished_at
+        conn.execute("UPDATE async_delegations SET task_json=? WHERE delegation_id=?", (json.dumps(task), did))
+    source_before = dr.retry_status(did)
+    assert source_before is not None and source_before["resume_attempts"] == 1
+    result = json.loads(dispatch._dispatch_background(cast(dispatch._Batch, batch)))
+    assert result["status"] == "rejected", "a previously claimed brief cannot reopen sealed execution"
+    assert "sealed" in result["error"].lower()
+    cast(Mock, dispatch._run_sync_with_note).assert_not_called()
+    cast(Mock, dispatch._execute_and_aggregate).assert_not_called()
+    assert dr.retry_status(batch.live_deleg_id) is None
+    assert dr.retry_status(did) == source_before, "policy rejection must not reopen or consume the original claim"
+    with sqlite3.connect(ad._db_path()) as conn:
+        consumed = conn.execute("SELECT replacement_delegation_id FROM async_delegation_child_recovery "
+                                "WHERE delegation_id=? AND replacement_delegation_id IS NOT NULL", (did,)).fetchall()
+    assert consumed == [], "rejection must neither INSERT a child nor consume a recovery receipt"
+
+
 @pytest.mark.parametrize("route", ["no_async", "synchronous"])
 @pytest.mark.parametrize("shape", ["tasks", "legacy"])
 def test_recovery_cannot_bypass_atomic_admission_on_sync_routes(monkeypatch, route, shape):
@@ -238,7 +349,7 @@ def _cut_live_batch(did, *, tui=False):
     checkpointed, release = threading.Event(), threading.Event()
 
     def runner():
-        ad.record_unit_child(did, {"task_index": 0, "status": "completed", "summary": "done"})
+        execution_checkpoints.record_unit_child(did, {"task_index": 0, "status": "completed", "summary": "done"})
         checkpointed.set()
         assert release.wait(5)
         raise RuntimeError("shutdown aggregation failed")
@@ -341,4 +452,363 @@ def test_actual_session_stop_revokes_claimed_legacy_recovery(monkeypatch, reason
     assert affected == 1
     assert dr.retry_status("deleg_claimed_stop_replacement") is None
     assert dr.retry_status(did)["retry_state"] == dr.RETRY_CANCELLED
+    assert "error" in json.loads(_handle_control_action("resume", did, None, _Parent()))
+
+
+@pytest.mark.parametrize("route", ["schedule", "sweep"])
+def test_retry_scheduler_and_execution_seal_have_one_sqlite_winner(monkeypatch, route):
+    from concurrent.futures import ThreadPoolExecutor
+
+    did = _batch_row("deleg_seal_scheduler_race")
+    now = time.time()
+    with sqlite3.connect(ad._db_path()) as conn:
+        conn.execute("UPDATE async_delegations SET retry_state=?, retry_due_at=?, "
+                     "delivery_state='delivered' WHERE delegation_id=?",
+                     ("armed" if route == "schedule" else "scheduled", now - 60, did))
+    checked, release_read = threading.Event(), threading.Event()
+    original_gate = dr._recovery_admission_error
+    before, receipts_before = None, []
+
+    def gated_gate(record):
+        reason = original_gate(record)
+        if record["delegation_id"] == did and not checked.is_set():
+            checked.set()
+            assert release_read.wait(10)
+        return reason
+
+    monkeypatch.setattr(dr, "_recovery_admission_error", gated_gate)
+    advance = (lambda: dr.schedule_retry(did, now=now)) if route == "schedule" else (
+        lambda: dr.sweep_retries(now=now))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(advance)
+        try:
+            assert checked.wait(10)
+            with sqlite3.connect(ad._db_path(), timeout=0.01) as competitor:
+                try:
+                    competitor.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as exc:
+                    assert "locked" in str(exc)
+                    seal_won = False
+                else:
+                    task = json.loads(competitor.execute(
+                        "SELECT task_json FROM async_delegations WHERE delegation_id=?", (did,),
+                    ).fetchone()[0])
+                    task["execution_sealed_at"] = now
+                    competitor.execute("UPDATE async_delegations SET task_json=? WHERE delegation_id=?",
+                                       (json.dumps(task), did))
+                    before = competitor.execute("SELECT * FROM async_delegations WHERE delegation_id=?",
+                                                (did,)).fetchone()
+                    receipts_before = competitor.execute(
+                        "SELECT * FROM async_delegation_child_recovery WHERE delegation_id=?", (did,),
+                    ).fetchall()
+                    seal_won = True
+        finally:
+            release_read.set()
+        actions = result.result(timeout=10)
+    with sqlite3.connect(ad._db_path()) as conn:
+        after = conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (did,)).fetchone()
+        receipts_after = conn.execute(
+            "SELECT * FROM async_delegation_child_recovery WHERE delegation_id=?", (did,),
+        ).fetchall()
+    if seal_won:
+        assert after == before, "a stale scheduler read must not mutate a durably sealed execution"
+        assert receipts_after == receipts_before
+        assert not actions, "a losing scheduler cannot publish a retry notice or terminal report"
+    else:
+        assert actions, "the admission winner must preserve ordinary unsealed retry processing"
+
+
+@pytest.mark.parametrize("route", ["manual", "batch", "retry"])
+def test_recovery_claim_and_execution_seal_have_one_sqlite_admission_winner(monkeypatch, route):
+    from concurrent.futures import ThreadPoolExecutor
+
+    did = _batch_row("deleg_seal_claim_race")
+    with sqlite3.connect(ad._db_path()) as conn:
+        if route != "batch":
+            task = json.loads(conn.execute(
+                "SELECT task_json FROM async_delegations WHERE delegation_id=?", (did,),
+            ).fetchone()[0])
+            task.update(goal="recover once", goals=["recover once"])
+            task.pop("task_indexes", None)
+            conn.execute("UPDATE async_delegations SET task_json=?, result_json=? WHERE delegation_id=?",
+                         (json.dumps(task), json.dumps({"results": [{"task_index": 0, "status": "interrupted"}]}), did))
+        if route == "retry":
+            conn.execute("UPDATE async_delegations SET retry_state='scheduled', retry_due_at=? WHERE delegation_id=?",
+                         (time.time() - 1, did))
+    loaded, release_read = threading.Event(), threading.Event()
+    real_load = dr._load
+
+    def gated_load(conn, delegation_id):
+        record = real_load(conn, delegation_id)
+        if delegation_id == did and not loaded.is_set():
+            loaded.set()
+            assert release_read.wait(10)
+        return record
+
+    monkeypatch.setattr(dr, "_load", gated_load)
+    claim = {"manual": dr.claim_resume, "batch": dr.claim_batch_resume, "retry": dr.claim_retry_dispatch}[route]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(claim, did)
+        try:
+            assert loaded.wait(10)
+            # Independent SQLite writer, not the process-local Python mutex.
+            with sqlite3.connect(ad._db_path(), timeout=0.01) as competitor:
+                try:
+                    competitor.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as exc:
+                    assert "locked" in str(exc)
+                    seal_won = False
+                else:
+                    task = json.loads(competitor.execute(
+                        "SELECT task_json FROM async_delegations WHERE delegation_id=?", (did,),
+                    ).fetchone()[0])
+                    task["execution_sealed_at"] = time.time()
+                    competitor.execute("UPDATE async_delegations SET task_json=? WHERE delegation_id=?",
+                                       (json.dumps(task), did))
+                    seal_won = True
+        finally:
+            release_read.set()
+        record, reason = result.result(timeout=10)
+    assert record is not None
+    if seal_won:
+        assert reason == dr.INELIGIBLE_SEALED, "a stale pre-seal read must not admit a post-seal recovery claim"
+    else:
+        assert reason is None
+    with sqlite3.connect(ad._db_path()) as conn:
+        state, attempts = conn.execute(
+            "SELECT resume_state, resume_attempts FROM async_delegations WHERE delegation_id=?", (did,),
+        ).fetchone()
+        receipts = conn.execute("SELECT COUNT(*) FROM async_delegation_child_recovery WHERE delegation_id=?",
+                                (did,)).fetchone()[0]
+    if seal_won:
+        assert state == dr.RESUME_STATE_NONE and attempts == 0 and receipts == 0
+    elif route == "batch":
+        assert state == dr.RESUME_STATE_CLAIMED and attempts == 1 and receipts == 2
+    else:
+        assert attempts == (1 if route == "manual" else 0)
+
+
+@pytest.mark.parametrize("shape", ["tasks", "legacy"])
+def test_replacement_admission_and_execution_seal_have_one_sqlite_winner(monkeypatch, shape):
+    from concurrent.futures import ThreadPoolExecutor
+    from typing import cast
+
+    source_before, receipts_before = None, []
+    did, batch, _ = _legacy_batch(monkeypatch, shape=shape)
+    checked, release_read = threading.Event(), threading.Event()
+    original_gate = dr.replacement_admission_error
+
+    def gated_gate(conn, record, task_json):
+        reason = original_gate(conn, record, task_json)
+        checked.set()
+        assert release_read.wait(10)
+        return reason
+
+    monkeypatch.setattr(dr, "replacement_admission_error", gated_gate)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(dispatch._dispatch_background, cast(dispatch._Batch, batch))
+        try:
+            assert checked.wait(10)
+            with sqlite3.connect(ad._db_path(), timeout=0.01) as competitor:
+                try:
+                    competitor.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as exc:
+                    assert "locked" in str(exc)
+                    seal_won = False
+                else:
+                    task = json.loads(competitor.execute(
+                        "SELECT task_json FROM async_delegations WHERE delegation_id=?", (did,),
+                    ).fetchone()[0])
+                    task["execution_sealed_at"] = time.time()
+                    competitor.execute("UPDATE async_delegations SET task_json=? WHERE delegation_id=?",
+                                       (json.dumps(task), did))
+                    source_before = competitor.execute(
+                        "SELECT * FROM async_delegations WHERE delegation_id=?", (did,),
+                    ).fetchone()
+                    receipts_before = competitor.execute(
+                        "SELECT * FROM async_delegation_child_recovery WHERE delegation_id=?", (did,),
+                    ).fetchall()
+                    seal_won = True
+        finally:
+            release_read.set()
+        payload = json.loads(result.result(timeout=10))
+    with sqlite3.connect(ad._db_path()) as conn:
+        replacement = conn.execute("SELECT delegation_id FROM async_delegations WHERE delegation_id=?",
+                                   (batch.live_deleg_id,)).fetchone()
+        source_after = conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (did,)).fetchone()
+        receipts_after = conn.execute("SELECT * FROM async_delegation_child_recovery WHERE delegation_id=?",
+                                      (did,)).fetchall()
+    if seal_won:
+        assert payload["status"] == "rejected", "a post-seal insertion must not consume the prior recovery claim"
+        assert replacement is None
+        assert source_after == source_before and receipts_after == receipts_before
+    else:
+        assert payload["status"] == "queued"
+        assert replacement == (batch.live_deleg_id,)
+    cast(Mock, dispatch._run_sync_with_note).assert_not_called()
+    cast(Mock, dispatch._execute_and_aggregate).assert_not_called()
+
+
+@pytest.mark.parametrize("linkage", ["scalar", "retry_root", "child", "mixed"])
+@pytest.mark.parametrize("request_from", ["root", "left", "native_child"])
+@pytest.mark.parametrize("gap", ["none", "live_child", "missing_record"])
+def test_explicit_seal_closes_the_complete_recovery_lineage(linkage, request_from, gap):
+    from tools import async_delegation_completion as execution
+
+    ids = {name: f"deleg_closed_lineage_{name}" for name in ("root", "left", "right")}
+    now = time.time()
+    for name, did in ids.items():
+        if name == "right" and gap == "missing_record":
+            continue
+        _batch_row(did)
+        with sqlite3.connect(ad._db_path()) as conn:
+            task = json.loads(conn.execute("SELECT task_json FROM async_delegations WHERE delegation_id=?",
+                                           (did,)).fetchone()[0])
+            task["child_execution"] = {
+                str(index): {"child_session_id": f"{did}-child-{index}",
+                             "checkpoint": "finished_child", "finished_at": now}
+                for index in task["task_indexes"]
+            }
+            task["unit_execution"] = {"checkpoint": "finished_unit", "finished_at": now}
+            if name == "right" and gap == "live_child":
+                task["child_execution"]["2"].update(checkpoint="admitted_child", finished_at=None)
+            conn.execute("UPDATE async_delegations SET task_json=? WHERE delegation_id=?", (json.dumps(task), did))
+    with sqlite3.connect(ad._db_path()) as conn:
+        if linkage == "scalar":
+            for source, target in (("root", "left"), ("left", "right")):
+                conn.execute("UPDATE async_delegations SET retry_replacement=? WHERE delegation_id=?",
+                             (ids[target], ids[source]))
+        elif linkage == "retry_root":
+            # A dangling retry-root reference is also unknown lineage, not a
+            # reason to silently discard the missing member from closure.
+            for source in ("left", "right"):
+                conn.execute("UPDATE async_delegations SET retry_root=? WHERE delegation_id=?",
+                             (ids["root"], ids[source]))
+            if gap == "missing_record":
+                conn.execute("UPDATE async_delegations SET retry_root=? WHERE delegation_id=?",
+                             (ids["right"], ids["root"]))
+        else:
+            edges = (("root", "left", 1), ("root", "right", 2)) if linkage == "child" else (
+                ("left", "right", 1),)
+            for source, target, index in edges:
+                conn.execute("INSERT INTO async_delegation_child_recovery "
+                             "(delegation_id, task_index, claim, claimed_at, replacement_delegation_id) "
+                             "VALUES (?, ?, ?, ?, ?)", (ids[source], index, "native-closure-claim", now, ids[target]))
+            if linkage == "mixed":
+                conn.execute("UPDATE async_delegations SET retry_replacement=? WHERE delegation_id=?",
+                             (ids["left"], ids["root"]))
+                conn.execute("UPDATE async_delegations SET retry_root=? WHERE delegation_id=?",
+                             (ids["root"], ids["left"]))
+
+    def rows():
+        with sqlite3.connect(ad._db_path()) as conn:
+            conn.row_factory = sqlite3.Row
+            return ({row["delegation_id"]: dict(row) for row in conn.execute(
+                        "SELECT * FROM async_delegations ORDER BY delegation_id")},
+                    [dict(row) for row in conn.execute(
+                        "SELECT * FROM async_delegation_child_recovery ORDER BY delegation_id, task_index")])
+
+    before, receipts_before = rows()
+    requested = ids["left" if request_from == "native_child" else request_from]
+    selector = "" if request_from == "native_child" else requested
+    assert execution.seal_execution(selector, child_session_id=f"{requested}-child-0") is (gap == "none"), (
+        "closure must cover every scalar, shared-root and per-child replacement before returning success"
+    )
+    after, receipts_after = rows()
+    assert receipts_after == receipts_before
+    assert after.keys() == before.keys()
+    if gap != "none":
+        assert after == before, "one unknown member must leave the whole lineage untouched"
+        return
+    for did in before:
+        before_task = json.loads(before[did].pop("task_json"))
+        after_task = json.loads(after[did].pop("task_json"))
+        assert after[did] == before[did], "closure must not rewrite outcome, delivery or claim state"
+        assert after_task.pop("execution_sealed_at") >= now
+        assert after_task == before_task
+        assert dr.claim_resume(did)[1] == dr.INELIGIBLE_SEALED
+    closed, closed_receipts = rows()
+    assert execution.seal_execution(selector, child_session_id=f"{requested}-child-0")
+    assert rows() == (closed, closed_receipts), "repeated closure must preserve every seal timestamp"
+
+
+@pytest.mark.parametrize("native_id", ["unknown-native-child", "ambiguous-native-child"])
+def test_native_only_seal_requires_a_unique_durable_identity(native_id):
+    from tools import async_delegation_completion as execution
+
+    now = time.time()
+    for did in ("deleg_native_identity_a", "deleg_native_identity_b"):
+        _batch_row(did)
+        with sqlite3.connect(ad._db_path()) as conn:
+            task = json.loads(conn.execute("SELECT task_json FROM async_delegations WHERE delegation_id=?",
+                                           (did,)).fetchone()[0])
+            task["child_execution"] = {
+                str(i): {"child_session_id": "ambiguous-native-child" if i == 0 else f"{did}-child-{i}",
+                         "checkpoint": "finished_child", "finished_at": now}
+                for i in task["task_indexes"]
+            }
+            task["unit_execution"] = {"checkpoint": "finished_unit", "finished_at": now}
+            conn.execute("UPDATE async_delegations SET task_json=? WHERE delegation_id=?", (json.dumps(task), did))
+    with sqlite3.connect(ad._db_path()) as conn:
+        before = conn.execute("SELECT * FROM async_delegations ORDER BY delegation_id").fetchall()
+    assert not execution.seal_execution("", child_session_id=native_id)
+    with sqlite3.connect(ad._db_path()) as conn:
+        assert conn.execute("SELECT * FROM async_delegations ORDER BY delegation_id").fetchall() == before
+        assert conn.execute("SELECT * FROM async_delegation_child_recovery").fetchall() == []
+
+
+@pytest.mark.parametrize("gap", [
+    "none", "missing_child", "admitted_child", "missing_unit", "legacy",
+    "wrong_native_child", "unknown_unit", "linked_replacement",
+])
+@pytest.mark.parametrize("by_native_child", [False, True])
+def test_explicit_execution_seal_requires_every_positive_checkpoint(gap, by_native_child):
+    from tools import async_delegation_completion as execution
+
+    did = _batch_row("deleg_execution_seal_policy")
+    sid = f"{did}-child-0"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        task = json.loads(conn.execute(
+            "SELECT task_json FROM async_delegations WHERE delegation_id=?", (did,),
+        ).fetchone()[0])
+        now = time.time()
+        task["child_execution"] = {
+            str(i): {"child_session_id": f"{did}-child-{i}", "checkpoint": "finished_child",
+                     "admitted_at": now - 1, "finished_at": now}
+            for i in range(3)
+        }
+        task["unit_execution"] = {"checkpoint": "finished_unit", "finished_at": now}
+        mutations = {
+            "missing_child": lambda: task["child_execution"].pop("2"),
+            "admitted_child": lambda: task["child_execution"].update({
+                "2": {"child_session_id": f"{did}-child-2", "checkpoint": "admitted", "admitted_at": now - 1},
+            }),
+            "missing_unit": lambda: task.pop("unit_execution"),
+            "legacy": lambda: task.pop("child_execution"),
+            "unknown_unit": lambda: task.update(unit_execution={"checkpoint": "unknown", "finished_at": now}),
+        }
+        mutations.get(gap, lambda: None)()
+        sid = {"wrong_native_child": "unrelated-native-child"}.get(gap, sid)
+        conn.execute("UPDATE async_delegations SET task_json=?, retry_state='reported' WHERE delegation_id=?",
+                     (json.dumps(task), did))
+        if gap == "linked_replacement":
+            conn.execute("UPDATE async_delegations SET retry_replacement='deleg_missing_replacement' "
+                         "WHERE delegation_id=?", (did,))
+    with sqlite3.connect(ad._db_path()) as conn:
+        conn.row_factory = sqlite3.Row
+        before = dict(conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (did,)).fetchone())
+    assert execution.seal_execution("" if by_native_child else did, child_session_id=sid) is (gap == "none")
+    with sqlite3.connect(ad._db_path()) as conn:
+        conn.row_factory = sqlite3.Row
+        after = dict(conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (did,)).fetchone())
+    if gap != "none":
+        assert after == before, "refused closure must preserve the complete outcome, delivery and claim row"
+        return
+    before_task, after_task = json.loads(before.pop("task_json")), json.loads(after.pop("task_json"))
+    assert after == before
+    assert after_task.pop("execution_sealed_at") >= now
+    assert after_task == before_task
+    # Reported/terminal states were never used as execution evidence. Once the
+    # positive checkpoints close admission, the existing claim gate must agree.
+    assert dr.claim_resume(did)[1] == dr.INELIGIBLE_SEALED
     assert "error" in json.loads(_handle_control_action("resume", did, None, _Parent()))

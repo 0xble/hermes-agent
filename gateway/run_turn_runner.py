@@ -11,8 +11,6 @@ import asyncio
 import dataclasses
 import json
 import logging
-import queue
-import re
 import threading
 import time
 from contextlib import suppress
@@ -26,15 +24,19 @@ from gateway.attended_model import (
     format_attended_switch_back_notice, format_attended_switch_notice, parse_attended_config,
 )
 from gateway.config import Platform
+from agent.notice_style import notice_metadata
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typing_after_prompt, typing_metadata_for_source
 from gateway.platforms.base_exec_approval import ea_default_reason_text
+from gateway.run_task_card_progress import TaskCardProgressMixin
 from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
 from gateway.run_turn_progress import GatewayTurnProgressMixin, _viewer_status_kind, local_viewer_turn
 from gateway.session_execution import GatewaySessionAgentMixin
+from gateway.turn_session_titles import TurnSessionTitlesMixin
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -46,13 +48,6 @@ logger = logging.getLogger("gateway.run")
 # _load_turn_history escalates the lag line from WARNING to ERROR (#114266: 11 days of WARNING).
 _TRANSCRIPT_LAG_ESCALATION_TURNS = 3
 
-# Exact refusals retained for older adapters/connectors without destination preflight.
-# Substring matching would also silence transient thread-resolution errors.
-_CARD_DESTINATION_REFUSALS = {
-    "No Slack thread target",
-    "slack task_card requires a thread anchor",
-    "slack task_card requires a thread anchor (Slack streams are thread replies)",
-}
 
 
 def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, str, bool]:
@@ -88,21 +83,6 @@ _LEDGER_PASSTHROUGH_KEYS = (
     "estimated_cost_usd", "cost_status", "cost_source", "cache_read_tokens", "cache_write_tokens",
     "reasoning_tokens", "total_tokens", "provider", "turn_exit_reason", "service_tier",
 )
-
-
-def _settle_api_runtime_lock(agent, result, captured):
-    """Settle a confirmed API runtime lock against the runtime that served the turn."""
-    from gateway.session_api_turn import api_runtime_locked
-    api = api_runtime_locked()
-    if api is None or not isinstance(result, dict):
-        return
-    settings = api["settings"]
-    try:
-        captured["usage"]["runtime"] = api["adapter"]._turn_runtime_metadata(
-            agent, route=settings.get("route"), requested_runtime=settings.get("requested_runtime"),
-            route_source=settings.get("route_source") or "", confirmed_runtime_lock=True)
-    except RuntimeError as exc:
-        result.update(final_response="", failed=True, completed=False, error=str(exc))
 
 
 def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
@@ -163,7 +143,7 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     """Per-turn callbacks, with routing assignment supplied by gateway turn assembly."""
 
     # ``None`` is a legitimate state: turns without a canonical session authority publish no
@@ -271,22 +251,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     platform=ctx.source.platform, user_config=ctx.user_config)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
-    def _progress_live_status(self, event_type: str, tool_name, args) -> None:
-        """Live status line (Slack assistant status): stash the tool phrase on the adapter; the
-        _keep_typing refresh renders it. Plain dict write, safe from the sync worker thread."""
-        ctx = self._ctx
-        adapter = ctx._live_status_adapter
-        if adapter is None or ctx._live_status_mode == "off" or tool_name == "_thinking":
-            return
-        try:
-            if event_type == "tool.started" and tool_name and ctx._run_still_current():
-                from agent.display import build_status_phrase
-                adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
-            elif event_type == "tool.completed":
-                # Between tools the model is genuinely "thinking" again — revert to the static default.
-                adapter.set_status_text(ctx.source.chat_id, None)
-        except Exception as err:
-            logger.debug("live status update failed: %s", err)
 
     def _progress_onboarding_hint(self, kwargs: dict) -> None:
         """First-touch onboarding: the first time a tool exceeds _LONG_TOOL_THRESHOLD_S while
@@ -304,222 +268,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
         except Exception as err:
             logger.debug("tool-progress onboarding hint failed: %s", err)
-
-    @staticmethod
-
-
-
-
-    # ── Slack-native task cards (progress-queue drain) ──────────────────────────────────────
-
-    @dataclasses.dataclass
-    class _TaskCardState:
-        """Task-card rail state for ``_send_native_task_card_progress``."""
-        adapter: Any
-        tasks: dict[str, dict[str, str]] = dataclasses.field(default_factory=dict)
-        task_order: list[str] = dataclasses.field(default_factory=list)
-        fallback_msg_id: Optional[str] = None
-        native_failed: bool = False
-        # TERMINAL for the turn, distinct from native_failed: no later publication
-        # in this turn may deliver task text through the native lane OR the text
-        # fallback. Two causes, both properties of the destination rather than of
-        # one attempt: the connector's egress guard refused the chat, or the chat
-        # cannot host a card (no thread anchor). Declared rather than set
-        # dynamically so the state is visible where it lives.
-        publication_suppressed: bool = False
-        anonymous_seq: int = 0
-
-        @staticmethod
-        def _compact(value: Any, limit: int = 120) -> str:
-            text = re.sub(r"\s+", " ", str(value or "")).strip()
-            return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
-
-        def visible_tasks(self) -> list[dict[str, str]]:
-            return [self.tasks[task_id] for task_id in self.task_order[-8:]]
-
-        def fallback_text(self) -> str:
-            labels = {"in_progress": t("gateway.progress.task_status_running"),
-                      "complete": t("gateway.progress.task_status_complete"),
-                      "error": t("gateway.progress.task_status_error")}
-            lines = [t("gateway.progress.task_line", title=task["title"], status=labels.get(task["status"], task["status"]))
-                     for task in self.visible_tasks()]
-            return t("gateway.progress.task_card_title") + "\n" + "\n".join(lines)
-
-        def _upsert(self, call_id: str, title: str) -> dict[str, str]:
-            if call_id not in self.tasks:
-                self.task_order.append(call_id)
-            self.tasks[call_id] = {"id": call_id, "title": self._compact(title), "status": "in_progress"}
-            return self.tasks[call_id]
-
-        def apply_event(self, raw: Any) -> bool:
-            event_type = raw.get("type") if isinstance(raw, dict) else None
-            if event_type not in {"tool.started", "tool.completed"}:
-                return False
-            call_id = str(raw.get("tool_call_id") or "")
-            if not call_id:
-                self.anonymous_seq += 1
-                call_id = f"anonymous_{self.anonymous_seq}"
-            tool_name = str(raw.get("tool_name") or "tool")
-            if event_type == "tool.started":
-                preview = self._compact(raw.get("preview"), 64)
-                self._upsert(call_id, f"{tool_name} - {preview}" if preview else tool_name)
-                return True
-            # Completion-only events are rare but valid on some runtimes; keep their real ID instead
-            # of guessing a same-name pending call.
-            task = self.tasks.get(call_id) or self._upsert(call_id, tool_name)
-            task["status"] = "error" if raw.get("is_error") else "complete"
-            return True
-
-    async def _task_card_send_or_edit_fallback(self, st) -> None:
-        ctx = self._ctx
-        text = st.fallback_text()
-        from gateway.relay.egress import declined_send
-
-        if st.publication_suppressed:
-            return
-        if st.fallback_msg_id:
-            result = await st.adapter.edit_message(
-                chat_id=ctx.source.chat_id, message_id=st.fallback_msg_id, content=text, metadata=ctx._progress_metadata,
-            )
-            if getattr(result, "success", False):
-                return
-            # P5(b): R5-4 made a declined native CARD terminal but left this
-            # editable-text fallback: a declined edit fell through to
-            # _send_progress_text and re-sent the same task text to the refused
-            # chat. The decline must set the terminal state here too.
-            if declined_send(result):
-                logger.warning(
-                    "Task-card fallback edit DECLINED by the connector's egress "
-                    "guard; suppressing progress delivery for the rest of this "
-                    "turn (the destination is not approved)"
-                )
-                st.publication_suppressed = True
-                return
-        result = await self._send_progress_text(st, text)
-        if getattr(result, "success", False) and getattr(result, "message_id", None):
-            st.fallback_msg_id = str(result.message_id)
-
-    async def _task_card_publish(self, st) -> None:
-        ctx = self._ctx
-        if not st.tasks:
-            return
-        if st.publication_suppressed:
-            # Publication was suppressed earlier in the turn (egress refusal or a chat
-            # that cannot host a card); every later publication would re-deliver the
-            # same task text there.
-            return
-        # Resolve eligibility in the owning adapter BEFORE transport I/O: a first
-        # timeout/disconnect must not turn an un-cardable chat into text fallback.
-        # Optional for older adapters; only an explicit False refuses publication.
-        destination_supported = getattr(st.adapter, "native_task_card_destination_supported", None)
-        if callable(destination_supported) and destination_supported(
-            ctx.source.chat_id, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-        ) is False:
-            self._task_card_uncardable_destination(st)
-            if st.publication_suppressed:
-                return
-        if not st.native_failed:
-            result = await st.adapter.send_native_task_card_progress(
-                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title=t("gateway.progress.task_card_title"),
-                reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
-            )
-            if getattr(result, "success", False):
-                return
-            # P5(b): an AUTHORIZATION decline is not a broken card lane. The
-            # fallback below sends the same task text to the same chat, which
-            # turns a refused card into delivered plain text. Stop the lane
-            # without re-delivering; the refusal is already logged.
-            from gateway.relay.egress import declined_send
-
-            if declined_send(result):
-                # TERMINAL, and stored SEPARATELY from native_failed. Reusing
-                # native_failed suppressed exactly ONE update: the next progress
-                # event skipped this branch (the lane is already "failed") and
-                # went straight to the text fallback. A refusal does not expire
-                # after one tick.
-                st.publication_suppressed = True
-                st.native_failed = True
-                logger.warning(
-                    "Slack native task-card progress DECLINED by the connector's "
-                    "egress guard — suppressing the text fallback for the rest "
-                    "of this turn (the destination is not approved)"
-                )
-                return
-            st.native_failed = True
-            if getattr(result, "error", None) in _CARD_DESTINATION_REFUSALS:
-                self._task_card_uncardable_destination(st, getattr(result, "error", "unknown error"))
-                if st.publication_suppressed:
-                    return
-            else:
-                logger.warning(
-                    "Slack native task-card progress failed; falling back "
-                    "to an editable text update: %s", getattr(result, "error", "unknown error"),
-                )
-        # Once the native rail fails, every later lifecycle event edits the same fallback message.
-        await self._task_card_send_or_edit_fallback(st)
-
-    def _task_card_uncardable_destination(self, st, reason: str = "no thread anchor") -> None:
-        """The chat cannot host a card (flat DM: no thread anchor) — a property of the destination,
-        not a transient outage. The text fallback exists to keep a WORKING card lane live through a
-        transient failure, not to invent text bubbles the operator never asked for: with Slack's tier
-        default (``tool_progress: off``) the lane goes silent for the turn. An operator who WROTE
-        ``new``/``all`` asked for text progress, so the editable fallback carries it instead."""
-        if self._ctx.tool_progress_enabled:
-            st.native_failed = True
-            logger.info(
-                "Slack native task cards are unsupported for this destination (%s); "
-                "tool progress continues as an editable text update", reason,
-            )
-            return
-        st.publication_suppressed = True
-        logger.info(
-            "Slack native task cards are unsupported for this destination (%s); "
-            "tool progress stays off for this turn", reason,
-        )
-
-    def _task_card_drain(self, st) -> bool:
-        changed = False
-        try:
-            while True:
-                changed = st.apply_event(self._ctx.progress_queue.get_nowait()) or changed
-        except queue.Empty:
-            pass
-        except Exception:
-            logger.debug("Slack native progress queue drain failed", exc_info=True)
-        return changed
-
-    async def _send_native_task_card_progress(self, adapter) -> None:
-        """Drain progress into native cards; supported destinations retain editable fallback.
-        Unsupported destinations and egress refusals suppress publication, never finalization.
-
-        See #29483.
-        """
-        ctx = self._ctx
-        st = self._TaskCardState(adapter)
-        try:
-            while ctx._run_still_current():
-                try:
-                    raw = ctx.progress_queue.get_nowait()
-                except queue.Empty:
-                    await asyncio.sleep(0.1)
-                    continue
-                if not self._agent_interrupted() and st.apply_event(raw):
-                    await self._task_card_publish(st)
-        except asyncio.CancelledError:
-            if self._task_card_drain(st) and ctx._run_still_current() and not self._agent_interrupted():
-                await self._task_card_publish(st)
-        finally:
-            if hasattr(adapter, "stop_native_task_card_progress"):
-                # Best-effort on the turn-cleanup path: an escaping transport exception would skip
-                # final-delivery logic (cleanup awaits catch only CancelledError).
-                try:
-                    await adapter.stop_native_task_card_progress(
-                        ctx.source.chat_id, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.debug("task-card stop failed during turn cleanup", exc_info=True)
 
     # ── editable progress bubbles (progress-queue drain) ────────────────────────────────────
 
@@ -783,66 +531,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         ctx = self._ctx
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
-    def _attach_session_title_callback(self, agent, ctx) -> None:
-        """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
-
-        The titler runs in the turn prologue, so attach before the run, not after it.
-        """
-        try:
-            # Gateway auto-title failures are not user-actionable, so never surface them as messages;
-            # overriding the failure sink keeps CLI on _emit_auxiliary_failure while gateway logs debug.
-            agent._title_failure_callback = lambda task, exc: logger.debug(
-                "Gateway auto-title failure suppressed (not user-visible): %s: %s", task, exc,
-            )
-            session_id = getattr(agent, "session_id", None)
-            if local_viewer_turn(self):
-                # Main's CLI repainted its status-bar title when the auto-title landed.
-                authority, canonical_id, _generation = self._approval_owner
-
-                def republish(title, title_source, **_kwargs):
-                    from gateway.session_contract import SessionRef
-                    from gateway.session_local import local_session_info
-                    ref = SessionRef(getattr(authority, "profile_id", ""), canonical_id)
-                    authority.sessions[canonical_id].event_stream.publish(
-                        canonical_id, local_session_info(authority, ref), event_type="session.info")
-                agent._on_session_title = republish
-                return
-            runner = self._runner
-            source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
-            # Both lanes spend a rate-limited platform call per title, so they use the model's title
-            # only (TitleCallback); renaming twice burns Discord's 2-per-10-min budget on a throwaway.
-            # Relay Discord predicate is shape-only: whether the connector auto-threaded our reply is
-            # only knowable AFTER delivery, so register eagerly and let the rename lane look up the
-            # cache at fire time — gating registration on the cache read meant it never registered.
-            if runner._is_telegram_topic_lane(source):
-                # Capture now: _prepare_turn_message may prepend resume/model notes to
-                # ctx.message before the titler fires, and the icon heuristic must score
-                # the user's words, not recovery guidance.
-                opening_message = getattr(ctx, "message", "") or ""
-                if not isinstance(opening_message, str):
-                    opening_message = ""
-
-                def _schedule_telegram_title(title, title_source, *, display_title=None, icon=None):
-                    if title_source != "llm":
-                        return False
-                    return runner._schedule_telegram_topic_title_rename(
-                        source, session_id, display_title or title,
-                        user_message=opening_message, model_icon=icon,
-                    )
-                agent._on_session_title = _schedule_telegram_title
-                agent._title_icon_context = runner._telegram_topic_icon_context(source)
-            elif runner._is_discord_auto_thread_lane(source) or runner._is_relay_discord_channel_lane(source):
-                lane = "_schedule_discord_semantic_thread_rename"
-                agent._on_session_title = lambda title, title_source: (
-                    title_source == "llm" and getattr(runner, lane)(source, session_id, title)
-                )
-            else:
-                return
-
-
-        except Exception:
-            logger.debug("Failed to attach session title callback", exc_info=True)
-
     def _emit_persistent_attended_notice(self, message: str) -> None:
         """Deliver an attended route card outside the temporary status-bubble rail."""
         from gateway.warning_notifications import render_notification
@@ -851,10 +539,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             return
 
         def present() -> None:
-            self._schedule(
-                self._runner._deliver_platform_notice(ctx.source, message),
-                "attended notice delivery scheduling error",
-            )
+            self._schedule(self._runner._deliver_platform_notice(ctx.source, message, notice_style="context"),
+                           "attended notice delivery scheduling error")
 
         render_notification(
             present,
@@ -883,7 +569,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                                                           "text": prepared})
                 return
             self._schedule(
-                self._status_delivery.send(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
+                self._status_delivery.send(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, notice_metadata(
+                    ctx._status_thread_metadata, platform=ctx.source.platform, style=getattr(message, "notice_style", None))),
                 f"status_callback ({event_type}) scheduling error",
             )
         render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
@@ -1173,7 +860,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 logger.debug("render_notice_line failed", exc_info=True)
                 return
             if line:
-                self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line), "notice_callback delivery scheduling error")
+                self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line, notice_style=getattr(notice, "notice_style", None)), "notice_callback delivery scheduling error")
         render_notification(present, platform=self._ctx.source.platform,
                             user_config=self._ctx.user_config, diagnostic=diagnostic)
 
@@ -1199,7 +886,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if self._status_live():
                 self._send_status_text(
                     message,
-                    _interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
+                    notice_metadata(_interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)), platform=ctx.source.platform, style="context"),
                     "background_review_callback scheduling error",
                 )
 
@@ -1402,6 +1089,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 decision.reason == "attended"
                 and not decision.new_session
                 and not unavailable_emitted
+                # Turn-start resolution may already have selected and announced this route.
+                # A changed desired key alone does not mean the live model switched.
+                and destination_route != current_route
                 and not (previous_key and previous_key[-1])
             ):
                 effort = decision.reasoning_effort or (agent.reasoning_config or {}).get("effort") or "none"
@@ -1602,15 +1292,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             answers[entry["qid"]] = None if raw == SKIPPED else raw
         return reply
 
-    async def _send_shared_clarify(self, entry, **kwargs):
-        result = await self._ctx._status_adapter.send_clarify(**kwargs)
-        if self._approval_owner is not None and result.success:
-            authority, session_id, generation = self._approval_owner
-            from gateway import local_viewer_events
-            authority.register_clarify(session_id, generation, entry,
-                                       timeout_s=local_viewer_events.prompt_timeout_s(self, "clarify"))
-        return result
-
     def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True) -> tuple[str, bool]:
         """One card: register, send, wait, then retire it (no answer) or re-arm (answer).
         Returns ``(response, answered)``; the caller decides what "no answer" means."""
@@ -1645,7 +1326,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Pause typing: a "thinking..." status must not obscure the prompt or block an "Other" reply
         # on platforms that disable input while typing (Slack Assistant).
         with suppress(Exception):
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            pause_typing_for_prompt(
+                ctx._status_adapter, ctx.session_key, ctx._status_chat_id,
+                typing_metadata_for_source(ctx.source, ctx.event_message_id))
         # Ordering barrier: flush buffered assistant prose BEFORE the poll, which goes out on a
         # separate agent-thread-blocking path and would otherwise render ABOVE its own explanation.
         # Best-effort + short timeout so the agent thread never hangs if the consumer isn't running.
@@ -1687,7 +1370,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 except Exception:
                     logger.debug("request_reopen_seed after clarify answer failed", exc_info=True)
             try:
-                ctx._status_adapter.resume_typing_for_chat(ctx._status_chat_id)
+                resume_typing_after_prompt(
+                    ctx._status_adapter, ctx.session_key, ctx._status_chat_id,
+                    typing_metadata_for_source(ctx.source, ctx.event_message_id))
             except Exception:
                 logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
         return response, answered
@@ -1716,7 +1401,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
-        adapter.pause_typing_for_chat(ctx._status_chat_id)
+        pause_typing_for_prompt(
+            adapter, ctx.session_key, ctx._status_chat_id,
+            typing_metadata_for_source(ctx.source, ctx.event_message_id))
         self._close_native_stream_boundary("Approval")
         # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
@@ -2017,18 +1704,23 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if persist_id is not None:
                 kwargs["persist_user_platform_id"] = str(persist_id)
             from agent.notification_presentation import notification_turn
+            from gateway.session_context import (
+                current_message_reaction_acknowledged, reaction_acknowledgement, scoped_turn_message,
+            )
             from gateway.session_results import execution_result
             captured = execution_result.get()
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx):
+            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx), scoped_turn_message(ctx.source, ctx.inbound_message_id or getattr(ctx.source, "message_id", None)), reaction_acknowledgement():
                 result = agent.run_conversation(api_message, **kwargs)
+                result["acknowledged_by_reaction"] = current_message_reaction_acknowledged()
             if captured is not None:
                 incoming = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
                 outgoing = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
                 captured['usage'] = {'input_tokens': incoming, 'output_tokens': outgoing,
                                      'total_tokens': incoming + outgoing}
-                _settle_api_runtime_lock(agent, result, captured)
+                from gateway.session_api_turn import settle_api_runtime_lock
+                settle_api_runtime_lock(agent, result, captured)
             return result
         finally:
             unregister_gateway_notify(session_key)
@@ -2408,6 +2100,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "recovered_reply": result.get("recovered_reply", False),
+            "acknowledged_by_reaction": result.get("acknowledged_by_reaction", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
             # The returned `messages` replaced the transcript, so a stored receipt keeps it whole.

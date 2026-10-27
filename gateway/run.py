@@ -266,8 +266,8 @@ async def run_codex_hygiene_compaction(
     except TimeoutError:
         # Executor thread keeps running (own RPC timeouts); brake retries so a wedged app-server isn't re-hit.
         if failure_cooldown_seconds >= 0:
-            _record_hygiene_cooldown(
-                gateway, session_id, failure_cooldown_seconds, "codex app-server thread compaction timed out")
+            await asyncio.to_thread(_record_hygiene_cooldown, gateway, session_id, failure_cooldown_seconds,
+                                    "codex app-server thread compaction timed out")
         logger.warning(
             "Session hygiene: codex app-server thread compaction for "
             "session %s timed out after %.1fs; continuing without compaction",
@@ -281,7 +281,7 @@ async def run_codex_hygiene_compaction(
     count_after = getattr(compressor, "compression_count", 0)
     if count_after > count_before:
         # Native boundary recorded: compacted server-side; mirror NOT rewritten, agent stays cached.
-        _reset_hygiene_failure_streak(gateway, session_key)
+        await asyncio.to_thread(_reset_hygiene_failure_streak, gateway, session_key)
         return "compacted"
     # No boundary: internal skip or compaction error; the codex route already persisted its own cooldown.
     return "failed:no-boundary"
@@ -3069,8 +3069,8 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
 
 
 def _resolve_update_hermes_bin(home: Path | None = None) -> Optional[list[str]]:
-    """Use the migration-bound source interpreter when running from a release."""
-    from hermes_cli.immutable_releases import resolved_release, source_checkout_python, update_source_checkout
+    """Keep release updater code current, with journal-bound source Git authority."""
+    from hermes_cli.immutable_releases import resolved_release, update_source_checkout
     root = Path(__file__).parent.parent.resolve()
     if (root / ".git").exists():
         return _resolve_hermes_bin()
@@ -3082,11 +3082,8 @@ def _resolve_update_hermes_bin(home: Path | None = None) -> Optional[list[str]]:
             raise RuntimeError(f"Cannot resolve the source checkout for release-origin /update in {active_home}; "
                                "repair release-layout.json and retry.")
         return None
-    python = source_checkout_python(active_home, source)
-    # -c inserts the trusted checkout ahead of the running release even when
-    # the detached process inherits its cwd or PYTHONPATH from the gateway.
-    script = "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('hermes_cli.main',run_name='__main__')"
-    return [str(python), "-c", script, str(source)]
+    from hermes_cli._launchers import runtime_command
+    return runtime_command(root, python=sys.executable)
 
 
 _PROFILE_ID_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -3250,6 +3247,9 @@ def _normalize_empty_agent_response(
         # isn't lost in silence. (#31884)
         if api_calls == 0:
             return t("gateway.errors.interrupted_before_start")
+        return response
+    from gateway.response_filters import reaction_answered
+    if reaction_answered(agent_result):
         return response
     if api_calls > 0:
         # Hidden-reasoning-only retry exhaustion: the loop's sentinel text ("Codex response remained
@@ -3462,10 +3462,6 @@ class GatewayRunner(
     GatewaySessionControlsMixin, GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin,
     GatewayBackgroundAdmissionMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
-
-    def _adapter_for_source(self, source):
-        """Return the delivery adapter that owns a session source."""
-        return self._delivery_adapter_for(source)
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
     _busy_input_mode: str = "interrupt"

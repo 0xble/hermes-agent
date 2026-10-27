@@ -64,6 +64,46 @@ class TestLogicalLineStreaming:
         assert "newline" in cli._spinner_text
 
 
+    def test_interrupt_fixture_keeps_progress_visible_after_batched_delivery(self, cli_stub):
+        """A delayed repaint must still see a pending turn, never the completed reply."""
+        import json
+        from urllib.request import Request, urlopen
+
+        from tests.e2e.core.cli_tmux.test_classic_cli_main_parity import _main
+        from tests.fakes.fake_llm_provider import FakeLLMServer
+
+        cli, emitted = cli_stub
+        chunks = []
+        stopped = False
+        with FakeLLMServer(_main) as server:
+            request = Request(
+                server.base_url + "/chat/completions",
+                data=json.dumps({
+                    "model": "fake-model", "stream": True,
+                    "tools": [{"type": "function", "function": {"name": "terminal"}}],
+                    "messages": [{"role": "user", "content": "STEP8 tell me a very long story"}],
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urlopen(request, timeout=30) as response:
+                for line in response:
+                    if not line.startswith(b"data: ") or line.strip() == b"data: [DONE]":
+                        continue
+                    payload = json.loads(line[6:])
+                    chunks.append(payload["choices"][0]["delta"].get("content", ""))
+                    if not stopped and "w040" in "".join(chunks):
+                        # Release a held fixture only at teardown. Text fixtures keep running to
+                        # completion, exposing the stale-marker race in the old scenario.
+                        server.stop()
+                        stopped = True
+
+        # Batch every delivered delta before the first repaint, as a busy event loop can do.
+        cli._stream_delta("".join(chunks))
+        assert stopped, "the interrupt progress witness was never streamed"
+        assert "w040" in cli._spinner_text, "progress vanished before the driver observed it"
+        assert "THE-END" not in cli._stream_buf
+        assert not any("THE-END" in line for line in emitted)
+
     def test_no_content_lost_across_stream(self, cli_stub):
         cli, emitted = cli_stub
         words = [f"word{i}" for i in range(120)]

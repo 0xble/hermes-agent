@@ -1,6 +1,6 @@
 # Hindsight memory provider
 
-**Patch identity:** `hindsight-retain-visibility` and `evict-memory-shutdown`.
+**Patch identity:** `hindsight-retain-visibility`, `evict-memory-shutdown`, and `hindsight-client-selection`.
 
 Soft agent-cache eviction must drain and shut down the agent's memory manager
 (including Hindsight's writer and the mem-sync executor), then release clients
@@ -165,6 +165,55 @@ strategy and cron-exclusion behavior.
   already drops it on /new, /resume, /branch and compression. In a shared chat it can carry one
   participant's recall to another's next turn, which every async turn already did before this gate. Proof:
   `tests/agent/test_synthetic_prompt.py` (`test_buffered_recall_*`).
+
+## Client Dependency Selection And Passive Readiness
+
+The configured bundled provider must join PM's complete profile dependency union
+without a second copy under the home plugin directory. Both selection gates need
+the bundled path: `pm.plugins_state._provider_from_config` admits it, and
+`pm.workspace.enabled_plugin_entries` resolves it before a same-name user copy.
+Update conflict recovery seats bundled providers first and never clears their
+`memory.provider` setting. A release-incompatible bundled provider fails before
+publishing a new dependency generation or changing profile selections.
+
+These PM changes and the first-generation/conflict regressions are adapted from
+[PR #564](https://github.com/0xble/hermes-agent/pull/564), exact head
+`37e7a37434beb6d4f80a5d8761243f439df52ab7`. This incident repair does not merge,
+rebase, or authorize activation of that branch. It adds the separate status fix:
+Hindsight availability checks the same client version/import prerequisite as its
+operation factory in every mode. `hermes memory status` prints the actionable
+`unavailable_reason` instead of claiming an SDK problem is a missing API key.
+Availability is local readiness, not server reachability or a recall test. Status
+retains its existing exit contract and performs no new client construction,
+provider initialization, dependency installation, or memory API requests. Normal
+CLI home/registry bootstrap and auth read locks retain their existing behavior.
+
+Upstream governing guidance was checked at
+`NousResearch/hermes-agent@9976f4857b72439d79016354d7b6e1a3ee952e2f`:
+`AGENTS.md` and `plugins/AGENTS.md` require a verified premise, an existing
+extension point, passive availability, and bounded dependencies. Upstream
+[#143970](https://github.com/NousResearch/hermes-agent/issues/143970) reports the
+related missing-client symptom. [#144642](https://github.com/NousResearch/hermes-agent/issues/144642)
+is related Windows import behavior. Neither establishes this exact PM path bug.
+
+The immutable-release boundary already carries declared extras from the previous
+release's committed PM generation, not just its base `.venv`. The `hindsight`
+extra is declared in this source, so the recorded recovery selection survives
+`prepare_venv`. A ready candidate built by older code uses `carry_active_extras`
+from the candidate's own code before activation. The existing tests in
+`tests/hermes_cli/test_immutable_releases.py` cover build-time carry, old-builder
+ready-candidate carry, and selecting the committed-generation smoke interpreter.
+No separate extras framework or release activation path is added here. Subsequent
+PM rebuilds are protected by the configured-provider union fix, independently of
+the retained extra. Release integration and promotion remain with Maintenance.
+
+Additional isolated proof lives in
+`tests/pm/test_bundled_memory_selection.py` (real offline union build with a named
+profile and recorded extra, including same-name shadowing) and
+`tests/hermes_cli/test_memory_status_client_dependency.py` (all client modes,
+missing metadata, unsupported versions, failed import, and supported client).
+The status regressions reject network access, SDK construction, initialization,
+and dependency preparation and preserve the initialized fixture home's files.
 
 ## Proof surface
 

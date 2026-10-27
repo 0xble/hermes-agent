@@ -1469,6 +1469,7 @@ DEFAULT_CONFIG = {
     # goal is satisfied, else a continuation prompt re-enters the session until done, budget
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
+        "notices": True,  # False hides automatic lifecycle output, not queries, errors or approvals.
         "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
         # Max turns before pausing, or a paced counter checkpoint when autonomy is enabled.
         "max_turns": 20,
@@ -1476,8 +1477,7 @@ DEFAULT_CONFIG = {
         # /loop or heartbeat wakes). A user message or a process/delegation result continues at
         # once. 0 disables the gap; values above 1800 (the goal wait ceiling) are capped.
         "min_continuation_gap_seconds": 900,
-        # Fork patch: agent-initiated goal_set receipts (goal set / subgoal added) surface as a
-        # notice when they commit. /goal and /subgoal replies and judge verdicts are unaffected.
+        # Fork patch: committed agent goal_set receipts surface as notices; /goal replies don't.
         "auto_notices": True,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
@@ -2182,7 +2182,10 @@ DEFAULT_CONFIG = {
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         "zero_cut_handover": {"enabled": False},
         "unmanaged_idle_exit_seconds": 600,  # client-auto-started gateway only; 0 disables
-        "guardian": {"enabled": False},
+        "guardian": {
+            "enabled": False,
+            "admission_canary": {"enabled": True, "window_seconds": 180, "refusal_threshold": 10},
+        },
         # Seconds a SIGTERM-interrupted agent unwinds before teardown; short to fit the stop budget.
         "signal_interrupt_grace_timeout": 1,
         # In-band restart wait cap for live background delegation units. 0 = do not wait for delegations.

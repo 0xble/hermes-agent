@@ -14,7 +14,8 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.observability.shared_metrics_loop import begin_delegation_run, finish_delegation_unit
-from tools.async_delegation import _new_delegation_id, record_unit_child
+from tools.async_delegation import _new_delegation_id
+from tools.async_delegation_completion import record_unit_child
 from tools.delegate_tool_child_run import _attach_child, _close_child, _detach_child, _fabricated_entry, _signal_child_stop
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _print_completion_line, _quiet, describe_subagent_failure, format_batch_tag,
@@ -414,7 +415,14 @@ def _cleanup_unit(unit: _Batch, reason: str, outcome: dict) -> None:
 def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str], routing: dict) -> dict:
     """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
     from tools.async_delegation import dispatch_async_delegation_batch
+    unit_id = unit_id or _new_delegation_id()
     child_agents = [c for (_, _, c) in unit.children]
+    child_sessions = {}
+    for index, _, child in unit.children:
+        sid = getattr(child, "session_id", None)
+        if isinstance(sid, str) and sid:
+            child._delegation_id = unit_id
+            child_sessions[str(index)] = sid
     # Child-scoped contexts carry resume briefs in the model-visible tasks API.
     # Keep them at the durable boundary too, otherwise replacement lineage is lost.
     contexts = dict.fromkeys(t["context"] for _, t, _ in unit.children if t.get("context"))
@@ -446,7 +454,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
         interrupt_fn=_interrupt, cancel_fn=_cancel_queued, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
-        task_contexts=task_contexts,
+        task_contexts=task_contexts, child_sessions=child_sessions,
         # Persist locators before starting workers; live_paths omits failed writers and can be compressed.
         task_transcripts={str(i): str(unit.live_writers[i].path) for i, _, _ in unit.children
                           if i < len(unit.live_writers) and unit.live_writers[i] is not None

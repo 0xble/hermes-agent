@@ -21,6 +21,32 @@ logger = logging.getLogger(__name__)
 _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset({"reasoning_content", "reasoning_details"})
 _RELAY_INTERNAL_PROVIDER_HEADERS = frozenset({"x-dynamo-parent-session-id", "x-dynamo-session-id"})
 _LogicalCall = tuple[relay_runtime.RelayTurnContext, Any, str]
+_provider_request_capture: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "relay_provider_request_capture", default=None,
+)
+
+
+@contextlib.contextmanager
+def capture_provider_request(request: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Capture final provider kwargs across Relay and its nested transport callbacks.
+
+    The mutable snapshot is request-local but shared by copied worker contexts, so
+    the caller can audit streaming and non-streaming requests without agent state.
+    """
+    captured = dict(request)
+    token = _provider_request_capture.set(captured)
+    try:
+        yield captured
+    finally:
+        _provider_request_capture.reset(token)
+
+
+def _capture_provider_request(request: dict[str, Any]) -> dict[str, Any]:
+    captured = _provider_request_capture.get()
+    if captured is not None:
+        captured.clear()
+        captured.update(request)
+    return request
 
 # Bound for awaiting a Relay stream's aclose() on the private loop: a wedged
 # close must not hang the worker thread or hold the runtime lease forever.
@@ -92,10 +118,11 @@ class _ManagedAttempt:
         self.context = contextvars.copy_context()
 
     def provider_request(self, next_request: Any) -> dict[str, Any]:
-        return _provider_request(
+        request = _provider_request(
             self.request, next_request, relay_request_body=self.body,
             codec_baseline_body=self.codec_baseline, metadata=self.metadata,
         )
+        return self.context.copy().run(_capture_provider_request, request)
 
     def run_callback(self, callback: Callable[..., Any], *args: Any) -> Any:
         """Run a Hermes callback in a fresh copy of the captured context.
@@ -186,7 +213,7 @@ def execute(
     ``session_id`` defaults to the inherited Hermes turn's session (unmanaged when there is none)."""
     attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
     if attempt is None:
-        return callback(request)
+        return callback(_capture_provider_request(request))
     try:
         managed = _run_awaitable(attempt.run_managed(
             attempt.runtime.relay.llm.execute, partial(attempt.invoke, callback)
@@ -203,7 +230,7 @@ async def execute_async(
     """Async ``execute``."""
     attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
     if attempt is None:
-        return await callback(request)
+        return await callback(_capture_provider_request(request))
     try:
         managed = await attempt.run_managed(attempt.runtime.relay.llm.execute, partial(attempt.invoke_async, callback))
     except BaseException as exc:
@@ -334,7 +361,7 @@ class ManagedLlmStream(Iterator[Any]):
         self._start_managed(attempt)
 
     def _start_unmanaged(self, request: dict[str, Any]) -> None:
-        raw_stream = self._stream_factory(request)
+        raw_stream = self._stream_factory(_capture_provider_request(request))
         predicate = self._completed_response_predicate
         if predicate is not None and predicate(raw_stream):
             self.final_response = raw_stream

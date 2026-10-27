@@ -93,6 +93,13 @@ and promptly removes exited local processes. Live child namespaces are exempt
 from the host idle TTL and remain owned by child teardown. A pinned remote runner
 still self-exits after `PINNED_RUNNER_IDLE_FACTOR` times the idle timeout, so a
 gateway killed without teardown cannot leave it running on the remote host.
+A runner measures idle from its last published result, not from pickup. While a
+result is missing, the host probes every 5 s. If the runner is gone, it renames
+the unclaimed request. A successful rename proves the code never ran, so the cell
+reports "did NOT run, safe to retry" instead of waiting out its timeout. The same
+rename at the deadline separates an unstarted cell from a real timeout. The
+runner treats a vanished request as reclaimed and never runs it. A dead runner
+whose request was already taken reports a possible partial run without waiting.
 
 Resource setup and process publication are fenced by each record's lifetime
 lock. Teardown signals pending spawn before waiting on that fence, closes the

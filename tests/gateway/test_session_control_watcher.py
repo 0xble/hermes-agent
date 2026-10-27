@@ -124,7 +124,7 @@ def test_control_card_leads_with_decision_and_nonblocking_note():
     assert "Target: Target session" in text
     assert "Requested by: Requester session" in text
     assert "Proposed goal: new objective" in text
-    assert "Proposed contract (replaces the current one):" in text
+    assert "Proposed contract edits (omitted fields unchanged):" in text
     assert "Approve only if this still matches the target's current state." in text
     assert "Session control request" not in text
 
@@ -608,6 +608,70 @@ async def test_control_continuation_revalidated_for_active_replacement_in_follow
     assert session_controls._load_record(record["id"])["continuation_discarded"] == "target_changed"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["pause", "resume", "replace"])
+@pytest.mark.parametrize("notices", [True, False])
+@pytest.mark.parametrize("user_quote", ["", "check progress"])
+async def test_autonomous_goal_outbox_attributes_both_notices_to_autonomy(
+    state, action, notices, user_quote,
+):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager
+
+    get_hermes_home().joinpath("config.yaml").write_text(
+        f"goals:\n  autonomy: true\n  auto_notices: {str(notices).lower()}\n", encoding="utf-8",
+    )
+    manager = GoalManager("target")
+    manager.set("old objective")
+    if action == "resume":
+        manager.pause()
+    result = session_controls.apply_control(
+        "goal", action, "target", requester_sid="requester", reason="wait for tests",
+        payload={"goal": "new objective"} if action == "replace" else None,
+        user_quote=user_quote,
+    )
+    assert result["status"] == "applied"
+    record = session_controls._load_record(result["record"]["id"])
+    assert record is not None
+    assert record["authority"] == {"via": "autonomy", "session_id": "requester", "quote": user_quote}
+    runner = _runner(state)
+
+    async def accept(_adapter, event):
+        event._gateway_accepted = True
+
+    with patch("gateway.wake.admit_internal_event", new=AsyncMock(side_effect=accept)):
+        await runner._drain_session_controls()
+        await runner._drain_session_controls()
+
+    # Control receipts keep their existing delivery policy, independent of routine goal notices.
+    assert len(runner.adapter.sends) == len(runner.injections) == 1
+    target = runner.adapter.sends[0][1]
+    requester = runner.injections[0]["content"]
+    assert "(applied autonomously without approval)" in target
+    assert "was applied autonomously without approval." in requester
+    assert "Telegram" not in target + requester
+    assert "your words" not in target + requester
+    assert runner.adapter.requests == []
+    assert runner.injections[0]["expected_session_id"] == "requester"
+    assert session_controls._load_record(record["id"])["authority"] == record["authority"]
+    assert session_controls.pending_outbox() == []
+    if action == "replace":
+        assert "Affected: goal: old objective\nProposed goal: new objective" in target
+        assert "Affected: goal: old objective\nProposed goal: new objective" in requester
+
+
+@pytest.mark.parametrize("authority", [{}, {"via": "future-authority"}])
+def test_control_notices_do_not_invent_approval_for_unrecorded_authority(authority):
+    from gateway.run_session_controls import GatewaySessionControlsMixin
+
+    record = {"status": "applied", "kind": "goal", "action": "pause", "authority": authority}
+    for notice in (GatewaySessionControlsMixin._control_notice(record),
+                   GatewaySessionControlsMixin._requester_notice(record)):
+        assert "authority source not recorded" in notice
+        assert "Telegram" not in notice
+
+
 def test_replace_notices_show_old_and_new_goal(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.session_controls import apply_control, request_control, resolve_request
@@ -868,9 +932,14 @@ def test_replace_card_shows_contract_and_max_turns_that_approval_installs():
     assert "Proposed goal: finish writing docs" in text
     assert "- Constraints: deploy production now" in text
     assert "Max turns: 999" in text
+    record["payload"]["contract"]["boundaries"] = ""
+    text = GatewaySessionControlsMixin._control_text(record)
+    assert "- Boundaries: (remove)" in text
+    assert "omitted fields unchanged" in text
     record["payload"] = {"goal": "finish writing docs"}
     text = GatewaySessionControlsMixin._control_text(record)
-    assert "Proposed contract: none (the current contract is dropped)" in text
+    assert "Proposed contract: unchanged" in text
+    assert "Subgoals: unchanged" in text
     assert "Max turns: unchanged" in text
     record["payload"] = {"goal": "finish writing docs", "max_turns": 0}
     assert "Max turns: unlimited" in GatewaySessionControlsMixin._control_text(record)

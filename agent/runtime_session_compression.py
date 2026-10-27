@@ -92,6 +92,9 @@ class RuntimeSessionCompressionMixin:
             raise StaleHeldHistory(result['stale_held_history'])
         from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(compacted_messages, result['annotations'])
+        # Adopt the committed generation as the owner stored it: one dict per message_uid.
+        from hermes_state_identity import _newest_message_uid_rows
+        compacted_messages[:] = _newest_message_uid_rows(compacted_messages)
         return result['value']
 
     def publish_compression_child(self, *, parent_session_id, child_session_id, source, messages,
@@ -106,6 +109,8 @@ class RuntimeSessionCompressionMixin:
             lease_ttl_seconds=lease_ttl_seconds, watermark=watermark, watermark_ceiling=watermark_ceiling))
         from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(messages, result['annotations'])
+        from hermes_state_identity import _newest_message_uid_rows
+        messages[:] = _newest_message_uid_rows(messages)
 
     def _compression_receipt_journal(self, candidate, result):
         assignment = result.get('worker_assignment')

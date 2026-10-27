@@ -124,6 +124,76 @@ def bound_session_key() -> str:
     return "" if value is _UNSET else value
 
 
+@contextmanager
+def preserved_session_context() -> Iterator[None]:
+    """Restore an inline caller after a fresh turn clears and rebinds its own scope."""
+    from agent.runtime_cwd import reset_session_cwd, scoped_session_cwd, set_session_cwd
+
+    variables = (*_VAR_MAP.values(), _SESSION_ASYNC_DELIVERY, _SESSION_HISTORY_DELIVERY)
+    tokens = [(var, var.set(var.get())) for var in variables]
+    cwd_token = set_session_cwd(scoped_session_cwd())
+    try:
+        yield
+    finally:
+        reset_session_cwd(cwd_token)
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
+# Mutable per-execution receipt shared with copied tool-worker contexts. Never exported
+# to subprocesses or persisted: another turn must deliver its own acknowledgement.
+_REACTION_ACKNOWLEDGEMENTS: ContextVar[set[tuple[str, str, str]] | None] = ContextVar(
+    "reaction_acknowledgements", default=None,
+)
+
+
+@contextmanager
+def reaction_acknowledgement() -> Iterator[set[tuple[str, str, str]]]:
+    """Collect successful reactions for one execution, restoring the enclosing context."""
+    receipts: set[tuple[str, str, str]] = set()
+    token = _REACTION_ACKNOWLEDGEMENTS.set(receipts)
+    try:
+        yield receipts
+    finally:
+        _REACTION_ACKNOWLEDGEMENTS.reset(token)
+
+
+@contextmanager
+def scoped_turn_message(source: Any, message_id: str | None) -> Iterator[None]:
+    """Bind a queued execution's own inbound identity and restore its enclosing turn."""
+    # Local/API turns may carry author identity without any transport target. Clear
+    # missing routing fields rather than inheriting an enclosing gateway message.
+    values = {key: getattr(source, key, None) for key in (
+        "platform", "chat_id", "thread_id", "user_id", "user_id_alt",
+        "user_name", "scope_id", "parent_chat_id",
+    )}
+    values["platform"] = getattr(values["platform"], "value", values["platform"])
+    values["message_id"] = message_id
+    tokens = [(var, var.set(str(values[key]) if values[key] is not None else ""))
+              for key in values for var in [_VAR_MAP[f"HERMES_SESSION_{key.upper()}"]]]
+    try:
+        yield
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
+def current_message_reaction_acknowledged() -> bool:
+    """Whether this execution delivered a reaction to its currently bound inbound message."""
+    target = (get_session_env("HERMES_SESSION_PLATFORM"), get_session_env("HERMES_SESSION_CHAT_ID"),
+              get_session_env("HERMES_SESSION_MESSAGE_ID"))
+    return all(target) and target in (_REACTION_ACKNOWLEDGEMENTS.get() or ())
+
+
+def acknowledge_current_message_reaction() -> None:
+    """Tools call only AFTER confirmed delivery to this session's triggering message."""
+    receipts = _REACTION_ACKNOWLEDGEMENTS.get()
+    if receipts is not None:
+        receipts.add((get_session_env("HERMES_SESSION_PLATFORM"),
+                      get_session_env("HERMES_SESSION_CHAT_ID"),
+                      get_session_env("HERMES_SESSION_MESSAGE_ID")))
+
+
 def source_route_metadata(source: Any, metadata: dict | None) -> dict | None:
     """Keep inbound route anchors for durable deliveries after the source is gone."""
     anchors = {key: str(value) for key in ("scope_id", "parent_chat_id")
