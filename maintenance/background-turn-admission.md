@@ -9,11 +9,12 @@ retries, process or delegation completions, or restart auto-resumes start turns,
 
 - Typed input is never gated. Only turns nobody typed ask the gate. Promotion and the load use
   `turn_origin_for_event`, so relays never count as typed input.
-- At most `gateway.background_turn_concurrency` (default 8) turns nobody typed run at once.
-  The load is measured from live runner state (sessions whose running turn's
-  `turn_origin_for_event` is not `user`), so relays, heartbeats and chained goal
-  continuations count against the cap even though they do not pass the gate, and a turn that
-  ends, crashes or is stopped frees its slot with no release bookkeeping.
+- At most `gateway.background_turn_concurrency` (default 8) gated turns run at once.
+  The load is measured from live runner state: `goal_loop` and `process` turns, plus running
+  non-user restart resumes tracked by `_startup_resume_inflight`. Resumes have `unknown` origin
+  but must still count after their reservation is claimed. Relays, cron and unrelated unknown
+  turns never acquire slots and cannot consume them. A turn that ends, crashes or is stopped
+  frees its slot with no release bookkeeping.
 - Gated: restart auto-resumes (`_schedule_resume_pending_sessions`) and every
   `admit_internal_event` wake whose origin is `goal_loop` or `process` (goal continuations,
   lifted barriers, session-control continuations, loop ticks, delegation retry notices, process,
@@ -33,12 +34,22 @@ retries, process or delegation completions, or restart auto-resumes start turns,
   that take a durable claim first reserve before claiming and stamp the token on the event
   (`BACKGROUND_RESERVATION_ATTR`), and admission honors a stamped token unconditionally: a
   `/loop` tick reserves before `fire_tick` (no room keeps the tick due) and a lifted goal barrier
-  reserves before its stale marker is cleared. Both release the token on every non-admitting exit.
+  reserves before its stale marker is cleared. Both release the token on every non-admitting exit,
+  including a raising `fire_tick`.
+- A booting gateway admits no wake until its startup restore has finished
+  (`_startup_restore_in_progress`): restored typed input and the queued resumes go first, so a
+  liveness-watchdog restart (exit 75) does not come back up into the stampede that caused it.
+- Queued resume preclaims do not count toward `max_concurrent_sessions`
+  (`_queued_resume_preclaims`); they order input for their session but run no turn.
 - A reservation counts its session until a turn claims it (`conversation.last_turn_started_at`)
   or 30 s pass, so turns that have not registered yet cannot overshoot the cap.
 - Only queued resumes are spaced (`BACKGROUND_TURN_SPACING_S`, 1 s between grants). Refused
-  wakes already retry on their own cadence, so spacing them would only delay them while slots
-  are free.
+  process watch events keep one copy in their existing queue and follow the refused-watch backoff
+  (#140899, `_WATCH_INJECTION_RETRY_BASE_DELAY`), whose first wait is 10 s, so the 2 s drain cannot
+  retake every freed slot ahead of the goal and loop watchers. Serial drains never sleep or retry an
+  event before its deadline. A draining gateway offers each held event once more so it reaches the
+  drain spool, and disabled notifications still consume events. Other refused wakes retry on their
+  existing cadence.
 - A person waiting on a session promotes that session's queued resume past the gate: any typed
   message reaching `_hm_handle_running_session_message`, and a recovered typed follow-up whose
   resume is still queued (not spooled internal events or declined follow-ups).
@@ -59,22 +70,38 @@ promotion), `gateway/run_inbound.py` (preclaim promotion), `gateway/config.py` a
 
 ## Known Trade-Offs
 
-- Wakes retry on their own cadence (watchers every 2 s, goal and loop scans every 15 s), so
-  order among waiting wakes is not FIFO; resumes poll the gate every second and usually win.
+- Wakes retry on their own cadence, so order among waiting wakes is not FIFO. The watch
+  backoff prevents hot process retries, but does not promise strict FIFO under arbitrary arrivals.
+  Queued resumes retain their existing scheduler priority and spacing.
 - A goal whose continuations chain inside one session holds its slot until it parks, finishes
   or reaches its turn limit. Round-robin between goals is later, if needed.
 - Queued resumes keep their preclaim sentinels, so `active_agents` in `gateway_state.json`
-  counts them while they wait, and so does `max_concurrent_sessions` when it is set.
-- The load counts every running turn nobody typed (relays, cron deliveries, heartbeats and
-  chained continuations too), but only the gated kinds above are ever refused.
+  counts them while they wait.
+- A refused watch-pattern event waits in the process registry's in-memory `completion_queue`
+  like any other refused or busy one. A drain offers it once more for the drain spool, but a
+  crash loses whatever that queue holds.
+- A wake the adapter accepted but the runner then drops before claiming the session keeps its
+  reservation until the 30 s expiry.
+- The bound covers admitted lanes, not always-ungated relay/cron/plugin work. Counting work
+  that is never refused cannot enforce an aggregate bound and can indefinitely starve gated wakes.
+  Chained goal continuations and heartbeat wakes remain in the gated load.
 
 ## Verification
 
-`scripts/run_tests.sh tests/gateway/test_background_turn_admission.py tests/gateway/test_replay_scheduler.py`
+`scripts/run_tests.sh tests/gateway/test_background_turn_fairness.py tests/gateway/test_background_turn_admission.py tests/gateway/test_replay_scheduler.py tests/gateway/test_restart_resume_admission_identity.py tests/gateway/test_restart_storm_canary.py`
+
+The restart-storm canary drives about 50 resumes, 38 wakes and 1 typed message through the real
+Telegram adapter, `GatewayRunner._handle_message`, the replay scheduler and
+`admit_internal_event`, and fails if background concurrency exceeds the cap (it reports 36 with
+the gate disabled) or the typed message's model call does not start within 3 s.
 
 ## Provenance
 
 - Fork patch identity: `background-turn-admission`.
+- Fairness correction: #815 (`a6521fc5`) intentionally counted all non-user turns. That allowed
+  8 long ungated relays to block every goal/loop wake indefinitely, while refused watch events
+  retried immediately. Scope the measured load to the lanes the gate actually bounds, retain
+  active restart resumes, and back off refused watches without changing claims or reservations.
 - Evidence (2026-10-25, Personal gateway at `787a4115`): after a liveness-watchdog exit, about
   120 turns nobody typed started within 12 minutes (53 restart resumes, 25 goal continuations,
   22 lifted barriers, 13 delegation retries and more), `active_agents` held at 119-130 with load

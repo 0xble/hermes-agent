@@ -246,7 +246,8 @@ class GatewayBusySessionMixin:
         max_sessions = self._get_max_concurrent_sessions()
         if max_sessions is None or self._is_session_running(session_key):
             return None
-        active_count = self._running_agent_count()
+        # A queued restart resume holds a preclaim for ordering, not a running session.
+        active_count = self._running_agent_count() - self._queued_resume_preclaims()
         if active_count < max_sessions:
             return None
         from hermes_cli.active_sessions import active_session_limit_message
