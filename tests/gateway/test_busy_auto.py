@@ -171,14 +171,159 @@ async def test_later_photo_does_not_merge_into_deferred_original_envelope(monkey
 
 
 @pytest.mark.asyncio
-async def test_ack_failure_does_not_requeue_twice_or_undo_handoff(monkeypatch):
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError],
+                         ids=["transport-error", "ack-cancelled"])
+async def test_ack_failure_does_not_requeue_twice_or_undo_handoff(monkeypatch, failure_type):
     from agent.steer_deferral import defer_message
     runner, agent, adapter = setup(monkeypatch)
-    adapter._send_with_retry.side_effect = RuntimeError("network down")
+    adapter._send_with_retry.side_effect = failure_type("ack failed")
     original = event()
     await runner._handle_active_session_busy_message(original, "key")
     args = {"message_id": message_id(agent)}
-    for _ in range(2):
-        assert (await asyncio.to_thread(defer_message, agent, args))["accepted"]
+    results = [await asyncio.to_thread(defer_message, agent, args) for _ in range(2)]
     assert adapter._pending_messages["key"] is original
     assert not runner._overflow_queue("key")
+    assert all(result["accepted"] for result in results)
+
+
+@pytest.mark.asyncio
+async def test_blocked_ack_can_be_cancelled_after_handoff_without_replaying_drained_original(monkeypatch):
+    from agent.steer_deferral import defer_message
+
+    runner, agent, adapter = setup(monkeypatch)
+    ack_started = asyncio.Event()
+    ack_tasks = []
+
+    async def blocked_send(**kwargs):
+        ack_tasks.append(asyncio.current_task())
+        ack_started.set()
+        await asyncio.Event().wait()
+
+    adapter._send_with_retry.side_effect = blocked_send
+    original = event("deferred while transport is blocked", reply_to_message_id="anchor")
+    assert await runner._handle_active_session_busy_message(original, "key")
+    args = {"message_id": message_id(agent)}
+    handoff = asyncio.create_task(asyncio.to_thread(defer_message, agent, args))
+    try:
+        await asyncio.wait_for(ack_started.wait(), timeout=5)
+        accepted = await asyncio.wait_for(asyncio.shield(handoff), timeout=2)
+        assert accepted["accepted"]
+        assert adapter._pending_messages.pop("key") is original
+        assert original.reply_to_message_id == "anchor"
+        assert original.source.thread_id == "9"
+        assert not runner._overflow_queue("key")
+        ack_tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await ack_tasks[0]
+        repeated = await asyncio.gather(*(
+            asyncio.to_thread(defer_message, agent, args) for _ in range(2)))
+        assert all(result["accepted"] for result in repeated)
+        assert not adapter._pending_messages
+        assert not runner._overflow_queue("key")
+        assert adapter._send_with_retry.await_count == 1
+    finally:
+        for task in ack_tasks:
+            task.cancel()
+        await asyncio.gather(*ack_tasks, return_exceptions=True)
+        await handoff
+
+
+@pytest.mark.asyncio
+async def test_ack_task_registration_failure_keeps_queue_ownership_committed(monkeypatch):
+    from agent.steer_deferral import defer_message
+
+    runner, agent, adapter = setup(monkeypatch)
+    original = event()
+    assert await runner._handle_active_session_busy_message(original, "key")
+    # Fail registration of the deferral ack, not the earlier attended-activity task.
+    retain_ack = Mock(side_effect=RuntimeError("cannot retain ack"))
+    monkeypatch.setattr(runner, "_retain_background_task", retain_ack)
+    args = {"message_id": message_id(agent)}
+    results = await asyncio.gather(*(
+        asyncio.to_thread(defer_message, agent, args) for _ in range(2)))
+    assert all(result["accepted"] for result in results)
+    assert adapter._pending_messages["key"] is original
+    assert not runner._overflow_queue("key")
+    retain_ack.assert_called_once()
+    ack_task = retain_ack.call_args.args[0]
+    await asyncio.gather(ack_task, return_exceptions=True)
+    assert ack_task.cancelled()
+    adapter._send_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_after_admission", [False, True],
+                         ids=["stop-before-admission", "stop-during-blocked-ack"])
+async def test_stop_fences_deferral_without_waiting_for_ack_or_replaying_original(
+        monkeypatch, stop_after_admission):
+    from agent.steer_deferral import defer_message
+    from gateway.run import _INTERRUPT_REASON_STOP
+
+    runner, agent, adapter = setup(monkeypatch)
+    # Keep the real stop, generation, turn-release and pending-message paths. Only
+    # external storage, plugin dispatch and background-child control are captured.
+    monkeypatch.setattr(runner, "session_store", object(), raising=False)
+    monkeypatch.setattr(runner, "_async_session_store", SimpleNamespace(
+        _store=runner.session_store,
+        get_resume_pending_marker=AsyncMock(return_value=None),
+    ), raising=False)
+    runner._pause_goal_for_stop = AsyncMock(return_value=False)
+    runner._persist_active_agents = Mock()
+    runner._evict_cached_agent = Mock()
+    adapter.get_pending_message = lambda key: adapter._pending_messages.pop(key, None)
+    interrupt_children = Mock()
+    monkeypatch.setattr("tools.async_delegation.interrupt_for_session", interrupt_children)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", Mock())
+    agent.hard_interrupt = Mock(
+        side_effect=lambda *_args, **_kwargs: setattr(agent, "_interrupt_requested", True))
+    ack_started = asyncio.Event()
+    ack_tasks = []
+
+    async def blocked_send(**kwargs):
+        ack_tasks.append(asyncio.current_task())
+        ack_started.set()
+        await asyncio.Event().wait()
+
+    adapter._send_with_retry.side_effect = blocked_send
+    original = event("deferred around stop", reply_to_message_id="anchor")
+    assert await runner._handle_active_session_busy_message(original, "key")
+    args = {"message_id": message_id(agent)}
+    generation = runner._current_session_run_generation("key")
+    try:
+        if stop_after_admission:
+            accepted = await asyncio.wait_for(
+                asyncio.to_thread(defer_message, agent, args), timeout=5)
+            assert accepted["accepted"]
+            await asyncio.wait_for(ack_started.wait(), timeout=5)
+            assert adapter._pending_messages["key"] is original
+
+        await asyncio.wait_for(
+            runner._busy_stop_command(event("/stop"), "key", original.source), timeout=5)
+        agent.hard_interrupt.assert_called_once_with(_INTERRUPT_REASON_STOP)
+        agent.interrupt.assert_not_called()
+        interrupt_children.assert_called_once_with(
+            session_key="key", reason="stop_command", parent_session_id="sid")
+        assert runner._current_session_run_generation("key") > generation
+        assert runner._session_state("key").turn.agent is None
+        assert runner._user_stop_latched("key")
+        assert not adapter._pending_messages
+        assert not runner._overflow_queue("key")
+        stopped = await asyncio.to_thread(defer_message, agent, args)
+        assert not stopped["accepted"] and "stopping" in stopped["error"]
+
+        # Cancellation or late completion of transport cannot restore stopped text.
+        for task in ack_tasks:
+            assert not task.done()
+            task.cancel()
+        await asyncio.gather(*ack_tasks, return_exceptions=True)
+        assert all(task.cancelled() for task in ack_tasks)
+        agent._interrupt_requested = False
+        retried = await asyncio.to_thread(defer_message, agent, args)
+        assert retried["accepted"] is stop_after_admission
+        assert not adapter._pending_messages
+        assert not runner._overflow_queue("key")
+        assert adapter._send_with_retry.await_count == int(stop_after_admission)
+    finally:
+        for task in ack_tasks:
+            task.cancel()
+        await asyncio.gather(*ack_tasks, return_exceptions=True)

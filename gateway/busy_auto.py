@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
 from gateway.platforms.event import MessageType
+
+logger = logging.getLogger(__name__)
 
 
 def can_auto_steer(event) -> bool:
@@ -54,7 +57,19 @@ async def try_auto_steer(runner, event, session_key, agent) -> bool:
         if not runner._queue_or_replace_pending_event(session_key, event, preserve_event=True):
             return False
         _restore_arrival_order(runner, session_key, adapter)
-        await runner._send_busy_ack_reply(event, adapter, "Queued after this.")
+        # Admission owns the original now. Transport cancellation must not leave its receipt
+        # actionable, so acknowledge independently without suspending this ownership handoff.
+        ack = runner._send_busy_ack_reply(event, adapter, "Queued after this.")
+        task = None
+        try:
+            task = loop.create_task(ack, name="auto-steer-ack")
+            runner._retain_background_task(task)
+        except Exception:
+            if task is None:
+                ack.close()
+            else:
+                task.cancel()
+            logger.debug("Failed to schedule auto-steer acknowledgment", exc_info=True)
         return True
 
     def handoff() -> bool:
