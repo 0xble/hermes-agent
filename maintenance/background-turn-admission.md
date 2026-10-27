@@ -34,7 +34,13 @@ retries, process or delegation completions, or restart auto-resumes start turns,
   that take a durable claim first reserve before claiming and stamp the token on the event
   (`BACKGROUND_RESERVATION_ATTR`), and admission honors a stamped token unconditionally: a
   `/loop` tick reserves before `fire_tick` (no room keeps the tick due) and a lifted goal barrier
-  reserves before its stale marker is cleared. Both release the token on every non-admitting exit.
+  reserves before its stale marker is cleared. Both release the token on every non-admitting exit,
+  including a raising `fire_tick`.
+- A booting gateway admits no wake until its startup restore has finished
+  (`_startup_restore_in_progress`): restored typed input and the queued resumes go first, so a
+  liveness-watchdog restart (exit 75) does not come back up into the stampede that caused it.
+- Queued resume preclaims do not count toward `max_concurrent_sessions`
+  (`_queued_resume_preclaims`); they order input for their session but run no turn.
 - A reservation counts its session until a turn claims it (`conversation.last_turn_started_at`)
   or 30 s pass, so turns that have not registered yet cannot overshoot the cap.
 - Only queued resumes are spaced (`BACKGROUND_TURN_SPACING_S`, 1 s between grants). Refused
@@ -70,14 +76,24 @@ promotion), `gateway/run_inbound.py` (preclaim promotion), `gateway/config.py` a
 - A goal whose continuations chain inside one session holds its slot until it parks, finishes
   or reaches its turn limit. Round-robin between goals is later, if needed.
 - Queued resumes keep their preclaim sentinels, so `active_agents` in `gateway_state.json`
-  counts them while they wait, and so does `max_concurrent_sessions` when it is set.
+  counts them while they wait.
+- A refused watch-pattern event waits in the process registry's in-memory `completion_queue`
+  like any other refused or busy one. A drain offers it once more for the drain spool, but a
+  crash loses whatever that queue holds.
+- A wake the adapter accepted but the runner then drops before claiming the session keeps its
+  reservation until the 30 s expiry.
 - The bound covers admitted lanes, not always-ungated relay/cron/plugin work. Counting work
   that is never refused cannot enforce an aggregate bound and can indefinitely starve gated wakes.
   Chained goal continuations and heartbeat wakes remain in the gated load.
 
 ## Verification
 
-`scripts/run_tests.sh tests/gateway/test_background_turn_fairness.py tests/gateway/test_background_turn_admission.py tests/gateway/test_replay_scheduler.py tests/gateway/test_restart_resume_admission_identity.py`
+`scripts/run_tests.sh tests/gateway/test_background_turn_fairness.py tests/gateway/test_background_turn_admission.py tests/gateway/test_replay_scheduler.py tests/gateway/test_restart_resume_admission_identity.py tests/gateway/test_restart_storm_canary.py`
+
+The restart-storm canary drives about 50 resumes, 38 wakes and 1 typed message through the real
+Telegram adapter, `GatewayRunner._handle_message`, the replay scheduler and
+`admit_internal_event`, and fails if background concurrency exceeds the cap (it reports 36 with
+the gate disabled) or the typed message's model call does not start within 3 s.
 
 ## Provenance
 

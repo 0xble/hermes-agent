@@ -1087,12 +1087,16 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         is_run_current = getattr(self, "_is_session_run_current", None)
         if not callable(is_run_current):
             is_run_current = lambda _key, _generation: True
-        wakeup = await self._run_in_executor_with_context(
-            functools.partial(
-                mgr.fire_tick, generation,
-                can_claim=lambda: not _turn_owner_exists() and is_run_current(session_key, generation),
+        try:
+            wakeup = await self._run_in_executor_with_context(
+                functools.partial(
+                    mgr.fire_tick, generation,
+                    can_claim=lambda: not _turn_owner_exists() and is_run_current(session_key, generation),
+                )
             )
-        )
+        except BaseException:
+            self._release_background_turn(reservation)
+            raise
         if not wakeup or _turn_owner_exists() or not is_run_current(session_key, generation):
             self._release_background_turn(reservation)
             # A consumed claim is skipped by recovery after the current owner releases.

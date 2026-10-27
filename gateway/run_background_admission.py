@@ -148,12 +148,24 @@ class GatewayBackgroundAdmissionMixin:
         key = self._background_admission_key(adapter, event)
         if key and (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})):
             return None
-        token = self._get_replay_scheduler().gate.try_reserve(key or ("event", id(event)))
+        token = self._try_reserve_background_turn(key or ("event", id(event)))
         if token is None:
-            logger.info("Background turn deferred: kind=%s session_key=%s (background turn limit reached)",
-                        kind, key or "")
-            raise WakeNotAccepted("background turn limit reached; retry later")
+            reason = ("startup restore in progress" if getattr(self, "_startup_restore_in_progress", False)
+                      else "background turn limit reached")
+            logger.info("Background turn deferred: kind=%s session_key=%s (%s)", kind, key or "", reason)
+            raise WakeNotAccepted(f"{reason}; retry later")
         return token
+
+    def _try_reserve_background_turn(self, key: Any) -> Optional[object]:
+        """A reservation token, or None while the gate is full or the boot restore runs.
+
+        A booting gateway admits no wake until its startup restore has finished: restored typed
+        input and the queued restart resumes go first, and a liveness-watchdog restart does not
+        come back up into the same stampede that took it down.
+        """
+        if getattr(self, "_startup_restore_in_progress", False):
+            return None
+        return self._get_replay_scheduler().gate.try_reserve(key)
 
     def _release_background_turn(self, token: Optional[object]) -> None:
         if token is not None:
@@ -165,7 +177,7 @@ class GatewayBackgroundAdmissionMixin:
         Stamp the returned token on the wake (``event``, or later via ``BACKGROUND_RESERVATION_ATTR``)
         so admission honors it, and release it on every path that does not admit.
         """
-        token = self._get_replay_scheduler().gate.try_reserve(session_key)
+        token = self._try_reserve_background_turn(session_key)
         if token is not None and event is not None:
             setattr(event, BACKGROUND_RESERVATION_ATTR, token)
         return token
@@ -173,7 +185,18 @@ class GatewayBackgroundAdmissionMixin:
     def _background_turn_room(self) -> bool:
         """Whether a background turn could start now (a cheap pre-check before scan work)."""
         gate = self._get_replay_scheduler().gate
-        return gate.load() < gate.limit
+        return not getattr(self, "_startup_restore_in_progress", False) and gate.load() < gate.limit
+
+    def _queued_resume_preclaims(self) -> int:
+        """Restart resumes still waiting for a slot; they hold a preclaim but run no turn yet."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        inflight = getattr(self, "_startup_resume_inflight", None) or ()
+        states = self._session_states()
+        return sum(
+            1 for key in inflight
+            if (state := states.get(key)) is not None
+            and state.turn.agent is _AGENT_PENDING_SENTINEL and state.turn.event is None
+        )
 
     def _promote_background_admission(self, session_key: str) -> None:
         """A person is now waiting on this session: start its queued background turn now."""

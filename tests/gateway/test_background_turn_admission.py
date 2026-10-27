@@ -126,3 +126,33 @@ async def test_a_wake_reserved_before_its_durable_claim_is_never_refused_for_cap
     runner._session_state("filler").turn.event = _event("filler")  # a background turn took over
     await admit_internal_event(adapter, tick)
     assert tick._gateway_accepted is True
+
+
+@pytest.mark.asyncio
+async def test_a_booting_gateway_admits_no_wake_until_its_startup_restore_finishes():
+    runner, adapter = _runner(8)
+    runner._startup_restore_in_progress = True  # e.g. coming back from a liveness-watchdog exit
+    with pytest.raises(WakeNotAccepted):
+        await admit_internal_event(adapter, _event("early"))
+    assert runner._reserve_background_turn("tick") is None
+    await adapter.handle_message(_event("typed", typed=True))  # typed input is never held
+
+    runner._startup_restore_in_progress = False
+    await admit_internal_event(adapter, _event("early"))
+    assert adapter.admitted == ["typed", "early"]
+
+
+def test_queued_restart_resumes_do_not_fill_max_concurrent_sessions():
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, _adapter = _runner(8)
+    runner.config.max_concurrent_sessions = 2
+    runner._startup_resume_inflight = {"r1", "r2"}
+    for key in ("r1", "r2"):  # preclaimed, still waiting for a background slot
+        runner._session_state(key).turn.agent = _AGENT_PENDING_SENTINEL
+    assert runner._active_session_limit_message("typed-new-chat") is None
+
+    running = runner._session_state("busy")
+    running.turn.agent, running.turn.event = object(), _event("busy", typed=True)
+    runner._session_state("busy2").turn.agent = object()
+    assert runner._active_session_limit_message("typed-new-chat") is not None
