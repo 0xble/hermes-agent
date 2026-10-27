@@ -21,7 +21,7 @@ async def _stop_card(client, channel: str, ts: str) -> None:
             timeout=API_TIMEOUT_SECONDS)
     except Exception as exc:
         # Expired streams are already sealed. An outage must not prevent deletion.
-        logger.debug("[Slack] Native task-card stopStream failed for %s: %s", ts, exc)
+        logger.debug("[Slack] Native task-card stopStream failed for %s: %s", ts, exc, exc_info=True)
 
 
 async def _delete_card(client, channel: str, ts: str) -> bool:
@@ -38,7 +38,8 @@ async def _delete_card(client, channel: str, ts: str) -> bool:
             return True
         logger.warning("[Slack] Native task-card deletion failed for %s: %s", ts, exc)
     except Exception as exc:
-        logger.warning("[Slack] Native task-card deletion failed for %s: %s", ts, exc)
+        # Any transport failure keeps the ledger entry for the next retry.
+        logger.warning("[Slack] Native task-card deletion failed for %s: %s", ts, exc, exc_info=True)
     return False
 
 
@@ -75,14 +76,14 @@ class TaskCardCleanup:
             return entries
         except FileNotFoundError:
             return []
-        except Exception as exc:
+        except (OSError, ValueError) as exc:  # includes JSON and UTF-8 decode errors
             logger.warning("[Slack] Cannot read task-card ledger %s: %s", self.path, exc)
             return []
 
     def _write(self, entries: list[dict]) -> None:
         try:
             atomic_write_text(self.path, json.dumps(entries), fsync_dir=True)
-        except Exception as exc:
+        except (OSError, TypeError, ValueError) as exc:
             # Cleanup bookkeeping must not stop progress or reply delivery.
             logger.warning("[Slack] Cannot write task-card ledger %s: %s", self.path, exc)
 
@@ -139,7 +140,7 @@ class TaskCardCleanup:
                 if deleted:
                     self.forget(*key)
         except Exception as exc:
-            logger.warning("[Slack] Native task-card sweep failed: %s", exc)
+            logger.warning("[Slack] Native task-card sweep failed: %s", exc, exc_info=True)
 
     def start(self, *, immediate: bool = False) -> None:
         if not self.enabled() or not self._read():
@@ -160,7 +161,7 @@ class TaskCardCleanup:
                 self.wake.clear()
                 await self.sweep()
         except Exception as exc:
-            logger.warning("[Slack] Native task-card retry worker failed: %s", exc)
+            logger.warning("[Slack] Native task-card retry worker failed: %s", exc, exc_info=True)
 
     async def close(self) -> None:
         if self.task is not None:
