@@ -154,14 +154,14 @@ def main():
         directory = Path(directory)
         baseline = load_baseline(args.baseline, directory)
         cases = [run_case(directory / f"{case}.sqlite", case, args, baseline) for case in args.cases.split(",")]
-    result = {"baseline_sha": subprocess.check_output(["git", "rev-parse", args.baseline], cwd=ROOT, text=True).strip(),
-              "candidate_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+    result = {"baseline_sha": subprocess.check_output(["git", "rev-parse", args.baseline], cwd=ROOT, text=True, encoding="utf-8").strip(),
+              "candidate_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, encoding="utf-8").strip(),
               "candidate_source_sha256": hashlib.sha256((ROOT / "hermes_state_display_fold.py").read_bytes()).hexdigest(),
               "python": sys.version, "sqlite": sqlite3.sqlite_version, "platform": platform.platform(),
               "switch_interval_s": sys.getswitchinterval(), "cpu_threads": 1,
               "protocol": vars(args) | {"output": str(args.output)}, "cases": cases}
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"output": str(args.output), "cases": [{"case": c["case"], "summary": c["summary"]} for c in cases]}, indent=2))
 
 
