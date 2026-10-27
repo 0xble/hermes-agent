@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -13,7 +14,6 @@ import pytest
 
 from hermes_cli.test_artifact_lifetime import (
     OWNER_MARKER,
-    guardian_main,
     owner_pid_from_home,
     pytest_tmp_home,
     register_tmux_server,
@@ -74,16 +74,18 @@ def _run_armed(home: Path, *, timeout: float, **extra: str) -> subprocess.Comple
     )
 
 
+@pytest.mark.platforms("posix")
 @pytest.mark.live_system_guard_bypass
 def test_pytest_home_exits_when_the_lifetime_elapses():
     home = Path(tempfile.mkdtemp(prefix="pytest-of-lifetime-")) / "pytest-0" / "h"
     home.mkdir(parents=True)
     started = time.monotonic()
     result = _run_armed(home, timeout=4, HERMES_TEST_MAX_LIFETIME="0.4")
-    assert result.returncode in {-signal.SIGKILL, 75}
+    assert result.returncode == -signal.SIGKILL  # windows-footgun: ok — POSIX-only test
     assert time.monotonic() - started < 3
 
 
+@pytest.mark.platforms("posix")
 @pytest.mark.live_system_guard_bypass
 def test_pytest_home_exits_when_its_owner_dies():
     home = Path(tempfile.mkdtemp(prefix="pytest-of-owner-")) / "pytest-0" / "h"
@@ -111,7 +113,7 @@ def test_pytest_home_exits_when_its_owner_dies():
             proc.kill()
             proc.wait(timeout=5)
             pytest.fail("artifact stayed up after its owner died")
-        assert proc.returncode in {-signal.SIGKILL, 75}
+        assert proc.returncode == -signal.SIGKILL  # windows-footgun: ok — POSIX-only test
     finally:
         if owner.poll() is None:
             owner.kill()
@@ -142,9 +144,11 @@ def test_operator_home_is_not_armed():
     assert proc.returncode == 0
 
 
+@pytest.mark.platforms("posix")
 @pytest.mark.live_system_guard_bypass
-def test_guardian_kills_only_its_tmux_server():
-    if subprocess.run(["tmux", "-V"], capture_output=True, check=False).returncode != 0:
+@pytest.mark.parametrize("expire", [False, True])
+def test_guardian_kills_only_its_tmux_server(expire):
+    if shutil.which("tmux") is None:
         pytest.skip("tmux is not installed")
     # macOS rejects a tmux socket path longer than the sockaddr limit.
     short = Path(tempfile.mkdtemp(prefix="ht", dir="/tmp"))
@@ -173,17 +177,23 @@ def test_guardian_kills_only_its_tmux_server():
              "guardian_main(int(sys.argv[1]), Path(sys.argv[2]))\n",
              str(owner.pid), str(root)],
             cwd=REPO,
-            env={**os.environ, "PYTHONPATH": str(REPO)},
+            env={**os.environ, "PYTHONPATH": str(REPO),
+                 "HERMES_TEST_MAX_LIFETIME": "0.5" if expire else "30"},
         )
         time.sleep(0.3)
-        owner.kill()
-        owner.wait(timeout=5)
+        if not expire:
+            owner.kill()
+            owner.wait(timeout=5)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and (_tmux_up(owned) or _tmux_up(registered)):
             time.sleep(0.1)
         assert not _tmux_up(owned)
         assert not _tmux_up(registered)
         assert _tmux_up(other)
+        if expire:
+            assert owner.poll() is None
+            owner.kill()
+            owner.wait(timeout=5)
         guardian.wait(timeout=5)
     finally:
         if owner.poll() is None:
@@ -194,6 +204,116 @@ def test_guardian_kills_only_its_tmux_server():
         for proc in servers:
             if proc.poll() is None:
                 proc.kill()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.live_system_guard_bypass
+def test_lifetime_kills_a_stopped_cli():
+    with tempfile.TemporaryDirectory(prefix="pytest-of-stopped-") as directory:
+        home = Path(directory)
+        ready = home / "ready"
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "from hermes_cli.test_artifact_lifetime import arm_test_artifact_lifetime\n"
+             "arm_test_artifact_lifetime()\n"
+             "import pathlib, sys, time\n"
+             "pathlib.Path(sys.argv[1]).touch()\n"
+             "time.sleep(30)\n", str(ready)],
+            cwd=REPO, env=_child_env(home, HERMES_TEST_MAX_LIFETIME="1"),
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert ready.exists()
+            proc.send_signal(signal.SIGSTOP)
+            assert proc.wait(timeout=4) == -signal.SIGKILL  # windows-footgun: ok — POSIX-only test
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=3)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.live_system_guard_bypass
+def test_sigkill_of_real_pytest_reaps_its_artifacts(tmp_path: Path):
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux is not installed")
+    import json
+    import psutil
+    import uuid
+
+    listener = f"hermes-e2e-custody-{uuid.uuid4().hex[:8]}"
+    evidence = tmp_path / "ready.json"
+    nested = tmp_path / "test_owner.py"
+    nested.write_text('''
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from hermes_cli.test_artifact_lifetime import install_session_custody, register_tmux_server
+
+def test_owner(tmp_path):
+    install_session_custody(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         "from hermes_cli.test_artifact_lifetime import arm_test_artifact_lifetime; "
+         "arm_test_artifact_lifetime(); import time; time.sleep(60)"],
+        env={**os.environ, "HERMES_HOME": str(home), "HERMES_TEST_MAX_LIFETIME": "30"},
+        start_new_session=True,
+    )
+    listener = os.environ["CUSTODY_TEST_LISTENER"]
+    register_tmux_server(listener=listener)
+    subprocess.run(["tmux", "-L", listener, "-f", os.devnull,
+                    "new-session", "-d", "-s", "p", "sleep", "60"], check=True)
+    Path(os.environ["CUSTODY_TEST_READY"]).write_text(json.dumps({"pid": child.pid}))
+    time.sleep(60)
+''', encoding="utf-8")
+    env = _child_env(tmp_path, CUSTODY_TEST_LISTENER=listener, CUSTODY_TEST_READY=str(evidence))
+    target = None
+    with (tmp_path / "pytest.log").open("w", encoding="utf-8") as log:
+        parent = subprocess.Popen([sys.executable, "-m", "pytest", "-q", str(nested)],
+                                  cwd=REPO, env=env, stdout=log, stderr=log)
+        try:
+            deadline = time.monotonic() + 15
+            while not evidence.exists() and parent.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert evidence.exists(), (tmp_path / "pytest.log").read_text(encoding="utf-8-sig")
+            target = psutil.Process(json.loads(evidence.read_text(encoding="utf-8-sig"))["pid"])
+            parent.kill()
+            assert parent.wait(timeout=5) == -signal.SIGKILL  # windows-footgun: ok — POSIX-only test
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline:
+                cli_up = target.is_running() and target.status() != psutil.STATUS_ZOMBIE
+                tmux_up = subprocess.run(["tmux", "-L", listener, "ls"], capture_output=True, check=False).returncode == 0
+                if not cli_up and not tmux_up:
+                    break
+                time.sleep(0.1)
+            assert not target.is_running() or target.status() == psutil.STATUS_ZOMBIE
+            assert subprocess.run(["tmux", "-L", listener, "ls"], capture_output=True, check=False).returncode != 0
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait(timeout=5)
+            if target is not None:
+                try:
+                    target.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            subprocess.run(["tmux", "-L", listener, "kill-server"], capture_output=True, check=False)
+
+
+@pytest.mark.parametrize("raw", ["", "0", "-1", "nan", "inf", "invalid"])
+def test_lifetime_cannot_be_disabled_by_an_invalid_value(monkeypatch, raw):
+    from hermes_cli.test_artifact_lifetime import DEFAULT_LIFETIME_S, _lifetime_s
+
+    monkeypatch.setenv("HERMES_TEST_MAX_LIFETIME", raw)
+    assert _lifetime_s() == DEFAULT_LIFETIME_S
 
 
 def _tmux_up(sock: Path) -> bool:
