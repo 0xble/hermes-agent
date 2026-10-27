@@ -48,7 +48,11 @@ never flushes back as a second active copy. The worker owner's history read mirr
 When that surviving dict carries both the reference summary and a typed steer, canonical
 user-origin projections and compressor selectors must retain its live human authority.
 Do not restore a duplicate plain row to make the ask selectable. Standalone handoffs and
-operational display kinds remain synthetic.
+operational display kinds remain synthetic. Split-turn eligibility prices and validates the
+carrier's projected live input, not its historical summary. A small text request must keep
+splitting on later compactions, while oversized or non-text requests remain indivisible.
+In-flight task replay also uses that live projection so a split never restores an older ask
+in place of the carried steer.
 
 Fork patch identity: `hygiene-deferred-adoption`.
 
@@ -63,6 +67,7 @@ prompt count was also stale, so hygiene ran a 93-second compression for a 33-to-
 
 - `scripts/run_tests.sh tests/gateway/test_session_hygiene_turnhold_adoption.py tests/hermes_state/test_stale_held_generation_guard.py tests/agent/test_micro_compaction.py tests/agent/test_proactive_prune_restart_safety.py tests/gateway/test_replay_entry_fields.py`
 - `scripts/run_tests.sh tests/hermes_state/test_compaction_active_uid.py tests/hermes_state/test_compression_watermark_commit.py tests/hermes_state/test_repaired_history_commit_coverage.py tests/hermes_state/test_compression_lease_refresh_before_publish.py tests/hermes_state/test_display_fold_incremental.py tests/hermes_state/test_runtime_worker_compression_annotations.py`
+- `scripts/run_tests.sh tests/agent/test_split_turn_compaction.py tests/agent/test_summary_carrier_split_turn.py tests/agent/test_reference_handoff_active_turn.py tests/gateway/test_folded_steer_silence_reprompt.py`
 - Live: a deferred adoption logs `summary adopted at the watermark-fenced commit boundary` and sends no chat notice.
   The next turn's hygiene check does not report a pre-compaction `actual` token count.
 

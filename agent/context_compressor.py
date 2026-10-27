@@ -4742,22 +4742,12 @@ Write only the summary body. Do not include any preamble or prefix."""
         from agent.conversation_compression import _is_real_user_message
 
         last_user_idx = -1
-        # Find the newest user message that carries at least one image part. We anchor on image-bearing user
-        # messages (not all user messages) so a plain text follow-up after a big-image turn still strips the
-        # old image — matching the problem kilocode#9434 set out to solve.
-        # Newest tool message carrying an image. Tool-result images (``vision_analyze``,
-        # screenshot-returning tools) accumulate on their own timeline and the user anchor never protects
-        # the stale ones: a session whose only image-bearing user message is the FIRST one leaves ``anchor
-        # <= 0`` and strips nothing at all, so twenty tool results keep multi-MB of base64 in every request
-        # body until the provider answers 413 -- and the 413 handler's recovery compaction lands right back
-        # here and frees nothing, which is the wedge in #89938. Keep the newest tool image, since that is
-        # the one the model is reasoning about, and drop every older one wherever it sits.
+        # Include live input projected from summary carriers, not just plain user rows.
         for i in range(len(messages) - 1, -1, -1):
             msg = messages[i]
-            # _is_real_user_message also rejects metadata-flagged scaffolding
-            # (_todo_snapshot_synthetic, recovery nudges, ...) that
-            # _is_actionable_user_turn cannot see.
-            if cls._is_actionable_user_turn(msg) and _is_real_user_message(msg):
+            # Check runtime scaffolding flags on the live view, not the carrier's summary prefix.
+            user_turn = user_originated_turn_view(msg)
+            if user_turn is not None and _is_real_user_message(user_turn):
                 last_user_idx = i
                 break
             if cls._has_merged_inflight_replay(msg):
@@ -4779,7 +4769,9 @@ Write only the summary body. Do not include any preamble or prefix."""
                 # hand the model finished work as a fresh instruction.
                 return None
             # Empty assistant row (a bare reasoning/stub turn): keep looking.
-        return messages[last_user_idx]
+        task = messages[last_user_idx]
+        # Replay the live request, never its historical summary; keep assistant-carried replay support.
+        return (user_originated_turn_view(task) or task) if cls._is_context_summary_message(task) else task
 
     def _reappend_inflight_user_task(
         self,
@@ -5046,14 +5038,13 @@ Write only the summary body. Do not include any preamble or prefix."""
         if (
             allow_split_turn
             and user_anchored_cut < cut_idx
-            # The handoff can restate text, but cannot replace an audio, image,
-            # or unknown structured input with its text-only projection.
-            and _is_text_only_content(messages[last_user_idx].get("content"))
-            # A single oversized user message is indivisible and must stay verbatim in the tail; this
-            # exception is only for aggregate turn growth after a normally sized opening request.
-            # The token ceiling is the only size guard: the request is restated verbatim after the
-            # handoff, so a character cap only pinned long requests (e.g. /goal prompts) in place.
-            and _estimate_msg_budget_tokens(messages[last_user_idx]) <= soft_ceiling
+            # Price and validate only live input: a carrier's historical summary is not the request.
+            and (user_turn := user_originated_turn_view(messages[last_user_idx])) is not None
+            # The handoff cannot replace audio, images, or unknown structured input with plain text.
+            and _is_text_only_content(user_turn.get("content"))
+            # An oversized request is indivisible; only aggregate turn growth permits splitting.
+            # The request is restated verbatim, so a character cap would pin long /goal prompts.
+            and _estimate_msg_budget_tokens(user_turn) <= soft_ceiling
             # Only split when there is real turn body to summarize: if the oversized weight is the
             # active turn's own newest group, the pre-anchor cut retains it anyway, so taking the
             # active request out of the tail buys no reclaim and loses the #10896 anchor.
