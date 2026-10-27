@@ -4985,6 +4985,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         try:
             result = await delivery_adapter._send_with_retry(
                 chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+            from gateway.reply_latency import record_first_reply
+            record_first_reply(getattr(event, "_reply_latency_receipt", None), text_content, result)
         finally:
             _PENDING_LEDGER_SETTLEMENT.reset(settlement)
         # Let records_delivery count the captured result before cancellation propagates,
