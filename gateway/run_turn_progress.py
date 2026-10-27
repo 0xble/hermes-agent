@@ -19,10 +19,8 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.typing_state import (
-    call_typing_with_metadata, pause_typing_for_prompt, resume_typing_after_prompt,
-    typing_metadata_for_source,
+    call_typing_with_metadata, typing_metadata_for_source,
 )
-from gateway.run_task_card_progress import TaskCardProgressMixin
 from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
@@ -107,7 +105,7 @@ def publish_worker_tool_event(authority, session_id, generation, frame) -> bool:
     return True
 
 
-class GatewayTurnProgressMixin(TaskCardProgressMixin):
+class GatewayTurnProgressMixin:
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
     def _schedule(self, coro, log_message: str, loop=None):
@@ -374,7 +372,7 @@ class GatewayTurnProgressMixin(TaskCardProgressMixin):
         else:
             ctx.progress_queue.put(msg)
 
-    # ── Slack-native task cards (progress-queue drain) ──────────────────────────────────────
+    # Slack-native task-card publication lives in ``gateway.run_task_card_progress``.
 
     # ── editable progress bubbles (progress-queue drain) ────────────────────────────────────
 
@@ -819,48 +817,6 @@ class GatewayTurnProgressMixin(TaskCardProgressMixin):
         ctx = self._ctx
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
-    def _attach_session_title_callback(self, agent, ctx) -> None:
-        """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
-
-        The titler runs in the turn prologue, so attach before the run, not after it.
-        """
-        try:
-            # Gateway auto-title failures are not user-actionable, so never surface them as messages;
-            # overriding the failure sink keeps CLI on _emit_auxiliary_failure while gateway logs debug.
-            agent._title_failure_callback = lambda task, exc: logger.debug(
-                "Gateway auto-title failure suppressed (not user-visible): %s: %s", task, exc,
-            )
-            session_id = getattr(agent, "session_id", None)
-            if local_viewer_turn(self):
-                # Main's CLI repainted its status-bar title when the auto-title landed.
-                authority, canonical_id, _generation = self._approval_owner
-
-                def republish(title, title_source):
-                    from gateway.session_contract import SessionRef
-                    from gateway.session_local import local_session_info
-                    ref = SessionRef(getattr(authority, "profile_id", ""), canonical_id)
-                    authority.sessions[canonical_id].event_stream.publish(
-                        canonical_id, local_session_info(authority, ref), event_type="session.info")
-                agent._on_session_title = republish
-                return
-            runner = self._runner
-            source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
-            # Both lanes spend a rate-limited platform call per title, so they use the model's title
-            # only (TitleCallback); renaming twice burns Discord's 2-per-10-min budget on a throwaway.
-            # Relay Discord predicate is shape-only: whether the connector auto-threaded our reply is
-            # only knowable AFTER delivery, so register eagerly and let the rename lane look up the
-            # cache at fire time — gating registration on the cache read meant it never registered.
-            if runner._is_telegram_topic_lane(source):
-                lane = "_schedule_telegram_topic_title_rename"
-            elif runner._is_discord_auto_thread_lane(source) or runner._is_relay_discord_channel_lane(source):
-                lane = "_schedule_discord_semantic_thread_rename"
-            else:
-                return
-            agent._on_session_title = lambda title, title_source: (
-                title_source == "llm" and getattr(runner, lane)(source, session_id, title)
-            )
-        except Exception:
-            logger.debug("Failed to attach session title callback", exc_info=True)
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
@@ -877,7 +833,7 @@ class GatewayTurnProgressMixin(TaskCardProgressMixin):
             )
             return
         def present():
-            from gateway.notice_style import notice_metadata
+            from agent.notice_style import notice_metadata
             if local_viewer_turn(self):
                 self._publish_execution("status.update", {"kind": _viewer_status_kind(event_type, prepared),
                                                           "text": prepared})

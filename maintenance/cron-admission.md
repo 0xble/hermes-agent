@@ -49,6 +49,28 @@ identity matching, or an execution-terminal release shortcut. Retire it only
 when the selected upstream baseline preserves the same admission and timing
 contract under general-pool saturation.
 
+## Dispatch Diagnostics
+
+Local `cron.scheduler_diagnostics` INFO events name the execution, job, profile
+home, actual general/reserved admission lane, existing ledger code revision,
+stage and monotonic timestamp. The copied dispatch context carries attribution
+through the executor hop. Direct calls use the imported immutable release when
+available, otherwise the revision remains unknown. Do not resolve a moving
+`current` pointer or run Git/ledger queries for each diagnostic event.
+
+`executor_queued` precedes submission and `executor_enter` marks callback entry.
+`fire_claim_enter` and `fire_claim_exit` bracket the persisted job claim.
+Launch events then bracket scope selection, handoff fencing, payload writing,
+secret scope, worker environment/specification, spawn and acknowledgement.
+Compare timestamps for the same execution, home and code revision. These
+milestones distinguish queue wait from fire-claim or launch preparation, but
+missing later milestones alone do not identify a cause or prove worker exit.
+
+Log only allowlisted metadata, never names, prompts, environment values,
+payloads, acknowledgements or exception objects. Logging failure must not change
+claims, admission, cancellation or process-exit fencing. These events add no
+scheduling policy, reservation, configuration, alert or live acceptance credit.
+
 ## Verify
 
 `tests/cron/test_reserved_admission.py` exercises actual `started_at` ledger

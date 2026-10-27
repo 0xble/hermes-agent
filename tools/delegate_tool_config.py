@@ -232,6 +232,7 @@ def _resolve_child_service_tier(
             return None
     mode = getattr(parent_agent, "service_tier", None)
     if mode == "ultrafast":
+        # Ultrafast crosses only to a child route and credential that offer it, never as a paid Priority fallback.
         from agent.codex_service_tiers import ultrafast_offered
 
         if not child_model or not ultrafast_offered(

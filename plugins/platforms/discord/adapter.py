@@ -3158,7 +3158,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             message = await channel.fetch_message(int(message_id))
             return await self._add_reaction(message, emoji)
         except Exception as exc:
-            logger.debug("[%s] reaction target lookup failed: %s", self.name, exc)
+            logger.debug("[%s] reaction target lookup failed: %s", self.name, exc, exc_info=True)
             return False
 
     async def _add_reaction(self, message: Any, emoji: str) -> bool:

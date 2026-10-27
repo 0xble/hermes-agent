@@ -191,6 +191,98 @@ class TestDeathDetection(RemoteKernelBase):
         self.assertTrue(any("kill " in c for c in env.commands))
 
 
+class TestUnstartedCellReclaim(RemoteKernelBase):
+    """A runner that never takes a request leaves provably unrun code, not a timeout."""
+
+    def _env(self, *, mid="ALIVE", deadline="", results=()):
+        results = list(results)
+
+        def cat_handler(command):
+            payload = results.pop(0) if results else None  # None: result not written yet
+            return {"output": json.dumps(payload) if payload is not None else "", "returncode": 0}
+
+        def probe(command):
+            out = mid if command.startswith("if kill -0") else deadline
+            if isinstance(out, Exception):
+                raise out
+            return {"output": out + "\n", "returncode": 0}
+
+        return ScriptedEnv([
+            (".cancelled", probe),
+            ("nohup", lambda c: {"output": "PID:91\n", "returncode": 0}),
+            ("kill -0", lambda c: {"output": "ALIVE\n", "returncode": 0}),
+            ("cat ", cat_handler),
+        ])
+
+    def _run_fast_probe(self, env, timeout):
+        with patch("tools.code_kernel_remote._CELL_LIVENESS_INTERVAL", 0.0), \
+                patch("tools.code_kernel_remote._CELL_POLL_INTERVAL", 0.05):
+            return _run(env, timeout=timeout)
+
+    def test_runner_gone_before_pickup_reports_not_run_without_waiting(self):
+        started = time.monotonic()
+        result = self._run_fast_probe(self._env(mid="RECLAIMED"), timeout=30)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("did NOT run", result["error"])
+        self.assertIn("exited before this cell started", result["kernel"]["note"])
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
+
+    def test_deadline_reclaim_separates_unstarted_from_timeout(self):
+        unstarted = self._run_fast_probe(self._env(deadline="RECLAIMED"), timeout=1)
+        self.assertEqual(unstarted["status"], "error")
+        self.assertIn("did not pick up this cell", unstarted["error"])
+        timed_out = self._run_fast_probe(self._env(), timeout=1)
+        self.assertEqual(timed_out["status"], "timeout")
+
+    def test_unreadable_probe_never_claims_not_run(self):
+        error = ConnectionError("ssh dropped")
+        result = self._run_fast_probe(self._env(mid=error, deadline=error), timeout=1)
+        self.assertEqual(result["status"], "timeout")
+        self.assertNotIn("did NOT run", json.dumps(result))
+
+    def test_runner_dead_after_taking_the_cell_reports_partial_run(self):
+        result = self._run_fast_probe(self._env(mid="GONE"), timeout=30)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("may have run partially", result["error"])
+
+    def test_picked_up_cell_keeps_waiting_for_its_result(self):
+        result = self._run_fast_probe(self._env(results=[None, None, _cell(stdout="late\n")]), timeout=30)
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(result["stdout"], "late\n")
+
+
+@unittest.skipIf(sys.platform == "win32", "POSIX shell probe")
+class TestReclaimProbeShell(unittest.TestCase):
+    """The probe string itself, against a real shell, PIDs and files."""
+
+    def _probe(self, tmp, pid, *, only_if_dead=True):
+        import shlex
+        import subprocess
+        from tools.code_kernel_remote import _reclaim_command
+        cmd = _reclaim_command(shlex.quote(os.path.join(tmp, "cell_req_000001.json")), str(pid),
+                               only_if_dead=only_if_dead)
+        return subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+
+    def test_probe_outcomes(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            req = os.path.join(tmp, "cell_req_000001.json")
+            live = subprocess.Popen(["sleep", "30"])
+            try:
+                open(req, "w").close()
+                self.assertEqual(self._probe(tmp, live.pid), "ALIVE")
+                self.assertTrue(os.path.exists(req), "a live runner's request must stay claimable")
+            finally:
+                live.kill()
+                live.wait()
+            self.assertEqual(self._probe(tmp, live.pid), "RECLAIMED")
+            self.assertFalse(os.path.exists(req))
+            self.assertEqual(self._probe(tmp, live.pid), "GONE")
+            self.assertEqual(self._probe(tmp, live.pid, only_if_dead=False), "")
+
+
 class TestOwnershipIsolation(RemoteKernelBase):
     def test_changed_tool_set_spawns_kernel_with_fresh_stubs(self):
         env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))

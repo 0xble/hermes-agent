@@ -605,7 +605,7 @@ class GatewayBusySessionMixin:
         """Send a busy-path reply anchored to the event (thread metadata included)."""
         reply_anchor = self._reply_anchor_for_event(event)
         from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
-        from gateway.notice_style import notice_metadata
+        from agent.notice_style import notice_metadata
 
         async def labelled_send():
             # A busy reply is a non-final notice: the first shed after cosmetics when the chat's
@@ -949,7 +949,7 @@ class GatewayBusySessionMixin:
             head, tail = t("gateway.busy.queued_head"), t("gateway.busy.queued_tail")
         else:
             head, tail = t("gateway.busy.interrupting_head"), t("gateway.busy.interrupting_tail")
-        from gateway.notice_style import ContextNotice
+        from agent.notice_style import ContextNotice
         message = ContextNotice(t("gateway.busy.ack", head=head, detail=status_detail, tail=tail))
 
         # One-time onboarding hint about the queue/interrupt knob (flag persisted to config.yaml).

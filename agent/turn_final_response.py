@@ -7,7 +7,7 @@ re-prompt, scaffolding pop, stop gates, then the durable final flush. Extracted 
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 from dataclasses import dataclass
 import logging
@@ -88,6 +88,13 @@ class FinalResponseVerdict:
     result: Optional[dict[str, Any]] = None
 
 
+def _is_contentless_stop(assistant_message: Any, finish_reason: Any) -> bool:
+    """A clean stop without tool calls or visible content, before recovery/promotion."""
+    content = assistant_message.content
+    return (finish_reason == "stop" and not assistant_message.tool_calls
+            and (content is None or (isinstance(content, str) and not content.strip())))
+
+
 def finish_text_response(
     agent: Any, *, assistant_message: Any, response: Any, finish_reason: Any, messages: Any,
     api_messages: Any, conversation_history: Any, api_call_count: Any, user_message: Any,
@@ -132,18 +139,13 @@ def finish_text_response(
     # Anthropic thinking (signed ``thinking`` block, or a plugin's ``*.native_assistant`` carrier
     # of native Claude turns) is a summary written by a separate model, never the answer: it
     # takes the empty-response continuation below instead.
-    _content = assistant_message.content
     _promoted = None
     # Responses/Codex reasoning is a provider-generated summary, not the assistant's visible
     # answer. The encrypted item and its summary are retained for replay, but must never enter
     # final_response or api_content. Chat-completions parsers (including vLLM's Nemotron route)
     # have no codex_reasoning_items carrier and keep the legacy promotion behavior.
     _responses_reasoning_summary = is_responses_reasoning_summary(agent, assistant_message)
-    _contentless_stop = (
-        finish_reason == "stop"
-        and not assistant_message.tool_calls
-        and (_content is None or (isinstance(_content, str) and not _content.strip()))
-    )
+    _contentless_stop = _is_contentless_stop(assistant_message, finish_reason)
     from gateway.session_context import current_message_reaction_acknowledged
     _reaction_stop = _contentless_stop and not truncated_response_parts and current_message_reaction_acknowledged()
     if (

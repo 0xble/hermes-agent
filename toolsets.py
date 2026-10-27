@@ -15,7 +15,7 @@ _HERMES_CORE_TOOLS = [
     "vision_analyze", "image_generate",
     "skills_list", "skill_view", "skill_manage",
     "browser_handoff", "browser_navigate", "browser_snapshot", "browser_click",
-    "browser_type", "browser_scroll", "browser_back", "browser_upload", "browser_downloads",
+    "browser_type", "browser_scroll", "browser_back", "browser_upload", "browser_downloads", "browser_tabs",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     "browser_vault",  # rides with the browser; deferred by default (tools.tool_search.defer)
@@ -474,12 +474,15 @@ def session_disabled_toolsets(disabled: Optional[list[str]], platform: Optional[
     this as its ``disabled_toolsets``, so the tool list, the tool_search listing and bridge, MCP refreshes
     and delegate children (which inherit it) all subtract the gated tools in ``_select_tool_names``."""
     from gateway.config import Platform
+    from gateway.platform_registry import platform_registry
 
-    try:
-        # Platform resolves registered plugins as well as built-in gateway adapters.
-        is_gateway = Platform(platform) != Platform.LOCAL
-    except ValueError:
-        is_gateway = False
+    # Tool selection must not discover manifests (notably in safe mode). Gateway
+    # sources already have a resolved enum identity or a registered adapter.
+    name = str(getattr(platform, "value", platform) or "").strip().lower()
+    is_gateway = name != Platform.LOCAL.value and (
+        name in {member.value for member in Platform.__members__.values()}
+        or platform_registry.is_registered(name)
+    )
     if not is_gateway:
         from tools.react_tool import check_react_requirements
         if not check_react_requirements():

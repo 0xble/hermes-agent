@@ -4,6 +4,8 @@ AIAgent first: ``run_codex_app_server_turn`` drives one ``codex app-server`` sub
 
 from __future__ import annotations
 
+from agent.notice_style import ContextNotice
+
 import contextvars
 import functools
 import json
@@ -227,7 +229,6 @@ def _record_codex_app_server_compaction(agent, turn, *, approx_tokens: int | Non
     if not force:
         with suppress(Exception):
             from agent.conversation_compression import COMPACTION_STATUS
-            from gateway.notice_style import ContextNotice
             agent._emit_status(ContextNotice(COMPACTION_STATUS))
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
@@ -535,7 +536,6 @@ def _start_codex_thread(agent) -> str:
     except CodexThreadResumeError as exc:
         logger.warning("%s; starting a new codex thread (session=%s)", exc.message, getattr(agent, "session_id", None))
         _store_codex_thread_id(agent, None)
-        from gateway.notice_style import ContextNotice
         agent._emit_diagnostic_status(ContextNotice(_CODEX_THREAD_RESUME_NOTICE))
         return agent._codex_session.ensure_started()
 

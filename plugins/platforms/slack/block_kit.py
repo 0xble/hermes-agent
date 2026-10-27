@@ -30,8 +30,8 @@ from __future__ import annotations
 
 import re
 
-from .rich_media import (cards_block, presentation_line, sanitize_carousel,
-                         sanitize_context, sanitize_image, thumbnail)
+from .rich_media import (RICH_BLOCK_SANITIZERS, emit_presentation, fenced_block,
+                         presentation_line, record_native_images, sanitize_section_accessory)
 from typing import Any, Dict, List, Optional, Tuple
 
 # Slack Block Kit hard limits (https://docs.slack.dev/reference/block-kit/blocks)
@@ -426,16 +426,7 @@ def render_blocks(
 
             special = presentation_line(line, fmt)
             if special:
-                if special["type"] == "image" or any(
-                    element.get("type") == "image" for element in special.get("elements", [])
-                ):
-                    image_lines.add(i)
-                accessory = thumbnail(line) if para else None
-                flush_para()
-                if accessory and blocks and blocks[-1]["type"] == "section":
-                    blocks[-1]["accessory"] = accessory
-                else:
-                    blocks.append(special)
+                emit_presentation(blocks, special, line, bool(para), flush_para, image_lines, i)
                 i += 1
                 continue
 
@@ -457,8 +448,7 @@ def render_blocks(
                     i += 1
                 i += 1  # consume closing fence
                 text = "\n".join(body)
-                card = cards_block(text, fmt) if fence.group(2).strip() == "cards" else None
-                blocks.append(card or _preformatted_block(text))
+                blocks.append(fenced_block(fence.group(2), text, fmt, _preformatted_block))
                 continue
 
             # Horizontal rule → divider
@@ -491,10 +481,7 @@ def render_blocks(
                 # Prefer a native Block Kit table; fall back to aligned
                 # monospace when it exceeds Slack's table limits or won't parse.
                 table = _table_block(trows, sep_line)
-                if table is not None:
-                    blocks.append(table)
-                else:
-                    blocks.append(_preformatted_block(_render_table(trows)))
+                blocks.append(table if table is not None else _preformatted_block(_render_table(trows)))
                 continue
 
             # Blockquote group
@@ -576,8 +563,7 @@ def render_blocks(
             # Too structurally complex to express safely — let the caller fall
             # back to plain text rather than truncating and losing content.
             return None
-        if native_image_lines is not None:
-            native_image_lines.update(image_lines)
+        record_native_images(native_image_lines, image_lines)
         return blocks
     except Exception:
         # Never let a rendering bug drop a message.
@@ -666,13 +652,12 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
                 continue
             btype = block["type"]
 
-            if btype == "section":
-                accessory = block.get("accessory")
-                if isinstance(accessory, dict) and accessory.get("type") == "image":
-                    block = dict(block)
-                    block["accessory"] = sanitize_image(accessory)
-                    if not block["accessory"]:
-                        block.pop("accessory")
+            if btype in RICH_BLOCK_SANITIZERS:
+                block = RICH_BLOCK_SANITIZERS[btype](block)
+                if not block:
+                    continue
+            elif btype == "section":
+                block = sanitize_section_accessory(block)
                 text_obj = block.get("text")
                 has_body = bool(block.get("fields")) or bool(block.get("accessory"))
                 if isinstance(text_obj, dict):
@@ -695,18 +680,6 @@ def sanitize_blocks(blocks: Optional[list[Block]]) -> Optional[list[Block]]:
                 if clamped is not text_obj:
                     block = dict(block)
                     block["text"] = clamped
-            elif btype == "context":
-                block = sanitize_context(block)
-                if not block:
-                    continue
-            elif btype == "image":
-                block = sanitize_image(block, block=True)
-                if not block:
-                    continue
-            elif btype == "carousel":
-                block = sanitize_carousel(block)
-                if not block:
-                    continue
             elif btype in ("rich_text", "actions", "context_actions"):
                 if not block.get("elements"):
                     continue

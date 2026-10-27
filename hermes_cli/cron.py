@@ -820,7 +820,7 @@ def cron_create(args):
         print(f"  Skills: {', '.join(result['skills'])}")
     _print_job_details(result.get("job", {}))
     if not result.get("job", {}).get("enabled", True):
-        print("  Created PAUSED — resume to schedule, or explicitly run now.")
+        print("  Created PAUSED. Resume before scheduled or manual runs.")
     else:
         print(f"  Next run: {result['next_run_at']}")
     _warn_if_gateway_not_running()

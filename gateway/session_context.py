@@ -124,6 +124,22 @@ def bound_session_key() -> str:
     return "" if value is _UNSET else value
 
 
+@contextmanager
+def preserved_session_context() -> Iterator[None]:
+    """Restore an inline caller after a fresh turn clears and rebinds its own scope."""
+    from agent.runtime_cwd import reset_session_cwd, scoped_session_cwd, set_session_cwd
+
+    variables = (*_VAR_MAP.values(), _SESSION_ASYNC_DELIVERY, _SESSION_HISTORY_DELIVERY)
+    tokens = [(var, var.set(var.get())) for var in variables]
+    cwd_token = set_session_cwd(scoped_session_cwd())
+    try:
+        yield
+    finally:
+        reset_session_cwd(cwd_token)
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
 # Mutable per-execution receipt shared with copied tool-worker contexts. Never exported
 # to subprocesses or persisted: another turn must deliver its own acknowledgement.
 _REACTION_ACKNOWLEDGEMENTS: ContextVar[set[tuple[str, str, str]] | None] = ContextVar(
@@ -145,11 +161,14 @@ def reaction_acknowledgement() -> Iterator[set[tuple[str, str, str]]]:
 @contextmanager
 def scoped_turn_message(source: Any, message_id: str | None) -> Iterator[None]:
     """Bind a queued execution's own inbound identity and restore its enclosing turn."""
-    values = {"platform": source.platform.value, "chat_id": source.chat_id,
-              "message_id": message_id, "thread_id": source.thread_id,
-              "user_id": source.user_id, "user_id_alt": source.user_id_alt,
-              "user_name": source.user_name, "scope_id": source.scope_id,
-              "parent_chat_id": source.parent_chat_id}
+    # Local/API turns may carry author identity without any transport target. Clear
+    # missing routing fields rather than inheriting an enclosing gateway message.
+    values = {key: getattr(source, key, None) for key in (
+        "platform", "chat_id", "thread_id", "user_id", "user_id_alt",
+        "user_name", "scope_id", "parent_chat_id",
+    )}
+    values["platform"] = getattr(values["platform"], "value", values["platform"])
+    values["message_id"] = message_id
     tokens = [(var, var.set(str(values[key]) if values[key] is not None else ""))
               for key in values for var in [_VAR_MAP[f"HERMES_SESSION_{key.upper()}"]]]
     try:

@@ -28,8 +28,8 @@ source inspection alone.
 ## Provenance
 
 - Patch identity: `thread-status-continuity`.
-- Source surfaces: `gateway/platforms/typing_state.py`, `gateway/platforms/base.py`, typing/status callers in `gateway/`, and the Slack and Telegram adapters.
-- Regression: `tests/gateway/test_slack.py`, `tests/gateway/test_typing_refresh_interval.py`, `tests/gateway/test_telegram_typing_retrigger.py`, and legacy clarify/approval adapter tests.
+- Source surfaces: `gateway/platforms/typing_state.py`, `gateway/platforms/base.py`, typing/status callers in `gateway/` (the live-status phrase lives in `gateway/run_turn_progress.py`), and the Slack and Telegram adapters.
+- Regression: `tests/gateway/test_slack_thread_status.py`, `tests/gateway/test_typing_stale_cleanup.py`, `tests/gateway/test_typing_surface_ownership.py`, `tests/gateway/test_typing_prompt_lifecycle.py`, `tests/gateway/test_typing_adapter_boundaries.py`, `tests/gateway/test_typing_refresh_interval.py`, `tests/gateway/test_telegram_typing_retrigger.py`, and legacy clarify/approval adapter tests.
 - Metadata is forwarded only when an adapter override accepts it, preserving legacy pause, resume and status signatures.
 - Prompt pause/resume records the original refresh surface by session on the delivery adapter. Typed approval, deny, clarify and relay answers consume that record instead of deriving a new surface from the answer event. Turn cleanup retires abandoned records.
 - Typing uses `typing_metadata_for_source`, independently of message-delivery metadata. Top-level Mattermost and Buzz progress can target a synthetic root while their refresh transport remains chat-scoped. Slack's synthetic typing root must never flow into message delivery, including approval/clarify prompts and status notices. Preserve actual source threads while keeping `reply_in_thread: false` sends flat.
@@ -40,6 +40,10 @@ Regression commands and results are recorded with the delivery commit. Preserve
 Telegram's topic re-arm isolation, its 4.5-second cadence and retry budget, Slack's
 legacy free-text API, elapsed heartbeat and explicit untracked-status cleanup.
 No configuration, dependency, schema or gateway activation change is needed.
+
+Only the current refresh owner may clear a surface. A retired owner, whether cancelled or
+stopped through `_stop_typing_refresh`, must leave a live successor's status, pause,
+phrase and prompt record intact; `_typing_owner_retired` is that fence.
 
 Late Slack status requests must re-clear a surface removed during their await,
 including explicit clears without a base refresh owner. The owner fence reads

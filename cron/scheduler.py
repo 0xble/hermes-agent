@@ -52,6 +52,7 @@ from cron.worker_bootstrap import WORKER_MARKER, finish_worker_boot
 from hermes_constants import get_hermes_home, hermes_home_key
 from hermes_cli.observability.shared_metrics_gateway import note_cron_execution, note_cron_skipped
 from cron.env_settings import cron_env_setting
+from cron.scheduler_diagnostics import dispatch_context, note_dispatch_stage, run_dispatched_job
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     load_config, load_config_readonly)
@@ -4021,20 +4022,19 @@ def _wait_for_external_cron_worker(
 def _launch_external_cron_worker(job: dict) -> bool:
     """Launch *job* outside the managed gateway process when required.
 
-    Returns ``False`` outside a supervised gateway (in-process path). Under
-    systemd the worker runs in a transient user scope, or — when no user D-Bus
+    Returns ``False`` outside a supervised gateway. Under systemd the worker
+    runs in a transient user scope, or — when no user D-Bus
     session exists and ``cron.require_restart_safe_scope`` is false — as a
     degraded external subprocess. Under macOS launchd it runs in a detached new
     session, outside the gateway's process group. The worker adopts the durable
     execution claim and performs its own delivery on both platforms.
-    direct subprocess (process separation kept, cgroup isolation lost).
-
     A fire routed to a profile other than the process's own is multiplexed at THIS boundary too.
     ``run_one_job`` switches the context on in ``_install_fire_secret_scope``, which runs AFTER
     this handoff, so a routed desktop fire on the managed path serialized ``multiplex_active=False``
     and built the worker environment with the launch profile's residue and no scrub (review on
     f5f88d5058). Enable it for exactly this span; the worker then re-establishes it from the payload.
     """
+    note_dispatch_stage(job, "launch_enter")
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])
     claim = job.get("fire_claim")
@@ -4089,6 +4089,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
         require_restart_safe_scope=require_restart_safe_scope,
     )
+    note_dispatch_stage(job, "launch_scope_ready")
     if dispatch.mode == "in_process":
         return False
 
@@ -4096,6 +4097,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
         raise RuntimeError(
             "cron execution claim changed before external worker handoff"
         )
+    note_dispatch_stage(job, "handoff_fenced")
 
     _ensure_cron_dir(handoff_dir)
     try:
@@ -4118,10 +4120,11 @@ def _launch_external_cron_worker(job: dict) -> bool:
     except BaseException:
         payload_path.unlink(missing_ok=True)
         raise
-
+    note_dispatch_stage(job, "payload_written")
     profile_home = _get_hermes_home().resolve()
     # Same hydrate -> scope -> (routed) multiplex-context install the in-process fire uses, for exactly
     # the env build; the helper's reset order keeps the context from outliving its scope.
+    note_dispatch_stage(job, "secret_scope_enter")
     with _fire_secret_scope():
         # No restore_managed_env here: the worker re-runs load_hermes_dotenv -> _apply_managed_env at
         # import, and strip_launch_profile_env leaves managed keys in place.
@@ -4130,7 +4133,9 @@ def _launch_external_cron_worker(job: dict) -> bool:
             inherit_profile_home=True,
             extra={"HERMES_HOME": str(profile_home)},
         ))
+    note_dispatch_stage(job, "secret_scope_ready")
     worker_env = systemd_user_bus_env(worker_env)
+    note_dispatch_stage(job, "worker_env_ready")
     # Unattended worker: the gateway sets HERMES_EXEC_ASK at startup (interactive launches set
     # the other two), and an inherited presence var makes every env-fallback consumer in the
     # child (`_is_interactive_cli`, sudo prompting, `check_cronjob_requirements`) believe a
@@ -4147,9 +4152,11 @@ def _launch_external_cron_worker(job: dict) -> bool:
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
     worker_env = pin_hermes_tree_on_pythonpath(worker_env, _LOADED_CODE_ROOT)
     worker_env[WORKER_MARKER] = "1"
+    note_dispatch_stage(job, "launch_spec_ready")
     try:
         stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
+            note_dispatch_stage(job, "spawn_enter")
             process = subprocess.Popen(
                 dispatch.argv,
                 cwd=str(worker_cwd),
@@ -4166,7 +4173,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
         payload_path.unlink(missing_ok=True)
         stderr_path.unlink(missing_ok=True)
         raise
-
+    note_dispatch_stage(job, "spawn_exit")
     # The worker arms its watchdog before publishing the acknowledgement. This
     # fallback covers an adoption race where the acknowledgement is unreadable or
     # never arrives; a valid acknowledgement below refreshes the deadline from
@@ -4184,6 +4191,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
     # a dispatch deadline shorter than the adoption grace made the two guards
     # around one handoff disagree.
     deadline = time.monotonic() + HANDOFF_ADOPTION_GRACE_SECONDS
+    note_dispatch_stage(job, "ack_wait_enter")
     while time.monotonic() < deadline:
         if ack_path.exists():
             try:
@@ -4235,6 +4243,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
             # same monotonic deadline so the parent never extends the worker's
             # lifetime merely because startup/ack polling took time.
             worker_hard_wall_deadline = acknowledged_deadline
+            note_dispatch_stage(job, "acknowledged")
             logger.info(
                 "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
                 job_id,
@@ -4729,33 +4738,9 @@ def _sweep_mcp_orphans() -> None:
         logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
 
 
-def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
-    """Run one due job via the shared ``run_one_job`` body."""
-    # Claim only when the worker actually starts, so a queued lease can't expire first.
-    try:
-        claimed = claim_job_for_fire(job["id"], return_job=True)
-    except OSError as exc:
-        store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
-        settle_unstarted_execution(
-            job["execution_id"], job["id"], f"Cron store unwritable; not started: {exc}")
-        return False
-    except BaseException as exc:  # settle first, then surface the real error
-        settle_unstarted_execution(
-            job["execution_id"], job["id"], f"Fire claim failed: {type(exc).__name__}: {exc}")
-        raise
-    if not claimed:
-        finish_execution(
-            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
-        return True
-    # CAS returns the persisted record; bool fallback only for older test doubles.
-    claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
-    claimed_job["execution_id"] = job["execution_id"]
-    claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
-    return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
-
-
 def _submit_with_guard(
     job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job, *, registration_owner=None,
+    dispatch_lane: str = "general",
 ):
     """Submit with the in-flight dedup guard; None if a prior tick's run is still in flight.
     Running-set membership is released in the worker's finally."""
@@ -4824,7 +4809,7 @@ def _submit_with_guard(
             job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
         dispatched_job = dict(job, execution_id=execution["id"])
         note_cron_execution(dispatched_job)
-        _ctx = contextvars.copy_context()
+        _ctx = dispatch_context(dispatch_lane, execution.get("code_sha"))
     except Exception as execution_err:
         # Release the claim so the next tick retries instead of wedging "already running".
         release_running_job(job_id, home=_claim_home, owner=registration_owner, wake=False)
@@ -4839,11 +4824,12 @@ def _submit_with_guard(
 
     def _run_and_release(j=dispatched_job, ctx=_ctx, home=_claim_home):
         try:
-            return ctx.run(process_job, j)
+            return ctx.run(run_dispatched_job, process_job, j)
         finally:
             release_running_job(j["id"], home=home, owner=registration_owner)
 
     try:
+        _ctx.run(note_dispatch_stage, dispatched_job, "executor_queued")
         fut = pool.submit(_run_and_release)
     except Exception as submit_err:
         release_running_job(job_id, home=_claim_home, owner=registration_owner, wake=False)

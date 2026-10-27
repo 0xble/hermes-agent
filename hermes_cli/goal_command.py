@@ -6,11 +6,12 @@ parses subcommands and mutates goal state. It never changes conversation history
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 import logging
 from typing import Callable
 
 from hermes_cli import goals
+from hermes_cli.goal_notices import goal_notices_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,7 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
     if drafting:
         if not arg:
             return GoalCommandResult("Usage: /goal draft <objective in plain language>", error=True)
-        if progress is not None:
+        if progress is not None and goal_notices_enabled():
             progress("Drafting completion contract…")
         try:
             contract = goals.draft_contract(arg)
@@ -209,9 +210,14 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
         # Bare /goal text is an in-place edit of the current objective. It must not
         # reset history or enqueue a turn: a paused goal remains paused, while an
         # active goal remains active until its existing continuation path runs.
+        # Inline fields and drafts do not express removal, so patch only supplied values.
         result = mgr.replace(
             reason="explicit /goal replacement command", goal=headline or arg,
-            contract=contract, actor="user",
+            contract=(
+                {key: value for key, value in contract.to_dict().items() if value.strip()}
+                if contract else None
+            ),
+            actor="user",
         )
         if not result.get("ok"):
             return GoalCommandResult(result.get("error", "goal replacement failed"), error=True)
@@ -244,7 +250,8 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
                    "exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.")
     if authoring_findings:
         output += "\n" + goals.format_goal_authoring_warning(authoring_findings)
-    return GoalCommandResult(ContextNotice(output) if not authoring_findings else output,
+    output = output if goal_notices_enabled() else ""
+    return GoalCommandResult(ContextNotice(output) if output and not authoring_findings else output,
                              goals.goal_kick_prompt(state.goal, last_user_message), kickoff=True)
 
 

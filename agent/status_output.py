@@ -4,13 +4,12 @@ Safe printing, quiet-mode gating, deduped context-overflow warnings, and the buf
 chatter that is shown only when every retry/fallback is exhausted.
 Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO unchanged.
 """
-
-from gateway.notice_style import ContextNotice
 import logging
 import sys
 
 from agent.i18n import t
 from agent.session_activity import ActivityProvenance
+from agent.notice_style import ContextNotice
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
@@ -97,17 +96,11 @@ class StatusOutputMixin:
     def _emit_diagnostic_status(self, message: str, *, context: bool = False) -> None:
         """A diagnostic on the lifecycle rail, without changing legacy formatting."""
         from gateway.warning_notifications import DiagnosticText
-        text = DiagnosticText(message)
-        if context or getattr(message, "notice_style", None) == "context":
-            text.notice_style = "context"
-        self._emit_status(text)
+        self._emit_status(DiagnosticText(ContextNotice(message) if context else message))
 
     def _emit_status(self, message: str, *, context: bool = False) -> None:
         """Emit a lifecycle status message (CLI + gateway ``status_callback``)."""
-        if context:
-            from gateway.notice_style import ContextNotice
-            message = ContextNotice(message)
-        self._emit_status_kind("lifecycle", message, origin="_emit_status")
+        self._emit_status_kind("lifecycle", ContextNotice(message) if context else message, origin="_emit_status")
 
     def _emit_warning(self, message: str) -> None:
         """Emit a user-visible warning for degraded side paths where the turn continues but the user must know."""

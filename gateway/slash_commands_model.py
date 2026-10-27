@@ -8,7 +8,7 @@ the import cycle.
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 import asyncio
 import contextlib
@@ -498,7 +498,7 @@ class GatewayModelCommandsMixin:
                 reply += "\n" + await self._apply_reasoning_selection_off_loop(
                     ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
                     persist_global=ctx.persist_global and global_error is None)
-        reply += "\n" + t("gateway.model.local_next_turn") if live is not None else ""
+        reply += ("\n" + t("gateway.model.local_next_turn") if live is not None else "")
         return ContextNotice(reply) if global_error is None else reply
 
     def _model_switch_context(

@@ -8,6 +8,8 @@ returns a ``TurnContext`` with only the locals the loop reads back.
 
 from __future__ import annotations
 
+from agent.notice_style import ContextNotice
+
 import logging
 import sys
 import threading
@@ -271,6 +273,9 @@ def _maybe_title_session_at_turn_start(
             ),
             title_preview=title_preview,
         )
+        title_style = getattr(agent, "_title_style", "noun")
+        if title_style != "noun":
+            title_kwargs["title_style"] = title_style
         upgrade = maybe_auto_title(session_db, session_id, user_text, **title_kwargs)
         # Finalization starts an unstarted upgrade, or retries a provisional eager
         # opening title with the reply. A settled llm/user title is never regenerated.
@@ -667,7 +672,6 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     if agent.api_mode != "anthropic_messages":
         with suppress(Exception):
             if agent._cleanup_dead_connections():
-                from gateway.notice_style import ContextNotice
                 agent._emit_diagnostic_status(
                     ContextNotice("🔌 Detected stale connections from a previous provider "
                     "issue — cleaned up automatically. Proceeding with fresh "
@@ -969,7 +973,6 @@ def _memory_turn_start_and_prefetch(
         with suppress(Exception):
             _recall_indicator = agent._memory_manager.describe_recall()
             if _recall_indicator:
-                from gateway.notice_style import ContextNotice
                 agent._emit_status(ContextNotice(_recall_indicator))
     return ext_prefetch_cache
 

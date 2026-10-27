@@ -729,3 +729,233 @@ def test_prune_owner_lookup_survives_symlinked_scratch_and_drops_orphaned_mcp_he
         if helper.poll() is None:
             helper.kill()
             helper.wait(timeout=10)
+
+
+def _age_tree(path: Path, hours: float = 30) -> None:
+    """Make *path* and everything beneath it look idle for *hours* (symlinks not followed)."""
+    ancient = time.time() - hours * 3600
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            os.utime(os.path.join(dirpath, name), (ancient, ancient), follow_symlinks=False)
+    os.utime(path, (ancient, ancient), follow_symlinks=False)
+
+
+def _pin(declaring: Path, *inputs: Path) -> None:
+    import json
+
+    (declaring / "input-pins.json").write_text(
+        json.dumps({"files": {str(p): {"sha256": "0" * 64} for p in inputs}}), encoding="utf-8")
+
+
+def test_prune_keeps_idle_input_pinned_by_another_entry_and_removes_unpinned_control(tmp_path):
+    """An old, closed input pinned by a different retained payload is in use even though nothing
+    touched it: deleting it would break the payload's frozen-input admission. An equally idle
+    entry nothing declares is still pruned."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    payload, pinned, control = scratch / "payload", scratch / "pinned-input", scratch / "control"
+    for d in (payload, pinned / "sub", control):
+        d.mkdir(parents=True)
+    (pinned / "sub" / "findings.md").write_text("x", encoding="utf-8")
+    (control / "f").write_text("x", encoding="utf-8")
+    _pin(payload, pinned / "sub" / "findings.md")
+    for d in (payload, pinned, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert payload.exists() and pinned.exists() and not control.exists()
+
+
+def test_prune_follows_pins_transitively_and_through_directory_and_alias_paths(tmp_path):
+    """A pinned entry that declares its own inputs holds them too. A directory pin and a symlinked
+    alias of a pinned path both resolve to the entry that holds them."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    a, b, c, d = (scratch / n for n in ("a", "b", "c", "d"))
+    for x in (a, b, c / "build", d):
+        x.mkdir(parents=True)
+    (b / "dep").write_text("x", encoding="utf-8")
+    (c / "build" / "out").write_text("x", encoding="utf-8")
+    alias = tmp_path / "alias-to-c"
+    alias.symlink_to(c)
+    _pin(a, b / "dep")
+    _pin(b, alias / "build")
+    for x in (a, b, c, d):
+        _age_tree(x)
+    assert prune_scratch_dir(scratch) == 1
+    assert a.exists() and b.exists() and c.exists() and not d.exists()
+
+
+def test_prune_keeps_every_idle_entry_when_a_declaration_is_unreadable(tmp_path):
+    """A malformed declaration hides its dependencies, so no idle entry can be shown free of
+    them: the pass removes nothing rather than guess."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    broken, other = scratch / "broken", scratch / "other"
+    broken.mkdir()
+    other.mkdir()
+    (broken / "input-pins.json").write_text("{not json", encoding="utf-8")
+    (other / "f").write_text("x", encoding="utf-8")
+    for x in (broken, other):
+        _age_tree(x)
+    assert prune_scratch_dir(scratch) == 0
+    assert broken.exists() and other.exists()
+
+
+def test_prune_honors_keep_marker_but_not_package_fixture_markers(tmp_path):
+    """A ``.keep`` anywhere in an entry holds it. One inside ``node_modules`` is a package
+    fixture, not a retention declaration."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    kept, fixture = scratch / "kept", scratch / "fixture"
+    (kept / "deep").mkdir(parents=True)
+    (kept / "deep" / ".keep").write_text("", encoding="utf-8")
+    (fixture / "node_modules" / "pkg").mkdir(parents=True)
+    (fixture / "node_modules" / "pkg" / ".keep").write_text("", encoding="utf-8")
+    for x in (kept, fixture):
+        _age_tree(x)
+    assert prune_scratch_dir(scratch) == 1
+    assert kept.exists() and not fixture.exists()
+
+
+def test_prune_rereads_declarations_before_removal(tmp_path, monkeypatch):
+    """A declaration written after idle selection (during the process reap) still holds its
+    input: retention is read again immediately before the destructive step."""
+    import hermes_constants_scratch as scratch_mod
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    payload, pinned = scratch / "payload", scratch / "pinned"
+    payload.mkdir()
+    pinned.mkdir()
+    (pinned / "f").write_text("x", encoding="utf-8")
+    for x in (payload, pinned):
+        _age_tree(x)
+
+    def reap_then_declare(root, doomed, audit=None):
+        _pin(payload, pinned / "f")
+        return 0
+
+    monkeypatch.setattr(scratch_mod, "reap_processes_rooted_in", reap_then_declare)
+    assert prune_scratch_dir(scratch) == 0
+    assert payload.exists() and pinned.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
+                    reason="root reads through a mode-0 directory")
+def test_prune_keeps_every_idle_entry_when_a_declaration_cannot_be_inspected(tmp_path):
+    """A declaration behind an unreadable directory is not an absent one: its owner's inputs
+    stay, and so does every other idle entry, since the hidden pins could name any of them."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, pinned, other = scratch / "owner", scratch / "pinned", scratch / "other"
+    for d in (owner, pinned, other):
+        d.mkdir()
+    (pinned / "f").write_text("x", encoding="utf-8")
+    (other / "f").write_text("x", encoding="utf-8")
+    _pin(owner, pinned / "f")
+    for d in (owner, pinned, other):
+        _age_tree(d)
+    os.chmod(owner, 0)
+    try:
+        assert prune_scratch_dir(scratch) == 0
+    finally:
+        os.chmod(owner, 0o700)
+    assert owner.exists() and pinned.exists() and other.exists()
+
+
+def test_prune_keeps_scratch_local_aliases_on_a_declared_path(tmp_path):
+    """A declared path that runs through a symlinked scratch entry, or through a link inside an
+    otherwise undeclared entry, keeps both the link's entry and the data, so the declared path
+    still resolves after pruning."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, alias, target, hop, data, control = (
+        scratch / n for n in ("owner", "alias", "target", "hop", "data", "control"))
+    for d in (owner, target, hop, data, control):
+        d.mkdir()
+    (target / "f").write_text("x", encoding="utf-8")
+    (data / "g").write_text("x", encoding="utf-8")
+    alias.symlink_to(target)
+    (hop / "link").symlink_to(data)
+    _pin(owner, alias / "f", hop / "link" / "g")
+    for d in (owner, alias, target, hop, data, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert (alias / "f").exists() and (hop / "link" / "g").exists()
+    assert owner.exists() and target.exists() and data.exists() and not control.exists()
+
+
+def test_prune_keeps_an_alias_a_declared_path_climbs_out_of(tmp_path):
+    """``alias/../f`` resolves through the link first, so ``alias`` must survive with the data
+    even though the lexical form of the path never mentions where it lands."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, data, alias, control = (scratch / n for n in ("owner", "data", "alias", "control"))
+    for d in (owner, data / "sub", control):
+        d.mkdir(parents=True)
+    (data / "f").write_text("x", encoding="utf-8")
+    alias.symlink_to(data / "sub")
+    declared = Path(f"{alias}/../f")
+    _pin(owner, declared)
+    for d in (owner, data, alias, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert declared.exists() and owner.exists() and not control.exists()
+
+
+def test_prune_treats_a_dangling_declaration_link_as_unreadable(tmp_path):
+    """An ``input-pins.json`` link whose target is gone still declares something unknown, so
+    nothing idle is removed that pass."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, other = scratch / "owner", scratch / "other"
+    owner.mkdir()
+    other.mkdir()
+    (other / "f").write_text("x", encoding="utf-8")
+    (owner / "input-pins.json").symlink_to(tmp_path / "gone.json")
+    for d in (owner, other):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 0
+    assert owner.exists() and other.exists()
+
+
+def test_prune_log_escapes_control_characters_in_unreadable_declarations(tmp_path):
+    """A newline in an entry name cannot split or forge a prune-log record when its malformed
+    declaration is reported."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner = scratch / "own\nscratch prune: removed 'forged'"
+    owner.mkdir()
+    (owner / "input-pins.json").write_text("{not json", encoding="utf-8")
+    _age_tree(owner)
+    assert prune_scratch_dir(scratch) == 0
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert not any(line.startswith("scratch prune: removed") for line in log.splitlines())
+    assert "kept all 1 idle entries, unreadable retention declaration" in log
+
+
+def test_prune_matches_declared_paths_to_entries_by_filesystem_identity(tmp_path):
+    """On a case-insensitive volume a declaration may spell an entry, or the scratch root, with
+    different case. The declared path still names the pinned data, so the entry must survive."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, data, control = (scratch / n for n in ("owner", "CaseSensitiveInput", "control"))
+    for d in (owner, data, control):
+        d.mkdir()
+    (data / "f").write_text("x", encoding="utf-8")
+    declared = Path(str(scratch).swapcase()) / "casesensitiveinput" / "f"
+    if not declared.exists():
+        pytest.skip("case-sensitive filesystem: differently cased paths name nothing")
+    _pin(owner, declared)
+    for d in (owner, data, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert declared.exists() and owner.exists() and not control.exists()
+
+
+def test_prune_keeps_the_entry_a_linked_declaration_file_points_into(tmp_path):
+    """A symlinked ``input-pins.json`` keeps the entry holding its target, so the retained
+    declaration does not dangle and freeze every later pass."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, manifests, data, control = (
+        scratch / n for n in ("owner", "manifests", "data", "control"))
+    for d in (owner, manifests, data, control):
+        d.mkdir()
+    (data / "f").write_text("x", encoding="utf-8")
+    _pin(manifests, data / "f")
+    (manifests / "input-pins.json").rename(manifests / "pins.json")
+    (owner / "input-pins.json").symlink_to(manifests / "pins.json")
+    for d in (owner, manifests, data, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert (owner / "input-pins.json").exists() and (data / "f").exists()
+    assert not control.exists()

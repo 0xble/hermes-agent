@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 from gateway.platforms.base import (
     MessageEvent, SendResult, in_ingress_consumer, ingress_consumer_scope, leave_ingress_consumer)
 from gateway.session import SessionSource

@@ -361,7 +361,7 @@ def test_release_clears_stale_tab_and_preserves_account_binding(tmp_path, monkey
     assert result == {"success": True, "account": "brianle", "released": released}
     assert user_id not in json.dumps(result)
     assert post.call_args.args[0].endswith(f"/browser/identities/{user_id}/release")
-    assert post.call_args.kwargs["json"] == {}
+    assert post.call_args.kwargs["json"] == {"tabId": "visible-tab"}
     assert post.call_args.kwargs["timeout"] == 120
     assert session["tab_id"] == "visible-tab"
     assert camofox._get_session("release", "brianle") is session

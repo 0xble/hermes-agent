@@ -19,7 +19,7 @@ from pm.store import current_target, tree_digest
 _REAL_HERMES_HOME = Path.home() / ".hermes"  # Captured before per-test HOME isolation.
 
 
-def _register_installed_tool(name, executable, companions=()):
+def _register_installed_tool(name, executable, companions=None):
     executable = Path(executable)
     version = subprocess.run([str(executable), "--version"], capture_output=True, text=True,
                              check=True, timeout=10).stdout.strip().removeprefix("v")
@@ -29,8 +29,8 @@ def _register_installed_tool(name, executable, companions=()):
     assert binary is not None
     binary.parent.mkdir(parents=True)
     binary.symlink_to(executable)
-    for companion in companions:
-        binary.with_name(companion.name).symlink_to(companion)
+    for companion_name, companion in (companions or {}).items():
+        binary.with_name(companion_name).symlink_to(companion)
     digest = hashlib.sha256(executable.read_bytes()).hexdigest()
     lock = Lockfile(paths.lockfile_path())
     lock.set_pin(name, version, {target: {"url": executable.as_uri(), "sha256": digest}})
@@ -142,7 +142,13 @@ def test_npm_and_npx_use_the_paired_pm_entry(node_store, monkeypatch):
     npx = Path(external).with_name("npx")
     if not npm.is_file() or not npx.is_file():
         pytest.skip("requires already-installed npm and npx")
-    binary = _register_installed_tool("npm", npm, [npx])
+    # Version-manager launchers may need a shell. PM pairs Node with the package's JS entries.
+    package_root = Path(external).resolve().parent.parent / "lib" / "node_modules" / "npm"
+    manifest = package_root / "package.json"
+    if manifest.is_file():
+        entrypoints = json.loads(manifest.read_text(encoding="utf-8"))["bin"]
+        npm, npx = (package_root / entrypoints[name] for name in ("npm", "npx"))
+    binary = _register_installed_tool("npm", npm, {"npx": npx})
     companion = binary.with_name("npx")
     legacy = home / "node" / "bin" / "npm"
     legacy.parent.mkdir(parents=True)

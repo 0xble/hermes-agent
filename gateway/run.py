@@ -266,8 +266,8 @@ async def run_codex_hygiene_compaction(
     except TimeoutError:
         # Executor thread keeps running (own RPC timeouts); brake retries so a wedged app-server isn't re-hit.
         if failure_cooldown_seconds >= 0:
-            _record_hygiene_cooldown(
-                gateway, session_id, failure_cooldown_seconds, "codex app-server thread compaction timed out")
+            await asyncio.to_thread(_record_hygiene_cooldown, gateway, session_id, failure_cooldown_seconds,
+                                    "codex app-server thread compaction timed out")
         logger.warning(
             "Session hygiene: codex app-server thread compaction for "
             "session %s timed out after %.1fs; continuing without compaction",
@@ -281,7 +281,7 @@ async def run_codex_hygiene_compaction(
     count_after = getattr(compressor, "compression_count", 0)
     if count_after > count_before:
         # Native boundary recorded: compacted server-side; mirror NOT rewritten, agent stays cached.
-        _reset_hygiene_failure_streak(gateway, session_key)
+        await asyncio.to_thread(_reset_hygiene_failure_streak, gateway, session_key)
         return "compacted"
     # No boundary: internal skip or compaction error; the codex route already persisted its own cooldown.
     return "failed:no-boundary"
@@ -3462,10 +3462,6 @@ class GatewayRunner(
     GatewaySessionControlsMixin, GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin,
     GatewayBackgroundAdmissionMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
-
-    def _adapter_for_source(self, source):
-        """Return the delivery adapter that owns a session source."""
-        return self._delivery_adapter_for(source)
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
     _busy_input_mode: str = "interrupt"

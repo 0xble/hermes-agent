@@ -1,4 +1,8 @@
-"""Producer-owned FYI styling, carried only to adapters that consume it."""
+"""Producer-owned FYI styling, carried only to adapters that consume it.
+
+Kept outside gateway/ so storage and agent modules can mark notices without
+importing the gateway package.
+"""
 
 
 class ContextNotice(str):

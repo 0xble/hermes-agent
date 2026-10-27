@@ -46,6 +46,7 @@ from gateway.session import (
     neutralize_untrusted_inline_text,
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
+from gateway.zero_cut_handover_drain import handover_accepts_received
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -324,9 +325,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return None
 
         # Adapter admission can precede this task by an arbitrary delay on an idle lane.
-        from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
-        if is_gateway_wake(event) and not await self._run_in_executor_with_context(
-                internal_wake_is_current, event):
+        from gateway.wake import automatic_event_is_current
+
+        if not await automatic_event_is_current(self, event):
             return None
         if is_internal:
             await _admit_outbox_event(self, event, source)
@@ -1005,7 +1006,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # handoff turn); a hidden review must neither interrupt nor queue behind it.
             return None
         from gateway.run import _AGENT_PENDING_SENTINEL
-        if self._draining and not self._hm_is_registered_command(event):
+        if (self._draining and not self._hm_is_registered_command(event)
+                and not handover_accepts_received(self, source)):
             if await self._route_plaintext_approval_while_busy(event, _quick_key):
                 return None
             self._preserve_drain_event(_quick_key, event)
@@ -1418,7 +1420,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
     ) -> tuple[_CommandHandled, Optional[str], Optional[str]]:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
-        if self._draining and not self._hm_is_registered_command(event):
+        if (self._draining and not self._hm_is_registered_command(event)
+                and not handover_accepts_received(self, source)):
             self._preserve_drain_event(self._session_key_for_source(source), event)
             return True, None, command
 
@@ -1781,11 +1784,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return False
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from agent.delegation_context import top_level_delegation_context
         from gateway.outbox import scoped_turn_entry, restore_turn, store_for
         token = scoped_turn_entry()
         result = None
         try:
-            result = await self._handle_admitted_message(event)
+            with top_level_delegation_context():
+                result = await self._handle_admitted_message(event)
             return result
         finally:
             turn_id = getattr(event, "_outbox_turn_id", None)
@@ -1868,7 +1873,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # The original response was already acknowledged. Returning it
             # here would send it a second time.
             return None
-        if self._draining and not self._hm_is_registered_command(event):
+        if (self._draining and not self._hm_is_registered_command(event)
+                and not handover_accepts_received(self, source)):
             from gateway.session_retry_admission import refuse_deferred_retry
             refuse_deferred_retry(event)
             session_key = self._session_key_for_source(source)
@@ -1945,7 +1951,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
             # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
             # only fall to zero. Reversible.
-            if self._external_drain_active:
+            if self._external_drain_active and not handover_accepts_received(self, source):
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
                 return t("gateway.busy.draining_maintenance")
 

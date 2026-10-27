@@ -486,6 +486,7 @@ async def test_retry_guidance_is_api_only_and_real_compaction_keeps_typed_ask(ha
             assert ephemeral not in str(summarize.call_args_list)
         assert len(compacted) < len(padding + messages)
         retained_idx = compressor._find_last_user_message_idx(compacted, head_end=0)
+        assert retained_idx >= 0
         assert TYPED_TEXT in str(compacted[retained_idx]["content"])
         assert _GATEWAY_SILENCE_RETRY_NOTE not in str(compacted)
         archived_after = db.get_messages_as_conversation("silence-test")

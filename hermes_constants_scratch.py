@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import time
 from logging.handlers import RotatingFileHandler
@@ -33,6 +34,20 @@ _GIT_FILE_MAX_DEPTH = 4
 # entry rescued or vanished mid-prune (#132401). Same fixed rotation as tool_calls.log.
 _PRUNE_LOG_MAX_BYTES = 5 * 1024 * 1024
 _PRUNE_LOG_BACKUPS = 3
+# Retention declarations, shared with the host storage cleaner (maintain-macos-storage):
+# a ``.keep`` anywhere in an entry pins it, and an entry's top-level ``input-pins.json``
+# (``{"files": {"<absolute path>": {...}}}``) pins that entry plus every scratch entry holding
+# one of its declared paths, transitively. A declaration lives until its owner deletes it.
+_KEEP_MARKER = ".keep"
+_INPUT_PINS = "input-pins.json"
+# Package fixtures under these trees are not user keep markers.
+_KEEP_SCAN_SKIP = frozenset({"node_modules", ".venv", "venv"})
+
+
+class UnreadableRetention(Exception):
+    """A retention declaration exists but cannot be read, so its dependencies are unknown."""
+
+
 # Paths and process names go in with %r: a control character (a newline in a legal POSIX name)
 # is written escaped, so it cannot split a record or forge one.
 
@@ -158,6 +173,187 @@ def subtree_touched_since(path: Path, cutoff: float) -> bool:
 
 def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _has_keep_marker(entry: Path) -> bool:
+    """A ``.keep`` file or directory anywhere in *entry*, symlinks not followed. An unreadable
+    directory is not reported as a marker: selection and the pre-removal activity re-check
+    already keep any tree they cannot fully read, and the audit then names that failed scan
+    instead of a retention declaration that was never observed."""
+    if entry.name == _KEEP_MARKER:
+        return True
+    try:
+        if not entry.is_dir() or entry.is_symlink():
+            return False
+    except OSError:
+        return False
+    stack = [str(entry)]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for child in it:
+                    if child.name == _KEEP_MARKER:
+                        return True
+                    if child.is_dir(follow_symlinks=False) and child.name not in _KEEP_SCAN_SKIP:
+                        stack.append(child.path)
+        except OSError:
+            continue
+    return False
+
+
+def _declared_inputs(entry: Path) -> list[str] | None:
+    """Absolute paths *entry*'s ``input-pins.json`` declares, or None without a declaration.
+    Raises :class:`UnreadableRetention` when the declaration may exist but cannot be read. An
+    explicit ``stat`` separates "absent" from "could not look": ``Path.is_file`` reports a
+    permission error as absence, which would let an unreadable owner's inputs be pruned."""
+    if entry.is_symlink():
+        return None
+    pins = entry / _INPUT_PINS
+    try:
+        st = os.stat(pins)
+    except (FileNotFoundError, NotADirectoryError):
+        # A dangling ``input-pins.json`` link is a declaration whose contents are gone, not an
+        # absent one: only a name that does not exist at all means "nothing declared".
+        if os.path.lexists(pins):
+            raise UnreadableRetention(f"{pins}: declaration target is missing") from None
+        return None
+    except OSError as exc:
+        raise UnreadableRetention(f"{pins}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise UnreadableRetention(f"{pins}: not a regular file")
+    try:
+        data = json.loads(pins.read_text(encoding="utf-8"))
+        files = data["files"]
+        if not isinstance(files, dict) or not all(isinstance(name, str) for name in files):
+            raise TypeError("files must map path strings")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise UnreadableRetention(f"{pins}: {exc}") from exc
+    return list(files)
+
+
+_SYMLINK_HOPS = 40
+
+
+def _identity(path: str) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of *path* itself (links not followed), or None when it is gone."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _prefixes(path: str) -> list[str]:
+    """Every ancestor-or-self prefix of an already-resolved absolute *path*."""
+    parts = Path(path).parts
+    out, cur = [], parts[0]
+    for part in parts[1:]:
+        cur = os.path.join(cur, part)
+        out.append(cur)
+    return out
+
+
+def _entries_on_path(path: str, by_identity: dict[tuple[int, int], set[str]]) -> set[str]:
+    """Top-level scratch entry names a declared *path* passes through on its way to the data,
+    including every symlink hop and the entry holding its realpath. Components are matched to
+    entries by filesystem identity, not spelling: on a case-insensitive volume a declaration may
+    name ``Input`` as ``input``, or spell the scratch root differently, and a string comparison
+    would let the pinned entry be pruned."""
+    tops: set[str] = set()
+
+    def note(component: str) -> None:
+        ident = _identity(component)
+        if ident is not None:
+            tops.update(by_identity.get(ident, ()))
+
+    # Join, never normpath: ``alias/../f`` must traverse ``alias`` before ``..`` applies, and
+    # ``abspath`` would drop it.
+    start = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+    pending = [start]
+    seen: set[str] = set()
+    while pending and len(seen) < _SYMLINK_HOPS:
+        candidate = pending.pop()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        parts = Path(candidate).parts
+        cur = parts[0]
+        for i, part in enumerate(parts[1:], 1):
+            if part == ".":
+                continue
+            # Every earlier component is a real directory (a symlink ends this walk), so ``..``
+            # here is the physical parent.
+            cur = os.path.dirname(cur) if part == ".." else os.path.join(cur, part)
+            note(cur)
+            if os.path.islink(cur):
+                try:
+                    target = os.readlink(cur)
+                except OSError:
+                    break
+                pending.append(os.path.join(os.path.dirname(cur), target, *parts[i + 1:]))
+                break
+    for component in _prefixes(os.path.realpath(start)):
+        note(component)
+    return tops
+
+
+def retained_entries(root: Path, entries: list[Path], candidates: list[Path]) -> set[str]:
+    """Names of *candidates* that a retention declaration holds. A candidate is held when it has a
+    ``.keep``, declares input pins itself, or contains an input declared by any entry of *root*,
+    followed transitively through that dependency's own declaration. Each declared path, and the
+    declaration file's own path, holds every top-level entry it passes through, symlink hops
+    included, and the entry holding its realpath, so aliases, directory pins and a linked
+    ``input-pins.json`` keep both the link and what it points at.
+
+    *entries* is every top-level entry (declarations anywhere protect a candidate); only
+    *candidates* pay for the ``.keep`` walk, since a marker protects only its own entry.
+
+    Raises :class:`UnreadableRetention` when any declaration cannot be read: its dependencies are
+    unknown, so no candidate can be shown to be free of them.
+    """
+    by_identity: dict[tuple[int, int], set[str]] = {}
+    for entry in entries:
+        ident = _identity(str(entry))
+        if ident is not None:
+            by_identity.setdefault(ident, set()).add(entry.name)
+    declared: dict[str, list[str]] = {}
+    for entry in entries:
+        paths = _declared_inputs(entry)
+        if paths is not None:
+            declared[entry.name] = [str(entry / _INPUT_PINS), *paths]
+    reached: set[str] = set()
+    pending = list(declared)
+    while pending:
+        name = pending.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        for path in declared.get(name, ()):
+            pending.extend(top for top in _entries_on_path(path, by_identity) if top not in reached)
+    return {c.name for c in candidates if c.name in reached or _has_keep_marker(c)}
+
+
+def _retention_filter(root: Path, skip_names: frozenset[str], doomed: list[Path],
+                      audit: logging.Logger) -> list[Path]:
+    """*doomed* minus every entry a retention declaration holds, read fresh from *root*. An
+    unreadable declaration keeps every candidate: its dependencies cannot be ruled out."""
+    if not doomed:
+        return doomed
+    try:
+        entries = [e for e in root.iterdir() if e.name not in skip_names]
+        held = retained_entries(root, entries, doomed)
+    except UnreadableRetention as exc:
+        audit.info("scratch prune: kept all %d idle entries, unreadable retention declaration: %r",
+                   len(doomed), str(exc))
+        return []
+    except OSError as exc:
+        audit.info("scratch prune: kept all %d idle entries, retention scan failed: %r", len(doomed),
+                   str(exc))
+        return []
+    for entry in doomed:
+        if entry.name in held:
+            audit.info("scratch prune: kept %r, held by a retention declaration", os.fspath(entry))
+    return [e for e in doomed if e.name not in held]
 
 
 def _own_lineage() -> set[int]:
@@ -389,6 +585,8 @@ def _prune_idle_entries(
             # A dir this user may not list (root-owned 0700) fails every idle scan: kept
             # (fail-closed) as before, but reported once and no longer re-scanned hourly.
             stuck.record(root, e, [denied_dir], audit)
+    # Idle is not unused: a declared input of a retained payload may sit untouched for days.
+    doomed = _retention_filter(root, skip_names, doomed, audit)
     # Runs even with nothing to delete: orphans whose cwd was removed by an earlier pass
     # (or by hand) are found by the deleted-cwd rule, not by membership in ``doomed``.
     try:
@@ -398,6 +596,8 @@ def _prune_idle_entries(
         return 0
     if not doomed:
         return 0
+    # Re-read declarations after the reap and before any removal: one written meanwhile still holds.
+    doomed = _retention_filter(root, skip_names, doomed, audit)
     repos: set[str] = set()
     removed = 0
     for entry in doomed:

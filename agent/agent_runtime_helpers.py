@@ -5,8 +5,6 @@ Each function takes the parent ``AIAgent`` as ``agent`` except the stateless mes
 """
 
 from __future__ import annotations
-
-from gateway.notice_style import ContextNotice
 import contextlib
 import copy
 import json
@@ -18,6 +16,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from agent.notice_style import ContextNotice
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import (
     _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, coerce_tool_name, tool_call_id_variants, tool_result_id_variants
@@ -1538,8 +1537,7 @@ def restore_primary_runtime(agent) -> bool:
         if provider_fallback_active and not held_shared_record:
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
-                agent._emit_diagnostic_status(
-                    ContextNotice(f"✅ Primary model restored: {agent.model} via {agent.provider}; "
+                agent._emit_diagnostic_status(ContextNotice(f"✅ Primary model restored: {agent.model} via {agent.provider}; "
                     f"fallback {previous_model} via {previous_provider} is no longer active."))
         return True
     except Exception as e:

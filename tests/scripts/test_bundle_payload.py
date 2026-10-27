@@ -60,7 +60,8 @@ def test_both_launchers_keep_active_home_and_call_declared_function(tmp_path, ta
     root = tmp_path / "payload with spaces"
     (root / "bin").mkdir(parents=True)
     (root / "app").mkdir()
-    (root / "python").symlink_to(sys.executable)
+    # A relocated venv executable may have no adjacent stdlib. Use its base runtime.
+    (root / "python").symlink_to(getattr(sys, "_base_executable", sys.executable))
     (root / "app/entry.py").write_text("import json,os,sys\ndef run():\n print(json.dumps([os.environ['HERMES_HOME'],sys.argv[1:]])); return 7\n", encoding="utf-8")
     launcher = root / "bin/custom"
     launcher.write_text(posix_launcher("custom", "entry:run", python="python", repo="app", site="deps", target=target), encoding="utf-8")

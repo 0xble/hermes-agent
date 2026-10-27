@@ -13,6 +13,7 @@ import pytest
 import cron.scheduler as sched
 from cron import unreachable_retry as ur
 from cron.scheduler_bookkeeping import finish_completed_run
+from cron.scheduler_tick import process_due_job
 from cron.jobs import create_job, get_due_jobs, get_job, load_jobs, mark_job_run, save_jobs
 
 
@@ -156,7 +157,7 @@ def test_ladder_reruns_do_not_spend_extra_repeat_budget(tmp_cron_home, monkeypat
         execution_id = f"exec-{rung}"
         clock[0] = datetime.fromisoformat(get_job(job_id)["next_run_at"]) + timedelta(seconds=1)
         due = next(d for d in get_due_jobs() if d["id"] == job_id)
-        assert sched._process_due_job(dict(due, execution_id=execution_id), None, None, False)
+        assert process_due_job(dict(due, execution_id=execution_id), None, None, False)
         run = runs[-1]
         if rung_tail == "crash" and held:
             assert sched._run_one_job_body(run) is False

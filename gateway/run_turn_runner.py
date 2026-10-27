@@ -11,8 +11,6 @@ import asyncio
 import dataclasses
 import json
 import logging
-import queue
-import re
 import threading
 import time
 from contextlib import suppress
@@ -26,19 +24,19 @@ from gateway.attended_model import (
     format_attended_switch_back_notice, format_attended_switch_notice, parse_attended_config,
 )
 from gateway.config import Platform
+from agent.notice_style import notice_metadata
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.platforms.typing_state import (
-    call_typing_with_metadata, pause_typing_for_prompt, resume_typing_after_prompt,
-    typing_metadata_for_source,
-)
+from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typing_after_prompt, typing_metadata_for_source
 from gateway.platforms.base_exec_approval import ea_default_reason_text
-from gateway.run_turn_runner_progress import send_progress_text
+from gateway.run_task_card_progress import TaskCardProgressMixin
+from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
-from gateway.run_turn_progress import GatewayTurnProgressMixin, _viewer_status_kind, local_viewer_turn
+from gateway.run_turn_progress import GatewayTurnProgressMixin, local_viewer_turn
 from gateway.session_execution import GatewaySessionAgentMixin
+from gateway.turn_session_titles import TurnSessionTitlesMixin
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -50,13 +48,6 @@ logger = logging.getLogger("gateway.run")
 # _load_turn_history escalates the lag line from WARNING to ERROR (#114266: 11 days of WARNING).
 _TRANSCRIPT_LAG_ESCALATION_TURNS = 3
 
-# Exact refusals retained for older adapters/connectors without destination preflight.
-# Substring matching would also silence transient thread-resolution errors.
-_CARD_DESTINATION_REFUSALS = {
-    "No Slack thread target",
-    "slack task_card requires a thread anchor",
-    "slack task_card requires a thread anchor (Slack streams are thread replies)",
-}
 
 
 def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, str, bool]:
@@ -92,21 +83,6 @@ _LEDGER_PASSTHROUGH_KEYS = (
     "estimated_cost_usd", "cost_status", "cost_source", "cache_read_tokens", "cache_write_tokens",
     "reasoning_tokens", "total_tokens", "provider", "turn_exit_reason", "service_tier",
 )
-
-
-def _settle_api_runtime_lock(agent, result, captured):
-    """Settle a confirmed API runtime lock against the runtime that served the turn."""
-    from gateway.session_api_turn import api_runtime_locked
-    api = api_runtime_locked()
-    if api is None or not isinstance(result, dict):
-        return
-    settings = api["settings"]
-    try:
-        captured["usage"]["runtime"] = api["adapter"]._turn_runtime_metadata(
-            agent, route=settings.get("route"), requested_runtime=settings.get("requested_runtime"),
-            route_source=settings.get("route_source") or "", confirmed_runtime_lock=True)
-    except RuntimeError as exc:
-        result.update(final_response="", failed=True, completed=False, error=str(exc))
 
 
 def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
@@ -167,7 +143,7 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     """Per-turn callbacks, with routing assignment supplied by gateway turn assembly."""
 
     # ``None`` is a legitimate state: turns without a canonical session authority publish no
@@ -275,6 +251,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     platform=ctx.source.platform, user_config=ctx.user_config)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
+
     def _progress_onboarding_hint(self, kwargs: dict) -> None:
         """First-touch onboarding: the first time a tool exceeds _LONG_TOOL_THRESHOLD_S while
         streaming every tool (progress_mode == "all"), append a one-time /verbose hint."""
@@ -389,66 +366,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         ctx = self._ctx
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
-    def _attach_session_title_callback(self, agent, ctx) -> None:
-        """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
-
-        The titler runs in the turn prologue, so attach before the run, not after it.
-        """
-        try:
-            # Gateway auto-title failures are not user-actionable, so never surface them as messages;
-            # overriding the failure sink keeps CLI on _emit_auxiliary_failure while gateway logs debug.
-            agent._title_failure_callback = lambda task, exc: logger.debug(
-                "Gateway auto-title failure suppressed (not user-visible): %s: %s", task, exc,
-            )
-            session_id = getattr(agent, "session_id", None)
-            if local_viewer_turn(self):
-                # Main's CLI repainted its status-bar title when the auto-title landed.
-                authority, canonical_id, _generation = self._approval_owner
-
-                def republish(title, title_source, **_kwargs):
-                    from gateway.session_contract import SessionRef
-                    from gateway.session_local import local_session_info
-                    ref = SessionRef(getattr(authority, "profile_id", ""), canonical_id)
-                    authority.sessions[canonical_id].event_stream.publish(
-                        canonical_id, local_session_info(authority, ref), event_type="session.info")
-                agent._on_session_title = republish
-                return
-            runner = self._runner
-            source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
-            # Both lanes spend a rate-limited platform call per title, so they use the model's title
-            # only (TitleCallback); renaming twice burns Discord's 2-per-10-min budget on a throwaway.
-            # Relay Discord predicate is shape-only: whether the connector auto-threaded our reply is
-            # only knowable AFTER delivery, so register eagerly and let the rename lane look up the
-            # cache at fire time — gating registration on the cache read meant it never registered.
-            if runner._is_telegram_topic_lane(source):
-                # Capture now: _prepare_turn_message may prepend resume/model notes to
-                # ctx.message before the titler fires, and the icon heuristic must score
-                # the user's words, not recovery guidance.
-                opening_message = getattr(ctx, "message", "") or ""
-                if not isinstance(opening_message, str):
-                    opening_message = ""
-
-                def _schedule_telegram_title(title, title_source, *, display_title=None, icon=None):
-                    if title_source != "llm":
-                        return False
-                    return runner._schedule_telegram_topic_title_rename(
-                        source, session_id, display_title or title,
-                        user_message=opening_message, model_icon=icon,
-                    )
-                agent._on_session_title = _schedule_telegram_title
-                agent._title_icon_context = runner._telegram_topic_icon_context(source)
-            elif runner._is_discord_auto_thread_lane(source) or runner._is_relay_discord_channel_lane(source):
-                lane = "_schedule_discord_semantic_thread_rename"
-                agent._on_session_title = lambda title, title_source: (
-                    title_source == "llm" and getattr(runner, lane)(source, session_id, title)
-                )
-            else:
-                return
-
-
-        except Exception:
-            logger.debug("Failed to attach session title callback", exc_info=True)
-
     def _emit_persistent_attended_notice(self, message: str) -> None:
         """Deliver an attended route card outside the temporary status-bubble rail."""
         from gateway.warning_notifications import render_notification
@@ -457,10 +374,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             return
 
         def present() -> None:
-            self._schedule(
-                self._runner._deliver_platform_notice(ctx.source, message, notice_style="context"),
-                "attended notice delivery scheduling error",
-            )
+            self._schedule(self._runner._deliver_platform_notice(ctx.source, message, notice_style="context"),
+                           "attended notice delivery scheduling error")
 
         render_notification(
             present,
@@ -468,6 +383,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             user_config=ctx.user_config,
             diagnostic=True,
         )
+
 
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
@@ -753,8 +669,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 logger.debug("render_notice_line failed", exc_info=True)
                 return
             if line:
-                style = getattr(notice, "notice_style", None)
-                self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line, **({"notice_style": style} if style else {})), "notice_callback delivery scheduling error")
+                self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line, notice_style=getattr(notice, "notice_style", None)), "notice_callback delivery scheduling error")
         render_notification(present, platform=self._ctx.source.platform,
                             user_config=self._ctx.user_config, diagnostic=diagnostic)
 
@@ -778,11 +693,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     live.event_stream.publish(session_id, {"text": str(message)}, event_type="review.summary")
                 return
             if self._status_live():
-                from gateway.notice_style import notice_metadata
                 self._send_status_text(
                     message,
-                    notice_metadata(_interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
-                                    platform=ctx.source.platform, style="context"),
+                    notice_metadata(_interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)), platform=ctx.source.platform, style="context"),
                     "background_review_callback scheduling error",
                 )
 
@@ -1187,15 +1100,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 break
             answers[entry["qid"]] = None if raw == SKIPPED else raw
         return reply
-
-    async def _send_shared_clarify(self, entry, **kwargs):
-        result = await self._ctx._status_adapter.send_clarify(**kwargs)
-        if self._approval_owner is not None and result.success:
-            authority, session_id, generation = self._approval_owner
-            from gateway import local_viewer_events
-            authority.register_clarify(session_id, generation, entry,
-                                       timeout_s=local_viewer_events.prompt_timeout_s(self, "clarify"))
-        return result
 
     def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True) -> tuple[str, bool]:
         """One card: register, send, wait, then retire it (no answer) or re-arm (answer).
@@ -1609,17 +1513,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if persist_id is not None:
                 kwargs["persist_user_platform_id"] = str(persist_id)
             from agent.notification_presentation import notification_turn
+            from gateway.session_context import (
+                current_message_reaction_acknowledged, reaction_acknowledgement, scoped_turn_message,
+            )
             from gateway.session_results import execution_result
             captured = execution_result.get()
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
-            from gateway.session_context import (
-                current_message_reaction_acknowledged, reaction_acknowledgement, scoped_turn_message,
-            )
-            with (notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""),
-                  silence_retry_prompt(agent, ctx),
-                  scoped_turn_message(ctx.source, getattr(ctx, "inbound_message_id", None) or ctx.source.message_id),
-                  reaction_acknowledgement()):
+            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx), scoped_turn_message(ctx.source, ctx.inbound_message_id or getattr(ctx.source, "message_id", None)), reaction_acknowledgement():
                 result = agent.run_conversation(api_message, **kwargs)
                 result["acknowledged_by_reaction"] = current_message_reaction_acknowledged()
             if captured is not None:
@@ -1627,7 +1528,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 outgoing = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
                 captured['usage'] = {'input_tokens': incoming, 'output_tokens': outgoing,
                                      'total_tokens': incoming + outgoing}
-                _settle_api_runtime_lock(agent, result, captured)
+                from gateway.session_api_turn import settle_api_runtime_lock
+                settle_api_runtime_lock(agent, result, captured)
             return result
         finally:
             unregister_gateway_notify(session_key)

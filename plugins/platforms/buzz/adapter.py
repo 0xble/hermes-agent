@@ -860,7 +860,7 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         try:
             return await self.send_reaction(chat_id, message_id, emoji)
         except Exception as exc:
-            logger.debug("Buzz: reaction add failed: %s", exc)
+            logger.debug("Buzz: reaction add failed: %s", exc, exc_info=True)
             return False
 
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:

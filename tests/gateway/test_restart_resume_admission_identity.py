@@ -36,6 +36,13 @@ async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path, c
     )
     runner._resume_pending_candidates = lambda _platform=None: entries
     runner._auto_resume_ready = lambda _entry: (adapter, source)
+    # The fixture's own state map. ``_session_states`` is a runner method (the background-turn
+    # gate reads its load through it), so an instance attribute of that name would shadow it.
+    fixture_states = {}
+    runner._session_state = lambda key: fixture_states.setdefault(
+        key, SimpleNamespace(turn=SimpleNamespace(agent=None, started_ts=None))
+    )
+    runner._peek_session_state = runner._session_state
     runner._release_running_agent_state = lambda key: setattr(
         runner._session_state(key).turn, "agent", None
     )

@@ -306,6 +306,41 @@ class TestClaimReleasedOnFailure:
         assert len(delivered) == 1
 
 
+def _set_reply_metadata(event, previous):
+    event["message"].update(reply_count=4, latest_reply=UNFURL_EVENT_TS)
+
+
+def _set_agent_session(event, previous):
+    event["message"]["agent_session"] = {"status": "active", "title": "Thread"}
+
+
+def _retain_edit_marker(event, previous):
+    edit = {"user": USER, "ts": "1787365410.000000"}
+    previous["edited"] = edit
+    event["message"]["edited"] = edit
+
+
+def _refresh_file_metadata(event, previous):
+    previous["files"] = [{"id": "F123", "title": "upload", "size": 3}]
+    event["message"]["files"] = [{"id": "F123", "title": "upload", "size": 4}]
+
+
+def _unfurl_only(event, previous):
+    """The base event already differs from its snapshot only by the unfurl attachment."""
+
+
+# Each metadata-only variant mutates the unfurl event and its previous snapshot.
+_METADATA_VARIANTS = {
+    "reply_metadata": _set_reply_metadata,
+    "agent_session": _set_agent_session,
+    "retained_edit": _retain_edit_marker,
+    "unfurl": _unfurl_only,
+    "file_metadata": _refresh_file_metadata,
+    "no_previous": _unfurl_only,
+    "no_previous_retained_edit": _retain_edit_marker,
+}
+
+
 class TestColdCacheChanges:
     """Thread bookkeeping is not user input, even after restart or cache eviction.
 
@@ -313,10 +348,7 @@ class TestColdCacheChanges:
     agent-session status changes, and file metadata refreshes are also bookkeeping.
     """
 
-    @pytest.mark.parametrize("variant", [
-        "reply_metadata", "agent_session", "retained_edit", "unfurl",
-        "file_metadata", "no_previous", "no_previous_retained_edit",
-    ])
+    @pytest.mark.parametrize("variant", list(_METADATA_VARIANTS))
     def test_metadata_change_does_not_dispatch_a_user_turn(self, variant):
         delivered = []
         adapter = _make_adapter(delivered)
@@ -325,17 +357,7 @@ class TestColdCacheChanges:
         previous = dict(event["message"])
         previous.pop("attachments")
         event["previous_message"] = previous
-        if variant == "reply_metadata":
-            event["message"].update(reply_count=4, latest_reply=UNFURL_EVENT_TS)
-        elif variant == "agent_session":
-            event["message"]["agent_session"] = {"status": "active", "title": "Thread"}
-        elif variant in {"retained_edit", "no_previous_retained_edit"}:
-            edit = {"user": USER, "ts": "1787365410.000000"}
-            previous["edited"] = edit
-            event["message"]["edited"] = edit
-        elif variant == "file_metadata":
-            previous["files"] = [{"id": "F123", "title": "upload", "size": 3}]
-            event["message"]["files"] = [{"id": "F123", "title": "upload", "size": 4}]
+        _METADATA_VARIANTS[variant](event, previous)
         if variant.startswith("no_previous"):
             event.pop("previous_message")
 

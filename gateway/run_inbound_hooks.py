@@ -29,6 +29,13 @@ logger = logging.getLogger("gateway.run")
 _EXEC_QUICK_COMMAND_TIMEOUT = 30
 
 
+def _plugin_reply(result) -> Optional[str]:
+    """A plugin command's reply text; string-like replies keep presentation attributes (``notice_style``)."""
+    if not result:
+        return None
+    return result if isinstance(result, str) else str(result)
+
+
 async def _stop_exec_tree(proc) -> None:
     """Kill an exec quick command's shell and everything it started, then reap the shell (bounded).
 
@@ -304,11 +311,11 @@ class GatewayInboundHooksMixin:
               chat_choices(self, source, self._session_key_for_source(source))):
             if invoke is not None:
                 started, result = await invoke(call, inspect.iscoroutinefunction(plugin_handler))
-                return started, ((result if isinstance(result, str) else str(result)) if result else None)
+                return started, _plugin_reply(result)
             if inspect.iscoroutinefunction(plugin_handler):
                 result = await call()
             else:
                 result = await self._run_in_executor_with_context(call)
                 if inspect.isawaitable(result):
                     result = await result
-        return (result if isinstance(result, str) else str(result)) if result else None
+        return _plugin_reply(result)

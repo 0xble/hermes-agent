@@ -87,6 +87,82 @@ def test_response_is_logged_once_after_middleware_and_preflight(
     assert "session=child-session" in _lines(caplog)[0]
 
 
+@pytest.mark.parametrize("mode", ["chat_completions", "codex_responses"])
+@pytest.mark.parametrize("execution", ["sync", "stream", "nested_stream"])
+def test_requested_tier_matches_real_relay_provider_callback(mode, execution, relay_turn, monkeypatch, caplog):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+
+    from agent import relay_llm
+
+    relay, _turn = relay_turn
+    sent_tiers = []
+    response = SimpleNamespace(service_tier="default", model="gpt-6.1-sol", choices=[])
+
+    def rewrite_tier(name, request, annotated):
+        annotated.service_tier = "default"
+        return relay.LLMRequestInterceptOutcome(request, annotated)
+
+    def provider(kwargs):
+        sent_tiers.append(kwargs.get("service_tier"))
+        return response
+
+    def stream_provider(kwargs):
+        sent_tiers.append(kwargs.get("service_tier"))
+        if mode == "codex_responses":
+            return iter([{"type": "response.completed", "response": {
+                "id": "response-1", "status": "completed", "model": "gpt-6.1-sol",
+                "service_tier": "default", "output": [],
+            }}])
+        return iter([{"choices": [], "service_tier": "default"}])
+
+    def consume_stream(kwargs, **ignored):
+        stream = relay_llm.stream(
+            kwargs, stream_provider, session_id="session-1", name="custom:codex-proxy",
+            model_name="gpt-6.1-sol", metadata={"api_mode": mode}, finalizer=lambda: response,
+        )
+        try:
+            list(stream)
+        finally:
+            stream.close()
+        return response
+
+    def threaded_stream(kwargs, **ignored):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(copy_context().run, consume_stream, kwargs).result()
+
+    def nested_stream(kwargs):
+        # Codex opens another Relay stream inside the outer non-stream callback.
+        return consume_stream({**kwargs, "service_tier": "priority"})
+
+    agent = SimpleNamespace(
+        api_mode=mode, model="gpt-6.1-sol", provider="custom:codex-proxy",
+        session_id="session-1", platform="subagent", base_url="http://provider.invalid/v1",
+        _get_transport=lambda: SimpleNamespace(preflight_kwargs=lambda kwargs, **ignored: kwargs),
+        _is_copilot_url=lambda: False, _is_codex_backend=lambda: False,
+        _interruptible_api_call=nested_stream if execution == "nested_stream" else provider,
+        _interruptible_streaming_api_call=threaded_stream, _has_pending_redirect=lambda: False,
+    )
+    monkeypatch.setattr("agent.turn_api_call._should_stream", lambda agent: execution == "stream")
+    relay.intercepts.register_llm_request("tier-audit-rewrite", 1, False, rewrite_tier)
+    try:
+        with caplog.at_level(logging.INFO):
+            verdict = perform_api_call(
+                agent, api_kwargs={"model": agent.model, "messages": [], "input": [],
+                                   "service_tier": "ultrafast"},
+                _original_api_kwargs={}, _llm_middleware_trace=[], _moa_prepared_request=None,
+                _retry=None, thinking_spinner=None, retry_count=0, api_call_count=1,
+                api_request_id="tier-audit-request", effective_task_id="task-1",
+                turn_id="turn-1", interrupted=False)
+    finally:
+        relay.intercepts.deregister_llm_request("tier-audit-rewrite")
+    assert verdict.response is response
+    expected = "priority" if execution == "nested_stream" else "default"
+    assert sent_tiers == [expected]
+    assert len(_lines(caplog)) == 1
+    assert f"requested={expected} served=default" in _lines(caplog)[0]
+
+
 def test_chat_relay_keeps_tier_on_choiceless_usage_frame():
     accumulator = RelayChatAccumulator()
     accumulator.observe({"model": "gpt-6.1-sol", "choices": [{"delta": {"content": "OK"}, "finish_reason": "stop"}]})
@@ -96,10 +172,11 @@ def test_chat_relay_keeps_tier_on_choiceless_usage_frame():
 
 
 # Reuse the real conversation/stream harness, not a fabricated completed response.
-from tests.agent import test_first_chunk_at_hook
+from tests.agent import test_first_chunk_at_hook, test_relay_llm
 from tests.agent.test_first_chunk_at_hook import _make_stream_chunk, _run_with_hooks
 
 agent = test_first_chunk_at_hook.agent
+relay_turn = test_relay_llm.relay_turn
 
 
 def test_streamed_chat_tier_reaches_the_conversation_log(agent, caplog):

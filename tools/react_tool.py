@@ -3,10 +3,13 @@
 
 import contextlib
 import json
+import logging
 
 from gateway.session_context import get_session_env
 from tools import desktop_ui
 from tools.registry import registry, tool_error
+
+logger = logging.getLogger(__name__)
 
 
 def _gateway_platform():
@@ -42,6 +45,7 @@ def _react_gateway(platform, emoji: str) -> str:
             "react: failed to schedule reaction on gateway loop",
         ))
     except Exception as exc:
+        logger.debug("Gateway reaction delivery failed", exc_info=True)
         return tool_error(f"Reaction failed: {exc}")
     if result is not True:
         return tool_error(f"Platform '{platform.value}' does not support this reaction or delivery failed.")
@@ -62,14 +66,12 @@ def _open_session_db():
 def react_tool(emoji: str, message_row_id=None, messages_back=None) -> str:
     """Attach (or with an empty ``emoji`` retract) the agent's reaction."""
     emoji = (emoji or "").strip()
-    # Routing keys identify a channel; message rows belong to the live durable session.
-
-
     platform = _gateway_platform()
     if platform is not None:
         if message_row_id is not None or messages_back is not None:
             return tool_error("Earlier-message selectors are desktop-only. Omit them to react to the triggering message.")
         return _react_gateway(platform, emoji)
+    # Routing keys identify a channel; message rows belong to the live durable session.
     session_key = get_session_env("HERMES_SESSION_ID", "") or get_session_env("HERMES_SESSION_KEY", "")
     if not session_key:
         return tool_error("No active session — reactions need a persisted conversation.")

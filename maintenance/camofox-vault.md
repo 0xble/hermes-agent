@@ -67,6 +67,13 @@ the browser vault fill tool, or the 1Password backends.
   profile-scoped guard is bounded to 256 entries and expires by monotonic time; a later
   explicit request can retry after expiry. Other origins/sessions, successful fills, and
   `no_payment_fields` do not arm it. Unanswered prompts are distinct from explicit declines.
+- Missing, failed or unattended approval transports raise `ApprovalUnavailable` rather than invent
+  a user rejection. Payment fills return `approval_unavailable`, resolve/write no card secrets and
+  do not arm the refusal guard. The active top-level turn must request fresh approval. Related
+  upstream issue: [NousResearch/hermes-agent#144369](https://github.com/NousResearch/hermes-agent/issues/144369).
+  Retire this adaptation when upstream distinguishes unavailable consent and the vault preserves
+  this fail-closed recovery contract. Verify with `scripts/run_tests.sh tests/tools/test_payment_approval_transport.py`.
+  Roll back by reverting the approval-unavailable change, not by disabling payment approval.
 - Vault listing accepts optional kind and exact normalized page origin filters, including
   manager multi-origin matches and unbound cards. No filters preserve the full listing;
   locked backend and error reports remain visible.

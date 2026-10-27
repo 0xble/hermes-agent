@@ -964,6 +964,43 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   No remaining successor source imports `timings_report`.
 - Retire once the next release sync no longer carries these merge points.
 
+## Native Admission Synthetic Metadata
+
+- Fork patch identity: `native-admission-synthetic-metadata`.
+- Upstream native admission (`78646003aeab0`) rejects ordinary inbound metadata. The
+  v0.22.5 fork integration retained gateway-authored goal prompts with routing and
+  continuation metadata, but did not project that producer state into the durable
+  codec. Goals intentionally have `internal=False` so their turns still evaluate
+  goals. Changing that flag would hide the defect by breaking goal lifecycle.
+- Only gateway producer entry points mint private synthetic provenance. The native
+  envelope carries its metadata and internal semantics separately, and restores
+  them before execution. Source, authorization, content and route validation still
+  run. Ordinary user metadata and the WhatsApp-only projection are unchanged.
+- Admission refusals for producer/internal inputs are silent in chat. Internal
+  refusals share one operator warning per 600-second window, with clause counts
+  logged at debug level and summarized in the next window's warning. Human refusal
+  notices are limited per authority/platform/chat/reason to one every 600 seconds,
+  including all threads of that chat. Suppressed attempts log their count.
+- Delegation retry claims and boot-recovery notices have distinct stable producer
+  identities, separate from final delegation results. Retry notices persist only
+  the validated `delegation_retry_notice` cancellation stamp through native and
+  local snapshots and replay. Unknown metadata remains closed. Refusals identify
+  producer-identity, event-shape and unknown-metadata clauses.
+- Guards: `tests/gateway/test_watch_automation_admission.py` drives real watch,
+  process, heartbeat and delegation producers through automation admission,
+  including retry settlement, persisted cancellation fencing, boot-notice dedupe,
+  native/local retry round trips, malformed stamps and unknown-key refusal.
+- Guards: `tests/gateway/test_synthetic_native_admission.py`, including the real
+  lifted-barrier and watch-pattern producer paths, durable restore, source/route
+  revalidation, foreign human metadata, internal silence, and per-chat notice windows.
+  Refusal and callback-rewrite cases use a stored active goal instance so the
+  goal-currency fence admits them to the boundary under test. Unbacked or stale
+  continuations must still be dropped before admission. The user-refusal case also
+  drives a 47-message transport burst and verifies the 599/600-second boundary.
+- Roll back as one source unit. No config, schema, state migration or new alert
+  system is involved. Retire when a released upstream provides equivalent producer
+  projection and refusal presentation guards.
+
 ## v0.21.6 merge integration
 
 - Fork patch identity: `v0216-merge-integration`.
@@ -1133,3 +1170,49 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   clock fix. Preserve equivalent past/future-clock coverage during that sync.
 - **Rollback:** Revert the commits carrying `Fork-Patch: install-run-clock`; keep the
   wall-clock-disagreement regression with the active patch.
+
+## Bot receipt read straddling its settlement commit
+
+- Fork patch identity: `bot-receipt-settled-race`.
+- `gateway/session_bot.py::_admission_outcome` read the admission row, then its
+  result. When the settlement worker committed between those reads, the stale
+  `started` row (no outcome) was projected through the terminal map as `failed`
+  with the completed reply as its error, and `remember_receipt` then dropped the
+  key from the wake index, so the delivery could never recover. Hosted run
+  40424222149 failed `test_paused_receipt_rearms_on_resume_without_polling_rpc`
+  twice on it. Re-read a nonterminal row whenever its result is present: the
+  result and terminal outcome commit together.
+- Upstream already carries the same fix in
+  [NousResearch/hermes-agent#144881](https://github.com/NousResearch/hermes-agent/pull/144881)
+  (`f62121e133baa525555db08abf23e785316f2efc`). Adapt only that fix; the next
+  upstream sync absorbs it as already present.
+- Guard: `tests/gateway/test_bot_mailbox_async.py::test_receipt_read_straddling_the_settlement_commit_projects_the_reply`
+  forces the interleave through real SQLite settlement and `refresh_receipt` and
+  expects `settled` with reply `pong`. The paused-resume contract and its timeout
+  are unchanged.
+
+## API admission drain check off the owner loop
+
+- Fork patch identity: `api-drain-owner-no-import`.
+- `gateway/platforms/api_server.py` imported `gateway.run` synchronously on the owner loop
+  to read the global runner's drain flags, stalling the loop (~0.85 s cold) ahead of the
+  off-loop SQLite admission. Read the adapter-attached runner first; keep the standalone
+  global fallback.
+- Guards: `tests/gateway/test_api_drain_owner.py` (both drain flags, no-import boundary) and
+  `tests/gateway/test_api_admission_off_loop.py`.
+
+## Delegation model-rejected banner on finished work
+
+- Fork patch identity: `delegation-model-rejected-banner`.
+- `tools/process_registry_notifications.py::_delegation_model_not_found` matched the
+  configured model name plus any model-not-found phrase (`does not exist`, `unknown model`,
+  ...) anywhere in a result's summary, including a task that finished normally. A completed
+  worker whose answer named its own model and said a file "does not exist" therefore raised
+  "SUBAGENT MODEL REJECTED … Every task in this batch failed … before doing any work".
+  Only results that did not finish normally (`exit_reason != "completed"`, set by
+  `tools/delegate_tool_child_run.py`) count, and the banner states the real share
+  (`N of M tasks`) unless every task was rejected.
+- Guards: `tests/tools/test_process_registry_model_not_found.py`, including
+  `test_model_not_found_notice_absent_for_a_normally_finished_task` and
+  `test_model_not_found_notice_counts_only_rejected_tasks`; `tests/tools/test_async_delegation.py`
+  model-rejection notices (a real rejection that exhausts iterations still raises it).

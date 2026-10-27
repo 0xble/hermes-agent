@@ -1353,6 +1353,7 @@ By default, when a standing goal is active, Hermes judges whether each assistant
 
 ```yaml
 goals:
+  notices: true       # Show routine goal lifecycle output for this profile
   autonomy: false      # Opt in to agent-managed lifecycle and evidence-backed completion
   max_turns: 20        # Max continuation turns before Hermes auto-pauses the goal (default: 20)
   auto_notices: true   # Announce agent-initiated goal_set receipts (goal set / subgoal added)
@@ -1360,7 +1361,9 @@ goals:
 
 `max_turns` caps how many continuation turns a goal can drive before Hermes auto-pauses it and asks the user to `/goal resume`. It protects against judge false negatives (goal actually done but judge says continue) and unbounded model spend on fuzzy or unachievable goals. See [Goals](./features/goals.md) for the full feature.
 
-`auto_notices` (fork setting) controls whether a goal the agent sets or extends through the `goal_set` tool is announced with its committed text and completion contract. `/goal` replies and judge verdicts are always shown regardless.
+`goals.notices` (fork setting) defaults to `true` and is read separately for each profile. Set it to `false` to hide routine goal lifecycle output, including judge verdicts, continuation/resume/pause notices, autonomous session-control notices, `/goal set` confirmations and drafting progress, and persisted `goal_set` receipts. Goal execution, continuation admission and cleanup still run. Explicit `/goal status` and `/goal show` replies, command errors and approval requests remain visible. Loop receipts and loop completion output are unaffected.
+
+`goals.auto_notices` (fork setting) controls whether a goal the agent sets or extends through the `goal_set` tool is announced with its committed text and completion contract. It applies when `goals.notices` is enabled. Turning off `auto_notices` alone does not hide `/goal` replies or judge verdicts.
 
 `goals.autonomy` defaults to `false`, preserving the judge and approval behavior above. When `true`, the supporting `goal_set` plugin can set, revise, replace, pause, resume and complete goals without approval. Clear remains user-only. Completion requires a mapping from every verification criterion to recorded proof, passing quality gates and no recorded hard-limit breach. Refusals leave the goal active and name the gap in history and `/goal status`.
 
@@ -1526,12 +1529,17 @@ A fake-IP TUN proxy needs an explicit sentinel declaration, for example
 blocked like other private/reserved targets. Declared ranges are allowed only as DNS answers,
 not literal URL hosts. Loopback, RFC 1918, link-local, CGNAT, and cloud metadata stay blocked.
 
-Bare links and attachment-only openers wait for the first reply before the title upgrade.
-Prose openers are tried immediately. If the model abstains, returns a platform label, raw ID,
+Link and prose openers are tried immediately, with link metadata fetched only in the background.
+Empty and attachment-only openers wait for the first reply before the title upgrade.
+If the model abstains, returns a platform label, raw ID,
 generic word (`None`, `Investigation`, `Unspecified`), or another session's title (ignoring case
-and a trailing ` #N` on the stored name only), the session keeps its placeholder and retries at the next user turn,
-not again when the current turn ends. Retries can use a bounded excerpt of the latest assistant
-reply. At turn 3, rejected model names fall back to a title derived from the current user message. Provider failures
+and a trailing ` #N` on the stored name only), the session keeps its placeholder. An unsuccessful
+eager attempt retries once at opening-turn completion using a bounded excerpt of the assistant
+reply. A provisional title gets model retries through turn 3. At turn 3, rejected model names
+fall back to a title derived from the current user message. That final candidate must be substantive
+and non-colliding before it receives `llm` authority and replaces the instant placeholder once.
+Otherwise it stays provisional, and later user turns can supply a literal subject without more
+model calls or link fetches. Entirely untitled sessions retain their model retry eligibility. Provider failures
 and truncated output use the derived fallback immediately rather than holding. A manual `/title`
 always wins, and a real title is never renamed.
 Set `auxiliary.title_generation.hold_until_reply: false` to title from the opening message only.

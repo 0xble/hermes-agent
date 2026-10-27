@@ -3712,22 +3712,30 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
-            cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
-            if cancel_retrigger is not None:
-                with contextlib.suppress(Exception):
-                    cancel_retrigger(chat_id, metadata)
-            # A send_typing after an outer stop_typing() may have recreated the platform loop.
-            await self._stop_typing_quietly(chat_id, metadata)
-            self._typing_paused.discard(scope)
-            if tasks.get(scope) is asyncio.current_task():
-                tasks.pop(scope, None)
-            getattr(self, "_status_text", {}).pop(scope, None)
-            forget_typing_prompt_surface(self, chat_id, metadata)
+            # A retired owner leaves its live successor's status, pause, phrase and prompt intact.
+            if not self._typing_owner_retired(chat_id, metadata, asyncio.current_task()):
+                cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
+                if cancel_retrigger is not None:
+                    with contextlib.suppress(Exception):
+                        cancel_retrigger(chat_id, metadata)
+                # A send_typing after an outer stop_typing() may have recreated the platform loop.
+                await self._stop_typing_quietly(chat_id, metadata)
+                self._typing_paused.discard(scope)
+                if tasks.get(scope) is asyncio.current_task():
+                    tasks.pop(scope, None)
+                getattr(self, "_status_text", {}).pop(scope, None)
+                forget_typing_prompt_surface(self, chat_id, metadata)
 
     async def _stop_typing_refresh(
         self, chat_id: str, typing_task: asyncio.Task | None = None, *, metadata=None,
         timeout: float = 0.5, stop_attempts: int = 2) -> None:
         """Stop the refresh task and platform typing state as one operation."""
+        if self._typing_owner_retired(chat_id, metadata, typing_task):
+            # Only retire the stale task: the surface now belongs to a live successor.
+            typing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(typing_task), timeout=timeout)
+            return
         cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
         if cancel_retrigger is not None:
             with contextlib.suppress(Exception):
@@ -4005,7 +4013,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
-        from gateway.notice_style import notice_metadata
+        from agent.notice_style import notice_metadata
         metadata = notice_metadata(metadata, platform=self.platform, style=getattr(content, "notice_style", None))
         result = await self._send_with_retry_body(
             chat_id, content, reply_to=reply_to, metadata=metadata,
@@ -5414,7 +5422,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
-                from gateway.notice_style import notice_metadata
+                from agent.notice_style import notice_metadata
                 _final_thread_metadata = notice_metadata(
                     _mark_notify_metadata(_thread_metadata), platform=self.platform,
                     style=getattr(response, "notice_style", None))

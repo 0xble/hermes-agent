@@ -162,7 +162,7 @@ async def test_permanent_rejection_uses_one_clean_fallback(monkeypatch, caplog):
 ])
 @pytest.mark.parametrize("event_type", ["tool.started", "tool.completed"])
 def test_executable_previews_never_become_progress_titles(monkeypatch, tool_name, preview, event_type):
-    _runner, state, _ = make_runner(monkeypatch, failure_method="unused", error=TimeoutError())
+    runner, state, _ = make_runner(monkeypatch, failure_method="unused", error=TimeoutError())
     state.apply_event({"type": event_type, "tool_call_id": "script", "tool_name": tool_name,
                        "preview": preview})
     title = state.tasks["script"]["title"]
@@ -192,9 +192,9 @@ async def test_idle_consumer_retries_latest_projection_without_new_events(monkey
     runner._ctx.agent_holder = [None]
     task = asyncio.create_task(runner._send_native_task_card_progress(state.adapter))
     await asyncio.wait_for(task, timeout=2)
+    # Turn end seals and then deletes the recovered card (ephemeral task cards, the default).
     assert [c.args[0] for c in client.api_call.await_args_list] == [
-        "chat.startStream", "chat.appendStream", "chat.appendStream", "chat.stopStream",
-        "chat.delete",
+        "chat.startStream", "chat.appendStream", "chat.appendStream", "chat.stopStream", "chat.delete",
     ]
     assert client.api_call.await_args.kwargs["json"] == {"channel": "D1", "ts": "stream-1"}
     state.adapter.send.assert_not_awaited()

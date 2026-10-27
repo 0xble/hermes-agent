@@ -49,6 +49,18 @@ def test_gateway_reaction_selection(config, override, expected_enabled, expected
     assert ("react" in {tool["function"]["name"] for tool in tools}) is expected_enabled
 
 
+@pytest.mark.parametrize("platform_name", [None, "cli", "desktop", "cron", "webhook-local", " LOCAL "])
+def test_non_gateway_reaction_selection_does_not_discover_plugins(platform_name, monkeypatch):
+    def discovery_forbidden():
+        raise AssertionError("Local toolset selection must not discover platform manifests")
+
+    monkeypatch.setattr(Platform, "_scan_bundled_plugin_platforms", discovery_forbidden)
+    monkeypatch.setattr("gateway.config._Platform__bundled_plugin_names", None)
+    monkeypatch.setattr(reactions.desktop_ui, "user_enabled", lambda *a, **kw: False)
+
+    assert "reactions" in (session_disabled_toolsets(None, platform_name) or [])
+
+
 @pytest.mark.parametrize("platform_name", ["photon", "buzz", "runtime-reactions"])
 @pytest.mark.parametrize("selection", [None, ["reactions"]], ids=["default", "explicit"])
 def test_plugin_gateway_exposes_reaction_without_desktop_opt_in(platform_name, selection, monkeypatch):

@@ -434,6 +434,17 @@ GNU `rm` long flags on Linux, where that syntax is executable, while retaining
 the portable destructive-command variants on macOS. These are test-harness
 adaptations under `fork-ci-reliability`, not runtime-policy changes.
 
+The classic CLI parity interrupt fixture holds its SSE response after the
+`w040` progress witness instead of racing a finite response. Partial-line
+streaming mirrors only its last 60 characters into a repainted status row.
+A busy runner can miss the marker there and see it only after the completed
+reply is committed, making the subsequent Ctrl+C correctly exit an idle CLI.
+The held prefix keeps both the witness and running turn available until the
+interrupt, without changing the alive, no-final-marker, or interruption-notice
+assertions. `test_stream_partial_line_flush.py` covers real loopback SSE with
+batched display observation. Retire this fixture adaptation when upstream has
+an equally synchronized interrupt scenario.
+
 Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
 completed lanes and failures. Focused regression success never closes a
 complete-suite gap or proves an installed runtime.

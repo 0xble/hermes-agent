@@ -97,6 +97,52 @@ def session_owned_by_profile(config: Any, profile: Optional[str], session_id: An
     return bool(row) and (row.get("profile_name") or profile) == profile
 
 
+async def automatic_route_available(runner: Any, source: Any) -> bool:
+    """Suppress automatic work only for an exact, read-only deleted-topic result.
+
+    Topic closure and lookup outages are not deletion. Never probe by sending or
+    change the saved goal, loop, session binding or ownership from this check.
+    """
+    from gateway.config import Platform
+
+    if source.platform != Platform.TELEGRAM or not source.thread_id:
+        return True
+    adapter = runner._delivery_adapter_for(source)
+    bot = getattr(adapter, "_bot", None)
+    if bot is None:
+        return True
+    try:
+        from gateway.telegram_retire import _probe_deleted
+
+        deleted = await _probe_deleted(bot, source, runner=runner, read_only=True)
+    except Exception:
+        logger.debug("automatic wake: topic availability lookup failed", exc_info=True)
+        return True
+    if deleted:
+        logger.info(
+            "automatic wake: exact lookup found no Telegram topic chat=%s thread=%s; "
+            "preserving saved work and skipping wake", source.chat_id, source.thread_id,
+        )
+    return not deleted
+
+
+async def automatic_event_is_current(runner: Any, event: Any) -> bool:
+    """Recheck automatic wake freshness and route before event admission."""
+    from gateway.platforms.event import is_goal_continuation_event
+    from hermes_cli.session_controls import (
+        LOOP_WAKE_METADATA_KEY, internal_wake_is_current, is_gateway_wake,
+    )
+
+    if is_gateway_wake(event) and not await runner._run_in_executor_with_context(
+        internal_wake_is_current, event,
+    ):
+        return False
+    metadata = getattr(event, "metadata", None) or {}
+    if not (is_goal_continuation_event(event) or metadata.get(LOOP_WAKE_METADATA_KEY)):
+        return True
+    return await automatic_route_available(runner, event.source)
+
+
 async def admit_internal_event(adapter: Any, event: Any) -> None:
     """Require a concrete adapter admission, not merely a handler returning None.
 
@@ -105,6 +151,8 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
     A background wake is refused while the gateway-wide turn limit is reached
     (``gateway/run_background_admission.py``); the caller keeps its claim and retries.
     """
+    from gateway.session_synthetic import mark_synthetic
+    mark_synthetic(event)
     event._gateway_accepted = False
     metadata = getattr(event, "metadata", None)
     runner = getattr(adapter, "gateway_runner", None)

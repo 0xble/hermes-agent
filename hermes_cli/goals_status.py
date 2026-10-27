@@ -2,6 +2,8 @@
 
 from hermes_cli.lifecycle_snapshot import snapshot_control
 
+from agent.notice_style import ContextNotice
+
 
 class GoalStatusMixin:
     @snapshot_control
@@ -23,7 +25,6 @@ class GoalStatusMixin:
     def status_line(self) -> str:
         from hermes_cli.goals import (GoalRowCorrupt, _goal_budget_label, contract_items,
                                       _session_waiting, _pid_alive, time)
-        from gateway.notice_style import ContextNotice
 
         s = self._state
         if isinstance(self._unreadable, GoalRowCorrupt):

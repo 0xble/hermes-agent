@@ -19,7 +19,7 @@ try:
     import aiohttp as _aiohttp
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-    from slack_sdk.web.async_client import AsyncWebClient
+    from plugins.platforms.slack.outbound_budget import BudgetedAsyncWebClient as AsyncWebClient
 
     aiohttp = _aiohttp
     SLACK_AVAILABLE = True
@@ -57,20 +57,18 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 try:  # sibling modules; support both package and flat plugin-dir import
     from .attachment_errors import describe_download_exception
     from .block_kit import render_blocks, sanitize_blocks
+    from .task_cards import TaskCardCleanup, finish_task_card
     from .adapter_slash_lane import SlashHandoffLanes
     from .adapter_slash_payload import slash_command_text, slash_thread_id
-    from .thread_cleanup import process_changed_message
     from .adapter_native_stop import handle_agent_session_stopped
-    from .task_card_stream import start_native_task_card_stream
-    from .task_cards import finish_task_card
+    from .thread_cleanup import process_changed_message
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from task_cards import TaskCardCleanup, finish_task_card  # type: ignore
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
     from adapter_native_stop import handle_agent_session_stopped  # type: ignore
-    from task_card_stream import start_native_task_card_stream  # type: ignore
-    from task_cards import finish_task_card  # type: ignore
     from thread_cleanup import process_changed_message
 
 
@@ -356,7 +354,7 @@ def check_slack_requirements() -> bool:
     def _import():
         from slack_bolt.async_app import AsyncApp
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-        from slack_sdk.web.async_client import AsyncWebClient
+        from plugins.platforms.slack.outbound_budget import BudgetedAsyncWebClient as AsyncWebClient
         import aiohttp
         return {
             "AsyncApp": AsyncApp, "AsyncSocketModeHandler": AsyncSocketModeHandler,
@@ -1015,7 +1013,10 @@ def _extra_or_env_channel_set_getter(
     return getter
 
 
-class SlackAdapter(BasePlatformAdapter):
+from plugins.platforms.slack.adapter_thread_titles import SlackThreadTitlesMixin
+
+
+class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -1126,8 +1127,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Native progress streams; each owns a lock so concurrent start/append/stop
         # can't create duplicates or append after finalization.
         self._native_task_card_streams: dict[tuple[str, str, str], _NativeTaskCardStream] = {}
+        self._task_card_cleanup = TaskCardCleanup(self)
         # Guard: set the Slack AI thread title once per DM thread, not per reply.
         self._titled_assistant_threads: set = set()
+        self._upgraded_assistant_threads: set = set()
         # Slash-command contexts so send() can route the first reply ephemerally. Keyed
         # (team_id, channel_id, user_id), two-part when no team id → {"response_url", "ts"}.
         self._slash_command_contexts: dict[tuple[str, ...], dict[str, Any]] = {}
@@ -1806,6 +1809,7 @@ class SlackAdapter(BasePlatformAdapter):
             await self._cancel_socket_watchdog("[Slack] Prior watchdog task failed while stopping")
             # A zombie Socket Mode handler would double-respond to every event.
             await self._stop_socket_mode_handler()
+            await self._task_card_cleanup.close()
             await self._close_workspace_clients()
             # Close any previous handler before creating a new one so that calling connect() a second time
             # (e.g. during a gateway restart or in-process reconnect attempt) does not leave a zombie Socket
@@ -1824,6 +1828,7 @@ class SlackAdapter(BasePlatformAdapter):
             _apply_slack_proxy(self._app.client, proxy_url)
             for token in bot_tokens:
                 await self._authenticate_workspace(token, proxy_url)
+            self._task_card_cleanup.start(immediate=True)
             self._register_bolt_handlers()
             # _running=True only once the handler is alive (watchdog needs the live
             # task); on failure keep it False so ``finally`` releases the lock.
@@ -1846,6 +1851,7 @@ class SlackAdapter(BasePlatformAdapter):
             return False
         finally:
             if lock_acquired and not self._running:
+                await self._task_card_cleanup.close()
                 self._release_platform_lock()
 
     def _fatal_missing_env(self, env_name: str) -> None:
@@ -1915,6 +1921,7 @@ class SlackAdapter(BasePlatformAdapter):
         # shutdown safety net for cancellation/reconnect races.
         for key, stream in list(self._native_task_card_streams.items()):
             await self._stop_native_task_card_stream(key, stream)
+        await self._task_card_cleanup.close()
         await self._stop_socket_mode_handler()
         await self._close_workspace_clients()
         self._app = self._app_token = self._proxy_url = self._bot_user_id = None
@@ -2118,6 +2125,7 @@ class SlackAdapter(BasePlatformAdapter):
                         raise
                     # Slack can seal a stream mid-turn. Reopen in the same thread with the
                     # full projection, once per update. A second rejection reaches the gateway.
+                    # Both card timestamps stay tracked so turn-end cleanup removes the expired card.
                     logger.info(
                         "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
                         "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts)
@@ -2143,8 +2151,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def _start_native_task_card_stream(
         self, client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
     ) -> None:
-        """Start through the transport helper, then restore only active typing."""
-        await start_native_task_card_stream(client, stream, metadata)
+        await self._task_card_cleanup.start_stream(client, stream, metadata)
         if self._typing_is_active(stream.channel, metadata):
             await self.send_typing(stream.channel, metadata=metadata)
 
@@ -2170,12 +2177,15 @@ class SlackAdapter(BasePlatformAdapter):
                     ephemeral = extra.get("native_task_cards_ephemeral", True)
                     await finish_task_card(
                         self._get_client(stream.channel, team_id=stream.team_id), stream,
-                        delete=self._truthy_config(ephemeral))
+                        delete=self._truthy_config(ephemeral), cleanup=self._task_card_cleanup)
             except Exception as exc:  # Never let progress cleanup block the real reply.
                 logger.warning("[Slack] Native task-card cleanup failed: %s", exc)
             finally:
                 if self._native_task_card_streams.get(key) is stream:
                     self._native_task_card_streams.pop(key, None)
+                # Cancellation can interrupt sealing or deletion. The adapter-owned
+                # worker must reclaim that card now, not after its retry delay.
+                self._task_card_cleanup.start(immediate=True)
 
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
@@ -2253,7 +2263,6 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             from .message_delivery import post_chunks
             last_result = await post_chunks(self, chat_id, team_id, content, formatted, thread_ts, metadata)
-            # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
                 await self._clear_thread_status_quietly(chat_id, metadata)
             # Track sent ts (and the thread root) so thread replies get answered
@@ -3765,37 +3774,6 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setSuggestedPrompts failed: %s", e)
 
-    def _assistant_thread_title_enabled(self) -> bool:
-        raw = self.config.extra.get("assistant_thread_titles", True)
-        if isinstance(raw, str):
-            return raw.strip().lower() not in {"0", "false", "no", "off"}
-        return bool(raw)
-
-    async def _set_assistant_thread_title(
-        self, channel_id: str, thread_ts: str, title_source: str, *, team_id: str = "") -> None:
-        """Best-effort title for visible Slack AI DM threads."""
-        if (
-            not self._app or not channel_id or not thread_ts or not title_source
-            or not self._assistant_thread_title_enabled()):
-            return
-        key = self._workspace_thread_key(team_id, channel_id, thread_ts)
-        if not key or key in self._titled_assistant_threads:
-            return
-        title = re.sub(r"\s+", " ", title_source).strip()
-        if not title or title.startswith("/"):
-            return
-        title = title[:77].rstrip() + "..." if len(title) > 80 else title
-        try:
-            _set_title = _session_title_method(self._get_client(channel_id, team_id=team_id))
-            await _set_title(channel_id=channel_id, thread_ts=thread_ts, title=title)
-        except Exception as e:
-            logger.debug("[Slack] session title set failed: %s", e)
-            return
-        self._titled_assistant_threads.add(key)
-        # Evict oldest thread_ts first so recently titled threads keep their guard.
-        self._evict_oldest_by_ts(
-            self._titled_assistant_threads, self._TITLED_ASSISTANT_THREADS_MAX, lambda e: e[2])
-
     def _seed_dm_session(
         self, metadata: dict[str, str], *, thread_ts: Optional[str], fail_log: tuple[Any, ...]
     ) -> None:
@@ -4713,7 +4691,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Best-effort: title the DM thread from the prompt for Slack's AI Agent Messages tab.
         if is_dm and thread_ts and msg_type != MessageType.COMMAND:
             await self._set_assistant_thread_title(
-                channel_id, thread_ts, original_text or text, team_id=team_id)
+                channel_id, thread_ts, original_text or text, team_id=team_id, is_reply=thread_ts != ts)
         source = self.build_source(
             chat_id=channel_id,
             chat_name=channel_name,

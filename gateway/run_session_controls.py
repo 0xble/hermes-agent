@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from hermes_cli.session_controls import REPLACEMENT_MAX_CHARS
+from hermes_cli.goal_notices import goal_notices_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -107,15 +108,15 @@ class GatewaySessionControlsMixin:
             current = affected.removesuffix(suffix)
             lines = [f"Affected: {cls._clip(current or '(state unavailable)', 600)}",
                      f"Proposed goal: {cls._clip(new, REPLACEMENT_MAX_CHARS)}"]
-            # Approval installs every one of these, so every one is shown: a missing contract
-            # drops the current one, and max_turns changes the budget. The budget line is left
-            # out only when it would say unlimited and the goal is already unlimited.
-            contract = {f: v for f, v in replacement_contract(payload).items() if v}
+            # Show the complete proposed delta. Omission preserves existing requirements,
+            # while an explicit empty field removes that field through the same approval.
+            contract = replacement_contract(payload)
             if contract:
-                lines.append("Proposed contract (replaces the current one):")
-                lines.extend(f"- {_CONTRACT_LABELS[f]}: {v}" for f, v in contract.items())
+                lines.append("Proposed contract edits (omitted fields unchanged):")
+                lines.extend(f"- {_CONTRACT_LABELS[f]}: {v or '(remove)'}" for f, v in contract.items())
             else:
-                lines.append("Proposed contract: none (the current contract is dropped)")
+                lines.append("Proposed contract: unchanged")
+            lines.append("Subgoals: unchanged")
             max_turns = payload.get("max_turns")
             if not (max_turns in (None, 0) and record.get("current_max_turns") == 0):
                 budget = {None: "unchanged", 0: "unlimited"}.get(max_turns, max_turns)
@@ -210,7 +211,7 @@ class GatewaySessionControlsMixin:
 
         metadata = dict(self._thread_metadata_for_source(source) or {})
         metadata["session_control_request_id"] = request_id
-        from gateway.notice_style import notice_metadata
+        from agent.notice_style import notice_metadata
         message = self._control_notice(record)
         metadata = notice_metadata(metadata, platform=source.platform, style=getattr(message, "notice_style", None))
         from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
@@ -279,6 +280,8 @@ class GatewaySessionControlsMixin:
 
         if status not in {"applied", "denied", "failed", "expired"}:
             return
+
+        record = await self._settle_quiet_autonomy_notices(session_controls, record)
 
         # A target with no persisted gateway origin is a CLI/TUI session, not a retryable route.
         source, adapter = await self._session_control_route(target_entry)
@@ -387,6 +390,22 @@ class GatewaySessionControlsMixin:
         if self._outbox_complete(record) and not record.get("outbox_done"):
             await self._mark_control(session_controls, request_id, "outbox_done")
 
+    async def _settle_quiet_autonomy_notices(self, session_controls, record):
+        """Settle only cosmetic delivery of autonomous goal outcomes when goal notices are off.
+
+        Runs even offline. Continuation admission and cleanup still own progress, supersession
+        and recovery, and explicit authorities (quote, button, session) keep their replies.
+        """
+        if (record.get("kind") != "goal"
+                or (record.get("authority") or {}).get("via") != "autonomy"
+                or goal_notices_enabled()):
+            return record
+        for sent, skipped in (("target_notice_sent", "target_notice_skipped"),
+                              ("requester_notified", "requester_notification_skipped")):
+            if not record.get(sent) and not record.get(skipped):
+                record = await self._mark_and_finish(session_controls, record, skipped)
+        return record
+
     async def _admit_control_continuation(self, record, session_controls, source, adapter, key, prompt):
         from gateway.wake import WakeNotAccepted, WakeSuperseded, admit_internal_event
 
@@ -416,6 +435,15 @@ class GatewaySessionControlsMixin:
             return record
         return await self._mark_and_finish(session_controls, record, "continuation_enqueued")
 
+    @staticmethod
+    def _approval_notice(authority: dict) -> tuple[str, str]:
+        """Target/requester wording must claim approval only for a recorded approval source."""
+        return {
+            "autonomy": ("applied autonomously without approval", "autonomously without approval"),
+            "button": ("approved in Telegram", "after Telegram approval"),
+        }.get(str(authority.get("via") or ""),
+              ("authority source not recorded", "(authority source not recorded)"))
+
     @classmethod
     def _control_notice(cls, record: dict) -> str:
         kind, action = record.get("kind", ""), record.get("action", "")
@@ -436,7 +464,7 @@ class GatewaySessionControlsMixin:
         }.get(action, action)
         change = (f"\n{cls._change_text(record)}"
                   if action == "replace" and record.get("affected_text") else "")
-        from gateway.notice_style import ContextNotice
+        from agent.notice_style import ContextNotice
         # Only committed no-action control outcomes opt in. Pending, pause and failures stay full.
         receipt = ContextNotice if status == "applied" and (kind, action) in {
             ("goal", "replace"), ("goal", "resume"), ("goal", "clear"),
@@ -449,13 +477,14 @@ class GatewaySessionControlsMixin:
                 f"⊘ {kind.title()} {verb} by {requester} "
                 f"(applied by session {session_id} without approval){change}"
             )
-        if quote:
+        if quote and authority.get("via") != "autonomy":
             message = str(authority.get("message") or "")
             full = (f"\nFull message: \"{cls._clip(message, 1200)}\""
                     if message and message != quote else "")
             quote = cls._clip(quote, 300)
             return receipt(f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\"){change}{full}")
-        return receipt(f"⊘ {kind.title()} {verb} by {requester} (approved in Telegram){change}")
+        how, _ = cls._approval_notice(authority)
+        return receipt(f"⊘ {kind.title()} {verb} by {requester} ({how}){change}")
 
     @classmethod
     def _requester_notice(cls, record: dict) -> str:
@@ -471,7 +500,7 @@ class GatewaySessionControlsMixin:
                 session_id = cls._clip(str(authority.get("session_id") or ""), 120)
                 how = f"by session authority{f' from {session_id}' if session_id else ''}"
             else:
-                how = "after Telegram approval"
+                _, how = cls._approval_notice(authority)
             change = (f"\n{cls._change_text(record)}"
                       if record.get("action") == "replace" and record.get("affected_text") else "")
             return f"✓ Your request to {action} in {target} was applied {how}.{change}"

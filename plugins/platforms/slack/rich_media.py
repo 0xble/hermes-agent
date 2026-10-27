@@ -80,6 +80,36 @@ def presentation_line(line: str, fmt) -> dict | None:
     return None
 
 
+def emit_presentation(blocks: list, block: dict, line: str, para_open: bool, flush, image_lines: set[int],
+                      index: int) -> None:
+    """Emit a presentation line: a paragraph-final thumbnail becomes its section's accessory.
+
+    ``flush`` closes the open paragraph first; ``image_lines`` records source lines whose
+    image the renderer owns, so the attachment extractor leaves them alone.
+    """
+    accessory = thumbnail(line) if para_open else None
+    flush()
+    if accessory and blocks and blocks[-1]["type"] == "section":
+        blocks[-1]["accessory"] = accessory
+    else:
+        blocks.append(block)
+    if block["type"] == "image" or any(
+            element.get("type") == "image" for element in block.get("elements", [])):
+        image_lines.add(index)
+
+
+def fenced_block(info: str, text: str, fmt, fallback) -> dict:
+    """A carousel for a valid ``cards`` fence, else ``fallback(text)`` (preformatted code)."""
+    cards = cards_block(text, fmt) if info.strip() == "cards" else None
+    return cards or fallback(text)
+
+
+def record_native_images(out: set[int] | None, image_lines: set[int]) -> None:
+    """Publish renderer-owned image lines to the caller's optional output set."""
+    if out is not None:
+        out.update(image_lines)
+
+
 def thumbnail(line: str) -> dict | None:
     match = image_line(line)
     if match and match[1].startswith("thumb:"):
@@ -181,3 +211,22 @@ def sanitize_card(card) -> dict | None:
 def sanitize_carousel(block: dict) -> dict | None:
     cards = [clean for card in (block.get("elements") or [])[:10] if (clean := sanitize_card(card))]
     return {**block, "elements": cards} if cards else None
+
+
+def sanitize_section_accessory(block: dict) -> dict:
+    """Validate an image accessory, dropping only the accessory when it is unusable."""
+    accessory = block.get("accessory")
+    if not isinstance(accessory, dict) or accessory.get("type") != "image":
+        return block
+    result = {key: value for key, value in block.items() if key != "accessory"}
+    clean = sanitize_image(accessory)
+    if clean:
+        result["accessory"] = clean
+    return result
+
+
+RICH_BLOCK_SANITIZERS = {
+    "context": sanitize_context,
+    "image": lambda block: sanitize_image(block, block=True),
+    "carousel": sanitize_carousel,
+}

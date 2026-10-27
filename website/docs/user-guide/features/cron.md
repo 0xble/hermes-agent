@@ -310,10 +310,11 @@ Omit `--paused` to retain normal enabled creation. `--paused-reason` requires
 
 The same `paused` boolean and optional `paused_reason` string are accepted by
 `cron.jobs.create_job`, the cron management tool's `create` action, the gateway
-`POST /api/jobs`, and the dashboard `POST /api/cron/jobs`. Resume schedules the next
-future run. Pausing prevents automatic fires, not operator overrides: existing
-explicit **Run now** / force-run behavior remains available and can resume and run
-the job. It is not a security boundary against an operator who can run jobs.
+`POST /api/jobs`, and the dashboard `POST /api/cron/jobs`. `hermes cron run` and the
+management tool's `run` action reject paused/disabled jobs. Resume first, then
+verify the job is enabled and has a `next_run_at` before manually firing it through
+those paths. The dashboard's explicit force-run path can resume and run a paused
+job. Per-job pause is not a security boundary against an operator with that access.
 
 ## Agent-managed scheduling (cron jobs that manage cron jobs)
 

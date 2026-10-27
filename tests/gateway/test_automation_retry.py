@@ -35,11 +35,12 @@ async def test_coalesced_siblings_survive_lost_ack_and_owner_restart(tmp_path, m
     events = [dict(pending(key, 'durable-sibling-' + str(i)), parent_session_id=sid) for i in range(2)]
     settle_claims = runner._settle_durable_claims
 
-    async def lose_completion_ack(operations):
+    async def lose_completion_ack(operations, **settle_kwargs):
         # Admission commits, but its ACK is lost. Return the original claims for
         # recovery without re-inserting dispatches or replacing cancellation state.
+        # The kwargs carry the pending-ack unpublish callback, which must still run.
         assert all(operation == 'complete' for operation, _did, _claim in operations)
-        await settle_claims([('defer', did, claim) for _operation, did, claim in operations])
+        await settle_claims([('defer', did, claim) for _operation, did, claim in operations], **settle_kwargs)
 
     with monkeypatch.context() as lost_ack:
         lost_ack.setattr(runner, '_settle_durable_claims', lose_completion_ack)

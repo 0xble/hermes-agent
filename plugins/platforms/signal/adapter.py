@@ -951,7 +951,7 @@ class SignalAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return False
         except Exception as exc:
-            logger.debug("Signal: reaction add failed: %s", exc)
+            logger.debug("Signal: reaction add failed: %s", exc, exc_info=True)
             return False
 
     async def send_reaction(self, chat_id: str, emoji: str, target_author: str, target_timestamp: int) -> bool:

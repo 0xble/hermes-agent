@@ -81,7 +81,7 @@ def _looks_like_homebrew_ci_poller(command: str) -> bool:
     return "statusCheckRollup" in command or (has_gh and has_jq)
 
 
-def _stamp_gateway_routing(proc_session, get_session_env) -> None:
+def _stamp_gateway_routing(proc_session, get_session_env, *, parent_session_id="") -> None:
     """Copy the spawning chat's routing metadata onto the process session so
     completion / watch notifications reach the right chat/thread."""
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
@@ -89,7 +89,8 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
         return
     proc_session.watcher_platform = platform
     for attr, var in _ROUTING_FIELDS:
-        setattr(proc_session, attr, get_session_env(var, ""))
+        value = parent_session_id if attr == "parent_session_id" and parent_session_id else get_session_env(var, "")
+        setattr(proc_session, attr, value)
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
@@ -121,6 +122,60 @@ def _apply_async_support(proc_session, result_data, notify_on_complete, watch_pa
     logger.info("background proc %s: async delivery unsupported on this "
                 "session; notify_on_complete/watch_patterns disabled", proc_session.id)
     return False, None
+
+
+def handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dict:
+    """Subagent-only: transfer a running background process to the parent agent so its completion is delivered THERE
+    (child-owned process notices are suppressed and child teardown kills what it owns). Validated against the live spawn
+    tree: the caller must be a registered child and must own the process; anything else is an error, never a silent
+    no-op, so a PID mentioned in prose can't masquerade as a transfer.
+
+    The completion moves with the owner: the chat's gateway key (not the parent's session-db id) stays the route,
+    the parent's session id becomes the spawning session the gateway pre-flight checks, notify is forced on (the
+    parent was promised the result even if the child launched it silently) and a gateway watcher is armed when the
+    process has none."""
+    from gateway.session_context import async_delivery_supported, get_session_env
+    from tools.process_registry import process_registry, _MAX_HANDOFFS_PER_CHILD
+    from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
+    from tools.terminal_tool import _resolve_container_task_id
+    with _active_subagents_lock:
+        record = _active_subagents.get(str(task_id or ""))
+    child = record.get("agent") if record else None
+    parent_ref = getattr(child, "_delegate_parent_ref", None)
+    parent = parent_ref() if callable(parent_ref) else None
+    if parent is None:
+        return {"error": "handoff is only available to a running subagent with a live parent; you are not one."}
+    parent_owner = str(getattr(parent, "_current_task_id", "") or getattr(parent, "session_id", "") or "")
+    parent_session_id = str(getattr(parent, "session_id", "") or "")
+    if not parent_owner or not parent_session_id:
+        return {"error": "parent has no process owner id yet; retry after the parent's turn has started."}
+    handed = getattr(child, "_handed_off_processes", None)
+    if handed is None:
+        handed = child._handed_off_processes = []
+    if len(handed) >= _MAX_HANDOFFS_PER_CHILD:
+        return {"error": f"handoff cap reached ({_MAX_HANDOFFS_PER_CHILD} per subagent); wait on or kill the rest yourself."}
+    note = str(args.get("data") or "").strip()
+    if not note:
+        return {"error": "handoff requires `data`: one sentence saying what the process is for and what the parent should do with its result."}
+    session = process_registry.transfer_ownership(
+        session_id, from_owner=str(task_id or ""), to_owner=parent_owner,
+        to_task_id=_resolve_container_task_id(parent_owner),
+        to_session_key=get_session_env("HERMES_SESSION_KEY") or parent_session_id,
+        to_parent_session_id=parent_session_id, notify=True, note=note)
+    if session is None:
+        return {"error": f"cannot hand off {session_id}: not a running process you own (already exited? read its result "
+                         "with poll/log and report it instead)."}
+    if async_delivery_supported():
+        if not session.watcher_platform:
+            _stamp_gateway_routing(session, get_session_env, parent_session_id=parent_session_id)
+        # watcher_interval is set only by _register_completion_watcher: an armed watcher follows the new route.
+        if session.watcher_platform and not session.watcher_interval:
+            _register_completion_watcher(process_registry, session, session.session_key)
+        process_registry._write_checkpoint()
+    handed.append({"session_id": session.id, "command": session.command, "note": note})
+    return {"status": "handed_off", "session_id": session.id, "command": session.command,
+            "note": "Your parent now owns this process and will receive its completion; you will not. Mention the handoff "
+                    "in your final answer."}
 
 
 def _register_completion_watcher(process_registry, proc_session, session_key) -> None:

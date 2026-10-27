@@ -1422,8 +1422,7 @@ async def test_slack_explicit_all_in_unsupported_card_destination_falls_back_to_
     assert len(adapter.native_updates) == 1
     assert len(adapter.sent) == 1
     assert adapter.edits
-    assert "Searching the web" in adapter.edits[-1]["content"]
-    assert "web_search" not in adapter.edits[-1]["content"]
+    assert "Searching the web" in adapter.edits[-1]["content"] and "web_search" not in adapter.edits[-1]["content"]
 
 
 @pytest.mark.asyncio

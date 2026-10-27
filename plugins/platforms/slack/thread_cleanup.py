@@ -1,4 +1,4 @@
-"""Changed-message normalization and owner-home-DM tombstone cleanup."""
+"""Owner-home-DM tombstone cleanup for Slack ``message_changed`` events."""
 
 from __future__ import annotations
 
@@ -6,30 +6,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .adapter import SlackAdapter
-
-
-def normalize_changed_message(adapter: SlackAdapter, event: dict) -> dict | None:
-    """Preserve the edit's event timestamp while retaining its message subtype."""
-    updated_message = event.get("message")
-    if not isinstance(updated_message, dict):
-        return None
-    original_message_ts = str(updated_message.get("ts") or "")
-    if original_message_ts and original_message_ts in adapter._processed_message_ts:
-        return None
-    edited = updated_message.get("edited")
-    edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
-    outer_event_ts = str(event.get("ts") or "")
-    changed_event_ts = (
-        str(event.get("event_ts") or edited_ts or "")
-        or (outer_event_ts if outer_event_ts != original_message_ts else "")
-        or (f"{original_message_ts}:changed" if original_message_ts else ""))
-    normalized_event = dict(updated_message)
-    for key in ("channel", "channel_type", "team", "team_id"):
-        if not normalized_event.get(key) and event.get(key):
-            normalized_event[key] = event.get(key)
-    if changed_event_ts:
-        normalized_event["_slack_changed_event_ts"] = changed_event_ts
-    return normalized_event
 
 
 async def process_changed_message(

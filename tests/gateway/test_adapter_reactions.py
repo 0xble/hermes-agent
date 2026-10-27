@@ -8,6 +8,116 @@ import pytest
 from gateway.platforms.base import BasePlatformAdapter
 
 
+def _telegram_reaction_transport(adapter, module, target, routing, monkeypatch):
+    # The shared gateway fixture stubs optional Telegram SDK constants.
+    from enum import StrEnum
+    constants = import_module("telegram.constants")
+    monkeypatch.setattr(constants, "ReactionEmoji", StrEnum("ReactionEmoji", {"THUMBS_UP": target.emoji}))
+    transport = AsyncMock(return_value=True)
+    adapter._bot = SimpleNamespace(set_message_reaction=transport)
+    expected_args, expected_kwargs = (), {"chat_id": 123, "message_id": 456, "reaction": target.emoji}
+    return transport, expected_args, expected_kwargs
+
+
+def _slack_reaction_transport(adapter, module, target, routing, monkeypatch):
+    transport = AsyncMock(return_value={"ok": True})
+    client = SimpleNamespace(reactions_add=transport)
+    adapter._app = object()
+    adapter._get_client = Mock(return_value=client)
+    target.emoji = "thumbsup"
+    expected_args, expected_kwargs = (), {"channel": target.chat, "timestamp": target.message, "name": target.emoji}
+    return transport, expected_args, expected_kwargs
+
+
+def _discord_reaction_transport(adapter, module, target, routing, monkeypatch):
+    transport = AsyncMock()
+    native_message = SimpleNamespace(add_reaction=transport)
+    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=native_message))
+    adapter._client = SimpleNamespace(get_channel=Mock(return_value=None), fetch_channel=AsyncMock(return_value=channel))
+    expected_args, expected_kwargs = (target.emoji,), {}
+    return transport, expected_args, expected_kwargs
+
+
+def _signal_reaction_transport(adapter, module, target, routing, monkeypatch):
+    transport = AsyncMock(return_value={})
+    adapter._rpc = transport
+    adapter.account = "+15550002222"
+    target.chat = "group:group-id"
+    expected_args, expected_kwargs = ("sendReaction", {
+        "account": adapter.account, "emoji": target.emoji, "targetAuthor": routing["user_id"],
+        "targetTimestamp": 456, "groupId": "group-id",
+    }), {}
+    return transport, expected_args, expected_kwargs
+
+
+def _photon_reaction_transport(adapter, module, target, routing, monkeypatch):
+    transport = AsyncMock(return_value={"ok": True})
+    adapter._sidecar_call = transport
+    expected_args, expected_kwargs = ("/react", {"spaceId": target.chat, "messageId": target.message, "emoji": target.emoji}), {}
+    return transport, expected_args, expected_kwargs
+
+
+def _matrix_reaction_transport(adapter, module, target, routing, monkeypatch):
+    transport = AsyncMock(return_value="$reaction")
+    adapter._client = SimpleNamespace(send_message_event=transport)
+    expected_args, expected_kwargs = (target.chat, module.EventType.REACTION, {
+        "m.relates_to": {"rel_type": "m.annotation", "event_id": target.message, "key": target.emoji},
+    }), {}
+    return transport, expected_args, expected_kwargs
+
+
+def _buzz_reaction_transport(adapter, module, target, routing, monkeypatch):
+    transport = AsyncMock(return_value=(0, "", ""))
+    adapter.cli_path = "buzz-cli"
+    adapter._run_cli = transport
+    expected_args, expected_kwargs = (["reactions", "add", "--event", target.message, "--emoji", target.emoji],), {}
+    return transport, expected_args, expected_kwargs
+
+
+def _feishu_reaction_transport(adapter, module, target, routing, monkeypatch):
+    # Keep the optional SDK at its transport boundary, including lazy request construction.
+    from unittest.mock import MagicMock
+    import sys
+    sdk = MagicMock()
+    monkeypatch.setitem(sys.modules, "lark_oapi.api.im.v1", sdk)
+    transport = AsyncMock(return_value=SimpleNamespace(success=lambda: True, data=SimpleNamespace(reaction_id="reaction")))
+    adapter._run_blocking = transport
+    api = object()
+    adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message_reaction=SimpleNamespace(create=api))))
+    target.emoji = "THUMBSUP"
+    request = sdk.CreateMessageReactionRequest.builder.return_value.message_id.return_value.request_body.return_value.build.return_value
+    expected_args, expected_kwargs = (api, request), {}
+    return transport, expected_args, expected_kwargs
+
+
+def _dingtalk_reaction_transport(adapter, module, target, routing, monkeypatch):
+    transport = AsyncMock(return_value=SimpleNamespace(body=SimpleNamespace(success=True)))
+    adapter._sdk_call = transport
+    adapter._get_access_token = AsyncMock(return_value="test-token")
+    adapter._robot_code = "robot"
+    api = object()
+    adapter._robot_sdk = SimpleNamespace(robot_reply_emotion_with_options_async=api)
+    models = SimpleNamespace(**{name: SimpleNamespace for name in (
+        "RobotReplyEmotionRequestTextEmotion", "RobotReplyEmotionRequest", "RobotReplyEmotionHeaders",
+    )})
+    monkeypatch.setattr(module, "dingtalk_robot_models", models, raising=False)
+    expected_args, expected_kwargs = None, {}
+    return transport, expected_args, expected_kwargs
+
+
+_REACTION_TRANSPORTS = {
+    "telegram": _telegram_reaction_transport,
+    "slack": _slack_reaction_transport,
+    "discord": _discord_reaction_transport,
+    "signal": _signal_reaction_transport,
+    "photon": _photon_reaction_transport,
+    "matrix": _matrix_reaction_transport,
+    "buzz": _buzz_reaction_transport,
+    "feishu": _feishu_reaction_transport,
+    "dingtalk": _dingtalk_reaction_transport,
+}
+
+
 @pytest.mark.asyncio
 async def test_unsupported_adapter_reactions_are_false():
     assert await BasePlatformAdapter.add_reaction(
@@ -32,81 +142,16 @@ async def test_public_reaction_delivers_exact_target_and_reports_failure(monkeyp
     routing = {"user_id": "+15550001111", "team_id": "T2", "scope_id": "T2", "thread_id": "789"}
     chat, message, emoji = "123", "456", "👍"
 
-    if platform == "telegram":
-        # The shared gateway fixture stubs optional Telegram SDK constants.
-        from enum import StrEnum
-        constants = import_module("telegram.constants")
-        monkeypatch.setattr(constants, "ReactionEmoji", StrEnum("ReactionEmoji", {"THUMBS_UP": emoji}))
-        transport = AsyncMock(return_value=True)
-        adapter._bot = SimpleNamespace(set_message_reaction=transport)
-        expected_args, expected_kwargs = (), {"chat_id": 123, "message_id": 456, "reaction": emoji}
-    elif platform == "slack":
-        transport = AsyncMock(return_value={"ok": True})
-        client = SimpleNamespace(reactions_add=transport)
-        adapter._app = object()
-        adapter._get_client = Mock(return_value=client)
-        emoji = "thumbsup"
-        expected_args, expected_kwargs = (), {"channel": chat, "timestamp": message, "name": emoji}
-    elif platform == "discord":
-        transport = AsyncMock()
-        native_message = SimpleNamespace(add_reaction=transport)
-        channel = SimpleNamespace(fetch_message=AsyncMock(return_value=native_message))
-        adapter._client = SimpleNamespace(get_channel=Mock(return_value=None), fetch_channel=AsyncMock(return_value=channel))
-        expected_args, expected_kwargs = (emoji,), {}
-    elif platform == "signal":
-        transport = AsyncMock(return_value={})
-        adapter._rpc = transport
-        adapter.account = "+15550002222"
-        chat = "group:group-id"
-        expected_args, expected_kwargs = ("sendReaction", {
-            "account": adapter.account, "emoji": emoji, "targetAuthor": routing["user_id"],
-            "targetTimestamp": 456, "groupId": "group-id",
-        }), {}
-    elif platform == "photon":
-        transport = AsyncMock(return_value={"ok": True})
-        adapter._sidecar_call = transport
-        expected_args, expected_kwargs = ("/react", {"spaceId": chat, "messageId": message, "emoji": emoji}), {}
-    elif platform == "matrix":
-        transport = AsyncMock(return_value="$reaction")
-        adapter._client = SimpleNamespace(send_message_event=transport)
-        expected_args, expected_kwargs = (chat, module.EventType.REACTION, {
-            "m.relates_to": {"rel_type": "m.annotation", "event_id": message, "key": emoji},
-        }), {}
-    elif platform == "buzz":
-        transport = AsyncMock(return_value=(0, "", ""))
-        adapter.cli_path = "buzz-cli"
-        adapter._run_cli = transport
-        expected_args, expected_kwargs = (["reactions", "add", "--event", message, "--emoji", emoji],), {}
-    elif platform == "feishu":
-        # Keep the optional SDK at its transport boundary, including lazy request construction.
-        from unittest.mock import MagicMock
-        import sys
-        sdk = MagicMock()
-        monkeypatch.setitem(sys.modules, "lark_oapi.api.im.v1", sdk)
-        transport = AsyncMock(return_value=SimpleNamespace(success=lambda: True, data=SimpleNamespace(reaction_id="reaction")))
-        adapter._run_blocking = transport
-        api = object()
-        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message_reaction=SimpleNamespace(create=api))))
-        emoji = "THUMBSUP"
-        request = sdk.CreateMessageReactionRequest.builder.return_value.message_id.return_value.request_body.return_value.build.return_value
-        expected_args, expected_kwargs = (api, request), {}
-    else:
-        transport = AsyncMock(return_value=SimpleNamespace(body=SimpleNamespace(success=True)))
-        adapter._sdk_call = transport
-        adapter._get_access_token = AsyncMock(return_value="test-token")
-        adapter._robot_code = "robot"
-        api = object()
-        adapter._robot_sdk = SimpleNamespace(robot_reply_emotion_with_options_async=api)
-        models = SimpleNamespace(**{name: SimpleNamespace for name in (
-            "RobotReplyEmotionRequestTextEmotion", "RobotReplyEmotionRequest", "RobotReplyEmotionHeaders",
-        )})
-        monkeypatch.setattr(module, "dingtalk_robot_models", models, raising=False)
-        expected_args, expected_kwargs = None, {}
+    target = SimpleNamespace(chat=chat, message=message, emoji=emoji)
+    transport, expected_args, expected_kwargs = _REACTION_TRANSPORTS[platform](
+        adapter, module, target, routing, monkeypatch,
+    )
+    chat, message, emoji = target.chat, target.message, target.emoji
 
     assert await adapter.add_reaction(chat, message, emoji, **routing) is True
     if platform == "dingtalk":
         args = transport.await_args.args
-        assert args[0] is api
+        assert args[0] is adapter._robot_sdk.robot_reply_emotion_with_options_async
         assert (args[1].open_msg_id, args[1].open_conversation_id, args[1].emotion_name) == (message, chat, emoji)
     else:
         transport.assert_awaited_once_with(*expected_args, **expected_kwargs)
@@ -114,8 +159,9 @@ async def test_public_reaction_delivers_exact_target_and_reports_failure(monkeyp
         adapter._get_client.assert_called_once_with(chat, team_id="T2")
     if platform == "discord":
         adapter._client.fetch_channel.assert_awaited_once_with(789)
-        channel.fetch_message.assert_awaited_once_with(456)
+        adapter._client.fetch_channel.return_value.fetch_message.assert_awaited_once_with(456)
     if platform == "feishu":
+        sdk = import_module("lark_oapi.api.im.v1")
         sdk.CreateMessageReactionRequest.builder.return_value.message_id.assert_called_once_with(message)
         sdk.CreateMessageReactionRequestBody.builder.return_value.reaction_type.assert_called_once_with({"emoji_type": emoji})
 

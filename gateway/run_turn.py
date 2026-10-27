@@ -504,7 +504,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         route = attended_runtime_route(decision)
         target_model = cfg.model or decision.model
         session_last_model = last_model or conversation.last_resolved_model or ""
-        if route_active is _NO_ATTENDED_ACTIVITY_STAMP:
+        if route_active is _NO_ATTENDED_ACTIVITY_STAMP:  # loop callers pass the off-loop snapshot's value
             load_route_active = getattr(self, "_load_attended_route_active", None)
             route_active = load_route_active(session_key) if callable(load_route_active) else None
         if (
@@ -3680,7 +3680,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             if text_content:
                 content = header + text_content
                 if source.platform == Platform.SLACK and not (result or {}).get("error"):
-                    from gateway.notice_style import notice_metadata
+                    from agent.notice_style import notice_metadata
                     await adapter.send(chat_id=source.chat_id, content=header,
                                        metadata=notice_metadata(_thread_metadata, platform=source.platform, style="context"))
                     content = text_content

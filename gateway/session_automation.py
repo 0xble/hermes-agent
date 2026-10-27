@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 def producer_identity(runner, event):
     identity = runner._completion_delivery_identity(event)
     if identity is None:
-        raise RuntimeStoreError('invalid_params')
+        raise RuntimeStoreError('invalid_params', field='producer_identity',
+                                detail=f"event_type={event.get('type', 'completion')}")
     return json.dumps(identity, separators=(',', ':'))
 
 
@@ -301,6 +302,19 @@ def automation_display_metadata(metadata):
         raise RuntimeStoreError('invalid_params')
     return {'display_kind': kind, 'display_text': text}
 
+def automation_retry_metadata(descriptor):
+    """Preserve the existing cancellation fence, not arbitrary producer metadata."""
+    key = 'delegation_retry_notice'
+    if key not in descriptor:
+        return {}
+    stamp = descriptor[key]
+    if (not isinstance(stamp, dict) or set(stamp) != {'delegation_id', 'claim'}
+            or any(not isinstance(stamp[name], str) or not stamp[name].strip()
+                   for name in ('delegation_id', 'claim'))):
+        raise RuntimeStoreError('invalid_params', field=key)
+    return {key: dict(stamp)}
+
+
 # notification_origin / original_trigger_message_id are producer debug context (#52694) and are not
 # persisted; notification_category="diagnostic" rides the snapshot so the replayed wake still mutes,
 # and display_kind/display_text so the persisted row is the card the producer named; heartbeat_tick is
@@ -311,7 +325,8 @@ def automation_display_metadata(metadata):
 # proof at execution from the target the pre-claim check validated, and the turn's resolver reads it.
 _AUTOMATION_METADATA = frozenset({'gateway_session_key', 'gateway_session_id', 'automation_identities',
     'turn_author', 'notification_origin', 'original_trigger_message_id', 'notification_category',
-    'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick'})
+    'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick',
+    'delegation_retry_notice'})
 
 
 def admission_display(payload):
@@ -349,11 +364,12 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     runner = authority.runner
     if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
             or not isinstance(event.text, str) or not identity
-            or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER
-            or set(event.metadata) - _AUTOMATION_METADATA):
-        raise RuntimeStoreError('invalid_params')
+            or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER):
+        raise RuntimeStoreError('invalid_params', field='automation_event')
+    if set(event.metadata) - _AUTOMATION_METADATA:
+        raise RuntimeStoreError('invalid_params', field='automation_metadata')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
-                    | _tick_metadata(event.metadata))
+                    | _tick_metadata(event.metadata) | automation_retry_metadata(event.metadata))
     entry = captured[0] if captured is not None else _owner(runner, event, authority)
     if event.source.platform == Platform.LOCAL:
         return snapshot_local_automation(authority, adapter, event, identity, entry,
@@ -421,6 +437,7 @@ def snapshot_local_automation(authority, adapter, event, identity, entry, *, ref
                   'route': entry.session_key, 'target': entry.session_id}
     descriptor.update(automation_notification_metadata(event.metadata))
     descriptor.update(automation_display_metadata(event.metadata))
+    descriptor.update(automation_retry_metadata(event.metadata))
     descriptor.update(_tick_metadata(event.metadata))
     if event.metadata.get('turn_author') is not None:
         from agent.turn_author import parse_turn_author
@@ -460,6 +477,7 @@ def restore_local_automation(authority, ref, row):
             'gateway_session_id': entry.session_id})
     event.metadata.update(automation_notification_metadata(descriptor))
     event.metadata.update(automation_display_metadata(descriptor))
+    event.metadata.update(automation_retry_metadata(descriptor))
     if descriptor.get('turn_author') is not None:
         event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
     if descriptor.get('heartbeat'):
