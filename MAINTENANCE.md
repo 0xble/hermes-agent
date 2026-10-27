@@ -238,8 +238,8 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 - **Patch identity:** `speed-tier-audit`.
 - **Behavior:** One `speed tier:` INFO record per completed Codex Responses or Chat Completions response, including when neither side reports a tier. Logs negotiated request kwargs and the response echo, with missing echoes labeled `unreported`. An Ultrafast parent passes the tier only to an eligible child route, using the child's credential. Explicit delegation overrides win and unsupported children get no inherited paid tier.
-- **Source surfaces:** `agent/turn_api_call.py`, `agent/turn_usage.py`, chat streaming accumulators, `tools/delegate_tool_config.py`, `tools/delegate_tool.py`, and [Requested And Served Speed Tiers](maintenance/speed-tier-audit.md).
-- **Upstream status:** The upstream explicit-backend-route work in `ed11601539`, `572ecbe43d`, `5d7fea742c` and `0214eb4fdc` does not fix the fork's inherited-mode path. Reuses its existing route/account gates rather than importing the larger route API change.
+- **Source surfaces:** `agent/turn_api_call.py`, `agent/relay_llm.py` provider-request capture, `agent/turn_usage.py`, chat streaming accumulators, `tools/delegate_tool_config.py`, `tools/delegate_tool.py`, and [Requested And Served Speed Tiers](maintenance/speed-tier-audit.md).
+- **Upstream status:** The upstream explicit-backend-route work in `ed11601539`, `572ecbe43d`, `5d7fea742c` and `0214eb4fdc` does not fix the fork's inherited-mode path. The per-task route `service_tier` in `tools/delegate_tool_tuning.py` covers explicit tiers only, so inheritance reuses its `without_service_tier` stripping and the same `ultrafast_offered` route/account gate.
 - **Focused regression:** `scripts/run_tests.sh tests/agent/test_service_tier_logging.py tests/tools/test_delegate_ultrafast.py`.
 - **Retirement:** Remove when upstream covers inherited Ultrafast and equivalent per-response requested/served auditing, without silent paid fallback or losing explicit-override precedence.
 - **Rollback:** Revert the commit carrying `Fork-Patch: speed-tier-audit`.

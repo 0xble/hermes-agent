@@ -10,7 +10,7 @@ Each completed `codex_responses` or `chat_completions` model response emits one 
 speed tier: session=<id> model=<wire-model> provider=<provider> route=<api-mode> requested=<tier|none> served=<tier|unreported>
 ```
 
-The request value comes from the execution middleware's outgoing kwargs, after Responses preflight, not `agent.service_tier`. SDK `extra_body.service_tier` takes precedence over the top-level field. A missing echo is `unreported`, not the requested tier. Logging happens before response validation and usage accounting, including replies without token usage and responses that will be retried.
+The request value comes from the final provider-callback kwargs, after execution middleware, Responses preflight and Relay interception, not `agent.service_tier`. Relay captures these kwargs in request-local context shared with its worker callbacks, including nested Codex streams. SDK `extra_body.service_tier` takes precedence over the top-level field. A missing echo is `unreported`, not the requested tier. Logging happens before response validation and usage accounting, including replies without token usage and responses that will be retried.
 
 `agent.usage_pricing.with_served_service_tier` is the canonical served-value normalizer. `agent.turn_usage.record_response_usage` already uses it for pricing. Codex streaming reads the terminal `response.service_tier` in `agent.codex_runtime._CodexResponseAssembler` and preserves it on the completed response. Chat streaming preserves it from both ordinary and usage-only frames, including Relay's separately accumulated final response.
 
@@ -18,7 +18,7 @@ The existing per-call token persistence writes counters and costs, not the raw u
 
 ## Delegation
 
-Static tiers use `agent.fast_mode.STATIC_TIERS`, alongside existing bounded-mode inheritance. Ultrafast inheritance uses `ultrafast_offered` for the child's resolved model, provider, endpoint and credential, then `resolve_fast_mode_overrides(tier="ultrafast")`. An unsupported child gets no inherited tier, never an implicit paid Priority fallback. Bounded modes remain bounded. Explicit delegation overrides, including nested `extra_body` fields, win. Parent wire-tier keys are stripped at both levels before rederiving the child's overlay.
+Static tiers use `agent.fast_mode.STATIC_TIERS`, alongside existing bounded-mode inheritance. Ultrafast inheritance uses `ultrafast_offered` for the child's resolved model, provider, endpoint and credential, then `resolve_fast_mode_overrides(tier="ultrafast")`. An unsupported child gets no inherited tier, never an implicit paid Priority fallback. Bounded modes remain bounded. Explicit delegation overrides, including nested `extra_body` fields, win. Parent wire-tier keys are stripped at both levels by `tools.delegate_tool_tuning.without_service_tier` before rederiving the child's overlay. An explicit per-task route `service_tier` (`task_service_tier`) still takes precedence over the inherited mode.
 
 Upstream `ed11601539`, `572ecbe43d`, `5d7fea742c` and `0214eb4fdc` add explicit backend-route tiers, refusal/reporting and route-account validation. They do not extend this fork's `_INHERITABLE_FAST_MODES` or its `_resolve_child_request_overrides` path. Importing that backend-route work would not fix the inherited Ultrafast gap on its own. This patch therefore extends the existing fork inheritance path and reuses the same route/account gates without importing the larger delegation-route API change.
 
