@@ -4,6 +4,10 @@
 
 See [Reaction Tool Name](../../../maintenance/react-tool-name.md) for the contract, upstream findings, verification and retirement conditions.
 
+## subagent-process-handoff-route
+
+See [Subagent Process Handoff Route](../../../maintenance/subagent-process-handoff-route.md) for the contract, upstream findings, verification and retirement conditions.
+
 ## seamless-restart-s2: Isolated Launcher Environment Acknowledgement
 
 - **Independent hypothesis (2026-10-24):** The supervised gateway matches the intended release, interpreter, cwd and exact generated `-I -c` bootstrap, but acknowledgement rejects its nonempty `PYTHONPATH`. PM deliberately exports the selected dependency paths at `pm/environments.py:554`, and the stderr wrapper passes them to its child. Process inspection reports that launch environment even though isolated Python ignores it and the bootstrap clears it before importing. This predicts deterministic acknowledgement failure with a PM-activated wrapper and success without inherited `PYTHONPATH`. A different failed identity predicate would falsify this diagnosis.
