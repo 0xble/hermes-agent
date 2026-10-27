@@ -366,6 +366,92 @@ def test_plugin_whose_pyproject_installs_nothing_keeps_the_environment(admission
     assert venv_is_current(project_root=core) is True
 
 
+def _bundled_provider(core: Path, shared: Path, requires_python: str) -> Path:
+    """A release-owned provider pinning *shared*'s sharedlib; plug-a pins the other source,
+    an unsatisfiable union that uv resolves offline."""
+    provider = core / "plugins" / "memory" / "bundled-provider"
+    provider.mkdir(parents=True)
+    (provider / "__init__.py").write_text("", encoding="utf-8")
+    (provider / "plugin.yaml").write_text("name: bundled-provider\n", encoding="utf-8")
+    (provider / "pyproject.toml").write_text(
+        '[project]\nname="bundled-provider"\nversion="1"\n'
+        f'requires-python="{requires_python}"\n'
+        'dependencies=["sharedlib==2.0.0"]\n[tool.uv]\npackage=false\n'
+        f'[tool.uv.sources]\nsharedlib = {{ path = "{shared.as_posix()}" }}\n',
+        encoding="utf-8",
+    )
+    return provider
+
+
+@pytest.mark.skipif(not _uv_available(), reason="uv not on PATH")
+def test_update_sync_evicts_third_party_plugin_conflicting_with_bundled_provider(admission_env):
+    """An update never fails because of a plugin: when a third-party plugin's pins conflict
+    with a bundled provider's, the provider is seated first and the third-party plugin is
+    the one disabled, even though config order lists it before the provider."""
+    from pm.environments import runtime_facts_path
+    from pm.install import sync_venv, venv_is_current
+    from pm.lock import Facts
+
+    tmp_path, home = admission_env
+    core = tmp_path / "core"
+    _plug_a, _plug_b, _shared1, shared2 = _local_conflict_members(home)
+    _bundled_provider(core, shared2, ">=3.11")
+    _write_enabled(home, ["plug-a"], provider="bundled-provider")
+
+    sync_venv(explicit=True, evict_incompatible_plugins=True)
+
+    cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert cfg["memory"]["provider"] == "bundled-provider"
+    assert cfg["plugins"]["disabled"] == ["plug-a"]
+    workspace = Path(Facts(runtime_facts_path(core), strict=True).get("venv")["resolved_lock"]).parent
+    members = (workspace / "pyproject.toml").read_text()
+    assert "bundled-provider" in members and "plug-a" not in members
+    warnings = json.dumps(_latest_receipt(home).get("warnings"))
+    assert "Disabled plugin 'plug-a'" in warnings
+    assert venv_is_current(project_root=core) is True
+
+
+@pytest.mark.skipif(not _uv_available(), reason="uv not on PATH")
+def test_update_sync_cannot_evict_bundled_memory_provider(admission_env):
+    """A bundled provider that cannot fit the release on its own fails the update loudly
+    rather than letting eviction clear ``memory.provider`` and silently disable memory."""
+    from pm.install import sync_venv
+    from pm.package import InstallError
+
+    tmp_path, home = admission_env
+    _plug_a, _plug_b, _shared1, shared2 = _local_conflict_members(home)
+    _bundled_provider(tmp_path / "core", shared2, ">999")
+    _write_enabled(home, ["plug-a"], provider="bundled-provider")
+    before = (home / "config.yaml").read_bytes()
+
+    with pytest.raises(InstallError, match="bundled memory provider"):
+        sync_venv(explicit=True, evict_incompatible_plugins=True)
+
+    assert (home / "config.yaml").read_bytes() == before
+    cfg = yaml.safe_load(before)
+    assert cfg["memory"]["provider"] == "bundled-provider"
+    assert "bundled-provider" not in cfg.get("plugins", {}).get("disabled", [])
+
+
+def test_bundled_provider_recognised_by_bare_and_memory_prefixed_key(tmp_path, monkeypatch):
+    """``memory.provider`` names the bare provider; a plugins.enabled key may be ``memory/<name>``."""
+    import pm.paths
+    from pm.plugin_eviction import _is_bundled_provider
+
+    core = tmp_path / "core"
+    provider = core / "plugins" / "memory" / "hindsight"
+    provider.mkdir(parents=True)
+    user_copy = tmp_path / "home" / "plugins" / "hindsight"
+    user_copy.mkdir(parents=True)
+    monkeypatch.setattr(pm.paths, "repo_root", lambda: core)
+    plugins_dir = tmp_path / "home" / "plugins"
+
+    assert _is_bundled_provider((plugins_dir, "hindsight", provider))
+    assert _is_bundled_provider((plugins_dir, "memory/hindsight", provider))
+    assert not _is_bundled_provider((plugins_dir, "hindsight", user_copy))
+    assert not _is_bundled_provider((plugins_dir, "memory/other", provider))
+
+
 @pytest.mark.skipif(not _uv_available(), reason="uv not on PATH")
 def test_update_sync_disables_plugin_excluded_by_requires_python(admission_env):
     """An update never fails because of a plugin: a member whose requires-python excludes the
