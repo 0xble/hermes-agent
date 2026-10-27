@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from hermes_cli.session_controls import REPLACEMENT_MAX_CHARS
+from hermes_cli.goal_notices import goal_notices_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -210,11 +211,12 @@ class GatewaySessionControlsMixin:
 
         metadata = dict(self._thread_metadata_for_source(source) or {})
         metadata["session_control_request_id"] = request_id
+        from agent.notice_style import notice_metadata
+        message = self._control_notice(record)
+        metadata = notice_metadata(metadata, platform=source.platform, style=getattr(message, "notice_style", None))
         from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
         with outbound_class(OUTBOUND_NOTICE):
-            result = await adapter.send(
-                source.chat_id, self._control_notice(record), metadata=metadata
-            )
+            result = await adapter.send(source.chat_id, message, metadata=metadata)
         if _send_succeeded(result):
             return await self._mark_and_finish(
                 session_controls, record, "target_notice_sent"
@@ -278,6 +280,8 @@ class GatewaySessionControlsMixin:
 
         if status not in {"applied", "denied", "failed", "expired"}:
             return
+
+        record = await self._settle_quiet_autonomy_notices(session_controls, record)
 
         # A target with no persisted gateway origin is a CLI/TUI session, not a retryable route.
         source, adapter = await self._session_control_route(target_entry)
@@ -386,6 +390,22 @@ class GatewaySessionControlsMixin:
         if self._outbox_complete(record) and not record.get("outbox_done"):
             await self._mark_control(session_controls, request_id, "outbox_done")
 
+    async def _settle_quiet_autonomy_notices(self, session_controls, record):
+        """Settle only cosmetic delivery of autonomous goal outcomes when goal notices are off.
+
+        Runs even offline. Continuation admission and cleanup still own progress, supersession
+        and recovery, and explicit authorities (quote, button, session) keep their replies.
+        """
+        if (record.get("kind") != "goal"
+                or (record.get("authority") or {}).get("via") != "autonomy"
+                or goal_notices_enabled()):
+            return record
+        for sent, skipped in (("target_notice_sent", "target_notice_skipped"),
+                              ("requester_notified", "requester_notification_skipped")):
+            if not record.get(sent) and not record.get(skipped):
+                record = await self._mark_and_finish(session_controls, record, skipped)
+        return record
+
     async def _admit_control_continuation(self, record, session_controls, source, adapter, key, prompt):
         from gateway.wake import WakeNotAccepted, WakeSuperseded, admit_internal_event
 
@@ -444,10 +464,16 @@ class GatewaySessionControlsMixin:
         }.get(action, action)
         change = (f"\n{cls._change_text(record)}"
                   if action == "replace" and record.get("affected_text") else "")
+        from agent.notice_style import ContextNotice
+        # Only committed no-action control outcomes opt in. Pending, pause and failures stay full.
+        receipt = ContextNotice if status == "applied" and (kind, action) in {
+            ("goal", "replace"), ("goal", "resume"), ("goal", "clear"),
+            ("loop", "resume"), ("loop", "stop"),
+        } else str
         authority = record.get("authority") or {}
         if authority.get("via") == "session":
             session_id = cls._clip(str(authority.get("session_id") or requester_id), 120)
-            return (
+            return receipt(
                 f"⊘ {kind.title()} {verb} by {requester} "
                 f"(applied by session {session_id} without approval){change}"
             )
@@ -456,9 +482,9 @@ class GatewaySessionControlsMixin:
             full = (f"\nFull message: \"{cls._clip(message, 1200)}\""
                     if message and message != quote else "")
             quote = cls._clip(quote, 300)
-            return f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\"){change}{full}"
+            return receipt(f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\"){change}{full}")
         how, _ = cls._approval_notice(authority)
-        return f"⊘ {kind.title()} {verb} by {requester} ({how}){change}"
+        return receipt(f"⊘ {kind.title()} {verb} by {requester} ({how}){change}")
 
     @classmethod
     def _requester_notice(cls, record: dict) -> str:

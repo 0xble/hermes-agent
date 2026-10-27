@@ -1,6 +1,7 @@
 """Cleanup for native progress cards, never the assistant's reply stream."""
 
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -98,7 +99,12 @@ class TaskCardCleanup:
             value = next((md[source] for source in sources if md.get(source)), None)
             if value:
                 payload[key] = value
-        result = await client.api_call("chat.startStream", json=payload)
+        # The SDK retries connection failures by default, and a start can take effect before its
+        # response is lost. Start on a copy without retry handlers so injected clients cannot
+        # replay an ambiguous start; production clients also disable SDK retries at admission.
+        start_client = copy.copy(client)
+        start_client.retry_handlers = []
+        result = await start_client.api_call("chat.startStream", json=payload)
         if hasattr(result, "get"):
             stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
         if not stream.stream_ts:

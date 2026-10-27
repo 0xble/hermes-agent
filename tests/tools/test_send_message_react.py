@@ -8,6 +8,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 import tools.send_message_tool as smt
 
 
@@ -17,7 +19,7 @@ class _FakePhotonAdapter:
     def __init__(self):
         self.calls = []
 
-    async def add_reaction(self, chat_id, emoji, message_id=None):
+    async def add_reaction(self, chat_id, message_id, emoji, **routing):
         self.calls.append(("add", chat_id, emoji, message_id))
         return {"success": True, "emoji": emoji}
 
@@ -57,3 +59,26 @@ def test_react_without_live_gateway():
         )
     assert result.get("success") is not True
     assert "live" in json.dumps(result)
+
+
+@pytest.mark.parametrize("delivered", [True, False, {"success": True}, {"success": False}])
+@pytest.mark.parametrize("message_id", ["current", "older"])
+def test_send_reaction_acknowledges_only_delivered_current_target(monkeypatch, delivered, message_id):
+    from gateway.session_context import clear_session_vars, reaction_acknowledgement, set_session_vars
+
+    async def react(**kwargs):
+        return delivered
+
+    adapter = SimpleNamespace(add_reaction=react)
+    monkeypatch.setattr(smt, "_resolve_tool_target", lambda *args, **kwargs: ("photon", "chat", None, None))
+    monkeypatch.setattr(smt, "_authorize_relay_target", lambda *args: None)
+    monkeypatch.setattr(smt, "_live_adapter", lambda *args: (_runner_with(adapter), adapter))
+    tokens = set_session_vars(platform="photon", chat_id="chat", message_id="current")
+    try:
+        with reaction_acknowledgement() as receipts:
+            result = _call({"action": "react", "target": "photon:chat", "message_id": message_id, "emoji": "👍"})
+            success = delivered.get("success") is True if isinstance(delivered, dict) else delivered is True
+            assert bool(result.get("success")) is success
+            assert bool(receipts) is (success and message_id == "current")
+    finally:
+        clear_session_vars(tokens)

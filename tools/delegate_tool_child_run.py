@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from tools.delegation_redaction import redact_child_result, redact_child_text
-from concurrent.futures import TimeoutError as FuturesTimeoutError
+from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
 from agent.compression_marker import elide
 from agent.interrupt_compat import request_hard_interrupt
@@ -785,6 +785,26 @@ class _ChildRun:
     parent_task_id: Optional[str] = None
     wall_start: float = 0.0
     parent_reads_snapshot: list = field(default_factory=list)
+    conversation_future: Optional[Future] = field(default=None, repr=False)
+
+    def checkpoint_finished_child(self) -> None:
+        """The driver has closed. Publish only once its admitted conversation has settled.
+
+        A missing Future stays unknown. A timed-out worker may finish after the aggregate,
+        so retain the producer's profile context for its genuine late acknowledgment.
+        Native request helpers can outlive a conversation. This is not physical quiescence.
+        """
+        if self.conversation_future is None:
+            return
+        context = contextvars.copy_context()
+
+        def checkpoint(_done: Future) -> None:
+            with _quiet("Failed to checkpoint finished child: %s", exc_info=True):
+                from tools.async_delegation_completion import record_child_finished
+                record_child_finished(getattr(self.child, "_delegation_id", ""), self.task_index,
+                                      getattr(self.child, "session_id", ""))
+
+        self.conversation_future.add_done_callback(lambda done: context.run(checkpoint, done))
 
     def elapsed(self) -> float:
         return round(time.monotonic() - self.child_start, 2)
@@ -938,7 +958,7 @@ class _ChildRun:
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
 
-        future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+        future = self.conversation_future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
         # Without the second, a worker wedged after its final answer holds a finite (-Q / Bot Chat
         # one-shot) turn — and its session lease — forever, since that runtime has no gateway

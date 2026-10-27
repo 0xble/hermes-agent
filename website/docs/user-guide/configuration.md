@@ -1353,6 +1353,7 @@ By default, when a standing goal is active, Hermes judges whether each assistant
 
 ```yaml
 goals:
+  notices: true       # Show routine goal lifecycle output for this profile
   autonomy: false      # Opt in to agent-managed lifecycle and evidence-backed completion
   max_turns: 20        # Max continuation turns before Hermes auto-pauses the goal (default: 20)
   auto_notices: true   # Announce agent-initiated goal_set receipts (goal set / subgoal added)
@@ -1360,7 +1361,9 @@ goals:
 
 `max_turns` caps how many continuation turns a goal can drive before Hermes auto-pauses it and asks the user to `/goal resume`. It protects against judge false negatives (goal actually done but judge says continue) and unbounded model spend on fuzzy or unachievable goals. See [Goals](./features/goals.md) for the full feature.
 
-`auto_notices` (fork setting) controls whether a goal the agent sets or extends through the `goal_set` tool is announced with its committed text and completion contract. `/goal` replies and judge verdicts are always shown regardless.
+`goals.notices` (fork setting) defaults to `true` and is read separately for each profile. Set it to `false` to hide routine goal lifecycle output, including judge verdicts, continuation/resume/pause notices, autonomous session-control notices, `/goal set` confirmations and drafting progress, and persisted `goal_set` receipts. Goal execution, continuation admission and cleanup still run. Explicit `/goal status` and `/goal show` replies, command errors and approval requests remain visible. Loop receipts and loop completion output are unaffected.
+
+`goals.auto_notices` (fork setting) controls whether a goal the agent sets or extends through the `goal_set` tool is announced with its committed text and completion contract. It applies when `goals.notices` is enabled. Turning off `auto_notices` alone does not hide `/goal` replies or judge verdicts.
 
 `goals.autonomy` defaults to `false`, preserving the judge and approval behavior above. When `true`, the supporting `goal_set` plugin can set, revise, replace, pause, resume and complete goals without approval. Clear remains user-only. Completion requires a mapping from every verification criterion to recorded proof, passing quality gates and no recorded hard-limit breach. Refusals leave the goal active and name the gap in history and `/goal status`.
 

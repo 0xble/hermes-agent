@@ -97,6 +97,11 @@ class TypingStateMixin:
         paused = getattr(self, "_typing_paused", ())
         return str(chat_id) in paused or self._typing_scope_key(chat_id, metadata) in paused
 
+    def _typing_owner_retired(self, chat_id: str, metadata, task) -> bool:
+        """True when a live successor, not ``task``, owns this surface's refresh."""
+        owner = getattr(self, "_typing_refresh_owners", {}).get(self._typing_scope_key(chat_id, metadata))
+        return task is not None and owner is not None and owner is not task and not owner.done()
+
     def _typing_is_active(self, chat_id: str, metadata=None) -> bool:
         task = getattr(self, "_typing_refresh_owners", {}).get(self._typing_scope_key(chat_id, metadata))
         return isinstance(task, asyncio.Task) and not task.done() and not self._typing_is_paused(chat_id, metadata)

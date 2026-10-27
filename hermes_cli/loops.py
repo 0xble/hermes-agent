@@ -8,6 +8,8 @@ A loop stops when the agent ends a wakeup reply with ``LOOP_COMPLETE`` on its ow
 
 from __future__ import annotations
 
+from agent.notice_style import ContextNotice
+
 import hashlib
 import json
 import logging
@@ -1167,7 +1169,7 @@ class LoopManager(LoopRevisionsMixin):
         judged against the current stored definition, never the fired version."""
         if state.times and state.ticks_fired >= state.times:
             return ("done", f"completed the requested {state.times} runs",
-                    f"✓ Loop finished — ran {state.times}/{state.times} times.")
+                    ContextNotice(f"✓ Loop finished — ran {state.times}/{state.times} times."))
         if state.max_ticks and state.ticks_fired >= state.max_ticks:
             return ("paused", f"tick budget exhausted ({state.ticks_fired}/{state.max_ticks})",
                     f"⏸ Loop paused — {state.ticks_fired}/{state.max_ticks} ticks used "
@@ -1211,7 +1213,8 @@ class LoopManager(LoopRevisionsMixin):
         if superseded:
             return {"status": "active", "stopped": False,
                     "reason": "loop revised during evaluation", "message": ""}
-        return {"status": status, "stopped": True, "reason": reason, "message": message}
+        return {"status": status, "stopped": True, "reason": reason,
+                "message": ContextNotice(message) if status == "done" else message}
 
     @staticmethod
     def _apply_stop(state: LoopState, status: str, reason: str) -> None:
@@ -1454,7 +1457,11 @@ def dispatch_loop_command(
     arg = (args or "").strip()
     control = _CONTROL_COMMANDS.get(arg.lower())
     if control is not None:
-        return {"output": control(mgr), "created": False}
+        output = control(mgr)
+        if arg.lower() in {"", "status", "resume", "stop", "clear", "cancel"}:
+            if not mgr.state or mgr.state.status != "paused":
+                output = ContextNotice(output)
+        return {"output": output, "created": False}
 
     parsed = parse_loop_args(arg)
     if parsed["error"]:
@@ -1498,7 +1505,7 @@ def dispatch_loop_command(
         lines.append(f"Backstop budget: {state.max_ticks} ticks (loops.max_ticks; 0 = unlimited).")
     first = "fires now, then on the cadence above" if state.status == "active" else state.remaining_label()
     lines.append(f"First wakeup {first}. Controls: /loop status · pause · resume · stop.")
-    return {"output": "\n".join(lines), "created": True}
+    return {"output": ContextNotice("\n".join(lines)), "created": True}
 
 
 __all__ = [

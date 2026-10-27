@@ -497,6 +497,31 @@ env-over-YAML rule as every other setting). Avoid
 `all` when peer bots can answer each other without an explicit mention, because
 their own reply policies can still create loops.
 
+### Deleted Threads in the Owner DM
+
+When Slack replaces a deleted thread root with a tombstone, Hermes can also
+remove its replies in the configured owner's home DM. This applies whether the
+root was written by the owner or the bot. Channels, group DMs, other users' DMs,
+and deleted individual replies are excluded. Tombstones never start agent turns.
+
+Set `platforms.slack.home_channel` with the DM's `chat_id`, owner's `user_id`, and
+workspace `scope_id`. Supply `SLACK_USER_TOKEN` through the existing secret
+sources or process environment. The token must authenticate as that owner in
+that workspace and have `chat:write`. Hermes uses its bot token to read the
+thread and delete bot replies, and the owner's user token to delete owner
+replies. Other authors are not deleted.
+
+For example, an existing noninteractive credential helper can supply the token
+through `secrets.command.enabled: true` and `secrets.command.command`. The
+command must print a `SLACK_USER_TOKEN=...` line without storing the token in
+configuration. The existing 1Password secret source also supports mapping
+`secrets.onepassword.env.SLACK_USER_TOKEN` to an `op://` reference.
+
+Hermes verifies the current parent is still a tombstone before deleting any
+replies. A cleanup failure produces 1 notice in the DM naming the failed
+operation or reply. Cleanup is not retried, and deleting messages while Hermes
+is offline is not caught up later.
+
 ### Working-State Status Line
 
 While the agent processes a message, Slack shows a status line next to the bot

@@ -23,7 +23,7 @@ import tomllib
 import plistlib
 from functools import lru_cache
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence, Any
 
@@ -944,7 +944,8 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
             if (_is_intended_gateway(process, intended_root, expected_python) and
                     (gateway_pid is None or _LOADED_CODE_ROOT == intended_root)):
                 _verify_transaction(paths, record)
-                record["reload_ack"] = {"plist_sha256": plist["intended_sha256"],
+                record["reload_ack"] = {"at": datetime.now(UTC).isoformat(),
+                                        "plist_sha256": plist["intended_sha256"],
                                         "launchd_pid": supervisor_pid,
                                         "gateway_pid": process.pid,
                                         "release_root": str(intended_root),

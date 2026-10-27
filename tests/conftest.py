@@ -31,6 +31,17 @@ from pathlib import Path
 import pytest
 
 
+def reset_pm_path_cache() -> None:
+    """Drop the per-process terminal PATH composition cache between tests.
+
+    A previous test's thread can still be importing ``pm.install`` when the next test starts, and
+    its partially initialized module has no cache yet, so there is nothing to clear.
+    """
+    cache = getattr(sys.modules.get("pm.install"), "_store_path_dirs_cache", None)
+    if cache is not None:
+        cache.clear()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_camofox_leases(tmp_path, monkeypatch):
     """Keep Camofox lease files inside the per-test directory, never the host state dir."""
@@ -337,9 +348,7 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
                                            sources=(install_state._active_root,))
     monkeypatch.setattr(install_state, "machine_places", lambda: isolated_places)
     install_state.probe.cache_clear()
-    # The per-process terminal PATH composition cache must not carry one test's store into the next.
-    if "pm.install" in sys.modules:
-        sys.modules["pm.install"]._store_path_dirs_cache.clear()
+    reset_pm_path_cache()
     from hermes_cli import onboarding_due
 
     onboarding_due.reset_for_tests()

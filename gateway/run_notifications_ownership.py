@@ -15,7 +15,7 @@ import logging
 import sqlite3
 from typing import Any, Optional, Sequence, cast
 
-from gateway.session import SessionEntry
+from gateway.session import SessionEntry, SessionStore
 from hermes_state_errors import StateDbReplacedError
 
 # Log-record parity with the origin module.
@@ -287,10 +287,14 @@ class GatewayNotificationOwnershipMixin:
         with runner._completion_delivery_lock:
             for delegation_id in completion_ids:
                 runner._completion_deliveries_delivered.pop(("async_delegation", delegation_id, ""), None)
+            # The turn can run before admission's off-loop acknowledgement commits: hand the requeue
+            # that claim so it reopens the still-pending row and the late acknowledgement loses.
+            pending_acks = dict(runner._pending_completion_acks())
         for delegation_id in completion_ids:
             try:
                 requeued = await asyncio.to_thread(
-                    requeue_admitted_completion, delegation_id, process_registry.completion_queue)
+                    requeue_admitted_completion, delegation_id, process_registry.completion_queue,
+                    pending_acks.get(delegation_id, ""))
             except Exception:
                 logger.debug("Could not requeue admitted completion %s", delegation_id, exc_info=True)
                 requeued = False
@@ -298,3 +302,97 @@ class GatewayNotificationOwnershipMixin:
                 "Async-delegation completion %s: owner not confirmed after admission; %s.", delegation_id,
                 "offered again" if requeued else "not offered again (result remains queryable)",
             )
+
+    async def _settle_ended_compression_tip(self, session_db: Any, parent_session_id: str) -> str:
+        """Terminal-report verdict for a compression lineage whose tip has itself ENDED.
+
+        Injection cannot follow an ended tip, so delivery pre-flight keeps it ``"retry"``. A terminal
+        report instead settles by the tip's own end reason, like an uncompressed parent."""
+        from gateway.run import _USER_BOUNDARY_END_REASONS
+        try:
+            tip_session_id = await session_db.get_compression_tip(parent_session_id)
+            if not tip_session_id or tip_session_id == parent_session_id:
+                return "retry"
+            tip = await session_db.get_session(tip_session_id)
+        except Exception:
+            logger.debug("Async-completion ended-tip lookup failed for %s", parent_session_id, exc_info=True)
+            return "retry"
+        if tip is None or not tip.get("ended_at"):
+            return "retry"
+        tip_end_reason = str(tip.get("end_reason") or "")
+        if tip_end_reason == "compression":
+            # A compression-ended tip means the next continuation is not visible yet.
+            return "retry"
+        return "terminal" if tip_end_reason in _USER_BOUNDARY_END_REASONS else "deliver"
+
+    async def _classify_completion_target(
+        self, parent_session_id: str, session_key: str = "", *, settle_ended_tip: bool = False,
+    ) -> str:
+        """Classify an async-completion target before adapter acceptance: ``"deliver"`` (spawning
+        session live or compression-rotated with a live continuation; the resolver still retargets),
+        ``"terminal"`` (parent gone for good — unknown / user boundary like /new; drop the durable row
+        rather than falsely ack), ``"retry"`` (DB unavailable / rotation mid-flight; defer the claim).
+
+        ``settle_ended_tip`` classifies an ENDED compression continuation by its own end reason, like
+        an uncompressed parent. Only terminal reports may use it: completion injection cannot follow an
+        ended tip, so for deliveries that state stays ``"retry"`` rather than a falsely acked drop."""
+        return (await self._classify_completion_owner(
+            parent_session_id, session_key, settle_ended_tip=settle_ended_tip,
+        ))[0]
+
+    async def _classify_completion_owner(
+        self, parent_session_id: str, session_key: str = "", *, settle_ended_tip: bool = False,
+    ) -> tuple[str, str, str]:
+        """``_classify_completion_target``'s verdict and, on ``"deliver"``, the owning session it proved
+        (a delegate child's pin resolved through ``model_config._delegate_from``) and the session delivery
+        reaches (the owner, or its compression tip)."""
+        from gateway.run import _USER_BOUNDARY_END_REASONS
+        session_db = await asyncio.to_thread(lambda: getattr(self, "_session_db", None))
+        if session_db is None:
+            return "retry", "", ""
+        entry = None
+        if session_key:
+            try:
+                session_store: SessionStore = cast(Any, self).session_store
+                await asyncio.to_thread(session_store._ensure_loaded)
+                entry = session_store._entries.get(session_key)
+            except Exception:
+                logger.debug("Completion route lookup failed for %s", session_key, exc_info=True)
+                return "retry", "", ""
+        verdict, parent_session_id, parent = await self._lookup_completion_owner(
+            parent_session_id, entry.session_id if entry else "",
+        )
+        target_session_id = parent_session_id
+        # A local conversation a viewer closed keeps its own work as a note on its closed tip (#134889 LC-7).
+        closed_tip = await self._closed_local_target(session_db, entry, parent_session_id, parent)
+        if closed_tip:
+            verdict, target_session_id = "deliver", closed_tip
+        elif verdict == "deliver" and parent is not None and parent.get("ended_at"):
+            end_reason = str(parent.get("end_reason") or "")
+            if end_reason != "compression":
+                # Only a USER-closed session (/new, user_exit, session_switch) is unreachable; idle/timeout
+                # ends stay routable and the resolver retargets. Boundary set shared with the resolver.
+                verdict = "terminal" if end_reason in _USER_BOUNDARY_END_REASONS else "deliver"
+            else:
+                verdict, target_session_id = await self._resolve_compression_lineage_target(
+                    session_db, entry, parent_session_id,
+                )
+                if verdict == "retry" and settle_ended_tip:
+                    verdict = await self._settle_ended_compression_tip(session_db, parent_session_id)
+        if verdict != "deliver":
+            return verdict, "", ""
+        return verdict, parent_session_id, target_session_id or parent_session_id
+
+    def _unpublish_completion_acks(self, ack_claims) -> None:
+        """Forget admission claims whose settle finished. Runs in the settle worker thread."""
+        runner = cast(Any, self)
+        with runner._completion_delivery_lock:
+            pending_acks = self._pending_completion_acks()
+            for delegation_id, claim_id in ack_claims:
+                if pending_acks.get(delegation_id) == claim_id:
+                    del pending_acks[delegation_id]
+
+    def _pending_completion_acks(self) -> dict:
+        """``delegation_id -> admission claim`` whose acknowledgement has not finished. Caller holds
+        ``_completion_delivery_lock``. Lazily created: some runners are built without ``__init__``."""
+        return self.__dict__.setdefault("_completion_acks_pending", {})

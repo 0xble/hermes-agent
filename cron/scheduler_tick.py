@@ -7,6 +7,7 @@ import time
 
 from cron import store_health
 from cron.constants import is_recurring
+from cron.scheduler_diagnostics import note_dispatch_stage
 
 logger = logging.getLogger("cron.scheduler")
 
@@ -28,6 +29,35 @@ def _log_tick_yield_once(reason: str) -> None:
             "process. Restart this one to reclaim its ticks.",
             reason)
     _last_yield_log = {"reason": reason, "at": now}
+
+
+def process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
+    """Run one due job via the shared ``run_one_job`` body."""
+    from cron import scheduler as _sched
+
+    # Claim only when the worker actually starts, so a queued lease can't expire first.
+    note_dispatch_stage(job, "fire_claim_enter")
+    try:
+        claimed = _sched.claim_job_for_fire(job["id"], return_job=True)
+        note_dispatch_stage(job, "fire_claim_exit")
+    except OSError as exc:
+        store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
+        _sched.settle_unstarted_execution(
+            job["execution_id"], job["id"], f"Cron store unwritable; not started: {exc}")
+        return False
+    except BaseException as exc:  # settle first, then surface the real error
+        _sched.settle_unstarted_execution(
+            job["execution_id"], job["id"], f"Fire claim failed: {type(exc).__name__}: {exc}")
+        raise
+    if not claimed:
+        _sched.finish_execution(
+            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+        return True
+    # CAS returns the persisted record; bool fallback only for older test doubles.
+    claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
+    claimed_job["execution_id"] = job["execution_id"]
+    claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    return _sched.run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
 def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None,
@@ -178,7 +208,7 @@ def _tick_admitted(
                 _max_workers if _max_workers else "unbounded")
 
         def _process_job(job: dict) -> bool:
-            return _sched._process_due_job(job, adapters, loop, verbose)
+            return process_due_job(job, adapters, loop, verbose)
 
         # Persistent pool, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
         # re-arms next_run_at on completion, so no catch-up queue is needed.
