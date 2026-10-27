@@ -103,7 +103,9 @@ def _revive_blocked_goal_for_user_turn(sid: str, session: dict, user_turn: bool)
     from hermes_cli.goals import GoalManager
     goal_mgr = GoalManager(session_id=str(session["session_key"]))
     if goal_mgr.resume_for_user_input():
-        _emit("status.update", sid, {"kind": "goal", "text": f"▶ Goal resumed: {goal_mgr.state.goal}"})
+        from hermes_cli.goal_notices import goal_notices_enabled
+        if goal_notices_enabled():
+            _emit("status.update", sid, {"kind": "goal", "text": f"▶ Goal resumed: {goal_mgr.state.goal}"})
         _publish_session_control_snapshot(sid, session, only_if_present=True)
 
 
@@ -379,6 +381,7 @@ def _goal_followup_after_turn(
     chain once ``running`` is released, or None.  Compression failures are never judge
     input: the error text is not work toward the goal, and judging it spends a turn."""
     from hermes_cli.goal_turn_outcome import model_final_response
+    from hermes_cli.goal_notices import goal_notices_enabled
     raw = model_final_response(result, raw)
     goal_followup = None
     compression_exhausted = bool(isinstance(result, dict) and result.get("compression_exhausted"))
@@ -410,7 +413,7 @@ def _goal_followup_after_turn(
             decision = goal_mgr.evaluate_after_turn(
                 raw, user_initiated=user_initiated, background_processes=_bg_procs, active_delegations=_active_deleg,
                 evidence_session_id=getattr(session.get("agent"), "session_id", None) or None)
-            if verdict_msg := decision.get("message") or "":
+            if (verdict_msg := decision.get("message") or "") and goal_notices_enabled():
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
             if decision.get("should_continue") and (
                 cont_prompt := decision.get("continuation_prompt") or ""):
