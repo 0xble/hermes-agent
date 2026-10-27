@@ -45,6 +45,10 @@ content, lineage reads, or forensic reads. This can hide divergent payloads unde
 violates the durable logical-identity contract. The caller's in-memory handoff list is collapsed the
 same way after the commit, on both direct `SessionDB` and the worker facade, so a dropped duplicate dict
 never flushes back as a second active copy. The worker owner's history read mirrors the replay rule.
+When that surviving dict carries both the reference summary and a typed steer, canonical
+user-origin projections and compressor selectors must retain its live human authority.
+Do not restore a duplicate plain row to make the ask selectable. Standalone handoffs and
+operational display kinds remain synthetic.
 
 Fork patch identity: `hygiene-deferred-adoption`.
 

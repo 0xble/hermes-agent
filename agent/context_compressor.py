@@ -4607,12 +4607,13 @@ Write only the summary body. Do not include any preamble or prefix."""
 
     @classmethod
     def _is_real_user_turn(cls, message: dict[str, Any]) -> bool:
-        """Actionable user turn that is not synthetic scaffolding — the row test both index scans share.
+        """Select live human input, including its projection from a summary carrier.
 
-        Weaker than ``agent.conversation_compression._is_real_user_message``, which also rejects
-        metadata-flagged scaffolding this pair cannot see; use that one when the question is
-        "is this a genuine inbound user message".
+        A standalone handoff is never eligible. Other synthetic flags are also
+        checked by ``agent.conversation_compression._is_real_user_message``.
         """
+        if cls._is_context_summary_message(message):
+            return user_originated_turn_view(message) is not None
         return cls._is_actionable_user_turn(message) and not cls._is_synthetic_compression_user_turn(message)
 
     @classmethod
@@ -5665,10 +5666,9 @@ def split_user_originated_turn(message: Any) -> tuple[Optional[dict[str, Any]], 
         if message.get("timestamp") is not None:
             handoff["timestamp"] = message["timestamp"]
         drop_stale_api_content(handoff)
-        # Hidden is the legacy compaction wrapper and doesn't hide an unwrapped human payload; other
-        # kinds are synthetic.
+        # Hidden wrappers and steers can carry human input. Operational kinds cannot confer user authority.
         display_kind = message.get("display_kind")
-        candidate = None if display_kind and display_kind != "hidden" else ContextCompressor._strip_context_summary_handoff_message(message)
+        candidate = None if display_kind and display_kind not in {"hidden", STEER_DISPLAY_KIND} else ContextCompressor._strip_context_summary_handoff_message(message)
         if candidate is None:
             return handoff, None
     elif message.get("display_kind") and message.get("display_kind") != STEER_DISPLAY_KIND:
