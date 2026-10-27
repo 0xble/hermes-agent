@@ -273,6 +273,20 @@ from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_cont
 from tests._fixtures.repair_capacity import adequate_repair_capacity  # noqa: F401 — registers fixture
 
 
+def clear_pm_install_path_caches():
+    """Clear pm.install's per-process PATH composition caches between tests.
+
+    ``pm.install`` can sit in sys.modules partially initialized (a test collected while its
+    own import chain was still executing the module) before the caches exist. Nothing is
+    cached yet then, so there is nothing to clear.
+    """
+    pm_install = sys.modules.get("pm.install")
+    for cache_name in ("_store_path_dirs_cache", "_store_roots_cache"):
+        cache = getattr(pm_install, cache_name, None)
+        if cache is not None:
+            cache.clear()
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
@@ -337,9 +351,8 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
                                            sources=(install_state._active_root,))
     monkeypatch.setattr(install_state, "machine_places", lambda: isolated_places)
     install_state.probe.cache_clear()
-    # The per-process terminal PATH composition cache must not carry one test's store into the next.
-    if "pm.install" in sys.modules:
-        sys.modules["pm.install"]._store_path_dirs_cache.clear()
+    # The per-process terminal PATH composition caches must not carry one test's store into the next.
+    clear_pm_install_path_caches()
     from hermes_cli import onboarding_due
 
     onboarding_due.reset_for_tests()

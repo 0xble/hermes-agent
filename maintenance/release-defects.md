@@ -1153,3 +1153,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   forces the interleave through real SQLite settlement and `refresh_receipt` and
   expects `settled` with reply `pong`. The paused-resume contract and its timeout
   are unchanged.
+
+## Shared fixture read pm.install caches before the module finished importing
+
+- Fork patch identity: `fork-ci-reliability`.
+- #821 added a per-test reset in `tests/conftest.py` that read
+  `sys.modules["pm.install"]._store_path_dirs_cache`. When a test's own import chain was still
+  executing `pm.install`, the module sat in `sys.modules` without its caches, and every test in that
+  worker errored at setup (`partially initialized module 'pm.install' has no attribute
+  '_store_path_dirs_cache'`, hosted runs 40450773041, 40450847192 and 6 others on 2026-10-26). The
+  reset is now `clear_pm_install_path_caches()`, which clears each cache only if it exists and also
+  resets `_store_roots_cache`.
+- Guard: `tests/test_conftest_pm_cache_reset.py`.
