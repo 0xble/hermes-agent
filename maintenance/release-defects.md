@@ -42,8 +42,8 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   Only events from the acknowledged PID/code identity within the post-ack window
   count. `release-admission-canary.json` retains the terminal result across the
   rollback, and the shared guardian lock prevents duplicate rollback attempts.
-- Only proven absent/ended targets and explicitly suspended routes are excluded
-  from automation outage evidence. Missing routes with a live durable target,
+- Only proven absent/ended targets in the source's runtime home and explicitly
+  suspended routes are excluded from automation outage evidence. Missing routes with a live durable target,
   native refusals, connector/auth failures and invalid producer payloads still
   count. The threshold, observation window and acknowledged-process fence are
   unchanged.

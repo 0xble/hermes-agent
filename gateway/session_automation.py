@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import json
 import logging
+from pathlib import Path
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
@@ -267,11 +268,16 @@ def _owner(runner, event, authority):
     entry = runner.session_store.lookup_by_session_key(route)
     if entry is None:
         # A route not yet restored is not proof its work is stale. Only a known
-        # absent/ended durable target is safe to exclude from outage evidence.
+        # absent/ended target in this source's proven runtime home is stale.
+        from gateway.session_identity import identity_of
+        identity = identity_of(event.source)
+        same_home = (identity is not None and
+                     identity.store_path.resolve() == Path(authority.db.db_path).resolve())
+        same_route = runner.session_store._generate_session_key(event.source) == route
         expected = event.metadata.get('gateway_session_id')
         tip = authority.db.get_compression_tip(expected) if expected else None
         target = authority.db.get_session(tip or expected) if expected else None
-        field = ('automation_target_gone' if expected and
+        field = ('automation_target_gone' if same_home and same_route and expected and
                  (target is None or target.get('ended_at') is not None)
                  else 'automation_route_unavailable')
         raise RuntimeStoreError('not_found', field=field)

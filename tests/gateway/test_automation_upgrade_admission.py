@@ -121,18 +121,29 @@ async def test_missing_legacy_envelope_does_not_hide_invalid_live_automation(upg
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('gone', [False, True])
-async def test_missing_route_only_excludes_a_proven_gone_target(upgraded_chat, monkeypatch, gone):
+@pytest.mark.parametrize('proof', ['same', 'foreign', 'absent'])
+async def test_missing_route_only_excludes_a_proven_gone_target(upgraded_chat, monkeypatch, gone, proof):
     from gateway.platforms.event import MessageEvent
     from hermes_state_runtime import RuntimeStoreError
     runner, adapter, authority, entry, _, turns, _ = upgraded_chat
-    event = MessageEvent(text='notice', source=entry.origin, internal=True,
+    source = runner._restored_source(runner.session_store.lookup_by_session_key(entry.session_key))
+    if proof == 'foreign':
+        from dataclasses import replace
+        from gateway.session_identity import identity_of
+        identity = identity_of(source)
+        assert identity is not None
+        source._identity = replace(identity, runtime_home=identity.runtime_home / 'foreign')
+    elif proof == 'absent':
+        from gateway.session import SessionSource
+        source = SessionSource.from_dict(source.to_dict())
+    event = MessageEvent(text='notice', source=source, internal=True,
                          metadata={'gateway_session_key': entry.session_key,
                                    'gateway_session_id': 'deleted' if gone else entry.session_id})
     monkeypatch.setattr(runner.session_store, 'lookup_by_session_key', lambda key: None)
     with pytest.raises(RuntimeStoreError) as refused:
         await authority.admit_automation(adapter, event, 'pending-route')
     assert refused.value.reason == 'not_found'
-    if gone:
+    if gone and proof == 'same':
         assert refused.value.field == 'automation_target_gone'
         assert admission_canary.snapshot()['refusals'] == []
     else:
