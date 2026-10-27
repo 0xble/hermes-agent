@@ -140,14 +140,19 @@ _TITLE_PROMPT_TEMPLATE = (
     'Too long: {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}\n\n'
     "__REPLY_RULE__"
 )
+# Good lines fit TASK_TITLE_TARGET_CHARS so the examples model the length the prompt asks for.
 _TASK_PROMPT_PAIRS = (
-    ("Science memo insights", "Extract insights from Science memo"),
-    ("Slack thread auto-rename", "Implement Slack thread auto-rename"),
+    ("Science memo insights", "Summarize Science memo"),
+    ("Slack thread auto-rename", "Auto-rename Slack threads"),
     ("Reply to Usman discussion", "Draft reply to Usman"),
 )
+# Bad lines only: a Good line can be the legitimately correct title for a similar message.
 _TASK_EXAMPLE_ECHO_REJECT = frozenset(
-    title.lower() for pair in _TASK_PROMPT_PAIRS for title in pair
+    bad.lower() for bad, _good in _TASK_PROMPT_PAIRS
 ) | {_PROMPT_VAGUE_EXAMPLE.lower()}
+# Soft target only: Slack's mobile thread header clips near 29 characters. Longer titles
+# are still accepted; the 80-character ceiling remains the hard limit.
+TASK_TITLE_TARGET_CHARS = 28
 _TASK_TITLE_PROMPT_TEMPLATE = (
     "You name chat sessions. Write a concise task-like title for the user's requested outcome.\n\n"
     "Rules:\n"
@@ -158,7 +163,9 @@ _TASK_TITLE_PROMPT_TEMPLATE = (
     "- For non-task chit-chat a short non-verb subject is acceptable. Use Friendly greeting for a bare greeting.\n"
     "- Keep proper names and technical terms exact. Never invent a subject or task.\n"
     "- Privacy-safe: omit secrets, credentials, contact details, and sensitive personal specifics.\n"
-    "- At most 80 characters. No emoji, trailing punctuation, quotes, tool names, or Title: prefix.\n"
+    f"- Aim for {TASK_TITLE_TARGET_CHARS} characters or fewer so the title fits a phone header. "
+    "Drop qualifiers before the verb or main object, and never cut a word short.\n"
+    "- No emoji, trailing punctuation, quotes, tool names, or Title: prefix.\n"
     "- Never answer the message. Name it. If the task or subject is unclear, set abstain to true and title empty.\n"
     "__LANGUAGE_RULE__\n__LINK_RULE__\n__INSTRUCTIONS__\n__AVOID_TITLES__\n__ICON_RULE__\n__EXAMPLES__"
     "__REPLY_RULE__"

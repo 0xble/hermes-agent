@@ -25,12 +25,21 @@ class TurnSessionTitlesMixin:
                 "Gateway auto-title failure suppressed (not user-visible): %s: %s", task, exc,
             )
             agent._title_style = "noun"
+            session_id = getattr(agent, "session_id", None)
+            runner = self._runner
+            session_key = getattr(ctx, "session_key", None)
+
+            def session_current() -> bool:
+                # Fence on session identity, not run generation: a quick follow-up starts a new
+                # run but keeps the session, and the titler never fires again for it.
+                peek = getattr(getattr(runner, "session_store", None), "peek_session_id", None)
+                return bool(session_id) and callable(peek) and peek(session_key) == session_id
+
             # A platform adapter may own its session-title lane (Slack DM thread upgrades).
             adapter = getattr(ctx, "_status_adapter", None)
             configure = getattr(type(adapter), "configure_session_titles", None)
-            if configure is not None and configure(adapter, agent, ctx):
+            if configure is not None and configure(adapter, agent, ctx, session_current):
                 return
-            session_id = getattr(agent, "session_id", None)
             if local_viewer_turn(self):
                 # Main's CLI repainted its status-bar title when the auto-title landed.
                 authority, canonical_id, _generation = self._approval_owner
@@ -43,7 +52,6 @@ class TurnSessionTitlesMixin:
                         canonical_id, local_session_info(authority, ref), event_type="session.info")
                 agent._on_session_title = republish
                 return
-            runner = self._runner
             source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
             # Both lanes spend a rate-limited platform call per title, so they use the model's title
             # only (TitleCallback); renaming twice burns Discord's 2-per-10-min budget on a throwaway.
