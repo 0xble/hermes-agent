@@ -5,6 +5,9 @@ pre-#531 main (3c537dad), and pre-rebase #551 (d662844);
 these fixtures deliberately do not import the current or legacy formatter constants.
 """
 
+import json
+from pathlib import Path
+
 import pytest
 
 from agent.synthetic_prompt import auto_recall_query, human_prompt_text
@@ -161,6 +164,122 @@ def _render(template: str) -> str:
 
 def _rows(formatter: str):
     return [row for row in GOAL_PROMPT_REGISTRY if row["formatter"] == formatter]
+
+
+FROZEN_REGISTRY_ROWS = json.loads(
+    (Path(__file__).parents[1] / "fixtures" / "goal_prompt_history.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("new_wording", [False, True])
+def test_regeneration_keeps_frozen_history_outside_reachable_commits(tmp_path, monkeypatch, new_wording):
+    import runpy
+    import sys
+    from scripts.dev import snapshot_goal_prompt_history as snapshot
+
+    historical = FROZEN_REGISTRY_ROWS[0]
+    output = tmp_path / "hermes_cli" / "goals_prompt_registry.py"
+    output.parent.mkdir()
+    output.write_text(f"GOAL_PROMPT_REGISTRY: tuple = ({historical!r},)\n", encoding="utf-8")
+    current = "A new contract for {goal}: {contract_block}." if new_wording else historical["template"]
+    (output.parent / "goals.py").write_text(
+        f"CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = {current!r}\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(snapshot, "REPO", tmp_path)
+    monkeypatch.setattr(snapshot, "OUTPUT", output)
+    monkeypatch.setattr(snapshot, "_commits", list)
+    monkeypatch.setattr(sys, "argv", ["snapshot_goal_prompt_history.py"])
+
+    assert snapshot.main() == 0
+    rows = runpy.run_path(str(output))["GOAL_PROMPT_REGISTRY"]
+    by_template = {row["template"]: row for row in rows}
+    assert set(by_template) == {historical["template"], current}
+    assert by_template[historical["template"]]["source_commits"] == tuple(historical["source_commits"])
+    if new_wording:
+        assert by_template[current]["source_commits"] == ("working-tree",)
+
+
+@pytest.mark.parametrize("frozen_provenance", [("working-tree",), ("retired-branch",)])
+def test_regeneration_refreshes_reachable_provenance(tmp_path, monkeypatch, frozen_provenance):
+    import runpy
+    import subprocess
+    import sys
+    from scripts.dev import snapshot_goal_prompt_history as snapshot
+
+    committed = "b" * 40
+    template = "Committed goal {goal}: {contract_block}"
+    row = {"formatter": "contract", "template": template, "source_commits": frozen_provenance}
+    output = tmp_path / "hermes_cli" / "goals_prompt_registry.py"
+    output.parent.mkdir()
+    output.write_text(f"GOAL_PROMPT_REGISTRY: tuple = ({row!r},)\n", encoding="utf-8")
+
+    def git(*args):
+        if args == ("show", f"{committed}:hermes_cli/goals.py"):
+            return f"CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = {template!r}\n"
+        raise subprocess.CalledProcessError(128, ("git", *args))
+
+    monkeypatch.setattr(snapshot, "REPO", tmp_path)
+    monkeypatch.setattr(snapshot, "OUTPUT", output)
+    monkeypatch.setattr(snapshot, "_commits", lambda: [committed])
+    monkeypatch.setattr(snapshot, "_git", git)
+    monkeypatch.setattr(sys, "argv", ["snapshot_goal_prompt_history.py"])
+
+    assert snapshot.main() == 0
+    generated = runpy.run_path(str(output))
+    assert generated["GOAL_PROMPT_REGISTRY"] == (row | {"source_commits": (committed,)},)
+    assert generated["SCANNED_GOAL_PROMPT_COMMITS"] == (committed,)
+
+
+def test_regeneration_keeps_main_scan_inventory(tmp_path, monkeypatch):
+    import runpy
+    import sys
+    from scripts.dev import snapshot_goal_prompt_history as snapshot
+
+    historical = dict(FROZEN_REGISTRY_ROWS[0])
+    historical["source_commits"] = tuple(historical["source_commits"])
+    own_scanned = historical["source_commits"]
+    main_scanned = (*own_scanned, "c" * 40)
+    frozen = f"GOAL_PROMPT_REGISTRY: tuple = ({historical!r},)\n"
+    output = tmp_path / "hermes_cli" / "goals_prompt_registry.py"
+    output.parent.mkdir()
+    output.write_text(frozen + f"SCANNED_GOAL_PROMPT_COMMITS: tuple = {own_scanned!r}\n", encoding="utf-8")
+
+    def git(*args):
+        assert args == ("show", "origin/main:hermes_cli/goals_prompt_registry.py")
+        return frozen + f"SCANNED_GOAL_PROMPT_COMMITS: tuple = {main_scanned!r}\n"
+
+    monkeypatch.setattr(snapshot, "REPO", tmp_path)
+    monkeypatch.setattr(snapshot, "OUTPUT", output)
+    monkeypatch.setattr(snapshot, "SOURCE_FILES", ())
+    monkeypatch.setattr(snapshot, "_commits", list)
+    monkeypatch.setattr(snapshot, "_git", git)
+    monkeypatch.setattr(sys, "argv", ["snapshot_goal_prompt_history.py"])
+
+    assert snapshot.main() == 0
+    generated = runpy.run_path(str(output))
+    assert generated["GOAL_PROMPT_REGISTRY"] == (historical,)
+    assert generated["SCANNED_GOAL_PROMPT_COMMITS"] == main_scanned
+
+
+@pytest.mark.parametrize("row", FROZEN_REGISTRY_ROWS, ids=lambda row: row["source_commits"][0][:8])
+def test_frozen_unreachable_history_stays_out_of_both_memory_paths(row):
+    prompt = _render(row["template"])
+    if row["formatter"] == "revisions":
+        prompt = _render(BASE_SIMPLE_TEMPLATE) + prompt
+    assert human_prompt_text(prompt) is None
+    assert auto_recall_query(prompt) == ""
+    assert filter_retain_messages(prompt, "[SILENT]") == (None, None)
+
+    merged = prompt + "\n\n" + HUMAN
+    if row["formatter"] == "revisions":
+        # Unframed revision quotes can span arbitrary paragraphs, so their suffix is ambiguous.
+        assert human_prompt_text(merged) is None
+        assert auto_recall_query(merged) == ""
+        assert filter_retain_messages(merged, "[SILENT]") == (None, None)
+    else:
+        assert human_prompt_text(merged) == HUMAN
+        assert auto_recall_query(merged) == HUMAN
+        assert filter_retain_messages(merged, "[SILENT]")[0] == HUMAN
 
 
 def test_registry_covers_every_current_goal_formatter_constant():

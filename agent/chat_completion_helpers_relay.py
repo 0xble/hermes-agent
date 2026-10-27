@@ -28,6 +28,19 @@ def _tool_call_delta_view(tc_delta: Any) -> Any:
         "function": SimpleNamespace(**function) if isinstance(function, dict) else function})
 
 
+def _relay_stream_metadata(agent, api_mode: str) -> dict:
+    call_role = ("delegated" if getattr(agent, "is_subagent", False)
+                 else "fallback" if int(getattr(agent, "_fallback_index", 0) or 0) > 0 else "primary")
+    return {"api_mode": api_mode, "api_request_id": getattr(agent, "_current_api_request_id", None),
+        "call_role": call_role}
+
+
+def stream_service_tier(chunk: Any, previous: str | None = None) -> str | None:
+    """Keep the last reported tier for either SDK chunks or Relay's post-intercept dicts."""
+    tier = chunk.get("service_tier") if isinstance(chunk, dict) else getattr(chunk, "service_tier", None)
+    return tier if isinstance(tier, str) and tier.strip() else previous
+
+
 class RelayChatAccumulator:
     """Rebuild a chat.completion from Relay's post-intercept chunk dicts."""
 
@@ -38,12 +51,14 @@ class RelayChatAccumulator:
         self._reasoning_details: list[Any] = []  # opaque provider records (signed blocks); order preserved verbatim
         self._tool_calls = _ToolCallAccumulator()
         self._model = self._usage = self._finish_reason = None
+        self._service_tier = None
         self._role = "assistant"
 
     def observe(self, chunk: Any) -> None:
         if not isinstance(chunk, dict):
             return
         self._model = chunk.get("model") or self._model
+        self._service_tier = stream_service_tier(chunk, self._service_tier)
         if chunk.get("usage"):
             self._usage = chunk["usage"]
         choices = chunk.get("choices") or []
@@ -78,5 +93,5 @@ class RelayChatAccumulator:
             "reasoning_details": self._reasoning_details or None,
             "tool_calls": [acc[i] for i in sorted(acc)] or None}
         # "stop" also covers Nous Portal ``lastOne`` usage frames, which carry no finish_reason.
-        return {"model": self._model, "usage": self._usage,
+        return {"model": self._model, "usage": self._usage, "service_tier": self._service_tier,
             "choices": [{"message": message, "finish_reason": self._finish_reason or "stop"}]}

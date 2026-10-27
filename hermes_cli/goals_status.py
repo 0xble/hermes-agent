@@ -1,7 +1,25 @@
-"""Goal status presentation shared by command surfaces."""
+"""Goal snapshot reads and status presentation shared by command surfaces."""
+
+from hermes_cli.lifecycle_snapshot import snapshot_control
 
 
 class GoalStatusMixin:
+    @snapshot_control
+    def refresh(self):
+        """Read the durable winner without writing over another manager's changes."""
+        from hermes_cli.goals import GoalPersistenceError, load_goal, logger
+
+        try:
+            self._state = (load_goal(self.session_id) if self._cursor is None else
+                           load_goal(self.session_id, cursor=self._cursor))
+        except GoalPersistenceError as exc:
+            logger.warning("GoalManager: goal for %s is unreadable; treating it as inert: %s",
+                           self.session_id, exc)
+            self._state, self._unreadable = None, exc
+        else:
+            self._unreadable = None
+        return self._state
+
     def status_line(self) -> str:
         from hermes_cli.goals import (GoalRowCorrupt, _goal_budget_label, contract_items,
                                       _session_waiting, _pid_alive, time)

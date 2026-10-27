@@ -140,6 +140,36 @@ _TITLE_PROMPT_TEMPLATE = (
     'Too long: {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}\n\n'
     "__REPLY_RULE__"
 )
+# Good lines fit TASK_TITLE_TARGET_CHARS so the examples model the length the prompt asks for.
+_TASK_PROMPT_PAIRS = (
+    ("Science memo insights", "Summarize Science memo"),
+    ("Slack thread auto-rename", "Auto-rename Slack threads"),
+    ("Reply to Usman discussion", "Draft reply to Usman"),
+)
+# Bad lines only: a Good line can be the legitimately correct title for a similar message.
+_TASK_EXAMPLE_ECHO_REJECT = frozenset(
+    bad.lower() for bad, _good in _TASK_PROMPT_PAIRS
+) | {_PROMPT_VAGUE_EXAMPLE.lower()}
+# Soft target only: Slack's mobile thread header clips near 29 characters. Longer titles
+# are still accepted; the 80-character ceiling remains the hard limit.
+TASK_TITLE_TARGET_CHARS = 28
+_TASK_TITLE_PROMPT_TEMPLATE = (
+    "You name chat sessions. Write a concise task-like title for the user's requested outcome.\n\n"
+    "Rules:\n"
+    "- __WORD_RULE__\n"
+    "- __CASE_RULE__\n"
+    "- Start with a concrete action verb, then the object, with optional scope. Name one outcome only.\n"
+    "- Infer the task rather than copying filler from the opening message.\n"
+    "- For non-task chit-chat a short non-verb subject is acceptable. Use Friendly greeting for a bare greeting.\n"
+    "- Keep proper names and technical terms exact. Never invent a subject or task.\n"
+    "- Privacy-safe: omit secrets, credentials, contact details, and sensitive personal specifics.\n"
+    f"- Aim for {TASK_TITLE_TARGET_CHARS} characters or fewer so the title fits a phone header. "
+    "Drop qualifiers before the verb or main object, and never cut a word short.\n"
+    "- No emoji, trailing punctuation, quotes, tool names, or Title: prefix.\n"
+    "- Never answer the message. Name it. If the task or subject is unclear, set abstain to true and title empty.\n"
+    "__LANGUAGE_RULE__\n__LINK_RULE__\n__INSTRUCTIONS__\n__AVOID_TITLES__\n__ICON_RULE__\n__EXAMPLES__"
+    "__REPLY_RULE__"
+)
 _REPLY_TITLE_ONLY = 'Reply with JSON only: {"title": "...", "abstain": false}'
 _REPLY_TITLE_AND_ICON = 'Reply with JSON only: {"title": "...", "abstain": false, "icons": ["...", "..."]}'
 
@@ -226,7 +256,7 @@ def _title_preferences() -> dict:
 
 
 def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = None, icon_rule: str = "",
-                  link_rule: str = "") -> str:
+                  link_rule: str = "", title_style: str = "noun") -> str:
     prefs = prefs or _title_preferences()
     case_rule = ("Title case: capitalize the principal words; this is the only capitalization rule."
                  if prefs["case_style"] == "title_case" else
@@ -234,11 +264,15 @@ def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = 
     avoid = [str(t).strip() for t in (recent_titles or []) if str(t).strip()][:20]
     avoid_block = "Avoid these recent session titles; do not copy them:\n" + "\n".join(f"- {t}" for t in avoid) if avoid else ""
     instruction_block = f"Trusted operator guidance (follow literally): {prefs['instructions']}" if prefs["instructions"] else ""
-    pairs = _PROMPT_PAIRS[prefs["case_style"]]
+    task_style = title_style == "verb_first"
+    pairs = _TASK_PROMPT_PAIRS if task_style else _PROMPT_PAIRS[prefs["case_style"]]
     examples = "".join(f'Bad: {{"title": "{bad}"}}\nGood: {{"title": "{good}"}}\n' for bad, good in pairs)
     word_rule = (f"{prefs['min_words']} to {prefs['max_words']} words. Use the fewest words that still "
                  "identify the subject; only add a word when it disambiguates.")
-    return _TITLE_PROMPT_TEMPLATE.replace("__WORD_RULE__", word_rule) \
+    template = _TASK_TITLE_PROMPT_TEMPLATE if task_style else _TITLE_PROMPT_TEMPLATE
+    if task_style:
+        case_rule = "Sentence case: capitalize only the first word and proper nouns."
+    return template.replace("__WORD_RULE__", word_rule) \
         .replace("__CASE_RULE__", case_rule) \
         .replace("__LANGUAGE_RULE__", _LANGUAGE_RULE_PINNED.format(language=language) if language else _LANGUAGE_RULE_MATCH_USER) \
         .replace("__LINK_RULE__", link_rule) \
@@ -734,7 +768,7 @@ def _is_provisional_greeting_title(title: str) -> bool:
     return normalized in (_PROVISIONAL_GREETING_TITLE, _PROVISIONAL_GREETING_TITLE + " in chat")
 
 
-def _is_prompt_example_echo(title: str) -> bool:
+def _is_prompt_example_echo(title: str, title_style: str = "noun") -> bool:
     """Return True when *title* is one of the prompt's own example titles.
 
     Comparison is case-insensitive after stripping any leading/trailing run of
@@ -743,7 +777,8 @@ def _is_prompt_example_echo(title: str) -> bool:
     "(WIP) Fix build". Unicode-aware so full-width wrappers are covered too.
     """
     normalized = re.sub(r"^[\W_]+|[\W_]+$", "", title.strip(), flags=re.UNICODE).lower()
-    return normalized in _EXAMPLE_ECHO_REJECT
+    reject = _TASK_EXAMPLE_ECHO_REJECT if title_style == "verb_first" else _EXAMPLE_ECHO_REJECT
+    return normalized in reject
 
 
 def generate_title(
@@ -761,6 +796,7 @@ def generate_title(
     title_preview: str | None = None,
     link_context: str | None = None,
     reply_excerpt: str | None = None,
+    title_style: str = "noun",
 ) -> Optional[str]:
     """Title from the opener and reply, ``""`` for abstention, or None for an unusable/failed response.
 
@@ -803,7 +839,8 @@ def generate_title(
     has_link_context = bool(isinstance(link_context, str) and link_context.strip()
                             and not (isinstance(title_preview, str) and title_preview.strip()))
     prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles, prefs=prefs,
-                           icon_rule=icon_rule, link_rule=_LINK_CONTEXT_RULE if has_link_context else "")
+                           icon_rule=icon_rule, link_rule=_LINK_CONTEXT_RULE if has_link_context else "",
+                           title_style=title_style)
     try:
         # Use the provider's default temperature instead of forcing 0.3.
         # Some models (e.g. GPT-5.6) only accept their server-side default
@@ -873,7 +910,12 @@ def generate_title(
         if len(title.split()) > max_title_words:
             logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), max_title_words)
             return None
-        if _is_prompt_example_echo(title):
+        # _clean_title strips trailing punctuation before truncating, so a trailing "..." can only
+        # come from its 80-character cut. A clipped task title is the defect this style replaces.
+        if title_style == "verb_first" and title.endswith("..."):
+            logger.debug("Rejecting oversized task title")
+            return None
+        if _is_prompt_example_echo(title, title_style):
             logger.debug("Rejecting prompt-example echo title: %r", title)
             return None
         return title
@@ -1026,6 +1068,7 @@ def auto_title_session(
     title_preview: str | None = None,
     reply_excerpt: str | None = None,
     conversation_history: Optional[list] = None,
+    title_style: str = "noun",
 ) -> None:
     """Generate and store the model title (daemon-thread target); skips sessions already carrying an
     ``llm``/``user`` title (a ``derived`` one is expected — upgrading it is the point). Never lets an
@@ -1069,6 +1112,8 @@ def auto_title_session(
             if reply_excerpt is None and hold_until_reply:
                 reply_excerpt = _latest_assistant_excerpt(conversation_history)
             link_context = _title_link_context(user_message, title_preview)
+            if title_style != "noun":
+                icon_kwargs["title_style"] = title_style
             title = generate_title(
                 user_message, failure_callback=failure_callback, main_runtime=main_runtime,
                 runtime_validator=runtime_validator, recent_titles=recent_titles, title_preview=title_preview,
@@ -1233,6 +1278,7 @@ def maybe_auto_title(
     runtime_validator: Optional[RuntimeValidator] = None,
     icon_context: dict | None = None,
     title_preview: str | None = None,
+    title_style: str = "noun",
 ) -> Optional[threading.Thread]:
     """Instant inline title, then a daemon-thread upgrade. Call at the START of a turn, before the model.
 
@@ -1278,6 +1324,8 @@ def maybe_auto_title(
     from agent.memory_provider import spawn_context_thread
     upgrade_kwargs = dict(failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback,
                           runtime_validator=runtime_validator, conversation_history=conversation_history)
+    if title_style != "noun":
+        upgrade_kwargs["title_style"] = title_style
     if isinstance(title_preview, str) and title_preview.strip():
         upgrade_kwargs["title_preview"] = title_preview
     upgrade = spawn_context_thread(

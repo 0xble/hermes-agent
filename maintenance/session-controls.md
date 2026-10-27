@@ -8,6 +8,32 @@ Session controls let one Hermes session pause, resume, clear, or replace another
 
 Agents reach this primitive through the `goal_set` and `loop_set` tools, which the `goal-lifecycle` and `loop-lifecycle` plugins in the agents repository register. Those plugins call `apply_control` (and `resolve_target`) when a control action carries `target` or `user_quote`; core itself registers no tool, so a build without those plugins has no initiating entry point.
 
+## Gateway Turn Ownership
+
+A fresh gateway turn has its own task-local delegation scope, even when an inline
+producer submits it from a delegated child. Admission masks the producer's child,
+immediate-parent and chain-root bindings. New children created by the admitted
+turn inherit that turn's session as their parent and chain root. Executor work
+inherits the same scope.
+
+This reset never removes a genuine subprocess child marker. The lifecycle
+plugins must check the core process-aware delegation predicate as well as the
+task-local flag, so a child process cannot gain `goal_set` or `loop_set` access by
+entering the gateway again. Both tools return `parent_only` in that process.
+
+When inline dispatch returns, raises or is cancelled, it restores the caller's
+session variables, delivery capabilities, task-local working directory and
+nested delegation bindings. The existing profile and Hermes-home scopes retain
+their own restoration. Clearing session variables inside a turn keeps its
+existing semantics.
+
+Core coverage is `tests/gateway/test_top_level_delegation_context.py` and the
+session-context, delegation-binding and subprocess-environment suites. Registered
+handler and real subprocess coverage is maintained with the lifecycle plugins in
+`agents` at `sources/plugins/goal-lifecycle/test_gateway_parent_tools.py`. Run that
+suite from a compatible core checkout with its own interpreter and disposable
+Hermes homes. The core lineage controls alone do not prove plugin permission.
+
 ## Required behavior
 
 - Store one audit/outbox record per control under `state_meta` with a 24-hour pending expiry.
@@ -59,6 +85,8 @@ arbitrary queue depth is not an enqueue receipt: the outbox retries until its ow
 accepted or superseded. Queue cleanup runs synchronously on the event loop and removes the adapter
 slot only while it still holds the inspected continuation. A persisted gateway origin with an
 unavailable adapter retains its unsettled outcome flags for retry, including cleanup and notices;
+`goals.notices: false` settles only autonomous goal outcome notices as skipped, not
+continuation admission or cleanup (see [notice visibility](goal-autonomy.md#notice-visibility));
 only a missing origin is permanently skipped. Offline continuations still record supersession,
 and the existing 24-hour outcome expiry bounds retries.
 

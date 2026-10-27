@@ -10,6 +10,7 @@ import logging
 from typing import Callable
 
 from hermes_cli import goals
+from hermes_cli.goal_notices import goal_notices_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +172,7 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
     if drafting:
         if not arg:
             return GoalCommandResult("Usage: /goal draft <objective in plain language>", error=True)
-        if progress is not None:
+        if progress is not None and goal_notices_enabled():
             progress("Drafting completion contract…")
         try:
             contract = goals.draft_contract(arg)
@@ -206,9 +207,14 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
         # Bare /goal text is an in-place edit of the current objective. It must not
         # reset history or enqueue a turn: a paused goal remains paused, while an
         # active goal remains active until its existing continuation path runs.
+        # Inline fields and drafts do not express removal, so patch only supplied values.
         result = mgr.replace(
             reason="explicit /goal replacement command", goal=headline or arg,
-            contract=contract, actor="user",
+            contract=(
+                {key: value for key, value in contract.to_dict().items() if value.strip()}
+                if contract else None
+            ),
+            actor="user",
         )
         if not result.get("ok"):
             return GoalCommandResult(result.get("error", "goal replacement failed"), error=True)
@@ -241,7 +247,8 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
                    "exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.")
     if authoring_findings:
         output += "\n" + goals.format_goal_authoring_warning(authoring_findings)
-    return GoalCommandResult(output, goals.goal_kick_prompt(state.goal, last_user_message), kickoff=True)
+    return GoalCommandResult(output if goal_notices_enabled() else "",
+                             goals.goal_kick_prompt(state.goal, last_user_message), kickoff=True)
 
 
 def is_goal_control(arg: str) -> bool:

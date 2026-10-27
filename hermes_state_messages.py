@@ -25,12 +25,12 @@ from hermes_state_common import (
 from hermes_state_detached_results import SessionDetachedResultsMixin
 from hermes_state_todo import SessionTodoResultMixin
 from hermes_state_identity import (
-    _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json,
-    _uid_list, display_identity)
+    _absorbed_uids_json, _carried_tail_slots, _compaction_messages, _newest_message_uid_rows, _restore_identity_columns,
+    _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json, _uid_list, display_identity)
 from hermes_state_transactions import execute_transcript_write
 
 from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_phase
-from hermes_state_message_archive import archive_message_rows, archive_named_rows
+from hermes_state_message_archive import archive_message_rows, archive_named_rows, clone_tail_survivors
 from hermes_state_display_fold import DisplayFoldMixin, _FoldPlan
 from hermes_state_search_runtime import search_stage
 
@@ -876,20 +876,23 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
                 carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
                 merged_away=proved[1], fold_plan=affected_fold)
         with write_phase("archive_enumerate"):
-            tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
+            tail_ids, _ = ([], 0) if watermark is None else self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
                 (session_id, int(watermark)))
             # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
             # concurrent append would steal a LIMIT slot.
             rewind_ids: list[int] = self._resolve_carried_row_ids(
                 conn, session_id, carried_messages or [])
-            if tail_count > 0:
+            # A carried tail slot whose original is a concurrent (above-watermark) row is not a
+            # positional rewind below the watermark.
+            tail_below = tail_count - _carried_tail_slots(conn, tail_ids, compacted_messages, tail_count)
+            if tail_below > 0:
                 bound = watermark is not None
                 rewind_ids += [int(row["id"]) for row in conn.execute(
                     f"SELECT id FROM messages WHERE session_id = ? AND active = 1{' AND id <= ?' if bound else ''} "
                     "ORDER BY id DESC LIMIT ?",
                     (session_id, *((int(watermark),) if bound else ()),
-                     int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
+                     int(tail_below) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
             rewind_ids += tail_ids
             rewind_ids = list(dict.fromkeys(rewind_ids))
         self._seed_display_removals(conn, session_id, affected_fold, rewind_ids)
@@ -899,10 +902,10 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
         with write_phase("archive_timestamp_carry"):
             self._carry_parent_timestamps(conn, session_id, compacted_messages)
-        inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
+        inserted, tool_calls_total = self._insert_message_rows(conn, session_id, _compaction_messages(compacted_messages))
         if tail_ids:
-            self._clone_message_rows(conn, tail_ids)
-            inserted += len(tail_ids)
+            cloned, tail_tool_calls = clone_tail_survivors(self, conn, tail_ids)
+            inserted += cloned
             tool_calls_total += tail_tool_calls
         self._reconcile_display_orders(conn, session_id, affected_fold)
         with write_phase("session_counters"):
@@ -961,57 +964,10 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
                 watermark=watermark, lock_holder=lock_holder, tail_count=tail_count,
                 carried_messages=carried_messages, covered_ids=covered_ids,
                 unresolved_held=unresolved_held, held_messages=held_messages, held_for_cas=held_for_cas, fold_plan=fold_plan)
-        return execute_transcript_write(self, _do, compacted_messages, session_id=session_id)
-
-    def _raise_if_unheld_summary(self, conn, session_id: str, held_messages: list[dict[str, Any]]) -> None:
-        """Raise ``StaleHeldHistory`` when an active summary row is missing from *held_messages*.
-
-        Every summary-producing compaction leaves its summary active, and a history loaded after that
-        commit carries it. A lease-less rewrite whose history lacks it was built from the generation the
-        compaction replaced. Prefer the durable row identity and CAS snapshot carried by gateway-loaded
-        messages; only legacy rows without those fields fall back to role and loaded-view content. This
-        prevents repeated identical summaries from making a stale generation look current."""
-        rows = conn.execute(
-            "SELECT * FROM messages WHERE session_id = ? AND active = 1 AND _compressed_summary = 1",
-            (session_id,)).fetchall()
-        if not rows:
-            return
-        def _view(role: Any, content: Any) -> Any:
-            return self._loaded_view_content(str(role or "unknown"), content)
-
-        held_dicts = [message for message in held_messages if isinstance(message, dict)]
-        held_ids = {message.get("_row_id") for message in held_dicts}
-        held = {
-            (message.get("role"), _view(message.get("role"), message["content"]))
-            for message in held_dicts
-            if isinstance(message.get("content"), str)
-        }
-        held_durable = set()
-        for message in held_dicts:
-            uid = message.get(MESSAGE_UID)
-            snapshot = message.get(DB_ROW_SNAPSHOT)
-            if isinstance(uid, str) and uid and isinstance(snapshot, str) and snapshot:
-                held_durable.add((message.get("role"), uid, snapshot))
-
-        # A gateway projection has durable identity/version for every loaded row. If the active row has
-        # that identity but no exact held version, content equality is not evidence: a newer generation may
-        # carry the same summary text. Legacy projections without identity/version retain the content fallback.
-        from agent.transcript_repair import transcript_row_snapshot
-        def _held_row(row: Any) -> bool:
-            if row["id"] in held_ids:
-                return True
-            uid = row["message_uid"]
-            if isinstance(uid, str) and uid:
-                if (row["role"], uid, transcript_row_snapshot(row)) in held_durable:
-                    return True
-                if held_durable:
-                    return False
-            return (row["role"], _view(row["role"], self._decode_content(row["content"]))) in held
-
-        if any(not _held_row(row) for row in rows):
-            from agent.context_compressor import StaleHeldHistory
-            raise StaleHeldHistory(
-                f"session {session_id} has a compaction summary the held history does not carry")
+        inserted = execute_transcript_write(self, _do, compacted_messages, session_id=session_id)
+        # The caller adopts the committed generation in memory: one dict per message_uid, as stored.
+        compacted_messages[:] = _newest_message_uid_rows(compacted_messages)
+        return inserted
 
     def _message_column_names(self, conn) -> list[str]:
         """Column names of the messages table, cached per-connection era."""
@@ -1596,6 +1552,10 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
             self._active_clause(include_inactive, include_compacted), with_session_id=False, with_compacted=display)
         if include_compacted:
             rows = self._dedupe_display_generations(rows, drop_removed=display)
+        elif repair_alternation and not include_inactive and not include_ancestors:
+            # Live replay of an already-corrupt session names each logical message once (read-only).
+            # Lineage reads keep their by-design rotation copies for the ancestor dedupe below.
+            rows = _newest_message_uid_rows(rows)
         return self._rows_to_conversation(rows, session_id=session_id, include_ancestors=include_ancestors,
             repair_alternation=repair_alternation, include_row_ids=include_row_ids,
             include_summary_markers=repair_alternation, display=display)
@@ -1751,7 +1711,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         # never LLM input: a resuming surface that fed it to the agent would count it in the history
         # and send a prefix the previous process never sent.
         model_history = self._rows_to_conversation(
-            [r for r in rows if r["session_id"] == session_id and r["active"] and r["role"] != "session_meta"],
+            _newest_message_uid_rows(
+                [r for r in rows if r["session_id"] == session_id and r["active"] and r["role"] != "session_meta"]),
             session_id=session_id,
             include_ancestors=False, repair_alternation=True, include_row_ids=True, include_summary_markers=True)
         display_history = self._rows_to_conversation(

@@ -271,6 +271,9 @@ def _maybe_title_session_at_turn_start(
             ),
             title_preview=title_preview,
         )
+        title_style = getattr(agent, "_title_style", "noun")
+        if title_style != "noun":
+            title_kwargs["title_style"] = title_style
         upgrade = maybe_auto_title(session_db, session_id, user_text, **title_kwargs)
         # Finalization starts an unstarted upgrade, or retries a provisional eager
         # opening title with the reply. A settled llm/user title is never regenerated.

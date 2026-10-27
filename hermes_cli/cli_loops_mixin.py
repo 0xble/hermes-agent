@@ -10,6 +10,7 @@ from typing import Any
 
 from agent.i18n import t
 from hermes_cli.gateway_client import GatewayClientError
+from hermes_cli.goal_notices import goal_notices_enabled
 from rich.markup import escape as _escape
 
 
@@ -734,12 +735,17 @@ class CLILoopsMixin:
             if not self._pending_input.empty():
                 return
             mgr = self._get_goal_manager()
-            if mgr is None or not mgr.is_parked():
+            if mgr is None:
+                return
+            # Tools write through separate managers while this CLI keeps its cached instance.
+            mgr.refresh()
+            if not mgr.is_parked():
                 return
             prompt = mgr.lifted_barrier_prompt()
             if prompt:
                 from cli import _DIM, _RST, _cprint
-                _cprint(f"  {_DIM}{t('cli.goal.barrier_lifted')}{_RST}")
+                if goal_notices_enabled():
+                    _cprint(f"  {_DIM}{t('cli.goal.barrier_lifted')}{_RST}")
                 since = mgr.state.waiting_since
                 instance = mgr.state.created_at
                 self._pending_input.put(prompt)
@@ -868,7 +874,8 @@ class CLILoopsMixin:
             return
         mgr = self._get_goal_manager()
         if mgr is not None and mgr.resume_for_user_input():
-            _cprint(f"  ▶ Goal resumed: {mgr.state.goal}")
+            if goal_notices_enabled():
+                _cprint(f"  ▶ Goal resumed: {mgr.state.goal}")
 
     def _post_turn_response(self) -> tuple[str, bool]:
         """Read only the current turn result; a started turn without one is unsuccessful."""
@@ -934,7 +941,8 @@ class CLILoopsMixin:
         decision = mgr.evaluate_after_turn(
             last_response, user_initiated=getattr(self, "_goal_turn_user_initiated", True),
             background_processes=_bg_procs, active_delegations=_active_deleg)
-        _print_decision_message(decision)
+        if goal_notices_enabled():
+            _print_decision_message(decision)
         if decision.get("should_continue"):
             prompt = decision.get("continuation_prompt")
             if prompt:

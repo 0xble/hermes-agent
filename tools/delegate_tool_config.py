@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Dict, List, NamedTuple, Optional
+from agent.fast_mode import BOUNDED_MODES, STATIC_TIERS
 from utils import base_url_hostname, is_truthy_value
 from hermes_cli.fallback_config import scoped_fallback_chain
 
@@ -193,7 +194,7 @@ def _inherit_service_tier() -> bool:
     return is_truthy_value(_cfg().get("inherit_service_tier", False))
 
 
-_INHERITABLE_FAST_MODES = frozenset({"priority", "auto", "cold"})
+_INHERITABLE_FAST_MODES = BOUNDED_MODES | STATIC_TIERS
 
 
 def explicit_parent_reasoning(parent_agent) -> Any:
@@ -209,7 +210,11 @@ def explicit_parent_reasoning(parent_agent) -> Any:
     return override
 
 
-def _resolve_child_service_tier(parent_agent, explicit_overrides: Optional[dict[str, Any]]) -> Optional[str]:
+def _resolve_child_service_tier(
+    parent_agent, explicit_overrides: Optional[dict[str, Any]], *,
+    child_model: Optional[str] = None, child_provider: Optional[str] = None,
+    child_base_url: Optional[str] = None, child_api_key: Optional[str] = None,
+) -> Optional[str]:
     """The child's Fast mode: the parent's mode verbatim when inheritance is on.
 
     The mode, not the parent's wire fields, crosses to the child, so a pinned
@@ -220,9 +225,20 @@ def _resolve_child_service_tier(parent_agent, explicit_overrides: Optional[dict[
     """
     if not _inherit_service_tier():
         return None
-    if isinstance(explicit_overrides, dict) and any(key in explicit_overrides for key in _FAST_REQUEST_OVERRIDE_KEYS):
-        return None
+    if isinstance(explicit_overrides, dict):
+        extra = explicit_overrides.get("extra_body")
+        if any(key in explicit_overrides or (isinstance(extra, dict) and key in extra)
+               for key in _FAST_REQUEST_OVERRIDE_KEYS):
+            return None
     mode = getattr(parent_agent, "service_tier", None)
+    if mode == "ultrafast":
+        # Ultrafast crosses only to a child route and credential that offer it, never as a paid Priority fallback.
+        from agent.codex_service_tiers import ultrafast_offered
+
+        if not child_model or not ultrafast_offered(
+            child_model, provider=child_provider, base_url=child_base_url, access_token=child_api_key,
+        ):
+            return None
     return mode if mode in _INHERITABLE_FAST_MODES else None
 
 
@@ -232,13 +248,14 @@ def _resolve_child_request_overrides(
     child_model: Optional[str],
     child_provider: Optional[str],
     child_base_url: Optional[str],
+    child_api_key: Optional[str] = None,
     explicit_overrides: Optional[dict[str, Any]],
     inherit_parent_route: bool,
 ) -> Optional[dict[str, Any]]:
     """Resolve child request overrides without leaking transient parent fast state.
 
     Non-fast parent overrides remain available when the child stays on the parent's
-    route. A static-priority Fast mode inherited through ``_resolve_child_service_tier``
+    route. A static Fast tier inherited through ``_resolve_child_service_tier``
     is pinned here, re-derived for the child's route; bounded modes are applied per
     request by ``agent.fast_mode``. Explicit child overrides win over inherited state.
     """
@@ -255,12 +272,17 @@ def _resolve_child_request_overrides(
     # Route-independent: a pinned delegation.provider inherits too. No parent wire field
     # crosses routes; the child's own model/provider/base_url decide (None on an
     # unsupported route, e.g. a proxy, so nothing is sent there).
-    if _resolve_child_service_tier(parent_agent, explicit) == "priority":
+    tier = _resolve_child_service_tier(
+        parent_agent, explicit, child_model=child_model, child_provider=child_provider,
+        child_base_url=child_base_url, child_api_key=child_api_key,
+    )
+    if tier in STATIC_TIERS:
         from hermes_cli.models import resolve_fast_mode_overrides
         child_fast = resolve_fast_mode_overrides(
             child_model,
             provider=child_provider,
             base_url=child_base_url,
+            tier=tier,
         )
         if child_fast:
             inherited.update(child_fast)

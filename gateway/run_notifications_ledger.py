@@ -13,8 +13,19 @@ import logging
 import threading
 from typing import Callable, Iterable, TypeVar
 
+from agent.memory_provider import spawn_context_thread
+
 logger = logging.getLogger("gateway.run")
 _T = TypeVar("_T")
+
+
+class _PartialClaimsError(RuntimeError):
+    """A batch claim failed after taking some claims; ``claimed`` is what ``claim_off_loop`` refunds."""
+
+    def __init__(self, cause: BaseException, claimed: list) -> None:
+        super().__init__(str(cause))
+        self.claimed = claimed
+        self.__cause__ = cause
 
 # kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
@@ -39,6 +50,8 @@ def settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> bool:
 async def settle_durable_claims(
     operations: Iterable[tuple[str, str, str]],
     settle: Callable[[str, str, str], bool | None] = settle_durable_claim,
+    *,
+    on_settled: Callable[[], None] | None = None,
 ) -> bool:
     """Settle ``(kind, delegation_id, claim_id)`` claims in ONE worker-thread hop.
 
@@ -47,21 +60,48 @@ async def settle_durable_claims(
     queued settle before the thread starts, and the thread finishes every settle regardless.
     Operations without a claim id are skipped. False reports an unsettled transition; legacy
     custom settlers returning None retain their successful no-result contract.
+
+    ``on_settled`` runs exactly once, after every settle has actually finished (or raised): in the
+    worker thread itself, so neither cancellation of the awaiting task nor loop teardown can run it
+    early or skip it. It runs inline when nothing needs settling. If the default executor is gone,
+    the batch settles on a dedicated thread and the callback follows it there; when no worker can
+    start at all nothing settled, so the callback does not run and the error propagates.
     """
     pending = [op for op in operations if op[2]]
+
+    def _finish() -> None:
+        if on_settled is not None:
+            try:
+                on_settled()
+            except Exception:
+                logger.warning("Durable claim settle callback failed", exc_info=True)
+
     if not pending:
+        _finish()
         return True
 
     def _settle_all() -> bool:
         settled = True
-        for kind, delegation_id, claim_id in pending:
-            if settle(kind, delegation_id, claim_id) is False:
-                settled = False
+        try:
+            for kind, delegation_id, claim_id in pending:
+                if settle(kind, delegation_id, claim_id) is False:
+                    settled = False
+        finally:
+            _finish()
         return settled
 
     loop = asyncio.get_running_loop()
     settle_ctx = contextvars.copy_context()
-    future = loop.run_in_executor(None, settle_ctx.run, _settle_all)
+    try:
+        future = loop.run_in_executor(None, settle_ctx.run, _settle_all)
+    except RuntimeError:
+        # The default executor is gone (loop teardown). Settle on a dedicated non-daemon thread so
+        # the claims are still durably settled; ``on_settled`` runs there only after they are. If
+        # even that thread cannot start, nothing settled, so the callback must not run either.
+        spawn_context_thread(
+            settle_ctx.run, args=(_settle_all,), name="completion-claim-settle", daemon=False,
+        ).start()
+        return True  # Handed off whole; a failed transition still logs from the dedicated thread.
     return await asyncio.shield(future)
 
 
@@ -87,7 +127,14 @@ async def claim_off_loop(claim: Callable[[], _T], release: Callable[[_T], None])
             logger.warning("Could not refund abandoned durable claim", exc_info=True)
 
     def _claim_and_handoff() -> _T:
-        result = claim()  # A failed claim has nothing to release.
+        try:
+            result = claim()  # A failed claim has nothing to release...
+        except _PartialClaimsError as exc:
+            # ...unless it failed partway through a batch: refund the claims already taken, here in
+            # the worker, so neither the caller's cancellation nor loop teardown can strand them.
+            if exc.claimed:
+                _release_abandoned(exc.claimed)
+            raise
         with lock:
             if not abandoned:
                 handed_over.append(result)
@@ -115,7 +162,14 @@ async def claim_siblings_off_loop(entries, consumer: str) -> list:
     from tools.async_delegation import claim_event_delivery, defer_completion_delivery
 
     def _claim() -> list:
-        return [(evt, text, claim_event_delivery(evt, consumer)) for evt, text in entries]
+        claimed = []
+        try:
+            for evt, text in entries:
+                claimed.append((evt, text, claim_event_delivery(evt, consumer)))
+            return claimed
+        except BaseException as exc:
+            # Let claim_off_loop refund every claim taken before the later claim failed.
+            raise _PartialClaimsError(exc, claimed) from exc
 
     def _defer(claimed) -> None:
         for evt, _text, claim_id in claimed:

@@ -702,7 +702,7 @@ _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+    "parent_session_id", "handoff_note", "notify_on_complete", "completion_output_chars", "watch_patterns",
     "heartbeat_seconds", "persist_on_release", "survive_restart", "log_path", "exit_path", "delivered_path",
     "output_log")
 _CHECKPOINT_DEFAULTS = {
@@ -1677,6 +1677,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
+                "parent_session_id": session.parent_session_id,
                 "task_id": session.task_id,
                 "owner_task_id": session.owner_task_id,
                 "command": session.command,
@@ -2614,11 +2615,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                     and s.id not in self._completion_consumed and s.id not in self._poll_observed]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
-                           to_session_key: str, note: str = "", to_source=None) -> Optional[ProcessSession]:
+                           to_session_key: str, note: str = "", to_source=None, to_parent_session_id: str = "",
+                           notify: bool = False) -> Optional[ProcessSession]:
         """Move a RUNNING process from one owner to another under the registry lock. Ownership is the ``owner_task_id``
         field: completion notices are stamped from it at exit time and teardown kills by it, so flipping it here is the
         whole transfer. Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
-        (the caller must not report a transfer that did not happen)."""
+        (the caller must not report a transfer that did not happen). ``to_parent_session_id`` and ``notify`` move the
+        promised completion with the owner: they are set before the exit path can publish, never after."""
         session = self.get(session_id)
         with self._lock:
             if session is None or session.exited or session.owner_task_id != from_owner:
@@ -2627,6 +2630,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
+            if to_parent_session_id:
+                session.parent_session_id = to_parent_session_id
+            if notify:
+                session.notify_on_complete = True
             if to_source is not None:
                 session.parent_session_id = to_owner
                 for field in _WATCHER_ROUTE_KEYS:
@@ -2636,10 +2643,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                     setattr(session, f"watcher_{field}", str(value or ""))
                 # An old reply anchor belongs to the old topic.
                 session.watcher_message_id = ""
-                for watcher in self.pending_watchers:
-                    if watcher.get("session_id") == session_id:
-                        watcher.update(session_key=to_session_key, parent_session_id=to_owner,
-                                       **{field: getattr(session, f"watcher_{field}") for field in _WATCHER_ROUTE_KEYS})
+            for watcher in self.pending_watchers:
+                if watcher.get("session_id") == session_id:
+                    watcher.update(session_key=to_session_key, parent_session_id=session.parent_session_id,
+                                   **{field: getattr(session, f"watcher_{field}") for field in _WATCHER_ROUTE_KEYS})
         # Checkpoints acquire the same lock. Persist after releasing it, including
         # crash-surviving watcher routes rather than only the in-memory owner.
         self._write_checkpoint()
@@ -3318,41 +3325,8 @@ _SESSION_ACTIONS = {
 
 
 def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dict:
-    """Subagent-only: transfer a running background process to the parent agent so its completion is delivered THERE
-    (child-owned process notices are suppressed and child teardown kills what it owns). Validated against the live spawn
-    tree: the caller must be a registered child and must own the process; anything else is an error, never a silent
-    no-op, so a PID mentioned in prose can't masquerade as a transfer."""
-    from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
-    from tools.terminal_tool import _resolve_container_task_id
-    with _active_subagents_lock:
-        record = _active_subagents.get(str(task_id or ""))
-    child = record.get("agent") if record else None
-    parent_ref = getattr(child, "_delegate_parent_ref", None)
-    parent = parent_ref() if callable(parent_ref) else None
-    if parent is None:
-        return {"error": "handoff is only available to a running subagent with a live parent; you are not one."}
-    parent_owner = str(getattr(parent, "_current_task_id", "") or getattr(parent, "session_id", "") or "")
-    if not parent_owner:
-        return {"error": "parent has no process owner id yet; retry after the parent's turn has started."}
-    handed = getattr(child, "_handed_off_processes", None)
-    if handed is None:
-        handed = child._handed_off_processes = []
-    if len(handed) >= _MAX_HANDOFFS_PER_CHILD:
-        return {"error": f"handoff cap reached ({_MAX_HANDOFFS_PER_CHILD} per subagent); wait on or kill the rest yourself."}
-    note = str(args.get("data") or "").strip()
-    if not note:
-        return {"error": "handoff requires `data`: one sentence saying what the process is for and what the parent should do with its result."}
-    session = process_registry.transfer_ownership(
-        session_id, from_owner=str(task_id or ""), to_owner=parent_owner,
-        to_task_id=_resolve_container_task_id(parent_owner),
-        to_session_key=str(getattr(parent, "session_id", "") or ""), note=note)
-    if session is None:
-        return {"error": f"cannot hand off {session_id}: not a running process you own (already exited? read its result "
-                         "with poll/log and report it instead)."}
-    handed.append({"session_id": session.id, "command": session.command, "note": note})
-    return {"status": "handed_off", "session_id": session.id, "command": session.command,
-            "note": "Your parent now owns this process and will receive its completion; you will not. Mention the handoff "
-                    "in your final answer."}
+    from tools.terminal_tool_background import handoff_process
+    return handoff_process(session_id, args, task_id)
 
 
 _MAX_HANDOFFS_PER_CHILD = 3

@@ -19,7 +19,7 @@ try:
     import aiohttp as _aiohttp
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-    from slack_sdk.web.async_client import AsyncWebClient
+    from plugins.platforms.slack.outbound_budget import BudgetedAsyncWebClient as AsyncWebClient
 
     aiohttp = _aiohttp
     SLACK_AVAILABLE = True
@@ -60,12 +60,16 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .task_cards import TaskCardCleanup, finish_task_card
     from .adapter_slash_lane import SlashHandoffLanes
     from .adapter_slash_payload import slash_command_text, slash_thread_id
+    from .adapter_native_stop import handle_agent_session_stopped
+    from .thread_cleanup import process_changed_message
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from attachment_errors import describe_download_exception  # type: ignore
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
     from task_cards import TaskCardCleanup, finish_task_card  # type: ignore
     from adapter_slash_lane import SlashHandoffLanes  # type: ignore
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
+    from adapter_native_stop import handle_agent_session_stopped  # type: ignore
+    from thread_cleanup import process_changed_message
 
 
 logger = logging.getLogger(__name__)
@@ -350,7 +354,7 @@ def check_slack_requirements() -> bool:
     def _import():
         from slack_bolt.async_app import AsyncApp
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-        from slack_sdk.web.async_client import AsyncWebClient
+        from plugins.platforms.slack.outbound_budget import BudgetedAsyncWebClient as AsyncWebClient
         import aiohttp
         return {
             "AsyncApp": AsyncApp, "AsyncSocketModeHandler": AsyncSocketModeHandler,
@@ -1009,7 +1013,10 @@ def _extra_or_env_channel_set_getter(
     return getter
 
 
-class SlackAdapter(BasePlatformAdapter):
+from plugins.platforms.slack.adapter_thread_titles import SlackThreadTitlesMixin
+
+
+class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -1123,6 +1130,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._task_card_cleanup = TaskCardCleanup(self)
         # Guard: set the Slack AI thread title once per DM thread, not per reply.
         self._titled_assistant_threads: set = set()
+        self._upgraded_assistant_threads: set = set()
         # Slash-command contexts so send() can route the first reply ephemerally. Keyed
         # (team_id, channel_id, user_id), two-part when no team id → {"response_url", "ts"}.
         self._slash_command_contexts: dict[tuple[str, ...], dict[str, Any]] = {}
@@ -1627,7 +1635,8 @@ class SlackAdapter(BasePlatformAdapter):
             ("file_change", _noop), ("reaction_added", _reaction(False)),
             ("reaction_removed", _reaction(True)),
             ("assistant_thread_started", self._handle_assistant_thread_lifecycle_event),
-            ("assistant_thread_context_changed", self._handle_assistant_thread_lifecycle_event)):
+            ("assistant_thread_context_changed", self._handle_assistant_thread_lifecycle_event),
+            ("agent_session_stopped", functools.partial(handle_agent_session_stopped, self))):
             self._app.event(event_type)(_listener_for(handler))
         # Catch-all ack: unacked envelopes count as failures and past 95%/60-min Slack disables
         # Event Subscriptions (ALL inbound). Registered AFTER all named handlers (first match wins).
@@ -2019,7 +2028,13 @@ class SlackAdapter(BasePlatformAdapter):
         just guarantees it runs without letting a cleanup error mask the caller's SendResult.
         """
         try:
-            await self.stop_typing(chat_id, metadata=metadata)
+            md = metadata or {}
+            # Slack clears status when a bot posts. An intermediate post must restore the
+            # running surface immediately, not leave it blank until the next 2s refresh.
+            if self._typing_is_active(chat_id, metadata) and not md.get("notify"):
+                await self.send_typing(chat_id, metadata=metadata)
+            elif not (md.get("_interim_send") or md.get("expect_edits")):
+                await self.stop_typing(chat_id, metadata=metadata)
         except Exception as e:  # pragma: no cover - defensive cleanup
             logger.debug("[Slack] status cleanup failed: %s", e)
 
@@ -2072,7 +2087,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Start or update a Slack-native plan/task progress stream."""
         title = title or t("platform.slack.task_card.title")
         if not self._app:
-            return SendResult(success=False, error="Not connected")
+            return SendResult(success=False, error="Not connected", retryable=True, pre_send=True)
         if not tasks:
             return SendResult(success=False, error="No tasks")
         key = self._native_task_card_key(chat_id, reply_to, metadata)
@@ -2101,14 +2116,9 @@ class SlackAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     if not _slack_error_is(exc, "message_not_in_streaming_state"):
                         raise
-                    # Slack seals a native stream server-side after a few minutes of a long
-                    # turn (live-observed at ~5m20s, 2026-09-16; the lifetime is not
-                    # documented). The sealed message is a regular message now, so reopen a
-                    # fresh card in the same thread. Every frame already carries the FULL
-                    # visible projection, so nothing is lost; the user sees the card
-                    # continue instead of degrading to text bubbles. One reopen per update:
-                    # a second rejection is a real failure. Both card timestamps stay
-                    # tracked so end-of-turn cleanup also removes the expired card.
+                    # Slack can seal a stream mid-turn. Reopen in the same thread with the
+                    # full projection, once per update. A second rejection reaches the gateway.
+                    # Both card timestamps stay tracked so turn-end cleanup removes the expired card.
                     logger.info(
                         "[Slack] Native task-card stream %s expired (message_not_in_streaming_state); "
                         "reopening a fresh card in thread %s", stream.stream_ts, stream.thread_ts)
@@ -2118,13 +2128,25 @@ class SlackAdapter(BasePlatformAdapter):
                         "chat.appendStream", json={"channel": chat_id, "ts": stream.stream_ts, "chunks": chunks})
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
-                logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
-                return SendResult(success=False, error=str(exc), retryable=True)
+                retryable = isinstance(exc, (TimeoutError, ConnectionError)) or self._is_retryable_upload_error(exc)
+                # A timed-out start may already have created a card. Only a positive
+                # rate-limit rejection proves it is safe to start again.
+                rate_limited = (_slack_error_is(exc, "ratelimited")
+                                or getattr(getattr(exc, "response", None), "status_code", None) == 429)
+                held = not stream.stream_ts and (
+                    (retryable and not rate_limited)
+                    or str(exc) == "Slack startStream returned no stream timestamp")
+                logger.error("[Slack] Native task-card progress error (%s): %r", type(exc).__name__, exc, exc_info=True)
+                return SendResult(success=False, error=f"{type(exc).__name__}: {exc}",
+                                  retryable=retryable and not held, held=held,
+                                  retry_after=self._retry_after_from_exc(exc) if retryable else None)
 
     async def _start_native_task_card_stream(
         self, client, stream: _NativeTaskCardStream, metadata: Optional[dict[str, Any]]
     ) -> None:
         await self._task_card_cleanup.start_stream(client, stream, metadata)
+        if self._typing_is_active(stream.channel, metadata):
+            await self.send_typing(stream.channel, metadata=metadata)
 
     @staticmethod
     def _task_update_chunk(task: dict[str, str]) -> dict[str, Any]:
@@ -2234,9 +2256,8 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             from .message_delivery import post_chunks
             last_result = await post_chunks(self, chat_id, team_id, content, formatted, thread_ts, metadata)
-            # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
-                await self.stop_typing(chat_id, metadata=metadata)
+                await self._clear_thread_status_quietly(chat_id, metadata)
             # Track sent ts (and the thread root) so thread replies get answered
             # without an @mention.
             sent_ts = last_result.get("ts") if last_result else None
@@ -2532,6 +2553,8 @@ class SlackAdapter(BasePlatformAdapter):
             "ts": str(ts), "draft_id": draft_id, "sent": text, "started": time.time(),
             "base": base}
         self._bot_message_ts.add(str(ts))
+        if self._typing_is_active(chat_id, metadata):
+            await self.send_typing(chat_id, metadata=metadata)
         return SendResult(success=True, message_id=str(ts))
 
     # A turn that ends without a matching final (crash, interrupt, rewritten final) leaves its
@@ -2717,10 +2740,16 @@ class SlackAdapter(BasePlatformAdapter):
             self._evict_oldest_by_ts(
                 self._active_status_threads, self._ACTIVE_STATUS_THREADS_MAX, lambda k: k[2])
         # May lack assistant:write scope or assistant context; reactions still work.
-        _status = getattr(self, "_status_text", {}).get(str(chat_id)) or getattr(
+        _status = self.get_status_text(chat_id, metadata) or getattr(
             self.config, "typing_status_text", None)
         _status = _status or self._default_status_text(_status_started)
+        owner = getattr(self, "_typing_refresh_owners", {}).get(self._typing_scope_key(chat_id, metadata))
         await self._set_thread_status(chat_id, team_id, thread_ts, _status, "failed")
+        # Final cleanup removes the tracked surface even when no base owner exists
+        # (or its cancellation times out). A late set must not leave idle status behind.
+        if ((status_key and status_key not in self._active_status_threads)
+                or (owner is not None and not self._typing_is_active(chat_id, metadata))):
+            await self.stop_typing(chat_id, metadata=metadata)
 
     async def _set_thread_status(
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
@@ -3687,37 +3716,6 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setSuggestedPrompts failed: %s", e)
 
-    def _assistant_thread_title_enabled(self) -> bool:
-        raw = self.config.extra.get("assistant_thread_titles", True)
-        if isinstance(raw, str):
-            return raw.strip().lower() not in {"0", "false", "no", "off"}
-        return bool(raw)
-
-    async def _set_assistant_thread_title(
-        self, channel_id: str, thread_ts: str, title_source: str, *, team_id: str = "") -> None:
-        """Best-effort title for visible Slack AI DM threads."""
-        if (
-            not self._app or not channel_id or not thread_ts or not title_source
-            or not self._assistant_thread_title_enabled()):
-            return
-        key = self._workspace_thread_key(team_id, channel_id, thread_ts)
-        if not key or key in self._titled_assistant_threads:
-            return
-        title = re.sub(r"\s+", " ", title_source).strip()
-        if not title or title.startswith("/"):
-            return
-        title = title[:77].rstrip() + "..." if len(title) > 80 else title
-        try:
-            _set_title = _session_title_method(self._get_client(channel_id, team_id=team_id))
-            await _set_title(channel_id=channel_id, thread_ts=thread_ts, title=title)
-        except Exception as e:
-            logger.debug("[Slack] session title set failed: %s", e)
-            return
-        self._titled_assistant_threads.add(key)
-        # Evict oldest thread_ts first so recently titled threads keep their guard.
-        self._evict_oldest_by_ts(
-            self._titled_assistant_threads, self._TITLED_ASSISTANT_THREADS_MAX, lambda e: e[2])
-
     def _seed_dm_session(
         self, metadata: dict[str, str], *, thread_ts: Optional[str], fail_log: tuple[Any, ...]
     ) -> None:
@@ -4183,29 +4181,8 @@ class SlackAdapter(BasePlatformAdapter):
         return True
 
     def _normalize_changed_message(self, event: dict) -> Optional[dict]:
-        """Turn a ``message_changed`` envelope into a plain message event.
-        None if malformed or the original was already routed to the agent. The edit's own ts rides
-        along as ``_slack_changed_event_ts`` for dedup."""
-        updated_message = event.get("message")
-        if not isinstance(updated_message, dict):
-            return None
-        original_message_ts = str(updated_message.get("ts") or "")
-        if original_message_ts and original_message_ts in self._processed_message_ts:
-            return None
-        edited = updated_message.get("edited")
-        edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
-        outer_event_ts = str(event.get("ts") or "")
-        changed_event_ts = (
-            str(event.get("event_ts") or edited_ts or "")
-            or (outer_event_ts if outer_event_ts != original_message_ts else "")
-            or (f"{original_message_ts}:changed" if original_message_ts else ""))
-        normalized_event = dict(updated_message)
-        for key in ("channel", "channel_type", "team", "team_id"):
-            if not normalized_event.get(key) and event.get(key):
-                normalized_event[key] = event.get(key)
-        if changed_event_ts:
-            normalized_event["_slack_changed_event_ts"] = changed_event_ts
-        return normalized_event
+        from .message_changes import normalize_changed_message
+        return normalize_changed_message(self, event)
 
     @staticmethod
     def _append_link_unfurls(text: str, slack_attachments: list) -> str:
@@ -4434,24 +4411,13 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: dict, payload: Optional[dict]) -> Optional[tuple[dict, str, str]]:
         """Normalize edits, then drop replays / ignored channels / bot posts / deletions.
         Returns ``(event, team_id, channel_id)`` for messages the handler should consider."""
-        # Entry log BEFORE any filtering so operators can tell "dropped here"
-        # from "never subscribed in the manifest". Metadata only, never text.
-        # DEBUG entry log — fires BEFORE any filtering so users debugging bot-to-bot interop, allow_bots
-        # config, or SLACK_ALLOWED_USERS drops can confirm whether the event actually arrived from Slack
-        # (vs. being silently filtered upstream by the app's event subscriptions — Socket Mode will not
-        # deliver events the app manifest hasn't subscribed to). See #30091.
-        if logger.isEnabledFor(logging.DEBUG):
-            _bot_profile = event.get("bot_profile") or {}
-            logger.debug(
-                "[Slack] event received type=%s subtype=%s user=%s bot_id=%s bot_name=%s "
-                "channel=%s ts=%s thread_ts=%s", event.get("type"), event.get("subtype"),
-                event.get("user", "") or "", event.get("bot_id", "") or "",
-                (_bot_profile.get("name") if isinstance(_bot_profile, dict) else "") or "",
-                event.get("channel", ""), event.get("ts", ""), event.get("thread_ts", ""))
+        from .message_changes import log_message_ingress
+        log_message_ingress(event, payload)
         if event.get("subtype") == "message_changed":
-            event = self._normalize_changed_message(event)
-            if event is None:
+            normalized_event = await process_changed_message(self, event, payload)
+            if normalized_event is None:
                 return None
+            event = normalized_event
         # Socket Mode redelivers after reconnects. Scope by workspace: ts is only unique per team.
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777) Scope the dedup id by
         # workspace: Slack event ts values are only unique within one workspace, so two teams' events with
@@ -4666,7 +4632,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Best-effort: title the DM thread from the prompt for Slack's AI Agent Messages tab.
         if is_dm and thread_ts and msg_type != MessageType.COMMAND:
             await self._set_assistant_thread_title(
-                channel_id, thread_ts, original_text or text, team_id=team_id)
+                channel_id, thread_ts, original_text or text, team_id=team_id, is_reply=thread_ts != ts)
         source = self.build_source(
             chat_id=channel_id,
             chat_name=channel_name,

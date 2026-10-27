@@ -48,18 +48,20 @@ def _db():
 # never saw.
 REPLACEMENT_MAX_CHARS = 1500
 
+# Quoted and approved replacements preserve omitted contract fields, additive subgoals
+# and the existing turn budget. Plugins use this semantic capability, not signatures alone.
+PRESERVES_GOAL_REPLACEMENT_REQUIREMENTS = True
+
 
 _REPLACE_PAYLOAD_KEYS = frozenset({"goal", "contract", "max_turns"})
 
 
 def replacement_contract(payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    """The contract a replacement installs (missing fields are empty: the old contract is dropped)."""
+    """Explicit replacement contract edits. Omitted fields retain their current values."""
     from hermes_cli.goals import _CONTRACT_FIELDS
     raw = (payload or {}).get("contract")
     raw = raw.to_dict() if hasattr(raw, "to_dict") else dict(raw or {})
-    from hermes_cli.goals_autonomy import goal_autonomy_enabled
-    return {f: str(raw.get(f) or "").strip() for f in _CONTRACT_FIELDS
-            if f in raw or not goal_autonomy_enabled()}
+    return {f: str(raw[f] or "").strip() for f in _CONTRACT_FIELDS if f in raw}
 
 
 def _check_payload(kind: str, action: str, payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -435,7 +437,7 @@ def _quote_matches_control(kind: str, action: str, target_sid: str, requester_si
         if (not contract.stop_when
                 and stop_condition_only(load_goal(target_sid, cursor=cursor),
                                         goal=str(edit.get("goal") or "").strip(),
-                                        contract=contract, max_turns=edit.get("max_turns"))):
+                                        contract=edit.get("contract"), max_turns=edit.get("max_turns"))):
             return True
     if kind == "goal" and action == "replace":
         link = next((n for n, w in enumerate(all_words) if w in _REPLACE_LINKS), len(all_words))
@@ -1112,9 +1114,21 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     if autonomous_goal:
         # No route/approval requirement: goal writes use the same transaction and wake receipt.
         # Replacement is an agent edit, so every existing requirement still binds.
+        def apply_autonomous(conn):
+            authority = {"via": "autonomy", "session_id": str(requester_sid), "quote": user_quote}
+            if action == "pause" and user_quote:
+                # Only a still-current user instruction may suspend automatic waking.
+                checked = check_user_quote(requester_sid, user_quote, cursor=conn)
+                if not isinstance(checked, str) and _quote_matches_control(
+                    kind, action, target_sid, requester_sid,
+                    _governing_sentence(*checked), payload, cursor=conn,
+                ):
+                    quote, message = checked
+                    authority = {"via": "quote", "quote": quote, "message": message}
+            return commit(conn, authority, "session_control_autonomy")
+
         try:
-            return _db()._execute_write(lambda conn: commit(
-                conn, {"via": "autonomy", "session_id": str(requester_sid), "quote": user_quote}, "session_control_autonomy"))
+            return _db()._execute_write(apply_autonomous)
         except Exception as exc:
             logger.warning("autonomous goal control failed", exc_info=True)
             return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
@@ -1367,8 +1381,20 @@ def mark_outbox(request_id: str, flag: str, value: Any = True) -> Optional[Dict[
     return db._execute_write(_mark)
 
 
+def _pause_goal(sid, reason, payload, authority, cursor=None):
+    from hermes_cli.goals import GoalManager
+
+    manager = GoalManager(sid, cursor=cursor)
+    if authority.get("via") == "autonomy":
+        if not manager.is_active():
+            return None
+        return manager.wait_for_seconds(manager._autonomy_wait_seconds(),
+                                        reason=reason or "session-control")
+    return manager.pause(reason=reason or "session-control")
+
+
 CONTROLS = {
-    ("goal", "pause"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).pause(reason=reason or "session-control"),
+    ("goal", "pause"): _pause_goal,
     ("goal", "resume"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).resume(),
     ("goal", "clear"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).clear(),
     ("loop", "pause"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid, cursor=cursor).pause(reason=reason or "session-control"),

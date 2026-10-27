@@ -483,18 +483,6 @@ _BLOCKED_PAUSE_PREFIX = "judge blocked: "
 _LEGACY_BLOCKED_PAUSE_PREFIX = "judged unachievable: "
 
 
-def _paused_by_contract_verdict(state) -> bool:
-    """Whether the judge paused this goal over its contract (a BLOCKED verdict).
-
-    A user-authorized replacement supersedes that contract, so it may lift such a pause. User and
-    interrupt pauses, an exhausted budget, and judge-infrastructure or barrier pauses are not about
-    the contract and stay until ``/goal resume``."""
-    reason = state.paused_reason or ""
-    if state.status != "paused":
-        return False
-    return state.last_verdict == "blocked" and reason.startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX))
-
-
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
 # on concrete evidence instead of a vibe check.
@@ -562,11 +550,15 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     + _AUTONOMOUS_REPLY_RULES
     + "Continue working toward the outcome above. Take the next concrete step. "
     "Stay within the stated boundaries and do not violate the constraints. "
-    "Your method may change as you learn; the end state may not. If a criterion "
-    "has become obsolete or wrong, say so. goal_set action=revise can only add "
-    "requirements (cite concrete recorded evidence for verification changes); "
-    "retiring or replacing an existing item requires a user-typed /goal remove "
-    "<kind> <N> or /goal replace command. Before "
+    "Your method may change in the plan without changing the contract. goal_set "
+    "action=revise can only add requirements. If an enrolled criterion is contradictory, "
+    "obsolete, or already falsified by history, name the conflict and propose "
+    "prospective verification through goal_set action=replace, preserving all "
+    "unrelated requirements and hard limits. Use the latest real user instruction "
+    "verbatim when it authorizes replacement, otherwise request the precise "
+    "session-control approval card. Do not ask the user to clear the goal or "
+    "compose a slash command. Explicit /goal remove <kind> <N> remains available "
+    "for user-directed removal. Before "
     "claiming the goal is done, audit each Verification item against current state "
     "and end with an Evidence section that quotes exact identifiers or output lines "
     "from tool results in "
@@ -2814,18 +2806,8 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
         # recover it. The manager holds no state (no continuation, judge, or revive) and remembers
         # why; writes still re-read the live row and refuse to overwrite it.
         self._unreadable: Optional[GoalPersistenceError] = None
-        try:
-            self._state: Optional[GoalState] = (
-                load_goal(session_id) if cursor is None else load_goal(session_id, cursor=cursor)
-            )
-        except GoalPersistenceError as exc:
-            logger.warning("GoalManager: goal for %s is unreadable; treating it as inert: %s", session_id, exc)
-            self._state = None
-            self._unreadable = exc
-
-    def refresh(self) -> None:
-        """Re-read state from the DB (another writer, e.g. a tool, moved it)."""
-        self._state = load_goal(self.session_id)
+        self._state: Optional[GoalState] = None
+        self.refresh()
 
     # --- introspection ------------------------------------------------
 
