@@ -16,6 +16,9 @@ Classification belongs to producers through `ContextNotice` or the existing
 notice's `notice_style` field, carried by `notice_metadata`. Never infer it from
 prose, notice-key prefixes, severity, or command names. `EphemeralReply` retains
 its command identity, lifetime and presentation marker through unwrapping.
+Both helpers live in `agent/notice_style.py`, outside `gateway/`, so storage and
+agent producers never load the gateway package
+(`tests/hermes_state/test_storage_import_boundary.py`).
 
 ## Classified Routes
 

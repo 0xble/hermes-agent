@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from collections.abc import Mapping
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.goals_contract_commands import GoalContractCommandsMixin
 from hermes_cli.goals_legacy_prompts import (

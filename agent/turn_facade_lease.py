@@ -8,7 +8,7 @@ timers run via the shared scheduler (``agent/periodic_scheduler.py``; timer thre
 bodies run on per-handle workers), not per-turn threads.
 """
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 import logging
 import os
 import threading

@@ -503,7 +503,7 @@ def _install_one(home: Path, feature: LeftCoreFeature, *, install: Callable[[str
             _record_migration(home, feature)
         except Exception as exc:  # the next run sees the plugin dir and records it then
             logger.debug("left-core install marker not written for %s: %s", home, exc)
-        from gateway.notice_style import ContextNotice
+        from agent.notice_style import ContextNotice
         say(ContextNotice(f"  ✓ {feature.label} moved out of core — installed the '{feature.plugin}' plugin from the "
             f"catalog ({feature.unchanged})."))
         return True

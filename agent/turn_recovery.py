@@ -33,7 +33,7 @@ from agent.turn_failure_copy import (
     CONTENT_POLICY_NEXT_STEPS, content_policy_copy, exhausted_copy, limit_reset_copy, nonretryable_copy, provider_label_for, site_copy, stamp_failure,
 )
 from agent.turn_retry_state import TurnRetryState
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 from agent.turn_recovery_codex import _is_codex_token_expired, _recover_stale_codex_reasoning
 from hermes_constants import display_hermes_home
 from utils import base_url_host_matches

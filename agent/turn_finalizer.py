@@ -6,7 +6,7 @@ imported lazily from ``agent.conversation_loop`` (no cycle, same logger name).""
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 import logging
 import os

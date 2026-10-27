@@ -9,7 +9,7 @@ did and returns a ``CompactionOutcome``. Predicates/estimators that tests patch 
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 import logging
 import time

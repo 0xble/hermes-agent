@@ -7,7 +7,7 @@ re-prompt, scaffolding pop, stop gates, then the durable final flush. Extracted 
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 from dataclasses import dataclass
 import logging

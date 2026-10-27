@@ -9,7 +9,7 @@ overflow warnings. Nothing here imports ``agent.conversation_loop`` at module le
 
 from __future__ import annotations
 
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 
 import logging
 from dataclasses import dataclass

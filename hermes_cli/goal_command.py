@@ -6,7 +6,7 @@ parses subcommands and mutates goal state. It never changes conversation history
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from gateway.notice_style import ContextNotice
+from agent.notice_style import ContextNotice
 import logging
 from typing import Callable
 

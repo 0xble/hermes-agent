@@ -26,7 +26,7 @@ _UpdateTarget = Any
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
-from gateway.notice_style import ContextNotice, notice_metadata
+from agent.notice_style import ContextNotice, notice_metadata
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource

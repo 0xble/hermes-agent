@@ -4013,7 +4013,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
-        from gateway.notice_style import notice_metadata
+        from agent.notice_style import notice_metadata
         metadata = notice_metadata(metadata, platform=self.platform, style=getattr(content, "notice_style", None))
         result = await self._send_with_retry_body(
             chat_id, content, reply_to=reply_to, metadata=metadata,
@@ -5422,7 +5422,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
-                from gateway.notice_style import notice_metadata
+                from agent.notice_style import notice_metadata
                 _final_thread_metadata = notice_metadata(
                     _mark_notify_metadata(_thread_metadata), platform=self.platform,
                     style=getattr(response, "notice_style", None))

@@ -94,7 +94,7 @@ async def test_context_and_action_statuses_never_share_a_bubble(adapter):
 
 @pytest.mark.parametrize("platform", ["telegram", "discord", "matrix"])
 def test_non_slack_metadata_is_identical(platform):
-    from gateway.notice_style import notice_metadata
+    from agent.notice_style import notice_metadata
     metadata = {"thread_id": "42", "custom": "kept"}
     assert notice_metadata(metadata, platform=platform, style="context") is metadata
 
@@ -214,7 +214,7 @@ async def test_restart_resend_stays_full():
 
 @pytest.mark.asyncio
 async def test_telegram_send_ignores_notice_style(monkeypatch):
-    from gateway.notice_style import ContextNotice, notice_metadata
+    from agent.notice_style import ContextNotice, notice_metadata
     from plugins.platforms.telegram.adapter import TelegramAdapter
     telegram = TelegramAdapter(PlatformConfig(enabled=True, token="test"))
     telegram._bot = AsyncMock()
@@ -289,7 +289,7 @@ async def test_multi_chunk_notice_uses_normal_rendering(adapter):
 
 
 def test_command_marker_preserves_ephemeral_type_and_expiry():
-    from gateway.notice_style import ContextNotice
+    from agent.notice_style import ContextNotice
     from gateway.platforms.base import CommandReply, EphemeralReply, as_command_reply
     reply = as_command_reply(ContextNotice("FYI"))
     assert isinstance(reply, CommandReply)
