@@ -5,7 +5,10 @@ from unittest.mock import Mock
 import pytest
 import requests
 
-from tests.tools.test_browser_camofox_tab_reuse import camofox, _dispatch
+from tests.tools import test_browser_camofox_tab_reuse as tab_reuse
+
+_dispatch = tab_reuse._dispatch
+camofox = tab_reuse.camofox  # shared fixture, injected by parameter name
 
 
 def navigate(fixture, task="owner"):
@@ -231,18 +234,17 @@ def test_shared_popups_require_explicit_opener_affinity(camofox):
 def test_popup_selection_obeys_existing_fences(camofox, monkeypatch, fence):
     session = navigate(camofox)
     camofox.server.seed(session["user_id"], {"tabId": "popup", "listItemId": session["session_key"]})
-    if fence == "protected":
-        camofox.cf._protected_tab_ids.add("popup")
-    elif fence == "quarantine":
-        camofox.cf._quarantine_protected_tab("popup")
-    elif fence == "stale":
-        camofox.cf._stale_tab_ids[session["user_id"]] = {"popup"}
-    elif fence == "closing":
-        camofox.cf._closing_tabs.add((camofox.server.url, session["user_id"], "popup"))
-    else:
-        from tools import browser_camofox_leases as leases
-        original = leases.claim
-        monkeypatch.setattr(leases, "claim", lambda server, user, tab: tab != "popup" and original(server, user, tab))
+    from tools import browser_camofox_leases as leases
+    original = leases.claim
+    apply_fence = {
+        "protected": lambda: camofox.cf._protected_tab_ids.add("popup"),
+        "quarantine": lambda: camofox.cf._quarantine_protected_tab("popup"),
+        "stale": lambda: camofox.cf._stale_tab_ids.__setitem__(session["user_id"], {"popup"}),
+        "closing": lambda: camofox.cf._closing_tabs.add((camofox.server.url, session["user_id"], "popup")),
+        "lease": lambda: monkeypatch.setattr(
+            leases, "claim", lambda server, user, tab: tab != "popup" and original(server, user, tab)),
+    }
+    apply_fence[fence]()
     assert not _dispatch("browser_tabs", {"tab_id": "popup"}, "owner")["success"]
     assert session["tab_id"] != "popup"
 

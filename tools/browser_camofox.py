@@ -968,16 +968,8 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
         # Headless-to-visible restart and clean shutdown can exceed the ordinary 30s command timeout.
         lifecycle_timeout = max(_get_command_timeout(), 90)
         if release:
-            tab_id = session.get("tab_id")
-            if not tab_id:
-                return tool_error("No caller-owned tab is bound; refusing an unscoped account release", success=False)
-            data = post_lifecycle(f"/browser/identities/{session['user_id']}/release", {"tabId": tab_id},
-                                  release=True, timeout=lifecycle_timeout)
-            if data.get("ok") is not True or not isinstance(data.get("released"), bool):
-                return tool_error("Camofox did not confirm account release; the task's tab was not changed", success=False)
-            keep_task_tabs(task_id, keep=False)
-            return json.dumps({"success": True, "account": session["account"], "released": data["released"],
-                               **({"warning": data["warning"]} if "warning" in data else {})})
+            from tools.browser_camofox_handoff import release_identity
+            return release_identity(session, task_id, timeout=lifecycle_timeout)
         prior_tab_id = session.get("tab_id")
         user_id = session["user_id"]
         open_body = {"tabId": prior_tab_id} if prior_tab_id else {}
@@ -1365,6 +1357,8 @@ def camofox_tabs(tab_id: Optional[str] = None, task_id: Optional[str] = None) ->
                 result["popup_discovery"] = "task_group_only"
             return json.dumps(result)
     except Exception as exc:
+        # Tool boundary: report the failure to the model, keep the traceback for operators.
+        logger.warning("Camofox tab listing/selection failed: %s", exc, exc_info=True)
         return tool_error(str(exc), success=False)
 
 
