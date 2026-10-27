@@ -4632,7 +4632,7 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         # Best-effort: title the DM thread from the prompt for Slack's AI Agent Messages tab.
         if is_dm and thread_ts and msg_type != MessageType.COMMAND:
             await self._set_assistant_thread_title(
-                channel_id, thread_ts, original_text or text, team_id=team_id)
+                channel_id, thread_ts, original_text or text, team_id=team_id, is_reply=thread_ts != ts)
         source = self.build_source(
             chat_id=channel_id,
             chat_name=channel_name,
