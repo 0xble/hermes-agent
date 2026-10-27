@@ -35,7 +35,7 @@ def _authored():
         },
         "delegation": {
             "model": SOL,
-            "provider": "custom:codex-proxy",
+            "provider": "custom:openai-proxy",
             "base_url": "https://pinned.test/v1",
             "api_key": "test-pinned-key",
             "reasoning_effort": "high",

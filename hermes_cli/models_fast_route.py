@@ -5,7 +5,7 @@ Fast params normally reach only the first-party endpoint that bills for them
 local subscription proxy, is opted in explicitly on its ``providers:`` entry::
 
     providers:
-      codex-proxy:
+      openai-proxy:
         api: http://127.0.0.1:8317/v1
         api_mode: codex_responses
         capabilities:

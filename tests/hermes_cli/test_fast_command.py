@@ -317,10 +317,10 @@ class TestFastRouteIgnoredWarning(unittest.TestCase):
         return " ".join(str(c) for c in mock_cprint.call_args_list)
 
     def test_proxy_route_warns(self):
-        self.assertIn("no effect", self._run("custom:codex-proxy", "http://127.0.0.1:8317/v1"))
+        self.assertIn("no effect", self._run("custom:openai-proxy", "http://127.0.0.1:8317/v1"))
 
     def test_first_party_route_does_not_warn(self):
         self.assertNotIn("no effect", self._run("openai", "https://api.openai.com/v1"))
 
     def test_turning_fast_off_never_warns(self):
-        self.assertNotIn("no effect", self._run("custom:codex-proxy", "http://127.0.0.1:8317/v1", "normal"))
+        self.assertNotIn("no effect", self._run("custom:openai-proxy", "http://127.0.0.1:8317/v1", "normal"))
