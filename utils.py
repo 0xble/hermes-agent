@@ -341,37 +341,41 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
     removed on any failure — ``BaseException`` on purpose, so KeyboardInterrupt / SystemExit still
     clean up.
     """
-    if path.name == "config.yaml":
-        # Hermes's own config writers (config set/unset, save_config, migrate_config, import-agent)
-        # all funnel here, so one check stops a newer-schema build stamping a release-managed
-        # config. Agent-authored file edits use tools/file_operations.py and are out of scope.
-        from hermes_cli.release_config_owner import ensure_release_owns_config_write
-        ensure_release_owns_config_write(path)
-    # A profile delete leaves a tombstone beside its removed home.  Background
-    # writers may retain that home in a context variable, so a plain mkdir here
-    # would resurrect the profile before the write can fail.
-    from hermes_constants import mkdir_under_hermes_home
+    from hermes_cli.config_write_guards import atomic_write_guard
 
-    mkdir_under_hermes_home(path.parent)
-    if mode is None and not path.exists():
-        mode = default_new_file_mode()
-    original_owner = _preserve_file_owner(path) if preserve_owner else None
-    fd, tmp_path = mkstemp_beside(path, prefix=prefix, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb" if binary else "w", encoding=None if binary else encoding) as f:
-            if mode is not None and hasattr(os, "fchmod"):
-                os.fchmod(f.fileno(), mode)
-            write(f)
-            f.flush()
-            os.fsync(f.fileno())
-        replaced = Path(atomic_replace(tmp_path, path))  # symlink-preserving actual destination
-        _restore_file_metadata(replaced, original_owner, mode)
-        if fsync_dir:
-            fsync_directory(replaced.parent)
-    except BaseException:
-        with suppress(OSError):
-            os.unlink(tmp_path)
-        raise
+    with atomic_write_guard(path) as admit:
+        if path.name == "config.yaml":
+            # Hermes's own config writers (config set/unset, save_config, migrate_config, import-agent)
+            # all funnel here, so one check stops a newer-schema build stamping a release-managed
+            # config. Agent-authored file edits use tools/file_operations.py and are out of scope.
+            from hermes_cli.release_config_owner import ensure_release_owns_config_write
+            ensure_release_owns_config_write(path)
+        # A profile delete leaves a tombstone beside its removed home.  Background
+        # writers may retain that home in a context variable, so a plain mkdir here
+        # would resurrect the profile before the write can fail.
+        from hermes_constants import mkdir_under_hermes_home
+
+        mkdir_under_hermes_home(path.parent)
+        if mode is None and not path.exists():
+            mode = default_new_file_mode()
+        original_owner = _preserve_file_owner(path) if preserve_owner else None
+        fd, tmp_path = mkstemp_beside(path, prefix=prefix, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb" if binary else "w", encoding=None if binary else encoding) as f:
+                if mode is not None and hasattr(os, "fchmod"):
+                    os.fchmod(f.fileno(), mode)
+                write(f)
+                f.flush()
+                os.fsync(f.fileno())
+            admit(Path(tmp_path))
+            replaced = Path(atomic_replace(tmp_path, path))  # symlink-preserving actual destination
+            _restore_file_metadata(replaced, original_owner, mode)
+            if fsync_dir:
+                fsync_directory(replaced.parent)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(tmp_path)
+            raise
 
 
 def _mode_for_write(path: Path, create_mode: int | None, preserve: bool = True) -> int | None:
@@ -476,11 +480,15 @@ def atomic_yaml_write(path: str | Path, data: Any, *, default_flow_style: bool =
     path = Path(path)
 
     def _write(f) -> None:
-        yaml.safe_dump(data, f, default_flow_style=default_flow_style, sort_keys=sort_keys)
+        yaml.safe_dump(dict(data) if isinstance(data, dict) else data, f,
+                       default_flow_style=default_flow_style, sort_keys=sort_keys)
         if extra_content:
             f.write(extra_content)
 
-    _atomic_write(path, _write, prefix=f".{path.stem}_", mode=_mode_for_write(path, create_mode))
+    from hermes_cli.config_write_guards import config_write_lock
+
+    with config_write_lock(path, data):
+        _atomic_write(path, _write, prefix=f".{path.stem}_", mode=_mode_for_write(path, create_mode))
 
 
 def _roundtrip_load(path: Path):
@@ -534,31 +542,34 @@ def atomic_roundtrip_yaml_update(path: str | Path, key_path: str, value: Any) ->
     # See #91607.
     from hermes_cli.config import _greedy_literal_match, _split_key_path
 
-    from hermes_constants import mkdir_under_hermes_home
+    from hermes_cli.config_write_guards import config_write_lock
 
-    mkdir_under_hermes_home(path.parent)
-    yaml_rt, config = _roundtrip_load(path)
-    current: CommentedMap = config
-    keys = _split_key_path(key_path)
-    i = 0
-    while True:
-        remaining = keys[i:]
-        seg, consumed = _greedy_literal_match(dict(current), remaining) or (remaining[0], 1)
-        if i + consumed == len(keys):
-            if value is None:
-                _roundtrip_delete_key(current, seg)
-            else:
-                current[seg] = value
-            break
-        next_value = current.get(seg)
-        if not isinstance(next_value, CommentedMap):
-            if value is None:
-                return  # nothing to remove under a missing/scalar parent
-            next_value = CommentedMap()
-            current[seg] = next_value
-        current = next_value
-        i += consumed
-    _roundtrip_dump(path, yaml_rt, config)
+    with config_write_lock(path, None):
+        from hermes_constants import mkdir_under_hermes_home
+
+        mkdir_under_hermes_home(path.parent)
+        yaml_rt, config = _roundtrip_load(path)
+        current: CommentedMap = config
+        keys = _split_key_path(key_path)
+        i = 0
+        while True:
+            remaining = keys[i:]
+            seg, consumed = _greedy_literal_match(dict(current), remaining) or (remaining[0], 1)
+            if i + consumed == len(keys):
+                if value is None:
+                    _roundtrip_delete_key(current, seg)
+                else:
+                    current[seg] = value
+                break
+            next_value = current.get(seg)
+            if not isinstance(next_value, CommentedMap):
+                if value is None:
+                    return  # nothing to remove under a missing/scalar parent
+                next_value = CommentedMap()
+                current[seg] = next_value
+            current = next_value
+            i += consumed
+        _roundtrip_dump(path, yaml_rt, config)
 
 
 # ruamel's round-trip dumper resolves plain scalars under YAML 1.2, where only true/false/null are
@@ -604,47 +615,50 @@ def atomic_roundtrip_yaml_save(path: str | Path, new_state: dict, *,
     from ruamel.yaml.comments import CommentedMap, CommentedSeq
     from hermes_cli.config import require_readable_config_before_write
 
-    from hermes_constants import mkdir_under_hermes_home
+    from hermes_cli.config_write_guards import config_write_lock
 
-    mkdir_under_hermes_home(path.parent)
-    require_readable_config_before_write(path)
-    creating = not path.exists() or not path.read_text(encoding="utf-8").strip()
-    yaml_rt, existing = _roundtrip_load(path)
+    with config_write_lock(path, new_state):
+        from hermes_constants import mkdir_under_hermes_home
 
-    def _unchanged(current: Any, value: Any) -> bool:
-        # ``True == 1`` in Python; a bool↔int flip is a real change for YAML readers.
-        return current == value and isinstance(current, bool) is isinstance(value, bool)
+        mkdir_under_hermes_home(path.parent)
+        require_readable_config_before_write(path)
+        creating = not path.exists() or not path.read_text(encoding="utf-8").strip()
+        yaml_rt, existing = _roundtrip_load(path)
 
-    def _merge_seq(dst: CommentedSeq, src: list) -> None:
-        # Element-wise so appending/editing one entry keeps the comments on its siblings.
-        for i, value in enumerate(src):
-            if i < len(dst):
-                _merge_item(dst, i, value)
-            else:
-                dst.append(_rt_value(value))
-        del dst[len(src):]
+        def _unchanged(current: Any, value: Any) -> bool:
+            # ``True == 1`` in Python; a bool↔int flip is a real change for YAML readers.
+            return current == value and isinstance(current, bool) is isinstance(value, bool)
 
-    def _merge_item(dst, key, value) -> None:
-        current = dst[key]
-        if isinstance(value, dict) and isinstance(current, CommentedMap):
-            _merge(current, value)
-        elif isinstance(value, list) and isinstance(current, CommentedSeq):
-            _merge_seq(current, value)
-        elif not _unchanged(current, value):
-            dst[key] = _rt_value(value)
-        # else: unchanged — keep the existing node and the comments/quoting attached to it
+        def _merge_seq(dst: CommentedSeq, src: list) -> None:
+            # Element-wise so appending/editing one entry keeps the comments on its siblings.
+            for i, value in enumerate(src):
+                if i < len(dst):
+                    _merge_item(dst, i, value)
+                else:
+                    dst.append(_rt_value(value))
+            del dst[len(src):]
 
-    def _merge(dst: CommentedMap, src: dict) -> None:
-        for key, value in src.items():
-            if key in dst:
-                _merge_item(dst, key, value)
-            else:
+        def _merge_item(dst, key, value) -> None:
+            current = dst[key]
+            if isinstance(value, dict) and isinstance(current, CommentedMap):
+                _merge(current, value)
+            elif isinstance(value, list) and isinstance(current, CommentedSeq):
+                _merge_seq(current, value)
+            elif not _unchanged(current, value):
                 dst[key] = _rt_value(value)
-        for key in [k for k in dst if k not in src]:
-            _roundtrip_delete_key(dst, key)
+            # else: unchanged — keep the existing node and the comments/quoting attached to it
 
-    _merge(existing, new_state)
-    _roundtrip_dump(path, yaml_rt, existing, extra_content=extra_content_on_create if creating else None)
+        def _merge(dst: CommentedMap, src: dict) -> None:
+            for key, value in src.items():
+                if key in dst:
+                    _merge_item(dst, key, value)
+                else:
+                    dst[key] = _rt_value(value)
+            for key in [k for k in dst if k not in src]:
+                _roundtrip_delete_key(dst, key)
+
+        _merge(existing, new_state)
+        _roundtrip_dump(path, yaml_rt, existing, extra_content=extra_content_on_create if creating else None)
 
 
 def safe_json_loads(text: str, default: Any = None) -> Any:

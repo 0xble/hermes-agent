@@ -724,8 +724,8 @@ class GatewayConfigLoadersMixin:
         try:
             return get_fallback_chain(_load_gateway_runtime_config()) or None
         except Exception as exc:
-            from hermes_cli.model_presets import ModelPresetError
-            if isinstance(exc, ModelPresetError):
+            from hermes_cli.config_errors import ConfigValidationError
+            if isinstance(exc, ConfigValidationError):
                 raise
             return None
 
@@ -761,7 +761,10 @@ class GatewayConfigLoadersMixin:
             # fail_closed: a torn mid-edit write must raise so the per-home last known-good chain
             # below survives, instead of being WIPED by an empty fail-open result.
             cfg = load_user_config_effective(cfg_path, fail_closed=True)
-        except Exception:
+        except Exception as exc:
+            from hermes_cli.config_errors import ConfigValidationError
+            if isinstance(exc, ConfigValidationError):
+                raise
             logger.debug("fallback_providers refresh: config.yaml read failed; keeping last known-good chain", exc_info=True)
             self._fallback_model = by_home.get(home_key, self._fallback_model)
             return self._fallback_model

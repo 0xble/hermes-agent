@@ -40,6 +40,13 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[
     """Last-known-good raw user mapping after a parse failure: this process's last good parse,
     else the newest ``good`` copy in backups/config/, else ``{}`` (warned as defaults)."""
     raw = _LAST_GOOD_USER_RAW.get(path_key)
+    if raw is not None:
+        from hermes_cli.config_write_guards import validate_candidate
+        from hermes_cli.config_errors import ConfigValidationError
+        try:
+            validate_candidate(raw)
+        except ConfigValidationError:
+            raw = None
     fallback = "last-known-good"
     if raw is None:
         from hermes_cli.config_backups import load_newest_good_backup
@@ -82,7 +89,6 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         raw_hit = _config._RAW_CONFIG_CACHE.get(path_key)
         if user_sig is not None and raw_hit is not None and raw_hit[:4] == user_sig:
             raw = copy.deepcopy(raw_hit[4])  # one parse per process, shared with read_raw_config()
-            _LAST_GOOD_USER_RAW.setdefault(path_key, copy.deepcopy(raw))
         elif user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8-sig") as f:
@@ -92,15 +98,29 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                     raise
                 raw, recovered = _recover_user_raw(config_path, path_key, exc), True
             else:
+                if loaded is not None and not isinstance(loaded, dict):
+                    if fail_closed:
+                        from hermes_cli.config_write_guards import validate_candidate
+                        validate_candidate(loaded)
+                    return _effective({})
                 raw = loaded if isinstance(loaded, dict) else {}
                 _config._RAW_CONFIG_CACHE[path_key] = (*user_sig, copy.deepcopy(raw))
-                _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
-                # Same copy load_config keeps: a fresh process recovers from it (see _recover_user_raw).
-                # Only for the ACTIVE home — a read of another profile's file (doctor, TUI cwd lookup)
-                # must not create backups/ inside that profile.
-                if config_path == _config.get_config_path():
-                    from hermes_cli.config_backups import backup_config
-                    backup_config(config_path, "good")
+
+        if not recovered:
+            from hermes_cli.config_write_guards import validate_candidate
+            from hermes_cli.config_errors import ConfigValidationError
+            try:
+                validate_candidate(raw)
+            except ConfigValidationError:
+                if fail_closed:
+                    raise
+                # Presence-sensitive readers retain their historical fail-open view. Runtime
+                # route boundaries still reject it, but it is never retained as last-good.
+                return _effective(raw)
+            _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
+            if user_sig is not None and config_path == _config.get_config_path():
+                from hermes_cli.config_backups import backup_config
+                backup_config(config_path, "good")
 
         env_snapshot = _config._env_ref_snapshot(raw)
         managed = managed_scope.load_managed_config()

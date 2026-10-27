@@ -55,6 +55,8 @@ All keys are opt-in; omitting them preserves existing routing. The attended rout
 hermes config              # View current configuration
 hermes config edit         # Open config.yaml in your editor
 hermes config get KEY      # Print a resolved value
+hermes config get KEY --raw  # Print the authored, unexpanded value (including secrets)
+hermes config get KEY --raw --expanded  # Resolved value with secrets unmasked
 hermes config set KEY VAL  # Set a specific value
 hermes config unset KEY    # Remove a user-set value
 hermes config check        # Check for missing options and stale saved selections
@@ -67,6 +69,10 @@ hermes config set terminal.backend docker
 hermes config unset terminal.backend
 hermes config set OPENROUTER_API_KEY sk-or-...  # Saves to .env
 ```
+
+The `--raw` YAML view has no schema defaults, managed overlay, environment-variable expansion or model-preset expansion. Use it for write-back snapshots. `--expanded` selects the runtime view, and `--raw --expanded` retains the old unmasked resolved view. Environment-variable keys continue to use `.env` routing.
+
+Managed YAML writes validate the complete candidate, including model presets, before replacement. `--force` can bypass key and overwrite confirmations, never semantic validation. If another process changed the revision you read, the write is refused. Read the config again and reapply the intended edit instead of replaying an old snapshot.
 
 :::tip
 The `hermes config set` command automatically routes values to the right file — every `UPPER_SNAKE` name (`OPENROUTER_API_KEY`, `DISCORD_HOME_CHANNEL`, `TELEGRAM_GROUP_ALLOWED_USERS`, `HERMES_TIMEZONE`, …) is an environment variable and is saved to `.env`, never to `config.yaml`; dotted settings go to `config.yaml`. Any other `UPPER_SNAKE` name is saved to `.env` as-is (it is exported to the process environment for plugins and skills); names on the env writer's denylist (`HERMES_YOLO_MODE`, `PATH`, …) are refused. A known key written under the wrong prefix (`gateway.discord.foo`, where `discord.foo` is itself a known key) is refused with a did-you-mean before anything is written; pass `--force` to write it anyway. Any other unknown path under a known section (a typo such as `agent.max_turnz`, or a runtime-read key with no seeded default) is written together with a did-you-mean notice, since the schema alone cannot tell the two apart. `hermes config get` on such a path prints the value from your file together with a stderr notice that Hermes may not read it, so a leftover key cannot silently pass for a live setting.
