@@ -177,14 +177,16 @@ def _under(path: str, root: str) -> bool:
 
 def _has_keep_marker(entry: Path) -> bool:
     """A ``.keep`` file or directory anywhere in *entry*, symlinks not followed. An unreadable
-    directory counts as marked: an incomplete scan cannot rule a marker out."""
+    directory is not reported as a marker: selection and the pre-removal activity re-check
+    already keep any tree they cannot fully read, and the audit then names that failed scan
+    instead of a retention declaration that was never observed."""
     if entry.name == _KEEP_MARKER:
         return True
     try:
         if not entry.is_dir() or entry.is_symlink():
             return False
     except OSError:
-        return True
+        return False
     stack = [str(entry)]
     while stack:
         try:
@@ -195,7 +197,7 @@ def _has_keep_marker(entry: Path) -> bool:
                     if child.is_dir(follow_symlinks=False) and child.name not in _KEEP_SCAN_SKIP:
                         stack.append(child.path)
         except OSError:
-            return True
+            continue
     return False
 
 
