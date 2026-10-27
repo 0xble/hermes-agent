@@ -13,6 +13,18 @@ See [Reaction Tool Name](../../../maintenance/react-tool-name.md) for the contra
 - **Verification:** `scripts/run_tests.sh tests/hermes_cli/test_release_ack_environment.py tests/hermes_cli/test_immutable_gateway_ack.py tests/hermes_cli/test_immutable_no_gateway_restart.py` passes all 11 tests. Run with disposable `HOME` and `HERMES_HOME` roots. Include inherited-path recovery and non-isolated rejection regressions. Broader reconciliation tests initially hit the real-home metadata guard in this checkout location, then exceeded the observation timeout with an isolated OS home. Real launchd integration remains separately gated by operator authorization.
 - **Rollback and retirement:** Revert only this launcher environment qualification and its regression changes. No state format or dependency change. Retire with the owning immutable-release patch when upstream provides its complete observed-activation contract.
 
+## attended-switch-notice-transition
+
+- **Status:** Candidate.
+- **Contract:** Announce an attended-model switch only when the session transitions to that route. Queued follow-ups and repeated API-boundary resolution on an already-selected attended model do not announce another switch. Preserve genuine idle-to-attended transitions, first-session silence, fallback ownership and idle return behavior.
+- **Source surfaces:** `gateway/run_turn.py`, `gateway/run_turn_runner.py`, `tests/gateway/test_attended_turn_runner.py`.
+- **Independent hypothesis (2026-10-25):** Turn-start resolution can compare a stale `last_resolved_model` snapshot even though the durable committed attended-route marker is already true. API-boundary resolution also announces a changed desired key without requiring a changed live route. Reuse the committed marker during turn-start staging and require a real model/provider/API-mode transition at the boundary. An intervening idle API call before the duplicate notice would falsify this incident explanation. The incident logs instead show the queued follow-up stayed on the attended model.
+- **Upstream findings:** Local-only attended-routing overlay. No upstream implementation to backport, so the upstream discussion-search exception applies.
+- **Verification:** `HERMES_PYTHON="$PWD/.venv/bin/python" bash scripts/run_tests.sh tests/gateway/test_attended_turn_runner.py tests/gateway/test_attended_model.py tests/gateway/test_attended_busy_activity.py tests/gateway/test_attended_session_opening.py tests/gateway/test_attend_command.py` passes: 287 tests, 0 failures. The new cases cover stale-model queued staging with committed active/inactive routes and no-op API-boundary resolutions with absent/stale decision keys.
+- **Outbound budget:** Removes redundant uses of the existing persistent notice rail. Adds no API calls, retries, timers, limiters or platform-specific send path. Existing shared egress budgeting is unchanged and worst-case notice traffic cannot increase.
+- **Rollback:** Revert the committed-route guard in turn-start resolution and the route-equality guard in API-boundary emission, plus their matching tests. No configuration, schema, dependency or state migration.
+- **Retirement:** Remove when the shared routing owner derives switch announcements solely from committed route transitions and equivalent regressions pass upstream.
+
 ## mcp-verbatim-tool-labels
 
 - **Status:** Candidate.
