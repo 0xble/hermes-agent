@@ -47,6 +47,21 @@ def test_register_is_a_no_op_without_a_session(tmp_path: Path, monkeypatch):
     assert not (tmp_path / ".hermes-pytest-tmux").exists()
 
 
+def test_session_lifetime_survives_a_hermetic_child_environment(tmp_path, monkeypatch):
+    from hermes_cli import test_artifact_lifetime as lifetime
+
+    monkeypatch.setenv("HERMES_TEST_MAX_LIFETIME", "0.75")
+    for key in ("HERMES_PYTEST_CUSTODY", "HERMES_TEST_OWNER_PID"):
+        monkeypatch.setenv(key, os.environ.get(key, ""))
+    monkeypatch.setattr(lifetime.subprocess, "Popen", lambda *args, **kwargs: None)
+    lifetime.install_session_custody(tmp_path)
+    monkeypatch.delenv("HERMES_TEST_MAX_LIFETIME")
+    monkeypatch.delenv("HERMES_TEST_OWNER_PID")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home" / ".hermes"))
+    assert lifetime.owner_pid_from_home(os.environ["HERMES_HOME"]) == os.getpid()
+    assert lifetime._lifetime_s() == 0.75
+
+
 @pytest.mark.parametrize("started", [1.0, 2.0])
 def test_watch_preserves_detached_artifacts_and_reused_pids(monkeypatch, started):
     import psutil
