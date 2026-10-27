@@ -291,21 +291,39 @@ def run_hermes(argv: list[str], home: Path, *, hermes_home: Path | None = None, 
     """Run the real ``hermes`` entry point in its own process group; kill only that group."""
     start = time.monotonic()
     proc = subprocess.Popen(
-        [sys.executable, "-m", "hermes_cli.main", *argv],
+        _owned_command("hermes_cli.main", argv),
         cwd=str(home), env=hermetic_env(home, hermes_home, proxy), stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
     )
     try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            out, err = proc.communicate()
+            err += f"\n[c11 harness] killed after {timeout}s"
+            proc.returncode = -signal.SIGKILL
+    finally:
         _kill_group(proc)
-        out, err = proc.communicate()
-        err += f"\n[c11 harness] killed after {timeout}s"
-    _kill_group(proc)  # reap any grandchild left in our own session
     return RunResult(argv, proc.returncode, out, err, time.monotonic() - start)
 
 
+def _owned_command(module: str, argv: list[str]) -> list[str]:
+    return [sys.executable, str(Path(__file__).with_name("_owned_process.py")),
+            str(os.getpid()), module, *argv]
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
+    # Let the guardian run its group-kill finalizer before escalating. Killing
+    # the guardian first would destroy the only owner of its worker's group.
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -319,7 +337,7 @@ class TuiGateway:
         self.home = home
         self._stderr = open(home / "tui_gateway.stderr.log", "w", encoding="utf-8")
         self.proc = subprocess.Popen(
-            [sys.executable, "-m", "tui_gateway.entry"], cwd=str(home), env=hermetic_env(home, proxy=proxy),
+            _owned_command("tui_gateway.entry", []), cwd=str(home), env=hermetic_env(home, proxy=proxy),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr, text=True, bufsize=1,
             start_new_session=True,
         )

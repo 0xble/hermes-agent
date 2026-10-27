@@ -87,6 +87,18 @@ offline. Otherwise its daemon can outlive the test, resolve a later test's pool,
 and send an earlier key into that test's HTTP recorder. Host and exact-key
 assertions remain unchanged. Dedicated usage tests still exercise real workers.
 
+The routing truth-table CLI/TUI fixtures own their complete process group through
+normal return, timeout, and SIGKILL of pytest. Keep their test-only parent-death
+guardian and no-detach entry point together: a finalizer in pytest alone cannot
+reap a daemon that deliberately starts a new session. The regression kills a
+real nested pytest parent and requires the gateway to exit within 10 seconds,
+independently of its 3600-second idle window. The detached idle-exit regression
+also retains real process exit under inherited supervisor markers. The marker
+strip adapts upstream [PR #143630](https://github.com/NousResearch/hermes-agent/pull/143630)
+and extends it to Desktop. Retire that runtime hunk once the accepted upstream
+release includes equivalent stripping, but retain fixture custody until upstream
+owns both group cleanup and parent-death behavior.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. Both exact-SHA profiles bind
