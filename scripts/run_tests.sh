@@ -37,6 +37,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Even targeted runs compile the whole checkout. Acquire host admission before
+# activation or compilation, not through spelling-dependent shell wrappers.
+# The re-exec marker also handles heavy-slot's disabled / ancestor-reuse paths,
+# which can exec the payload without setting HEAVY_SLOT_HELD.
+if [ -z "${HEAVY_SLOT_HELD:-}${__HERMES_TESTS_HEAVY_SLOT:-}" ] && command -v heavy-slot >/dev/null 2>&1; then
+  exec heavy-slot --label "scripts/run_tests.sh (in $REPO_ROOT)" -- \
+    env __HERMES_TESTS_HEAVY_SLOT=1 "$BASH" "$SCRIPT_DIR/run_tests.sh" "$@"
+fi
+
 # ── Locate python ───────────────────────────────────────────────────────────
 # The suite runs under the checkout's isolated test environment (pm.testenv),
 # and only there: unless the inherited environment is current for this
@@ -173,8 +182,9 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # downloads, channel reads) need the host's pointer to verify TLS.
 # Keep this an explicit allowlist (no HERMES_TEST_* glob) so the "no
 # credential can leak" property stays auditable at a glance.
+# HEAVY_SLOT_HELD lets nested runners reuse this admission after env -i.
 TEST_ENV=()
-for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_PATHS \
+for _test_var in HERMES_PYTHON HEAVY_SLOT_HELD HERMES_TEST_IMAGE HERMES_TEST_PATHS \
   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
   HERMES_TEST_SCRATCH_ROOT PLAYWRIGHT_BROWSERS_PATH SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
