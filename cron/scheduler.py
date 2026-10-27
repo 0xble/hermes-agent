@@ -65,6 +65,8 @@ from agent.memory_provider import ctx_bound
 from agent.session_activity import AwakeIdleMeter
 from agent.turn_failure_copy import is_max_iteration_handoff
 
+from cron.config_audit import audit_config_changes
+
 logger = logging.getLogger(__name__)
 
 
@@ -2613,6 +2615,7 @@ class _FireAudit:
 
 
 
+@audit_config_changes
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
