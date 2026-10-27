@@ -981,7 +981,7 @@ with ci.checkout_lock():
             self.assertFalse((finished / 'target').exists())
             self.assertFalse(finished_venv.exists())
             self.assertTrue(outside.is_dir())
-            self.assertEqual((finished / 'keep.py').read_text(encoding='utf-8'), 'source\n')
+            self.assertEqual((finished / 'keep.py').read_text(encoding='utf-8-sig'), 'source\n')
             self.assertTrue((busy / '.ci' / 'blob').is_file())
             self.assertTrue((busy / '.venv').is_dir())
             run.assert_called()
