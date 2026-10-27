@@ -8,10 +8,10 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import _thread_metadata_for_event
 from gateway.platforms.event import MessageEvent
-from gateway.platforms.signal import SignalAdapter
 from gateway.relay.adapter import RelayAdapter
 from gateway.session import SessionSource
 from plugins.platforms.discord.adapter import DiscordAdapter
+from plugins.platforms.signal.adapter import SignalAdapter
 from tests.gateway.relay.test_relay_adapter import _CaptureTransport, make_desc
 from tests.gateway.test_slack import adapter as slack_fixture
 

@@ -117,7 +117,9 @@ async def test_scoped_telegram_pause_cancels_own_rearm_only():
     await a._retrigger_typing("123", first)
     await a._retrigger_typing("123", second)
     a.pause_typing_for_chat("123", metadata=first)
-    await asyncio.sleep(0.04)
+    # Wait for every re-arm still scheduled after the pause, not a wall-clock window.
+    pending = [task for task_map in a._typing_retrigger_task_maps() for task in task_map.values()]
+    await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 2)
     calls = [c.kwargs["metadata"]["thread_id"] for c in a.send_typing.await_args_list]
     assert calls == ["11", "22", "22"]
     a._cancel_typing_retrigger("123")
