@@ -835,6 +835,18 @@ MIGRATIONS: tuple[tuple[int, Callable[[dict[str, Any], bool], None]], ...] = (
     (49, _migrate_to_49),
     # 49 → 50: security.tirith_* dropped; the bundled scanner is gone (see _migrate_to_50).
     (50, _migrate_to_50),
+    # 50 → 51: cron.bot_chat_delivery_timeout_seconds is gone with the local `hermes chat`
+    # fallback lane it bounded. Bot Chat deliveries are admitted to the running gateway and
+    # settle on its durable receipt; there is no cron-side turn left to time out.
+    (51, functools.partial(
+        _rewrite_key, section="cron", key="bot_chat_delivery_timeout_seconds", new=None,
+        match=lambda _cur: True,
+        added="removed cron.bot_chat_delivery_timeout_seconds",
+        message=(
+            "  ✓ Removed cron.bot_chat_delivery_timeout_seconds — bot-chat deliveries are now "
+            "admitted to the target profile's running gateway and tracked by receipt, so cron no "
+            "longer runs (or times out) a Bot Chat turn of its own."),
+        extra_guard=lambda raw: "bot_chat_delivery_timeout_seconds" in raw)),
 )
 
 #: Steps triggered by a legacy key or identifier (a renamed or retired key, a removed plugin or
