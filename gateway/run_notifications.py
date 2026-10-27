@@ -58,6 +58,28 @@ def _local_completion_card(evt: dict) -> dict[str, str]:
     return {}
 
 
+def _coalesce_pending_watch_matches(events):
+    """Keep one held match per process incarnation and destination, preserving its retry clock."""
+    result, pending = [], {}
+    for evt in events:
+        if evt.get("type") != "watch_match" or not evt.get("session_id"):
+            result.append(evt)
+            continue
+        key = tuple(evt.get(field) for field in (
+            "session_id", "started_at", "session_key", "parent_session_id", "origin_hermes_home"))
+        held = pending.get(key)
+        if held is None:
+            pending[key] = evt
+            result.append(evt)
+            continue
+        # The producer bounds output. Absorb newer matches without resetting the old refusal
+        # deadline or identity, otherwise fresh process output bypasses admission backoff.
+        held["suppressed"] = int(held.get("suppressed") or 0) + int(evt.get("suppressed") or 0) + 1
+        held["output"] = evt.get("output", "")
+        held["pattern"] = evt.get("pattern", held.get("pattern", ""))
+    return result
+
+
 def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
     """Metadata carried by synthetic watch/completion notifications."""
     metadata: dict[str, Any] = {"notification_origin": "process_registry_synthetic"}
@@ -1581,7 +1603,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume watches in their owning profile, backing off refusals even during drain."""
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
-        watch_events = _drain_gateway_watch_events(completion_queue)
+        watch_events = _coalesce_pending_watch_matches(_drain_gateway_watch_events(completion_queue))
         for evt in watch_events:
             next_retry_at = evt.get("_watch_next_retry_at")
             draining = getattr(self, "_draining", False)
