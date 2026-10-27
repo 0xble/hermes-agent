@@ -415,6 +415,15 @@ class GatewaySessionControlsMixin:
             return record
         return await self._mark_and_finish(session_controls, record, "continuation_enqueued")
 
+    @staticmethod
+    def _approval_notice(authority: dict) -> tuple[str, str]:
+        """Target/requester wording must claim approval only for a recorded approval source."""
+        return {
+            "autonomy": ("applied autonomously without approval", "autonomously without approval"),
+            "button": ("approved in Telegram", "after Telegram approval"),
+        }.get(str(authority.get("via") or ""),
+              ("authority source not recorded", "(authority source not recorded)"))
+
     @classmethod
     def _control_notice(cls, record: dict) -> str:
         kind, action = record.get("kind", ""), record.get("action", "")
@@ -442,13 +451,14 @@ class GatewaySessionControlsMixin:
                 f"⊘ {kind.title()} {verb} by {requester} "
                 f"(applied by session {session_id} without approval){change}"
             )
-        if quote:
+        if quote and authority.get("via") != "autonomy":
             message = str(authority.get("message") or "")
             full = (f"\nFull message: \"{cls._clip(message, 1200)}\""
                     if message and message != quote else "")
             quote = cls._clip(quote, 300)
             return f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\"){change}{full}"
-        return f"⊘ {kind.title()} {verb} by {requester} (approved in Telegram){change}"
+        how, _ = cls._approval_notice(authority)
+        return f"⊘ {kind.title()} {verb} by {requester} ({how}){change}"
 
     @classmethod
     def _requester_notice(cls, record: dict) -> str:
@@ -464,7 +474,7 @@ class GatewaySessionControlsMixin:
                 session_id = cls._clip(str(authority.get("session_id") or ""), 120)
                 how = f"by session authority{f' from {session_id}' if session_id else ''}"
             else:
-                how = "after Telegram approval"
+                _, how = cls._approval_notice(authority)
             change = (f"\n{cls._change_text(record)}"
                       if record.get("action") == "replace" and record.get("affected_text") else "")
             return f"✓ Your request to {action} in {target} was applied {how}.{change}"
