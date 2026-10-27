@@ -40,10 +40,10 @@ retries, process or delegation completions, or restart auto-resumes start turns,
 - Only queued resumes are spaced (`BACKGROUND_TURN_SPACING_S`, 1 s between grants). Refused
   process watch events keep one copy in their existing queue and follow the refused-watch backoff
   (#140899, `_WATCH_INJECTION_RETRY_BASE_DELAY`), whose first wait is 10 s, so the 2 s drain cannot
-  retake every freed slot ahead of the goal and loop watchers. Serial drains never sleep or retry an
-  event before its deadline. A draining gateway offers each held event once more so it reaches the
-  drain spool, and disabled notifications still consume events. Other refused wakes retry on their
-  existing cadence.
+  retake every freed slot ahead of the goal and loop watchers. Serial drains never sleep. A draining
+  gateway offers each held event once more before its retry deadline so it reaches the drain spool.
+  A refused drain offer returns to the bounded backoff, and disabled notifications still consume
+  events. Other refused wakes retry on their existing cadence.
 - A person waiting on a session promotes that session's queued resume past the gate: any typed
   message reaching `_hm_handle_running_session_message`, and a recovered typed follow-up whose
   resume is still queued (not spooled internal events or declined follow-ups).

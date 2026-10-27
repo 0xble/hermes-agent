@@ -23,7 +23,7 @@ def _watch_queue(runner, adapter, monkeypatch):
     monkeypatch.setattr(runner, "_completion_event_scope", lambda _evt: nullcontext())
     monkeypatch.setattr(runner, "_completion_held_by_stop", lambda _evt: False)
     monkeypatch.setattr(runner, "_load_background_notifications_mode", lambda: "all")
-    monkeypatch.setattr(runner, "_build_process_event_source", lambda _evt: _event(key).source)
+    monkeypatch.setattr(runner, "_build_process_event_source", lambda _evt: _event("watch").source)
     monkeypatch.setattr(runner, "_resolve_injection_adapter", lambda *_args: adapter)
     monkeypatch.setattr("gateway.run._format_gateway_process_notification", lambda _evt: "ready")
     monkeypatch.setattr("hermes_cli.session_controls.internal_wake_is_current", lambda _evt: True)
@@ -97,4 +97,49 @@ async def test_watch_retry_deadline_keeps_one_event_and_preserves_the_resume_bou
     await runner._drain_watch_notifications(completions)
     assert inject.await_count == 2
     assert adapter.admitted.count(evt["session_key"]) == 1
+    assert completions.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spooled", [True, False])
+async def test_drain_offers_a_held_watch_once_then_honors_backoff(monkeypatch, spooled):
+    runner, adapter = _runner(1)
+    completions, evt, clock, inject = _watch_queue(runner, adapter, monkeypatch)
+    await adapter.handle_message(_event("busy"))
+    await runner._drain_watch_notifications(completions)
+    assert inject.await_count == 1
+
+    preserved = []
+
+    def preserve(key, event):
+        preserved.append((key, event))
+        return spooled
+
+    monkeypatch.setattr(runner, "_preserve_drain_event", preserve)
+    runner._draining = True
+    clock.now = 1.0  # The first normal retry is not due until 10 seconds.
+    await runner._drain_watch_notifications(completions)
+    assert inject.await_count == 2
+    assert len(preserved) == 1
+    if spooled:
+        assert completions.empty()
+        assert preserved[0][0] == evt["session_key"]
+        return
+
+    for _ in range(100):
+        await runner._drain_watch_notifications(completions)
+        assert completions.qsize() == 1
+    assert inject.await_count == 2, "a refused drain offer must not retry on every tick"
+    clock.now = 21.0
+    await runner._drain_watch_notifications(completions)
+    assert inject.await_count == 3, "a refused drain offer still retries at its deadline"
+
+    # A cancelled restart wait must not prevent the next drain from preserving the event.
+    runner._draining = False
+    await runner._drain_watch_notifications(completions)
+    assert inject.await_count == 3
+    runner._draining = True
+    await runner._drain_watch_notifications(completions)
+    assert inject.await_count == 4
+    assert completions.get_nowait() is evt
     assert completions.empty()
