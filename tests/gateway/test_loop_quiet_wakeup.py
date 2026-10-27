@@ -67,6 +67,157 @@ def _runner(adapter):
     return r
 
 
+@pytest.fixture()
+def goal_loop(hermes_home, monkeypatch):
+    """A real persisted goal/loop pair using the gateway wake fixtures and a fixed clock."""
+    from hermes_cli import goals, loops
+
+    clock = SimpleNamespace(now=2_000_000_000.0)
+    monkeypatch.setattr(loops.time, "time", lambda: clock.now)
+
+    def setup(interval_seconds=300):
+        sid = "loop-goal-sid"
+        route = {"platform": "telegram", "chat_id": "42", "chat_type": "dm", "user_id": "42"}
+        goal = goals.GoalManager(session_id=sid)
+        goal.set("finish the migration")
+        loop = loops.LoopManager(session_id=sid)
+        loop.set("check the queue", interval_seconds=interval_seconds, route=route)
+        assert loop.state is not None
+        interval = interval_seconds or loops.self_paced_floor_seconds()
+        if not interval_seconds:
+            # A quiet self-paced loop may already be at its ceiling. Goal deferral still uses
+            # the floor, not another full backoff period on top of its scheduled delay.
+            loop.state.current_delay = float(loops.self_paced_ceiling_seconds())
+            loop._save()
+        adapter = _Adapter()
+        runner = _runner(adapter)
+        runner._adapters_for_profile = lambda profile: {Platform.TELEGRAM: adapter}
+        runner._build_process_event_source = lambda evt: SessionSource(
+            platform=Platform.TELEGRAM, chat_id=evt["chat_id"], chat_type=evt["chat_type"],
+            user_id=evt["user_id"],
+        )
+        runner._session_key_for_source = lambda source: "agent:main:telegram:dm:42"
+        return SimpleNamespace(
+            sid=sid, goal=goal, loop=loop, interval=interval, clock=clock,
+            runner=runner, adapter=adapter,
+        )
+
+    return setup
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval_seconds", [300, 0], ids=["fixed", "self-paced"])
+@pytest.mark.parametrize("overdue_intervals", [1, 2], ids=["at-limit", "past-limit"])
+async def test_idle_active_goal_cannot_starve_overdue_loop(goal_loop, interval_seconds, overdue_intervals):
+    from hermes_cli import goals, loops
+
+    env = goal_loop(interval_seconds)
+    env.loop.state.next_due_at = env.clock.now - overdue_intervals * env.interval
+    env.loop._save()
+    assert env.goal.is_active() and not env.goal.is_waiting()
+
+    await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+
+    assert len(env.adapter.events) == 1
+    stored = loops.load_loop(env.sid)
+    assert stored is not None
+    assert stored.ticks_fired == 1 and stored.awaiting_response
+    goal = goals.GoalManager(session_id=env.sid).state
+    assert goal is not None and goal.turns_used == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval_seconds", [300, 0], ids=["fixed", "self-paced"])
+@pytest.mark.parametrize("overdue_fraction", [0, 0.99], ids=["just-due", "before-limit"])
+async def test_active_goal_keeps_initial_loop_deferral(goal_loop, interval_seconds, overdue_fraction):
+    from hermes_cli import loops
+
+    env = goal_loop(interval_seconds)
+    env.loop.state.next_due_at = env.clock.now - overdue_fraction * env.interval
+    env.loop._save()
+    assert env.loop.is_due(env.clock.now)
+
+    await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+
+    assert env.adapter.events == []
+    stored = loops.load_loop(env.sid)
+    assert stored is not None
+    assert stored.ticks_fired == 0 and not stored.awaiting_response
+    assert stored.next_due_at == env.loop.state.next_due_at
+
+
+@pytest.mark.asyncio
+async def test_overdue_loop_still_defers_to_inflight_goal_turn(goal_loop):
+    from hermes_cli import loops
+
+    env = goal_loop()
+    env.loop.state.next_due_at = env.clock.now - 2 * env.interval
+    env.loop._save()
+    key = env.runner._session_key_for_source(None)
+    env.runner._running_agents[key] = SimpleNamespace(goal_continuation=True)
+
+    await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+
+    assert env.adapter.events == []
+    stored = loops.load_loop(env.sid)
+    assert stored is not None
+    assert stored.ticks_fired == 0 and not stored.awaiting_response
+
+    env.runner._running_agents.pop(key)
+    await env.runner._loop_wakeup_fire_one(env.sid, stored, env.clock.now, set())
+    assert len(env.adapter.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_parked_goal_with_holding_barrier_does_not_defer_loop(goal_loop):
+    from hermes_cli import goals, loops
+
+    env = goal_loop()
+    env.goal.wait_for_seconds(3600, reason="waiting on CI")
+    assert env.goal.is_active() and env.goal.is_waiting()
+
+    await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+
+    assert len(env.adapter.events) == 1
+    stored = loops.load_loop(env.sid)
+    assert stored is not None and stored.ticks_fired == 1
+    assert goals.GoalManager(session_id=env.sid).is_waiting()
+
+
+@pytest.mark.asyncio
+async def test_goal_loop_deferral_logs_once_per_interval(goal_loop, caplog):
+    import logging
+
+    from hermes_cli import loops
+
+    env = goal_loop()
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    for elapsed in (0, 1, env.interval - 1):
+        env.clock.now = env.loop.state.next_due_at + elapsed
+        await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+
+    def deferred_records():
+        return [record for record in caplog.records if "deferred by active goal" in record.message]
+
+    assert len(deferred_records()) == 1
+    assert deferred_records()[0].levelno == logging.INFO
+    assert env.sid in deferred_records()[0].message
+    assert env.adapter.events == []
+
+    env.clock.now = env.loop.state.next_due_at + env.interval
+    await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+    assert len(env.adapter.events) == 1
+    assert len(deferred_records()) == 1
+
+    loop = loops.LoopManager(session_id=env.sid)
+    loop.complete_tick("[SILENT]")
+    assert loop.state is not None
+    env.clock.now = loop.state.next_due_at
+    await env.runner._loop_wakeup_fire_one(env.sid, loop.state, env.clock.now, set())
+    assert len(deferred_records()) == 2
+    assert len(env.adapter.events) == 1
+
+
 class _ShapeRunner(GatewayTurnMixin):
     def __init__(self):
         self.async_session_store = SimpleNamespace(clear_resume_pending=self._noop)
