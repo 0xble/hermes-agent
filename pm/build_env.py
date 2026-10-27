@@ -6,6 +6,11 @@ from collections.abc import Sequence
 from pathlib import Path
 import sys
 
+if __name__ == "__main__":
+    # Immutable updates enter this candidate-owned stdlib CLI before its
+    # application environment exists, ignoring the old updater's import path.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 
 def _record_selection(source: Path, extras: list[str]) -> None:
     """Publish the built extras as the store's venv selection, as a bundle build does.
