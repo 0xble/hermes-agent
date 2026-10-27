@@ -114,3 +114,43 @@ def _layer_over_inherited(inherited: dict[str, Any], user: dict[str, Any]) -> di
             continue
         merged[key] = value
     return merged
+
+
+_DEFAULT_TRANSIENT_RETRIES = 2
+
+
+def _transient_retry_count() -> int:
+    """Same-provider retries for a transient blip: ``auxiliary.transient_retries``
+    (default 2), clamped to [0, 6]; config-read failures fall back to default."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        val = cfg_get(load_config(), "auxiliary", "transient_retries")
+        return _DEFAULT_TRANSIENT_RETRIES if val is None else max(0, min(int(val), 6))
+    except Exception:  # health: allow BLE001 -- config-read failures retain the built-in retry budget
+        return _DEFAULT_TRANSIENT_RETRIES
+
+
+def _user_set_task_timeout(task: str) -> float | None:
+    """User-pinned positive seconds, without DEFAULT_CONFIG's merged timeout.
+
+    Adapted from upstream #127083. A session's frozen policy takes precedence over disk.
+    """
+    aux = _SESSION_AUXILIARY.get()
+    if aux is None:
+        try:
+            import hermes_yaml as yaml
+            from hermes_cli.config import get_config_path
+
+            raw_config = yaml.safe_load(get_config_path().read_text(encoding="utf-8-sig")) or {}
+            aux = raw_config.get("auxiliary", {}) if isinstance(raw_config, dict) else {}
+        except Exception:  # health: allow BLE001 -- absent/unreadable config keeps the default budget
+            return None
+    task_config = aux.get(str(task), {}) if isinstance(aux, dict) else {}
+    raw = task_config.get("timeout") if isinstance(task_config, dict) else None
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None

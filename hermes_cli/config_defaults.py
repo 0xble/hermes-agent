@@ -677,7 +677,7 @@ DEFAULT_CONFIG = {
         # Inactivity budget for in-agent compress_context (loop, /compress, preflight); same
         # progress-aware semantics as hygiene_timeout_seconds. 0 = disable the owned wrapper
         # (callers passing commit_fence, e.g. gateway hygiene, never use it). Floored at the auxiliary
-        # compression request timeout (auxiliary.compression.timeout, min 300s): the host never judges
+        # compression request timeout (300s when unset): the host never judges
         # silence before the summary request itself would time out.
         "context_timeout_seconds": 120,
         # Absolute cap on the *pre-commit* compress_context wait (summary/stream phase) even while
@@ -838,7 +838,7 @@ DEFAULT_CONFIG = {
         "triage_specifier": _aux(120),
         "kanban_decomposer": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
-        "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
+        "goal_judge": _aux(30),          # /goal satisfaction + contract drafting; JSON calls
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
         # of skills); route cheaper via `hermes model` → auxiliary → Curator.
         "curator": _aux(600),
