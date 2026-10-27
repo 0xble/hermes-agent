@@ -99,6 +99,12 @@ and extends it to Desktop. Retire that runtime hunk once the accepted upstream
 release includes equivalent stripping, but retain fixture custody until upstream
 owns both group cleanup and parent-death behavior.
 
+Chaos scenario workers build child environments while pytest changes the parent
+process environment between tests. Filter names before reading values and omit
+variables removed in that interval, without weakening credential isolation or
+requiring the variable to remain set. The deterministic environment regression
+covers removal of both filtered and inherited names, including empty values.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. Both exact-SHA profiles bind

@@ -111,13 +111,15 @@ def write_chaos_home(root: Path, base_url: str, **cfg: Any) -> tuple[Path, Path]
 def hermetic_env(home: Path, hermes_home: Path, tag: str) -> dict[str, str]:
     """Child env: fake HOME/HERMES_HOME, no real credentials, repo importable, and a
     tag every descendant inherits so the orphan scan can find it after reparenting."""
+    # Scenario workers overlap pytest's per-test env cleanup. _Environ.items()
+    # looks up snapshotted keys later, so a removed variable can raise KeyError.
     env = {
-        k: v for k, v in os.environ.items()
+        k: v for k in os.environ
         if not (
             k.endswith(("_API_KEY", "_TOKEN", "_SECRET"))
             or k.startswith(("HERMES_", "OPENROUTER", "ANTHROPIC", "OPENAI", "NOUS_"))
             or k in {"PYTEST_CURRENT_TEST"}
-        )
+        ) and (v := os.environ.get(k)) is not None
     }
     env.update({
         "HOME": str(home),
