@@ -70,6 +70,16 @@ def rows(authority, sid):
     return list_session_admissions(authority.db, session_id=sid, pending_only=False)
 
 
+def goal_prompt(runner, source, text):
+    from hermes_cli.goals import GoalManager
+    entry = runner.session_store.lookup_by_session_key(runner._session_key_for_source(source))
+    state = GoalManager(entry.session_id).set('Verify synthetic admission')
+    # A continuation must name a live goal instance. Otherwise the currency fence correctly
+    # drops it before admission, so it cannot prove codec refusal or rewrite behavior.
+    return runner._synthetic_prompt_event(source, text, goal_continuation=True,
+                                         goal_session_id=entry.session_id, goal_state=state)
+
+
 @pytest.mark.asyncio
 async def test_lifted_goal_barrier_drives_real_native_admission(native_chat):
     from hermes_cli.goals import GoalManager, load_goal
@@ -206,15 +216,40 @@ async def test_user_refusal_notice_is_per_chat_reason_and_ten_minutes(native_cha
     clock[0] += 1
     assert 'refused this message' in await admit_message(authority, event)
 
+    # The incident flooded the transport, not just the admission return value. Replay its
+    # 47-message burst through the real adapter and check the same 599/600-second boundary.
+    async def dispatch(message_id):
+        await adapter.handle_message(replace(event, message_id=message_id))
+        await async_wait_until(lambda: not adapter._background_tasks, timeout=20, what='refused user dispatch')
+
+    clock[0] += 600
+    before = list(sent)
+    for index in range(47):
+        await dispatch(f'refused-{index}')
+    assert len(sent) == len(before) + 1
+    assert 'refused this message' in sent[-1]
+    clock[0] += 599
+    await dispatch('refused-599')
+    assert len(sent) == len(before) + 1
+    clock[0] += 1
+    await dispatch('refused-600')
+    assert len(sent) == len(before) + 2
+    assert 'refused this message' in sent[-1]
+    assert len(turns) == 1
+    entry = runner.session_store.lookup_by_session_key(runner._session_key_for_source(source))
+    assert len(rows(authority, entry.session_id)) == 1
+
 
 @pytest.mark.asyncio
-async def test_refused_gateway_prompt_never_sends_a_transport_reply(native_chat):
+async def test_refused_gateway_prompt_never_sends_a_transport_reply(native_chat, caplog):
     runner, adapter, authority, source, sent, turns = native_chat
     before = list(sent)
-    event = runner._synthetic_prompt_event(source, 'gateway wake', goal_continuation=True)
+    event = goal_prompt(runner, source, 'gateway wake')
     event.media_urls = 'invalid'
-    await admit_internal_event(adapter, event)
-    await async_wait_until(lambda: not adapter._background_tasks, timeout=20, what='refused synthetic dispatch')
+    with caplog.at_level(logging.WARNING, logger='gateway.session_refusals'):
+        await admit_internal_event(adapter, event)
+        await async_wait_until(lambda: not adapter._background_tasks, timeout=20, what='refused synthetic dispatch')
+    assert any('invalid_params (media_urls)' in record.getMessage() for record in caplog.records)
     assert sent == before
     assert len(turns) == 1
     entry = runner.session_store.lookup_by_session_key(runner._session_key_for_source(source))
@@ -225,7 +260,7 @@ async def test_refused_gateway_prompt_never_sends_a_transport_reply(native_chat)
 async def test_rewritten_gateway_prompt_keeps_private_producer_provenance(native_chat):
     from gateway.session_ingress_context import carry_callback, native_callback
     runner, adapter, authority, source, sent, turns = native_chat
-    original = runner._synthetic_prompt_event(source, 'original', goal_continuation=True)
+    original = goal_prompt(runner, source, 'original')
     rewritten = replace(original, text='rewritten')
     carry_callback(original, rewritten)
     with native_callback(runner, rewritten, get_hermes_home()):

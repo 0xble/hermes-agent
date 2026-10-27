@@ -993,6 +993,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Guards: `tests/gateway/test_synthetic_native_admission.py`, including the real
   lifted-barrier and watch-pattern producer paths, durable restore, source/route
   revalidation, foreign human metadata, internal silence, and per-chat notice windows.
+  Refusal and callback-rewrite cases use a stored active goal instance so the
+  goal-currency fence admits them to the boundary under test. Unbacked or stale
+  continuations must still be dropped before admission. The user-refusal case also
+  drives a 47-message transport burst and verifies the 599/600-second boundary.
 - Roll back as one source unit. No config, schema, state migration or new alert
   system is involved. Retire when a released upstream provides equivalent producer
   projection and refusal presentation guards.
