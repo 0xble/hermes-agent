@@ -55,6 +55,8 @@ def _respond(record: dict[str, Any]) -> Say:
 def _drive(fake: FakeVertex, tmp_path: Path):
     nh = make_home(tmp_path / "h", **hermes_setup(fake, extra_config={"display": {"interface": "cli"}}))
     sock = f"hermes-e2e-vertex-{uuid.uuid4().hex[:8]}"
+    from hermes_cli.test_artifact_lifetime import register_tmux_server
+    register_tmux_server(listener=sock)
     env = nh.env({**fake.child_env(), "TERM": "xterm-256color"})
 
     def tmux(*args: str) -> str:

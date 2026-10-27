@@ -1237,10 +1237,30 @@ def pytest_unconfigure(config):
     _remove_relocated_basetemp(config)
 
 
+def _install_test_artifact_custody(config) -> None:
+    """Mark this session's basetemp and start the guardian that outlives a killed pytest."""
+    relocated = getattr(config, "_hermes_relocated_basetemp", None)
+    if relocated is not None:
+        basetemp = Path(relocated)
+        basetemp.mkdir(parents=True, exist_ok=True)
+    else:
+        factory = getattr(config, "_tmp_path_factory", None)
+        if factory is None:
+            return
+        basetemp = Path(factory.getbasetemp())
+    try:
+        from hermes_cli.test_artifact_lifetime import install_session_custody
+
+        install_session_custody(basetemp)
+    except Exception:
+        return
+
+
 @pytest.hookimpl(trylast=True)  # after _pytest.tmpdir has built config._tmp_path_factory
 def pytest_configure(config):
     """Register markers used by hermetic conftest."""
     _relocate_basetemp_outside_operator_home(config)
+    _install_test_artifact_custody(config)
     config.addinivalue_line(
         "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "

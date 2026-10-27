@@ -6124,6 +6124,13 @@ def _guard_corrupt_user_config() -> None:
 
 def main():
     """CLI entry point for the gateway."""
+    # ``python -m gateway.run`` bypasses hermes_cli.main. Same artifact watch.
+    try:
+        from hermes_cli.test_artifact_lifetime import arm_test_artifact_lifetime
+
+        arm_test_artifact_lifetime()
+    except Exception:
+        pass
     # Before any config-dependent startup (watchdog, DB opens, provider resolution).
     _guard_corrupt_user_config()
 

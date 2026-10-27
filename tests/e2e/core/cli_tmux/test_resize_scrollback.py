@@ -40,6 +40,8 @@ def _reply(turn: int) -> str:
 def test_resizes_keep_each_transcript_line_once_in_tmux_scrollback(tmp_path: Path) -> None:
     require_tmux()
     sock = f"hermes-e2e-{uuid.uuid4().hex[:8]}"
+    from hermes_cli.test_artifact_lifetime import register_tmux_server
+    register_tmux_server(listener=sock)
     home = tmp_path / "home"
     (tmp_path / "work").mkdir()
 
