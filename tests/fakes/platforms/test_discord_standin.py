@@ -1,9 +1,15 @@
-"""The Discord fake must not stall the real SDK after a cancelled progress send."""
+"""The Discord fake must not stall the real SDK after a cancelled progress send.
+
+This lives beside the fake, outside tests/e2e and tests/gateway, whose conftests replace
+`discord` with a mock module; it must drive the real discord.py HTTP client (a pinned
+dependency), and fails loudly rather than skipping if a mock ever shadows it.
+"""
 
 import asyncio
 from contextlib import suppress
 
-import discord.http
+import discord
+import discord.http as discord_http
 import pytest
 
 from tests.fakes.platforms.discord_standin import DiscordStandin, TOKEN
@@ -14,18 +20,18 @@ from tests.fakes.platforms.discord_standin import DiscordStandin, TOKEN
 async def test_cancelled_progress_does_not_stall_next_send(monkeypatch, preceding_forbidden):
     standin = DiscordStandin()
     standin.start()
-    monkeypatch.setattr(discord.http.Route, "BASE", standin.api_base)
-    client = discord.http.HTTPClient(asyncio.get_running_loop())
+    monkeypatch.setattr(discord_http.Route, "BASE", standin.api_base)
+    client = discord_http.HTTPClient(asyncio.get_running_loop())
     try:
         await client.static_login(TOKEN)
         channel = await client.start_private_message(111)
-        route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel["id"])
+        route = discord_http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel["id"])
         if preceding_forbidden:
             standin.fail("create_message", {"message": "Missing Access", "code": 50001}, status=403)
             with pytest.raises(discord.Forbidden):
                 await client.request(route, json={"content": "rejected"})
 
-        parse = discord.http.json_or_text
+        parse = discord_http.json_or_text
         cancelled = asyncio.Event()
 
         async def cancel_after_progress_response(response):
