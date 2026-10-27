@@ -337,6 +337,9 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
                                            sources=(install_state._active_root,))
     monkeypatch.setattr(install_state, "machine_places", lambda: isolated_places)
     install_state.probe.cache_clear()
+    # The per-process terminal PATH composition cache must not carry one test's store into the next.
+    if "pm.install" in sys.modules:
+        sys.modules["pm.install"]._store_path_dirs_cache.clear()
     from hermes_cli import onboarding_due
 
     onboarding_due.reset_for_tests()

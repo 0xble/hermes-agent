@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -938,6 +939,54 @@ def _dependents_first(names: list[str]) -> list[str]:
             order.remove(name)
             order.insert(min(positions), name)
     return order
+
+
+# Every terminal command composes its PATH through ``pm.user_facing``. One composition resolves
+# the store root, reads each root's facts and probes each package's binary (Chromium's is an
+# rglob of its whole tree): on the live gateway that was 23% of all GIL-held time (2026-10-25),
+# which also stretched SQLite writer-lock holds queued behind the GIL. The key carries every
+# root's facts.json stat, so an install by any process shows on the next command; a PM write in
+# this process also invalidates it, and the TTL bounds out-of-band damage. Activation
+# (``store_first_path``) stays uncached: it reports live damage.
+_STORE_PATH_DIRS_TTL_S = 30.0
+_store_path_dirs_cache: dict[tuple, list[str]] = {}
+_store_roots_cache: dict[tuple, tuple[Path, ...]] = {}
+_store_path_dirs_lock = threading.Lock()
+_clock = time.monotonic
+
+
+def _facts_stamp(root: Path) -> tuple[int, int] | None:
+    try:
+        stat = (root / "facts.json").stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def cached_store_path_dirs() -> list[str]:
+    """:func:`_store_path_dirs`, cached per process for the terminal's PATH composition."""
+    from pm import filesystem
+
+    active = _active_install_store.get()
+    bucket = _clock() // _STORE_PATH_DIRS_TTL_S
+    env_key = (bucket, os.environ.get("HERMES_RUNTIME_DIR"), os.environ.get("HERMES_HOME"),
+               os.environ.get("HOME"), None if active is None else str(active.root))
+    roots = _store_roots_cache.get(env_key)
+    if roots is None:
+        roots = tuple(dict.fromkeys(((active.root,) if active is not None else ())
+                                    + (paths.store_root(), paths.writable_store_root())))
+        _store_roots_cache.clear()
+        _store_roots_cache[env_key] = roots
+    key = (filesystem.write_generation, env_key, tuple(_facts_stamp(root) for root in roots))
+    dirs = _store_path_dirs_cache.get(key)
+    if dirs is None:
+        with _store_path_dirs_lock:  # one recompose when concurrent commands all miss at a rollover
+            dirs = _store_path_dirs_cache.get(key)
+            if dirs is None:
+                dirs = _store_path_dirs()
+                _store_path_dirs_cache.clear()
+                _store_path_dirs_cache[key] = dirs
+    return list(dirs)
 
 
 def _store_path_dirs() -> list[str]:

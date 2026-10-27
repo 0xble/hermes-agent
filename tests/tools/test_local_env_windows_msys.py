@@ -339,7 +339,7 @@ def test_git_bash_dirs_stay_first_when_hermes_tools_move_behind_the_users(monkey
     from tools.environments import local as local_mod
 
     bash_dir, node_dir, system32 = "/store/git/usr/bin", "/store/node", "/windows/system32"
-    monkeypatch.setattr(pm.install, "_store_path_dirs", lambda: [bash_dir, node_dir])
+    monkeypatch.setattr(pm.install, "cached_store_path_dirs", lambda: [bash_dir, node_dir])
     monkeypatch.setattr(local_mod, "_git_bash_bin_dirs", lambda: [bash_dir])
     path = os.pathsep.join([bash_dir, node_dir, system32])
     assert local_mod._user_tools_first(path).split(os.pathsep) == [bash_dir, system32, node_dir]
