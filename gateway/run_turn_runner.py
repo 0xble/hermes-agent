@@ -55,6 +55,10 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
     from agent.error_classifier import FailoverReason
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     from hermes_state_runtime import RuntimeStoreError
+    from hermes_cli.config_errors import config_error_notice, config_error_reason
+    reason = config_error_reason(exc)
+    if reason is not None:
+        return config_error_notice(reason), "config_error", False
     auth_permanent = FailoverReason.auth_permanent.value
     if isinstance(exc, RuntimeStoreError):
         return (f"⚠️ This session's launch credentials are no longer available ({exc.reason}), so this "
@@ -1990,7 +1994,12 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         except Exception as exc:
             # Model/credential resolution failed before the turn began. Keep the raw cause in logs,
             # but return a failed turn with a stable user-facing recovery message and reason.
-            logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
+            from hermes_cli.config_errors import config_error_reason, log_config_error_once
+            config_reason = config_error_reason(exc)
+            if config_reason is not None:
+                log_config_error_once(logger, config_reason)
+            else:
+                logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
             from agent.turn_failure_copy import stamp_failure
             text, reason, retryable = _resolution_failure_reply(exc, ctx.source.platform)
             return stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
