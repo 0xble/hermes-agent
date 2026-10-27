@@ -26,17 +26,15 @@ logger = logging.getLogger("gateway.run")
 DEFAULT_BACKGROUND_TURN_CONCURRENCY = 8
 # Minimum gap between two background turn starts; a backlog drains as a trickle, not a burst.
 BACKGROUND_TURN_SPACING_S = 1.0
-# Origins (gateway.platforms.event.turn_origin_for_event) whose wakes ask the gate.
 # Event attribute carrying a slot reserved before the caller took its durable claim.
 BACKGROUND_RESERVATION_ATTR = "_background_turn_reservation"
-_GATED_ORIGINS = frozenset({"goal_loop", "process"})
 
 
 def gated_background_kind(event: Any) -> Optional[str]:
-    """The gate lane for a wake nobody typed, or None when it is admitted without the gate."""
+    """Match the live-load predicate: every non-human origin needs the gate."""
     from gateway.platforms.event import turn_origin_for_event
     origin = turn_origin_for_event(event)
-    return origin if origin in _GATED_ORIGINS else None
+    return origin if origin != "user" else None
 
 
 class GatewayBackgroundAdmissionMixin:
@@ -126,7 +124,7 @@ class GatewayBackgroundAdmissionMixin:
         """Reserve a background turn slot for ``event`` or raise ``WakeNotAccepted``.
 
         Returns the reservation token (release it if the adapter then refuses the event), or
-        None when no slot is needed: typed input, an ungated kind, or a session that already has a
+        None when no slot is needed: typed input or a session that already has a
         live turn, whose queue this wake joins without adding a turn. A token the caller reserved
         before taking a durable claim (``_reserve_background_turn``) is honored unconditionally,
         so a claimed /loop tick or cleared barrier is never refused for capacity afterwards.

@@ -7,18 +7,18 @@ retries, process or delegation completions, or restart auto-resumes start turns,
 
 ## Required Behavior
 
-- Typed input is never gated. Only turns nobody typed ask the gate. Promotion and the load use
-  `turn_origin_for_event`, so relays never count as typed input.
+- Typed input is never gated, including a synthetic event merged with genuine human input.
+  Wake admission, promotion and the load use `turn_origin_for_event`, so relays alone never
+  count as typed input.
 - At most `gateway.background_turn_concurrency` (default 8) turns nobody typed run at once.
   The load is measured from live runner state (sessions whose running turn's
   `turn_origin_for_event` is not `user`), so relays, heartbeats and chained goal
-  continuations count against the cap even though they do not pass the gate, and a turn that
-  ends, crashes or is stopped frees its slot with no release bookkeeping.
+  continuations count against the cap. A turn that ends, crashes or is stopped frees its slot
+  with no release bookkeeping.
 - Gated: restart auto-resumes (`_schedule_resume_pending_sessions`) and every
-  `admit_internal_event` wake whose origin is `goal_loop` or `process` (goal continuations,
-  lifted barriers, session-control continuations, loop ticks, delegation retry notices, process,
-  watch-pattern and async delegation completions). Cron deliveries and reviews, opening briefs,
-  plugin injections and relays are not gated.
+  `admit_internal_event` wake whose origin is not `user`: `goal_loop`, `process`, `relay`,
+  `cron` and `unknown`. This uses the same predicate as the measured load rather than a
+  separate origin allowlist. The existing reservation and refusal protocol is unchanged.
 - Resumes wait in the replay scheduler's priority queue (FIFO within lanes, behind restored typed
   input). Wakes never wait: with no room, `admit_internal_event` raises `WakeNotAccepted` before
   the adapter sees the event and the caller keeps its durable claim (lifted barrier, ledger row,
@@ -65,12 +65,12 @@ promotion), `gateway/run_inbound.py` (preclaim promotion), `gateway/config.py` a
   or reaches its turn limit. Round-robin between goals is later, if needed.
 - Queued resumes keep their preclaim sentinels, so `active_agents` in `gateway_state.json`
   counts them while they wait, and so does `max_concurrent_sessions` when it is set.
-- The load counts every running turn nobody typed (relays, cron deliveries, heartbeats and
-  chained continuations too), but only the gated kinds above are ever refused.
+- The load counts every running turn nobody typed. This gate owns restart resumes and the
+  `admit_internal_event` boundary, not ingress paths that do not call it.
 
 ## Verification
 
-`scripts/run_tests.sh tests/gateway/test_background_turn_admission.py tests/gateway/test_replay_scheduler.py`
+`scripts/run_tests.sh tests/gateway/test_background_turn_admission.py tests/gateway/test_background_turn_origins.py tests/gateway/test_turn_origin.py tests/gateway/test_replay_scheduler.py -j 1`
 
 ## Provenance
 
