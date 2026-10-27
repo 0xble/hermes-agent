@@ -3124,6 +3124,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             "completion_reason": getattr(session, "completion_reason", "exited"),
             "termination_source": getattr(session, "termination_source", ""),
             "output": _redact_gateway_user_facing_secrets(_out),
+            "handoff_note": _redact_gateway_user_facing_secrets(getattr(session, "handoff_note", "") or ""),
             # Spawning session-db id: lets pre-flight drop this completion if the user /new'd first.
             "parent_session_id": (
                 watcher.get("parent_session_id") or getattr(session, "parent_session_id", "") or ""
@@ -3205,12 +3206,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             session = await asyncio.to_thread(process_registry.get, session_id)
             if session is None:
                 break
-            # A retiring topic can transfer a live process. Its mutable registry
-            # route is authoritative, not this watcher's launch-time snapshot.
-            if getattr(session, "session_key", "") and session.session_key != watcher.get("session_key"):
-                from tools.process_registry import _WATCHER_ROUTE_KEYS
-                watcher.update(session_key=session.session_key, parent_session_id=session.parent_session_id,
-                               **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS})
+            # A retiring topic or a subagent handoff can transfer a live process. Its mutable
+            # registry route is authoritative, not this watcher's launch-time snapshot.
+            if self._follow_process_route(watcher, session):
                 platform_name = watcher.get("platform", "")
                 chat_id, thread_id = watcher.get("chat_id", ""), watcher.get("thread_id", "")
             async with self._completion_event_scope(watcher):

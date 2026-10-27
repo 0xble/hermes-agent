@@ -32,6 +32,21 @@ _MAX_DELEGATE_PROVENANCE_HOPS = 16
 class GatewayNotificationOwnershipMixin:
     """Ownership proof and route resolution for pinned async and process completions."""
 
+    @staticmethod
+    def _follow_process_route(watcher: dict, session: Any) -> bool:
+        """Adopt a transferred process's live route into its watcher. A retiring topic moves the
+        session key; a subagent handoff keeps the chat's key but moves the spawning session id to
+        the parent. Returns True when the watcher's route changed."""
+        from tools.process_registry import _WATCHER_ROUTE_KEYS
+        session_key = str(getattr(session, "session_key", "") or "")
+        parent_session_id = str(getattr(session, "parent_session_id", "") or "")
+        handed_off = bool(getattr(session, "handoff_note", "")) and parent_session_id != watcher.get("parent_session_id")
+        if not session_key or (session_key == watcher.get("session_key") and not handed_off):
+            return False
+        watcher.update(session_key=session_key, parent_session_id=parent_session_id,
+                       **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS})
+        return True
+
     async def _resolve_compression_lineage_target(
         self, session_db: Any, session_entry: Optional[SessionEntry], pinned_session_id: str,
     ) -> tuple[str, Optional[str]]:
