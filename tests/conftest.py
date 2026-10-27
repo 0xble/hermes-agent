@@ -1233,13 +1233,17 @@ def require_mcp_2_sdk():
 
 
 def pytest_unconfigure(config):
-    root = os.environ.get("HERMES_PYTEST_CUSTODY")
-    if root:
-        from hermes_cli.test_artifact_lifetime import _kill_session_tmux
+    try:
+        root = os.environ.get("HERMES_PYTEST_CUSTODY")
+        if root:
+            from hermes_cli.test_artifact_lifetime import _kill_session_tmux
 
-        _kill_session_tmux(Path(root))
-    _reap_session_hermes_processes(config)
-    _remove_relocated_basetemp(config)
+            _kill_session_tmux(Path(root))
+    finally:
+        try:
+            _reap_session_hermes_processes(config)
+        finally:
+            _remove_relocated_basetemp(config)
 
 
 def _install_test_artifact_custody(config) -> None:

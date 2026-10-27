@@ -7,7 +7,7 @@ that owner dies and when its age exceeds ``HERMES_TEST_MAX_LIFETIME`` (default
 
 The session guardian is a child of pytest. SIGKILL of pytest does not kill it;
 it notices the owner pid is gone and ``kill-server``s only the tmux servers
-this session registered or created under its basetemp.
+this session registered.
 """
 from __future__ import annotations
 
@@ -195,40 +195,38 @@ def _kill_artifact(target: int) -> None:
 
 def _kill_session_tmux(root: Path) -> None:
     registry = root / TMUX_REGISTRY
-    if registry.is_file():
-        for line in registry.read_text(encoding="utf-8-sig").splitlines():
-            kind, _, value = line.partition(" ")
-            if kind == "L" and value:
-                _kill_listener(value)
-            elif kind == "S" and value:
-                _kill_socket(value)
-    if not root.is_dir():
+    try:
+        lines = registry.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
         return
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = [name for name in dirnames if not name.startswith(".")]
-        for name in filenames:
-            path = Path(dirpath) / name
-            try:
-                if path.is_socket():
-                    _kill_socket(str(path))
-            except OSError:
-                continue
+    # Only registered tmux endpoints are ours. A gateway.sock below basetemp is
+    # not a tmux server and can hold a tmux client open until its timeout.
+    for line in lines:
+        kind, _, value = line.partition(" ")
+        if kind == "L" and value:
+            _kill_listener(value)
+        elif kind == "S" and value:
+            _kill_socket(value)
 
 
 def _kill_listener(name: str) -> None:
-    subprocess.run(
-        ["tmux", "-L", name, "kill-server"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        timeout=5, check=False,
-    )
+    _kill_tmux("-L", name)
 
 
 def _kill_socket(path: str) -> None:
-    subprocess.run(
-        ["tmux", "-S", path, "kill-server"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        timeout=5, check=False,
-    )
+    _kill_tmux("-S", path)
+
+
+def _kill_tmux(selector: str, value: str) -> None:
+    try:
+        subprocess.run(
+            ["tmux", selector, value, "kill-server"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # A missing executable or one bad endpoint must not abort the sweep.
+        pass
 
 
 def main(argv: list[str]) -> int:

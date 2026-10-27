@@ -481,7 +481,7 @@ Test CLIs, gateways, and tmux servers started by the e2e and classic-cli harness
 die when their pytest owner dies, including SIGKILL of pytest, and any gateway or
 CLI whose ``HERMES_HOME`` is under a pytest tmp dir exits after
 ``HERMES_TEST_MAX_LIFETIME`` (default 2 hours). The session guardian kills only
-tmux servers that session registered or created under its basetemp. A process
-whose home is the operator install is never armed. The macOS session reaper
-cannot see detached grandchildren (no ``/proc``), so the in-process watch is the
-backstop for those.
+tmux servers that session registered. A process whose home is the operator
+install is never armed. The macOS session reaper cannot see detached
+grandchildren (no ``/proc``), so an independent watchdog is the backstop for
+those, even if the CLI is stopped or cannot schedule Python threads.
