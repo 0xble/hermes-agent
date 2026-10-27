@@ -92,6 +92,8 @@ async def test_input_queued_behind_a_live_worker_is_released_then_runs_when_it_f
     restarts the drain so the queued input runs without an unrelated submit."""
     import asyncio
     from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
     from gateway.session_authority import LiveSession, SessionAuthority
     from gateway.session_contract import Principal, SessionRef, Submission
     from gateway.session_ingress import admit_message
@@ -106,7 +108,8 @@ async def test_input_queued_behind_a_live_worker_is_released_then_runs_when_it_f
                              _adapter_for_source=lambda source: None)
     authority = SessionAuthority(runner, profile_id='p', instance_id='owner', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='owner'))
-    authority.sessions['owned'] = LiveSession(SimpleNamespace(platform=Platform.TELEGRAM, user_id='human'), 'route')
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='chat', user_id='human')
+    authority.sessions['owned'] = LiveSession(source, 'route')
     ran = []
 
     async def execute(authority, ref, row):
@@ -123,7 +126,7 @@ async def test_input_queued_behind_a_live_worker_is_released_then_runs_when_it_f
     try:
         registered = await worker_request(connection, ref, scope | {'kind': 'compute'}, operation='register')
         # Native ingress waits on the admission it committed; a blocked FIFO must answer it.
-        event = SimpleNamespace()
+        event = MessageEvent(text='hi', source=source)
         async def admit_native(_event):
             return await authority.submit(actor, Submission('behind', ref, {'text': 'hi'}, 'queue'))
         authority.admit_native = admit_native
