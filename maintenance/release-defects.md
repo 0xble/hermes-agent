@@ -1212,7 +1212,7 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   Only results that did not finish normally (`exit_reason != "completed"`, set by
   `tools/delegate_tool_child_run.py`) count, and the banner states the real share
   (`N of M tasks`) unless every task was rejected.
-- Guards: `tests/tools/test_process_registry.py` model_not_found notices, including
+- Guards: `tests/tools/test_process_registry_model_not_found.py`, including
   `test_model_not_found_notice_absent_for_a_normally_finished_task` and
   `test_model_not_found_notice_counts_only_rejected_tasks`; `tests/tools/test_async_delegation.py`
   model-rejection notices (a real rejection that exhausts iterations still raises it).
