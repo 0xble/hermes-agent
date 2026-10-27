@@ -53,12 +53,10 @@ _startup_fast.normalize_hermes_home_env()
 
 # Pytest artifacts must die with their owner and after a hard lifetime, including
 # when this process has already detached. No-op unless HERMES_HOME is a test dir.
-try:
-    from hermes_cli.test_artifact_lifetime import arm_test_artifact_lifetime
+from hermes_cli.test_artifact_lifetime import arm_test_artifact_lifetime
 
+if "pytest" not in sys.modules:
     arm_test_artifact_lifetime()
-except Exception:
-    pass
 
 # Startup-liveness watchdog: for gateway runs, arm BEFORE the heavy import
 # graph below — an import-time deadlock (native-extension init, contended

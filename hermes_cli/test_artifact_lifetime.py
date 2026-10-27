@@ -11,6 +11,7 @@ this session registered or created under its basetemp.
 """
 from __future__ import annotations
 
+import math
 import os
 import signal
 import subprocess
@@ -42,7 +43,10 @@ def owner_pid_from_home(home: str) -> int | None:
     for parent in (current, *current.parents):
         marker = parent / OWNER_MARKER
         if marker.is_file():
-            return _positive_pid(marker.read_text(encoding="utf-8").strip())
+            try:
+                return _positive_pid(marker.read_text(encoding="utf-8-sig").strip())
+            except OSError:
+                return None
     return None
 
 
@@ -94,27 +98,41 @@ def arm_test_artifact_lifetime() -> None:
         return
     owner = _owner_pid(home)
     _armed = True
-    started = time.monotonic()
-    lifetime = _lifetime_s()
-    parent = os.getppid()
-    watch_parent = parent > 1
+    if os.name == "posix":
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "artifact", str(os.getpid()),
+             str(owner or 0), str(os.getppid()), str(_lifetime_s())],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        # Windows has no POSIX parent/setsid contract. The independent wall-time
+        # watchdog still enforces the deadline even when the CLI's GIL is stuck.
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "artifact", str(os.getpid()),
+             str(owner or 0), "0", str(_lifetime_s())],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
-    def watch() -> None:
-        while True:
-            if owner is not None and not _alive(owner):
-                _die()
-            if watch_parent and not _alive(parent):
-                _die()
-            if time.monotonic() - started >= lifetime:
-                _die()
-            time.sleep(0.25)
 
-    import threading
-    threading.Thread(target=watch, name="hermes-test-lifetime", daemon=True).start()
+def artifact_main(target: int, owner: int, parent: int, lifetime: float) -> None:
+    """An independent process enforces the deadline even when the target is hung."""
+    deadline = time.monotonic() + lifetime
+    while _alive(target):
+        # On POSIX this watcher stays our child until exit. Once reparented, the
+        # target exited, so never send a signal to a potentially reused target pid.
+        if os.name == "posix" and os.getppid() != target:
+            return
+        if ((owner and not _alive(owner)) or (parent > 1 and not _alive(parent))
+                or time.monotonic() >= deadline):
+            _kill_artifact(target)
+            return
+        time.sleep(0.25)
 
 
 def guardian_main(owner: int, root: Path) -> None:
-    while _alive(owner):
+    deadline = time.monotonic() + _lifetime_s()
+    while _alive(owner) and time.monotonic() < deadline:
         time.sleep(0.25)
     _kill_session_tmux(root)
 
@@ -134,7 +152,7 @@ def _lifetime_s() -> float:
         value = float(raw)
     except ValueError:
         return float(DEFAULT_LIFETIME_S)
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         return float(DEFAULT_LIFETIME_S)
     return value
 
@@ -150,36 +168,35 @@ def _positive_pid(raw: str) -> int | None:
 def _alive(pid: int) -> bool:
     if pid <= 1:
         return False
+    import psutil
+
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        proc = psutil.Process(pid)
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
         return False
-    except PermissionError:
+    except psutil.AccessDenied:
         return True
-    except OSError:
-        return False
-    return True
 
 
-def _die() -> None:
-    # SIGKILL the group when we lead it, then exit. ``_exit`` covers the race
-    # where the signal has not been delivered before the next instruction.
-    if os.name == "posix" and os.getpgrp() == os.getpid():
+def _kill_artifact(target: int) -> None:
+    if os.name == "posix":
         try:
-            os.killpg(os.getpid(), signal.SIGKILL)
-        except OSError:
-            pass
+            if os.getpgid(target) == target:
+                os.killpg(target, signal.SIGKILL)  # windows-footgun: ok — guarded by os.name == posix
+                return
+        except ProcessLookupError:
+            return
     try:
-        os.kill(os.getpid(), signal.SIGKILL)
-    except OSError:
+        os.kill(target, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except ProcessLookupError:
         pass
-    os._exit(75)
 
 
 def _kill_session_tmux(root: Path) -> None:
     registry = root / TMUX_REGISTRY
     if registry.is_file():
-        for line in registry.read_text(encoding="utf-8").splitlines():
+        for line in registry.read_text(encoding="utf-8-sig").splitlines():
             kind, _, value = line.partition(" ")
             if kind == "L" and value:
                 _kill_listener(value)
@@ -217,6 +234,9 @@ def _kill_socket(path: str) -> None:
 def main(argv: list[str]) -> int:
     if len(argv) == 4 and argv[1] == "guardian":
         guardian_main(int(argv[2]), Path(argv[3]))
+        return 0
+    if len(argv) == 6 and argv[1] == "artifact":
+        artifact_main(int(argv[2]), int(argv[3]), int(argv[4]), float(argv[5]))
         return 0
     arm_test_artifact_lifetime()
     return 0
