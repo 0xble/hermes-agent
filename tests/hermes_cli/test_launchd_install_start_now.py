@@ -89,6 +89,7 @@ def test_cli_no_start_now_loads_only_a_gateway_launchd_already_runs(
 
 
 def test_wizard_no_to_start_now_installs_without_loading(launchd, monkeypatch):
+    monkeypatch.setattr(gateway_cli.sys.stdin, "isatty", lambda: True)
     answers = iter([False, True])  # "Start the gateway now?" No, "on login" Yes
     monkeypatch.setattr(gateway_cli, "prompt_yes_no", lambda *a, **k: next(answers))
     monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)

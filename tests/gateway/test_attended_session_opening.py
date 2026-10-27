@@ -72,7 +72,7 @@ async def test_opening_turn_finalizes_before_later_switch_in(opening, monkeypatc
     if kind == "recovered-topic":
         # Internal lobby-shaped events bypass the lobby refusal, then recover a topic.
         source = replace(source, thread_id=None)
-        monkeypatch.setattr(runner, "_recover_telegram_topic_thread_id", lambda _: "456")
+        monkeypatch.setattr(runner, "_recover_telegram_lobby_thread_id", lambda _: "456")
     quick_key = runner._session_key_for_source(source)
     event = MessageEvent(
         text="hello", source=source, internal=kind in {"agent-created", "recovered-topic"},

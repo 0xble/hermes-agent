@@ -10,19 +10,7 @@ import json
 import pytest
 
 from gateway.update_notifications import expected_revision, final_outcome
-from tests.gateway.update_fixtures import finalize_update
-
-SOURCE = "a" * 40  # frozen source-checkout HEAD recorded as pre/post_update
-RELEASE = "c" * 40  # active immutable release
-
-
-def _release(home, sha=RELEASE):
-    path = home / "releases" / sha
-    path.mkdir(parents=True)
-    for name in (".release-ready", ".hermes_build_sha"):
-        (path / name).write_text(sha)
-    (home / "current").symlink_to(path)
-    return path
+from tests.gateway.update_fixtures import RELEASE, SOURCE, _release, finalize_update
 
 
 def _pending():

@@ -108,6 +108,8 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     dist = "construction_root-1.dist-info"
     entries = {
         "construction_root.pth": str(Path.cwd()) + "\\n",
+        # A build-machine pointer of the kind sealing must strip (pm.environment.prune_site_pth).
+        "__editable__.construction_root-1.pth": "# build machine path\\n",
         dist + "/METADATA": "Metadata-Version: 2.1\\nName: construction-root\\nVersion: 1\\nRequires-Dist: base-dep==1.0\\n",
         dist + "/WHEEL": "Wheel-Version: 1.0\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n",
     }
@@ -155,7 +157,7 @@ def test_public_build_installs_all_extras_at_explicit_destination(installable_pr
     assert executable.parent.parent == tmp_path / "native environment"
     assert not (tmp_path / "wrong-environment").exists()
     assert "root_app" not in sys.modules
-    assert (site / "_virtualenv.pth").exists() is not sealed
+    assert (site / "__editable__.construction_root-1.pth").exists() is not sealed
     assert (site / "construction_root.pth").is_file(), "load-bearing .pth must survive sealing"
     assert (source / "uv.lock").read_bytes() == locked
     assert dict(os.environ) == before
@@ -681,7 +683,9 @@ def test_explicit_environment_installs_locked_members_without_live_selection(loc
          "print(json.dumps([sys.base_prefix, member_dep.__version__, "
          "importlib.util.find_spec('other_dep') is None]))"], cwd=tmp_path, env=env,
     ))
-    assert result == [sys.base_prefix, "1.0", True]
+    # uv may canonicalize a version alias while preserving the same interpreter.
+    assert Path(result[0]).samefile(sys.base_prefix)
+    assert result[1:] == ["1.0", True]
     assert (source / "uv.lock").read_bytes() == before_lock
     assert not (source / ".venv").exists()
     assert not (Path(env["HERMES_HOME"])).exists()

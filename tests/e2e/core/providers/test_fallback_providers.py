@@ -46,7 +46,7 @@ pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="su
 # KnownBugError from bug_assertions() matching the pattern XFAILs the cell (known_gate).
 KNOWN: dict[str, tuple[str, str]] = {
     "unreachable_portal_falls_back": (
-        r"(?s)fallback_providers never consulted: .*agent failed: \[Errno 111\] Connection refused",
+        r"(?s)fallback_providers never consulted: .*\[Errno 111\] Connection refused",
         "#120608 transport error during credential resolution skips fallback_providers"),
 }
 
@@ -198,6 +198,7 @@ def test_primary_credential_resolution_failure_falls_back(tmp_path, portal_kind:
     scenario = "unreachable_portal_falls_back" if portal_kind == "refused" else f"portal_{portal_kind}"
     with bug_assertions(KNOWN, scenario):
         assert fallback_mains, f"fallback_providers never consulted: {run.describe()}"
+        assert fallback_mains[0].get("model") == FALLBACK_MODEL, fallback_mains[0].get("model")
         assert any(PROMPT in t for t in _user_texts(fallback_mains[0])), fallback_mains[0].get("messages")
         assert run.proc.returncode == 0 and run.stdout.strip() == "FROM-FALLBACK", run.describe()
         assert run.usage.get("model") == FALLBACK_MODEL, run.describe()

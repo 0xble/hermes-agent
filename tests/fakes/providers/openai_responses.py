@@ -118,6 +118,9 @@ class HttpError:
 Step = Turn | SoftFail | HttpError
 Responder = Callable[[dict[str, Any]], Step]
 
+# SDK models can lazily rebuild shared Pydantic schemas, which is not thread-safe.
+# Keep construction AND dumping serialized across all server instances, not HTTP I/O.
+_SDK_MODEL_LOCK = threading.Lock()
 _REQUEST_ADAPTER = TypeAdapter(ResponseCreateParamsStreaming)
 
 
@@ -179,13 +182,14 @@ def validate_request(body: dict[str, Any]) -> str | None:
 
     ``dump_json`` forces pydantic's lazy ``Iterable[...]`` validators (``input``,
     ``tools``) to walk every element, so a malformed nested item is reported too."""
-    body = _apply_vendor_deviations(body)
-    try:
-        _REQUEST_ADAPTER.dump_json(_REQUEST_ADAPTER.validate_python(body), warnings=False)
-    except Exception as exc:
-        detail = _explain_items(body["input"]) if isinstance(body.get("input"), list) else ""
-        return (detail or str(exc))[:4000]
-    return None
+    with _SDK_MODEL_LOCK:
+        body = _apply_vendor_deviations(body)
+        try:
+            _REQUEST_ADAPTER.dump_json(_REQUEST_ADAPTER.validate_python(body), warnings=False)
+        except Exception as exc:
+            detail = _explain_items(body["input"]) if isinstance(body.get("input"), list) else ""
+            return (detail or str(exc))[:4000]
+        return None
 
 
 # Event rendering ---------------------------------------------------------------
@@ -251,36 +255,38 @@ def _item_events(built: Any, idx: int, seq: _Seq) -> list[Any]:
 
 def turn_events(turn: Turn) -> list[dict[str, Any]]:
     """The full SSE event sequence for ``turn``, each event a JSON-mode dict."""
-    seq, resp_id = _Seq(), f"resp_{uuid.uuid4().hex[:12]}"
-    events: list[Any] = [ResponseCreatedEvent(response=_response(resp_id, "in_progress", []),
-                                              sequence_number=seq(), type="response.created")]
-    built = [_built_item(item, i) for i, item in enumerate(turn.items)]
-    for i, b in enumerate(built):
-        events.extend(_item_events(b, i, seq))
-    usage = ResponseUsage(
-        input_tokens=turn.input_tokens, output_tokens=turn.output_tokens,
-        total_tokens=turn.input_tokens + turn.output_tokens,
-        input_tokens_details=InputTokensDetails(cached_tokens=turn.cached_tokens),
-        output_tokens_details=OutputTokensDetails(reasoning_tokens=0))
-    events.append(ResponseCompletedEvent(response=_response(resp_id, "completed", built, usage),
-                                         sequence_number=seq(), type="response.completed"))
-    return [e.model_dump(mode="json", exclude_none=True) for e in events]
+    with _SDK_MODEL_LOCK:
+        seq, resp_id = _Seq(), f"resp_{uuid.uuid4().hex[:12]}"
+        events: list[Any] = [ResponseCreatedEvent(response=_response(resp_id, "in_progress", []),
+                                                  sequence_number=seq(), type="response.created")]
+        built = [_built_item(item, i) for i, item in enumerate(turn.items)]
+        for i, b in enumerate(built):
+            events.extend(_item_events(b, i, seq))
+        usage = ResponseUsage(
+            input_tokens=turn.input_tokens, output_tokens=turn.output_tokens,
+            total_tokens=turn.input_tokens + turn.output_tokens,
+            input_tokens_details=InputTokensDetails(cached_tokens=turn.cached_tokens),
+            output_tokens_details=OutputTokensDetails(reasoning_tokens=0))
+        events.append(ResponseCompletedEvent(response=_response(resp_id, "completed", built, usage),
+                                             sequence_number=seq(), type="response.completed"))
+        return [e.model_dump(mode="json", exclude_none=True) for e in events]
 
 
 def soft_fail_events(fail: SoftFail) -> list[dict[str, Any]]:
     """``response.created`` then ``response.failed``. ``model_construct`` for the error: the
     SDK's ``ResponseError.code`` literal lags the codes the vendor actually sends in this slot
     (``invalid_encrypted_content`` is observed in production and absent from the literal)."""
-    seq, resp_id = _Seq(), f"resp_{uuid.uuid4().hex[:12]}"
-    created = ResponseCreatedEvent(response=_response(resp_id, "in_progress", []), sequence_number=seq(),
-                                   type="response.created")
-    failed_resp = _response(resp_id, "failed", []).model_copy(
-        update={"error": ResponseError.model_construct(code=fail.code, message=fail.message)})
-    failed = ResponseFailedEvent.model_construct(response=failed_resp, sequence_number=seq(), type="response.failed")
-    out = [created.model_dump(mode="json", exclude_none=True)]
-    dumped = failed.model_dump(mode="json", exclude_none=True, warnings=False)
-    dumped["response"]["error"] = {"code": fail.code, "message": fail.message}
-    return out + [dumped]
+    with _SDK_MODEL_LOCK:
+        seq, resp_id = _Seq(), f"resp_{uuid.uuid4().hex[:12]}"
+        created = ResponseCreatedEvent(response=_response(resp_id, "in_progress", []), sequence_number=seq(),
+                                       type="response.created")
+        failed_resp = _response(resp_id, "failed", []).model_copy(
+            update={"error": ResponseError.model_construct(code=fail.code, message=fail.message)})
+        failed = ResponseFailedEvent.model_construct(response=failed_resp, sequence_number=seq(), type="response.failed")
+        out = [created.model_dump(mode="json", exclude_none=True)]
+        dumped = failed.model_dump(mode="json", exclude_none=True, warnings=False)
+        dumped["response"]["error"] = {"code": fail.code, "message": fail.message}
+        return out + [dumped]
 
 
 # Server ------------------------------------------------------------------------

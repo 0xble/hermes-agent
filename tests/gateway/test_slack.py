@@ -383,10 +383,10 @@ class TestAppMentionHandler:
         assert "reaction_removed" in registered_events
         assert "assistant_thread_started" in registered_events
         assert "assistant_thread_context_changed" in registered_events
-        # Slack slash commands are registered via a single regex matcher
-        # covering every COMMAND_REGISTRY entry (e.g. /hermes, /btw, /stop,
-        # /model, ...) so users get native-slash parity with Discord and
-        # Telegram. Verify the regex matches the key expected slashes.
+        assert "agent_session_stopped" in registered_events
+        # Slack slash commands are registered via a single regex matcher covering every
+        # COMMAND_REGISTRY entry (e.g. /hermes, /btw, /stop, /model, ...) so users get
+        # native-slash parity with Discord and Telegram. Verify it matches the key slashes.
         assert (
             len(registered_commands) == 1
         ), f"expected 1 combined slash matcher, got {registered_commands!r}"
@@ -547,7 +547,7 @@ class TestSlackConnectCleanup:
             ),
             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
-            patch("gateway.status.release_scoped_lock"),
+            patch("gateway.status_scoped_locks.release_scoped_lock"),
             patch("asyncio.create_task", side_effect=_fake_create_task),
         ):
             result = await adapter.connect()
@@ -556,7 +556,7 @@ class TestSlackConnectCleanup:
         first_handler.close_async.assert_awaited_once_with()
         assert adapter._handler is second_handler
 
-        with patch("gateway.status.release_scoped_lock"):
+        with patch("gateway.status_scoped_locks.release_scoped_lock"):
             await adapter.disconnect()
 
     @pytest.mark.asyncio
@@ -594,7 +594,7 @@ class TestSlackConnectCleanup:
         adapter._proxy_url = "http://proxy.example.com:3128"
         adapter._bot_user_id = "U_BOT"
 
-        with patch("gateway.status.release_scoped_lock") as mock_release:
+        with patch("gateway.status_scoped_locks.release_scoped_lock") as mock_release:
             await adapter.disconnect()
 
         handler.close_async.assert_awaited_once_with()
@@ -684,7 +684,7 @@ class TestSlackSocketWatchdog:
             patch.object(_slack_mod, "AsyncSocketModeHandler", fake_factory),
             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
-            patch("gateway.status.release_scoped_lock"),
+            patch("gateway.status_scoped_locks.release_scoped_lock"),
         ]
 
 
@@ -3078,6 +3078,40 @@ class TestAssistantThreadLifecycle:
 
 
     @pytest.mark.asyncio
+    async def test_app_home_opened_does_not_block_the_loop_on_a_stalled_session_store(
+        self, assistant_adapter
+    ):
+        """2026-10-25: the DM seed read state.db on the event loop; behind slow writes the loop missed
+        its liveness probes and the gateway was killed twice. The ack must return while the store waits."""
+        import threading
+        import time
+
+        release = threading.Event()
+        seeded = []
+
+        class StalledStore:
+            def get_or_create_session(self, source):
+                release.wait(5)
+                seeded.append(source)
+
+        assistant_adapter._session_store = StalledStore()
+        assistant_adapter._app.client.assistant_threads_setSuggestedPrompts = AsyncMock()
+        event = {"type": "app_home_opened", "tab": "messages", "team": "T_TEAM",
+                 "channel": "D123", "user": "U_USER"}
+
+        started = time.monotonic()
+        await asyncio.wait_for(assistant_adapter._handle_app_home_opened(event), timeout=2)
+        assert time.monotonic() - started < 2
+        assert seeded == []  # still waiting on the store, off the loop
+        release.set()
+        for _ in range(100):
+            if seeded:
+                break
+            await asyncio.sleep(0.05)
+        assert len(seeded) == 1 and seeded[0].chat_id == "D123"
+
+
+    @pytest.mark.asyncio
     async def test_assistant_thread_cache_is_scoped_per_workspace(
         self, assistant_adapter
     ):
@@ -3146,7 +3180,8 @@ class TestAssistantThreadLifecycle:
 
         msg_event = assistant_adapter.handle_message.await_args.args[0]
         assert msg_event.source.scope_id == "T_OTHER"
-        assert msg_event.metadata["slack_team_id"] == "T_OTHER"
+        # Native admission rejects adapter-set metadata (reserved for gateway routing keys).
+        assert msg_event.metadata == {}
         assert msg_event.source.thread_id == "171.111"
         assert msg_event.text.startswith(
             "[Slack app context: user is viewing channel C_ACTIVE]"
@@ -3197,7 +3232,7 @@ class TestAssistantThreadLifecycle:
             title="Please summarize this incident thread",
         )
         msg_event = assistant_adapter.handle_message.call_args[0][0]
-        assert msg_event.metadata["slack_team_id"] == "T_TEAM"
+        assert msg_event.source.scope_id == "T_TEAM"
 
 
 # ---------------------------------------------------------------------------
@@ -3321,6 +3356,21 @@ class TestMessageSplitting:
 
 
 
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("size", [77_965, 77_968])
+    async def test_send_keeps_two_chunk_boundary_without_transport_overhead(self, adapter, size):
+        """Raw Slack indicators must not spend Telegram escaping or an unused final fence."""
+        content = "x" * size
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        result = await adapter.send("C123", content)
+
+        assert result.success is True
+        posts = [call.kwargs["text"] for call in adapter._app.client.chat_postMessage.call_args_list]
+        assert len(posts) == 2
+        assert all(len(post) <= adapter.MAX_MESSAGE_LENGTH for post in posts)
+        assert "".join(post.removesuffix(f" ({i}/2)") for i, post in enumerate(posts, 1)) == content
 
     @pytest.mark.asyncio
     async def test_send_coerces_string_unfurl_options(self, adapter):
@@ -4765,7 +4815,7 @@ class TestNativeTaskCardProgress:
 
         await adapter.stop_native_task_card_progress("C1", metadata=metadata)
 
-        assert team_client.api_call.await_args.args[0] == "chat.stopStream"
+        assert team_client.api_call.await_args.args[0] == "chat.delete"
         assert adapter._native_task_card_streams == {}
 
     @pytest.mark.asyncio
@@ -4822,7 +4872,7 @@ class TestNativeTaskCardProgress:
         assert [call.args[0] for call in client.api_call.await_args_list] == [
             "chat.startStream",
             "chat.appendStream",
-            "chat.stopStream",
+            "chat.stopStream", "chat.delete",
         ]
         assert adapter._native_task_card_streams == {}
 
@@ -4917,8 +4967,8 @@ class TestNativeTaskCardProgress:
         assert stream.stream_ts == "stream-2" and stream.stopped is False
 
         await adapter.stop_native_task_card_progress("C1", metadata=metadata)
-        stop = client.api_call.await_args_list[-1]
-        assert stop.args[0] == "chat.stopStream" and stop.kwargs["json"]["ts"] == "stream-2"
+        assert [(c.args[0], c.kwargs["json"]["ts"]) for c in client.api_call.await_args_list[-3:]] == [
+            ("chat.stopStream", "stream-2"), ("chat.delete", "stream-1"), ("chat.delete", "stream-2")]
         assert adapter._native_task_card_streams == {}
 
     @pytest.mark.asyncio

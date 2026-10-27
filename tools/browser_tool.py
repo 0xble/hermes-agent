@@ -605,6 +605,15 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "browser_tabs",
+        "description": "List this task's browser tabs and OAuth/payment popups. Pass tab_id from the list to select a tab for subsequent browser actions, then call browser_snapshot for fresh refs. Other tasks' tabs cannot be selected. Requires browser_navigate or browser_handoff first. Available with Camofox only.",
+        "parameters": {
+            "type": "object",
+            "properties": {"tab_id": {"type": "string", "description": "Tab ID from browser_tabs to select. Omit to list this task's tabs."}},
+            "required": []
+        }
+    },
+    {
         "name": "browser_get_images",
         "description": "Get a list of all images on the current page with their URLs and alt text. Useful for finding images to analyze with the vision tool. Requires browser_navigate to be called first.",
         "parameters": {
@@ -624,7 +633,7 @@ BROWSER_TOOL_SCHEMAS = [
                 "annotate": {
                     "type": "boolean",
                     "default": False,
-                    "description": "If true, overlay numbered [N] labels on interactive elements. Each [N] maps to ref @eN for subsequent browser commands. Useful for QA and spatial reasoning about page layout."
+                    "description": "If true, overlay numbered [N] labels on interactive elements. Each [N] maps to ref @eN for subsequent browser commands. Camofox does not support image overlays and reports this limitation with an unannotated screenshot."
                 }
             },
             "required": ["question"]
@@ -852,6 +861,9 @@ def browser_navigate(url: str, task_id: Optional[str] = None, account: Optional[
     features = session_info.get("features") or {}
     if features.get("real_profile"):  # auditability: this ran on the user's real-profile copy-browser
         response["used_real_profile"] = True
+    elif session_info.get("real_profile_unavailable") and not session_info.get("_rp_note_shown"):
+        session_info["_rp_note_shown"] = True  # first SUCCESSFUL navigation carries it, failed opens don't eat it
+        response["real_profile_unavailable"] = session_info["real_profile_unavailable"]
     # Only a successful, non-blocked navigation becomes the task owner: failed opens
     # and blocked redirects must not retarget follow-up clicks to an irrelevant session.
     _last_active_session_key[effective_task_id] = nav_session_key
@@ -931,6 +943,14 @@ def _tool_response(result: dict[str, Any], ok: dict[str, Any], default_error: st
     if not result.get("success"):
         return _failed_response(result, default_error)
     return _json_with_fallback({"success": True, **ok}, result)
+
+
+def browser_tabs(tab_id: Optional[str] = None, task_id: Optional[str] = None) -> str:
+    """Ownership-aware Camofox tab discovery and selection."""
+    if not _is_camofox_mode():
+        return _dumps(_err("Tab selection is available with the Camofox backend only",
+                           error_type="unsupported_capability", supported=False))
+    return _camofox("camofox_tabs", tab_id, task_id)
 
 
 def _camofox(func_name: str, *args):
@@ -1485,6 +1505,10 @@ registry.register(name="browser_handoff", toolset="browser", schema=_BROWSER_SCH
                                                                release=args.get("release") is True),
                   check_fn=_is_camofox_mode, dynamic_schema_overrides=_camofox_handoff_schema_override,
                   emoji="🌐")
+
+registry.register(name="browser_tabs", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_tabs"],
+                  handler=lambda args, **kw: browser_tabs(args.get("tab_id"), task_id=kw.get("task_id")),
+                  check_fn=_is_camofox_mode, emoji="🌐")
 
 registry.register(name="browser_upload", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_upload"],
                   handler=lambda args, **kw: browser_upload(

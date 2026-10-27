@@ -261,7 +261,10 @@ def _make_runner(adapter):
     runner._session_db = None
     runner._running_agents = {}
     runner._session_run_generation = {}
-    runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
+    runner.session_store = SimpleNamespace(
+        _entries={}, _save=lambda: None, get_model_role=lambda _key: None,
+        get_model_override=lambda _key: None, get_model_override_scope=lambda _key: "session",
+    )
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,

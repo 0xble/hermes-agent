@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 _MARKER_LOCK = threading.RLock()
@@ -42,7 +43,7 @@ def same_update(path: Path, pending: dict) -> bool:
         current = json.loads(path.read_text(encoding="utf-8-sig"))
         if pending.get("request_id") or current.get("request_id"):
             return bool(pending.get("request_id") and current.get("request_id") == pending["request_id"])
-        current.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())
+        current.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat())
         return current.get("timestamp") == pending.get("timestamp") and current.get("reason") == pending.get("reason")
     except (OSError, ValueError, AttributeError):
         return False
@@ -54,7 +55,7 @@ def read_pending(home: Path) -> tuple[Path, dict] | None:
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(data, dict):
-                data.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())
+                data.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat())
                 return path, data
         except (OSError, ValueError):
             continue
@@ -139,6 +140,114 @@ def update_receipt_path(home: Path) -> Path:
     return newest[1] if newest else latest
 
 
+def _finalized_receipt(home: Path, pending: dict, exit_path: Path) -> dict | None:
+    receipt = json.loads(update_receipt_path(home).read_text(encoding="utf-8-sig"))
+    started = _timestamp(receipt["started_at"])
+    finished = _timestamp(receipt["finished_at"])
+    requested = _timestamp(pending["timestamp"]) if pending.get("timestamp") else exit_path.stat().st_mtime
+    if finished < requested or finished < started:
+        return None
+    if pending.get("notification_version") == 2 and started < requested:
+        return None
+    return receipt
+
+
+def _failure_cause(receipt: dict, exit_code: int) -> str:
+    # Keep the explanation, never the traceback or its frame/source lines. The
+    # command boundary's sys.exit(N) safety net explains no underlying failure.
+    for reason in (receipt.get("stop_reason"), (receipt.get("gateway_restart") or {}).get("phase_error")):
+        if not isinstance(reason, str):
+            continue
+        explanation = []
+        for line in reason.splitlines():
+            line = line.strip()
+            if line.startswith("Traceback (most recent call last):") or re.fullmatch(r"sys\.exit\(-?\d+\)", line):
+                break
+            if line:
+                explanation.append(line)
+        if explanation:
+            # A pip-check report starts with progress, not the offending
+            # requirement. Prefer the actual conflicts, within the same bound.
+            conflicts = [line for line in explanation if line.startswith("The package `")]
+            return (" ".join(conflicts) if conflicts else explanation[0])[:240].rstrip()
+    stop_class = receipt.get("stop_class")
+    if isinstance(stop_class, str) and stop_class.strip():
+        explanations = {
+            "syntax_rollback": "The downloaded update contains a syntax error.",
+            "target_syntax_error": "The selected update contains a syntax error.",
+        }
+        return explanations.get(stop_class, stop_class.splitlines()[0].strip()[:240])
+    if exit_code:
+        return f"The updater exited with code {exit_code}."
+    return f"Updater outcome: {receipt.get('outcome') or 'unknown'}."
+
+
+def _update_recovery_pending(home: Path) -> bool:
+    """HEAD may already be restored while checkout repair or completion is still owed."""
+    from hermes_cli._early_recovery import interrupted_pull_marker
+    from hermes_cli.immutable_releases import update_source_checkout
+    from hermes_cli.update_host_obligation import HOST_OBLIGATION_NAME, host_obligation_path
+    from hermes_cli.venv_sync import completion_pending_path
+
+    root = update_source_checkout(home, Path(__file__).resolve().parents[1])
+    if root is None:
+        # ZIP/non-git installs cannot rule out source-keyed recovery debt.
+        return True
+    host_record = host_obligation_path(root)
+    return any(path.exists() for path in (
+        interrupted_pull_marker(root), completion_pending_path(root),
+        host_record, host_record.with_name(HOST_OBLIGATION_NAME),
+    ))
+
+
+def _local_changes_evidence(receipt: dict) -> tuple[bool, str]:
+    """HEAD equality says nothing about edits removed from the tree by autostash."""
+    for step in reversed(receipt.get("steps") or []):
+        if step.get("name") != "local_changes_stash":
+            continue
+        detail = step.get("detail") or ""
+        if step.get("ok") is True and detail.startswith(("restored: ", "not_needed: ")):
+            return True, ""
+        if detail.startswith("parked: "):
+            stash = detail.removeprefix("parked: ").split(" ", 1)[0]
+            if re.fullmatch(r"[0-9a-fA-F]{40}", stash):
+                return False, f"Local changes remain in stash {stash}; restore with git stash apply {stash}."
+            return False, "Local changes remain in stash; see the update output before restoring them."
+        if detail.startswith("unverified: "):
+            return False, ""
+        if detail.startswith("discarded: "):
+            return False, "Local changes were discarded."
+        return False, "Local changes were not confirmed restored; see the update output."
+    return next((step.get("ok") is True for step in reversed(receipt.get("steps") or [])
+                 if step.get("name") == "immutable_source_untouched"), False), ""
+
+
+def _failed_update_detail(home: Path, receipt: dict | None, exit_code: int) -> str:
+    if receipt is None:
+        return f"The updater exited with code {exit_code}. Runtime state is unverified; see the update output."
+    cause = _failure_cause(receipt, exit_code)
+    previous = (receipt.get("pre_update") or {}).get("sha")
+    post = (receipt.get("post_update") or {}).get("sha")
+    expected, disagreement = expected_revision(home, receipt)
+    if (home / "current").is_symlink():
+        from hermes_cli.immutable_releases import resolved_release
+        release = resolved_release(home)
+        if release is None or release.name != expected:
+            expected = None
+    # Immutable source HEAD is frozen, so equality alone cannot rule out a promotion.
+    changed_runtime = (any(receipt.get(key) for key in ("release_transition", "gateway_restart", "fleet"))
+                       or any(step.get("name") == "zip_source_swap" for step in receipt.get("steps") or []))
+    pending_runtime = any((home / name).exists() for name in ("release-txn.json", "fleet_restart_pending"))
+    tree_verified, local_changes = _local_changes_evidence(receipt)
+    valid_sha = isinstance(previous, str) and re.fullmatch(r"[0-9a-fA-F]{40}", previous)
+    if (receipt.get("outcome") in {"failed", "partial"} and valid_sha and previous == post
+            and expected and not disagreement and not changed_runtime and not pending_runtime
+            and tree_verified and not receipt.get("user_action") and not _update_recovery_pending(home)):
+        return f"Nothing changed. Still on {expected[:12]}. Cause: {cause}"
+    detail = f"Cause: {cause} Runtime state is unverified; see the update output."
+    return f"{detail} {local_changes}" if local_changes else detail
+
+
 def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
     """None means still waiting; success needs process completion AND runtime proof.
 
@@ -146,32 +255,25 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
     compatibility. Receipt timestamps bind evidence to this request, not to an exit
     file whose shell wrapper overwrites its mtime after the receipt is finalized.
     """
+    exit_code = 0
     try:
         process_exit = home / ".update_process_exit_code"
         exit_path = process_exit if pending.get("notification_version") == 2 else home / ".update_exit_code"
         if not exit_path.exists():
             return None
         exit_code = int(exit_path.read_text(encoding="utf-8-sig").strip())
-        if exit_code:
-            return False, f"The updater exited with code {exit_code}. Runtime state is unverified; see the update output."
         receipt_path = update_receipt_path(home)
-        if not receipt_path.exists() and pending.get("notification_version") != 2:
+        if not receipt_path.exists() and pending.get("notification_version") != 2 and not exit_code:
             # Legacy gateway markers predate runtime receipts. Preserve their terminal
             # notification contract while v2 markers remain fail-closed.
             return True, "Hermes update finished successfully."
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
-        started = _timestamp(receipt["started_at"])
-        finished = _timestamp(receipt["finished_at"])
-        requested = _timestamp(pending["timestamp"]) if pending.get("timestamp") else exit_path.stat().st_mtime
-        if finished < requested or finished < started:
-            return None
-        if pending.get("notification_version") == 2 and started < requested:
-            return None
+        receipt = _finalized_receipt(home, pending, exit_path)
+        if receipt is None:
+            return (False, _failed_update_detail(home, None, exit_code)) if exit_code else None
         outcome = receipt.get("outcome")
         restart = receipt.get("gateway_restart") or {}
-        if outcome != "success" or restart.get("incomplete") or restart.get("phase_error"):
-            cause = restart.get("phase_error") or receipt.get("stop_reason") or f"Updater outcome: {outcome or 'unknown'}."
-            return False, f"{cause} Runtime completion is unverified."
+        if exit_code or outcome != "success" or restart.get("incomplete") or restart.get("phase_error"):
+            return False, _failed_update_detail(home, receipt, exit_code)
         if (home / "fleet_restart_pending").exists():
             return None
         fleet = receipt.get("fleet")
@@ -193,7 +295,7 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
             return None  # the enclosing gateway accepted a self-restart and has not come back yet
         return True, f"Update finalized and the running gateway revision was verified ({expected[:12]}). Interrupted work may still need recovery."
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
-        return None
+        return (False, _failed_update_detail(home, None, exit_code)) if exit_code else None
 
 
 def _row_verdict(home: Path, row, expected: str) -> bool | None:

@@ -5,6 +5,7 @@ the _send_update_notification startup hook (sends results after restart).
 """
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -12,31 +13,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.event import MessageEvent
-from gateway.session import SessionSource
-
-
-def _make_event(text="/update", platform=Platform.TELEGRAM,
-                user_id="12345", chat_id="67890", thread_id=None):
-    """Build a MessageEvent for testing."""
-    source = SessionSource(
-        platform=platform,
-        user_id=user_id,
-        chat_id=chat_id,
-        user_name="testuser",
-        thread_id=thread_id,
-    )
-    return MessageEvent(text=text, source=source)
-
-
-def _make_runner():
-    """Create a bare GatewayRunner without calling __init__."""
-    from gateway.run import GatewayRunner
-    runner = object.__new__(GatewayRunner)
-    runner.adapters = {}
-    runner._voice_mode = {}
-    runner._update_prompt_pending = {}
-    return runner
+from tests.gateway.update_fixtures import _make_event, _make_runner
 
 
 # ---------------------------------------------------------------------------
@@ -660,3 +637,50 @@ class TestUpdateCommandInstallMethodRefusal:
         # No update attempt: nothing spawned, no pending marker written.
         mock_popen.assert_not_called()
         assert not (hermes_home / ".update_pending.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Exit-code publication: the watcher reads the complete process-exit marker.
+# ---------------------------------------------------------------------------
+
+
+class TestDetachedUpdateExitCodePublication:
+    """The detached wrapper never exposes an empty ``.update_process_exit_code`` to the watcher."""
+
+    @pytest.mark.platforms("linux", "macos")
+    @pytest.mark.live_system_guard_bypass  # runs the wrapper around `sh -c 'exit 3'`, never hermes
+    def test_bash_wrapper_never_exposes_an_empty_exit_code(self, tmp_path, monkeypatch):
+        import subprocess
+        from gateway.slash_commands import _spawn_detached_update
+
+        output, seen = tmp_path / "out.log", tmp_path / "seen.log"
+        legacy_marker = tmp_path / ".update_exit_code"
+        marker = tmp_path / ".update_process_exit_code"
+        legacy_marker.write_text("stale", encoding="utf-8")
+        spawned = MagicMock()
+        with patch("shutil.which", return_value=None), patch("subprocess.Popen", spawned):
+            _spawn_detached_update(["sh", "-c", "exit 3"], output, legacy_marker)
+        # Poll the marker at the instant the wrapper's printf runs: a `printf > marker` redirect has
+        # already truncated it by then (bash applies redirections before running the command).
+        hook = tmp_path / "bash_env.sh"
+        hook.write_text('printf() { [ -e "$MARKER" ] && echo "exists:$(cat "$MARKER")" >> "$SEEN"; '
+                        'builtin printf "$@"; }\n', encoding="utf-8")
+        env = {**os.environ, "BASH_ENV": str(hook), "MARKER": str(marker), "SEEN": str(seen)}
+        subprocess.run(spawned.call_args[0][0], env=env, check=True, timeout=60)
+        assert not seen.exists() or "exists:\n" not in seen.read_text(encoding="utf-8")
+        assert marker.read_text(encoding="utf-8") == "3"
+        assert not legacy_marker.exists()
+
+    def test_windows_helper_never_exposes_an_empty_exit_code(self, tmp_path, monkeypatch):
+        import sys
+        from gateway.slash_commands import _WINDOWS_UPDATE_HELPER
+        from tests.file_write_observer import observe_file_writes
+
+        output, marker = tmp_path / "out.log", tmp_path / ".update_process_exit_code"
+        seen = []
+        monkeypatch.setattr(sys, "argv", ["-c", str(output), str(marker),
+                                          sys.executable, "-c", "raise SystemExit(4)"])
+        with observe_file_writes(lambda: seen.append(marker.read_text() if marker.exists() else None)):
+            exec(compile(_WINDOWS_UPDATE_HELPER, "<update-helper>", "exec"), {"__name__": "__main__"})
+        assert "" not in seen
+        assert marker.read_text(encoding="utf-8") == "4"

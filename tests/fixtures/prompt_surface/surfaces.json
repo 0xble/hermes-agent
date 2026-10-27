@@ -5,7 +5,7 @@
       "stable": 1935,
       "volatile": 1813
     },
-    "tool_tokens": 15097,
+    "tool_tokens": 15242,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -20,6 +20,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -53,7 +54,7 @@
       "stable": 1445,
       "volatile": 1813
     },
-    "tool_tokens": 15097,
+    "tool_tokens": 15242,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -68,6 +69,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -101,7 +103,7 @@
       "stable": 1866,
       "volatile": 1812
     },
-    "tool_tokens": 15097,
+    "tool_tokens": 15242,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -116,6 +118,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -149,7 +152,7 @@
       "stable": 2612,
       "volatile": 1810
     },
-    "tool_tokens": 15253,
+    "tool_tokens": 15398,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -164,6 +167,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -197,7 +201,7 @@
       "stable": 1445,
       "volatile": 1813
     },
-    "tool_tokens": 15097,
+    "tool_tokens": 15242,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -212,6 +216,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -245,7 +250,7 @@
       "stable": 1317,
       "volatile": 1814
     },
-    "tool_tokens": 15097,
+    "tool_tokens": 15242,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -260,6 +265,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -293,7 +299,7 @@
       "stable": 1579,
       "volatile": 1814
     },
-    "tool_tokens": 15732,
+    "tool_tokens": 15871,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -308,6 +314,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -319,7 +326,7 @@
       "manage_connections",
       "memory",
       "patch",
-      "react_to_message",
+      "react",
       "read_file",
       "search_files",
       "skill_manage",
@@ -342,7 +349,7 @@
       "stable": 1349,
       "volatile": 1814
     },
-    "tool_tokens": 15097,
+    "tool_tokens": 15242,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -357,6 +364,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",
@@ -387,10 +395,10 @@
   "telegram.claude": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1436,
+      "stable": 1418,
       "volatile": 1815
     },
-    "tool_tokens": 15148,
+    "tool_tokens": 15292,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -405,6 +413,7 @@
       "browser_press",
       "browser_scroll",
       "browser_snapshot",
+      "browser_tabs",
       "browser_type",
       "browser_upload",
       "browser_vault_list",

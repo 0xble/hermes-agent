@@ -82,6 +82,11 @@ partway through the fourth case, not in launchd. Reusing a ready, immutable
 candidate preserves each kind's import rejection, unflipped pointer, and partial
 receipt without repeatedly testing unrelated build tooling.
 
+The Codex host-binding catalog test keeps unrelated account-usage refreshes
+offline. Otherwise its daemon can outlive the test, resolve a later test's pool,
+and send an earlier key into that test's HTTP recorder. Host and exact-key
+assertions remain unchanged. Dedicated usage tests still exercise real workers.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. Both exact-SHA profiles bind
@@ -364,6 +369,26 @@ Linux platform skips; this proves collection, not Linux behavior. Require safe,
 exact-head hosted Linux proof before qualifying the regrouping. Retire this
 adaptation when the accepted upstream harness independently schedules the cells
 within the same finite budget without sacrificing fresh-install isolation.
+
+## Test-Owned Session Provenance
+
+The `fork-ci-reliability` identity also covers process ownership in the live-system
+guard. A shell can orphan helpers before Python's first signal, while its owned
+session leader remains alive. Live ancestry and a pre-signal descendant snapshot
+then miss legitimate members of the group. Require every member's identity as
+before, with POSIX session membership as an alternate origin proof only while the
+same verified owned session leader is alive. Recheck both process creation times,
+SID and PGID, reject members older than the leader, and never override a stale
+cached identity. Shared foreign sessions, unverifiable processes and genuinely
+unowned groups remain blocked. Previously verified identities continue to cover
+leaderless groups without trusting a bare PID or PGID.
+
+Run the live-system guard canary, process registry and PTY suites, plus the real
+handoff publication fixture. The canary creates an inert orphan before the first
+signal and covers stale identities, vanished leaders and changing membership.
+Linux handoff behavior requires native Linux evidence, not a macOS platform skip.
+Retire this adaptation when the accepted upstream guard proves the same owned
+process topologies without allowing signals to unrelated live processes.
 
 ## Verification and retirement
 

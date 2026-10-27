@@ -31,6 +31,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
+from cron.jobs_invariants import NO_AGENT_WITHOUT_SCRIPT_ERROR, _validate_job_mode_invariants
 from cron.scheduler_ownership import _claim_owner_is_dead
 from cron.scheduler_detached_worker import normalize_hard_wall_timeout
 from cron.review import apply_review_update, normalize_review, validate_review_delivery
@@ -168,8 +169,11 @@ def self_removal_delivery_allowed(job_id: str) -> bool:
 def _self_pause_delivery_allowed(job: dict) -> bool:
     """Only the run's exact internal auto-pause may finish its blocked-run alert."""
     marker = _self_removal_delivery.get()
-    return bool(marker and marker.job_id == job.get("id") and marker.paused_at
-                and marker.paused_at == job.get("paused_at") and job.get("state") == "paused")
+    if not marker or marker.job_id != job.get("id") or not marker.paused_at:
+        return False
+    current = next((item for item in load_jobs() if item.get("id") == marker.job_id), None)
+    return bool(current and current.get("state") == "paused"
+                and current.get("paused_at") == marker.paused_at)
 
 # Import-time snapshot so deliberate re-pointing of CRON_DIR/JOBS_FILE/OUTPUT_DIR (the documented
 # escape hatch for tests/embedders) is distinguishable from the constants merely being stale.
@@ -484,11 +488,6 @@ EMPTY_PAYLOAD_ERROR = (
     "skill(s) are set. Provide a prompt, a script, or at least one skill."
 )
 DEFAULT_PAUSE_REASON = "Paused by operator."
-
-NO_AGENT_WITHOUT_SCRIPT_ERROR = (
-    "no_agent=True requires a script — with no agent and no script "
-    "there is nothing for the job to run."
-)
 
 
 def job_payload_is_empty(job: dict[str, Any]) -> bool:
@@ -1218,7 +1217,7 @@ def _cron_zone(timezone_name: Optional[str]):
     return get_timezone()
 
 
-def _in_job_zone(dt: datetime, job: Dict[str, Any]) -> datetime:
+def _in_job_zone(dt: datetime, job: dict[str, Any]) -> datetime:
     """*dt* expressed in a zoned job's own cron zone; unchanged for a job that follows the profile.
 
     The due scan compares stored wall clocks and cron lattices. A zoned job's stored offset is its
@@ -1231,7 +1230,7 @@ def _in_job_zone(dt: datetime, job: Dict[str, Any]) -> datetime:
 
 
 def compute_next_run(
-    schedule: Dict[str, Any], last_run_at: Optional[str] = None, job_timezone: Optional[str] = None,
+    schedule: dict[str, Any], last_run_at: Optional[str] = None, job_timezone: Optional[str] = None,
 ) -> Optional[str]:
     """Compute the next run time for a schedule as an ISO string, or None if no more runs.
     ``job_timezone`` is the job's own IANA zone for cron expressions (see normalize_job_timezone)."""
@@ -1591,7 +1590,7 @@ def _unlink_quiet(path: Optional[str]) -> None:
 
 
 def _stage_jobs_payload(
-    jobs_file: Path, jobs: List[Dict[str, Any]], *, document: Optional[Any] = None,
+    jobs_file: Path, jobs: list[dict[str, Any]], *, document: Optional[Any] = None,
 ) -> str:
     """Serialize the store payload to a fsynced temp file beside *jobs_file*; return its path.
 
@@ -1635,16 +1634,16 @@ def _parse_removed_at(value: Any) -> Optional[datetime]:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
-def _read_removed_jobs_lines(path: Path) -> List[str]:
+def _read_removed_jobs_lines(path: Path) -> list[str]:
     """Read the delete journal while preserving every decodable line."""
     return path.read_bytes().decode("utf-8-sig", errors="replace").splitlines()
 
 
-def get_removed_job_ids(since: Optional[datetime] = None) -> Set[str]:
+def get_removed_job_ids(since: Optional[datetime] = None) -> set[str]:
     """Return intentionally removed job ids, optionally limited to a time window.
 
     This is a best-effort read of the small per-profile journal used by the
@@ -1665,9 +1664,9 @@ def get_removed_job_ids(since: Optional[datetime] = None) -> Set[str]:
     boundary = since
     if boundary is not None:
         if boundary.tzinfo is None:
-            boundary = boundary.replace(tzinfo=timezone.utc)
-        boundary = boundary.astimezone(timezone.utc)
-    removed: Set[str] = set()
+            boundary = boundary.replace(tzinfo=UTC)
+        boundary = boundary.astimezone(UTC)
+    removed: set[str] = set()
     for line in lines:
         try:
             record = json.loads(line)
@@ -1689,10 +1688,10 @@ def _record_removed_jobs_unlocked(removed_ids: Collection[str]) -> None:
     removed_file = _removed_jobs_file()
     now = _hermes_now()
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    now_utc = now.astimezone(timezone.utc)
+        now = now.replace(tzinfo=UTC)
+    now_utc = now.astimezone(UTC)
     cutoff = now_utc - _REMOVED_JOBS_RETENTION
-    retained: List[Dict[str, str]] = []
+    retained: list[dict[str, str]] = []
     try:
         existing = _read_removed_jobs_lines(removed_file)
     except FileNotFoundError:
@@ -1721,7 +1720,7 @@ _SAVE_JOBS_MERGE_ATTEMPTS = 5
 
 
 def _save_jobs_unlocked(
-    jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
+    jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
     replace: bool = False, document: Optional[Any] = None,
 ):
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
@@ -1976,27 +1975,6 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
 }
 
 
-def _validate_job_mode_invariants(
-    monitor_script: Optional[str],
-    monitor_url: Optional[str],
-    no_agent: bool,
-    script: Optional[str],
-) -> None:
-    """Execution-mode invariants shared by create_job and update_job (no bypass via the update
-    door)."""
-    if monitor_script and monitor_url:
-        raise ValueError(
-            "monitor_script and monitor_url are mutually exclusive — a job "
-            "can only have one monitor source.")
-    if (monitor_script or monitor_url) and no_agent:
-        raise ValueError(
-            "monitor_script/monitor_url cannot be combined with no_agent=True — "
-            "the whole point of a monitor job is to suppress or wake the AGENT "
-            "based on source changes. Use a plain no_agent script job instead.")
-    if no_agent and not script:
-        raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
-
-
 def _oneshot_past_grace_error(run_at: Any) -> ValueError:
     return ValueError(
         f"Requested one-shot time {run_at} is more than "
@@ -2004,7 +1982,7 @@ def _oneshot_past_grace_error(run_at: Any) -> ValueError:
 
 
 def _next_run_or_reject_past_oneshot(
-    parsed_schedule: Dict[str, Any], label: str, fallback_run_at: Any, what: str,
+    parsed_schedule: dict[str, Any], label: str, fallback_run_at: Any, what: str,
     job_timezone: Optional[str] = None,
 ) -> Optional[str]:
     """``compute_next_run`` that raises (after a warning log) for a one-shot outside the grace
@@ -2042,14 +2020,14 @@ def create_job(
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
     keep_pinned_lane: bool = False,
-    review: Optional[Dict[str, Any]] = None,
+    review: Optional[dict[str, Any]] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
     job_timezone: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
     hard_wall_timeout_seconds: Optional[float] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
     deliver defaults to "origin" when ``origin`` is given, else "local"; repeat None = forever.
@@ -2199,7 +2177,7 @@ def resolve_job_ref(ref: str) -> Optional[dict[str, Any]]:
     return _normalize_job_record(name_matches[0])
 
 
-def job_running_state(job: Dict[str, Any]) -> dict:
+def job_running_state(job: dict[str, Any]) -> dict:
     """Best-effort visibility without booting the scheduler in listing/tool processes."""
     if sys.modules.get("cron.scheduler") is not None:
         try:
@@ -2213,7 +2191,7 @@ def job_running_state(job: Dict[str, Any]) -> dict:
             "run_started_at": claim.get("started_at", claim.get("at")) if live else None}
 
 
-def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
+def list_jobs(include_disabled: bool = False) -> list[dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
@@ -2405,7 +2383,7 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
 def pause_job(
     job_id: str, reason: Optional[str] = None, *, run_result: Optional[dict] = None,
     interrupt_running: bool = True,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
     if not job:
@@ -2698,6 +2676,7 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    execution_id: Optional[str] = None,
     model_unreachable: bool = False,
     ladder_rung: bool = False,
     quota_hold_seconds: Optional[float] = None,
@@ -2727,6 +2706,8 @@ def mark_job_run(
     repeat budget. Finite one-shots refund their preclaim and retry on the next tick.
     """
     def apply(jobs, _i, job):
+        if execution_id is not None and execution_id in job.get("canonical_completions", []):
+            return True
         if expected_fire_owner is not None:
             claim = job.get("fire_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
@@ -2736,6 +2717,9 @@ def mark_job_run(
                 return False
         now = _hermes_now().isoformat()
         _record_run_outcome(job, success, error, delivery_error, status, now)
+        if execution_id is not None:  # retire ids recovery can no longer replay; latest stays last
+            from cron.scheduler_authority import replayable_completions as live
+            job["canonical_completions"] = [*live(job_id, job.get("canonical_completions")), execution_id]
         if run_not_started:
             from cron.job_run_retry import preserve_unstarted_run
             preserve_unstarted_run(job, now, ladder_rung=ladder_rung)

@@ -73,7 +73,7 @@ def _remote_write(env, remote_path: str, content: str, *, atomic: bool = False,
     (``check=True`` raises on failure via _execute_checked).
 
     The base64 payload always travels as ``stdin_data``: pipe-mode backends
-    (ssh, docker, local, singularity: the real shared-host ones) deliver it on
+    (ssh, docker, local: the real shared-host ones) deliver it on
     real stdin, so it never enters argv where a co-tenant can read it via
     ``/proc/*/cmdline``; ``BaseEnvironment.execute`` embeds it as a heredoc
     for heredoc-mode backends (modal, daytona, vercel), and managed_modal
@@ -243,6 +243,10 @@ def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_ca
                 call_start = time.monotonic()
                 quoted_req_file = shlex.quote(req_file)
                 read_result = env.execute(f"cat {quoted_req_file}", cwd="/", timeout=10)
+                # A cell can settle while the transport is reading. Its retired poller
+                # must not dispatch a late request under the old cell's authority.
+                if stop_event.is_set():
+                    break
                 try:
                     request = json.loads(read_result.get("output", ""))
                 except (json.JSONDecodeError, ValueError):
@@ -271,8 +275,8 @@ def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_ca
                 _remote_write(env, f"{rpc_dir}/res_{seq:06d}", tool_result,
                               atomic=True, timeout=60)
                 env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
-        except Exception as e:
+        except Exception:  # health: allow BLE001 -- keep polling after arbitrary transport/tool errors without leaking request or result contents.
             if not stop_event.is_set():
-                logger.debug("RPC poll error: %s", e, exc_info=True)
+                logger.debug("RPC poll failed (details omitted)")
         if not stop_event.is_set():
             stop_event.wait(poll_interval)

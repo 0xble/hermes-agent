@@ -194,6 +194,15 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 def _reflect_execution_delivery(execution_id: str, status: str) -> None:
     """Project the independent queue receipt onto an existing execution, never create a run."""
     from cron import executions
+    terminal = {"delivered", "failed", "unknown", "suppressed"}
+    ledger_outcome = "failed" if status == "unknown" else status
+    if status in terminal:
+        # The queue keeps `unknown` to prevent replay, while the run-level outcome records
+        # that delivery failed. Project both dimensions independently.
+        try:
+            executions.settle_delivery_outcome(str(execution_id), ledger_outcome)
+        except Exception:
+            logger.debug("Unable to settle queued execution %s", execution_id, exc_info=True)
     path = executions.EXECUTIONS_FILE or get_hermes_home().resolve() / "cron" / "executions.db"
     if Path(path).exists():
         executions.record_delivery_status(str(execution_id), status)
@@ -479,7 +488,7 @@ def begin_final_delivery(execution_id: str, owner_process_id: str) -> bool:
     return cur.rowcount == 1
 
 
-def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False) -> bool:
+def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False, job_id: Optional[str] = None) -> bool:
     status = "failed" if error else "suppressed" if suppressed else "delivered"
     safe_error = (
         redact_sensitive_text(str(error), force=True, redact_url_credentials=True)
@@ -511,6 +520,7 @@ def recover_abandoned() -> int:
     """Replay abandoned reviews, but never replay uncertain final sends."""
     changed = 0
     terminal_ids: list[str] = []
+    terminal_jobs: list[tuple[str | None, str]] = []
     unknown_receipts: list[dict] = []
     with _transaction() as conn:
         rows = conn.execute(
@@ -553,6 +563,7 @@ def recover_abandoned() -> int:
             if cur.rowcount == 1:
                 terminal_ids.append(row["execution_id"])
                 job = json.loads(row["job_json"])
+                terminal_jobs.append((job.get("id"), row["execution_id"]))
                 if job.get("review"):
                     unknown_receipts.append({
                         "job_id": job.get("id"), "run_id": row["execution_id"],
@@ -561,6 +572,9 @@ def recover_abandoned() -> int:
         _prune_terminal_unlocked(conn)
     _reflect_terminal_deliveries(terminal_ids, "unknown")
     _mark_terminal_projected(terminal_ids)
+    from cron.delivery_outcome import settle_quietly
+    for job_id, receipt_id in terminal_jobs:
+        settle_quietly(job_id, receipt_id)
     # The receipt file is an audit trail; a failed write must never stall the queue drain.
     for receipt in unknown_receipts:
         try:
@@ -581,8 +595,12 @@ def _send_claimed(row, send):
                 return  # Keep the original and admission deadline for the next gateway.
             logger.exception("Cron delivery failed for %s", row["execution_id"])
             error = f"{type(exc).__name__}: {exc}"
-        _finish(row["execution_id"], error=error,
-                suppressed=bool(row["job"].get("_notification_all_targets_suppressed")))
+        finished = _finish(row["execution_id"], error=error,
+                           suppressed=bool(row["job"].get("_notification_all_targets_suppressed")),
+                           job_id=row["job"].get("id"))
+        if finished:
+            from cron.delivery_outcome import settle_quietly
+            settle_quietly(row["job"].get("id"), row["execution_id"])
     finally:
         with _lock:
             _ACTIVE_DELIVERIES.discard(row["execution_id"])

@@ -21,6 +21,11 @@ its optional icon, and the durable alias can be observed through one Telegram to
   omits `name`, so Telegram keeps the visible name; resending the saved session title
   reverted an earlier `--title` rename. Manual icon ownership is
   preserved when configured, and successful automatic writes record state and history.
+- Legacy topic-icon schema rebuilds stay inside the `SessionDB` writer transaction.
+  A failure rebuilding either icon table, creating later indexes, or writing the
+  schema-version marker must roll back the exact pre-migration schema and rows.
+  Retrying preserves manual icon ownership and profile isolation. Patch identity:
+  `slice-16-topic-icons`.
 - Icon choice favors relevance, with variety only among relevant icons. The model is always
   offered the whole catalog; withholding recently used icons made the obvious icon unavailable and
   forced unrelated picks. The model returns up to three ranked icons (`icons`, with the older
@@ -49,6 +54,11 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - `preserve_manual_topic_icons` relies on a Bot API `StatusUpdate` handler that observes
   `forum_topic_created`/`forum_topic_edited` service messages in private chats; a user-chosen
   icon recorded there is never replaced by an automatic rename.
+- Paste-only `@file:` openers may title from an explicit usable preview in both
+  the instant-title and model-upgrade entrypoints. The raw opener must still pass
+  nonempty, type, machine-prefix, and summary guards. Blank, machine-authored,
+  and attachment-only previews do not make a file drop titleable. Patch identity:
+  `slice-15-title-config`.
 - A title the model cannot support does not lock. The schema includes `abstain`; a true
   answer, or a deterministic junk title (`None`, `Investigation`, `Unspecified...`, a platform
   label plus a raw ID such as `Slack Thread <id>` or `YouTube Video <id>`, or a title that is
@@ -61,15 +71,22 @@ its optional icon, and the durable alias can be observed through one Telegram to
   a reply can supply a subject even when the opener was only a greeting. If both attempts
   are greetings, the placeholder stays provisional. Each failed attempt is logged, but
   the turn's failure callback reports only the first failure, including a retry-only
-  failure. Gateway callbacks remain debug-only, not user-visible. Later turns retain
-  the existing turn-3 cap. A manual `/title` still wins, and a stored `llm` or `user`
+  failure. Gateway callbacks remain debug-only, not user-visible. A provisional title
+  gets model attempts through turn 3. At turn 3 a rejected name falls back to a title
+  derived from the current user message. Only a substantive, non-colliding final
+  candidate gets `llm` authority and replaces the instant `derived` placeholder once.
+  A rejected fallback stays provisional. Later user turns may recover from their
+  literal subject without more model calls or link fetches. An entirely untitled
+  session retains its existing model retry eligibility. A manual `/title` still wins, and a stored `llm` or `user`
   title is never replaced. `auxiliary.title_generation.hold_until_reply: false` restores
   the previous opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
   multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. The opening
-  turn's subject-less opener is the exception: `auxiliary.title_generation.hold_until_reply`
-  (default true) waits for that turn's reply before the first model title. Other openers
-  start immediately and receive the bounded completion retry described above.
+  turn's empty or attachment-only opener is the exception: `auxiliary.title_generation.hold_until_reply`
+  (default true) waits for that turn's reply before the first model title. Link and prose
+  openers start immediately and receive the bounded completion retry described above.
+  Links fetch metadata only in the background attempt. A readable page can yield a title
+  before the reply, while an unreadable link can abstain and recover from the reply.
   Upstream #117296 defers the title until the turn settles whenever both share a self-hosted base URL,
   which delays a new topic's name and icon by the whole first turn on a routing proxy. The
   declaration is keyed by endpoint URL, never by route name, and an undeclared or `false`
@@ -123,6 +140,12 @@ its ledger rows in the same reviewed change.
 ## Verify and recover
 
 Run the focused title, icon, gateway, and state tests through `scripts/run_tests.sh`.
+`tests/hermes_state/test_telegram_icon_migration.py` injects failures at both
+legacy icon-table drops, a later index, and the schema-version write, then checks
+exact rollback and successful retry.
+`tests/agent/test_title_preview_eligibility.py` exercises preview eligibility through
+both title entrypoints with and without the model upgrade. Completion-retry
+behavior stays covered by `tests/agent/test_title_completion_retry.py`.
 Run `python scripts/check_fork_patches.py` against the worktree HEAD, `git diff --check`,
 and `ruff check` on changed Python files. If rollback is required, revert the landed
 squash commit (found by its `Fork-Patch:` trailer) as one unit and retain the two icon tables

@@ -226,6 +226,8 @@ def test_cancel_after_delivery_keeps_completed_outcome(isolated_store, monkeypat
     claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
     assert isinstance(claimed, dict)
     assert scheduler.run_one_job(claimed)
+    # Agent runs hand the send to the durable queue; the gateway drain performs it.
+    assert scheduler.drain_delivery_queue({}, None) == 1
     delivered.assert_called_once()
     execution = scheduler.get_execution(claimed["execution_id"])
     assert execution is not None
@@ -380,6 +382,8 @@ def test_disable_after_delivery_keeps_completed_outcome(isolated_store, monkeypa
     claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
     assert isinstance(claimed, dict)
     assert scheduler.run_one_job(claimed)
+    # Agent runs hand the send to the durable queue; the gateway drain performs it.
+    assert scheduler.drain_delivery_queue({}, None) == 1
     delivered.assert_called_once()
     execution = scheduler.get_execution(claimed["execution_id"])
     assert execution is not None

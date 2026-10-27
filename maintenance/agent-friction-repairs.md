@@ -8,7 +8,8 @@ This unit owns small, evidence-backed fixes where runtime bookkeeping makes the
 model repeat work or misread execution state. It covers context-pruning dedupe,
 skill_view reload-marker preservation across compaction and tail demotion, the
 idempotent-read guardrail at content-loss boundaries, local execute_code session-kernel
-eviction reporting, terminal retry hints, and execute_code sandbox file-tool failures.
+eviction reporting and local/remote kernel lifetime and attribution, terminal retry hints,
+and execute_code sandbox file-tool failures.
 
 ## Idempotent-read guardrail at content-loss boundaries
 
@@ -82,6 +83,58 @@ A conversation resumed across that boundary gets a fresh kernel whether its old
 kernel was evicted earlier or killed at the boundary. Remote kernels share the
 cap without an eviction note; a dead or disconnected remote kernel reports
 `kernel.state_lost`.
+
+## Session-Kernel Lifetime And Attribution
+
+The configured `max_session_kernels` remains an unpinned cache budget, not a
+hard active-runner ceiling. Local and remote registries share idle-LRU selection
+and final-detach reconciliation. The existing reaper also reconciles overshoot
+and promptly removes exited local processes. Live child namespaces are exempt
+from the host idle TTL and remain owned by child teardown. A pinned remote runner
+still self-exits after `PINNED_RUNNER_IDLE_FACTOR` times the idle timeout, so a
+gateway killed without teardown cannot leave it running on the remote host.
+A runner measures idle from its last published result, not from pickup. While a
+result is missing, the host probes every 5 s. If the runner is gone, it renames
+the unclaimed request. A successful rename proves the code never ran, so the cell
+reports "did NOT run, safe to retry" instead of waiting out its timeout. The same
+rename at the deadline separates an unstarted cell from a real timeout. The
+runner treats a vanished request as reclaimed and never runs it. A dead runner
+whose request was already taken reports a possible partial run without waiting.
+
+Resource setup and process publication are fenced by each record's lifetime
+lock. Teardown signals pending spawn before waiting on that fence, closes the
+record permanently and claims cleanup once. Remote acquisition registers an
+attached pending record before transport work and serializes cells per record,
+without holding the registry lock across transport calls. The remote fallback
+remains spawn-only: after cell shipping starts, an ambiguous transport failure
+returns an error and retires state rather than replaying code. A retired file-RPC
+poller rechecks cancellation after a slow read before dispatching a tool.
+
+Structured lifecycle events use a kernel-instance ID, owner/current task/caller,
+attachment and pin state, retirement reason, PID and local process-start identity.
+RSS sampling uses the existing process utilities outside registry locks. Remote
+process-start identity and RSS are explicitly unknown rather than treating a
+remote PID as a host PID. Identity strings pass forced redaction, and touched
+lifecycle failure paths omit exception text, tracebacks, code and transport output.
+Attribution never raises: spawn and teardown log after claiming their cleanup, so
+an escaping failure would orphan the child and make a retry a no-op.
+
+Proof is `tests/tools/test_code_kernel_lifetime.py`, existing real-process
+`tests/tools/test_code_kernel.py`, transport-stub
+`tests/tools/test_code_kernel_remote.py`, file-RPC tests and
+`tests/tui_gateway/test_session_finalize_reaps_kernels.py`.
+
+Related upstream work, not adopted implementations, is
+[#105213](https://github.com/NousResearch/hermes-agent/issues/105213) and
+[#117169](https://github.com/NousResearch/hermes-agent/issues/117169).
+[#136403](https://github.com/NousResearch/hermes-agent/issues/136403) proposes a
+separate memory-limit concern, not authority for an RSS kill or hard active cap.
+Upstream guidance was checked at
+`55ee4acdd822b73fb9573a2321531ae3a9d0b3e0`, and the fork adaptation is based on
+`a6521fc59857ceddead3083f34a730c7f9d0d040`. The route retains a bounded fork
+repair without adding a policy knob or service. Retire this divergence only
+when released upstream preserves the complete lifetime, cache, authority and
+secret-safe attribution contract with these regressions passing.
 
 ## Foreground heavy-slot queue waits
 

@@ -116,7 +116,7 @@ async def test_destination_preflight_survives_transport_recovery(
         if kind == "native":
             methods = [call.args[0] for call in io.api_call.await_args_list]
             assert methods == ["chat.startStream", "chat.appendStream", "chat.appendStream",
-                               "chat.appendStream", "chat.stopStream"]
+                               "chat.appendStream", "chat.stopStream", "chat.delete"]
             assert not adapter._native_task_card_streams
         else:
             assert [frame["op"] for frame in io.frames] == [

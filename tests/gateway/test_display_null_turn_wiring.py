@@ -45,6 +45,7 @@ def _wire(user_config, *, voice_turn=False, agent=None):
     )
     holder = types.SimpleNamespace(
         _ctx=ctx,
+        _approval_owner=None,
         _runner=types.SimpleNamespace(
             _service_tier=None,
             _session_reasoning_override=lambda key: None,

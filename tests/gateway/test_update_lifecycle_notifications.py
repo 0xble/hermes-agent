@@ -12,8 +12,7 @@ import pytest
 from gateway.config import Platform
 from gateway.update_launcher import launch_native_update
 from gateway.update_notifications import final_outcome, read_pending, same_update
-from tests.gateway.test_update_command import _make_runner
-from tests.gateway.update_fixtures import finalize_update
+from tests.gateway.update_fixtures import _make_runner, finalize_update, pending
 
 
 @pytest.mark.live_system_guard_bypass  # Fixed python -c only: no updater, git, service or runtime access.
@@ -73,16 +72,6 @@ def test_windows_helper_publishes_process_exit_marker_atomically(tmp_path):
             exec(compile(_WINDOWS_UPDATE_HELPER, "<helper>", "exec"), {"__name__": "__main__"})
     assert replaced == [(str(final_exit) + ".tmp", str(final_exit), False)]
     assert final_exit.read_text(encoding="utf-8") == "7"
-
-
-def pending(home, *, reason=True):
-    data = {"platform": "telegram", "chat_id": "42", "thread_id": "77", "chat_type": "dm",
-            "session_key": "agent:main:telegram:dm:42:thread:77",
-            "timestamp": datetime.now(timezone.utc).isoformat()}
-    if reason:
-        data["reason"] = "Activating the delegation-label fix."
-    launch_native_update(home=home, hermes_cmd=["hermes"], pending=data, spawn=Mock())
-    return read_pending(home)[1]
 
 
 def test_same_update_accepts_bom_prefixed_marker(tmp_path):
@@ -587,7 +576,7 @@ async def test_slash_update_final_outcome_follows_the_detached_wrapper(tmp_path)
     The wrapper reports only ``.update_process_exit_code`` and deletes ``.update_exit_code``,
     so a request still waiting on the legacy marker never sees the updater finish.
     """
-    from tests.gateway.test_update_command import _make_event
+    from tests.gateway.update_fixtures import _make_event
     runner = _make_runner()
     event = _make_event(platform=Platform.TELEGRAM, chat_id="42")
     fake_root = tmp_path / "project"

@@ -8,6 +8,32 @@ Session controls let one Hermes session pause, resume, clear, or replace another
 
 Agents reach this primitive through the `goal_set` and `loop_set` tools, which the `goal-lifecycle` and `loop-lifecycle` plugins in the agents repository register. Those plugins call `apply_control` (and `resolve_target`) when a control action carries `target` or `user_quote`; core itself registers no tool, so a build without those plugins has no initiating entry point.
 
+## Gateway Turn Ownership
+
+A fresh gateway turn has its own task-local delegation scope, even when an inline
+producer submits it from a delegated child. Admission masks the producer's child,
+immediate-parent and chain-root bindings. New children created by the admitted
+turn inherit that turn's session as their parent and chain root. Executor work
+inherits the same scope.
+
+This reset never removes a genuine subprocess child marker. The lifecycle
+plugins must check the core process-aware delegation predicate as well as the
+task-local flag, so a child process cannot gain `goal_set` or `loop_set` access by
+entering the gateway again. Both tools return `parent_only` in that process.
+
+When inline dispatch returns, raises or is cancelled, it restores the caller's
+session variables, delivery capabilities, task-local working directory and
+nested delegation bindings. The existing profile and Hermes-home scopes retain
+their own restoration. Clearing session variables inside a turn keeps its
+existing semantics.
+
+Core coverage is `tests/gateway/test_top_level_delegation_context.py` and the
+session-context, delegation-binding and subprocess-environment suites. Registered
+handler and real subprocess coverage is maintained with the lifecycle plugins in
+`agents` at `sources/plugins/goal-lifecycle/test_gateway_parent_tools.py`. Run that
+suite from a compatible core checkout with its own interpreter and disposable
+Hermes homes. The core lineage controls alone do not prove plugin permission.
+
 ## Required behavior
 
 - Store one audit/outbox record per control under `state_meta` with a 24-hour pending expiry.
@@ -69,8 +95,11 @@ and the existing 24-hour outcome expiry bounds retries.
 **Fork patch identity:** `telegram-topic-retire`. `/retire [topic|now|cancel]`
 and `telegram_topic`'s `retire`/`cancel_retire` actions share the profile-local
 `state_meta` record and executor in `gateway/telegram_retire.py`. Pending
-retirement gates new user work, but accepts cancellation, owner answers and
-already-owned internal completions. `now` requests interruption first.
+retirement gates new user work, but accepts cancellation and already-owned
+internal completions. Only an explicit user request to retire or delete this topic
+authorizes invocation, including a deferred request after its named conditions
+are verified and its result delivered. Finishing, inactivity, splitting or handing
+off never grants permission. `now` requires an explicit interruption request.
 Retirement waits until the active turn settles before discovering obligations.
 
 `gateway/telegram_retire_work.py` discovers goals, loops, active and paused cron
@@ -85,10 +114,21 @@ row and relay's self-send refusal. Stable, bounded plain-token relay keys and
 assignment reconciliation prevent duplicate offers during recovery.
 A changed session binding holds retirement for an explicit cancel/retry instead
 of guessing which session owns a compacted turn's work. The existing live
-exact-title matcher selects unambiguous subject owners. Other owners require
-1 numbered question or an explicit target topic. Receipt IDs, transfer intentions
-and verified moves persist independently of discovery, so a restart cannot
-forget an item that has already left the source inventory.
+exact-title matcher can select unambiguous subject-owner candidates. A bare
+command or unresolved owner quietly reuses the source session's normal internal
+turn to decide merge versus delete and choose compatible owners, creating a
+subject-specific successor only when needed. This wake is pinned to the source
+session and retirement generation. A cancelled or superseded wake cannot re-arm
+retirement. Active claims are a quiet wait, not a failed retirement. No standing
+commitment is cancelled merely because its owner is unclear. A merge hands off
+the source context summary (the tool's existing `message` field) even with no
+executable items. This context-only settlement is a verified FYI, not a fabricated
+task. Actual obligations retain their task-linked handoffs. The merge records
+its destination and keeps
+existing automation owner keys as shared redirects. Source histories are not
+combined. The closing note states the choice, its reason, and continuing owners.
+Receipt IDs, transfer intentions and verified moves persist independently of
+discovery, so a restart cannot forget an item already moved.
 
 Deletion requires the same generation's complete successful closing SendResult,
 including a message ID and the original thread. Partial, deferred, held,

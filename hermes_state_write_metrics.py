@@ -35,16 +35,20 @@ def add_write_rows(name: str, count: int) -> None:
 
 
 @contextmanager
-def write_phase(name: str):
+def write_phase(name: str, *, thread_cpu: bool = False):
     metrics = current_write_metrics.get()
     if metrics is None:
         yield
         return
     started = time.monotonic()
+    cpu_started = time.thread_time() if thread_cpu else None
     try:
         yield
     finally:
+        cpu_elapsed = time.thread_time() - cpu_started if cpu_started is not None else None
         metrics.add_time(name, time.monotonic() - started)
+        if cpu_elapsed is not None:
+            metrics.add_time(f"{name}_cpu", cpu_elapsed)
 
 
 def timed_write_phase(name: str):

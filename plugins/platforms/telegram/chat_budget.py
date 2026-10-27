@@ -97,6 +97,22 @@ def endpoint_kind(endpoint: str) -> str:
     return _SHED_ENDPOINTS.get(endpoint, KIND_DELIVERY)
 
 
+def skip_progress_edit(adapter: Any, chat_id: str, content: str, finalize: bool) -> bool:
+    """Shed cosmetic edits without mistaking rich progress formatting for a final answer."""
+    from gateway.platforms.base import current_outbound_class, utf16_len
+
+    kind = current_outbound_class()
+    if kind == OUTBOUND_PROGRESS and adapter._daily_sheds(chat_id, OUTBOUND_PROGRESS):
+        return True
+    # Keep the existing shared-slot and saturated-preview rules for unlabelled interim edits.
+    return (
+        not finalize
+        and utf16_len(content) <= adapter.MAX_MESSAGE_LENGTH
+        and (adapter._chat_budget().interim_blocked(chat_id)
+             or adapter._daily_sheds(chat_id, kind or OUTBOUND_PROGRESS))
+    )
+
+
 @dataclass
 class _ChatState:
     next_at: float = 0.0

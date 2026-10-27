@@ -9,6 +9,23 @@ import hermes_yaml as yaml
 from hermes_cli.model_switch import ModelSwitchResult
 
 
+@pytest.fixture(autouse=True)
+def model_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "model:\n  default: old-model\n  provider: copilot\n"
+        "  base_url: https://api.githubcopilot.com\n  api_mode: chat_completions\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _saved_model():
+    from hermes_cli.config import read_user_config_raw
+    return {f"model.{key}": value for key, value in read_user_config_raw()["model"].items()}
+
+
 def _make_result(*, base_url="https://api.minimax.io/v1", api_mode="chat_completions", provider_changed=True):
     return ModelSwitchResult(
         success=True,
@@ -79,6 +96,23 @@ def _run_switch(monkeypatch, tmp_path, result, cmd="/model MiniMax-M3 --global")
     before = config_path.read_bytes()
     cli_mod.HermesCLI._handle_model_switch(_StubCLI(), cmd)
     return config_path, before
+
+
+def _run_apply(monkeypatch, result, persist_global=True):
+    """Drive the interactive-picker persistence path against the isolated config."""
+    import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *a, **k: None)
+    cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, persist_global)
+    return _saved_model()
+
+
+def test_picker_global_switch_persists_base_url_and_api_mode(monkeypatch):
+    saved = _run_apply(monkeypatch, _make_result())
+    assert saved["model.default"] == "MiniMax-M3"
+    assert saved["model.provider"] == "custom:minimax"
+    assert saved["model.base_url"] == "https://api.minimax.io/v1"
+    assert saved["model.api_mode"] == "chat_completions"
 
 
 @pytest.mark.parametrize("base_url,api_mode", [

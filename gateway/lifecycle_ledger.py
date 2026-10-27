@@ -180,36 +180,54 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]
             evidence["suspected_oom"] = True
     return evidence
 
+
 # Startup-watchdog lease held while a SYNCHRONOUS unclean-exit integrity check runs (#115542):
 # ``PRAGMA quick_check(1)`` is one monolithic SQLite operation and per-call leases clamp at
-# 900s, so one entry lease cannot cover a multi-thousand-second healthy check on a huge store.
-# The progress handler renews a phase-owned lease while SQLite makes progress and always
-# returns 0 so it never aborts the check. Background (WAL) checks never take it: they are not
-# startup progress, and renewing from them would mask a genuinely wedged startup.
+# 900s, so one entry lease cannot cover a multi-thousand-second healthy check on a huge store;
+# without renewal the watchdog kills the attempt with exit 75 and the restart loop never
+# reaches the cron ticker. The progress handler renews a phase-owned lease while SQLite makes
+# progress; without a deadline it always returns 0 so it never aborts the check, and the
+# ok/absent/first-complaint verdicts stay fail-closed. Background (WAL) checks never take the
+# lease: they are not startup progress, and renewing from them would mask a genuinely wedged
+# startup. When an explicit ``deadline_at`` is supplied the handler returns non-zero once it
+# passes, so SQLite aborts the scan and the caller can bound a pathological store.
 _INTEGRITY_CHECK_LEASE_PHASE = "state_db_unclean_integrity_check"
 _INTEGRITY_CHECK_LEASE_S = 900.0
 # VM instructions between progress-handler invocations; each invocation is a
 # monotonic-clock compare, renewing at most every _INTEGRITY_CHECK_LEASE_RENEW_S.
 _INTEGRITY_CHECK_PROGRESS_OPS = 100_000
 _INTEGRITY_CHECK_LEASE_RENEW_S = 60.0
+# Bound on the deferred post-connect scan: a pathological store cannot pin its thread forever.
+STATE_DB_INTEGRITY_DEADLINE_S = 1800.0
 
 
-def _install_integrity_check_lease(conn: sqlite3.Connection) -> None:
-    """Claim the integrity-check lease and renew it from a SQLite progress handler.
+def _install_integrity_check_lease(
+    conn: sqlite3.Connection, *, deadline_at: Optional[float] = None, renew_startup_lease: bool = True,
+) -> None:
+    """Install the scan's progress handler: startup-lease renewal and/or a deadline.
 
     ``report_startup_progress`` is a no-op when no watchdog is armed and never raises.
+    Only a SYNCHRONOUS startup scan renews the lease (``renew_startup_lease``); a background
+    scan is not startup progress, and renewing from it would mask a genuinely wedged startup
+    (``maintenance/gateway-loop-statedb-guard.md``). Without ``deadline_at`` the handler always
+    returns 0 -- it must never abort the verdict PRAGMA.  With ``deadline_at`` (a
+    ``time.monotonic`` timestamp) it returns non-zero once that instant is reached, so SQLite
+    raises ``OperationalError: interrupted`` and the caller can bound the scan.
     """
     from hermes_startup_watchdog import report_startup_progress
 
-    report_startup_progress(_INTEGRITY_CHECK_LEASE_S, phase=_INTEGRITY_CHECK_LEASE_PHASE)
+    if renew_startup_lease:
+        report_startup_progress(_INTEGRITY_CHECK_LEASE_S, phase=_INTEGRITY_CHECK_LEASE_PHASE)
     last_renew = time.monotonic()
 
     def _on_progress() -> int:
         nonlocal last_renew
         now = time.monotonic()
-        if now - last_renew >= _INTEGRITY_CHECK_LEASE_RENEW_S:
+        if renew_startup_lease and now - last_renew >= _INTEGRITY_CHECK_LEASE_RENEW_S:
             last_renew = now
             report_startup_progress(_INTEGRITY_CHECK_LEASE_S, phase=_INTEGRITY_CHECK_LEASE_PHASE)
+        if deadline_at is not None and now >= deadline_at:
+            return 1
         return 0
 
     conn.set_progress_handler(_on_progress, _INTEGRITY_CHECK_PROGRESS_OPS)
@@ -219,53 +237,103 @@ def _state_db_is_wal(home: Optional[Path]) -> bool:
     """True only when the on-disk header says WAL (bytes 18/19 == 2).
 
     Read through the lock-safe cached descriptor: no SQLite lock, no busy wait, and no fd
-    close that could cancel this process's POSIX locks. Absent, torn or rollback-journal
-    headers answer False, which keeps the check on the synchronous pre-writer path.
+    close that could cancel this process's POSIX locks. Absent, torn, unreadable or
+    rollback-journal headers answer False, which keeps the check on the synchronous
+    pre-writer path.
     """
-    from hermes_state_dbfile import _pread_db_header
+    try:
+        from hermes_state_dbfile import _pread_db_header
+        head = _pread_db_header(_home_path(home, "state.db"), 20)
+        return bool(head) and len(head) >= 20 and head[:16] == b"SQLite format 3\x00" and head[18] == head[19] == 2
+    except Exception:
+        return False
 
-    head = _pread_db_header(_home_path(home, "state.db"), 20)
-    return bool(head) and len(head) >= 20 and head[:16] == b"SQLite format 3\x00" and head[18] == head[19] == 2
 
-
-def check_state_db_integrity(home: Optional[Path] = None, *, renew_startup_lease: bool = False) -> str:
+def check_state_db_integrity(
+    home: Optional[Path] = None, *, renew_startup_lease: bool = False,
+    deadline_s: Optional[float] = None,
+) -> str:
     """``"ok"``, ``"absent"``, or the first ``quick_check`` complaint.  Never raises.
 
     Only after an unclean death — SIGKILL mid-WAL-checkpoint can leave half-written
     b-tree pages. ``quick_check(1)`` stops at the first problem but can take minutes
     on a large healthy store. Opened normally: a WAL store needs its -shm sidecar for
-    read-only, and the PRAGMA writes nothing. *renew_startup_lease* is for the
-    synchronous startup path only (see ``_INTEGRITY_CHECK_LEASE_PHASE``).
+    read-only, and the PRAGMA writes nothing.
+
+    ``renew_startup_lease`` is reserved for the synchronous rollback-journal startup scan
+    (see ``_INTEGRITY_CHECK_LEASE_PHASE``); background and deferred WAL scans deliberately do
+    not renew the startup watchdog.
+
+    ``deadline_s`` (optional): abort the scan once that many seconds elapse and
+    return ``"check-incomplete: exceeded <N>s"``.  ``deadline_s=None`` (default) is the
+    historic unbounded behaviour -- the progress handler never aborts the PRAGMA.
     """
     path = _home_path(home, "state.db")
     if not path.exists():
         return "absent"
+    deadline_at: Optional[float] = None
+    if deadline_s is not None:
+        try:
+            deadline_at = time.monotonic() + max(0.0, float(deadline_s))
+        except (TypeError, ValueError):
+            deadline_at = None
     try:
         from hermes_state_dbfile import _connect_tracked_db
         with closing(_connect_tracked_db(str(path), tracking_path=path)) as conn:
-            if renew_startup_lease:
-                _install_integrity_check_lease(conn)
+            if renew_startup_lease or deadline_at is not None:
+                _install_integrity_check_lease(
+                    conn, deadline_at=deadline_at, renew_startup_lease=renew_startup_lease)
             row = conn.execute("PRAGMA quick_check(1)").fetchone()
     except Exception as exc:
+        if (deadline_at is not None and isinstance(exc, sqlite3.OperationalError)
+                and "interrupt" in str(exc).lower()):
+            limit = max(0.0, float(deadline_s)) if deadline_s is not None else 0.0
+            return f"check-incomplete: exceeded {limit:g}s"
         return f"check-failed: {exc}"
     return "check-failed: no result" if not row or row[0] is None else str(row[0])
 
 
-def _report_unclean_exit(evidence: dict[str, Any], home: Optional[Path], *, renew_startup_lease: bool = False) -> None:
-    """Integrity-check the store, persist the verdict, report corruption loudly."""
-    # The death may have torn the store; this is the only moment we know to look.
-    verdict = evidence["state_db_integrity"] = check_state_db_integrity(
-        home=home, renew_startup_lease=renew_startup_lease)
-    if verdict not in ("ok", "absent"):
-        logger.error(
-            "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
-            "missing until it is repaired. Run `hermes doctor`.",
-            verdict,
-        )
-    _append_exit_diag({"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home)
+def _state_db_journal_mode(path: Path) -> Optional[str]:
+    """On-disk journal mode of ``path`` via one ``PRAGMA journal_mode`` read on a short-lived
+    connection (no lock outlives it); ``None`` when undeterminable.  Never raises."""
+    try:
+        from hermes_state_wal import _on_disk_journal_mode
+
+        with closing(sqlite3.connect(str(path), timeout=1.0)) as conn:
+            return _on_disk_journal_mode(conn) or None
+    except Exception:
+        logger.debug("Could not read state.db journal mode", exc_info=True)
+        return None
 
 
-def _warn_unclean_exit(evidence: Dict[str, Any]) -> None:
+def _report_unclean_exit(
+    evidence: dict[str, Any], home: Optional[Path], *,
+    renew_startup_lease: bool = False, defer_integrity_check: bool = False,
+) -> None:
+    """Integrity-check the store (or mark it deferred), persist the record, report corruption loudly.
+
+    When ``defer_integrity_check`` is set, the forensic store scan is NOT run here (it would
+    gate platform startup); the record carries ``state_db_integrity: "deferred"`` and
+    :func:`run_deferred_integrity_check` runs the scan post-connect.
+    """
+    if defer_integrity_check:
+        evidence["state_db_integrity"] = "deferred"
+    else:
+        # The death may have torn the store; this is the only moment we know to look.
+        verdict = evidence["state_db_integrity"] = check_state_db_integrity(
+            home=home, renew_startup_lease=renew_startup_lease)
+        if verdict not in ("ok", "absent"):
+            logger.error(
+                "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
+                "missing until it is repaired. Run `hermes doctor`.",
+                verdict,
+            )
+    _append_exit_diag(
+        {"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home,
+    )
+
+
+def _warn_unclean_exit(evidence: dict[str, Any]) -> None:
     logger.warning(
         "Previous gateway life (pid=%s, started_at=%s) exited UNCLEANLY (no exit path ran — SIGKILL / OOM / "
         "VM death, or a process kill issued by the agent or one of its descendants, e.g. a pkill/taskkill of "
@@ -275,17 +343,27 @@ def _warn_unclean_exit(evidence: Dict[str, Any]) -> None:
     )
 
 
-def record_startup(home: Optional[Path] = None) -> Optional[dict[str, Any]]:
+def record_startup(
+    home: Optional[Path] = None, *, defer_integrity_check: bool = True,
+) -> Optional[dict[str, Any]]:
     """Detect an unclean prior life, preserve the journal-mode startup ordering, and claim.
 
-    WAL (the default): the sentinel is claimed, then a pending diagnostic record is written before
-    a daemon worker owns a copy of the evidence and runs the scan; the worker appends the
-    completed verdict when finished, so a minutes-long scan of a huge store stays off the
-    readiness path. A WAL reader never blocks writers; it only pins its snapshot, so checkpoints
-    cannot reset ``state.db-wal`` until it ends (``maintenance/gateway-loop-statedb-guard.md``).
-    Anything else (DELETE / unreadable header): the scan runs synchronously before this process
-    claims the sentinel or opens any SessionDB writer, under a startup lease, and the returned
-    evidence carries ``state_db_integrity``. Never raises.
+    Rollback journal (DELETE / unreadable header): the scan runs synchronously before this
+    process claims the sentinel or opens any SessionDB writer, under a startup lease, and the
+    returned evidence carries ``state_db_integrity``; a rollback reader holds SHARED for the
+    whole scan and would fail every live writer with "database is locked".
+
+    WAL, ``defer_integrity_check=True`` (the default): the state.db scan is forensic and must
+    NOT gate platform startup (a large store's ``quick_check`` blocked the ``:8644`` fleet
+    peer-DM transport for minutes).  The exit-diag record is written immediately with
+    ``state_db_integrity: "deferred"`` and the scan runs post-connect via
+    :func:`run_deferred_integrity_check`.
+
+    WAL, ``defer_integrity_check=False``: the sentinel is claimed, then a pending diagnostic
+    record is written before a daemon worker owns a copy of the evidence and runs the scan; the
+    worker appends the completed verdict when finished.  A WAL reader never blocks writers; it
+    only pins its snapshot, so checkpoints cannot reset ``state.db-wal`` until it ends
+    (``maintenance/gateway-loop-statedb-guard.md``).  Never raises.
     """
     evidence: Optional[dict[str, Any]] = None
     wal_mode: Optional[bool] = None
@@ -307,12 +385,16 @@ def record_startup(home: Optional[Path] = None) -> Optional[dict[str, Any]]:
                 logger.debug("WAL-mode header probe failed; using synchronous integrity ordering", exc_info=True)
             if not wal_mode:
                 _report_unclean_exit(evidence, home, renew_startup_lease=True)
+            elif defer_integrity_check:
+                _report_unclean_exit(evidence, home, defer_integrity_check=True)
         except Exception:
             logger.error("Unclean-exit state.db integrity check could not run", exc_info=True)
     try:
-        claim: dict[str, Any] = {"phase": "running", "pid": os.getpid(), "start_time": time.time(), "started_at": _now_iso()}
-        # Process birth is distinct from the ledger claim time; the Windows start
-        # attestation binds PIDs to birth time (#110020 review).
+        claim: dict[str, Any] = {
+            "phase": "running", "pid": os.getpid(), "start_time": time.time(), "started_at": _now_iso(),
+        }
+        # Process birth (psutil), distinct from ``start_time`` (the ledger claim, seconds later once
+        # imports finish): the Windows start attestation binds PIDs to birth time (#110020 review).
         from hermes_cli.process_identity import _process_create_time
 
         create_time = _process_create_time(os.getpid())
@@ -328,22 +410,14 @@ def record_startup(home: Optional[Path] = None) -> Optional[dict[str, Any]]:
         _write_sentinel(claim, home)
     except Exception:
         logger.debug("Failed to claim lifecycle sentinel", exc_info=True)
-    if evidence is not None and wal_mode is not False:
+    if evidence is not None and wal_mode is True and not defer_integrity_check:
         try:
-            if wal_mode is None:
-                wal_mode = _state_db_is_wal(home)
-            if not wal_mode:
-                _report_unclean_exit(evidence, home, renew_startup_lease=True)
-                return evidence
             _append_exit_diag(
-                {
-                    "ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(),
-                    **evidence, "state_db_integrity": "pending",
-                },
+                {"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(),
+                 **evidence, "state_db_integrity": "pending"},
                 home,
             )
             from agent.memory_provider import spawn_context_thread
-
             spawn_context_thread(
                 _report_unclean_exit, name="gateway-unclean-integrity-check",
                 daemon=True, args=(dict(evidence), home),
@@ -351,6 +425,65 @@ def record_startup(home: Optional[Path] = None) -> Optional[dict[str, Any]]:
         except Exception:
             logger.error("Unclean-exit state.db integrity check could not run", exc_info=True)
     return evidence
+
+
+def run_deferred_integrity_check(
+    evidence: Optional[dict[str, Any]], *, home: Optional[Path] = None,
+    deadline_s: float = STATE_DB_INTEGRITY_DEADLINE_S,
+) -> str:
+    """Run the deferred post-connect state.db scan and append a second diag record.
+
+    Companion to :func:`record_startup` with ``defer_integrity_check=True``: the forensic scan
+    is moved off the startup path (where, on a multi-GB store, it gated every platform adapter
+    — including the ``:8644`` fleet peer-DM transport — for minutes) into a daemon thread
+    started only after platforms connected.  ``deadline_s`` bounds a pathological store so the
+    thread cannot be pinned forever.
+
+    Appends ``{"tag": "gateway.state_db_integrity", "deferred": true, "state_db_integrity":
+    <verdict>, "prior_pid": ...}`` and logs the existing ERROR text on a bad verdict.  NEVER
+    raises -- a forensic scan must not disturb a running gateway (the alerting path is the
+    bounded per-poll readiness probe ``gateway/readiness.py::_probe_state_db``).
+
+    Only a WAL store is scanned: in rollback-journal mode (``database.journal_mode: delete``,
+    or a silent WAL fallback) the scan's SHARED lock would block every live commit for its
+    whole run, so the scan is skipped with a ``skipped: ...`` verdict and one WARNING.  The
+    on-disk mode decides, not config; an undeterminable mode is skipped too.
+    """
+    try:
+        path = _home_path(home, "state.db")
+        mode = _state_db_journal_mode(path) if path.exists() else "wal"
+        if mode != "wal":
+            verdict = (f"skipped: rollback-journal store (journal_mode={mode or 'unknown'}), "
+                       "scan would block live writes")
+            logger.warning(
+                "Previous gateway exit was unclean, but the state.db integrity check was skipped: %s is a "
+                "rollback-journal store (journal_mode=%s) and a background scan would block live writes. "
+                "To check it, stop the gateway and run: sqlite3 %s 'PRAGMA quick_check'",
+                path, mode or "unknown", path,
+            )
+        else:
+            verdict = check_state_db_integrity(home=home, deadline_s=deadline_s)
+        if verdict not in ("ok", "absent") and not verdict.startswith("skipped:"):
+            logger.error(
+                "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
+                "missing until it is repaired. Run `hermes doctor`.",
+                verdict,
+            )
+        record: dict[str, Any] = {
+            "ts": _now_iso(),
+            "tag": "gateway.state_db_integrity",
+            "deferred": True,
+            "state_db_integrity": verdict,
+        }
+        if isinstance(evidence, dict) and evidence.get("prior_pid") is not None:
+            record["prior_pid"] = evidence.get("prior_pid")
+        _append_exit_diag(record, home)
+        if isinstance(evidence, dict):
+            evidence["state_db_integrity"] = verdict
+        return verdict
+    except Exception:
+        logger.debug("Deferred state.db integrity check failed", exc_info=True)
+        return "check-failed: deferred scan raised"
 
 
 def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdown", home: Optional[Path] = None) -> None:

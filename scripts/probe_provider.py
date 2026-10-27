@@ -95,7 +95,12 @@ def _endpoint(requested):
     # Reuse the runtime's keyed-entry lookup for URL/key_env/inline precedence.
     # Never call load_pool, select, or the full runtime builder (they can write,
     # refresh credentials, execute key_cmd, and auto-detect local models).
-    resolved = _match_new_style_provider(requested, {requested: entry}) or {}
+    matched = _match_new_style_provider(requested, {requested: entry})
+    # The runtime helper returns the resolved row alone on older forks and
+    # ``(row, config_key)`` on the current frozen-route surface. The probe only
+    # needs the row, and must remain read-only across both shapes.
+    resolved = matched[0] if isinstance(matched, tuple) else matched
+    resolved = resolved or {}
     base = str(resolved.get("base_url") or "").strip().rstrip("/")
     key = resolved.get("api_key") or ""
     if ((resolved.get("api_mode") or _detect_api_mode_for_url(base) or "chat_completions")

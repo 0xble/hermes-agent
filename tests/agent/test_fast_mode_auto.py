@@ -5,6 +5,13 @@ from types import SimpleNamespace
 from agent import fast_mode
 
 
+def test_expiry_remaining_does_not_overstate_subminute_windows():
+    for seconds, expected in ((0.5, "<1m"), (10, "<1m"), (59.9, "<1m"),
+                              (60, "1m"), (3599, "59m"), (3600, "1h 0m"),
+                              (5400, "1h 30m")):
+        assert fast_mode.format_expiry_remaining(seconds) == expected
+
+
 def _agent(**kw):
     base = dict(
         service_tier="auto",

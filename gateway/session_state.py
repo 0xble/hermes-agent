@@ -42,6 +42,9 @@ class TurnState:
     # token for their own generation, so a displaced turn's unwind frees only its own lease and
     # never a successor's (an evicted turn and its replacement may both hold one briefly).
     lease_tokens: dict[int, Any] = field(default_factory=dict)
+    # Agents taken out of the cache while this turn still ran them (a one-turn ``model_override``
+    # agent): ``_release_running_agent_state`` releases them once the slot clears.
+    retired_agents: list[Any] = field(default_factory=list)
 
     def clear(self) -> None:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
@@ -59,6 +62,9 @@ class ConversationState:
     one_turn_restore: Optional[dict[str, Any]] = None  # /model --once snapshot
     reasoning_override: Optional[dict[str, Any]] = None  # /reasoning override
     reasoning_override_scope: str = "session"  # session or temporary
+    # Bumped by every reasoning_override write and by clear(), never reset: an off-loop restart
+    # rehydration publishes the persisted pick only if no set, reset or boundary landed meanwhile.
+    reasoning_override_epoch: int = 0
     service_tier_override: Any = _UNSET_TIER  # /fast: "priority" or None; _UNSET_TIER = absent
     service_tier_override_expires_at: float = 0.0  # wall-clock deadline; 0 = no expiry
     service_tier_override_expiry_seconds: float = 0.0  # duration used in the one-shot notice
@@ -83,10 +89,20 @@ class ConversationState:
     # Wall-clock start of the most recent turn of any kind. A routine completion result arriving
     # within the batch window of it is held for fan-in rather than waking the session again.
     last_turn_started_at: float = 0.0
+    # One notice per compression-in-flight episode, reset when the lock is absent.
+    compression_deferred_notice_sent: bool = False
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "reasoning_override":
+            object.__setattr__(self, "reasoning_override_epoch",
+                               getattr(self, "reasoning_override_epoch", 0) + 1)
+        object.__setattr__(self, name, value)
 
     def clear(self) -> None:
         """Reset every field to its default, so new fields are cleared automatically."""
+        epoch = self.reasoning_override_epoch + 1
         self.__dict__.update(ConversationState().__dict__)
+        self.reasoning_override_epoch = epoch
 
 
 @dataclass

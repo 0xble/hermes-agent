@@ -69,14 +69,20 @@ _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 def _ensure_client_dependency() -> None:
     """Validate the client declared by this plugin before creating any client."""
     from importlib.metadata import PackageNotFoundError, version
+    from packaging.specifiers import SpecifierSet
     from packaging.version import Version
     try:
         installed = version("hindsight-client")
     except PackageNotFoundError as exc:
         raise ImportError("Hindsight client is missing. Run `hermes pm install` to prepare plugin dependencies.") from exc
-    if Version(installed) < Version(_MIN_CLIENT_VERSION):
-        raise ImportError(f"Hindsight client {installed} needs >= {_MIN_CLIENT_VERSION}. "
+    if Version(installed) not in SpecifierSet(f">={_MIN_CLIENT_VERSION},<1"):
+        raise ImportError(f"Hindsight client {installed} needs >= {_MIN_CLIENT_VERSION},<1. "
                           "Run `hermes pm install` to refresh plugin dependencies.")
+    try:
+        from hindsight_client import Hindsight as _Hindsight
+    except ImportError as exc:
+        raise ImportError("Hindsight client cannot be imported. Run `hermes pm repair`, "
+                          "then restart Hermes to use the repaired environment.") from exc
 
 
 def _scoped_setting(name: str, default: str = "") -> str:
@@ -423,6 +429,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def is_available(self) -> bool:
         try:
+            _ensure_client_dependency()
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
             if mode in _LOCAL_MODES:
@@ -433,13 +440,11 @@ class HindsightMemoryProvider(MemoryProvider):
             return False
 
     def unavailable_reason(self) -> str:
-        """Install hint for an unavailable local_embedded runtime (is_available() gates
-        initialize() out, so the hint it would log never fires; agent_init shows this).
-
-        ``is_available()`` returns False for local modes when the embedded runtime can't be imported, so
-        ``initialize()`` — and the hint it would log — is never reached (#7718). Surface the install
-        guidance here, where agent_init warns about an unavailable provider.
-        """
+        """Explain missing client or embedded prerequisites without starting a client."""
+        try:
+            _ensure_client_dependency()
+        except ImportError as exc:
+            return str(exc)
         try:
             if _load_config().get("mode", "cloud") not in _LOCAL_MODES:
                 return ""

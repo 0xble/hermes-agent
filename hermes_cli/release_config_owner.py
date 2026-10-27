@@ -54,6 +54,16 @@ def _running_code_root() -> Path:
 
 
 def _running_schema_version() -> int:
+    """Return the schema shipped by the code tree that is actually running.
+
+    A long-lived release can be promoted away from ``current`` while its process
+    is still writing. Reading the imported candidate's defaults here mistakes
+    that older process for the newer checkout and rejects harmless writes.
+    """
+    root = Path(_running_code_root())
+    version = _release_schema_version(root)
+    if version is not None:
+        return version
     from hermes_cli.config_defaults import DEFAULT_CONFIG
     return int(DEFAULT_CONFIG.get("_config_version", 1))
 

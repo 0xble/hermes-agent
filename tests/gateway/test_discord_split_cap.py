@@ -74,6 +74,23 @@ class TestCapSplitChunks:
 
 class TestSendCap:
     @pytest.mark.asyncio
+    async def test_send_at_cap_preserves_complete_response(self, monkeypatch, tmp_path):
+        """Telegram-only overhead must not turn an eight-message answer into a truncated ninth."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        content = "x" * 15_850
+        channel = SimpleNamespace(id=555, send=AsyncMock(return_value=SimpleNamespace(id=9000)))
+        adapter._client = SimpleNamespace(get_channel=lambda _cid: channel, fetch_channel=AsyncMock())
+
+        result = await adapter.send("555", content)
+
+        assert result.success is True
+        posts = [call.kwargs["content"] for call in channel.send.call_args_list]
+        assert len(posts) == CAP
+        assert all(len(post) <= MAX for post in posts)
+        assert "".join(post.removesuffix(f" ({i}/{CAP})") for i, post in enumerate(posts, 1)) == content
+
+    @pytest.mark.asyncio
     async def test_send_caps_split_flood(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         adapter = _make_adapter()

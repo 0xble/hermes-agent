@@ -335,8 +335,13 @@ def _abort_zip_update_if_dirty_tree() -> None:
     from hermes_cli.update_cmd import _m
     # Settle an interrupted swap first: only its journal tells its staging/backup siblings apart from a
     # user's lookalike file, and once settled none are left to refuse the retry on.
-    restore_interrupted_zip_swap(_m().PROJECT_ROOT)
-    reason = _zip_overlay_block_reason(_m().PROJECT_ROOT)
+    root = _m().PROJECT_ROOT
+    if (root / ZIP_SWAP_JOURNAL).exists():
+        from hermes_cli.update_receipt import record_step
+        # Recovery can rewrite source before the new swap starts, even if it later fails.
+        record_step("zip_source_swap", False, "unverified: interrupted ZIP swap recovery", replace=True)
+    restore_interrupted_zip_swap(root)
+    reason = _zip_overlay_block_reason(root)
     if reason is None:
         return
     print(f"✗ ZIP fallback refused: {reason}.")
@@ -646,7 +651,18 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False,
     if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
             or any(part in (".", "..") for part in repository.split("/"))):
         raise ValueError("ZIP update requires a GitHub owner/repository")
+    from hermes_cli.update_receipt import _current, record_step
+    # A ZIP swap can change files while Git HEAD stays fixed. Keep that evidence
+    # separate from the stash disposition, which may name deliberately parked work.
+    record_step("zip_source_swap", False, "unverified: ZIP update started", replace=True)
     installed = _download_and_swap_zip(branch, f"https://github.com/{repository}/archive/{ref}.zip", target_sha)
+    record_step("zip_source_swap", True, "ZIP source replacement completed", replace=True)
+    current = _current.get()
+    steps = current.data["steps"] if current is not None else []
+    latest = next((s for s in reversed(steps) if s["name"] == "local_changes_stash"), {})
+    if latest.get("detail", "").startswith("unverified: "):
+        record_step("local_changes_stash", True,
+                    "not_needed: ZIP update replaced source without a git stash", replace=True)
     completion_request["expected_sha"] = installed or target_sha
     completion_request["apply_mode"] = "zip"
     _complete_source_update(completion_request)

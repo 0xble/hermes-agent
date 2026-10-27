@@ -16,6 +16,21 @@ _MALFORMED_SCHEMA_MARKERS = ("malformed database schema",)
 _MALFORMED_DB_MARKERS = (*_MALFORMED_SCHEMA_MARKERS, "database disk image is malformed")
 
 
+def is_fts_query_syntax_error(exc: BaseException) -> bool:
+    """Only FTS5 parser diagnostics, never contention, interruption or broken schema.
+
+    A known non-SQLITE_ERROR code wins over text. SQLITE_ERROR alone is too broad
+    (it also covers missing tables), so require the parser's exact message shape.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and code & 0xFF != sqlite3.SQLITE_ERROR:
+        return False
+    text = str(exc).lower()
+    return text == "unterminated string" or text.startswith("fts5: syntax error near ")
+
+
 def is_malformed_db_error(exc: BaseException) -> bool:
     """Malformed-schema OR generic corrupt-image error. Diagnostics / offline
     recovery only — runtime repair must use :func:`is_malformed_schema_error`."""
@@ -168,6 +183,27 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
 
 class CompressionLeaseLostError(SessionCompressionInProgressError):
     """This publication lost its holder. Waiting cannot revive the old snapshot."""
+
+
+class PruneRowUnresolvedError(RuntimeError):
+    """An in-place prune rewrite could not name the exact live row of a changed message. Raised before
+    any write, so the caller commits through ``archive_and_compact`` instead."""
+
+
+class PruneRowStaleError(PruneRowUnresolvedError):
+    """The named live row no longer holds the body the pruner is pruning: another writer already
+    rewrote this generation. Unlike plain ambiguity this must NOT fall back to the full writer —
+    that writer archives rows it never compared and would republish the stale held text over the
+    newer one. Subclassing keeps callers that only know the parent failing closed-enough (they stop
+    the in-place path); the prune caller tells the two apart and skips the pass entirely."""
+
+
+class HeldRowRewrittenError(RuntimeError):
+    """A full-writer commit found one of the held rows it was about to archive already rewritten in
+    place by another writer. Raised INSIDE the commit's write transaction, after the caller's
+    precheck but before any row is archived: a write that lands in that window is exactly the lost
+    race the precheck cannot see (#124102). Callers treat it like ``StaleHeldHistory`` — nothing
+    written, the pass is a no-op and the newer generation keeps the session."""
 
 
 class SessionTurnLeaseLostError(RuntimeError):

@@ -183,7 +183,8 @@ def test_expired_model_dispatch_does_not_fall_back_to_inline_execution(monkeypat
     record, reason = dr.claim_retry_dispatch(did)
     assert reason is None
     task = {"goal": "build the model", "context": dr.build_recovery_instruction(record)}
-    batch = SimpleNamespace(task_list=[task], context=None, children=[(0, task, object())],
+    batch = dispatch._Batch(max_children=1, origin_owner_transport=None, origin_owner_session_record=None,
+                            overall_start=time.monotonic(), task_list=[task], context=None, children=[(0, task, object())],
                             parent_agent=SimpleNamespace(session_id="sess-owner"),
                             creds={"model": "m"}, top_role="leaf", live_writers=[], live_paths=[],
                             live_deleg_id="deleg_expired_model", origin_wake_sid="wake",
@@ -221,7 +222,8 @@ def test_managed_retry_storage_failure_does_not_run_inline_or_consume_claim(monk
     record, reason = dr.claim_retry_dispatch(did)
     assert reason is None
     task = {"goal": "build the model", "context": dr.build_recovery_instruction(record)}
-    batch = SimpleNamespace(task_list=[task], context=None, children=[(0, task, object())],
+    batch = dispatch._Batch(max_children=1, origin_owner_transport=None, origin_owner_session_record=None,
+                            overall_start=time.monotonic(), task_list=[task], context=None, children=[(0, task, object())],
                             parent_agent=SimpleNamespace(session_id="sess-owner"),
                             creds={"model": "m"}, top_role="leaf", live_writers=[], live_paths=[],
                             live_deleg_id="deleg_storage_replacement", origin_wake_sid="wake",

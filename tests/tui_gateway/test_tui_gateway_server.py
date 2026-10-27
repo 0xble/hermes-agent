@@ -3432,6 +3432,28 @@ def test_reconcile_display_with_live_trusts_db_when_tail_absent():
     assert server._reconcile_display_with_live(db_display, []) == db_display
 
 
+def test_live_visible_history_keeps_an_unflushed_repeat_of_the_last_turn_real_db(tmp_path):
+    """The live tail is anchored on the last DB row's durable id, not its text: sending the same words again
+    ("ok" -> "done") before the flush must not fold the new turn into the persisted one."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("s1", source="tui")
+    db.append_message("s1", role="user", content="ok")
+    db.append_message("s1", role="assistant", content="done")
+    live = db.get_messages_as_conversation("s1") + [
+        {"role": "user", "content": "ok"}, {"role": "assistant", "content": "done"}]
+
+    merged = server._live_visible_history({"session_key": "s1"}, db, live)
+    assert [m["content"] for m in merged] == ["ok", "done", "ok", "done"]
+    # Fully flushed: the same four rows, never doubled.
+    for msg in live[2:]:
+        db.append_message("s1", role=msg["role"], content=msg["content"])
+    flushed = db.get_messages_as_conversation("s1")
+    assert [m["content"] for m in server._live_visible_history({"session_key": "s1"}, db, flushed)] == [
+        "ok", "done", "ok", "done"]
+
+
 def test_live_visible_history_matches_eager_resume_with_real_db(tmp_path):
     """E2E cross-builder consistency against a real SessionDB.
 
@@ -5117,9 +5139,9 @@ def test_ws_orphan_reap_spares_turn_reattached_within_grace(monkeypatch):
 
     try:
         server._close_sessions_for_transport(disconnecting_transport)
-        assert session["transport"] is server._detached_ws_transport
+        assert server._ws_session_is_detached(session)
 
-        session["transport"] = _LiveTransport()
+        server._attach_session_transport(session, _LiveTransport())
         callbacks.pop(0)()
 
         assert interrupted == []
@@ -5310,6 +5332,9 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
     monkeypatch.setattr(server, "_teardown_session", _slow_teardown)
+    # The reap's delegation check reads the session row from the launch store; open that handle
+    # before the timer fires so the wait below measures lock release, not a cold state.db open.
+    server._get_db()
     server._sessions["slow-orphan"] = _session(
         transport=server._detached_ws_transport,
         running=False,
@@ -5571,8 +5596,7 @@ def test_close_transport_rebinds_session_to_remaining_viewer(monkeypatch):
 
 
 def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
-    """The last viewer closing still lands the session on the drop sentinel
-    and schedules the grace reap (unchanged single-window behavior)."""
+    """The last viewer closing parks the mailbox and schedules the grace reap."""
     reap_calls = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: reap_calls.append(sid))
 
@@ -5588,7 +5612,7 @@ def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
     reaped, detached = server._close_sessions_for_transport(only)
 
     assert reaped == 0 and detached == 1
-    assert session["transport"] is server._detached_ws_transport
+    assert server._ws_session_is_detached(session)
     assert reap_calls == ["solo-sid"]
 
 
@@ -5625,7 +5649,7 @@ def test_close_transport_skips_dead_remaining_viewers(monkeypatch):
         reaped, detached = server._close_sessions_for_transport(popout)
 
         assert reaped == 0 and detached == 1
-        assert session["transport"] is server._detached_ws_transport
+        assert server._ws_session_is_detached(session)
         assert reap_calls == ["dead-viewer-sid"]
     finally:
         server._sessions.pop("dead-viewer-sid", None)
@@ -5642,7 +5666,7 @@ def test_live_session_payload_registers_transport_as_viewer():
     session = _session(transport=server._detached_ws_transport, running=False)
     server._live_session_payload("viewer-sid", session, transport=t)
 
-    assert session["transport"] is t
+    assert server._session_transport_contains(session, t)
     assert t in session.get("viewers", {})
 
 
@@ -5751,7 +5775,7 @@ def test_claim_or_reuse_live_winner_cancels_pending_reap(monkeypatch):
         response = server._resume_reuse_live(ctx, *live)
 
         assert response["result"]["session_id"] == "winner-sid"
-        assert winner["transport"] is transport
+        assert server._session_transport_contains(winner, transport)
         assert "winner-sid" not in server._pending_ws_reaps
         assert len(cancelled) == 1
     finally:
@@ -5760,11 +5784,13 @@ def test_claim_or_reuse_live_winner_cancels_pending_reap(monkeypatch):
         server._pending_ws_reaps.pop("winner-sid", None)
 
 
-def test_superseded_runtime_finalized_without_reclaimed_broadcast(monkeypatch):
+@pytest.mark.parametrize("parked", ["legacy_sentinel", "empty_mailbox"])
+def test_superseded_runtime_finalized_without_reclaimed_broadcast(monkeypatch, parked):
     """When a resume mints a fresh runtime for a stored id whose prior runtime
-    is sentinel-parked, the old record is finalized quietly with end_reason
+    is parked, the old record is finalized quietly with end_reason
     superseded_by_resume — no session.reclaimed broadcast, and its pending
-    reap Timer is cancelled (storm killer, part 2)."""
+    reap Timer is cancelled (storm killer, part 2). Live sessions park as an
+    empty fan-out mailbox; the disconnected-WS sentinel is the legacy shape."""
     cancelled = []
     broadcasts = []
     torn_down = []
@@ -5794,10 +5820,12 @@ def test_superseded_runtime_finalized_without_reclaimed_broadcast(monkeypatch):
     monkeypatch.setattr(server, "_register_session_cwd", lambda _s: None)
 
     old_agent = types.SimpleNamespace(session_id="stored-super")
+    parked_transport = (server._detached_ws_transport if parked == "legacy_sentinel"
+                        else server.FanoutTransport())
     old = _session(
         agent=old_agent,
         session_key="stored-super",
-        transport=server._detached_ws_transport,
+        transport=parked_transport,
         running=False,
     )
     server._sessions["old-sid"] = old
@@ -5893,7 +5921,7 @@ def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(monkeypatch)
         )
 
         assert resp is not None and resp["result"]["session_id"] == "lazy-sid"
-        assert session["transport"] is live_transport
+        assert server._session_transport_contains(session, live_transport)
         assert "lazy-sid" not in server._pending_ws_reaps
         assert len(cancelled) == 1
     finally:
@@ -6660,6 +6688,8 @@ def _submit_truncation_only(monkeypatch):
 
 def test_prompt_submit_truncates_by_message_id(monkeypatch, _submit_truncation_only):
     """#82756: truncate_before_message_id resolves target message and cuts history accurately."""
+    # This test ends at truncation admission, not model execution.
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     replaced = []
 
     class _FakeDB:
@@ -6699,6 +6729,10 @@ def test_prompt_submit_truncates_by_message_id(monkeypatch, _submit_truncation_o
         assert len(replaced) == 1
         assert replaced[0][1] == history[:2]
     finally:
+        worker = server._sessions["msg-id-trunc-sid"].get("_run_thread")
+        if worker is not None:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
         server._sessions.pop("msg-id-trunc-sid", None)
 
 
@@ -6757,6 +6791,13 @@ def test_prompt_submit_truncation_falls_back_to_sid_when_session_key_null(
         assert replaced[0][0] == "null-key-trunc-sid"
         assert replaced[0][1] == history[:2]
     finally:
+        # The prompt worker resolves server bindings when it runs. Reap it before
+        # monkeypatch teardown or it can consume the next test's notification.
+        session = server._sessions.get("null-key-trunc-sid")
+        worker = session.get("_run_thread") if session else None
+        if worker is not None:
+            worker.join(timeout=5)
+            assert not worker.is_alive()
         server._sessions.pop("null-key-trunc-sid", None)
 
 
@@ -6901,6 +6942,8 @@ def test_prompt_submit_refuses_ordinal_only_when_durable_history_is_unstamped(mo
 
 def test_prompt_submit_truncates_by_row_id(monkeypatch, _submit_truncation_only):
     """#82959: prompt.submit with truncate_before_row_id must cut at the target row id."""
+    # This test ends at truncation admission, not model execution.
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     replaced = []
 
     class _FakeDB:
@@ -6944,11 +6987,17 @@ def test_prompt_submit_truncates_by_row_id(monkeypatch, _submit_truncation_only)
         assert len(replaced) == 1
         assert replaced[0][1] == history[:2]
     finally:
+        worker = server._sessions["row-id-trunc-sid"].get("_run_thread")
+        if worker is not None:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
         server._sessions.pop("row-id-trunc-sid", None)
 
 
 def test_prompt_submit_truncates_by_string_row_id(monkeypatch, _submit_truncation_only):
     """#82959: String row IDs in history match correctly against integer truncate_before_row_id."""
+    # This test ends at truncation admission, not model execution.
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
     replaced = []
 
     class _FakeDB:
@@ -6988,6 +7037,10 @@ def test_prompt_submit_truncates_by_string_row_id(monkeypatch, _submit_truncatio
         assert resp.get("error") is None
         assert len(sess["history"]) == 2
     finally:
+        worker = server._sessions["str-row-id-trunc-sid"].get("_run_thread")
+        if worker is not None:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
         server._sessions.pop("str-row-id-trunc-sid", None)
 
 
@@ -7492,6 +7545,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     def _deliver(_rid, sid, session, text, **_kw):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False
+        return True  # the execution gate accepted the turn; None would re-queue for redelivery
 
     monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
     server._sessions.update(
@@ -9772,8 +9826,7 @@ def _slash_skill_fixtures(monkeypatch):
     usage = {"work": 297, "research": 84, "clean": 12}
 
     monkeypatch.setattr(
-        server,
-        "_skill_usage_lookup",
+        "tui_gateway.command_discovery._skill_usage_lookup",
         lambda: (
             lambda name: usage.get(name, 0),
             lambda name: "bundled" if name.startswith("unused-") else "local",
@@ -10118,8 +10171,9 @@ def test_config_set_model_requires_confirmation_for_expensive_model(monkeypatch)
     assert agent.switched is True
 
 
-def test_config_set_model_global_persists(monkeypatch, tmp_path):
-    from hermes_yaml import safe_load
+@pytest.mark.parametrize("slot", ["keep", "off"])
+def test_config_set_model_global_persists(monkeypatch, slot):
+    from hermes_cli.config import get_config_path, read_user_config_raw
 
     class _Agent:
         provider = "openrouter"
@@ -10139,20 +10193,17 @@ def test_config_set_model_global_persists(monkeypatch, tmp_path):
         api_mode="anthropic_messages",
         warning_message="",
     )
-    seen = {}
-
-
-    def _switch_model(**kwargs):
-        seen.update(kwargs)
-        return result
+    switch = Mock(return_value=result)
+    config_path = get_config_path()
 
     server._sessions["sid"] = _session(agent=_Agent())
-    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _switch_model)
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", switch)
     monkeypatch.setattr(server, "_restart_slash_worker", lambda sid, session: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text('model: {default: old/model, model_slots: {fast: "off"}}\n', encoding="utf-8")
-    monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: config_path)
+    config_path.write_text(
+        f'model:\n  default: old/model\n  model_slots:\n    fast: "{slot}"\n',
+        encoding="utf-8",
+    )
 
     resp = server.handle_request(
         {
@@ -10167,13 +10218,13 @@ def test_config_set_model_global_persists(monkeypatch, tmp_path):
     )
 
     assert resp["result"]["value"] == "anthropic/claude-sonnet-4.6"
-    assert seen["is_global"] is True
-    saved_values = safe_load(config_path.read_text(encoding="utf-8"))["model"]
+    assert switch.call_args.kwargs["is_global"] is True
+    saved_values = read_user_config_raw(config_path)["model"]
     assert saved_values["default"] == "anthropic/claude-sonnet-4.6"
     assert saved_values["provider"] == "anthropic"
     assert saved_values["base_url"] == "https://api.anthropic.com"
     assert saved_values["api_mode"] == "anthropic_messages"
-    assert saved_values["model_slots"] == {"fast": "off"}
+    assert saved_values["model_slots"] == {"fast": slot}
 
 
 def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatch):
@@ -12021,8 +12072,7 @@ def test_commands_catalog_ranks_skill_commands_by_recorded_usage(monkeypatch):
     opened outranks the one they invoke daily.
     """
     monkeypatch.setattr(
-        server,
-        "_skill_usage_lookup",
+        "tui_gateway.command_discovery._skill_usage_lookup",
         lambda: (
             lambda name: {"research": 60, "work": 172}.get(name, 0),
             lambda name: "bundled" if name == "research-paper-writing" else "local",
@@ -12395,7 +12445,7 @@ def test_rollback_restore_resolves_number_and_file_path():
         def list_checkpoints(self, cwd):
             return [{"hash": "aaa111"}, {"hash": "bbb222"}]
 
-        def restore(self, cwd, target, file_path=None):
+        def restore(self, cwd, target, file_path=None, safe=False):
             calls["args"] = (cwd, target, file_path)
             return {"success": True, "message": "done"}
 
@@ -12450,7 +12500,7 @@ def test_rollback_restore_truncates_from_real_user_turn_not_marker(monkeypatch):
         def list_checkpoints(self, cwd):
             return [{"hash": "abc123"}]
 
-        def restore(self, cwd, target, file_path=None):
+        def restore(self, cwd, target, file_path=None, safe=False):
             return {"success": True, "message": "restored"}
 
     history = [
@@ -12507,7 +12557,7 @@ def test_rollback_restore_skips_legacy_compaction_handoff(monkeypatch):
         def list_checkpoints(self, cwd):
             return [{"hash": "abc123"}]
 
-        def restore(self, cwd, target, file_path=None):
+        def restore(self, cwd, target, file_path=None, safe=False):
             return {"success": True, "message": "restored"}
 
     handoff = {
@@ -12568,7 +12618,7 @@ def test_rollback_restore_preserves_composite_carrier_scaffold(monkeypatch, tmp_
         def list_checkpoints(self, cwd):
             return [{"hash": "abc123"}]
 
-        def restore(self, cwd, target, file_path=None):
+        def restore(self, cwd, target, file_path=None, safe=False):
             return {"success": True, "message": "restored"}
 
     carrier = {
@@ -14086,6 +14136,7 @@ def test_prompt_submit_row_id_accepts_full_lineage_ordinal(monkeypatch):
     server._sessions["lineage-row-sid"] = sess
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
 
     try:
         resp = server.handle_request(
@@ -16584,7 +16635,7 @@ def test_session_create_seed_failure_after_row_compensates(monkeypatch):
         def append_messages_batch(self, session_id, messages, **kwargs):
             raise RuntimeError("transcript write failed")
 
-        def delete_session(self, session_id):
+        def discard_unadmitted_session(self, session_id):
             seen["deleted"] = session_id
             return True
 
@@ -17895,689 +17946,6 @@ def test_verification_status_outside_workspace_is_not_applicable(monkeypatch, tm
     assert resp["result"]["verification"]["status"] == "not_applicable"
 
 
-# ── browser.manage ───────────────────────────────────────────────────
-
-
-def _stub_urlopen(monkeypatch, *, ok: bool):
-    """Patch the loopback-aware opener browser.manage probes through (#110565) to short-circuit probes."""
-
-    class _Resp:
-        status = 200 if ok else 503
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-    def _opener(_url, timeout=2.0):
-        if not ok:
-            raise OSError("probe failed")
-        return _Resp()
-
-    import urllib.request
-
-    monkeypatch.setattr(urllib.request.OpenerDirector, "open", lambda _self, url, *a, timeout=2.0, **k: _opener(url, timeout=timeout))
-
-
-def _stub_urlopen_capture(monkeypatch, *, ok: bool):
-    urls: list[str] = []
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-    def _opener(url, timeout=2.0):
-        urls.append(url)
-        if not ok:
-            raise OSError("probe failed")
-        return _Resp()
-
-    import urllib.request
-
-    monkeypatch.setattr(urllib.request.OpenerDirector, "open", lambda _self, url, *a, timeout=2.0, **k: _opener(url, timeout=timeout))
-    return urls
-
-
-def test_browser_manage_status_reads_env_var(monkeypatch):
-    """Status returns the env var verbatim (no network I/O)."""
-    monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
-
-    resp = server.handle_request(
-        {"id": "1", "method": "browser.manage", "params": {"action": "status"}}
-    )
-
-    assert resp["result"]["connected"] is True
-    assert resp["result"]["url"] == "http://127.0.0.1:9222"
-
-
-def test_browser_manage_status_falls_back_to_config_cdp_url(monkeypatch):
-    """When env is unset, status surfaces ``browser.cdp_url`` from
-    config.yaml so users see what the next tool call will read."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-
-    fake_cfg = types.SimpleNamespace(
-        read_raw_config=lambda: {"browser": {"cdp_url": "http://lan:9222"}}
-    )
-    with patch.dict(sys.modules, {"hermes_cli.config": fake_cfg}):
-        resp = server.handle_request(
-            {"id": "1", "method": "browser.manage", "params": {"action": "status"}}
-        )
-
-    assert {k: resp["result"][k] for k in ("connected", "url")} == {"connected": True, "url": "http://lan:9222"}
-
-
-def test_browser_manage_use_swaps_the_profiles_browser_tools_for_new_agents(monkeypatch, tmp_path):
-    """Desktop/TUI ``/browser use [off]``: the target profile's ``browser.backend`` flips, ``status``
-    reports it, and the tool surface a NEW agent resolves swaps (stale check_fn verdicts dropped).
-    ``profile`` scopes the write: the launch profile's config stays untouched."""
-    from hermes_cli.config import read_raw_config
-    from hermes_constants import get_hermes_home
-    from tools import browser_use_cli
-    import model_tools
-    import hermes_yaml as yaml
-
-    monkeypatch.setattr(browser_use_cli, "_find_cli", lambda: ["browser-harness"])
-    manage = lambda **p: server.handle_request({"id": "1", "method": "browser.manage", "params": p})["result"]
-    exec_offered = lambda: "browser_exec" in {
-        t["function"]["name"] for t in model_tools.get_tool_definitions(enabled_toolsets=["browser", "terminal"])}
-
-    assert manage(action="use", enabled=False)["browser_use"] is False
-    assert manage(action="status")["browser_use"] is False and not exec_offered()
-    assert manage(action="use")["browser_use"] is True
-    assert read_raw_config()["browser"]["backend"] == "browser-use" and exec_offered()
-
-    other_home = tmp_path / "profiles" / "other"
-    other_home.mkdir(parents=True)
-    monkeypatch.setattr(server, "_profile_home", lambda name: other_home if name == "other" else None)
-    manage(action="use", enabled=False, profile="other")
-    backend = lambda home: yaml.safe_load((home / "config.yaml").read_text())["browser"]["backend"]
-    assert (backend(other_home), backend(get_hermes_home())) == ("off", "browser-use")
-
-
-def test_browser_manage_connect_sets_env_and_cleans_twice(monkeypatch):
-    """`/browser connect` must reach the live process: set env, reap browser
-    sessions before AND after publishing the new URL.  The double-cleanup
-    closes the supervisor swap window where ``_ensure_cdp_supervisor``
-    could re-attach to the *old* CDP endpoint between steps."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    cleanup_calls: list[str] = []
-
-    def _cleanup_all():
-        cleanup_calls.append(os.environ.get("BROWSER_CDP_URL", ""))
-
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=_cleanup_all,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        _stub_urlopen(monkeypatch, ok=True)
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "browser.manage",
-                "params": {"action": "connect", "url": "http://127.0.0.1:9222"},
-            }
-        )
-
-    assert resp["result"]["connected"] is True
-    assert resp["result"]["url"] == "http://127.0.0.1:9222"
-    assert os.environ.get("BROWSER_CDP_URL") == "http://127.0.0.1:9222"
-    # First cleanup runs against the OLD env (none here), second against the NEW.
-    assert cleanup_calls == ["", "http://127.0.0.1:9222"]
-
-
-def test_browser_manage_connect_defaults_to_loopback(monkeypatch):
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        urls = _stub_urlopen_capture(monkeypatch, ok=True)
-        resp = server.handle_request(
-            {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
-        )
-
-    assert resp["result"]["connected"] is True
-    assert resp["result"]["url"] == "http://127.0.0.1:9222"
-    assert urls[0] == "http://127.0.0.1:9222/json/version"
-
-
-def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    # No ``platform.system`` fake: the resolved system string only flows into
-    # ``launch_chrome_debug`` / ``manual_chrome_debug_command`` /
-    # ``get_chrome_debug_candidates``, all of which are mocked below — the
-    # host's real value never reaches unmocked code.
-    emitted: list[tuple[str, dict]] = []
-    monkeypatch.setattr(
-        server,
-        "_emit",
-        lambda evt, sid, payload=None: emitted.append((evt, payload or {})),
-    )
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        _stub_urlopen(monkeypatch, ok=False)
-        with (
-            patch(
-                "hermes_cli.browser_connect.launch_chrome_debug",
-                return_value=ChromeDebugLaunch(),
-            ),
-            patch("hermes_cli.browser_connect.local_port_in_use", return_value=False),
-            patch("hermes_cli.browser_connect.manual_chrome_debug_command", return_value=None),
-            patch(
-                "hermes_cli.browser_connect.get_chrome_debug_candidates",
-                return_value=[],
-            ),
-        ):
-            resp = server.handle_request(
-                {
-                    "id": "1",
-                    "method": "browser.manage",
-                    "params": {
-                        "action": "connect",
-                        "session_id": "sess-1",
-                        "url": "http://localhost:9222",
-                    },
-                }
-            )
-
-    assert resp["result"]["connected"] is False
-    assert resp["result"]["url"] == "http://127.0.0.1:9222"
-    assert resp["result"]["messages"]
-    assert "BROWSER_CDP_URL" not in os.environ
-    progress = [p["message"] for evt, p in emitted if evt == "browser.progress"]
-    assert progress == resp["result"]["messages"]
-
-
-def test_browser_manage_connect_no_session_skips_progress_events(monkeypatch):
-    """Without a session_id the TUI prints messages from the response;
-    emitting ``browser.progress`` events would double-render. Gate the
-    emit so callers without a session see the bundled list only."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    emitted: list[tuple[str, dict]] = []
-    monkeypatch.setattr(
-        server,
-        "_emit",
-        lambda evt, sid, payload=None: emitted.append((evt, payload or {})),
-    )
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        _stub_urlopen(monkeypatch, ok=False)
-        with (
-            patch(
-                "hermes_cli.browser_connect.launch_chrome_debug",
-                return_value=ChromeDebugLaunch(),
-            ),
-            patch("hermes_cli.browser_connect.manual_chrome_debug_command", return_value=None),
-            patch(
-                "hermes_cli.browser_connect.get_chrome_debug_candidates",
-                return_value=[],
-            ),
-        ):
-            resp = server.handle_request(
-                {
-                    "id": "1",
-                    "method": "browser.manage",
-                    "params": {"action": "connect", "url": "http://localhost:9222"},
-                }
-            )
-
-    assert resp["result"]["connected"] is False
-    assert resp["result"]["messages"]  # bundled list still populated
-    assert [evt for evt, _ in emitted if evt == "browser.progress"] == []
-
-
-def test_browser_manage_connect_handles_null_url(monkeypatch):
-    """Explicit ``{"url": null}`` (or empty string) must fall back to the
-    default loopback URL instead of raising a TypeError that gets swallowed
-    by the outer 5031 catch."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        _stub_urlopen(monkeypatch, ok=True)
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "browser.manage",
-                "params": {"action": "connect", "url": None},
-            }
-        )
-
-    assert resp["result"]["connected"] is True
-    assert resp["result"]["url"] == "http://127.0.0.1:9222"
-
-
-def test_browser_manage_connect_rejects_non_string_url(monkeypatch):
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    resp = server.handle_request(
-        {
-            "id": "1",
-            "method": "browser.manage",
-            "params": {"action": "connect", "url": 9222},
-        }
-    )
-
-    assert resp["error"]["code"] == 4015
-    assert "BROWSER_CDP_URL" not in os.environ
-
-
-def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    monkeypatch.setattr(server.time, "sleep", lambda _seconds: None)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-    # IPv4 answers only from the 3rd probe onwards (browser still starting);
-    # the IPv6 loopback never answers.
-    attempts = {"n": 0}
-
-    def _opener(url, timeout=2.0):
-        if "[::1]" in url:
-            raise OSError("no IPv6 listener")
-        attempts["n"] += 1
-        if attempts["n"] < 3:
-            raise OSError("not ready")
-        return _Resp()
-
-    import urllib.request
-
-    monkeypatch.setattr(urllib.request.OpenerDirector, "open", lambda _self, url, *a, timeout=2.0, **k: _opener(url, timeout=timeout))
-    launched = ChromeDebugLaunch(launched=True)
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        with (
-            patch(
-                "hermes_cli.browser_connect.launch_chrome_debug",
-                return_value=launched,
-            ),
-            patch("hermes_cli.browser_connect.local_port_in_use", return_value=False),
-        ):
-            resp = server.handle_request(
-                {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
-            )
-
-    assert resp["result"]["connected"] is True
-    assert resp["result"]["url"] == "http://127.0.0.1:9222"
-    assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:9222"
-
-
-def test_browser_manage_connect_finds_ipv6_only_browser(monkeypatch):
-    """Regression: an IDE debugger squatting 127.0.0.1:9222 pushes the debug
-    browser onto [::1]:9222. Connect must discover and adopt the IPv6
-    endpoint instead of timing out against the squatter."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-    def _opener(url, timeout=2.0):
-        if "[::1]" in url:
-            return _Resp()
-        raise OSError("IPv4 loopback held by a non-CDP squatter")
-
-    import urllib.request
-
-    monkeypatch.setattr(urllib.request.OpenerDirector, "open", lambda _self, url, *a, timeout=2.0, **k: _opener(url, timeout=timeout))
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        resp = server.handle_request(
-            {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
-        )
-
-    assert resp["result"]["connected"] is True
-    assert resp["result"]["url"] == "http://[::1]:9222"
-    assert os.environ["BROWSER_CDP_URL"] == "http://[::1]:9222"
-
-
-def test_browser_manage_connect_squatted_port_launches_on_alternate(monkeypatch):
-    """When neither loopback speaks CDP but the port is held by another
-    application, connect must pick an alternate port for the launch and
-    say so — never fight the squatter for 9222."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    monkeypatch.setattr(server.time, "sleep", lambda _seconds: None)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-    def _opener(url, timeout=2.0):
-        if ":9223" in url and "127.0.0.1" in url:
-            return _Resp()  # relaunched browser comes up on the alternate port
-        raise OSError("9222 squatted / nothing else listening")
-
-    import urllib.request
-
-    monkeypatch.setattr(urllib.request.OpenerDirector, "open", lambda _self, url, *a, timeout=2.0, **k: _opener(url, timeout=timeout))
-    launch_ports: list[int] = []
-
-    def _launch(port, _system):
-        launch_ports.append(port)
-        return ChromeDebugLaunch(launched=True)
-
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        with (
-            patch("hermes_cli.browser_connect.launch_chrome_debug", side_effect=_launch),
-            patch("hermes_cli.browser_connect.local_port_in_use", return_value=True),
-            patch("hermes_cli.browser_connect.find_free_debug_port", return_value=9223),
-        ):
-            resp = server.handle_request(
-                {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
-            )
-
-    assert launch_ports == [9223]
-    assert resp["result"]["connected"] is True
-    assert resp["result"]["url"] == "http://127.0.0.1:9223"
-    assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:9223"
-
-
-def test_browser_manage_connect_rejects_unreachable_endpoint(monkeypatch):
-    """An unreachable endpoint must NOT mutate the env or reap sessions."""
-    monkeypatch.setenv("BROWSER_CDP_URL", "http://existing:9222")
-    cleanup_calls: list[str] = []
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: cleanup_calls.append(
-            os.environ.get("BROWSER_CDP_URL", "")
-        ),
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        _stub_urlopen(monkeypatch, ok=False)
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "browser.manage",
-                "params": {"action": "connect", "url": "http://unreachable:9222"},
-            }
-        )
-
-    assert "error" in resp
-    # Env preserved; nothing reaped.
-    assert os.environ["BROWSER_CDP_URL"] == "http://existing:9222"
-    assert cleanup_calls == []
-
-
-def test_browser_manage_connect_normalizes_bare_host_port(monkeypatch):
-    """Persist a parsed `scheme://host:port` URL so `_get_cdp_override`
-    can normalize it; storing a bare host:port would break subsequent
-    tool calls (Copilot review on #17120)."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        _stub_urlopen(monkeypatch, ok=True)
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "browser.manage",
-                "params": {"action": "connect", "url": "127.0.0.1:9222"},
-            }
-        )
-
-    assert resp["result"]["connected"] is True
-    # Bare host:port got promoted to a full URL with explicit scheme.
-    assert resp["result"]["url"].startswith("http://")
-    assert os.environ["BROWSER_CDP_URL"].startswith("http://")
-
-
-def test_browser_manage_connect_strips_discovery_path(monkeypatch):
-    """User-supplied discovery paths like `/json` or `/json/version`
-    must collapse to bare `scheme://host:port`; otherwise
-    ``_resolve_cdp_override`` will append ``/json/version`` again and
-    produce a duplicate path (Copilot review round-2 on #17120)."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        _stub_urlopen(monkeypatch, ok=True)
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "browser.manage",
-                "params": {"action": "connect", "url": "http://127.0.0.1:9222/json"},
-            }
-        )
-
-    assert resp["result"]["connected"] is True
-    assert resp["result"]["url"] == "http://127.0.0.1:9222"
-    assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:9222"
-
-
-def test_browser_manage_connect_preserves_devtools_browser_endpoint(monkeypatch):
-    """Concrete devtools websocket endpoints (e.g. Browserbase) must
-    survive verbatim — we only collapse discovery-style paths."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    concrete = "ws://browserbase.example/devtools/browser/abc123"
-
-    class _OkSocket:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        # If urlopen is reached for a concrete ws endpoint, the test
-        # would still pass because _stub_urlopen returned ok=True before;
-        # patch it to assert-fail so we prove the HTTP probe is skipped.
-        with patch(
-            "urllib.request.urlopen", side_effect=AssertionError("urlopen called")
-        ):
-            with patch("socket.create_connection", return_value=_OkSocket()):
-                resp = server.handle_request(
-                    {
-                        "id": "1",
-                        "method": "browser.manage",
-                        "params": {"action": "connect", "url": concrete},
-                    }
-                )
-
-    assert resp["result"]["connected"] is True
-    assert resp["result"]["url"] == concrete
-    assert os.environ["BROWSER_CDP_URL"] == concrete
-
-
-def test_browser_manage_connect_local_devtools_ws_preserves_path(monkeypatch):
-    """Regression: ``ws://127.0.0.1:9222/devtools/browser/<id>`` is a real
-    connectable endpoint; default-local normalization must not strip the
-    ``/devtools/browser/...`` path or it breaks valid local CDP connects."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    concrete = "ws://127.0.0.1:9222/devtools/browser/abc123"
-
-    class _OkSocket:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        with patch("socket.create_connection", return_value=_OkSocket()):
-            resp = server.handle_request(
-                {
-                    "id": "1",
-                    "method": "browser.manage",
-                    "params": {"action": "connect", "url": concrete},
-                }
-            )
-
-    assert resp["result"]["connected"] is True
-    assert resp["result"]["url"] == concrete
-    assert os.environ["BROWSER_CDP_URL"] == concrete
-
-
-def test_browser_manage_connect_rejects_invalid_port(monkeypatch):
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    resp = server.handle_request(
-        {
-            "id": "1",
-            "method": "browser.manage",
-            "params": {"action": "connect", "url": "http://localhost:abc"},
-        }
-    )
-
-    assert resp["error"]["code"] == 4015
-    assert "BROWSER_CDP_URL" not in os.environ
-
-
-def test_browser_manage_connect_rejects_missing_host(monkeypatch):
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    resp = server.handle_request(
-        {
-            "id": "1",
-            "method": "browser.manage",
-            "params": {"action": "connect", "url": "http://:9222"},
-        }
-    )
-
-    assert resp["error"]["code"] == 4015
-    assert "BROWSER_CDP_URL" not in os.environ
-
-
-def test_browser_manage_connect_concrete_ws_skips_http_probe(monkeypatch):
-    """Regression for round-2 Copilot review: a hosted CDP endpoint
-    (no HTTP discovery) must connect via TCP-only reachability check.
-    The HTTP probe used to reject these even though they're valid."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    concrete = "wss://chrome.browserless.io/devtools/browser/sess-1"
-
-    seen_targets: list[tuple[str, int]] = []
-
-    class _OkSocket:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    def _fake_create_connection(addr, timeout=None):
-        seen_targets.append(addr)
-        return _OkSocket()
-
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        # urlopen would 404/ECONNREFUSED on a real hosted CDP endpoint;
-        # asserting it's never called proves the probe was skipped.
-        with patch(
-            "urllib.request.urlopen", side_effect=AssertionError("urlopen called")
-        ):
-            with patch("socket.create_connection", side_effect=_fake_create_connection):
-                resp = server.handle_request(
-                    {
-                        "id": "1",
-                        "method": "browser.manage",
-                        "params": {"action": "connect", "url": concrete},
-                    }
-                )
-
-    assert resp["result"] == {"connected": True, "url": concrete}
-    # wss → port 443, host preserved verbatim.
-    assert seen_targets == [("chrome.browserless.io", 443)]
-
-
-def test_browser_manage_connect_concrete_ws_tcp_unreachable(monkeypatch):
-    """If the TCP reachability check fails for a concrete ws endpoint,
-    return a clear 5031 error — no fallback to the HTTP probe (which
-    can never succeed for these URLs anyway)."""
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    concrete = "ws://offline.example/devtools/browser/missing"
-
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        with patch("socket.create_connection", side_effect=OSError("ECONNREFUSED")):
-            resp = server.handle_request(
-                {
-                    "id": "1",
-                    "method": "browser.manage",
-                    "params": {"action": "connect", "url": concrete},
-                }
-            )
-
-    assert "error" in resp
-    assert resp["error"]["code"] == 5031
-
-
-def test_browser_manage_disconnect_drops_env_and_cleans(monkeypatch):
-    monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
-    cleanup_count = {"n": 0}
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: cleanup_count.__setitem__(
-            "n", cleanup_count["n"] + 1
-        ),
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}):
-        resp = server.handle_request(
-            {"id": "1", "method": "browser.manage", "params": {"action": "disconnect"}}
-        )
-
-    assert resp["result"] == {"connected": False}
-    assert "BROWSER_CDP_URL" not in os.environ
-    # Two cleanups: once before env removal, once after, matching connect.
-    assert cleanup_count["n"] == 2
-
-
 # ── config.get indicator normalization ───────────────────────────────
 
 
@@ -19152,7 +18520,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, **_kwargs):
         turns.append(text)
         with session["history_lock"]:
             session["running"] = False
@@ -19679,7 +19047,7 @@ def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
     try:
         server._close_sessions_for_transport(transport, end_reason="ws_disconnect")
         assert seen == [("a", "ws_disconnect")]  # only the flagged one closed
-        assert server._sessions["b"]["transport"] is server._detached_ws_transport  # re-pointed
+        assert server._ws_session_is_detached(server._sessions["b"])
     finally:
         server._sessions.clear()
 
@@ -19722,7 +19090,7 @@ def test_close_sessions_for_transport_skips_session_rebound_before_claim(
 
                 def _resume_rebind():
                     with server._session_resume_lock:
-                        session["transport"] = new_transport
+                        server._attach_session_transport(session, new_transport)
                     rebound.set()
 
                 thread = threading.Thread(target=_resume_rebind)
@@ -19739,7 +19107,7 @@ def test_close_sessions_for_transport_skips_session_rebound_before_claim(
         assert reaped == 0
         assert detached == 0
         assert server._sessions["rebound"] is session
-        assert session["transport"] is new_transport
+        assert server._session_transport_contains(session, new_transport)
         assert teardowns == []
         assert reaps == []
     finally:
@@ -22033,6 +21401,7 @@ def test_prompt_submit_row_id_resolves_via_db_when_memory_lacks_stamps(monkeypat
     server._sessions["db-row-resolve-sid"] = sess
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **k: None)
 
     try:
         resp = server.handle_request(
@@ -22058,7 +21427,7 @@ def test_prompt_submit_row_id_resolves_via_db_when_memory_lacks_stamps(monkeypat
 
 
 def test_prompt_submit_row_id_real_sessiondb_resolve_without_memory_stamps(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, _submit_truncation_only
 ):
     """#82959 production path: real SessionDB insert → live history without
     _row_id (turn rewrite) → truncate_before_row_id cuts durable + memory.
@@ -22094,12 +21463,10 @@ def test_prompt_submit_row_id_real_sessiondb_resolve_without_memory_stamps(
     sid = "real-db-row-trunc-sid"
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
     try:
         # Cut before second user turn (row_ids[2]) — leave first exchange only.
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",
@@ -22255,7 +21622,7 @@ def test_prompt_submit_row_id_misaligned_memory_refuses_content_swap(
 
 
 def test_prompt_submit_row_id_misaligned_memory_role_shift_targets_real_turn(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, _submit_truncation_only
 ):
     """#82959 heal-path guard: equal-length but role-misaligned live memory
     must not be positionally stamped. The content-verified DB fallback still
@@ -22290,11 +21657,9 @@ def test_prompt_submit_row_id_misaligned_memory_role_shift_targets_real_turn(
     sid = "misalign-role-sid"
     server._sessions[sid] = sess
     monkeypatch.setattr(server, "_get_db", lambda: db)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_start_inflight_turn", lambda *a, **k: None)
 
     try:
-        resp = server.handle_request(
+        resp = _submit_truncation_only(
             {
                 "id": "1",
                 "method": "prompt.submit",
@@ -23050,93 +22415,3 @@ def test_named_profile_without_backend_stays_local_under_ssh_launch(monkeypatch,
     monkeypatch.setattr(server, "_profile_home", lambda name: home if name == "plain" else None)
 
     assert server._completion_cwd({"profile": "plain", "cwd": launch, "cwd_explicit": False}) == launch
-
-
-def test_session_branch_idempotency_key_dedupes_retry(monkeypatch, tmp_path):
-    """A retried session.branch with the SAME idempotency_key returns the SAME
-    child instead of a duplicate (#65410): a branch whose first response was
-    lost must not leave two children behind. The hit answers the SAME result
-    shape (title, parent, message_count) without re-copying the transcript."""
-
-    class ProfileDB:
-        def __init__(self, db_path=None):
-            pass
-
-        def get_session_title(self, _key):
-            return "parent"
-
-        def get_next_title_in_lineage(self, current):
-            return f"{current} (branch)"
-
-        def create_session(self, new_key, **kwargs):
-            pass
-
-        def append_messages_batch(self, session_id, messages, **kwargs):
-            return list(range(1, len(messages) + 1))
-
-        def set_session_title(self, key, title):
-            return True
-
-        def get_session(self, key):
-            return {"id": key, "cwd": str(tmp_path)}
-
-        def update_session_cwd(self, *a, **k):
-            return None
-
-        def close(self):
-            return None
-
-    class FakeAgent:
-        def __init__(self):
-            self.model = "test-model"
-            self.session_id = None
-
-    parent = {
-        "session_key": "parent-key",
-        "history": [{"role": "user", "content": "hi"}],
-        "history_lock": threading.Lock(),
-        "running": False,
-        "cols": 80,
-        "profile_home": None,
-        "source": "tui",
-        "agent": FakeAgent(),
-        "created_at": 1.0,
-        "last_active": 1.0,
-        "cwd": str(tmp_path),
-    }
-    server._sessions["parent"] = parent
-    monkeypatch.setattr(server, "_get_db", lambda: ProfileDB())
-    monkeypatch.setattr("hermes_state_registry.acquire", ProfileDB)
-    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
-    monkeypatch.setattr(server, "_make_agent", lambda *a, **k: FakeAgent())
-    monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: {})
-    monkeypatch.setattr(server, "_clear_session_context", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
-    monkeypatch.setattr(server, "_session_cwd", lambda s: str(tmp_path))
-    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_attach_worker", lambda *a, **k: None)
-    server._idempotency_keys.clear()
-    try:
-        params = {"session_id": "parent", "name": "forked", "idempotency_key": "branch-live-retry-1"}
-        first = server.handle_request({"id": "b1", "method": "session.branch", "params": dict(params)})
-        assert "result" in first, first
-        first_sid = first["result"]["session_id"]
-        first_key = first["result"]["stored_session_id"]
-        assert first["result"]["title"] == "forked"
-        assert first["result"]["parent"] == "parent-key"
-
-        # Client retries after a lost response: same key, same params.
-        second = server.handle_request({"id": "b2", "method": "session.branch", "params": dict(params)})
-        assert "result" in second, second
-        assert second["result"]["session_id"] == first_sid
-        assert second["result"]["stored_session_id"] == first_key
-        assert second["result"]["title"] == "forked"
-        assert second["result"]["parent"] == "parent-key"
-
-        # Only ONE child runtime exists besides the parent.
-        children = [sid for sid, s in server._sessions.items() if sid != "parent"]
-        assert len(children) == 1
-    finally:
-        for k in list(server._sessions):
-            server._sessions.pop(k, None)
-        server._idempotency_keys.clear()

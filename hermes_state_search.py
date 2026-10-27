@@ -13,13 +13,15 @@ import time
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
-from hermes_state_errors import is_malformed_db_error, is_sqlite_lock_error
+from hermes_state_errors import is_malformed_db_error, is_sqlite_lock_error, is_fts_query_syntax_error
+from hermes_state_search_runtime import search_operation, hydration_stage, search_stage, set_search_path
 from hermes_state_common import (
     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
     MAX_FTS5_QUERY_CHARS, SCHEMA_VERSION, _FTS_CJK_TRIGGERS,
     escape_like as _escape_like, fts_rebuild_admission, fts_trigram_session_sql, routed_sessions_setting,
 )
+from hermes_state_fts import fts_layout_current, fts_layout_drift
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -718,7 +720,13 @@ class SessionSearchMixin:
             return "teardown_incomplete"
         if self._fts_external_index_empty_with_messages(conn):
             return "backfill_incomplete"
-        self.set_meta("fts_storage_version", str(FTS_STORAGE_VERSION), cursor=conn)
+        current = fts_layout_current(conn)
+        if not current and fts_layout_drift(conn):
+            return "layout_drift"
+        # Not current with no older layout left means a definition this code does not recognise (a newer
+        # release's): the work is done, but the stamp is not this release's to write.
+        if current:
+            self.set_meta("fts_storage_version", str(FTS_STORAGE_VERSION), cursor=conn)
         _delete_meta(conn, "fts_optimize_available")
         conn.execute("UPDATE schema_version SET version = ? WHERE version < ?", (SCHEMA_VERSION, SCHEMA_VERSION))
         return None
@@ -828,7 +836,7 @@ class SessionSearchMixin:
         if bookend > 0:
             role_clause = "" if keep_roles is None else f" AND role IN ({','.join('?' for _ in keep_roles)})"
             role_params = [] if keep_roles is None else list(keep_roles)
-            with self._read_ctx() as conn:
+            with self._read_ctx() as conn, search_stage(self, "sql_ms"):
                 def _bookend(op: str, boundary_id: int, order: str):
                     return conn.execute(
                         f"SELECT * FROM messages "
@@ -1036,31 +1044,31 @@ class SessionSearchMixin:
         )
         return sql, params
 
-    def _match_rows(self, table: str, match_query: str, order_by_sql: str, *, fail_open: Optional[str] = None,
+    def _match_rows(self, table: str, match_query: str, order_by_sql: str, *,
                     operational_debug: Optional[str] = None, **kwargs) -> Optional[list[dict[str, Any]]]:
-        """Run one MATCH against *table*; ``None`` when the query cannot execute (tokenizer /
-        syntax) so the caller falls back. *fail_open* names the index for the
-        substring-capable routes: a corruption-class ``DatabaseError`` there detaches the
-        derived indexes (``_enter_fts_fail_open``) and answers from canonical rows — a live
-        search never runs the unbounded rebuild. Other ``DatabaseError``s propagate."""
+        """Run one MATCH. Only an FTS parser diagnostic permits fallback.
+
+        Database failures propagate. Detaching corrupt indexes takes the writer
+        lock, so only writer/reopen/maintenance paths own that recovery.
+        """
         sql, params = self._fts_match_sql(table, match_query, order_by_sql, **kwargs)
+        set_search_path(self, {
+            "messages_fts": "fts5", "messages_fts_cjk": "fts_cjk",
+            "messages_fts_trigram": "trigram",
+        }[table])
         try:
             return [dict(row) for row in self._read_all(sql, params)]
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if not is_fts_query_syntax_error(exc):
+                raise
             if operational_debug:
                 logger.debug(operational_debug, exc_info=True)
-            return None
-        except sqlite3.DatabaseError as exc:
-            if fail_open is None or not self._enter_fts_fail_open(exc):
-                raise
-            logger.warning(
-                "%s FTS search hit a corruption error (%s); detached FTS and falling back to canonical LIKE.",
-                fail_open, exc)
             return None
 
     def _like_rows(self, where: list[str], params: list, *, order_by: str, limit_sql: str) -> list[dict[str, Any]]:
         """Canonical-table LIKE scan; ``params[0]`` is the snippet anchor term."""
         sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", where, order_by, limit_sql)
+        set_search_path(self, "like_scan_fts_stale" if self._fts_stale else "like_scan")
         return [dict(row) for row in self._read_all(sql, params)]
 
     @staticmethod
@@ -1121,14 +1129,13 @@ class SessionSearchMixin:
         """Observe fail-open initiated by another process sharing state.db."""
         if self._fts_stale or not self._fts_enabled:
             return
-        try:
-            stale = self._read_one("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,))
-        except sqlite3.Error:
-            return
+        # Do not turn a failed read into an apparently fresh index.
+        stale = self._read_one("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,))
         if stale is not None:
             self._fts_stale = True
             self._fts_enabled = self._trigram_available = self._fts_cjk_available = False
 
+    @hydration_stage
     def _finalize_search_matches(
         self, matches: list[dict[str, Any]], result_fields: Optional[Collection[str]] = None) -> list[dict[str, Any]]:
         """Attach neighboring messages in bounded batches, only when context is requested."""
@@ -1138,10 +1145,11 @@ class SessionSearchMixin:
                 contexts = {match["id"]: [] for match in batch}
                 try:
                     sql = _CONTEXT_WINDOW_SQL.format(ids=",".join("?" for _ in contexts))
-                    with self._read_ctx() as conn:
-                        rows = conn.execute(sql, list(contexts)).fetchall()
+                    rows = self._read_all(sql, list(contexts))
                     for row in rows:
                         contexts[row["match_id"]].append(row)
+                except sqlite3.Error:
+                    raise  # Never return an apparently complete hit with failed context SQL.
                 except Exception:
                     contexts = {}
                 for match in batch:
@@ -1169,20 +1177,18 @@ class SessionSearchMixin:
     ) -> list[dict[str, Any]]:
         """:meth:`_search_messages_impl` plus one log line per slow search with the routing
         path taken. Threshold HERMES_SEARCH_SLOW_MS (default 1000; 0 logs every call)."""
-        started = time.time()
-        rows = None
-        try:
+        filters = dict(source_filter=source_filter, exclude_sources=exclude_sources,
+                       role_filter=role_filter, include_inactive=include_inactive,
+                       after_ts=after_ts, before_ts=before_ts,
+                       exclude_tool_calls=exclude_tool_calls, fields=fields, limit=limit, offset=offset)
+        with search_operation(self, query=query, sort=sort, filters=filters) as operation:
+            operation.path = self._describe_search_path(query)
             rows = self._search_messages_impl(
                 query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
                 limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
                 after_ts=after_ts, before_ts=before_ts, exclude_tool_calls=exclude_tool_calls)
+            operation.rows = len(rows)
             return rows
-        finally:
-            elapsed_ms = (time.time() - started) * 1000.0
-            if elapsed_ms >= _search_slow_ms():
-                logger.info("slow session search: path=%s elapsed=%.0fms rows=%s query=%r",
-                            self._describe_search_path(query), elapsed_ms, len(rows) if rows is not None else "err",
-                            query[: 200])
 
     def _search_messages_impl(
         self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
@@ -1238,18 +1244,10 @@ class SessionSearchMixin:
             sql, params = self._fts_match_sql("messages_fts", query, **route)
             try:
                 matches = [dict(row) for row in self._read_all(sql, params)]
-            except sqlite3.OperationalError:
-                return []  # FTS5 syntax error despite sanitization
-            except sqlite3.DatabaseError as exc:
-                # Corruption parent class: detach the derived indexes and answer from
-                # canonical rows; repair paths own the rebuild.
-                # A corrupt FTS index raises the malformed / "fts5: corrupt structure record" class on the
-                # MATCH read, the same class the write path handles (#66296). OperationalError (query
-                # syntax) is a subclass caught above; this arm is the corruption parent. The existing
-                # stale-open/repair paths retain rebuild ownership.
-                if not self._enter_fts_fail_open(exc):
+            except sqlite3.OperationalError as exc:
+                if not is_fts_query_syntax_error(exc):
                     raise
-                matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
+                return []  # Only an invalid MATCH expression is a miss.
 
         # Deferred-rebuild supplement: while the backfill is pending the FTS indexes miss
         # the (progress, high_water] gap; top up with a bounded LIKE scan so old messages
@@ -1260,7 +1258,9 @@ class SessionSearchMixin:
                 seen_ids = {m["id"] for m in matches}
                 matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
             except sqlite3.OperationalError as exc:
-                logger.debug("Unindexed-gap supplement skipped: %s", exc)
+                if not is_fts_query_syntax_error(exc):
+                    raise
+                logger.debug("Unindexed-gap supplement skipped for invalid FTS query: %s", exc)
 
         # unicode61 puts no boundary between Latin and adjacent CJK ("修改youer服务端" is
         # one token, so MATCH "youer" misses). On a zero-result Latin miss retry the
@@ -1292,7 +1292,7 @@ class SessionSearchMixin:
         if not matches and not is_cjk and not self._fts_stale:
             relaxed = self._or_relaxed_query(query)
             if relaxed is not None:
-                matches = self._match_rows("messages_fts", relaxed, fail_open="OR-relaxed",
+                matches = self._match_rows("messages_fts", relaxed,
                                            operational_debug="OR-relaxed FTS retry failed; keeping empty result",
                                            **route) or matches
         return self._finalize_search_matches(matches, result_fields=result_fields)
@@ -1310,12 +1310,12 @@ class SessionSearchMixin:
         match_query = _quote_fts_tokens(raw_query)
         if self._fts_cjk_available and not wants_unindexed_rows and not self._has_lone_cjk_run(raw_query):
             matches = self._match_rows(
-                "messages_fts_cjk", match_query, fail_open="CJK-bigram",
+                "messages_fts_cjk", match_query,
                 operational_debug="messages_fts_cjk query failed; falling back to trigram/LIKE", **route)
             if matches is not None:
                 return matches
         if self._trigram_route_ok(raw_query) and not wants_unindexed_rows:
-            matches = self._match_rows("messages_fts_trigram", match_query, fail_open="Trigram", **route)
+            matches = self._match_rows("messages_fts_trigram", match_query, **route)
             if matches is not None:
                 return matches
         non_op_tokens = [

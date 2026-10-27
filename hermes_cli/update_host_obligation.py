@@ -33,6 +33,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
+from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger("hermes_cli.update_cmd")
 
@@ -47,19 +48,20 @@ PROFILE_MARKER_NAME = "fleet_restart_pending"
 _RECORD_VERSION = 1
 
 
-def host_obligation_path() -> Path:
-    """This installation's host obligation record.
+def host_obligation_path(install_root: Path | None = None) -> Path:
+    """The host obligation record keyed by the resolved installation checkout.
 
-    Keyed by the checkout this module runs from: every profile of one install arms, reads and
-    clears the same record, while a second install of the same OS user (another checkout, a ZIP
-    install) owes its own, so its completed restart never erases this install's debt (review S3).
+    Callers running from an immutable release supply its journal-bound source root.
+    Other callers default to the checkout this module runs from, preserving the
+    updater's per-install, cross-profile record identity.
     """
     # Not ``gateway.host_rendezvous.host_state_dir``: ``gateway.status`` imports ``utils`` -> ruamel,
     # absent from the historical interpreter an old updater's takeover arms this record in; the
     # recovery module's stdlib copy of the rule is drift-tested against the gateway resolver.
     from hermes_cli.update_restart_recovery import _host_state_dir
 
-    install = os.path.normcase(str(Path(__file__).resolve().parents[1]))
+    root = Path(__file__).resolve().parents[1] if install_root is None else Path(install_root).resolve()
+    install = os.path.normcase(str(root))
     key = hashlib.sha256(install.encode("utf-8")).hexdigest()[:16]
     return Path(_host_state_dir()) / f"{Path(HOST_OBLIGATION_NAME).stem}-{key}.json"
 
@@ -244,7 +246,7 @@ def _write_locked(path: Path, *, expected_sha: str, runtimes: Optional[list], pr
     if runtimes is not None:
         payload["inventory"] = {"version": 1, "runtimes": runtimes}
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        make_user_dir(path.parent, parents=True, exist_ok=True)
         _write_record(path, payload)
     except Exception as exc:  # health: allow BLE001 -- never raises: the caller falls back to the per-home marker
         logger.debug("Could not write host update-restart obligation: %s", exc)
@@ -261,7 +263,7 @@ def _record_mutex(path: Path):
     """
     # One guard for every install's record (and the unkeyed one an older release still locks).
     guard = path.parent / f".{Path(HOST_OBLIGATION_NAME).stem}.mutex"
-    guard.mkdir(parents=True, exist_ok=True)
+    make_user_dir(guard, parents=True, exist_ok=True)
     with _marker_mutex()(guard / "record"):
         yield
 

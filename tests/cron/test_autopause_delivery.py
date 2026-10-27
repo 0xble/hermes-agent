@@ -5,8 +5,8 @@ from unittest.mock import Mock
 
 import pytest
 
-import cron.jobs as jobs
-import cron.scheduler as scheduler
+from cron import jobs
+from cron import scheduler
 import tools.cronjob_tools
 from tools.registry import registry
 
@@ -17,6 +17,8 @@ def test_unrunnable_claimed_job_autopauses_and_delivers_reason(tmp_path, monkeyp
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 3600)
     delivered = Mock(return_value=None)
     monkeypatch.setattr(scheduler, "_deliver_result", delivered)
+    admitted = Mock(side_effect=AssertionError("an unrunnable job must not need an agent owner"))
+    monkeypatch.setattr("cron.scheduler_authority.run_canonical_job", admitted)
     with jobs.use_cron_store(tmp_path):
         job = jobs.create_job(prompt="", schedule="every 5m", no_agent=unrunnable == "no_agent",
                               script="missing.py", deliver="local")
@@ -39,6 +41,7 @@ def test_unrunnable_claimed_job_autopauses_and_delivers_reason(tmp_path, monkeyp
         delivered.assert_called_once()
         assert reason in delivered.call_args.args[1]
         assert jobs.get_due_jobs() == []
+        admitted.assert_not_called()
 
 
 def test_run_pausing_own_job_still_delivers_once(tmp_path, monkeypatch):

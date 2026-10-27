@@ -24,9 +24,11 @@ class GoalEvaluationPersistenceError(Exception):
 
 
 def _read_goal(session_id: str, db: SessionDB) -> GoalState | None:
-    from hermes_cli.goals import GoalState, _meta_key
+    from hermes_cli.goals import GoalState, _meta_key, goal_autonomy_enabled, load_goal
 
     try:
+        if goal_autonomy_enabled():
+            return load_goal(session_id, db=db)
         raw = db.get_meta(_meta_key(session_id))
         return GoalState.from_json(raw) if raw else None
     except Exception as exc:
@@ -49,7 +51,7 @@ def _reload_if_readable(manager: GoalManager, db: SessionDB | None) -> None:
             logger.warning("Could not reload goal %s; retaining in-memory state", manager.session_id)
 
 
-def commit_goal_snapshot(session_id: str, expected: str, state: GoalState, db: SessionDB) -> None:
+def commit_goal_snapshot(session_id: str, expected: str, state: GoalState, db: SessionDB, *, precondition=None) -> None:
     """Validate and commit in the SessionDB writer transaction, including unchanged results."""
     from hermes_cli.goals import GoalState, _meta_key
 
@@ -57,6 +59,8 @@ def commit_goal_snapshot(session_id: str, expected: str, state: GoalState, db: S
         row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
         if not row or not row[0] or GoalState.from_json(row[0]).to_json() != expected:
             raise GoalEvaluationConflict
+        if precondition is not None:
+            precondition(cursor)
         if state.to_json() != expected:
             state.mutation_id = uuid.uuid4().hex
             db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
@@ -70,11 +74,14 @@ def commit_goal_snapshot(session_id: str, expected: str, state: GoalState, db: S
 
 
 def evaluate_goal_snapshot(manager: GoalManager, last_response: str, **kwargs: Any) -> dict[str, Any]:
-    from hermes_cli.goals import GoalState, _decision, _get_session_db
+    from hermes_cli.goals import GoalState, _decision, _get_session_db, goal_autonomy_enabled
 
     state = manager.state
     if state is None or state.status != "active":
         return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+    if goal_autonomy_enabled() and getattr(state, "_legacy_migration_pending", False):
+        return _decision("active", False, None, "persistence_failed", "goal migration was not saved",
+                         "Goal migration could not be saved. The next load will retry it.")
     if not manager.session_id:
         return manager._evaluate_after_turn(last_response, **kwargs)
     expected = state.to_json()
@@ -119,3 +126,19 @@ def evaluate_goal_snapshot(manager: GoalManager, last_response: str, **kwargs: A
             manager.state.status if manager.state else None, False, None, "persistence_failed",
             "goal state could not be read or saved", "Goal state could not be read or saved; automatic continuation stopped.",
         )
+
+
+def blocked_goal_decision(manager, reason):
+    from hermes_cli.goals import _BLOCKED_ON_USER_RE, _BLOCKED_PAUSE_RE, _BLOCKED_PAUSE_PREFIX
+
+    # Only a real irreversible-constraint breach or a goal with nothing left to try
+    # pauses. Every other BLOCKED (approval, decision, credentials, an answer) is a
+    # wait on the user's next message: the goal stays active and no /goal resume chore.
+    needs_user = bool(_BLOCKED_ON_USER_RE.search(reason or "")) and not _BLOCKED_PAUSE_RE.search(reason or "")
+    if needs_user:
+        return manager._apply_wait_directive({"user_message": True}, reason)
+    return manager._pause_decision(
+        f"{_BLOCKED_PAUSE_PREFIX}{reason}", "blocked", reason,
+        f"⏸ Goal blocked — paused: {reason} If input is needed, supply it to continue; "
+        "use /goal set to re-scope or /goal resume to override this block (counts as your approval of it).",
+    )

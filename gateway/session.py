@@ -23,6 +23,7 @@ from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pi
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _local_iso, _local_naive, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
+from hermes_state_keys import profile_from_session_key_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -574,7 +575,8 @@ class SessionEntry:
     prompt_pin: Optional[dict[str, Any]] = None
     # Gateway ``/yolo`` bypass for this lane, mirrored from ``tools.approval``'s in-memory set so a restart
     # keeps it; cleared with it at every conversation boundary (``_clear_session_boundary_security_state``).
-    yolo: bool = False
+    # None means no explicit toggle; True/False are explicit ON/OFF choices.
+    yolo: Optional[bool] = None
     # When a resumed successor is interrupted before its predecessor preview can be re-keyed,
     # retain the predecessor token so recovery can adopt only that exact chained row. Appended to
     # preserve older positional SessionEntry construction.
@@ -590,6 +592,7 @@ class SessionEntry:
     attended_route_active: Optional[bool] = None
     model_role: Optional[str] = None
     attended_pinned: bool = False
+    attended_pin_until: Optional[float] = None
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -616,6 +619,8 @@ class SessionEntry:
             "chat_type": self.chat_type, "metadata": self.metadata,
         }
         result.update((name, getattr(self, name)) for name in self._PLAIN_FIELDS)
+        # Preserve legacy readers' boolean view while the tri-state value is authoritative.
+        result["yolo"], result["yolo_toggle"] = self.yolo is True, self.yolo
         if self.restart_notes:
             result["restart_notes"] = [
                 {
@@ -637,6 +642,8 @@ class SessionEntry:
             result["model_role"] = self.model_role
         if self.attended_pinned:
             result["attended_pinned"] = True
+            if self.attended_pin_until is not None:
+                result["attended_pin_until"] = self.attended_pin_until
         if self.active_turn_token and self.active_turn_owner_pid and self.active_turn_owner_slot:
             result["active_turn_owner_pid"] = self.active_turn_owner_pid
             result["active_turn_owner_slot"] = self.active_turn_owner_slot
@@ -686,6 +693,11 @@ class SessionEntry:
         defaults = {f.name: f.default for f in fields(cls)}
         plain = {n: data.get(n, defaults[n]) for n in cls._PLAIN_FIELDS + cls._RESET_FIELDS}
         plain["expiry_finalized"] = data.get("expiry_finalized", data.get("memory_flushed", False))
+        # Legacy rows stored bare yolo=False for both "off" and "never toggled"; only True
+        # is an explicit old toggle. New rows use yolo_toggle as the authoritative tri-state.
+        plain["yolo"] = data["yolo_toggle"] if "yolo_toggle" in data else (
+            True if data.get("yolo") is True else None
+        )
         raw_notes = plain.get("restart_notes") or []
         if not isinstance(raw_notes, list):
             raw_notes = []
@@ -731,6 +743,7 @@ class SessionEntry:
             if isinstance(data.get("attended_route_active"), bool) else None,
             model_role=str(data.get("model_role")).strip().lower() if data.get("model_role") else None,
             attended_pinned=data.get("attended_pinned") is True,
+            attended_pin_until=data.get("attended_pin_until"),
             model_override_scope=data.get("model_override_scope", "session")
             if data.get("model_override_scope") in ("session", "temporary", "once") else "session",
             reasoning_override_scope=data.get("reasoning_override_scope", "session")
@@ -783,14 +796,6 @@ def _session_key_namespace(profile: Optional[str]) -> str:
     if not profile or profile == "default":
         return "agent:main"
     return "agent:main~" if profile == "main" else f"agent:{profile}"
-
-
-def profile_from_session_key_namespace(namespace: str) -> str:
-    """Inverse of :func:`_session_key_namespace` for the ``<ns>`` slot of a key: ``"default"`` for
-    ``main``, ``"main"`` for the marked ``main~``, else the slot is the profile id."""
-    if namespace == "main":
-        return "default"
-    return "main" if namespace == "main~" else namespace
 
 
 def _canonical_participant(source: SessionSource) -> Optional[str]:
@@ -1116,8 +1121,11 @@ class SessionStore(
         checks = None
         if not force_new and observed is not None:
             sid = observed.session_id
+            # A local route the authority holds by receipt is never stale: a stamped row is
+            # reopened by its next admitted turn, never replaced (#140642).
             checks = _RouteChecks(
-                sid, self._compression_tip_for_session_id(sid), self._is_session_ended_in_db(sid),
+                sid, self._compression_tip_for_session_id(sid),
+                self._is_session_ended_in_db(sid) and self._local_receipt_target(observed) is None,
                 self._route_reset_reason(observed),
             )
         # Phase 2 (lock): apply the decisions to _entries.
@@ -1372,6 +1380,7 @@ class SessionStore(
                 entry.last_user_activity_at = durable.last_user_activity_at
             if entry is not None and durable is not None and durable.session_id == entry.session_id:
                 entry.attended_pinned = durable.attended_pinned
+                entry.attended_pin_until = durable.attended_pin_until
             return getattr(entry, "last_user_activity_at", None) if entry else None
 
     def mark_user_activity(self, session_key: str, when: Optional[datetime] = None) -> bool:
@@ -1419,6 +1428,9 @@ class SessionStore(
                 return None
             now = _now()
             session_id = _new_session_id(now)
+            if old_entry.origin and old_entry.origin.platform == Platform.LOCAL:
+                from gateway.session_local_recovery import reset_local_session
+                return reset_local_session(self, old_entry, session_id, now, display_name)
             new_entry = self._replace_route_locked(
                 session_key, old_entry, session_id, now,
                 display_name=display_name if display_name is not None else old_entry.display_name,
@@ -1571,6 +1583,7 @@ class SessionStore(
                 last_user_activity_at=old_entry.last_user_activity_at,
                 attended_route_active=old_entry.attended_route_active,
                 attended_pinned=old_entry.attended_pinned if preserve_attended_pin else False,
+                attended_pin_until=old_entry.attended_pin_until if preserve_attended_pin else None,
                 model_role=old_entry.model_role,
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
@@ -1604,8 +1617,9 @@ class SessionStore(
             entries = list(self._entries.values())
         if active_minutes is not None:
             cutoff = _now() - timedelta(minutes=active_minutes)
-            entries = [e for e in entries if e.updated_at >= cutoff]
-        entries.sort(key=lambda e: e.updated_at, reverse=True)
+            entries = [e for e in entries if e.updated_at.timestamp() >= cutoff.timestamp()]
+        # Legacy local timestamps and canonical UTC timestamps can coexist after recovery.
+        entries.sort(key=lambda e: e.updated_at.timestamp(), reverse=True)
         return entries
 
     def lookup_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
@@ -1648,5 +1662,6 @@ def build_session_context(
     if session_entry:
         context.session_key = session_entry.session_key
         context.session_id = session_entry.session_id
-        context.created_at, context.updated_at = session_entry.created_at, session_entry.updated_at
+        context.created_at = getattr(session_entry, "created_at", None)
+        context.updated_at = getattr(session_entry, "updated_at", None)
     return context

@@ -90,6 +90,12 @@ The follow-up patch `delegation-explicit-inheritance` changes two things:
 Upstream has no equivalent option. Contribute it upstream only if a
 delegation-speed issue asks for it there.
 
+Parent wire fields are stripped with the shared native tier sanitizer, including
+nested `extra_body.service_tier` and `extra_body.speed`. A profile-routed child
+uses its target profile's final reasoning and Fast settings. It must not label
+that profile default as an explicit session pick inherited from the launcher.
+The provider-boundary and profile-route suites exercise the real child builder.
+
 ## Verification
 
 Run:

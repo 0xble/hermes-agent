@@ -110,7 +110,7 @@ from hermes_cli.update_cmd_git import (
     _prune_orphan_rescue_refs, _push_synced_fork, _should_skip_upstream_prompt, _sync_fork_with_upstream,
     _sync_with_upstream_if_needed, UpstreamTargetBroken)
 from hermes_cli.update_cmd_maint import (
-    _PRE_UPDATE_SNAPSHOT_KEEP, _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE, _clear_stale_sqlite_sidecars,
+    _PRE_UPDATE_SNAPSHOT_KEEP, _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
     _checkout_version, _ensure_acp_launcher, _ensure_fhs_path_guard, _finish_dashboard_update_cleanup,
     _format_time_ago, _post_update_sqlite_runtime_status, _print_bundled_skills_sync_report,
     _print_curator_first_run_notice, _print_curator_recent_run_notice,
@@ -961,7 +961,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
         git_cmd, root, branch, ["--depth", "1"] if is_shallow else [],
     )
     if fetch_result.returncode != 0:
-        _print_fetch_failure(fetch_result.stderr)
+        _print_fetch_failure(fetch_result.stderr, git_cmd=git_cmd, root=root)
         sys.exit(1)
     if is_shallow:
         _check.repair_shallow_grafts(root)
@@ -1546,6 +1546,11 @@ def _refuse_before_commit_point(git_cmd, target_ref, _windows_gateway_resume) ->
     """Preconditions that used to fail AFTER the swap: refuse with the install untouched."""
     reason = _commit.preflight_refusal(git_cmd, _m().PROJECT_ROOT, target_ref, _UPDATE_CRITICAL_FILES)
     if reason is None:
+        from hermes_cli.update_downgrade_guard import downgrade_refusal
+        reason = downgrade_refusal(git_cmd, _m().PROJECT_ROOT, target_ref)
+        if reason is not None:
+            _record_stop("downgrade_refused")
+    if reason is None:
         return
     print(reason)
     print("  No update was applied; your install is unchanged.")
@@ -1896,6 +1901,8 @@ def _prepare_git_command(*, checkout_move=None) -> tuple[bool, list, bool]:
 
     # Before stash/branch logic: npm rewrites package-lock.json non-deterministically and
     # line-ending churn is machine-made dirt; both would otherwise force an autostash every update.
+    from hermes_cli.update_cmd_stash import _track_preparation_moves
+    checkout_move = _track_preparation_moves(checkout_move)
     _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT, checkout_move=checkout_move)
     _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT, checkout_move=checkout_move)
 
@@ -2166,8 +2173,9 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
 
 def _finish_already_up_to_date(
     git_cmd, branch: str, current_branch: str, _plan, *, gw_input_fn, completion_request: dict,
-    _windows_gateway_resume=None) -> None:
+    _windows_gateway_resume=None, held_message: str | None = None) -> None:
     """"Already up to date" path: restore stash, repair the checkout, catch up the fleet.
+    ``held_message`` replaces "Already up to date!" when the channel's release was held, not reached.
     ``sys.exit(1)`` when the repair is incomplete (after gateway exit code + partial receipt)."""
     # A parked branch the update switched off stays on the target: re-parking on the stale branch
     # recreates the incident. No other checkout left current_branch (in-place and release updates
@@ -2189,7 +2197,7 @@ def _finish_already_up_to_date(
         # Same code, same host obligation: an SHA-less arm would REPLACE the standing record
         # (and its restarted proof), so a sibling profile's no-op update re-kills the multiplexer.
         completion_request["expected_sha"] = _capture_head_sha(git_cmd, _m().PROJECT_ROOT) or ""
-        completion_request["completion_message"] = (
+        completion_request["completion_message"] = held_message or (
             "✓ Already up to date!" if _plan.upstream_checked
             else "✓ Up to date with your fork (official repo not checked).")
     _complete_source_update(completion_request)
@@ -2202,6 +2210,7 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
     from hermes_cli.immutable_releases import (
         ReleasePaths, read_pointer, release_sha, stage_release, _release_is_ready,
     )
+    _record_update_step("immutable_source_untouched", True, "fetch-only release apply leaves source files and venv untouched")
     source = _m().PROJECT_ROOT.resolve()
     home = get_hermes_home()
     paths = ReleasePaths.for_home(home)
@@ -2213,17 +2222,17 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
         raise RuntimeError("current is not a release; remove the obsolete source pointer before updating")
     if current is not None and not _release_is_ready(current, current.name):
         raise RuntimeError("current release is not ready; refusing to activate from an invalid pointer")
-    # Migration metadata and the source plist are captured with the candidate
-    # inside one transaction at activation, not before staging/handoff.
-    # A deferred candidate must be promoted on the next normal update, even
-    # when the remote has not advanced beyond that exact staged commit.
+    from hermes_cli.update_cmd_candidate import select_update_target
+    fetched, selected_branch = select_update_target(source, home, current, fetched, branch, args)
+    # Capture migration metadata and the source plist transactionally at activation, not at
+    # staging/handoff. Promote a deferred candidate even when the remote has not advanced.
     if current is not None and current.name == fetched:
         _catch_up_immutable_release(defer=opts.no_gateway_restart, sha=fetched, source=source)
         _apply_pending_fleet_restart_catchup(defer=opts.no_gateway_restart)
         return
-    # stage_release archives FETCH_HEAD itself, builds web and its own locked
-    # environment in a build-aside directory, then atomically publishes it.
-    candidate, _ = stage_release(source, home, sha=fetched)
+    # stage_release archives the selected target (FETCH_HEAD or a local carry-forward merge),
+    # builds web and its own locked environment in a build-aside directory, then publishes it.
+    candidate, _ = stage_release(source, home, sha=fetched, branch=selected_branch)
     if candidate != paths.release(fetched) or not _release_is_ready(candidate, fetched):
         raise RuntimeError("staged release does not match fetched commit")
     _write_fleet_restart_pending_marker(
@@ -2271,10 +2280,9 @@ _POST_SWAP_FORWARDED_FLAGS = (
 
 def _post_swap_argv_tail(args) -> list[str]:
     tail = [flag for attr, flag in _POST_SWAP_FORWARDED_FLAGS if getattr(args, attr, False)]
+    # Selection-only flags stay behind: the child runs the target's parser, which may predate them.
     branch = getattr(args, "branch", None)
-    if branch:
-        tail += ["--branch", str(branch)]
-    return tail
+    return tail + (["--branch", str(branch)] if branch else [])
 
 
 def _post_swap_payload(
@@ -2717,7 +2725,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if is_partial_clone_pack_objects_crash(fetch_result.stderr or ""):
                 print("✗ git still crashed after marking this checkout's packs. See 'Fetch fails with"
                       " should_include_obj' in https://hermes-agent.nousresearch.com/docs/getting-started/updating")
-            _print_fetch_failure(fetch_result.stderr)
+            _print_fetch_failure(fetch_result.stderr, git_cmd=git_cmd, root=_m().PROJECT_ROOT)
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             _record_stop("git_timeout" if fetch_result.returncode == 124 else "disk_full"
                          if "No space left on device" in (fetch_result.stderr or "") else "fetch_failed")
@@ -2737,8 +2745,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _windows_gateway_resume=_windows_gateway_resume)
             return
 
+        # The fetch-only proof must not survive into a phase that may stash or rewrite files.
+        _completion_receipt.record_step(
+            "local_changes_stash", False, "unverified: checkout preparation started", replace=True)
         current_branch = _current_branch_name(git_cmd, check=True)
         _commit.record_run_start(git_cmd, _m().PROJECT_ROOT)
+        held_message = None
+        if release_sha and not target_is_head:
+            channel = _update_run_channel(args)
+            held = _check.hold_channel_release_behind_runtime(git_cmd, target_ref, channel)
+            if held:
+                target_ref = held
+                held_message = f"✓ Holding at this build until a newer {channel} release ships."
         _refuse_before_commit_point(git_cmd, target_ref, _windows_gateway_resume)
         _plan = _prepare_checkout_for_update(
             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
@@ -2749,7 +2767,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if commit_count == 0:
             _finish_already_up_to_date(
                 git_cmd, branch, current_branch, _plan, gw_input_fn=gw_input_fn,
-                completion_request=completion_request, _windows_gateway_resume=_windows_gateway_resume)
+                completion_request=completion_request, _windows_gateway_resume=_windows_gateway_resume,
+                held_message=held_message)
             return
 
         if release_sha:

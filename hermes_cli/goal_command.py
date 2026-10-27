@@ -28,12 +28,12 @@ def _english(key, default, **values):
 
 
 def _status(mgr, arg, render):
-    details = mgr.render_removable_items()
+    details = "\n".join(filter(None, (mgr.render_removable_items(), mgr.render_completion_history())))
     return GoalCommandResult(mgr.status_line() + (f"\n{details}" if details else ""))
 
 
 def _show(mgr, arg, render):
-    details = mgr.render_removable_items()
+    details = "\n".join(filter(None, (mgr.render_removable_items(), mgr.render_completion_history())))
     return GoalCommandResult(f"{mgr.status_line()}\n{mgr.render_contract()}" + (f"\n{details}" if details else ""))
 
 
@@ -206,9 +206,14 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
         # Bare /goal text is an in-place edit of the current objective. It must not
         # reset history or enqueue a turn: a paused goal remains paused, while an
         # active goal remains active until its existing continuation path runs.
+        # Inline fields and drafts do not express removal, so patch only supplied values.
         result = mgr.replace(
             reason="explicit /goal replacement command", goal=headline or arg,
-            contract=contract, actor="user",
+            contract=(
+                {key: value for key, value in contract.to_dict().items() if value.strip()}
+                if contract else None
+            ),
+            actor="user",
         )
         if not result.get("ok"):
             return GoalCommandResult(result.get("error", "goal replacement failed"), error=True)

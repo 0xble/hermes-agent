@@ -1497,6 +1497,44 @@ async def test_fence_suppressed_command_dispatch_keeps_started_tick(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["coroutine", "sync"])
+async def test_plugin_wake_superseded_during_session_lookup_is_suppressed(control_home, monkeypatch, kind):
+    """The plugin dispatch looks up the chat's session before calling the handler. A stop landing
+    during that lookup must still suppress the handler: the fence is checked after the lookup."""
+    runner, _adapter, source, entry = native_runner(control_home)
+    runner._defer_goal_status_notice_after_delivery = AsyncMock()
+    runner._run_agent = AsyncMock()
+    event = await _prepare_loop_command_dispatch(runner, source, entry, "/plugin-effect")
+    effect = AsyncMock(return_value="effect ran")
+    sync_calls = []
+
+    def sync_plugin(_args):
+        sync_calls.append(_args)
+        return "effect ran"
+
+    plugin = effect if kind == "coroutine" else sync_plugin
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_command_handler", lambda name: plugin)
+    store = runner.async_session_store
+    original_lookup = store.lookup_by_session_key
+
+    async def lookup_then_stop(key):
+        found = await original_lookup(key)
+        runner._begin_session_run_generation(entry.session_key)  # /loop stop lands mid-lookup
+        return found
+
+    monkeypatch.setattr(store, "lookup_by_session_key", lookup_then_stop)
+    try:
+        handled, result = await runner._hm_dispatch_idle_commands(event, source, entry.session_key)
+        assert handled and result is None
+        effect.assert_not_awaited()
+        assert sync_calls == []
+        saved = loops.load_loop(entry.session_id)
+        assert saved is not None and saved.awaiting_response and saved.claim_phase == "started"
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("migration_fails", [False, True])
 async def test_matching_compression_tip_rehomes_loop_without_losing_claim(control_home, monkeypatch, migration_fails):
     runner, adapter, source, entry = native_runner(control_home)

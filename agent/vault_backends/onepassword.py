@@ -344,7 +344,9 @@ class OnePasswordLoginBackend(LoginBackend):
                        timeout_message="op timed out", stdin=subprocess.DEVNULL)
         if proc.returncode != 0:
             err = _scrub(proc.stderr or "")
-            if "session" in err.lower() or "sign in" in err.lower() or "not signed in" in err.lower():
+            # A service account never holds a session, so an auth failure there is not a lock to undo:
+            # surface op's own error instead of an unlock prompt that reports "already unlocked".
+            if not self._service_token and any(w in err.lower() for w in ("session", "sign in", "not signed in")):
                 _unlock.lock(self.name)
                 raise UnlockRequired(self)
             raise RuntimeError(f"op failed: {err[:200]}")
@@ -395,6 +397,54 @@ class OnePasswordLoginBackend(LoginBackend):
     def _list_json_fresh(self) -> str:
         """Explicitly refresh the display listing for a vault hint or origin filter."""
         return self._shared_listing(0.0)
+
+    def otp_availability(self, handle: str, *, fetch: bool = False) -> Optional[bool]:
+        """Display-only CLI field availability, cached with the existing listing TTL.
+
+        Callers may fetch only for an unambiguous origin-filtered login. Never
+        reveal fields or mint a code, and never use this hint to authorize a fill.
+        """
+        if self._connect_credentials()[1]:
+            return None
+        item_id = self._metadata_handle_id(handle)
+        key = self._listing_key()
+        with _LISTING_LOCK:
+            snapshot = _LISTING_CACHE.get(key)
+        if not snapshot or time.monotonic() - snapshot[0] >= _LISTING_TTL_SECONDS:
+            return None
+        rows = json.loads(snapshot[1])
+        matches = [row for row in rows if isinstance(row, dict)
+                   and row.get("id") == item_id and row.get("category") == "LOGIN"]
+        if len(matches) != 1:
+            return None
+        row = matches[0]
+        cached = row.get("_hermes_otp_available")
+        if isinstance(cached, bool) or not fetch:
+            return cached if isinstance(cached, bool) else None
+        vault = row.get("vault")
+        vault_id = vault.get("id") if isinstance(vault, dict) else None
+        if not isinstance(vault_id, str) or not vault_id:
+            return None
+        try:
+            detail = json.loads(self._run("item", "get", item_id, "--vault", vault_id, "--format", "json"))
+            if (not isinstance(detail, dict) or detail.get("id") != item_id
+                    or (detail.get("vault") or {}).get("id") != vault_id
+                    or detail.get("category") != "LOGIN" or detail.get("state", "ACTIVE") != "ACTIVE"):
+                return None
+            fields = detail.get("fields")
+            if not isinstance(fields, list) or any(not isinstance(f, dict) or not isinstance(f.get("type"), str)
+                                                   for f in fields):
+                return None
+            available = any(f["type"] == "OTP" for f in fields)
+        except (RuntimeError, UnlockRequired, OSError, ValueError, TypeError, AttributeError):
+            # A lookup failure is unknown, not evidence that the item has no OTP.
+            return None
+        row["_hermes_otp_available"] = available
+        with _LISTING_LOCK:
+            # Do not extend freshness or resurrect an invalidated/refreshed listing.
+            if _LISTING_CACHE.get(key) == snapshot:
+                _LISTING_CACHE[key] = (snapshot[0], json.dumps(rows))
+        return available
 
     def _metadata_handle_id(self, handle: str) -> str:
         if not handle.startswith(self.prefix):

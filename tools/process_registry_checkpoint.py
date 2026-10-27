@@ -42,15 +42,38 @@ class ProcessCheckpointMixin:
                     # PID, never re-runs it), so masking is lossless.
                     # See #77484.
                     entry["command"] = redact_sensitive_text(s.command, code_file=True)
+                    entry["handoff_note"] = redact_sensitive_text(s.handoff_note, code_file=True)
                     entry["owner_task_id"] = s.owner_task_id or s.task_id
                     entries.append(entry)
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
                     entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
+                known = {*self._running, *self._finished}
+            from hermes_cli.active_sessions import _FileLock
             from utils import atomic_json_write
-            atomic_json_write(_checkpoint_path(), entries)
+            path = _checkpoint_path()
+            # Every interpreter of the profile (owner, each managed worker) rewrites this file from
+            # its own table; a worker's output-log handoff is its only path to the next one, so a
+            # writer keeps the handoffs it does not track (read-merge-write under one file lock).
+            with _FileLock(path.with_name(path.name + ".lock")):
+                entries.extend(self._foreign_handoffs(path, known))
+                atomic_json_write(path, entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+
+    def _foreign_handoffs(self, path, known) -> list[dict[str, Any]]:
+        """On-disk worker handoffs this registry never tracked whose log still decides an outcome:
+        the process is alive (same start time) or its recorded exit is waiting to be read."""
+        from pathlib import Path
+        from tools.process_registry_output_log import _exit_path, adoptable_log
+        try:
+            on_disk = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return []
+        return [entry for entry in on_disk if isinstance(entry, dict) and entry.get("session_id") not in known
+                and (log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
+                and (_exit_path(log).exists() or self._detached_host_fate(
+                    entry.get("pid"), entry.get("host_start_time")) == "running")]
 
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
@@ -62,6 +85,7 @@ class ProcessCheckpointMixin:
             ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
             _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
         )
+        from tools.process_registry_output_log import adoptable_log
 
         self._prune_delivered_survivor_runs()
         checkpoint_path = _checkpoint_path()
@@ -97,7 +121,13 @@ class ProcessCheckpointMixin:
             # a live child unsupervised, and marking it exited would invent a
             # completion. A positive mismatch means the number was recycled:
             # do not adopt it and do not signal it.
+            log = adoptable_log(entry.get("output_log"))
             fate = self._detached_host_fate(pid, entry.get("host_start_time")) if pid else "gone"
+            # A worker spawn's output log and recorded exit outlive both the spawner and the PID,
+            # so its reader decides the outcome. A positive start-time mismatch still proves the
+            # PID was recycled, so a reused PID is never adopted or signalled.
+            if log and fate != "reused":
+                fate = "running"
             # A survivor whose PID was recycled is never adopted, supervised, or signalled
             # either. Only a result its wrapper already recorded is reported (once, via the
             # delivery claim); without one the stale entry is discarded like any other.
@@ -144,12 +174,19 @@ class ProcessCheckpointMixin:
                 command=entry.get("command", "unknown"),
                 owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
                 started_at=entry.get("started_at", time.time()))
-            # detached: can't read output, but can report status + kill
+            # detached: no Popen handle, but can report status + kill; a worker spawn's output log
+            # (and recorded exit) outlives its spawner, so tail it from the start.
+            fields["output_log"] = log
             session = ProcessSession(id=entry["session_id"], detached=True, **fields)
             if recorded_exit is not None:
                 session.pid = None  # a file-backed result has no signalable PID
-            with self._lock:
-                self._running[session.id] = session
+                with self._lock:
+                    self._running[session.id] = session
+            elif session.output_log:
+                self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
+            else:
+                with self._lock:
+                    self._running[session.id] = session
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%s)", session.command[:60], pid)
             # Restore the delivery route even when only the recorded result remains.

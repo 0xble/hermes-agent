@@ -42,21 +42,25 @@ def _rebuild_legacy_icon_tables(conn) -> None:
 
     state_cols = _columns("telegram_topic_icon_state")
     if state_cols and "owner" not in state_cols:
-        conn.executescript("""
+        # executescript would commit the caller's BEGIN IMMEDIATE before the rebuild,
+        # leaving partial schema changes behind if this or a later migration stage fails.
+        conn.execute("""
             CREATE TABLE telegram_topic_icon_state_new (
                 profile_name TEXT NOT NULL DEFAULT 'default', chat_id TEXT NOT NULL,
                 thread_id TEXT NOT NULL, custom_emoji_id TEXT, emoji TEXT,
                 owner TEXT NOT NULL CHECK(owner IN ('auto','manual')), updated_at REAL NOT NULL,
                 PRIMARY KEY (profile_name, chat_id, thread_id)
-            );
+            )
+        """)
+        conn.execute("""
             INSERT INTO telegram_topic_icon_state_new
                 (profile_name, chat_id, thread_id, custom_emoji_id, emoji, owner, updated_at)
             SELECT profile_name, chat_id, thread_id, custom_emoji_id, NULL,
                    CASE WHEN ownership = 'manual' THEN 'manual' ELSE 'auto' END, observed_at
-            FROM telegram_topic_icon_state;
-            DROP TABLE telegram_topic_icon_state;
-            ALTER TABLE telegram_topic_icon_state_new RENAME TO telegram_topic_icon_state;
+            FROM telegram_topic_icon_state
         """)
+        conn.execute("DROP TABLE telegram_topic_icon_state")
+        conn.execute("ALTER TABLE telegram_topic_icon_state_new RENAME TO telegram_topic_icon_state")
     history_cols = _columns("telegram_topic_icon_history")
     if history_cols:
         notnull = {row[1] for row in conn.execute("PRAGMA table_info('telegram_topic_icon_history')") if row[3]}
@@ -341,6 +345,24 @@ class SessionTelegramTopicsMixin:
             (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(thread_id)),
         )
         return dict(row) if row else None
+
+    def resolve_telegram_topic_owner(
+        self, *, chat_id: str, owner_key: str, profile_name: str = "default",
+    ) -> Optional[dict[str, Any]]:
+        """Follow explicit shared-owner redirects, including successive topic merges."""
+        seen = set()
+        while owner_key:
+            if owner_key in seen:
+                raise RuntimeError("Telegram topic owner redirect cycle")
+            seen.add(owner_key)
+            owner = self.get_telegram_topic_owner(
+                chat_id=chat_id, owner_key=owner_key, profile_name=profile_name)
+            if not owner or owner.get("status") != "active":
+                return None
+            if owner.get("thread_id"):
+                return owner
+            owner_key = str(owner.get("canonical_owner_key") or "")
+        return None
 
     def reserve_telegram_topic_owner(
         self, *, chat_id: str, owner_key: str, topic_name: str, profile_name: str = "default",

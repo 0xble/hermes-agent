@@ -749,3 +749,44 @@ def test_the_windows_build_launcher_returns_at_once_when_nothing_was_left(monkey
     events = _run_join_launcher(monkeypatch, stray_polls=0)
     assert [e[0] for e in events if e[0] == "QueryInformationJobObject"] == ["QueryInformationJobObject"]
     assert events[-1] == ("exit", 3), events
+
+
+@pytest.mark.live_system_guard_bypass
+def test_merge_tree_prefetches_both_sides_before_entering_custody(repo, tmp_path, monkeypatch):
+    from hermes_cli import update_custody as custody
+
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "switch", "-c", "candidate")
+    (repo / "candidate.txt").write_text("candidate blob\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "candidate")
+    candidate = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "switch", "main")
+    (repo / "target.txt").write_text("target blob\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "target")
+    target = _git(repo, "rev-parse", "HEAD")
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(origin)], check=True)
+    _git(origin, "config", "uploadpack.allowFilter", "true")
+    _git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+    clone = tmp_path / "partial"
+    subprocess.run(["git", "clone", "-q", "--no-checkout", "--filter=blob:none", f"file://{origin}", str(clone)], check=True)
+    _git(clone, "checkout", "--detach", base)
+    def missing():
+        return [line for line in _git(clone, "rev-list", "--objects", "--missing=print", target, candidate).splitlines() if line.startswith("?")]
+    assert len(missing()) == 2
+    seen = []
+    original = custody.run
+    def observe(argv, **kwargs):
+        sub = custody.git_subcommand(argv[1:])
+        if sub in {"diff", "merge-tree"}:
+            seen.append((sub, kwargs.get("inherit_lock", False), "credential.helper=" in argv))
+        if sub == "merge-tree":
+            assert not missing(), "merge-tree entered lock custody with unfetched blobs"
+        return original(argv, **kwargs)
+    monkeypatch.setattr(custody, "run", observe)
+    merged = custody.run_git(["git"], ["merge-tree", "--write-tree", target, candidate], cwd=clone, capture_output=True, text=True)
+    assert merged.returncode == 0, merged.stderr
+    assert seen == [("diff", False, False), ("diff", False, False), ("merge-tree", True, True)]
+    assert _git(clone, "rev-parse", "HEAD") == base

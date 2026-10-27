@@ -63,6 +63,60 @@ def release_sha(source: Path) -> str:
     return result.stdout.strip()
 
 
+def merge_release_tree(source: Path, target: str, live: str) -> str:
+    """Compute candidate content without creating a synthetic commit or moving HEAD."""
+    from hermes_cli.update_custody import run_git
+
+    def run(args, *, check=True):
+        return run_git(["git"], args, cwd=source, check=check, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+
+    merged = run(["merge-tree", "--write-tree", target, live], check=False)
+    if merged.returncode != 0:
+        detail = (merged.stdout + merged.stderr).strip()
+        raise RuntimeError(f"candidate merge conflict: {detail}" if merged.returncode == 1 else detail)
+    return merged.stdout.splitlines()[0]
+
+
+def merge_release_commits(source: Path, target: str, live: str, *, existing: str | None = None,
+                          tree: str | None = None) -> str:
+    """Build a local-only release commit without moving the checkout or index."""
+    from hermes_cli.update_custody import run_git
+
+    def run(args):
+        return run_git(["git"], args, cwd=source, check=True, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+
+    tree = tree or merge_release_tree(source, target, live)
+    if tree == run(["rev-parse", f"{target}^{{tree}}"]).stdout.strip():
+        return target
+    if existing and tree == run(["rev-parse", f"{existing}^{{tree}}"]).stdout.strip():
+        return existing
+    commit = run(["-c", "user.name=Hermes Update", "-c", "user.email=hermes-update@localhost",
+                  "commit-tree", tree, "-p", target, "-p", live,
+                  "-m", f"Carry installed candidate {live} into update {target}"]).stdout.strip()
+    # Archives work from local objects, but a live synthetic commit must survive
+    # garbage collection even though it belongs to no published branch.
+    run(["update-ref", f"refs/hermes/carry-forward/{commit}", commit])
+    return commit
+
+
+def prune_carry_forward_refs(source: Path, paths: ReleasePaths) -> None:
+    """Retain synthetic objects only for the active and rollback releases."""
+    from hermes_cli.update_custody import run_git
+
+    def run(args):
+        return run_git(["git"], args, cwd=source, check=True, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+
+    keep = {release.name for pointer in (paths.current, paths.previous)
+            if (release := read_pointer(pointer)) is not None}
+    refs = run(["for-each-ref", "--format=%(refname)", "refs/hermes/carry-forward/"])
+    for ref in refs.stdout.splitlines():
+        if ref.rsplit("/", 1)[-1] not in keep:
+            run(["update-ref", "-d", ref])
+
+
 def _content_digest(release: Path) -> str:
     digest = hashlib.sha256()
     for name in ("pyproject.toml", "uv.lock"):
@@ -200,24 +254,27 @@ def _source_install_python(source: Path, home: Path | None = None) -> Path:
     return Path(sys.executable)
 
 
-def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
-    """Infer selected leaf extras from installed direct requirements.
+def _optional_dependencies(project: Path) -> dict[str, list[str]]:
+    """The candidate's declared extras; none for a tree without `pyproject.toml`."""
+    project_file = project / "pyproject.toml"
+    return (tomllib.loads(project_file.read_text(encoding="utf-8-sig"))["project"]
+            .get("optional-dependencies", {}) if project_file.is_file() else {})
 
-    Wheel metadata lists *available*, not selected, extras. A uniquely named
-    installed requirement identifies a partially installed leaf group; groups
-    with all applicable direct requirements installed identify the remainder.
+
+def _leaf_requirements(project: Path) -> dict[str, set[str]]:
+    """Each leaf extra's direct requirements that apply on this host.
+
+    Composite extras are reconstructed from their leaf groups, and an extra with no
+    applicable requirement here (platform-gated off) is absent.
     """
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
     from packaging.markers import default_environment
 
-    project_data = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8-sig"))
-    groups = project_data["project"].get("optional-dependencies", {})
-    installed = set(_active_distributions(source_python))
     declared: dict[str, set[str]] = {}
-    for extra, requirements in groups.items():
+    for extra, requirements in _optional_dependencies(project).items():
         if extra in {"all", "termux", "termux-all"}:
-            continue  # composite extras are reconstructed from their leaf groups
+            continue
         direct = set()
         for raw in requirements:
             req = Requirement(raw)
@@ -227,6 +284,20 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
                 direct.add(canonicalize_name(req.name))
         if direct:
             declared[extra] = direct
+    return declared
+
+
+def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
+    """Infer selected leaf extras from installed direct requirements.
+
+    Wheel metadata lists *available*, not selected, extras. A uniquely named
+    installed requirement identifies a partially installed leaf group; groups
+    with all applicable direct requirements installed identify the remainder.
+    """
+    declared = _leaf_requirements(project)
+    if not declared:
+        return []
+    installed = set(_active_distributions(source_python))
     unique = {name for extra, names in declared.items() for name in names
               if sum(name in other for other in declared.values()) == 1}
     selected = {extra for extra, names in declared.items()
@@ -251,11 +322,21 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
 
 def _build_venv(release: Path, *, uv: str = "uv", extras: Sequence[str] = (),
                 python: Path | None = None) -> None:
-    # PM supplies its pinned Python ABI and locked build engine. The migration-bound
-    # source interpreter can remain 3.11 and is never a candidate build target.
-    from pm import build_environment
-    build_environment(source=release, out=release / ".venv", extras=extras,
-                      env=_release_subprocess_env(release), frozen=True, explicit=True)
+    # The updater's source checkout is frozen. Enter the candidate's PM before
+    # building: its lock may require policy the old updater does not understand.
+    # Bootstrap with the maintained updater, not the possibly older migration
+    # interpreter. Keep the legacy python argument ignored; PM selects its ABI.
+    command = [sys.executable, "-I", "-B", str(release / "pm" / "build_env.py"),
+               "--source", str(release), "--out", str(release / ".venv")]
+    for extra in extras:
+        command.extend(("--extra", extra))
+    result = subprocess.run(command, cwd=release, env=_release_subprocess_env(release),
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+        if "Traceback (most recent call last):" in detail:
+            detail = detail.splitlines()[-1]
+        raise RuntimeError(f"candidate dependency build failed: {detail}")
 
 
 def _active_distributions(python: Path) -> dict[str, str]:
@@ -332,20 +413,82 @@ def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv
 def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv",
                  source: Path | None = None, source_python: Path | None = None) -> tuple[Path, str]:
     """Build at the final release path: venv scripts and metadata are not relocatable."""
+    extras: set[str] = set()
     if source is not None:
         source_python = source_python or _source_install_python(source)
-        extras = _active_locked_extras(source_python, release)
-    else:
-        extras = []
-    _build_venv(release, uv=uv, extras=extras, python=source_python)
+        extras.update(_active_locked_extras(source_python, release))
+    # At first migration nothing is active yet; the source checkout's own committed
+    # environment is what its gateway ran.
+    extras.update(_committed_extras(previous if previous is not None else source, release))
+    _build_venv(release, uv=uv, extras=sorted(extras), python=source_python)
     if source is not None:
         restore_active_distributions(source, release, uv=uv, source_python=source_python)
     return release / ".venv", "built"
 
 
+def _committed_extras(release: Path | None, project: Path) -> set[str]:
+    """Extras `project` declares that `release`'s committed PM environment carries.
+
+    The source interpreter is frozen at first migration. Extras added since
+    (`hermes pm install --extra`, lazy installs) live only in the active
+    release's committed PM environment.
+    """
+    if release is None:
+        return set()
+    from pm.environments import project_python
+    python = project_python(release)
+    inferred = set(_active_locked_extras(python, project)) if python.is_file() else set()
+    return (_recorded_extras(release) & set(_optional_dependencies(project))) | inferred
+
+
+def _recorded_extras(release: Path) -> set[str]:
+    """The extras PM recorded for `release`'s committed environment; none when nothing is committed."""
+    from pm.environments import runtime_facts_path
+    try:
+        data = json.loads(runtime_facts_path(release).read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return set()
+    fact = data.get("packages", {}).get("venv", {})
+    return set(fact.get("extras", [])) if fact.get("environment") else set()
+
+
+def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
+    """Commit into a ready candidate's PM environment the extras the active release carries.
+
+    A ready candidate may come from an older builder: `hermes update` from a release
+    re-enters the source checkout (`main.cmd_update`), which stages with its own frozen
+    code. Committing the missing extras before activation lets the first boot select them
+    instead of lazily installing them into a process that cannot adopt them. Only the
+    candidate's own code carries: PM resolves against the calling tree's lockfile, and
+    the post-swap child imports from the candidate.
+    """
+    from pm.paths import repo_root
+    if previous is None or previous == candidate or repo_root() != candidate.resolve():
+        return []
+    from pm.environments import project_python
+    # Missing means the candidate's boot environment lacks an applicable requirement, so a
+    # recorded extra that is platform-gated off, or already installed, never re-syncs.
+    leaves = _leaf_requirements(candidate)
+    installed = set(_active_distributions(project_python(candidate)))
+    missing = sorted(extra for extra in _committed_extras(previous, candidate)
+                     if extra in leaves and not leaves[extra] <= installed)
+    if missing:
+        import pm
+        from hermes_cli.update_receipt import record_step
+        # An update never fails because of a plugin: evict one that keeps the candidate's
+        # environment from building, as every other update-path sync does.
+        pm.sync_venv(missing, explicit=True, project_root=candidate, evict_incompatible_plugins=True)
+        record_step("immutable_extras_carry", True, f"carried {', '.join(missing)} from {previous}")
+    return missing
+
+
 def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) -> None:
-    """Load enabled plugins with the candidate interpreter before promotion."""
-    python = _release_python(release)
+    """Load enabled plugins with the interpreter the candidate will boot, before promotion.
+
+    That is its committed PM generation when one exists (a carry commits one), else `.venv`.
+    """
+    from pm.environments import project_python
+    python = project_python(release)
     if not python.exists():
         raise RuntimeError(f"candidate interpreter missing: {python}")
     plugin_dir = plugin_dir or home / "plugins"
@@ -500,13 +643,14 @@ def _build_candidate_web(staging: Path) -> None:
 
 def stage_release(source: Path, home: Path, *, sha: str | None = None,
                   uv: str = "uv", plugin_dir: Path | None = None,
-                  source_python: Path | None = None) -> tuple[Path, str]:
+                  source_python: Path | None = None, branch: str | None = None) -> tuple[Path, str]:
     paths = ReleasePaths.for_home(home)
     sha = sha or release_sha(source)
     target = paths.release(sha)
     if target.is_symlink():
         raise RuntimeError(f"release target is a symlink, refusing to follow or replace: {target}")
     if _release_is_ready(target, sha):
+        carry_active_extras(target, read_pointer(paths.current))
         smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
         return target, "existing"
     if target.exists() or target.is_symlink():
@@ -536,6 +680,8 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
                             display_version=identity.display_version if identity else None,
                             distance=identity.distance if identity else None)
         stamp["branch"] = None
+        if branch:
+            stamp["sourceBranch"] = branch
         stamp["commitDate"] = None
         if identity:
             stamp["commitDate"] = identity.commit_date
@@ -605,6 +751,16 @@ def _write_txn(paths: ReleasePaths, record: dict[str, Any]) -> None:
 
 
 def _finish_txn(paths: ReleasePaths, record: dict[str, Any]) -> None:
+    # Prune after pointer verification. Refs only retain synthetic objects, so a
+    # Git or journal failure here must not leave the pointer switch unfinished.
+    journal = paths.home / "release-layout.json"
+    try:
+        if journal.is_file():
+            source = Path(json.loads(journal.read_text(encoding="utf-8-sig"))["source"])
+            if (source / ".git").exists():
+                prune_carry_forward_refs(source, paths)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        print(f"  ! Could not prune carry-forward refs: {exc}", file=sys.stderr)
     # Keep a durable completion identity: after the pending record's final unlink,
     # an immediate CLI --rollback retry must not interpret the newly exchanged
     # previous pointer as a fresh request to roll back the rollback.
@@ -693,20 +849,45 @@ def _verify_transaction(paths: ReleasePaths, record: dict[str, Any]) -> None:
             raise RuntimeError("launchd plist differs from transaction intent")
 
 
-def _runs_hermes_main(argv: list[str], root: Path) -> bool:
+def _runs_hermes_main(argv: list[str], root: Path, *, pythonpath: str = "") -> bool:
     """Is ``argv`` an interpreter entering ``hermes_cli.main`` for exactly ``root``?
 
     Two launch shapes exist: ``python -m hermes_cli.main`` and the generated
     ``python -I -c <bootstrap>`` launcher that launchd services run. The second
     is accepted only when its code equals the bootstrap generated for ``root``,
-    so another tree's or an arbitrary ``-c`` program cannot pass.
+    so another tree's or an arbitrary ``-c`` program cannot pass. Only that
+    isolated bootstrap ignores inherited PYTHONPATH and clears it before
+    importing. PM may export its selected paths again for child processes.
     """
     if argv[1:3] == ["-m", "hermes_cli.main"]:
-        return True
+        return not pythonpath
     if len(argv) < 4:
         return False
     from hermes_cli._launchers import runtime_command
     return argv[1:4] == runtime_command(root, (), module="hermes_cli.main", python=argv[0])[1:4]
+
+
+def _is_intended_gateway(process, root: Path, expected_python: Path) -> bool:
+    """Does ``process`` run the gateway from ``root`` on its expected interpreter?
+
+    A descendant that exits or is a zombie mid-scan is not the gateway; skip it
+    rather than abandoning the scan.
+    """
+    import psutil
+    from gateway.status import looks_like_gateway_command_line
+    try:
+        argv = process.cmdline()
+        # The wrapper embeds the command in its argv. Require the inner
+        # interpreter's entrypoint before applying the canonical parser,
+        # which also accepts a profile selector before `gateway run`.
+        if (not _runs_hermes_main(argv, root) or
+                not looks_like_gateway_command_line(shlex.join(argv))):
+            return False
+        return (Path(process.exe()).resolve() == _interpreter_process_executable(expected_python) and
+                Path(process.cwd()).resolve() == root and
+                _runs_hermes_main(argv, root, pythonpath=process.environ().get("PYTHONPATH", "")))
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
 
 
 def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
@@ -756,23 +937,12 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
             return False
         if gateway_pid is not None and (gateway_pid != os.getpid() or _LOADED_CODE_ROOT != intended_root):
             return False
+        expected_python = (intended_root / ".venv" / "bin" / "python" if
+                           intended_root.parent == paths.releases.resolve() else
+                           Path(record["journal_original"]["source_python"]))
         for process in processes:
-            argv = process.cmdline()
-            # The wrapper embeds the command in its argv. Require the inner
-            # interpreter's entrypoint before applying the canonical parser,
-            # which also accepts a profile selector before `gateway run`.
-            from gateway.status import looks_like_gateway_command_line
-            if (not _runs_hermes_main(argv, intended_root) or
-                    not looks_like_gateway_command_line(shlex.join(argv))):
-                continue
-            executable = Path(process.exe()).resolve()
-            expected_python = (intended_root / ".venv" / "bin" / "python" if
-                               intended_root.parent == paths.releases.resolve() else
-                               Path(record["journal_original"]["source_python"]))
-            if (executable == _interpreter_process_executable(expected_python) and
-                    (gateway_pid is None or _LOADED_CODE_ROOT == intended_root) and
-                    Path(process.cwd()).resolve() == intended_root and
-                    not process.environ().get("PYTHONPATH")):
+            if (_is_intended_gateway(process, intended_root, expected_python) and
+                    (gateway_pid is None or _LOADED_CODE_ROOT == intended_root)):
                 _verify_transaction(paths, record)
                 record["reload_ack"] = {"plist_sha256": plist["intended_sha256"],
                                         "launchd_pid": supervisor_pid,
@@ -1107,7 +1277,7 @@ def _source_python_valid(python: Path, source: Path) -> bool:
 
 
 def source_checkout_python(home: Path, source: Path) -> Path:
-    """Resolve the migration-bound source interpreter for CLI and gateway re-entry."""
+    """Resolve the migration-bound source interpreter without rebuilding it."""
     journal = ReleasePaths.for_home(home).home / "release-layout.json"
     try:
         record = json.loads(journal.read_text(encoding="utf-8-sig"))

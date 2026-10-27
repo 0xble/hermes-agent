@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -52,12 +53,16 @@ async def test_admitted_successor_waits_past_lease_deadline(monkeypatch, tmp_pat
         return "processed once"
 
     runner._handle_message_with_agent = handle
+    before = time.time()
     task = asyncio.create_task(runner._handle_message(event))
     try:
         await asyncio.wait_for(spooled.wait(), HANG_GUARD_SECONDS)
+        receipt = getattr(event, "_attended_activity_received_at", None)
+        assert receipt is not None and before <= receipt <= time.time()
         assert not task.done(), "the admitted message was rejected at the lease deadline"
         assert not executed
         payload = json.loads(event._gateway_lease_wait_spool.read_text())
+        assert payload["data"]["_attended_activity_received_at"] == receipt
         assert payload["data"]["message_id"] == event.message_id
         assert payload["data"]["text"] == event.text
         expected = "same-key generation overlap" if holder_key == "same-key" else "two routing keys"
@@ -281,7 +286,9 @@ async def test_wait_spool_follows_inbound_exit_intent(monkeypatch, tmp_path, exi
 
 
 @pytest.mark.asyncio
-async def test_reconnect_does_not_decline_a_live_durable_lease_wait(monkeypatch, tmp_path):
+@pytest.mark.parametrize("reason", ["turn_lease_wait", "shutdown_follow_up"])
+@pytest.mark.parametrize("reconnect", [False, True])
+async def test_running_durable_followup_retained_only_for_live_lease_wait(monkeypatch, tmp_path, reason, reconnect):
     from gateway.run import _AGENT_PENDING_SENTINEL
     from gateway.run_pending_recovery import _defer_followup
     from tests.gateway.test_stop_pauses_goal_and_holds_wakes import _runner
@@ -291,15 +298,21 @@ async def test_reconnect_does_not_decline_a_live_durable_lease_wait(monkeypatch,
     event = _event()
     event.source = source
     data = shutdown_flush._serialise_value(event)
-    data.update(drain_deferred=True, shutdown_follow_up=True, _recovery_reason="turn_lease_wait")
+    assert data is not None
+    data = shutdown_flush._upgrade_shutdown_follow_up({"reason": reason}, data)
     monkeypatch.setattr("gateway.run_pending_recovery.input_already_durable", lambda *a: True)
     recovered = []
     outcome = _defer_followup(
         runner, {}, source.platform, key, session_id, data, tmp_path / "pending.json",
-        reconnect_recovery=True, recovered_events=recovered,
+        reconnect_recovery=reconnect, recovered_events=recovered,
     )
-    assert outcome is None
-    assert recovered == []
+    if reconnect and reason == "turn_lease_wait":
+        assert outcome is None
+        assert recovered == []
+    else:
+        assert outcome is True
+        assert len(recovered) == 1
+        assert recovered[0]._hermes_recovery_decline_reason == "possibly-duplicate"
 
 
 @pytest.mark.asyncio
@@ -426,8 +439,37 @@ async def test_uncontended_turn_runs_with_null_gateway_config(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [0.001, 0.1])
+async def test_lease_notice_deadline_is_independent_of_preservation_deadline(monkeypatch, timeout):
+    monkeypatch.setattr("gateway.turn_lease.DEFAULT_LEASE_NOTICE_DELAY", 0.01)
+    registry = SessionTurnLeaseRegistry()
+    holder = await registry.acquire("notice", owner_key="old", generation=1)
+    noticed = asyncio.Event()
+    preserve = AsyncMock()
+
+    async def notice_and_release():
+        noticed.set()
+        registry.release(holder)
+
+    task = asyncio.create_task(registry.acquire(
+        "notice", owner_key="new", generation=2, timeout=timeout,
+        on_timeout=preserve, on_wait=notice_and_release,
+    ))
+    try:
+        token = await asyncio.wait_for(task, HANG_GUARD_SECONDS)
+        assert noticed.is_set()
+        assert preserve.await_count == (1 if timeout < 0.01 else 0)
+        registry.release(token)
+    finally:
+        registry.release(holder)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("prior_ack", [False, True])
 async def test_long_lease_wait_sends_one_busy_ack(monkeypatch, tmp_path, prior_ack):
+    from agent.i18n import t
     from tests.gateway.test_stop_pauses_goal_and_holds_wakes import _Adapter
 
     runner = _bootstrap(monkeypatch, tmp_path)
@@ -464,7 +506,11 @@ async def test_long_lease_wait_sends_one_busy_ack(monkeypatch, tmp_path, prior_a
         assert not task.done()
         await lease_wait_notice(runner, key, event)
         assert len(adapter.sent) == 1
-        assert adapter.sent[0] == ("Already queued" if prior_ack else "Queued behind the previous turn.")
+        assert adapter.sent[0] == ("Already queued" if prior_ack else
+                                   t("gateway.busy.ack", head=t("gateway.busy.queued_head"), detail="",
+                                     tail=t("gateway.busy.queued_tail")))
+        if not prior_ack and adapter.sent[0].startswith("⏳ Queued"):
+            assert adapter.sent[0] == "⏳ Queued for the next turn. I'll respond once the current task finishes."
         runner._turn_leases.release(holder)
         await asyncio.wait_for(task, HANG_GUARD_SECONDS)
     finally:

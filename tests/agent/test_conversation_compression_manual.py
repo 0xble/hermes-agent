@@ -200,6 +200,28 @@ def test_in_place_here_n_stores_the_kept_exchanges(session_db):
     assert _live(session_db.get_messages_as_conversation("sid")) == _live(next_turn)
 
 
+@pytest.mark.parametrize("row_ids", [False, True])
+def test_here_n_preserves_a_rewritten_tail_original_in_display(session_db, row_ids):
+    """A summary folded into the head's oldest tail row does not replace that row verbatim.
+
+    Warm and row-addressed resumed histories both keep the original reply visible when UID
+    folding selects its composite carrier. Model replay still keeps the synthetic summary.
+    """
+    history = [{"role": role, "content": f"{role} {i}: " + ("reply " * 2000 if role == "assistant" else "question").rstrip()}
+               for i in range(6) for role in ("user", "assistant")]
+    agent, _ = _stored_agent(session_db, history)
+    loaded = session_db.get_messages_as_conversation("sid", include_row_ids=row_ids)
+    try:
+        result = _compress_here(agent, loaded, 1)
+        assert result.status == "compressed"
+        model, display = session_db.get_resume_conversations("sid")
+        assert _live(model) == _live(result.after_messages)
+        for original in history:
+            assert _live(display).count((original["role"], original["content"])) == 1
+    finally:
+        agent.close()
+
+
 def test_rotated_here_n_publishes_the_kept_exchanges(session_db):
     """Rotation publishes the child atomically and the gateway no longer rewrites it, so the handoff itself must
     carry the kept tail: a head-only child loses the exchanges the user asked to keep on the next resume."""

@@ -22,11 +22,13 @@ _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
 def parse_duration_seconds(value: str) -> Optional[float]:
-    """Parse ``5h`` / ``30m`` / ``2d`` / ``1w`` / ``90`` (bare = days, backward compatible with
+    """Parse ``5h`` / ``30m`` / ``1h30m`` / ``2d`` / ``1w`` / ``90`` (bare = days, backward compatible with
     ``--older-than 90``) into seconds. Returns None when the value doesn't look like a duration."""
     s = str(value).strip().lower()
     if re.fullmatch(r"\d+(?:\.\d+)?", s):
         return float(s) * 86400
+    if re.fullmatch(r"(?:\d+(?:\.\d+)?[smhdw]){2,}", s):
+        return sum(parse_duration_seconds(part) or 0 for part in re.findall(r"\d+(?:\.\d+)?[smhdw]", s))
     m = _DURATION_RE.match(s)
     return None if not m else float(m.group(1)) * _UNIT_SECONDS[m.group(2)[0]]
 

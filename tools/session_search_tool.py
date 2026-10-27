@@ -10,10 +10,11 @@ No LLM calls — every shape returns actual DB messages.
 
 import json
 import logging
+import sqlite3
 import re
 import time
 from datetime import datetime, timezone, UTC
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from hermes_state_common import _BOUNDARY_END_REASONS
 from hermes_time import safe_strftime
@@ -57,9 +58,11 @@ _FRESH_RESET_END_REASONS = _BOUNDARY_END_REASONS
 
 
 def _quiet(fn, default, msg, *log_args, with_exc: bool = False):
-    """``fn()``, or *default* after debug-logging *msg* (+ the exception when *with_exc*)."""
+    """Best-effort ancillary call. Database failures must reach the agent, not become missing data."""
     try:
         return fn()
+    except sqlite3.Error:
+        raise
     except Exception as e:
         logging.debug(msg, *(log_args + (e,) if with_exc else log_args), exc_info=True)
         return default
@@ -70,6 +73,8 @@ def _loud(fn, log_msg, error_prefix, *log_args):
     calls whose failure the model must see."""
     try:
         return fn(), None
+    except sqlite3.Error:
+        raise
     except Exception as e:
         logging.error(log_msg, *log_args, e, exc_info=True)
         return None, tool_error(f"{error_prefix}: {e}", success=False)
@@ -213,11 +218,9 @@ def _session_left_live_context(db, session_id: str) -> bool:
 
 
 def _get_message_storage_state(db, message_id) -> Optional[dict[str, Any]]:
-    """Owning session and visibility flags for *message_id* (None if missing/error)."""
+    """Owning session and visibility flags (None if absent, database errors propagate)."""
     def _lookup():
-        with db._lock:
-            return db._conn.execute(
-                "SELECT session_id, active, compacted FROM messages WHERE id = ?", (message_id,)).fetchone()
+        return db._read_one("SELECT session_id, active, compacted FROM messages WHERE id = ?", (message_id,))
     row = message_id and _quiet(_lookup, None, "message storage-state lookup failed for %s", message_id)
     return dict(row) if row else None
 
@@ -332,6 +335,8 @@ def _hydrate_hit(db, lineage_root: str, match_info: dict[str, Any], result_detai
     hit_sid, msg_id = match_info.get("session_id") or lineage_root, match_info.get("id")
     try:
         view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
+    except sqlite3.Error:
+        raise
     except Exception as e:
         logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
         return None
@@ -575,49 +580,61 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
               "means you've hit that end of the session."), **extra)
 
 
+def _open_current_db():
+    """Open recall's existing database without initializing canonical storage."""
+    from hermes_constants import get_hermes_home
+    from hermes_state import SessionDB
+    return SessionDB(db_path=get_hermes_home() / "state.db", read_only=True)
+
+
 def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
-              around_message_id, window, sort, profile, detail, owned_dbs,
+              around_message_id, window, sort, profile, detail,
               after=None, before=None, exclude_session_ids=None) -> str:
-    """Mode dispatch (see module docstring); scroll wins when an anchor is set.
-    Profile DBs opened here are appended to *owned_dbs* for the caller to close."""
-    # A raw `@session:<profile>/<id>` link as session_id: ids never contain "/", so
-    # split on it and adopt the embedded profile only when none was passed.
-    if isinstance(session_id, str) and "/" in session_id:
-        emb_profile, _, emb_id = session_id.partition("/")
-        if emb_id:
-            session_id = emb_id
-            if emb_profile and (profile is None or not str(profile).strip()):
-                profile = emb_profile
-    # Cross-profile: swap in the named profile's DB (read-only) for every shape;
-    # current-lineage guards key off ids that won't collide, so they stay inert.
-    try:
-        profile_db = _resolve_profile_db(profile)
-    except Exception as e:
-        return tool_error(f"profile '{profile}': {e}", success=False)
-    if profile_db is not None:
-        db, current_session_id = profile_db, None
-        owned_dbs.append(profile_db)
-    if isinstance(session_id, str) and session_id.strip():
-        if around_message_id is not None:
-            return _scroll(db, session_id.strip(), around_message_id, window, current_session_id)
-        return _read_scoped(db, session_id.strip(), profile)
-    limit = _clamp_int(limit, 3, 1, 10)
-    if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
-    sort_norm = sort.strip().lower() if isinstance(sort, str) else None
-    try:
-        after_ts, before_ts = _parse_iso_bound(after), _parse_iso_bound(before)
-    except ValueError as e:
-        return tool_error(str(e), success=False)
-    return _discover(
-        db=db, query=query.strip(), limit=limit, sort=sort_norm if sort_norm in ("newest", "oldest") else None,
-        role_filter=([r.strip() for r in role_filter.split(",") if r.strip()] or None) if isinstance(role_filter, str) else None,
-        detail="full" if isinstance(detail, str) and detail.strip().lower() == "full" else "adaptive",
-        current_session_id=current_session_id, link_profile=profile, after_ts=after_ts, before_ts=before_ts,
-        exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids))
+    """Mode dispatch inside one independent-reader scope; scroll wins with an anchor."""
+    from contextlib import nullcontext
+    from hermes_state import SessionDB
+    from hermes_state_search_runtime import search_operation, search_stage
+
+    after_ts = before_ts = None
+    if not (isinstance(session_id, str) and session_id.strip()) and isinstance(query, str) and query.strip():
+        try:
+            after_ts, before_ts = _parse_iso_bound(after), _parse_iso_bound(before)
+        except ValueError as e:
+            return tool_error(str(e), success=False)
+    filters = dict(role_filter=role_filter, after=after, before=before,
+                   exclude_session_ids=exclude_session_ids, detail=detail, limit=limit)
+    discovery_query = "" if isinstance(session_id, str) and session_id.strip() else query
+    scope = (search_operation(db, caller="session_search tool", query=discovery_query, sort=sort, filters=filters)
+             if isinstance(db, SessionDB) else nullcontext())
+    with scope as operation:
+        with search_stage(db, "hydration_ms"):
+            if isinstance(session_id, str) and session_id.strip():
+                mode = "scroll" if around_message_id is not None else "read"
+                if operation is not None:
+                    operation.path = mode
+                result = (_scroll(db, session_id.strip(), around_message_id, window, current_session_id)
+                          if mode == "scroll" else _read_scoped(db, session_id.strip(), profile))
+            elif not query or not isinstance(query, str) or not query.strip():
+                if operation is not None:
+                    operation.path = "browse"
+                result = _list_recent_sessions(db, _clamp_int(limit, 3, 1, 10), current_session_id, link_profile=profile)
+            else:
+                sort_norm = sort.strip().lower() if isinstance(sort, str) else None
+                return _discover(
+                    db=db, query=query.strip(), limit=_clamp_int(limit, 3, 1, 10),
+                    sort=sort_norm if sort_norm in ("newest", "oldest") else None,
+                    role_filter=([r.strip() for r in role_filter.split(",") if r.strip()] or None) if isinstance(role_filter, str) else None,
+                    detail="full" if isinstance(detail, str) and detail.strip().lower() == "full" else "adaptive",
+                    current_session_id=current_session_id, link_profile=profile, after_ts=after_ts, before_ts=before_ts,
+                    exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids))
+            if operation is not None:
+                payload = json.loads(result)
+                if payload.get("success"):
+                    operation.rows = payload.get("count", payload.get("message_count", len(payload.get("messages", []))))
+            return result
 
 
-def _shape_session_links(raw_result: str, platform: str = None) -> str:
+def _shape_session_links(raw_result: str, platform: str | None = None) -> str:
     """Only Desktop can render the internal references in session-search results."""
     surface = str(getattr(platform, "value", platform) or "").strip().lower()
     if not surface or surface == "desktop":
@@ -637,29 +654,64 @@ def _shape_session_links(raw_result: str, platform: str = None) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=None,
-                   current_session_id: str = None, session_id: str = None, around_message_id: int = None,
-                   window: int = 5, sort: str = None, profile: str = None, detail: str = "adaptive",
-                   after: str = None, before: str = None, exclude_session_ids: Optional[List[str]] = None,
-                   platform: str = None) -> str:
+def session_search(query: str = "", role_filter: str | None = None, limit: int = 3, db=None,
+                   current_session_id: str | None = None, session_id: str | None = None,
+                   around_message_id: int | None = None, window: int = 5, sort: str | None = None,
+                   profile: str | None = None, detail: str = "adaptive", after: str | None = None,
+                   before: str | None = None, exclude_session_ids: list[str] | None = None,
+                   platform: str | None = None) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
     from hermes_state import format_session_db_unavailable
-    from hermes_state_registry import acquire, release_or_close
+    from hermes_state_registry import release_or_close
     owned_dbs: list[Any] = []
+    # A raw `@session:<profile>/<id>` link as session_id: ids never contain "/", so
+    # split on it and adopt the embedded profile only when none was passed.
+    if isinstance(session_id, str) and "/" in session_id:
+        emb_profile, _, emb_id = session_id.partition("/")
+        if emb_id:
+            session_id = emb_id
+            if emb_profile and (profile is None or not str(profile).strip()):
+                profile = emb_profile
+    # Cross-profile: swap in the named profile's DB (read-only) for every shape;
+    # current-lineage guards key off ids that won't collide, so they stay inert.
+    try:
+        profile_db = _resolve_profile_db(profile)
+    except Exception as e:
+        logging.debug("session_search: cannot open profile %r", profile, exc_info=True)
+        return tool_error(f"profile '{profile}': {e}", success=False)
+    if profile_db is not None:
+        db, current_session_id = profile_db, None
+        owned_dbs.append(profile_db)
+    # A managed worker's handle is a RuntimeSessionStore: it mirrors the owner's write and lineage
+    # surface, not the FTS read API, and every read is an owner RPC. Handing it here made recall in a
+    # worker fail with `'RuntimeSessionStore' object has no attribute 'search_messages'` (#141705), so
+    # recall opens its own read-only handle — the same one the no-db path below uses.
+    from agent.runtime_session_store import RuntimeSessionStore
+    if isinstance(db, RuntimeSessionStore):
+        db = None
     if db is None:
-        db = _quiet(acquire, None, "SessionDB unavailable for session_search")
+        try:
+            db = _quiet(_open_current_db, None, "SessionDB unavailable for session_search")
+        except sqlite3.Error:
+            return tool_error(format_session_db_unavailable(), success=False)
         if db is None:
             return tool_error(format_session_db_unavailable(), success=False)
         owned_dbs.append(db)
     try:
         result = _dispatch(query, role_filter, limit, db, current_session_id, session_id,
-                           around_message_id, window, sort, profile, detail, owned_dbs,
+                           around_message_id, window, sort, profile, detail,
                            after=after, before=before, exclude_session_ids=exclude_session_ids)
         return _shape_session_links(result, platform)
+    except sqlite3.Error as exc:
+        return tool_error(f"Search failed: {exc}", success=False)
     finally:
         for owned_db in reversed(owned_dbs):
-            _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
+            # Cleanup must not discard a finished result: _quiet re-raises sqlite errors for reads.
+            try:
+                release_or_close(owned_db)
+            except Exception:
+                logging.debug("Failed to close session_search SessionDB", exc_info=True)
 
 
 def check_session_search_requirements() -> bool:

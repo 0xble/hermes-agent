@@ -4,6 +4,7 @@ import concurrent.futures
 import contextvars
 import logging
 import time
+from pathlib import Path
 
 logger = logging.getLogger("cron.scheduler")
 
@@ -27,12 +28,28 @@ def _open_cron_session_db(job: dict):
     _session_db_timeout = _get_session_db_timeout()
     attempts = _CRON_SESSION_DB_ATTEMPTS if _session_db_timeout > 0 else 1
     last_error = None
-    from hermes_state_registry import acquire
+    from hermes_state_registry import acquire, release_or_close
+    from gateway.session_cron import current_execution
+
+    owner = current_execution()
+    from agent.runtime_session_store import WorkerPersistenceError, is_worker_process
+    if owner is None and is_worker_process():
+        # Worker assignments must bind their canonical owner store before running billed inference.
+        raise WorkerPersistenceError("worker_cron_registration_required")
+
+    def acquire_store():
+        if owner is None:
+            return acquire()
+        db = acquire(Path(owner[0].db.db_path))
+        if db is not owner[0].db:
+            release_or_close(db)
+            raise RuntimeError("cron requires the canonical owner store")
+        return db
 
     for attempt in range(1, attempts + 1):
         try:
             if _session_db_timeout <= 0:
-                handle = acquire()
+                handle = acquire_store()
                 if handle is not None:
                     return handle
                 break
@@ -41,7 +58,7 @@ def _open_cron_session_db(job: dict):
             # instead of the process-global default.
             _session_db_context = contextvars.copy_context()
             _session_db_future = _session_db_pool.submit(
-                _session_db_context.run, acquire
+                _session_db_context.run, acquire_store
             )
             try:
                 handle = _session_db_future.result(timeout=_session_db_timeout)

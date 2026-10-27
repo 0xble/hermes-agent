@@ -103,10 +103,14 @@ async def test_serve_timer_runs_due_curator_once_and_honors_pause(tmp_path, monk
         finally:
             with gateway._sessions_lock:
                 gateway._sessions.pop('maintenance-test', None)
-        async with asyncio.timeout(8):
-            while load_state()["run_count"] == 0:
-                await asyncio.sleep(.02)
-        await asyncio.sleep(.15)
+        # run_count is persisted before the background report finishes.
+        # Wait for the completed summary, as the sibling idle-watermark test does.
+        from tests.waiting import async_wait_until
+
+        await async_wait_until(
+            lambda: "consolidation off" in (load_state().get("last_run_summary") or ""),
+            timeout=8, what="curator consolidation-off summary",
+        )
         state = json.loads((tmp_path / "skills" / ".curator_state").read_text())
         assert state["run_count"] == 1
         assert "consolidation off" in state["last_run_summary"]

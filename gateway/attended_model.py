@@ -255,14 +255,17 @@ def _stamp_seconds(value: Any) -> Optional[float]:
         return None
 
 
-def is_active(last_user_activity_at: Any, *, now: Optional[float], idle_revert_minutes: float, pinned: bool = False) -> bool:
-    if pinned:
-        return True
-    stamp = _stamp_seconds(last_user_activity_at)
-    if stamp is None:
-        return False
+def pin_is_active(pinned: bool, pin_until: Optional[float], *, now: float) -> bool:
+    return pinned and (pin_until is None or now < pin_until)
+
+
+def is_active(last_user_activity_at: Any, *, now: Optional[float], idle_revert_minutes: float,
+              pinned: bool = False, pin_until: Optional[float] = None) -> bool:
     clock = float(time.time() if now is None else now)
-    return 0 <= clock - stamp < idle_revert_minutes * 60.0
+    if pin_is_active(pinned, pin_until, now=clock):
+        return True
+    deadline = expiry_time(last_user_activity_at, idle_revert_minutes, pinned=pinned, pin_until=pin_until)
+    return deadline is not None and 0 < deadline - clock <= idle_revert_minutes * 60.0
 
 
 def _effort_label(value: Any) -> str | dict[str, Any]:
@@ -314,7 +317,7 @@ def resolve_attended_model(
             role_route = None
     # An invalid hold has an explicit default fallback, not automatic attended routing.
     active = not (model_role and role_route is None) and cfg.enabled and (new_session or is_active(
-        get("last_user_activity_at"), now=now_value, idle_revert_minutes=cfg.idle_revert_minutes, pinned=get("attended_pinned") is True
+        get("last_user_activity_at"), now=now_value, idle_revert_minutes=cfg.idle_revert_minutes, pinned=get("attended_pinned") is True, pin_until=get("attended_pin_until")
     ))
 
     explicit_model = (
@@ -357,7 +360,7 @@ def resolve_attended_model(
             or _effort_label(get("attended_reasoning")) or default_reasoning
         )
         return AttendedResolution(
-            model, provider, effort, "attended", True, idle_model="" if get("attended_pinned") is True else channel_model or default_model,
+            model, provider, effort, "attended", True, idle_model="" if pin_is_active(get("attended_pinned") is True, get("attended_pin_until"), now=now_value) else channel_model or default_model,
             new_session=new_session,
         )
 
@@ -370,6 +373,12 @@ def resolve_attended_model(
 def is_genuine_user_message(event: Any) -> bool:
     """Return true only for a human message that should reset attended idle time."""
     if event is None or bool(getattr(event, "internal", False)):
+        return False
+    if bool(getattr(getattr(event, "source", None), "is_bot", False)):
+        return False
+    # Recovery is not arrival. A legacy spool's ordering/flush time is not a receipt.
+    if (getattr(event, "_hermes_recovered_followup", False)
+            and getattr(event, "_attended_activity_received_at", None) is None):
         return False
     metadata = getattr(event, "metadata", None) or {}
     if not isinstance(metadata, Mapping):
@@ -386,6 +395,10 @@ def is_genuine_user_message(event: Any) -> bool:
     if _RELAY_HEADER_RE.search(text):
         return False
     stripped = text.lstrip()
+    # /attend owns idle timing. Inspections and rejected durations must not extend it.
+    get_command = getattr(event, "get_command", None)
+    if callable(get_command) and get_command() == "attend":
+        return False
     if stripped.startswith(_AUTOMATION_PREFIXES):
         return False
     if any(line.lstrip().startswith(_AUTOMATION_LINE_MARKERS) for line in text.splitlines()):
@@ -430,8 +443,12 @@ def attended_request_context_too_large(agent, loop_state, *, model, runtime) -> 
         return False
 
 
-def expiry_time(last_user_activity_at: Any, idle_revert_minutes: float, *, pinned: bool = False) -> Optional[float]:
-    if pinned:
+def expiry_time(last_user_activity_at: Any, idle_revert_minutes: float, *, pinned: bool = False,
+                pin_until: Optional[float] = None) -> Optional[float]:
+    if pinned and pin_until is None:
         return None
     stamp = _stamp_seconds(last_user_activity_at)
+    if pinned and pin_until is not None:
+        # Expiry acts like /attend off at the deadline, not at the next read.
+        stamp = max(stamp, pin_until) if stamp is not None else pin_until
     return None if stamp is None else stamp + idle_revert_minutes * 60.0

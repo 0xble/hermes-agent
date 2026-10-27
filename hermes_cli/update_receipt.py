@@ -161,7 +161,9 @@ class UpdateReceipt:
         # action-status route certifies an outcome only from a receipt naming ITS action.
         self.data["action_id"] = os.environ.get("HERMES_ACTION_ID", "").strip() or None
 
-    def step(self, name: str, ok: bool, detail: str = "") -> None:
+    def step(self, name: str, ok: bool, detail: str = "", *, replace: bool = False) -> None:
+        if replace:
+            self.data["steps"] = [step for step in self.data["steps"] if step.get("name") != name]
         self.data["steps"].append({"name": name, "ok": bool(ok), "detail": detail, "at": _utc_now_iso()})
 
     def skip(self, name: str, reason: str) -> None:
@@ -385,8 +387,9 @@ def begin_update_receipt(*, previous: dict | None = None, correlation_id: str | 
                 rows = list((prior.get("plan") or {}).get("runtimes") or [])
                 rows += list(prior.get("pending_manual_serves") or [])
                 rows += list(prior.get("carried_manual_serves") or [])  # a run killed before finalize
-                receipt.data["carried_manual_serves"] = [
-                    row for row in rows if isinstance(row, dict) and row.get("supervisor") == "manual-serve"]
+                from hermes_cli.update_serve_obligations import is_reminder_row
+
+                receipt.data["carried_manual_serves"] = [row for row in rows if is_reminder_row(row)]
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not start update receipt: %s", exc)
         return
@@ -495,9 +498,9 @@ def _record(method: str, what: str, *args: Any, **kwargs: Any) -> None:
         logger.debug("Could not record %s: %s", what, exc)
 
 
-def record_step(name: str, ok: bool, detail: str = "") -> None:
-    """Record one update step outcome. No-op when no receipt is active."""
-    _record("step", f"update step {name}", name, ok, detail)
+def record_step(name: str, ok: bool, detail: str = "", *, replace: bool = False) -> None:
+    """Record a step, optionally replacing earlier states of the same named step."""
+    _record("step", f"update step {name}", name, ok, detail, replace=replace)
 
 
 def record_release_transition(*, from_sha: str | None, to_sha: str, from_path: str | None,
@@ -645,6 +648,12 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason
     current = _current.get()
     if current is None:
         return None
+    # Inner failure handlers and the command-boundary safety net share this close.
+    # Persist any still-pending autostash before the receipt becomes immutable.
+    with suppress(Exception):
+        from hermes_cli.update_cmd_stash import _record_pending_autostash
+        _record_pending_autostash()
+    current = _current.get() or current
     receipt = copy.copy(current)
     receipt.data = copy.deepcopy(current.data)
     token = getattr(receipt, "current_token", None)

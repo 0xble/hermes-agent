@@ -48,16 +48,20 @@ def _db():
 # never saw.
 REPLACEMENT_MAX_CHARS = 1500
 
+# Quoted and approved replacements preserve omitted contract fields, additive subgoals
+# and the existing turn budget. Plugins use this semantic capability, not signatures alone.
+PRESERVES_GOAL_REPLACEMENT_REQUIREMENTS = True
+
 
 _REPLACE_PAYLOAD_KEYS = frozenset({"goal", "contract", "max_turns"})
 
 
 def replacement_contract(payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    """The contract a replacement installs (missing fields are empty: the old contract is dropped)."""
+    """Explicit replacement contract edits. Omitted fields retain their current values."""
     from hermes_cli.goals import _CONTRACT_FIELDS
     raw = (payload or {}).get("contract")
     raw = raw.to_dict() if hasattr(raw, "to_dict") else dict(raw or {})
-    return {f: str(raw.get(f) or "").strip() for f in _CONTRACT_FIELDS}
+    return {f: str(raw[f] or "").strip() for f in _CONTRACT_FIELDS if f in raw}
 
 
 def _check_payload(kind: str, action: str, payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -208,8 +212,8 @@ def _message_grants_authority(source: str) -> bool:
     return not any(w in _NEGATION_TOKENS or w in _QUALIFIER_TOKENS for w in words)
 
 
-def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
-    """Validate a quote against only the requester's latest typed user message."""
+def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> tuple[str, str] | str:
+    """Bind a verbatim quote to current typed input before applying action-specific authority."""
     normalized = _normalize(quote)
     if len(normalized) < _REVISION_QUOTE_MIN_CHARS:
         return "user_quote_too_short"
@@ -221,6 +225,7 @@ def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> T
         rows = db.messages_by_role(requester_session_id, "user", since=0.0, limit=500, cursor=cursor,
                                    current_only=True)
     except Exception:
+        logger.debug("current user quote lookup failed", exc_info=True)
         return "user_quote_not_found"
     latest = next((row for row in rows if _is_user_typed(row)), None)
     if latest is None:
@@ -233,6 +238,7 @@ def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> T
     except ValueError:
         raise
     except Exception:
+        logger.debug("current user quote provenance unavailable", exc_info=True)
         return "user_quote_not_found"
     # The gateway reply pointer repeats the assistant's words; only the user's own text authorizes.
     # Its end is ambiguous when the quoted words themselves contain the closing marker, and then
@@ -246,6 +252,16 @@ def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> T
         return "user_message_too_long"
     if normalized not in source:
         return "user_quote_not_found"
+    return normalized, stripped
+
+
+def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
+    """Validate a quote against only the requester's latest typed user message."""
+    checked = _read_current_user_quote(requester_session_id, quote, cursor=cursor)
+    if isinstance(checked, str):
+        return checked
+    normalized, stripped = checked
+    source = _normalize(stripped)
     if _is_negated(normalized, source):
         return "user_quote_negated"
     # Authority comes from the user's instruction in its full context, never a trimmed substring:
@@ -421,7 +437,7 @@ def _quote_matches_control(kind: str, action: str, target_sid: str, requester_si
         if (not contract.stop_when
                 and stop_condition_only(load_goal(target_sid, cursor=cursor),
                                         goal=str(edit.get("goal") or "").strip(),
-                                        contract=contract, max_turns=edit.get("max_turns"))):
+                                        contract=edit.get("contract"), max_turns=edit.get("max_turns"))):
             return True
     if kind == "goal" and action == "replace":
         link = next((n for n, w in enumerate(all_words) if w in _REPLACE_LINKS), len(all_words))
@@ -478,7 +494,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                 goal=str(payload.get("goal") or ""),
                 max_turns=payload.get("max_turns"),
                 contract=payload.get("contract"),
-                actor="user",
+                actor="agent" if (authority or {}).get("via") == "autonomy" else "user",
                 user_quote=str((authority or {}).get("quote") or ""),
             )
         continuation_prompt = manager.next_continuation_prompt() if result.get("ok") else None
@@ -492,7 +508,8 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
                     "state": manager.state}
-        result = manager.resume()
+        autonomous = (authority or {}).get("via") == "autonomy"
+        result = manager.resume(reset_budget=not autonomous, user_override=not autonomous)
         if result is None:
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
@@ -988,7 +1005,11 @@ def _goal_replace_failure(target_sid: str, *, cursor=None) -> Optional[dict[str,
 
 def request_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
                     reason: str = "", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Create a durable, 24-hour pending approval request."""
+    """Create a pending request, or apply an autonomous goal control immediately."""
+    from hermes_cli.goals_autonomy import goal_autonomy_enabled
+    if kind == "goal" and goal_autonomy_enabled():
+        return apply_control(kind, action, target_sid, requester_sid=requester_sid,
+                             reason=reason, payload=payload)
     if (kind, action) not in CONTROLS:
         raise ValueError("unsupported_control")
     payload = _check_payload(kind, action, payload)
@@ -1034,6 +1055,10 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     """
     if (kind, action) not in CONTROLS:
         return {"ok": False, "error_code": "unsupported_control"}
+    from hermes_cli.goals_autonomy import goal_autonomy_enabled
+    autonomous_goal = kind == "goal" and goal_autonomy_enabled()
+    if autonomous_goal and action == "clear":
+        return {"ok": False, "error_code": "user_only", "error": "Only the user can clear a goal with /goal clear"}
     try:
         payload = _check_payload(kind, action, payload)
         target_sid = resolve_target(target_sid)
@@ -1085,6 +1110,28 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         _save_record(record, cursor=conn)
         return {"ok": not bool(code), "status": record["status"], "record": record,
                 **({"error_code": code, "error": code} if code else {}), **result}
+
+    if autonomous_goal:
+        # No route/approval requirement: goal writes use the same transaction and wake receipt.
+        # Replacement is an agent edit, so every existing requirement still binds.
+        def apply_autonomous(conn):
+            authority = {"via": "autonomy", "session_id": str(requester_sid), "quote": user_quote}
+            if action == "pause" and user_quote:
+                # Only a still-current user instruction may suspend automatic waking.
+                checked = check_user_quote(requester_sid, user_quote, cursor=conn)
+                if not isinstance(checked, str) and _quote_matches_control(
+                    kind, action, target_sid, requester_sid,
+                    _governing_sentence(*checked), payload, cursor=conn,
+                ):
+                    quote, message = checked
+                    authority = {"via": "quote", "quote": quote, "message": message}
+            return commit(conn, authority, "session_control_autonomy")
+
+        try:
+            return _db()._execute_write(apply_autonomous)
+        except Exception as exc:
+            logger.warning("autonomous goal control failed", exc_info=True)
+            return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
 
     # Cross-session goal clear/replace without a quote is intentionally non-blocking and does not
     # require a Telegram route. A supplied quote remains subject to the normal safety checks, so a
@@ -1334,8 +1381,20 @@ def mark_outbox(request_id: str, flag: str, value: Any = True) -> Optional[Dict[
     return db._execute_write(_mark)
 
 
+def _pause_goal(sid, reason, payload, authority, cursor=None):
+    from hermes_cli.goals import GoalManager
+
+    manager = GoalManager(sid, cursor=cursor)
+    if authority.get("via") == "autonomy":
+        if not manager.is_active():
+            return None
+        return manager.wait_for_seconds(manager._autonomy_wait_seconds(),
+                                        reason=reason or "session-control")
+    return manager.pause(reason=reason or "session-control")
+
+
 CONTROLS = {
-    ("goal", "pause"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).pause(reason=reason or "session-control"),
+    ("goal", "pause"): _pause_goal,
     ("goal", "resume"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).resume(),
     ("goal", "clear"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).clear(),
     ("loop", "pause"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid, cursor=cursor).pause(reason=reason or "session-control"),

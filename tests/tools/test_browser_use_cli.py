@@ -11,6 +11,7 @@ Covers the three seams the integration relies on:
 * ``browser_exec`` execution — code is piped on stdin, ``session`` becomes
   ``BU_NAME``, bad session names and a missing CLI produce actionable errors.
 """
+import ipaddress
 import json
 import os
 import socket
@@ -1298,13 +1299,15 @@ class TestExecHybridPrivateUrlRouting:
         monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: object())
         monkeypatch.setattr(bt_cloud, "_auto_local_for_private_urls", lambda: True)
         monkeypatch.setattr(bu_cli, "_exec_route_is_sidecar", {}, raising=False)
-        monkeypatch.setattr(bu_cli, "_driven_daemons", set())
+        monkeypatch.setattr(bu_cli, "_driven_daemons", {})
         self.cloud_keys = []
         monkeypatch.setattr(bt_session, "_get_session_info",
                             lambda key: self.cloud_keys.append(key) or {"cdp_url": "wss://cloud.example/x"})
         cli = _fake_cli(tmp_path, 'cat >/dev/null; printf "%s" "${BU_NAME:-default}"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         self.local_keys = _fake_managed_chromium
+        # Public/private routing must not depend on the host resolver or VPN.
+        self._dns(monkeypatch, "93.184.216.34", "93.184.216.34")
 
     @staticmethod
     def _dns(monkeypatch, first_ip, later_ip):
@@ -1312,6 +1315,15 @@ class TestExecHybridPrivateUrlRouting:
         lookups = []
 
         def fake_getaddrinfo(host, *a, **kw):
+            try:
+                literal = ipaddress.ip_address(host)
+            except ValueError:
+                pass
+            else:
+                # Numeric hosts retain their identity and do not consume DNS rebinding answers.
+                if literal.version == 4:
+                    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (str(literal), 0))]
+                return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (str(literal), 0, 0, 0))]
             lookups.append(host)
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (first_ip if len(lookups) == 1 else later_ip, 0))]
 

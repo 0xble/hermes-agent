@@ -46,8 +46,8 @@ def store(tmp_path, monkeypatch):
 def _make_source() -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
-        user_id="170829464",
-        chat_id="170829464",
+        user_id="17082946",
+        chat_id="17082946",
         chat_type="dm",
         thread_id="544520",
     )
@@ -122,7 +122,7 @@ class TestBranchRoutingColumns:
         # THIS is the bug: without the fix, these are all None, because
         # create_session() at branch time never received them — only the
         # (now-crashed) switch_session() call would have backfilled them.
-        assert row["chat_id"] == "170829464", (
+        assert row["chat_id"] == "17082946", (
             "branched session lost chat_id — unroutable if a crash lands "
             "between create_session() and switch_session()"
         )
@@ -130,7 +130,7 @@ class TestBranchRoutingColumns:
         assert row["thread_id"] == "544520"
         # user_id and session_key are also required for the fallback lookup
         # path (hermes_state.py:1994-2009) when session_key-based lookup fails
-        assert row["user_id"] == "170829464", (
+        assert row["user_id"] == "17082946", (
             "branched session lost user_id — fallback peer-tuple lookup "
             "in find_latest_gateway_session_for_peer can never match"
         )
@@ -139,7 +139,7 @@ class TestBranchRoutingColumns:
         )
         # origin_json completes the identity (#82633 reset-path pattern):
         # consumers reading routing/presentation data from state.db
-        # (mcp_serve, mirror, channel directory) need the full origin on
+        # (the mcp-serve plugin, mirror, channel directory) need the full origin on
         # the branch row without waiting for any backfill.
         assert row["origin_json"], (
             "branched session lost origin_json — state.db consumers see an "
@@ -148,7 +148,7 @@ class TestBranchRoutingColumns:
         import json as _json
 
         origin = _json.loads(row["origin_json"])
-        assert origin.get("chat_id") == "170829464"
+        assert origin.get("chat_id") == "17082946"
         assert origin.get("thread_id") == "544520"
 
         _ = real_switch_session  # silence unused

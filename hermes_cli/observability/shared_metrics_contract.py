@@ -138,7 +138,7 @@ SKILL_POST_PATCH_STATES = frozenset({"no_new_patch", "not_applicable", "reused_a
 CLIENT_OS_FAMILIES = frozenset({"linux", "macos", "unknown", "windows"})
 CLIENT_ARCHITECTURES = frozenset({"arm", "arm64", "unknown", "x86", "x86_64"})
 CLIENT_INSTALL_METHODS = frozenset({
-    "apt", "docker", "git", "home-manager", "homebrew", "nixos", "pip", "unknown",
+    "apt", "docker", "git", "home-manager", "homebrew", "microsoft-store", "nixos", "pip", "unknown",
 })
 CLIENT_RESOURCE_KEYS = frozenset({"architecture", "hermes_version", "install_method", "os_family"})
 
@@ -156,9 +156,9 @@ TASK_FAILURE_CLASSES = MODEL_ERROR_CLASSES | frozenset({
 _CORE_GATEWAY_PLATFORMS = (frozenset(PLATFORMS) - {"api_server", "cli", "cron"}) | {"none", "plugin", "relay"}
 # The Tool Search bridge tools are not in a toolset; every hosted connector tool reads ``connector``.
 BRIDGE_TOOL_NAMES = frozenset({"tool_call", "tool_describe", "tool_search"})
-# Deleted with the old setup flow. v4 only adds values, and rows that v0.21.6/7 saved with these names
-# must still package; recording maps through the live sets (tool_metric_name, toolset_metric_name).
-RETIRED_TOOL_NAMES = frozenset({"setup_choose", "start_chat"})
+# Retired names remain accepted for previously saved rows. v4 only adds values;
+# recording maps through the live sets (tool_metric_name, toolset_metric_name).
+RETIRED_TOOL_NAMES = frozenset({"react_to_message", "setup_choose", "start_chat"})
 RETIRED_TOOLSET_NAMES = frozenset({"setup", "start_chat"})
 _LIVE_TOOL_NAMES = BUILTIN_TOOL_NAMES | BRIDGE_TOOL_NAMES | {"connector", "mcp", "plugin", "unknown"}
 TOOL_NAMES = _LIVE_TOOL_NAMES | RETIRED_TOOL_NAMES
@@ -504,6 +504,7 @@ UPDATE_STOP_CLASSES = frozenset({
     "commit_point_refused",   # the commit point could not be armed durably; nothing moved
     "detached_head",          # a detached checkout stayed put, or its commits could not be backed up
     "disk_full",              # (see above)
+    "downgrade_refused",      # the target predates the gateway runtime a state.db already uses
     "download_failed",        # the ZIP fallback download failed
     "fetch_failed",           # git fetch failed
     "gateway_pause_failed",   # Windows: the gateways could not be paused safely before the venv moves

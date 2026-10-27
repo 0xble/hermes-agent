@@ -12,6 +12,9 @@ from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+# Shared with gateway shutdown: tools cannot import the gateway runner.
+INTERRUPT_REASON_GATEWAY_SHUTDOWN = "gateway shutdown"
+
 # Opt-in debug tracing — pairs with HERMES_DEBUG_INTERRUPT in tools/environments/base.py.
 _DEBUG_INTERRUPT = env_var_enabled("HERMES_DEBUG_INTERRUPT")
 if _DEBUG_INTERRUPT:
@@ -115,9 +118,12 @@ def run_if_not_interrupted(callback: Callable[[], None]) -> bool:
 
 
 def get_interrupt_reason() -> str | None:
-    """User-safe interrupt cause for the current thread, if known."""
+    """User-safe cause for this thread or the tool thread its deadline worker acts for."""
     with _lock:
-        return _interrupt_reasons.get(threading.current_thread().ident)
+        for tid in (threading.get_ident(), acting_for_tid.get()):
+            if tid is not None and (reason := _interrupt_reasons.get(tid)):
+                return reason
+    return None
 
 
 def clear_current_thread_interrupt() -> None:

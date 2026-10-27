@@ -264,6 +264,16 @@ Step 1, Option A) that declares every command in
 as a slash command. In Socket Mode, Slack routes the command event
 through the WebSocket regardless of the manifest's `url` field.
 
+### Native Stop control
+
+Slack shows a Stop button while an agent session is processing. Hermes routes
+`agent_session_stopped` through the same session-scoped `/stop` command as a typed
+stop, then clears the processing status. Existing Assistant and Agent apps must add
+`agent_session_stopped` under **Event Subscriptions → Subscribe to bot events**.
+The generated manifest includes it, and the event requires the existing
+`chat:write` scope. Slack does not emit a corresponding native resume event. Send
+a new message to continue after stopping.
+
 ### Agent messaging experience
 
 New Slack apps use Slack's **Agent** messaging experience. Existing Hermes
@@ -276,7 +286,8 @@ hermes slack manifest --agent-view --write
 Update the manifest in **Features → App Manifest**, then reinstall the app if
 Slack asks. Agent view cannot be reverted to Assistant view, and users may need
 to hard-refresh Slack after the switch. The generated Agent manifest subscribes
-to `message.im`, `app_home_opened`, and `app_context_changed`, so Hermes can
+to `message.im`, `app_home_opened`, `app_context_changed`, and
+`agent_session_stopped`, so Hermes can
 identify a Messages-tab DM and receive the user's active Slack context with a
 turn. Hermes only supplies that context as a label; it does not read the viewed
 channel's history.
@@ -888,6 +899,8 @@ stt_enabled: true
 
 When `true` (the default), incoming audio messages are automatically transcribed using the configured STT provider before being processed by the agent.
 
+With `stt.echo_transcripts` enabled (the default), native Slack echoes use a small microphone context line with speaker labels supplied by the transcript and Slack as the source. If no speaker is identified, the context identifies the uploader as “Shared by”, not as the speaker. The body preserves the transcript as literal text, without the old outer quotes. Multiple speaker labels remain in the body. Long transcripts continue across bounded cards in the same thread, and each card includes an accessible text fallback. This does not require `rich_blocks` or `markdown_blocks`. Relay-backed Slack keeps its existing text fallback.
+
 ### Full Example
 
 ```yaml
@@ -1024,7 +1037,7 @@ slack:
       performance implications.
 ```
 
-Keys are Slack channel IDs (find them via channel details → "About" → scroll to bottom). All messages in the matching channel get the prompt injected as an ephemeral system instruction.
+Keys are Slack channel IDs (find them via channel details → "About" → scroll to bottom). All messages in the matching channel, including slash-command turns (`/hermes <question>` and native `/<command>`), get the prompt injected as an ephemeral system instruction.
 
 ## Per-Channel Skill Bindings
 
@@ -1050,7 +1063,7 @@ slack:
 ```
 
 Notes:
-- The binding matches by channel ID. For threaded messages in a bound channel, the thread inherits the parent channel's binding.
+- The binding matches by channel ID. For threaded messages in a bound channel, the thread inherits the parent channel's binding. A session started by a slash command (`/hermes <question>`) loads the binding too.
 - The skill is loaded only at session start (new session). If you change the binding, run `/new` for it to take effect.
 - Combine with `channel_prompts` for per-channel tone/constraints on top of the skill's instructions.
 

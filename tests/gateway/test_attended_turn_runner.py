@@ -99,6 +99,71 @@ def test_mid_turn_activation_switches_once_and_posts_one_notice():
     assert state.conversation.last_resolved_model == "opus"
 
 
+@pytest.mark.parametrize("previous_key", [None, ("default", "nous", "xhigh", "default", False)])
+def test_boundary_does_not_announce_an_already_selected_attended_model(previous_key):
+    decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
+    turn, _, _ = _runner(decision)
+    agent = SimpleNamespace(
+        model="opus", provider="anthropic", api_mode="anthropic_messages",
+        _gateway_attended_decision_key=previous_key,
+        reasoning_config={"enabled": True, "effort": "medium"},
+    )
+
+    with patch("agent.agent_runtime_helpers.switch_model") as switch:
+        turn._apply_attended_before_api_call(agent, commit=False)
+        turn._apply_attended_before_api_call(agent)
+
+    switch.assert_not_called()
+    assert turn.attended_notices == []
+
+
+@pytest.mark.parametrize("route_active", [False, True])
+def test_queued_turn_stages_notice_only_after_a_committed_idle_route(route_active):
+    from gateway.run_turn import GatewayTurnMixin
+
+    decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
+    turn, runner, state = _runner(decision)
+    state.conversation.pending_attended_notice = None
+    # The committed API-route marker survives queued turns and worker handoffs. Model
+    # resolution alone can still have a stale model snapshot from before the switch.
+    runner._load_attended_route_active = lambda _key: route_active
+    runner._handoff_attended_state = lambda _key, conversation: vars(state.conversation).update(conversation)
+    config = {"model": {"default": "default", "attended": {"model": "opus", "provider": "anthropic"}}}
+
+    for _ in range(2):
+        GatewayTurnMixin._attended_route_for_session(
+            runner, source=None, session_key="session-1", user_config=config,
+            override=None, last_model="default",
+        )
+
+    assert bool(state.conversation.pending_attended_notice) is (not route_active)
+
+
+@pytest.mark.parametrize("route_active", [False, True])
+def test_snapshot_route_state_is_used_without_a_loop_store_read(route_active):
+    """Loop callers pass the off-loop snapshot's route marker; reading the store here would take
+    the session-store lock on the gateway loop (live loop-guard hit, 2026-10-25)."""
+    from gateway.run_turn import GatewayTurnMixin
+
+    decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
+    turn, runner, state = _runner(decision)
+    state.conversation.pending_attended_notice = None
+
+    def _loop_read(_key):
+        raise AssertionError("route marker read on the loop despite a snapshot value")
+
+    runner._load_attended_route_active = _loop_read
+    runner._handoff_attended_state = lambda _key, conversation: vars(state.conversation).update(conversation)
+    config = {"model": {"default": "default", "attended": {"model": "opus", "provider": "anthropic"}}}
+
+    GatewayTurnMixin._attended_route_for_session(
+        runner, source=None, session_key="session-1", user_config=config,
+        override=None, last_model="default", route_active=route_active,
+    )
+
+    assert bool(state.conversation.pending_attended_notice) is (not route_active)
+
+
 def test_mid_turn_idle_expiry_switches_back_once_with_one_notice():
     previous = AttendedResolution(
         "claude-opus-5-5", "anthropic", "medium", "attended", True, idle_model="gpt-6.1-sol",

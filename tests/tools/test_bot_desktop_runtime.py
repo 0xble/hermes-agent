@@ -107,7 +107,8 @@ _FAKE_LAUNCHER = """#!/usr/bin/env bash
 sleep 0.4
 echo $$ > "$HERMES_BD_XLOCK_DIR/.X${HERMES_BD_DISPLAY_NUM}-lock"
 : > "$HERMES_BD_SOCKET"
-printf 'DISPLAY=:%s\\n' "$HERMES_BD_DISPLAY_NUM" > "$HERMES_BD_ENV_FILE"
+printf 'DISPLAY=:%s\\n' "$HERMES_BD_DISPLAY_NUM" > "$HERMES_BD_ENV_FILE.tmp"
+mv "$HERMES_BD_ENV_FILE.tmp" "$HERMES_BD_ENV_FILE"
 sleep 30
 """
 
@@ -191,9 +192,46 @@ _ORPHANING_LAUNCHER = """#!/usr/bin/env bash
 sleep 30 &
 echo $! > "$HERMES_BD_XLOCK_DIR/.X${HERMES_BD_DISPLAY_NUM}-lock"
 : > "$HERMES_BD_SOCKET"
-printf 'DISPLAY=:%s\\n' "$HERMES_BD_DISPLAY_NUM" > "$HERMES_BD_ENV_FILE"
+printf 'DISPLAY=:%s\\n' "$HERMES_BD_DISPLAY_NUM" > "$HERMES_BD_ENV_FILE.tmp"
+mv "$HERMES_BD_ENV_FILE.tmp" "$HERMES_BD_ENV_FILE"
 wait
 """
+
+
+@pytest.mark.platforms("linux", "macos")
+@pytest.mark.parametrize("launcher", [_FAKE_LAUNCHER, _ORPHANING_LAUNCHER], ids=["cold-start", "orphan"])
+def test_launcher_env_is_invisible_until_display_is_written(tmp_path, launcher):
+    import os
+    import subprocess
+
+    from tests.waiting import wait_until
+
+    entered, release = tmp_path / "writing", tmp_path / "release"
+    env_file = tmp_path / "desktop.env"
+    prefix = '''
+sleep() { :; }
+wait() { :; }
+printf() {
+    : > "$WRITE_ENTERED"
+    while [ ! -e "$WRITE_RELEASE" ]; do command sleep 0.01; done
+    builtin printf "$@"
+}
+'''
+    env = {**os.environ, "WRITE_ENTERED": str(entered), "WRITE_RELEASE": str(release),
+           "HERMES_BD_XLOCK_DIR": str(tmp_path), "HERMES_BD_DISPLAY_NUM": "37",
+           "HERMES_BD_SOCKET": str(tmp_path / "socket"), "HERMES_BD_ENV_FILE": str(env_file)}
+    proc = subprocess.Popen(["bash", "-c", prefix + launcher], env=env)
+    try:
+        wait_until(entered.exists, what="launcher opened its output before writing DISPLAY")
+        assert not env_file.exists(), "existence advertises readiness before DISPLAY is written"
+        release.touch()
+        assert proc.wait(timeout=5) == 0
+        assert env_file.read_text() == "DISPLAY=:37\n"
+    finally:
+        release.touch()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
 
 
 def _gone(pid: int) -> bool:
@@ -309,7 +347,8 @@ sleep 30 &
 echo $! > "$HERMES_BD_XLOCK_DIR/.X${HERMES_BD_DISPLAY_NUM}-lock"
 sleep 1
 : > "$HERMES_BD_SOCKET"
-printf 'DISPLAY=:%s\\n' "$HERMES_BD_DISPLAY_NUM" > "$HERMES_BD_ENV_FILE"
+printf 'DISPLAY=:%s\\n' "$HERMES_BD_DISPLAY_NUM" > "$HERMES_BD_ENV_FILE.tmp"
+mv "$HERMES_BD_ENV_FILE.tmp" "$HERMES_BD_ENV_FILE"
 wait
 """
 
@@ -366,7 +405,8 @@ def test_allocation_lock_is_released_once_xvnc_claims_the_number(in_process_runt
     # X lock at once, env file only much later: the lock must be free in between.
     (scratch / "launcher.sh").write_text(
         '#!/usr/bin/env bash\necho $$ > "$HERMES_BD_XLOCK_DIR/.X${HERMES_BD_DISPLAY_NUM}-lock"\n'
-        'sleep 1.5\n: > "$HERMES_BD_SOCKET"\nprintf \'DISPLAY=:%s\\n\' "$HERMES_BD_DISPLAY_NUM" > "$HERMES_BD_ENV_FILE"\nsleep 30\n',
+        'sleep 1.5\n: > "$HERMES_BD_SOCKET"\nprintf \'DISPLAY=:%s\\n\' "$HERMES_BD_DISPLAY_NUM" > "$HERMES_BD_ENV_FILE.tmp"\n'
+        'mv "$HERMES_BD_ENV_FILE.tmp" "$HERMES_BD_ENV_FILE"\nsleep 30\n',
         encoding="utf-8")
     seen: dict = {}
 

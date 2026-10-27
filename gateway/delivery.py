@@ -1,6 +1,7 @@
 """Delivery routing for cron job outputs and agent responses, by target: explicit ("telegram:123456789"),
 platform home channel ("telegram"), origin (back to where the job was created), or local (files)."""
 
+import asyncio
 import logging
 import re
 from pathlib import Path
@@ -320,7 +321,8 @@ class DeliveryRouter:
         ):
             validate_owner = getattr(adapter, "ensure_existing_telegram_topic_owner", None)
             if callable(validate_owner):
-                validate_owner(target.chat_id, str(thread_id), topic_owner_key)
+                # The owner registry lives in state.db (claims are writes): keep it off the loop.
+                await asyncio.to_thread(validate_owner, target.chat_id, str(thread_id), topic_owner_key)
         if thread_id and not any(key in send_metadata for key in _THREAD_ROUTING_KEYS):
             send_metadata["thread_id"] = thread_id
             if target.platform == Platform.TELEGRAM and looks_like_telegram_private_chat_id(target.chat_id):

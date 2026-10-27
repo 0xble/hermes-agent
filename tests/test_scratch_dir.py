@@ -1,6 +1,8 @@
 """Scratch dir contract: TMPDIR/TMP/TEMP follow HERMES_HOME/cache/scratch unless the user set them."""
 
+import contextlib
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -9,6 +11,9 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.waiting import wait_until
+
+import psutil
 import pytest
 
 
@@ -100,6 +105,25 @@ def test_prune_removes_idle_entries_and_keeps_trees_written_deep_inside(tmp_path
         os.utime(path, (ancient, ancient))
     assert prune_scratch_dir(scratch) == 1
     assert not idle.exists() and live.exists() and fresh.exists()
+
+
+@pytest.mark.platforms("posix")  # DirEntry.stat() reports st_nlink only on POSIX
+def test_prune_ignores_freshened_hardlinks_shared_with_a_live_repo(tmp_path):
+    """``git clone --local`` hardlinks packs into a scratch clone; when git freshens the source
+    repo's copy the shared inode's mtime moves, which must not keep the idle clone alive."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    live_pack = tmp_path / "live-repo" / "pack-1.pack"
+    live_pack.parent.mkdir()
+    live_pack.write_bytes(b"P" * 64)
+    clone = scratch / "clone" / ".git" / "objects" / "pack"
+    clone.mkdir(parents=True)
+    os.link(live_pack, clone / "pack-1.pack")
+    ancient = time.time() - 30 * 3600
+    for path in (clone, clone.parent, clone.parent.parent, scratch / "clone"):
+        os.utime(path, (ancient, ancient))
+    os.utime(live_pack)  # the live repo freshens its pack: the shared inode is "recent"
+    assert prune_scratch_dir(scratch) == 1
+    assert not (scratch / "clone").exists() and live_pack.read_bytes() == b"P" * 64
 
 
 @pytest.mark.platforms("posix")  # POSIX directory modes
@@ -418,9 +442,520 @@ def test_prune_releases_git_worktree_registration_of_idle_entry(tmp_path):
     ancient = time.time() - 30 * 3600
     for dirpath, dirnames, filenames in os.walk(tree.parent):
         for name in dirnames + filenames:
-            os.utime(os.path.join(dirpath, name), (ancient, ancient), follow_symlinks=False)
+            try:
+                os.utime(os.path.join(dirpath, name), (ancient, ancient), follow_symlinks=False)
+            except NotImplementedError:
+                # Windows: os.utime has no follow_symlinks parameter.
+                os.utime(os.path.join(dirpath, name), (ancient, ancient))
     os.utime(tree.parent, (ancient, ancient))
     assert prune_scratch_dir(scratch) == 1
     listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo, capture_output=True,
                              text=True, stdin=subprocess.DEVNULL, check=True).stdout
     assert str(tree) not in listing and not tree.exists()
+
+
+
+def test_write_during_size_walk_is_rescued(tmp_path: Path) -> None:
+    """F6 on #139850: no full-tree walk may sit between the final re-check and rmtree.
+    A writer overwrites an old file while the prune is sizing the doomed entry; the
+    re-check must still see it. Red when the size walk runs after the re-check: the
+    entry is destroyed with the fresh write inside."""
+    import hermes_constants_scratch as scratch_mod
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "sized-lane"
+    entry.mkdir()
+    payload = entry / "payload"
+    payload.write_text("OLD", encoding="utf-8")
+    ancient = time.time() - 48 * 3600
+    for path in (payload, entry):
+        os.utime(path, (ancient, ancient))
+    real_tree_bytes = scratch_mod._tree_bytes
+
+    def write_during_size_walk(path):
+        payload.write_text("FRESH", encoding="utf-8")
+        return real_tree_bytes(path)
+
+    with patch("hermes_constants_scratch._tree_bytes", write_during_size_walk):
+        assert prune_scratch_dir(scratch) == 0
+    assert payload.read_text(encoding="utf-8-sig") == "FRESH", "write during size walk was destroyed"
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert f"rescued {str(entry)!r} " in log, log
+
+def test_midprune_resumed_write_is_rescued(tmp_path: Path) -> None:
+    """F1 on #132401, ported from 3f72fd9c8e (#132455): a writer whose cwd is outside
+    scratch — invisible to the reap — resumes during the prune's own reap window and
+    lands a fresh file in a doomed entry. The doomed list is a candidate list, never a
+    verdict: the entry is re-validated with the same idleness walk immediately before
+    deletion, rescued, recorded in ``scratch-prune.log``, and never counted as removed.
+    Red on pre-fix code: the entry is destroyed with the fresh write inside."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "resumed-lane"
+    entry.mkdir()
+    (entry / "old-output.md").write_text("stale content\n", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    for path in (entry / "old-output.md", entry):
+        os.utime(path, (ancient, ancient))
+    fresh = entry / "resumed-work.md"
+
+    def write_during_reap(root, doomed, *args, **kwargs):
+        # The resumed writer lands its fresh write mid-prune: selection is done,
+        # the deletion loop has not started. This is the F1 window.
+        fresh.write_text("FRESH RESUMED WORK\n", encoding="utf-8")
+        return 0
+
+    with patch("hermes_constants_scratch.reap_processes_rooted_in", write_during_reap):
+        assert prune_scratch_dir(scratch) == 0  # rescued — not counted as removed
+    assert fresh.exists(), "fresh mid-prune write was destroyed"
+    assert entry.exists()
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert f"rescued {str(entry)!r} " in log, log
+    assert f"removed {str(entry)!r} (" not in log, log
+
+
+def test_midprune_nested_overwrite_is_rescued_by_descending_recheck(tmp_path: Path) -> None:
+    """Greptile P2 on #134173: the mid-prune re-validation must descend the whole
+    subtree, and the original rescue test could not pin that — a fresh file created
+    directly in ``entry`` also bumps the entry directory's own mtime, so a shallow
+    re-check that never looked below the top level would rescue it too. This case
+    holds every directory mtime ancient and touches only an existing file deep in
+    an old nested tree (an overwrite bumps the file's mtime alone), so a top-level
+    re-check sees idle and deletes real work while the descending walk rescues it.
+    Red against a shallow (lstat-only) re-validation; green against the subtree walk."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "nested-resume-lane"
+    deep = entry / "lane" / "wt"  # three levels, every directory aged below
+    deep.mkdir(parents=True)
+    payload = deep / "old-output.md"
+    payload.write_text("stale content\n", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    for path in (payload, deep, deep.parent, entry):
+        os.utime(path, (ancient, ancient))
+
+    def overwrite_during_reap(root, doomed, *args, **kwargs):
+        # The resumed writer overwrites an existing file inside the old nested
+        # tree: no directory mtime changes — only the file's own timestamp moves.
+        payload.write_text("FRESH OVERWRITE, DEEP\n", encoding="utf-8")
+        return 0
+
+    with patch("hermes_constants_scratch.reap_processes_rooted_in", overwrite_during_reap):
+        assert prune_scratch_dir(scratch) == 0  # rescued — not counted as removed
+    assert payload.read_text(encoding="utf-8-sig") == "FRESH OVERWRITE, DEEP\n", (
+        "deep mid-prune overwrite was destroyed"
+    )
+    assert entry.exists()
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert f"rescued {str(entry)!r} " in log, log
+    assert f"removed {str(entry)!r} (" not in log, log
+
+
+def test_midprune_vanished_entry_is_recorded_not_counted(tmp_path: Path) -> None:
+    """The third state beside rescued and kept: an entry deleted by an outside actor
+    during the reap window is recorded as vanished — not a rescue (no touch happened),
+    not a scan failure (nothing is unreadable), and never counted as removed (we did
+    not remove it). Pins the tri-state audit born in the P3 review of #134173."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "doomed-lane"
+    entry.mkdir()
+    (entry / "old-output.md").write_text("stale content\n", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    for path in (entry / "old-output.md", entry):
+        os.utime(path, (ancient, ancient))
+
+    def remove_during_reap(root, doomed, *args, **kwargs):
+        # An outside actor (a lane's own cleanup) deletes the entry mid-prune.
+        shutil.rmtree(entry)
+        return 0
+
+    with patch("hermes_constants_scratch.reap_processes_rooted_in", remove_during_reap):
+        assert prune_scratch_dir(scratch) == 0  # gone, but not by our hand
+    assert not entry.exists()
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert f"entry {str(entry)!r} vanished" in log, log
+    assert f"rescued {str(entry)!r} " not in log, log
+    assert "re-scan failed" not in log, log
+
+
+def test_postremoval_unreadable_entry_is_not_counted_as_removed(tmp_path: Path) -> None:
+    """R2/P2 on #134173: after rmtree, the removal-confirmation gate uses
+    os.path.lexists(), which swallows OSError from lstat and returns False — so an
+    entry that stayed (rmtree left residue) but became unreadable is counted and
+    recorded as removed. Only an explicit lstat proves absence: FileNotFoundError
+    confirms gone, a successful stat is residue, any other OSError means the
+    removal state is unknown, so the entry is neither counted nor recorded removed.
+    Red on the previous head: removed == 1 and a false 'removed' record."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "residue-lane"
+    entry.mkdir()
+    payload = entry / "result.txt"
+    payload.write_text("still here", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    for path in (payload, entry):
+        os.utime(path, (ancient, ancient))
+    log_file = tmp_path / "logs" / "scratch-prune.log"
+
+    deny = {"lstat": False}
+
+    def rmtree_leaves_residue(path, *args, **kwargs):
+        # rmtree(ignore_errors=True) is allowed to leave the directory in place.
+        deny["lstat"] = True
+
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        # Only the post-removal visibility check fails; everything else stat()s.
+        if deny["lstat"] and os.path.abspath(os.fspath(path)) == os.path.abspath(entry):
+            raise PermissionError("post-rmtree visibility denied")
+        return real_lstat(path, *args, **kwargs)
+
+    with patch("hermes_constants_scratch.reap_processes_rooted_in", lambda *a, **k: 0), \
+         patch("hermes_constants_scratch.shutil.rmtree", rmtree_leaves_residue), \
+         patch("hermes_constants_scratch.os.lstat", lstat):
+        assert prune_scratch_dir(scratch) == 0  # unknown, not removed
+    assert entry.exists() and payload.read_text(encoding="utf-8-sig") == "still here"
+    log = log_file.read_text(encoding="utf-8-sig")
+    assert f"removed {str(entry)!r} (" not in log, log
+    assert "could not confirm removal" in log, log
+    assert "could not fully remove" not in log, log
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.live_system_guard_bypass  # a red run must kill the orphan this test made (reparented to init)
+def test_prune_keeps_entry_a_registered_hermes_process_works_in_but_reaps_orphans(tmp_path, monkeypatch):
+    """#132401 live-worker guard: a background process Hermes itself started (tracked in the
+    process registry's ``processes.json``) is never reaped, and the idle entry it works in is
+    kept with an audit line. The orphaned grandchild of a registered shell that already exited
+    is no longer Hermes' — it is still reaped and its entry removed. Red on the cwd-only reap."""
+    from tools.process_registry import ProcessRegistry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owned_dir, orphan_dir = scratch / "live-worker", scratch / "dead-lane"
+    owned_dir.mkdir()
+    orphan_dir.mkdir()
+    sleeper = f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(60)'"
+    pidfile = tmp_path / "orphan.pid"
+    registry = ProcessRegistry()
+    worker = registry.spawn_local(sleeper, cwd=str(owned_dir))
+    lane = registry.spawn_local(f"{sleeper} >/dev/null 2>&1 </dev/null & echo $! > {shlex.quote(str(pidfile))}",
+                                cwd=str(orphan_dir))
+    def _lane_done():
+        registry.poll(lane.id)
+        return lane.exited and pidfile.exists() and pidfile.read_text(encoding="utf-8-sig").strip()
+    orphan = int(wait_until(_lane_done, timeout=15, what="lane shell exits after forking its orphan"))
+    ancient = time.time() - 30 * 3600
+    for path in (owned_dir, orphan_dir):
+        os.utime(path, (ancient, ancient))
+    try:
+        assert prune_scratch_dir(scratch) == 1
+        assert owned_dir.exists() and not orphan_dir.exists()
+        assert worker.process.poll() is None, "registered Hermes worker was reaped"
+        def _orphan_gone():
+            try:
+                return psutil.Process(orphan).status() == psutil.STATUS_ZOMBIE
+            except psutil.NoSuchProcess:
+                return True
+        wait_until(_orphan_gone, timeout=10, what="orphan reaped")
+        log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+        assert f"kept {str(owned_dir)!r} — live Hermes process pid=" in log, log
+    finally:
+        registry.kill_process(worker.id)
+        with contextlib.suppress(psutil.Error):
+            psutil.Process(orphan).kill()
+
+
+@pytest.mark.platforms("posix")
+def test_prune_keeps_entry_the_pruning_sessions_own_lineage_works_in(tmp_path, monkeypatch):
+    """#132401 review: a live session inside an idle entry that launches another Hermes
+    command is the pruner's ancestor — never signalled, and its entry must not be deleted
+    from under it either."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    session_dir = scratch / "session-cwd"
+    session_dir.mkdir()
+    ancient = time.time() - 30 * 3600
+    os.utime(session_dir, (ancient, ancient))
+    monkeypatch.chdir(session_dir)
+    assert prune_scratch_dir(scratch) == 0
+    assert session_dir.exists()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.live_system_guard_bypass  # the helper outlives the spawner the test killed
+def test_prune_owner_lookup_survives_symlinked_scratch_and_drops_orphaned_mcp_helpers(tmp_path, monkeypatch):
+    """#132401 review: the owning home comes from the configured scratch path even when it is a
+    symlink onto another disk, and an MCP helper whose recorded spawner died is an orphan again
+    (reaped, entry removed) while a live background worker keeps its entry."""
+    from hermes_cli import process_identity
+    from tools.process_registry import ProcessRegistry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    elsewhere = tmp_path / "other-disk" / "scratch"
+    elsewhere.mkdir(parents=True)
+    (home / "cache").mkdir()
+    (home / "cache" / "scratch").symlink_to(elsewhere, target_is_directory=True)
+    scratch = home / "cache" / "scratch"
+    owned_dir, helper_dir = scratch / "live-worker", scratch / "orphan-helper"
+    owned_dir.mkdir()
+    helper_dir.mkdir()
+    sleeper = [sys.executable, "-c", "import time; time.sleep(60)"]
+    registry = ProcessRegistry()
+    worker = registry.spawn_local(" ".join(shlex.quote(a) for a in sleeper), cwd=str(owned_dir))
+    helper = subprocess.Popen(sleeper, cwd=str(helper_dir), stdin=subprocess.DEVNULL)
+    # A real spawner registers the helper the way the MCP client does, then dies.
+    repo = str(Path(__file__).resolve().parents[1])
+    spawner = subprocess.Popen(
+        [sys.executable, "-c",
+         f"import sys; sys.path.insert(0, {repo!r}); from hermes_cli.process_identity import register_child; "
+         f"assert register_child({helper.pid}, 'mcp-helper'); import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL, env={**os.environ, "HERMES_HOME": str(home)})
+    wait_until(lambda: helper.pid in {e.get("pid") for e in process_identity.ledger_entries(all_installs=True)},
+               timeout=20, what="spawner registered the mcp-helper")
+    spawner.kill()
+    spawner.wait(timeout=10)
+    assert process_identity.spawner_is_dead(next(
+        e for e in process_identity.ledger_entries(all_installs=True) if e.get("pid") == helper.pid)) is True
+    ancient = time.time() - 30 * 3600
+    for path in (owned_dir, helper_dir):
+        os.utime(path, (ancient, ancient))
+    try:
+        assert prune_scratch_dir(scratch) == 1
+        assert owned_dir.exists() and not helper_dir.exists()
+        assert worker.process.poll() is None, "registered worker under a symlinked scratch was reaped"
+        assert helper.wait(timeout=10) is not None, "orphaned mcp-helper was kept"
+    finally:
+        registry.kill_process(worker.id)
+        if helper.poll() is None:
+            helper.kill()
+            helper.wait(timeout=10)
+
+
+def _age_tree(path: Path, hours: float = 30) -> None:
+    """Make *path* and everything beneath it look idle for *hours* (symlinks not followed)."""
+    ancient = time.time() - hours * 3600
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            os.utime(os.path.join(dirpath, name), (ancient, ancient), follow_symlinks=False)
+    os.utime(path, (ancient, ancient), follow_symlinks=False)
+
+
+def _pin(declaring: Path, *inputs: Path) -> None:
+    import json
+
+    (declaring / "input-pins.json").write_text(
+        json.dumps({"files": {str(p): {"sha256": "0" * 64} for p in inputs}}), encoding="utf-8")
+
+
+def test_prune_keeps_idle_input_pinned_by_another_entry_and_removes_unpinned_control(tmp_path):
+    """An old, closed input pinned by a different retained payload is in use even though nothing
+    touched it: deleting it would break the payload's frozen-input admission. An equally idle
+    entry nothing declares is still pruned."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    payload, pinned, control = scratch / "payload", scratch / "pinned-input", scratch / "control"
+    for d in (payload, pinned / "sub", control):
+        d.mkdir(parents=True)
+    (pinned / "sub" / "findings.md").write_text("x", encoding="utf-8")
+    (control / "f").write_text("x", encoding="utf-8")
+    _pin(payload, pinned / "sub" / "findings.md")
+    for d in (payload, pinned, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert payload.exists() and pinned.exists() and not control.exists()
+
+
+def test_prune_follows_pins_transitively_and_through_directory_and_alias_paths(tmp_path):
+    """A pinned entry that declares its own inputs holds them too. A directory pin and a symlinked
+    alias of a pinned path both resolve to the entry that holds them."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    a, b, c, d = (scratch / n for n in ("a", "b", "c", "d"))
+    for x in (a, b, c / "build", d):
+        x.mkdir(parents=True)
+    (b / "dep").write_text("x", encoding="utf-8")
+    (c / "build" / "out").write_text("x", encoding="utf-8")
+    alias = tmp_path / "alias-to-c"
+    alias.symlink_to(c)
+    _pin(a, b / "dep")
+    _pin(b, alias / "build")
+    for x in (a, b, c, d):
+        _age_tree(x)
+    assert prune_scratch_dir(scratch) == 1
+    assert a.exists() and b.exists() and c.exists() and not d.exists()
+
+
+def test_prune_keeps_every_idle_entry_when_a_declaration_is_unreadable(tmp_path):
+    """A malformed declaration hides its dependencies, so no idle entry can be shown free of
+    them: the pass removes nothing rather than guess."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    broken, other = scratch / "broken", scratch / "other"
+    broken.mkdir()
+    other.mkdir()
+    (broken / "input-pins.json").write_text("{not json", encoding="utf-8")
+    (other / "f").write_text("x", encoding="utf-8")
+    for x in (broken, other):
+        _age_tree(x)
+    assert prune_scratch_dir(scratch) == 0
+    assert broken.exists() and other.exists()
+
+
+def test_prune_honors_keep_marker_but_not_package_fixture_markers(tmp_path):
+    """A ``.keep`` anywhere in an entry holds it. One inside ``node_modules`` is a package
+    fixture, not a retention declaration."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    kept, fixture = scratch / "kept", scratch / "fixture"
+    (kept / "deep").mkdir(parents=True)
+    (kept / "deep" / ".keep").write_text("", encoding="utf-8")
+    (fixture / "node_modules" / "pkg").mkdir(parents=True)
+    (fixture / "node_modules" / "pkg" / ".keep").write_text("", encoding="utf-8")
+    for x in (kept, fixture):
+        _age_tree(x)
+    assert prune_scratch_dir(scratch) == 1
+    assert kept.exists() and not fixture.exists()
+
+
+def test_prune_rereads_declarations_before_removal(tmp_path, monkeypatch):
+    """A declaration written after idle selection (during the process reap) still holds its
+    input: retention is read again immediately before the destructive step."""
+    import hermes_constants_scratch as scratch_mod
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    payload, pinned = scratch / "payload", scratch / "pinned"
+    payload.mkdir()
+    pinned.mkdir()
+    (pinned / "f").write_text("x", encoding="utf-8")
+    for x in (payload, pinned):
+        _age_tree(x)
+
+    def reap_then_declare(root, doomed, audit=None):
+        _pin(payload, pinned / "f")
+        return 0
+
+    monkeypatch.setattr(scratch_mod, "reap_processes_rooted_in", reap_then_declare)
+    assert prune_scratch_dir(scratch) == 0
+    assert payload.exists() and pinned.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
+                    reason="root reads through a mode-0 directory")
+def test_prune_keeps_every_idle_entry_when_a_declaration_cannot_be_inspected(tmp_path):
+    """A declaration behind an unreadable directory is not an absent one: its owner's inputs
+    stay, and so does every other idle entry, since the hidden pins could name any of them."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, pinned, other = scratch / "owner", scratch / "pinned", scratch / "other"
+    for d in (owner, pinned, other):
+        d.mkdir()
+    (pinned / "f").write_text("x", encoding="utf-8")
+    (other / "f").write_text("x", encoding="utf-8")
+    _pin(owner, pinned / "f")
+    for d in (owner, pinned, other):
+        _age_tree(d)
+    os.chmod(owner, 0)
+    try:
+        assert prune_scratch_dir(scratch) == 0
+    finally:
+        os.chmod(owner, 0o700)
+    assert owner.exists() and pinned.exists() and other.exists()
+
+
+def test_prune_keeps_scratch_local_aliases_on_a_declared_path(tmp_path):
+    """A declared path that runs through a symlinked scratch entry, or through a link inside an
+    otherwise undeclared entry, keeps both the link's entry and the data, so the declared path
+    still resolves after pruning."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, alias, target, hop, data, control = (
+        scratch / n for n in ("owner", "alias", "target", "hop", "data", "control"))
+    for d in (owner, target, hop, data, control):
+        d.mkdir()
+    (target / "f").write_text("x", encoding="utf-8")
+    (data / "g").write_text("x", encoding="utf-8")
+    alias.symlink_to(target)
+    (hop / "link").symlink_to(data)
+    _pin(owner, alias / "f", hop / "link" / "g")
+    for d in (owner, alias, target, hop, data, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert (alias / "f").exists() and (hop / "link" / "g").exists()
+    assert owner.exists() and target.exists() and data.exists() and not control.exists()
+
+
+def test_prune_keeps_an_alias_a_declared_path_climbs_out_of(tmp_path):
+    """``alias/../f`` resolves through the link first, so ``alias`` must survive with the data
+    even though the lexical form of the path never mentions where it lands."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, data, alias, control = (scratch / n for n in ("owner", "data", "alias", "control"))
+    for d in (owner, data / "sub", control):
+        d.mkdir(parents=True)
+    (data / "f").write_text("x", encoding="utf-8")
+    alias.symlink_to(data / "sub")
+    declared = Path(f"{alias}/../f")
+    _pin(owner, declared)
+    for d in (owner, data, alias, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert declared.exists() and owner.exists() and not control.exists()
+
+
+def test_prune_treats_a_dangling_declaration_link_as_unreadable(tmp_path):
+    """An ``input-pins.json`` link whose target is gone still declares something unknown, so
+    nothing idle is removed that pass."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, other = scratch / "owner", scratch / "other"
+    owner.mkdir()
+    other.mkdir()
+    (other / "f").write_text("x", encoding="utf-8")
+    (owner / "input-pins.json").symlink_to(tmp_path / "gone.json")
+    for d in (owner, other):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 0
+    assert owner.exists() and other.exists()
+
+
+def test_prune_log_escapes_control_characters_in_unreadable_declarations(tmp_path):
+    """A newline in an entry name cannot split or forge a prune-log record when its malformed
+    declaration is reported."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner = scratch / "own\nscratch prune: removed 'forged'"
+    owner.mkdir()
+    (owner / "input-pins.json").write_text("{not json", encoding="utf-8")
+    _age_tree(owner)
+    assert prune_scratch_dir(scratch) == 0
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert not any(line.startswith("scratch prune: removed") for line in log.splitlines())
+    assert "kept all 1 idle entries, unreadable retention declaration" in log
+
+
+def test_prune_matches_declared_paths_to_entries_by_filesystem_identity(tmp_path):
+    """On a case-insensitive volume a declaration may spell an entry, or the scratch root, with
+    different case. The declared path still names the pinned data, so the entry must survive."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, data, control = (scratch / n for n in ("owner", "CaseSensitiveInput", "control"))
+    for d in (owner, data, control):
+        d.mkdir()
+    (data / "f").write_text("x", encoding="utf-8")
+    declared = Path(str(scratch).swapcase()) / "casesensitiveinput" / "f"
+    if not declared.exists():
+        pytest.skip("case-sensitive filesystem: differently cased paths name nothing")
+    _pin(owner, declared)
+    for d in (owner, data, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert declared.exists() and owner.exists() and not control.exists()
+
+
+def test_prune_keeps_the_entry_a_linked_declaration_file_points_into(tmp_path):
+    """A symlinked ``input-pins.json`` keeps the entry holding its target, so the retained
+    declaration does not dangle and freeze every later pass."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    owner, manifests, data, control = (
+        scratch / n for n in ("owner", "manifests", "data", "control"))
+    for d in (owner, manifests, data, control):
+        d.mkdir()
+    (data / "f").write_text("x", encoding="utf-8")
+    _pin(manifests, data / "f")
+    (manifests / "input-pins.json").rename(manifests / "pins.json")
+    (owner / "input-pins.json").symlink_to(manifests / "pins.json")
+    for d in (owner, manifests, data, control):
+        _age_tree(d)
+    assert prune_scratch_dir(scratch) == 1
+    assert (owner / "input-pins.json").exists() and (data / "f").exists()
+    assert not control.exists()

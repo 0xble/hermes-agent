@@ -522,6 +522,41 @@ def _release_header_probe_fds() -> None:
         hermes_state_dbfile._HEADER_PROBE_FDS.clear()
 
 
+def test_repair_budget_probe_holds_cross_process_lock(tmp_path, monkeypatch):
+    """Fingerprint descriptors must not make repair siblings veto one another."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    real_lock = hermes_state_repair._cross_process_repair_lock
+    real_exhausted = hermes_state_repair._persistent_repair_attempts_exhausted
+    holding_lock = False
+
+    @contextlib.contextmanager
+    def observed_lock(path):
+        nonlocal holding_lock
+        with real_lock(path) as acquired:
+            holding_lock = bool(acquired)
+            try:
+                yield acquired
+            finally:
+                holding_lock = False
+
+    def checked_exhaustion(path):
+        assert holding_lock, "repair fingerprint opened state.db before acquiring the repair lock"
+        return real_exhausted(path)
+
+    monkeypatch.setattr(hermes_state_repair, "_cross_process_repair_lock", observed_lock)
+    monkeypatch.setattr(hermes_state_repair, "_persistent_repair_attempts_exhausted", checked_exhaustion)
+
+    report = repair_state_db_schema(db_path)
+
+    assert report["repaired"], report
+    assert len(list(tmp_path.glob("state.db.malformed-backup-*"))) == 1
+    with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 10
+
+
 @pytest.mark.platforms("posix")  # POSIX flock test
 def test_two_processes_repairing_at_once_perform_surgery_once(tmp_path):
     """Concurrent repairers serialise; the loser sees a healed DB and stops.

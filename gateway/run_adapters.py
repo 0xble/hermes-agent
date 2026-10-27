@@ -222,7 +222,7 @@ class GatewayAdapterLifecycleMixin:
         return _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT if initial else _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT
 
     async def _connect_adapter_with_timeout(
-        self, adapter, platform, *, is_reconnect: bool = False, initial: bool = False
+        self, adapter, platform, *, is_reconnect: bool = False, initial: bool = False, predecessor=None
     ) -> bool:
         """Connect with a bound so one platform can't block others. ``is_reconnect``: cold boot
         drops the stale server-side queue, a reconnect keeps it. ``initial``: capped budget.
@@ -235,21 +235,19 @@ class GatewayAdapterLifecycleMixin:
         to spend before the gateway reaches ``running`` (#85993 — Telegram's 180s).
         """
         try:
-            ok = await self._connect_adapter_bounded(adapter, platform, is_reconnect=is_reconnect, initial=initial)
+            ok = await self._connect_adapter_bounded(
+                adapter, platform, is_reconnect=is_reconnect, initial=initial, predecessor=predecessor)
         except Exception as exc:
             record_platform_connect(adapter, platform, is_reconnect=is_reconnect, ok=False, exc=exc)
             raise
         record_platform_connect(adapter, platform, is_reconnect=is_reconnect, ok=bool(ok))
         return ok
 
-    async def _connect_adapter_bounded(self, adapter, platform, *, is_reconnect: bool, initial: bool) -> bool:
-        timeout = self._platform_connect_timeout_secs(platform, initial=initial)
-        if timeout <= 0:
-            return await adapter.connect(is_reconnect=is_reconnect)
-        task = asyncio.ensure_future(adapter.connect(is_reconnect=is_reconnect))
-        if await self._wait_or_detach(task, timeout):
-            return bool(await task)
-        raise TimeoutError(f"{platform.value} connect timed out after {timeout:g}s")
+    async def _connect_adapter_bounded(self, adapter, platform, *, is_reconnect: bool, initial: bool,
+                                       predecessor=None) -> bool:
+        from gateway.run_adapters_connect import connect_adapter_bounded
+        return await connect_adapter_bounded(self, adapter, platform, is_reconnect=is_reconnect,
+                                             initial=initial, predecessor=predecessor)
 
     async def _connect_initial_adapter_with_timeout(self, adapter, platform) -> bool:
         """Cold-start connect with replace intent visible ONLY during this await, so a later
@@ -884,7 +882,8 @@ class GatewayAdapterLifecycleMixin:
             carry_inbound_dedup(info.get("predecessor"), adapter)
             self._wire_adapter_handlers(adapter)
             # is_reconnect keeps the server-side update queue so offline-period messages are delivered.
-            success = await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
+            success = await self._connect_adapter_with_timeout(
+                adapter, platform, is_reconnect=True, predecessor=info.get("predecessor"))
             if success:
                 await self._install_reconnected_adapter(platform, adapter)
             elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
@@ -936,6 +935,9 @@ class GatewayAdapterLifecycleMixin:
     def _publish_primary_adapter(self, platform, adapter) -> None:
         """Register a connected primary adapter and wire voice mode/input (transcription without /voice join)."""
         self.adapters[platform] = adapter
+        if platform == Platform.API_SERVER:
+            from gateway.session_api_turn import recover_api_turns
+            recover_api_turns(adapter)
         self._sync_voice_mode_state_to_adapter(adapter)
         self._bind_voice_input_callback(adapter)
 
@@ -1190,7 +1192,16 @@ class GatewayAdapterLifecycleMixin:
         with _log_suppressed(logging.DEBUG, "could not record served_profiles", exc_info=True):
             from gateway.status import publish_runtime_status
             from gateway.pairing import PairingStore
-            served = [active] + sorted(name for name, _home in profile_homes if name != active)
+            # Configuration includes parked profiles. Only authorities accepting work are served,
+            # the same set the runtime descriptor and attach-ticket store publish.
+            registry = getattr(self, "session_authorities", None)
+            if registry is not None:
+                from hermes_constants import hermes_home_key
+                admitted = {hermes_home_key(home) for home in registry.profile_ids()}
+                profile_homes = [(name, home) for name, home in profile_homes
+                                 if hermes_home_key(home) in admitted]
+            served = sorted({name for name, _home in profile_homes},
+                            key=lambda name: (name != active, name))
             self._note_served_profiles(profile_homes)
             for name in served:
                 if name and name not in self.pairing_stores:
@@ -1506,6 +1517,9 @@ class GatewayAdapterLifecycleMixin:
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
         adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+        _set_transfer = getattr(adapter, "set_topic_transfer_fn", None)
+        if callable(_set_transfer):
+            _set_transfer(self._transfer_telegram_root_dm)
         adapter.set_authorization_check(
             authorization_check or self._make_adapter_auth_check(adapter.platform)
         )
@@ -1594,7 +1608,8 @@ class GatewayAdapterLifecycleMixin:
             carry_inbound_dedup(predecessor, adapter)
             try:
                 self._configure_profile_adapter(adapter, profile_name, platform)
-                success = await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
+                success = await self._connect_adapter_with_timeout(
+                    adapter, platform, is_reconnect=True, predecessor=predecessor)
             except BaseException:
                 # Caller never sees this adapter; release its partial resources and return its held inbound.
                 await self._safe_adapter_disconnect(adapter, platform)
@@ -1849,13 +1864,21 @@ class GatewayAdapterLifecycleMixin:
         visible here)."""
         from gateway.run import _async_profile_runtime_scope
         profile_home = self._routed_profile_home(profile_name)
+        from gateway.session_ingress_context import native_callback, register_transport_home
+        # An unresolvable named profile has no transport home: the native callback then fails
+        # closed under session authority (``profile_mismatch``) instead of naming a path.
+        transport_home = None if profile_home is UNRESOLVED_PROFILE_HOME else profile_home
+        register_transport_home(self, profile_name, transport_home)
 
-        async def _handler(event):
+        async def _handler(_runner, event):
             self._canonicalize(getattr(event, "source", None), transport_profile=profile_name)
-            async with self._async_scope_or_null(_async_profile_runtime_scope, profile_home):
-                return await self._handle_message(event)
+            if transport_home is not None:
+                event.source._authorization_profile_home = transport_home
+            with native_callback(self, event, transport_home, profile_name):
+                async with self._async_scope_or_null(_async_profile_runtime_scope, profile_home):
+                    return await self._handle_message(event)
 
-        return _handler
+        return _handler.__get__(self)
 
     def _make_profile_busy_session_handler(self, profile_name: str):
         """Busy-path twin: canonicalize FIRST, then resolve busy policy under the profile scope
@@ -1875,14 +1898,18 @@ class GatewayAdapterLifecycleMixin:
         with the transport profile (a routed profile may have no credential/allowlist)."""
         from gateway.run import _async_profile_runtime_scope, get_hermes_home
         default_home = Path(get_hermes_home())
+        from gateway.session_ingress_context import register_transport_home
+        register_transport_home(self, None, default_home)
 
-        async def _handler(event):
+        async def _handler(_runner, event):
             # A rejected route still enters ``_handle_message``, whose ingress gate drops it fail-closed.
             profile_home = self._admit_primary_source(event.source, default_home) or default_home
-            async with _async_profile_runtime_scope(profile_home):
-                return await self._handle_message(event)
+            from gateway.session_ingress_context import native_callback
+            with native_callback(self, event, default_home):
+                async with _async_profile_runtime_scope(profile_home):
+                    return await self._handle_message(event)
 
-        return _handler
+        return _handler.__get__(self)
 
     def _make_default_profile_busy_session_handler(self):
         """Busy-path twin of ``_make_default_profile_message_handler``: busy callbacks bypass the message
@@ -1914,7 +1941,8 @@ class GatewayAdapterLifecycleMixin:
 
     def _primary_message_handler(self):
         """Return the correctly scoped handler for a primary adapter."""
-        if self._multiplex_on():
+        shared = getattr(self, 'session_authority', None) is not None
+        if self._multiplex_on() or shared:
             return self._make_default_profile_message_handler()
         return self._standalone_scoped(self._handle_message)
 
@@ -1927,10 +1955,13 @@ class GatewayAdapterLifecycleMixin:
     def _standalone_scoped(self, handler):
         """Standalone twin of the ``_make_default_profile_*`` wrappers: run ``handler`` under
         ``_standalone_launch_scope`` so slash commands and turns keep resolving the launch profile's
-        credentials after a hosted room flipped the process-wide guard (#112878). Decided per event:
-        activation happens after the adapters were wired."""
+        credentials after a hosted room flipped the process-wide guard (#112878). The credential
+        body is marked at entry (``launch_body``): a turn already running when a second profile
+        switches this gateway to multiplexing keeps resolving its launch credentials."""
+        from tui_gateway.launch_profile_policy import launch_body
+
         async def _handler(*args):
-            with self._standalone_launch_scope():
+            with launch_body(), self._standalone_launch_scope():
                 return await handler(*args)
 
         return _handler

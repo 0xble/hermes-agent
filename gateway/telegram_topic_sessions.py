@@ -235,7 +235,7 @@ async def _apply_session_settings(
                 warnings.append(result.warning_message)
     if effort is not None or reasoning_reset:
         runner._session_state(entry.session_key)
-        previous = runner._session_reasoning_override(entry.session_key)
+        previous = await runner._session_reasoning_override_async(entry.session_key)
         selected = None if reasoning_reset else effort
         if previous != selected:
             await asyncio.to_thread(runner._set_reasoning_override, entry.session_key, selected, dest)
@@ -303,7 +303,8 @@ async def _origin_line(runner, adapter, source: SessionSource) -> str:
     icon = None
     db = getattr(runner, "_session_db", None)
     try:
-        session_id = runner.session_store.peek_session_id(runner._session_key_for_source(source))
+        session_id = await asyncio.to_thread(
+            runner.session_store.peek_session_id, runner._session_key_for_source(source))
         if db is not None:
             if not session_id:
                 binding = await db.get_telegram_topic_binding(
@@ -479,7 +480,9 @@ async def _topic_exists(runner, dest: SessionSource, thread_id: str) -> bool:
             profile_name=runner._telegram_topic_profile_name(dest))
         if binding:
             return True
-    return runner.session_store.peek_session_id(runner._session_key_for_source(dest)) is not None
+    session_id = await asyncio.to_thread(
+        runner.session_store.peek_session_id, runner._session_key_for_source(dest))
+    return session_id is not None
 
 
 async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -> dict:

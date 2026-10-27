@@ -227,6 +227,9 @@ def test_quarantine_during_writability_preflight_is_not_readonly(
 
     def opener():
         try:
+            # Startup serializes quarantine and full preflight under one lock. Test
+            # standalone preflight so the peer can quarantine before the probe resumes.
+            hs.preflight_db_writability(db)
             sdb = hs.SessionDB(db_path=db)
             try:
                 if next_opener_recreates:

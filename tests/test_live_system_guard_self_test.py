@@ -5,7 +5,9 @@ tests fail. If anyone adds a NEW kill primitive to the codebase without
 adding it to the guard, the corresponding test added here will fail too.
 
 The guard exists to protect the developer's live ``hermes-gateway`` process
-from being SIGTERMed by tests. See PR #23397 for the original incident
+from being SIGTERMed by tests, and every live Hermes systemd unit
+(``hermes-gateway*``, ``hermes-dashboard*``, ``hermes-serve*``) from being
+restarted or stopped by them. See PR #23397 for the original incident
 (5+ live gateway kills in 3 days). Per Teknium 2026-05-10:
 
   > "You better do such a deep scan and scrub of the tests that this
@@ -22,6 +24,8 @@ import signal
 import subprocess
 import sys
 import types
+from contextlib import contextmanager
+from unittest.mock import Mock
 
 import pytest
 
@@ -115,6 +119,440 @@ def test_os_kill_blocks_negative_one():
 def test_os_killpg_blocks_foreign_pgid():
     with pytest.raises(RuntimeError, match="live-system guard"):
         os.killpg(FOREIGN_PID, signal.SIGTERM)
+
+
+@contextmanager
+def _record_signal_delivery(request, *, deliver=False):
+    """Install the real fixture above recording sinks, never bypass its checks."""
+    from tests._fixtures.live_system_guard import _live_system_guard
+
+    with pytest.MonkeyPatch.context() as patch:
+        kill = Mock(wraps=os.kill if deliver else None)
+        killpg = Mock(wraps=os.killpg if deliver else None) if hasattr(os, "killpg") else None
+        patch.setattr(os, "kill", kill)
+        if killpg is not None:
+            patch.setattr(os, "killpg", killpg)
+        guard = _live_system_guard.__wrapped__(request, patch)
+        next(guard)
+        try:
+            yield kill, killpg
+        finally:
+            with pytest.raises(StopIteration):
+                next(guard)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("primitive", ["kill", "killpg"])
+def test_signal_guard_preserves_zero_as_own_group(request, primitive):
+    # Recording sinks prove pass-through without signalling pytest's own group.
+    with _record_signal_delivery(request) as (kill, killpg):
+        getattr(os, primitive)(0, signal.SIGTERM)
+        sink = kill if primitive == "kill" else killpg
+        assert sink is not None
+        sink.assert_called_once_with(0, signal.SIGTERM)
+
+
+def _missing_signal_target(state, primitive, pid, target, lookup, monkeypatch):
+    import psutil
+
+    if state == "missing_during_parents":
+        target.parents.side_effect = psutil.NoSuchProcess(pid)
+    else:
+        lookup.side_effect = psutil.NoSuchProcess(pid)
+    if not state.startswith("missing_leader_"):
+        return ProcessLookupError
+    # A missing leader is not proof of either group ownership or absence.
+    member = Mock(pid=pid + 1)
+    member.create_time.return_value = 11.0
+    member.parents.return_value = (
+        [types.SimpleNamespace(pid=os.getpid())]
+        if state == "missing_leader_owned_member" else []
+    )
+
+    def leader_gone(value):
+        if value == member.pid:
+            return member
+        raise psutil.NoSuchProcess(value)
+
+    lookup.side_effect = leader_gone
+    pids = Mock(return_value=[member.pid])
+    getpgid = Mock(return_value=pid)
+    monkeypatch.setattr(psutil, "pids", pids)
+    monkeypatch.setattr(os, "getpgid", getpgid, raising=False)
+    if state == "missing_leader_reaped_member":
+        getpgid.side_effect = ProcessLookupError()
+    elif state == "missing_leader_unverifiable_member":
+        getpgid.side_effect = PermissionError()
+    elif state == "missing_leader_unverifiable_scan":
+        pids.side_effect = psutil.AccessDenied(member.pid)
+    if primitive == "killpg" and state == "missing_leader_owned_member":
+        return None
+    return (
+        RuntimeError if primitive == "killpg" and state != "missing_leader_reaped_member"
+        else ProcessLookupError
+    )
+
+
+@pytest.mark.parametrize("primitive", ["kill", pytest.param("killpg", marks=pytest.mark.platforms("posix"))])
+@pytest.mark.parametrize(
+    "state",
+    [
+        "owned", "foreign", "foreign_ancestor_gone", "missing_before", "missing_during_parents",
+        "access_denied_before", "access_denied_parents", "access_denied_identity",
+        "unexpected_lookup_error", "initial_owned", "initial_recycled",
+        "initial_unverifiable", "recycled_during_parents",
+        "missing_leader_owned_member", "missing_leader_foreign_member",
+        "missing_leader_unverifiable_member", "missing_leader_unverifiable_scan",
+        "missing_leader_reaped_member",
+    ],
+)
+def test_signal_guard_only_delivers_to_verified_owned_targets(request, monkeypatch, primitive, state):
+    """Vanished PIDs are not an allowlist, and a missing leader is not a missing group."""
+    import psutil
+
+    pid = 987654321
+    target = Mock(pid=pid)
+    target.create_time.return_value = 10.0
+    target.children.return_value = []
+    target.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
+    owner = Mock()
+    owner.children.return_value = [target] if state.startswith("initial_") else []
+    lookup = Mock(side_effect=lambda value: owner if value == os.getpid() else target)
+    monkeypatch.setattr(psutil, "Process", lookup)
+    monkeypatch.setattr(psutil, "pids", Mock(return_value=[pid]))
+    monkeypatch.setattr(os, "getpgid", Mock(return_value=pid), raising=False)
+
+    with _record_signal_delivery(request) as (kill, killpg):
+        sink = kill if primitive == "kill" else killpg
+        assert sink is not None
+        if state == "initial_owned":
+            target.parents.return_value = []  # Identity survives reparenting.
+        expected = RuntimeError
+        if state in {"owned", "initial_owned"}:
+            expected = None
+        elif state == "foreign":
+            target.parents.return_value = []
+        elif state == "foreign_ancestor_gone":
+            # A vanished ancestor does not prove that this specific target vanished.
+            target.parents.side_effect = psutil.NoSuchProcess(pid + 1)
+        elif state.startswith("missing_"):
+            expected = _missing_signal_target(state, primitive, pid, target, lookup, monkeypatch)
+        elif state == "access_denied_before":
+            lookup.side_effect = psutil.AccessDenied(pid)
+        elif state == "access_denied_parents":
+            target.parents.side_effect = psutil.AccessDenied(pid)
+        elif state in {"access_denied_identity", "initial_unverifiable"}:
+            target.create_time.side_effect = psutil.AccessDenied(pid)
+        elif state == "unexpected_lookup_error":
+            lookup.side_effect = ValueError("unverifiable process identity")
+            expected = ValueError
+        elif state == "initial_recycled":
+            target.create_time.return_value = 20.0
+        elif state == "recycled_during_parents":
+            replacement = Mock(pid=pid)
+            replacement.create_time.return_value = 20.0
+            lookup.side_effect = [target, replacement]
+
+        if expected is None:
+            getattr(os, primitive)(pid, signal.SIGTERM)
+            sink.assert_called_once_with(pid, signal.SIGTERM)
+        else:
+            with pytest.raises(expected):
+                getattr(os, primitive)(pid, signal.SIGTERM)
+            sink.assert_not_called()
+        other = killpg if primitive == "kill" else kill
+        if other is not None:
+            other.assert_not_called()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("primitive", ["kill", "killpg"])
+@pytest.mark.parametrize("interleave", ["live", "reap_before_handle", "reap_during_parents"])
+def test_signal_guard_handles_owned_child_exit_interleavings(request, monkeypatch, primitive, interleave):
+    """Synchronize real child exit at the two inspection boundaries, without delays."""
+    import psutil
+
+    with _record_signal_delivery(request, deliver=True) as sinks, subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    ) as child:
+        original_process = psutil.Process
+        original_init = psutil.Process.__init__
+        original_parents = psutil.Process.parents
+        identity = original_process(child.pid).create_time()
+        assert original_process(child.pid).ppid() == os.getpid()
+        assert os.getpgid(child.pid) == child.pid
+        assert child.stdin is not None
+
+        def reap():
+            child.stdin.close()
+            assert child.wait(timeout=5) == 0
+
+        def inspect_process(process, pid=None):
+            if pid == child.pid and interleave == "reap_before_handle":
+                reap()
+            original_init(process, pid)
+
+        def inspect_parents(process):
+            if process.pid == child.pid and interleave == "reap_during_parents":
+                reap()
+            return original_parents(process)
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(original_process, "__init__", inspect_process)
+                patch.setattr(original_process, "parents", inspect_parents)
+                sink = sinks[0] if primitive == "kill" else sinks[1]
+                assert sink is not None
+                if interleave == "live":
+                    getattr(os, primitive)(child.pid, signal.SIGTERM)
+                    assert child.wait(timeout=5) == -signal.SIGTERM
+                    sink.assert_called_once_with(child.pid, signal.SIGTERM)
+                else:
+                    with pytest.raises(ProcessLookupError):
+                        getattr(os, primitive)(child.pid, signal.SIGTERM)
+                    for sink in sinks:
+                        assert sink is not None
+                        sink.assert_not_called()
+        finally:
+            if child.poll() is None:
+                assert original_process(child.pid).create_time() == identity
+                reap()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("primitive", ["kill", "killpg"])
+def test_signal_guard_keeps_owned_orphan_identity(request, primitive):
+    """A verified helper remains owned after TERM reaps its group leader."""
+    import psutil
+
+    script = (
+        "import os,signal,sys\n"
+        "if os.fork() == 0:\n"
+        " signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        " print(os.getpid(), flush=True)\n"
+        "sys.stdin.buffer.read()\n"
+    )
+    with _record_signal_delivery(request, deliver=True), subprocess.Popen(
+        [sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        start_new_session=True, text=True,
+    ) as leader:
+        assert leader.stdin is not None and leader.stdout is not None
+        helper = psutil.Process(int(leader.stdout.readline()))
+        identity = helper.create_time()
+        try:
+            os.kill(leader.pid, signal.SIGTERM)
+            assert leader.wait(timeout=5) == -signal.SIGTERM
+            assert all(parent.pid != os.getpid() for parent in helper.parents())
+            assert helper.create_time() == identity
+            getattr(os, primitive)(helper.pid if primitive == "kill" else leader.pid, signal.SIGKILL)
+            assert leader.stdout.read() == ""  # EOF proves the surviving helper released its pipe.
+        finally:
+            leader.stdin.close()  # Also releases the helper if an assertion failed.
+            leader.stdout.close()
+
+
+@pytest.mark.platforms("posix")
+def test_signal_guard_owns_orphans_in_a_live_owned_session(request):
+    """A shell can orphan helpers itself, before Python ever sends a signal."""
+    import psutil
+
+    script = (
+        "import os,sys\n"
+        "middle = os.fork()\n"
+        "if middle == 0:\n"
+        " if os.fork() != 0: os._exit(0)\n"
+        " print(os.getpid(), flush=True)\n"
+        "else:\n"
+        " os.waitpid(middle, 0)\n"
+        " print('ready', flush=True)\n"
+        "sys.stdin.buffer.read()\n"
+    )
+    with _record_signal_delivery(request, deliver=True) as (_, killpg), subprocess.Popen(
+        [sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        start_new_session=True, text=True,
+    ) as leader:
+        assert leader.stdin is not None and leader.stdout is not None
+        lines = {leader.stdout.readline().strip(), leader.stdout.readline().strip()}
+        assert "ready" in lines
+        helper = psutil.Process(int((lines - {"ready"}).pop()))
+        try:
+            assert leader.poll() is None
+            assert all(parent.pid != os.getpid() for parent in helper.parents())
+            assert os.getsid(helper.pid) == os.getsid(leader.pid) == leader.pid
+            assert os.getpgid(helper.pid) == leader.pid
+            os.killpg(leader.pid, signal.SIGKILL)
+            assert killpg is not None
+            killpg.assert_called_once_with(leader.pid, signal.SIGKILL)
+            assert leader.wait(timeout=5) == -signal.SIGKILL
+            assert leader.stdout.read() == ""
+        finally:
+            leader.stdin.close()  # EOF releases both processes even if the guard refuses.
+            leader.wait(timeout=5)
+            leader.stdout.close()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("state", ["owned", "recycled", "unverifiable", "foreign", "mixed"])
+@pytest.mark.parametrize("leader_exited", [False, True])
+def test_signal_guard_rechecks_group_members(request, monkeypatch, state, leader_exited):
+    """Saved ownership never authorizes a replacement or a foreign group member."""
+    import psutil
+
+    leader_pid = 987654321
+    member = Mock(pid=leader_pid + 1)
+    member.create_time.return_value = 10.0
+    member.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
+    foreign = Mock(pid=leader_pid + 2)
+    foreign.create_time.return_value = 20.0
+    foreign.parents.return_value = []
+    leader = Mock(pid=leader_pid)
+    leader.create_time.return_value = 9.0
+    leader.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
+    leader.children.return_value = [member]
+    owner = Mock()
+    owner.children.return_value = []
+    processes = {os.getpid(): owner, leader_pid: leader, member.pid: member}
+
+    def lookup(pid):
+        if pid not in processes:
+            raise psutil.NoSuchProcess(pid)
+        return processes[pid]
+
+    monkeypatch.setattr(psutil, "Process", lookup)
+    monkeypatch.setattr(psutil, "pids", lambda: [pid for pid in processes if pid != os.getpid()])
+    monkeypatch.setattr(os, "getpgid", lambda pid: leader_pid)
+    with _record_signal_delivery(request) as (kill, killpg):
+        os.kill(leader_pid, signal.SIGTERM)
+        kill.assert_called_once_with(leader_pid, signal.SIGTERM)
+        if leader_exited:
+            del processes[leader_pid]
+        member.parents.return_value = []
+        if state == "recycled":
+            member.create_time.return_value = 30.0
+        elif state == "unverifiable":
+            member.create_time.side_effect = psutil.AccessDenied(member.pid)
+        elif state in {"foreign", "mixed"}:
+            processes[foreign.pid] = foreign
+            if state == "foreign":
+                del processes[member.pid]
+        assert killpg is not None
+        if state == "owned":
+            os.killpg(leader_pid, signal.SIGKILL)
+            killpg.assert_called_once_with(leader_pid, signal.SIGKILL)
+        else:
+            with pytest.raises(RuntimeError, match="live-system guard"):
+                os.killpg(leader_pid, signal.SIGKILL)
+            killpg.assert_not_called()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("state", [
+    "owned", "foreign_session", "older_member", "recycled_member", "recycled_leader",
+    "unverifiable_member", "unverifiable_session", "changed_session", "leader_gone",
+    "cached_stale_member", "not_session_leader", "changed_leader_session", "changed_leader_identity",
+    "changed_group",
+])
+def test_signal_guard_requires_verified_session_provenance(request, monkeypatch, state):
+    """Group membership alone never authorizes an otherwise unowned process."""
+    import psutil
+
+    pgid = 987654321
+    leader = Mock(pid=pgid)
+    leader.create_time.return_value = 10.0
+    leader.children.return_value = []
+    leader.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
+    member = Mock(pid=pgid + 1)
+    member.create_time.return_value = 11.0
+    member.parents.return_value = []
+    owner = Mock()
+    owner.children.return_value = [leader, member] if state == "cached_stale_member" else [leader]
+    monkeypatch.setattr(psutil, "Process", lambda pid: {
+        os.getpid(): owner, pgid: leader, member.pid: member,
+    }[pid])
+    monkeypatch.setattr(psutil, "pids", lambda: [member.pid, pgid])
+    monkeypatch.setattr(os, "getpgid", lambda pid: pgid)
+    getsid = Mock(return_value=pgid)
+    monkeypatch.setattr(os, "getsid", getsid)
+
+    def foreign_session():
+        getsid.side_effect = lambda pid: pgid + 2 if pid == member.pid else pgid
+
+    def older_member():
+        member.create_time.return_value = 9.0
+
+    def recycled_member():
+        # psutil caches create_time on a handle. Only a fresh lookup sees
+        # the replacement, so re-reading the original handle is unsafe.
+        replacement = Mock(pid=member.pid)
+        replacement.create_time.return_value = 12.0
+        member_handles = iter([member, member, replacement])
+        lookup = psutil.Process
+        monkeypatch.setattr(psutil, "Process", lambda pid: (
+            next(member_handles) if pid == member.pid else lookup(pid)
+        ))
+
+    def recycled_leader():
+        leader.create_time.return_value = 12.0
+
+    def unverifiable_member():
+        member.create_time.side_effect = psutil.AccessDenied(member.pid)
+
+    def unverifiable_session():
+        getsid.side_effect = PermissionError()
+
+    def changed_session():
+        member_sessions = iter([pgid, pgid + 2])
+        getsid.side_effect = lambda pid: next(member_sessions) if pid == member.pid else pgid
+
+    def leader_gone():
+        leader.create_time.side_effect = psutil.NoSuchProcess(pgid)
+
+    def cached_stale_member():
+        member.create_time.return_value = 12.0
+
+    def not_session_leader():
+        getsid.side_effect = lambda pid: pgid + 2 if pid == pgid else pgid
+
+    def changed_leader_session():
+        leader_sessions = iter([pgid, pgid + 2])
+        getsid.side_effect = lambda pid: next(leader_sessions) if pid == pgid else pgid
+
+    def changed_leader_identity():
+        leader.create_time.side_effect = [10.0, 10.0, 10.0, 12.0]
+
+    def changed_group():
+        member_groups = iter([pgid, pgid + 2])
+        monkeypatch.setattr(os, "getpgid", lambda pid: next(member_groups))
+
+    arrange = {
+        "owned": lambda: None,
+        "foreign_session": foreign_session,
+        "older_member": older_member,
+        "recycled_member": recycled_member,
+        "recycled_leader": recycled_leader,
+        "unverifiable_member": unverifiable_member,
+        "unverifiable_session": unverifiable_session,
+        "changed_session": changed_session,
+        "leader_gone": leader_gone,
+        "cached_stale_member": cached_stale_member,
+        "not_session_leader": not_session_leader,
+        "changed_leader_session": changed_leader_session,
+        "changed_leader_identity": changed_leader_identity,
+        "changed_group": changed_group,
+    }
+
+    with _record_signal_delivery(request) as (_, killpg):
+        arrange[state]()
+        assert killpg is not None
+        if state == "owned":
+            os.killpg(pgid, signal.SIGKILL)
+            killpg.assert_called_once_with(pgid, signal.SIGKILL)
+        else:
+            with pytest.raises(RuntimeError, match="live-system guard"):
+                os.killpg(pgid, signal.SIGKILL)
+            killpg.assert_not_called()
 
 
 # ──────────────────── subprocess regex bypasses ────────────────
@@ -334,9 +772,83 @@ def test_subprocess_run_bash_c_systemctl_blocked():
 
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["systemctl", "--user", "restart", "hermes-dashboard.service"],
+        ["systemctl", "--user", "restart", "hermes-dashboard-work.service"],
+        ["systemctl", "--user", "stop", "hermes-serve"],
+        ["/usr/bin/systemctl", "--user", "--no-ask-password", "restart", "hermes-serve-work.service"],
+        ["bash", "-c", "systemctl --user restart hermes-dashboard.service"],
+        "systemctl --user restart hermes-dashboard-work.service",
+        'bash -c "systemctl --user restart hermes-serve.service"',
+    ],
+)
+def test_subprocess_run_systemctl_mutating_any_hermes_unit_blocked(cmd):
+    """Not just the gateway: a test that forgot to stub the runner restarted the developer's
+    real hermes-dashboard / hermes-serve units, which the gateway-only tokens let through."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(cmd, shell=isinstance(cmd, str), check=False)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["systemctl", "--user", "show", "hermes-dashboard.service", "--property=MainPID"],
+        ["systemctl", "--user", "status", "hermes-dashboard"],
+        ["systemctl", "--user", "is-active", "hermes-serve.service"],
+        ["systemctl", "--user", "restart", "nginx.service"],
+        ["systemctl", "--user", "restart", "myhermes-dashboard.service"],
+    ],
+)
+def test_subprocess_run_systemctl_read_only_or_foreign_unit_passes_guard(cmd):
+    """Read-only verbs on Hermes units and mutating verbs on other units reach the real
+    ``subprocess.run``; an empty PATH turns that into FileNotFoundError, never a real systemctl."""
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(cmd, env={"PATH": "/nonexistent"}, check=False)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["bash", "-c", r"systemctl st\op hermes.service"],
+        ["bash", "-c", r"systemctl --user rest\art hermes-dashboard"],
+        r"systemctl --user re\start hermes-serve.service",
+        ["bash", "-c", "sh -c 'systemctl --user restart hermes-dashboard'"],
+    ],
+)
+def test_subprocess_run_shell_escaped_or_nested_verb_blocked(cmd):
+    """The shell runs ``rest\\art`` as ``restart``; the guard must read it the same way."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(cmd, shell=isinstance(cmd, str), check=False)
+
+
+def test_a_test_owned_unit_can_be_cleaned_up_but_no_other(request):
+    """A unit the test created under its own name may be stopped; every other Hermes unit stays refused."""
+    owned = "hermes-worker-kanban-t_selftest-run-1.scope"
+    request.node.live_system_guard_owned_units = {owned}
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(["systemctl", "--user", "stop", owned], env={"PATH": "/nonexistent"}, check=False)
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["systemctl", "--user", "stop", owned, "hermes-dashboard.service"], check=False)
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["systemctl", "--user", "stop", "hermes-worker-kanban-other-run-1.scope"], check=False)
+
+
 def test_subprocess_run_setsid_systemctl_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
         subprocess.run(["setsid", "systemctl", "kill", "hermes-gateway"], check=False)
+
+
+def test_host_gateway_start_blocked_but_container_exec_allowed():
+    """A host-side ``hermes gateway start`` spawns a real runtime; the same words addressed to
+    a container via ``docker exec`` stay inside it and are the Docker harness's business."""
+    with pytest.raises(RuntimeError, match="REAL hermes gateway runtime"):
+        subprocess.run(["hermes", "-p", "p", "gateway", "start"], check=False)
+    argv = ["docker", "exec", "-u", "hermes", "hermes-test-x", "sh", "-c", "hermes -p p gateway start"]
+    # Past the guard the call reaches the real subprocess.run; a missing binary is fine here.
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(argv, env={"PATH": "/nonexistent"}, check=False)
 
 
 def test_subprocess_run_string_shell_true_blocked():

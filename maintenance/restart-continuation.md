@@ -85,8 +85,9 @@ translated, and the retired cause-based keys were removed.
 Post-restart intake uses one process-wide `ReplayScheduler` with FIFO order inside
 priority lanes. Restored human input enters before empty synthetic resumes.
 Recovered follow-ups wait for their own session's resume and use the deferred
-lane. `gateway.restart_replay_concurrency` defaults to 2. Delegation, goal and
-notification wakes remain outside this scheduler. Live authorized gateway controls bypass
+lane. `gateway.restart_replay_concurrency` defaults to 2. Resumes and delegation, goal and
+notification wakes also wait for the gateway-wide turn cap in
+[background turn admission](background-turn-admission.md). Live authorized gateway controls bypass
 session restore fences. A stopped synthetic resume must lose its pending preclaim
 before dispatch and must never be resurrected by the scheduler.
 

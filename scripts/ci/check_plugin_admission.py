@@ -21,9 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import hermes_yaml as yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from validate_plugin_catalog import validate_entry  # noqa: E402
+from validate_plugin_catalog import validate_entry
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from release_baseline import accepted_release_baseline  # noqa: E402
+from release_baseline import accepted_release_baseline
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -53,7 +53,12 @@ def run(command: list[str], *, cwd: Path, timeout: float = 120) -> str:
         process.communicate()
         raise
     if process.returncode:
-        raise RuntimeError(f"{command[0]} exited {process.returncode}: {stderr.strip() or stdout.strip()}")
+        details = "\n".join(
+            f"{label}:\n{output.strip()}"
+            for label, output in (("stdout", stdout), ("stderr", stderr))
+            if output.strip()
+        )
+        raise RuntimeError(f"{command[0]} exited {process.returncode}:\n{details}")
     return stdout
 
 

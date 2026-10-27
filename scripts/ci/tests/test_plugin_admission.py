@@ -150,6 +150,22 @@ class PluginAdmissionTests(unittest.TestCase):
                 self.admit(self.entry(sha=symlink_pin))
             self.assertEqual(list(self.clones.iterdir()), [])
 
+    def test_validator_failure_preserves_both_output_streams(self):
+        self.validator.write_text(
+            "import sys\n"
+            "print('capability probe failed')\n"
+            "print('dependencies installed', file=sys.stderr)\n"
+            "raise SystemExit(7)\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(RuntimeError) as failure:
+            self.admit(self.entry())
+        message = str(failure.exception)
+        self.assertIn("exited 7", message)
+        self.assertIn("stdout:\ncapability probe failed", message)
+        self.assertIn("stderr:\ndependencies installed", message)
+        self.assertEqual(list(self.clones.iterdir()), [])
+
     def test_entries_identical_to_the_accepted_release_are_not_readmitted(self):
         directory = self.catalog / "plugin-catalog"
         directory.mkdir()

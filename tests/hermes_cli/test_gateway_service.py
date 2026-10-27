@@ -189,8 +189,8 @@ class TestServiceIdentityForForeignHome:
         home = tmp_path / "home"
         home.mkdir()
         monkeypatch.setattr(Path, "home", lambda: home)
-        # The user unit dir follows the ACCOUNT home (#98699), which is read from the environment.
-        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(hermes_constants, "_account_home", lambda: home)  # names services
+        monkeypatch.setenv("HOME", str(home))  # the user unit dir follows it (#98699)
         monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
         monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
         return home
@@ -1653,7 +1653,10 @@ class TestHermesHomeForTargetUser:
     """Unit tests for _hermes_home_for_target_user()."""
 
     def test_remaps_default_home(self, monkeypatch):
+        import hermes_constants
+
         monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
+        monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: Path("/root/.hermes"))
         monkeypatch.delenv("HERMES_HOME", raising=False)
 
         result = gateway_cli._hermes_home_for_target_user("/home/alice")
@@ -2979,7 +2982,7 @@ class TestUnitAnchoredServiceIdentity:
             f'[Service]\nEnvironment="HERMES_HOME={alice_home}"\n', encoding="utf-8"
         )
         monkeypatch.setattr(gateway_cli, "_SYSTEM_UNIT_DIR", unit_dir)
-        monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: root_home)
+        monkeypatch.setattr(hermes_constants, "account_default_hermes_home", lambda: root_home)
         monkeypatch.setenv("HERMES_HOME", str(bob_home))
         name = gateway_cli.get_service_name()
         assert name != gateway_cli._SERVICE_BASE
@@ -3018,7 +3021,7 @@ class TestUnitAnchoredServiceIdentity:
         unit_path.write_text(f'[Service]\nEnvironment="HERMES_HOME={profile_home}"\n', encoding="utf-8")
         monkeypatch.setattr(gateway_cli, "_SYSTEM_UNIT_DIR", unit_dir)
         monkeypatch.setattr(os, "geteuid", lambda: 0)
-        monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: root_home)
+        monkeypatch.setattr(hermes_constants, "account_default_hermes_home", lambda: root_home)
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
         assert gateway_cli.get_service_name() == gateway_cli._SERVICE_BASE
         # The profile branch, consulted against the home that owns the profile, would have answered
@@ -3040,6 +3043,8 @@ class TestUnitAnchoredServiceIdentity:
         )
         monkeypatch.setattr(gateway_cli, "_SYSTEM_UNIT_DIR", unit_dir)
         monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr(hermes_constants, "account_default_hermes_home", lambda: root_home)
+        # Account identity and the process fallback must describe the same sudo home.
         monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: root_home)
         monkeypatch.delenv("HERMES_HOME", raising=False)
 

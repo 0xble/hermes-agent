@@ -90,6 +90,7 @@ describe('messagePaintWeight', () => {
         toolName: 'todo',
         args: { todos: Array.from({ length: 40 }, (_, i) => ({ content: `t${i}` })) }
       },
+      { type: 'tool-call', toolName: 'react', args: { emoji: '❤️' } },
       { type: 'tool-call', toolName: 'react_to_message', args: { emoji: '❤️' } }
     ]
 

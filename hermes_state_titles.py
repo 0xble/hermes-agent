@@ -25,6 +25,17 @@ def _auto_title_matches(stored: str, candidate: str) -> bool:
     return stored.casefold() == candidate or _NUMBERED_TITLE_RE.sub(r'\1', stored).casefold() == candidate
 
 
+def _auto_title_collides(conn, title: str, exclude_session_id: str) -> bool:
+    """True when another session holds *title* under the automatic-title equivalence rule."""
+    # SQLite's lower()/NOCASE do not implement Unicode casefolding.
+    conn.create_function("auto_title_matches", 2, _auto_title_matches, deterministic=True)
+    return conn.execute(
+        "SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL "
+        "AND auto_title_matches(title, ?) LIMIT 1",
+        (exclude_session_id or "", title.casefold()),
+    ).fetchone() is not None
+
+
 def next_title_in_lineage(conn, base_title: str) -> str:
     """Next title in a lineage ("my session" -> "my session #2") as seen by *conn*: strip any
     " #N" suffix, then increment the highest existing number."""
@@ -85,62 +96,79 @@ class SessionTitlesMixin:
             SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
             """, (descendant_id, ancestor_id, descendant_id)).fetchone() is not None
 
-    def _set_session_title(self, session_id: str, title: str, *, source: str) -> bool:
+    def _set_session_title(self, session_id: str, title: str, *, source: str,
+                           reject_auto_collision: bool = False) -> bool:
         """Write a title, enforcing provenance precedence. A ``user`` write always lands;
         ``derived``/``llm`` land only when the row is untitled or holds strictly lower
         authority (derived upgrades to llm exactly once, nothing overwrites a user name,
         re-running the titler on an llm row is a no-op). No writer may move a hidden
         canonical Bot Chat off its title. Read and write are one compare-and-swap
-        transaction, so a manual ``/title`` racing an in-flight generation is not clobbered."""
+        transaction, so a manual ``/title`` racing an in-flight generation is not clobbered.
+        ``reject_auto_collision`` refuses an automatic title equivalent to another session's
+        inside that same write transaction, so concurrent workers cannot both pass a check."""
+        return bool(self._execute_write(
+            lambda conn: self._set_session_title_in_transaction(
+                conn, session_id, title, source=source, reject_auto_collision=reject_auto_collision,
+            )
+        ))
+
+    def _set_session_title_in_transaction(self, conn, session_id: str, title: str, *, source: str,
+                                          reject_auto_collision: bool = False):
+        """Reuse title rules within an authority-owned transaction; never commit here."""
         title = self.sanitize_title(title)
         is_user = source == self.TITLE_SOURCE_USER
         new_rank = self._title_rank(source) if not is_user else None
+        affected = []
 
-        def _do(conn):
-            current = conn.execute(
-                "SELECT title, title_source, hidden FROM sessions WHERE id = ?", (session_id,),
-            ).fetchone()
-            if current is None:
-                return 0
-            # The canonical Bot Chat's NAME is its identity (Bot Mode resolves it by
-            # exact-title lookup on every open), so a rename orphans the conversation. Hidden
-            # is the discriminator: canonical chats are born hidden; a visible session merely
-            # named "Bot Chat" stays renameable. Provenance-blind.
-            if ((current["title"] or "") == self.CANONICAL_BOT_CHAT_TITLE and bool(current["hidden"])
-                    and title != self.CANONICAL_BOT_CHAT_TITLE):
-                if is_user:
-                    raise ValueError("This is the bot's canonical Bot Chat — its name is its "
-                                     "identity, and renaming it would orphan the conversation. "
-                                     "To start fresh, create a new bot instead.")
-                return 0
-            if not is_user and current["title"] is not None and self._title_rank(current["title_source"]) >= new_rank:
-                return 0
-            if title:
-                self._resolve_title_conflict(conn, session_id, title)
-            # CAS on the values just read (``IS`` is NULL-safe): a concurrent write between
-            # the SELECT and here loses instead of being overwritten.
-            return conn.execute(
-                "UPDATE sessions SET title = ?, title_source = ? WHERE id = ? AND title IS ? AND title_source IS ?",
-                (title, source if title else None, session_id, current["title"], current["title_source"]),
-            ).rowcount
+        current = conn.execute(
+            "SELECT title, title_source, hidden FROM sessions WHERE id = ?", (session_id,),
+        ).fetchone()
+        if current is None:
+            return []
+        # The canonical Bot Chat's NAME is its identity (Bot Mode resolves it by
+        # exact-title lookup on every open), so a rename orphans the conversation. Hidden
+        # is the discriminator: canonical chats are born hidden; a visible session merely
+        # named "Bot Chat" stays renameable. Provenance-blind.
+        if ((current["title"] or "") == self.CANONICAL_BOT_CHAT_TITLE and bool(current["hidden"])
+                and title != self.CANONICAL_BOT_CHAT_TITLE):
+            if is_user:
+                raise ValueError("This is the bot's canonical Bot Chat — its name is its "
+                                 "identity, and renaming it would orphan the conversation. "
+                                 "To start fresh, create a new bot instead.")
+            return []
+        if not is_user and current["title"] is not None and self._title_rank(current["title_source"]) >= new_rank:
+            return []
+        if reject_auto_collision and not is_user and title and _auto_title_collides(conn, title, session_id):
+            return []
+        if title:
+            cleared = self._resolve_title_conflict(conn, session_id, title)
+            if cleared:
+                affected.append(cleared)
+        # CAS on the values just read (``IS`` is NULL-safe): a concurrent write between
+        # the SELECT and here loses instead of being overwritten.
+        changed = conn.execute(
+            "UPDATE sessions SET title = ?, title_source = ? WHERE id = ? AND title IS ? AND title_source IS ?",
+            (title, source if title else None, session_id, current["title"], current["title_source"]),
+        ).rowcount
+        return [*affected, session_id] if changed else affected
 
-        return self._execute_write(_do) > 0
-
-    def _resolve_title_conflict(self, conn, session_id: str, title: str) -> None:
+    def _resolve_title_conflict(self, conn, session_id: str, title: str) -> Optional[str]:
         """Free ``title`` for ``session_id`` inside the caller's write transaction, or raise
         ValueError when another session legitimately holds it. The one place the uniqueness
-        rule lives, shared by renames and the API server's create-with-title."""
+        rule lives, shared by renames and the API server's create-with-title. Returns the id
+        whose title was cleared (an affected row for mutation receipts), else None."""
         conflict = conn.execute(
             f"SELECT id, archived, hidden, {self._EMPTY_SESSION_WHERE} AS ghost "
             "FROM sessions WHERE title = ? AND id != ?", (title, session_id),
         ).fetchone()
         if not conflict:
-            return
+            return None
         conflict_id = conflict["id"]
         # A hidden compressed ancestor holding the title cannot be freed by the
         # user, so transfer it onto the tip (uniqueness + lineage kept).
         if self._is_compression_ancestor(conn, ancestor_id=conflict_id, descendant_id=session_id):
             conn.execute("UPDATE sessions SET title = NULL WHERE id = ?", (conflict_id,))
+            return conflict_id
         # A deliberately archived hidden Bot Chat is a retired registry
         # entry, not a live identity. Retire its name in the same title
         # transaction so a replacement can become the sole canonical row;
@@ -149,14 +177,14 @@ class SessionTitlesMixin:
         # out, so the user cannot find it to free the name) yields too (#81888).
         # The full index stays: a ``message_count > 0`` partial index would make
         # the ghost's first append_message fail with IntegrityError.
-        elif (title == self.CANONICAL_BOT_CHAT_TITLE and bool(conflict["archived"])
+        if (title == self.CANONICAL_BOT_CHAT_TITLE and bool(conflict["archived"])
               and bool(conflict["hidden"])) or (conflict["ghost"] and not conflict["hidden"]):
             conn.execute(
                 "UPDATE sessions SET title = NULL, title_source = NULL WHERE id = ?",
                 (conflict_id,),
             )
-        else:
-            raise ValueError(f"Title '{title}' is already in use by session {conflict_id}")
+            return conflict_id
+        raise ValueError(f"Title '{title}' is already in use by session {conflict_id}")
 
     def set_session_title_in_lineage(self, session_id: str, title: str) -> str:
         """Store the user's exact title, or the next free ``<title> #N`` alias when that exact text
@@ -198,11 +226,12 @@ class SessionTitlesMixin:
         ValueError on conflict or validation failure."""
         return self._set_session_title(session_id, title, source=self.TITLE_SOURCE_USER)
 
-    def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
-        """Set an automatic title; False (untouched) when a higher-authority title holds the row."""
+    def set_auto_title(self, session_id: str, title: str, *, source: str, reject_collision: bool = False) -> bool:
+        """Set an automatic title; False (untouched) when a higher-authority title holds the row,
+        or, with ``reject_collision``, when another session holds an equivalent title."""
         if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
             raise ValueError(f"invalid automatic title source: {source!r}")
-        return self._set_session_title(session_id, title, source=source)
+        return self._set_session_title(session_id, title, source=source, reject_auto_collision=reject_collision)
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -214,13 +243,7 @@ class SessionTitlesMixin:
         if not title:
             return False
         with self._read_ctx() as conn:
-            # SQLite's lower()/NOCASE do not implement Unicode casefolding.
-            conn.create_function("auto_title_matches", 2, _auto_title_matches, deterministic=True)
-            return conn.execute(
-                "SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL "
-                "AND auto_title_matches(title, ?) LIMIT 1",
-                (exclude_session_id or "", title.casefold()),
-            ).fetchone() is not None
+            return _auto_title_collides(conn, title, exclude_session_id or "")
 
     def list_recent_session_titles(self, exclude_session_id: Optional[str] = None, limit: int = 20):
         """Return non-empty titles, newest first, excluding the active session."""
@@ -280,3 +303,9 @@ class SessionTitlesMixin:
     def get_next_title_in_lineage(self, base_title: str) -> str:
         """Next title in a lineage ("my session" -> "my session #2")."""
         return self._read_retrying_ioerr(lambda conn: next_title_in_lineage(conn, base_title))
+
+
+def lineage_title_on_conn(conn, base_title: str) -> str:
+    """``get_next_title_in_lineage`` inside an authority-owned transaction (same connection, so a
+    sibling branch committed in this transaction is counted)."""
+    return next_title_in_lineage(conn, base_title)

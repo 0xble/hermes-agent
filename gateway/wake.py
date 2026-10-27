@@ -35,8 +35,25 @@ def adapter_supports_push(adapter: Any) -> bool:
     return bool(getattr(adapter, "supports_async_delivery", True))
 
 
+# Store refusal codes (``RuntimeStoreError.reason``) that refuse a notice for good by themselves: the
+# route has no session (``not_found``) or the payload is malformed (``invalid_params``). A bare
+# ``admission_conflict`` proves nothing: an unowned completion, or one pinned to a live session the
+# route does not run, may still find its owner (d6635ffe03b), so it is permanent only when the
+# authority's state proves the pin gone (``refusal_proven_permanent``). Every other refusal
+# (``runtime_draining`` during a restart's after-turn wait or a parked profile, ``queue_full``,
+# ``session_busy``, ``stale_epoch``, ...) clears on its own: back off, never give the notice up.
+PERMANENT_REFUSAL_REASONS = frozenset({'not_found', 'invalid_params'})
+
+
 class WakeNotAccepted(RuntimeError):
-    """No adapter admission: retry without treating a healthy chat as dead."""
+    """No adapter admission: retry without treating a healthy chat as dead. ``reason`` is the
+    store's refusal code when the session authority refused it (None: the adapter did not accept);
+    ``permanent`` is set once the refusal is proven final (``refusal_proven_permanent``)."""
+
+    def __init__(self, message: str = "internal wake not accepted by adapter", *, reason: Optional[str] = None):
+        super().__init__(message)
+        self.reason = reason
+        self.permanent = False
 
 
 class WakeSuperseded(WakeNotAccepted):
@@ -80,28 +97,84 @@ def session_owned_by_profile(config: Any, profile: Optional[str], session_id: An
     return bool(row) and (row.get("profile_name") or profile) == profile
 
 
+async def automatic_route_available(runner: Any, source: Any) -> bool:
+    """Suppress automatic work only for an exact, read-only deleted-topic result.
+
+    Topic closure and lookup outages are not deletion. Never probe by sending or
+    change the saved goal, loop, session binding or ownership from this check.
+    """
+    from gateway.config import Platform
+
+    if source.platform != Platform.TELEGRAM or not source.thread_id:
+        return True
+    adapter = runner._delivery_adapter_for(source)
+    bot = getattr(adapter, "_bot", None)
+    if bot is None:
+        return True
+    try:
+        from gateway.telegram_retire import _probe_deleted
+
+        deleted = await _probe_deleted(bot, source, runner=runner, read_only=True)
+    except Exception:
+        logger.debug("automatic wake: topic availability lookup failed", exc_info=True)
+        return True
+    if deleted:
+        logger.info(
+            "automatic wake: exact lookup found no Telegram topic chat=%s thread=%s; "
+            "preserving saved work and skipping wake", source.chat_id, source.thread_id,
+        )
+    return not deleted
+
+
+async def automatic_event_is_current(runner: Any, event: Any) -> bool:
+    """Recheck automatic wake freshness and route before event admission."""
+    from gateway.platforms.event import is_goal_continuation_event
+    from hermes_cli.session_controls import (
+        LOOP_WAKE_METADATA_KEY, internal_wake_is_current, is_gateway_wake,
+    )
+
+    if is_gateway_wake(event) and not await runner._run_in_executor_with_context(
+        internal_wake_is_current, event,
+    ):
+        return False
+    metadata = getattr(event, "metadata", None) or {}
+    if not (is_goal_continuation_event(event) or metadata.get(LOOP_WAKE_METADATA_KEY)):
+        return True
+    return await automatic_route_available(runner, event.source)
+
+
 async def admit_internal_event(adapter: Any, event: Any) -> None:
     """Require a concrete adapter admission, not merely a handler returning None.
 
     The public handler return stays unchanged. This receipt means scheduled/queued,
     not model execution, authorization of a later turn, or successful outbound delivery.
+    A background wake is refused while the gateway-wide turn limit is reached
+    (``gateway/run_background_admission.py``); the caller keeps its claim and retries.
     """
     event._gateway_accepted = False
     metadata = getattr(event, "metadata", None)
+    runner = getattr(adapter, "gateway_runner", None)
     from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
     if is_gateway_wake(event) and not await asyncio.to_thread(internal_wake_is_current, event):
         raise WakeSuperseded("goal continuation or loop tick superseded before admission")
     # Last strict-pin check before admission: an idle adapter admits without awaiting again, so a
     # /new or /resume rebind after the caller's lookup would otherwise be acknowledged here and
     # only dropped at execution. Resolved on the runner's class so test doubles are not awaited.
-    runner = getattr(adapter, "gateway_runner", None)
     pin_holds = getattr(type(runner), "_strict_session_pin_holds", None)
     if (isinstance(metadata, dict) and metadata.get("gateway_session_strict") and pin_holds is not None
             and not await pin_holds(runner, event)):
         raise WakeNotAccepted("pinned session no longer owns its key")
-    await adapter.handle_message(event)
+    # A background wake needs a gateway-wide turn slot; without one it is refused, not queued.
+    # The reservation counts against the limit until the admitted turn claims its session.
+    admit_background = getattr(type(runner), "_admit_background_turn", None)
+    reserved = admit_background(runner, adapter, event) if admit_background is not None else None
+    try:
+        await adapter.handle_message(event)
+    finally:
+        if reserved is not None and event._gateway_accepted is not True:
+            runner._release_background_turn(reserved)
     if event._gateway_accepted is not True:
-        raise WakeNotAccepted("internal wake not accepted by adapter")
+        raise WakeNotAccepted()
 
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
@@ -116,6 +189,16 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
         from gateway.platforms.event import MessageEvent, MessageType
+        runner = getattr(adapter, "gateway_runner", None)
+        if runner is not None:
+            from gateway.session_automation import admit_route_wake
+            from hermes_state_runtime import RuntimeStoreError
+            category = {"notification_category": notification_category} if notification_category != "result" else {}
+            try:
+                if await admit_route_wake(runner, adapter, source, text, "kanban-wake", category):
+                    return  # committed to the session FIFO: never interrupts the admitted turn
+            except RuntimeStoreError as exc:
+                raise WakeNotAccepted(str(exc), reason=exc.reason) from exc
         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
                                    metadata={"notification_category": notification_category})
         await admit_internal_event(adapter, synth_event)

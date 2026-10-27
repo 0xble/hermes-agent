@@ -90,9 +90,12 @@ def format_expiry_duration(seconds: Any) -> str:
 
 
 def format_expiry_remaining(seconds: Any) -> str:
-    """Format remaining time as compact hours/minutes for status and picker text."""
+    """Format remaining time without overstating a sub-minute window."""
     try:
-        total_minutes = max(1, int(float(seconds) / 60))
+        value = float(seconds)
+        if 0 < value < 60:
+            return "<1m"
+        total_minutes = max(1, int(value / 60))
     except (TypeError, ValueError, OverflowError):
         total_minutes = 1
     hours, minutes = divmod(total_minutes, 60)

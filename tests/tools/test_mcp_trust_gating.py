@@ -228,6 +228,7 @@ class TestTrustGateApprovalRouting:
         ("webhook", "", False),
         ("telegram", "1", False),
         ("api_server", "", True),
+        ("local", "", True),  # a `chat -q` turn admitted to the gateway: finite, nobody answers
     ])
     def test_unattended_cron_and_single_query_contexts_do_not_use_callback(
         self, monkeypatch, platform, cron, single_query
@@ -257,7 +258,8 @@ class TestTrustGateApprovalRouting:
         if single_query:
             monkeypatch.setattr(approval_prompt._ctx, "_is_single_query_approval_context", lambda: True)
         try:
-            assert approval_prompt.request_elicitation_consent("write", "Approve once or deny.") == "decline"
+            with pytest.raises(approval_prompt.ApprovalUnavailable):
+                approval_prompt.request_elicitation_consent("write", "Approve once or deny.")
         finally:
             approval.unregister_gateway_notify(session_key)
             reset_current_session_key(key_token)
@@ -286,7 +288,8 @@ class TestTrustGateApprovalRouting:
         asked = []
         set_approval_callback(lambda *args, **kwargs: asked.append(args) or "once")
         try:
-            assert approval_prompt.request_elicitation_consent("write", "Approve once or deny.") == "decline"
+            with pytest.raises(approval_prompt.ApprovalUnavailable):
+                approval_prompt.request_elicitation_consent("write", "Approve once or deny.")
         finally:
             set_approval_callback(None)
             clear_session_vars(tokens)

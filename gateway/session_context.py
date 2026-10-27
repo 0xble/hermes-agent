@@ -106,6 +106,40 @@ def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
         _SESSION_ID.set(previous)
 
 
+@contextmanager
+def scoped_session_key(session_key: str) -> Iterator[None]:
+    """Bind only the route key of the session a call works for (a hook fired for it outside its
+    turn) and restore the prior value on exit; never touches ``os.environ``."""
+    token = _SESSION_KEY.set(session_key)
+    try:
+        yield
+    finally:
+        _SESSION_KEY.reset(token)
+
+
+def bound_session_key() -> str:
+    """The route key bound in THIS context, ``""`` when none is: no ``os.environ`` fallback, so a
+    thread that inherited no context never borrows another session's key."""
+    value = _SESSION_KEY.get()
+    return "" if value is _UNSET else value
+
+
+@contextmanager
+def preserved_session_context() -> Iterator[None]:
+    """Restore an inline caller after a fresh turn clears and rebinds its own scope."""
+    from agent.runtime_cwd import reset_session_cwd, scoped_session_cwd, set_session_cwd
+
+    variables = (*_VAR_MAP.values(), _SESSION_ASYNC_DELIVERY, _SESSION_HISTORY_DELIVERY)
+    tokens = [(var, var.set(var.get())) for var in variables]
+    cwd_token = set_session_cwd(scoped_session_cwd())
+    try:
+        yield
+    finally:
+        reset_session_cwd(cwd_token)
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
 def source_route_metadata(source: Any, metadata: dict | None) -> dict | None:
     """Keep inbound route anchors for durable deliveries after the source is gone."""
     anchors = {key: str(value) for key in ("scope_id", "parent_chat_id")
@@ -237,9 +271,12 @@ def declare_stateless_channel() -> None:
 
 def async_delivery_supported() -> bool:
     """Whether the current session can deliver a background completion later.  False for
-    stateless channels (:func:`declare_stateless_channel`) and Kanban workers
-    (``HERMES_KANBAN_TASK``: one-shot subprocesses whose parent disappears after the turn)."""
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    stateless channels (:func:`declare_stateless_channel`), Kanban workers
+    (``HERMES_KANBAN_TASK``: one-shot subprocesses whose parent disappears after the turn) and
+    registered worker processes: a managed worker exits at its turn boundary, so detached work
+    it scheduled would be lost (recovered ``unknown``) and its completion queue has no reader."""
+    from agent.runtime_session_store import is_worker_process
+    if os.environ.get("HERMES_KANBAN_TASK") or is_worker_process():
         return False
     value = _SESSION_ASYNC_DELIVERY.get()
     return True if value is _UNSET else bool(value)

@@ -130,6 +130,19 @@ def _fake_release(path: Path, marker: str, *, lock: str = "same") -> None:
     (path / ".hermes_build_sha").write_text(path.name + "\n", encoding="utf-8")
 
 
+def _copy_pm_builder(candidate: Path) -> None:
+    """Minimal candidate-owned PM and its stdlib lifetime helper for real builds."""
+    import shutil
+
+    root = Path(releases.__file__).resolve().parents[1]
+    shutil.copytree(root / "pm", candidate / "pm", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copyfile(root / "hermes_constants.py", candidate / "hermes_constants.py")
+    package = candidate / "hermes_cli"
+    package.mkdir(exist_ok=True)
+    (package / "__init__.py").touch()
+    shutil.copyfile(root / "hermes_cli" / "runtime_state.py", package / "runtime_state.py")
+
+
 def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, monkeypatch):
     """The release is exactly tracked HEAD, not its own staging dir or profile state."""
     source = tmp_path / "source"
@@ -141,9 +154,10 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     (module / "__init__.py").write_text("")
     (module / "main.py").write_text("print(__file__)\n")
     (module / "immutable_releases.py").write_text("# staging capability probe\n")
+    (source / "hermes_bootstrap.py").write_text("# fixture bootstrap\n")
     (source / "pyproject.toml").write_text("[project]\nname='staged-probe'\nversion='1.0'\n")
     subprocess.run(["git", "init", "-q", str(source)], check=True)
-    subprocess.run(["git", "-C", str(source), "add", "hermes_cli", "pyproject.toml"], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "hermes_cli", "pyproject.toml", "hermes_bootstrap.py"], check=True)
     subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
                     "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"], check=True)
     sha = releases.release_sha(source)
@@ -175,16 +189,16 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     from gateway import run as gateway_run
     monkeypatch.setattr(gateway_run, "__file__", str(release / "gateway" / "run.py"))
     argv = gateway_run._resolve_update_hermes_bin(home)
-    assert argv is not None and argv[0] == str(source / ".venv" / "bin" / "python")
+    assert argv is not None and argv[0] == sys.executable
     launched = subprocess.run([*argv, "probe"], cwd=release,
                               capture_output=True, text=True)
     assert launched.returncode == 0, launched.stderr
-    assert launched.stdout.strip() == str(source / "hermes_cli" / "main.py")
+    assert launched.stdout.strip() == str(release / "hermes_cli" / "main.py")
 
 
 @pytest.mark.parametrize("layout", ["venv", ".venv", "external"])
-def test_release_update_reentry_uses_validated_source_interpreter(tmp_path, monkeypatch, layout):
-    """Gateway and CLI re-enter the same source interpreter, not release Python."""
+def test_release_update_keeps_current_code_and_targets_source_git(tmp_path, monkeypatch, layout):
+    """Frozen source code cannot veto builds under the running release's PM policy."""
     import venv
     from gateway import run as gateway_run
     from hermes_cli import main
@@ -207,18 +221,57 @@ def test_release_update_reentry_uses_validated_source_interpreter(tmp_path, monk
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
     monkeypatch.setattr(gateway_run, "__file__", str(release / "gateway" / "run.py"))
     argv = gateway_run._resolve_update_hermes_bin(home)
-    assert argv is not None and argv[0] == str(interpreter)
+    assert argv is not None and argv[0] == sys.executable
+    assert str(release) in argv[3]
     monkeypatch.setattr(main, "PROJECT_ROOT", release)
     monkeypatch.setattr(main, "get_hermes_home", lambda: home)
-    called = []
-    def intercept(path, argv):
-        called.append((path, argv))
-        raise RuntimeError("intercepted exec")
-    monkeypatch.setattr(main.os, "execv", intercept)
-    with pytest.raises(RuntimeError, match="intercepted exec"):
+    def preflight(_args):
+        assert main.PROJECT_ROOT == source
+        raise RuntimeError("current updater targets source")
+    monkeypatch.setattr(main, "_update_preflight_handled", preflight)
+    monkeypatch.setattr("hermes_cli.update_owning_install.retarget_to_owning_install",
+                        lambda _: pytest.fail("must not re-enter frozen source code"))
+    with pytest.raises(RuntimeError, match="current updater targets source"):
         main.cmd_update(object())
-    assert called[0][0] == str(interpreter)
-    assert called[0][1][3] == str(source)
+
+
+def test_release_origin_check_runs_real_git_only_in_journal_source(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    from hermes_cli import main, update_custody
+
+    source, home = tmp_path / "source", tmp_path / "profile"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "--initial-branch=main", str(source)], check=True)
+    (source / "README.md").write_text("source\n")
+    subprocess.run(["git", "-C", str(source), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"], check=True)
+    subprocess.run(["git", "-C", str(source), "remote", "add", "origin", str(source)], check=True)
+    release = home / "releases" / "A"
+    _fake_release(release, "A")
+    releases.promote(home, release)
+    (home / "release-layout.json").write_text(json.dumps({"source": str(source)}))
+    sentinel = source / ".venv" / "preserve"
+    sentinel.parent.mkdir()
+    sentinel.write_text("source environment\n")
+    old_python = releases._release_python(release).read_bytes()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(main, "PROJECT_ROOT", release)
+    monkeypatch.setattr(main, "get_hermes_home", lambda: home)
+    real_git, roots = update_custody.run_git, []
+
+    def observe_git(*args, **kwargs):
+        roots.append(Path(kwargs["cwd"]).resolve())
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(update_custody, "run_git", observe_git)
+    monkeypatch.setattr("pm.sync_venv", lambda *a, **kw: pytest.fail("check must not sync dependencies"))
+    main.cmd_update(SimpleNamespace(check=True, branch="main"))
+    assert "Already up to date" in capsys.readouterr().out
+    assert roots and set(roots) == {source.resolve()}
+    assert sentinel.read_text() == "source environment\n"
+    assert releases._release_python(release).read_bytes() == old_python
+    assert (home / "current").resolve() == release.resolve()
 
 
 def test_migration_records_source_interpreter_and_preserves_it_on_retry(tmp_path, monkeypatch):
@@ -245,7 +298,7 @@ def test_migration_records_source_interpreter_and_preserves_it_on_retry(tmp_path
     assert releases.source_checkout_python(home, source) == interpreter
 
 
-def test_source_interpreter_missing_fails_loudly(tmp_path, monkeypatch):
+def test_missing_frozen_source_interpreter_does_not_block_release_updater(tmp_path, monkeypatch):
     source = tmp_path / "source"
     (source / ".git").mkdir(parents=True)
     home = tmp_path / "profile"
@@ -259,10 +312,11 @@ def test_source_interpreter_missing_fails_loudly(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "__file__", str(release / "gateway" / "run.py"))
     monkeypatch.setattr(main, "PROJECT_ROOT", release)
     monkeypatch.setattr(main, "get_hermes_home", lambda: home)
-    with pytest.raises(RuntimeError, match="No usable source checkout interpreter"):
-        gateway_run._resolve_update_hermes_bin(home)
-    with pytest.raises(RuntimeError, match="No usable source checkout interpreter"):
-        main.cmd_update(object())
+    command = gateway_run._resolve_update_hermes_bin(home)
+    assert command is not None and command[0] == sys.executable
+    monkeypatch.setattr(main, "_update_preflight_handled", lambda _: True)
+    main.cmd_update(object())
+    assert main.PROJECT_ROOT == source
 
 
 def test_release_with_unreadable_migration_journal_fails_loudly(tmp_path, monkeypatch):
@@ -365,13 +419,14 @@ def test_active_locked_extra_is_passed_to_frozen_pm_build(tmp_path, monkeypatch)
     extras = releases._active_locked_extras(Path(sys.executable), project)
     assert extras == ["messaging"]
     calls = []
-    monkeypatch.setattr("pm.build_environment", lambda **kwargs: calls.append(kwargs))
-    releases._build_venv(project, extras=extras, python=Path(sys.executable))
-    assert calls[0]["extras"] == ["messaging"]
-    assert calls[0]["source"] == project
-    assert calls[0]["out"] == project / ".venv"
-    assert calls[0]["frozen"] and calls[0]["explicit"]
-    assert "python" not in calls[0]  # PM selects the candidate ABI, not the old interpreter.
+    def build(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+    monkeypatch.setattr(releases.subprocess, "run", build)
+    releases._build_venv(project, extras=extras, python=tmp_path / "frozen-source-python-3.11")
+    assert calls[0] == [sys.executable, "-I", "-B", str(project / "pm" / "build_env.py"),
+                        "--source", str(project), "--out", str(project / ".venv"),
+                        "--extra", "messaging"]  # PM selects the candidate ABI.
 
 
 def test_orphan_transitive_package_does_not_enable_another_feature(tmp_path, monkeypatch):
@@ -933,6 +988,7 @@ def test_build_venv_ignores_inherited_source_uv_target_and_preserves_other_envs(
 
     candidate = tmp_path / "candidate"
     candidate.mkdir()
+    _copy_pm_builder(candidate)
     (candidate / "pyproject.toml").write_text(
         "[project]\nname = 'candidate-env-probe'\nversion = '0.1.0'\n"
         "requires-python = '>=3.11'\n[tool.uv]\npackage = false\n", encoding="utf-8")
@@ -978,6 +1034,125 @@ def test_prepare_venv_identical_lock_still_builds_in_place(tmp_path, monkeypatch
     _target, mode = releases.prepare_venv(new, old)
     assert mode == "built"
     assert called == [new]
+
+
+@pytest.mark.parametrize("carrier", ["previous", "source"])
+def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path, monkeypatch, carrier):
+    """An extra installed into the active release survives the next release build.
+
+    The migration-bound source interpreter never sees `hermes pm install --extra` or a lazy
+    install; only the active release's committed PM environment does. Building from the source
+    interpreter alone dropped Slack on every update. At first migration nothing is active yet,
+    so the source checkout's own committed environment carries instead.
+    """
+    from pm.environments import install_state_dir, runtime_facts_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    pyproject = ("[project]\nname='hermes-agent'\nversion='0.1.0'\n[project.optional-dependencies]\n"
+                 "slack=['slack-bolt==1.30.0']\ntelegram=['python-telegram-bot==22.8']\n")
+    previous, new = tmp_path / "releases" / "previous", tmp_path / "releases" / "new"
+    source = tmp_path / "source"
+    for release in (previous, new, source):
+        release.mkdir(parents=True)
+        (release / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    carried = previous if carrier == "previous" else source
+    environment = install_state_dir(carried) / "environments" / "generation" / "venv"
+    (environment / "bin").mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("", encoding="utf-8")
+    (environment / "bin" / "python").symlink_to(sys.executable)
+    facts = runtime_facts_path(carried)
+    facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(environment), "extras": ["slack", "telegram"]}}}), encoding="utf-8")
+
+    def distributions(python):
+        installed = {"python-telegram-bot": "22.8"}
+        if Path(python).parent.parent == environment.resolve():
+            installed["slack-bolt"] = "1.30.0"
+        return installed
+
+    monkeypatch.setattr(releases, "_active_distributions", distributions)
+    monkeypatch.setattr(releases, "restore_active_distributions", lambda *args, **kwargs: None)
+    built = []
+    monkeypatch.setattr(releases, "_build_venv",
+                        lambda release, uv="uv", extras=(), python=None: built.append(list(extras)))
+    releases.prepare_venv(new, previous if carrier == "previous" else None,
+                          source=source, source_python=Path(sys.executable))
+    assert built == [["slack", "telegram"]]
+
+
+def test_smoke_runs_the_interpreter_the_candidate_boots(tmp_path, monkeypatch):
+    """After a carry commits a PM generation, staging smokes that generation, not `.venv`."""
+    from pm.environments import install_state_dir, runtime_facts_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    release = tmp_path / "releases" / "B"
+    _fake_release(release, "B")
+    generation = install_state_dir(release) / "environments" / "generation" / "venv"
+    (generation / "bin").mkdir(parents=True)
+    (generation / "pyvenv.cfg").write_text("", encoding="utf-8")
+    (generation / "bin" / "python").symlink_to(sys.executable)
+    runtime_facts_path(release).write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(generation), "extras": ["slack"]}}}), encoding="utf-8")
+    ran = []
+    monkeypatch.setattr(releases.subprocess, "run",
+                        lambda argv, **kwargs: ran.append(argv[0]) or subprocess.CompletedProcess(argv, 0, "", ""))
+    releases.smoke_plugins(release, tmp_path / "profile")
+    assert ran == [str(generation.resolve() / "bin" / "python")]
+
+
+def test_ready_candidate_from_older_builder_commits_active_extras_before_activation(tmp_path, monkeypatch):
+    """A release staged by the frozen source checkout gets the active release's extras.
+
+    `hermes update` re-enters the source checkout, whose older `prepare_venv` built B without
+    the `slack` that A's committed PM generation carries. The post-swap child, importing B,
+    reaches B through `stage_release`'s ready path and must commit `slack` before activation.
+    PM's record supplies `documents`, which inference from installed packages cannot see.
+    A recorded extra that is platform-gated off here is never re-synced.
+    """
+    from pm.environments import install_state_dir, runtime_facts_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    home = tmp_path / "profile"
+    a, b = home / "releases" / "A", home / "releases" / "B"
+    for release in (a, b):
+        _fake_release(release, release.name)
+        (release / "pyproject.toml").write_text(
+            "[project]\nname='hermes-agent'\nversion='0.1.0'\n[project.optional-dependencies]\n"
+            "slack=['slack-bolt==1.30.0']\ntelegram=['python-telegram-bot==22.8']\n"
+            "documents=['docx-pkg==1.0']\ngated=['gated-pkg==1.0; sys_platform == \"none\"']\n",
+            encoding="utf-8")
+        (release / ".venv" / "bin" / "python").unlink()
+        (release / ".venv" / "bin" / "python").symlink_to(sys.executable)
+    releases.promote(home, a)
+    generation = install_state_dir(a) / "environments" / "generation" / "venv"
+    (generation / "bin").mkdir(parents=True)
+    (generation / "pyvenv.cfg").write_text("", encoding="utf-8")
+    (generation / "bin" / "python").symlink_to(sys.executable)
+    runtime_facts_path(a).write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(generation), "extras": ["documents", "gated", "slack", "telegram"]}}}),
+        encoding="utf-8")
+
+    def distributions(python):
+        installed = {"python-telegram-bot": "22.8"}
+        if Path(python).parent.parent == generation.resolve():
+            installed["slack-bolt"] = "1.30.0"
+        return installed
+
+    synced, steps = [], []
+    monkeypatch.setattr("hermes_cli.update_receipt.record_step", lambda *args, **kwargs: steps.append(args))
+    monkeypatch.setattr(releases, "_active_distributions", distributions)
+    monkeypatch.setattr(releases, "smoke_plugins", lambda *args, **kwargs: None)
+    monkeypatch.setattr("pm.sync_venv", lambda extras, **kwargs: synced.append((extras, kwargs)))
+    # Pre-handoff: the source checkout's code finds B ready and must not touch B's environment.
+    monkeypatch.setattr("pm.paths.repo_root", lambda: tmp_path / "source")
+    assert releases.stage_release(tmp_path / "source", home, sha="B") == (b, "existing")
+    assert synced == []
+    # Post-swap: B's own code commits the missing extra before activate_release runs.
+    monkeypatch.setattr("pm.paths.repo_root", lambda: b.resolve())
+    assert releases.stage_release(tmp_path / "source", home, sha="B") == (b, "existing")
+    assert synced == [(["documents", "slack"],
+                       {"explicit": True, "project_root": b, "evict_incompatible_plugins": True})]
+    assert steps == [("immutable_extras_carry", True, f"carried documents, slack from {a.resolve()}")]
 
 
 def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
@@ -1433,6 +1608,7 @@ def test_atomic_publish_refuses_existing_empty_target(tmp_path):
 def test_real_uv_build_aside_relocates_interpreter_and_scripts(tmp_path, monkeypatch):
     source, home = tmp_path / "source", tmp_path / "profile"
     (source / "hermes_cli").mkdir(parents=True)
+    _copy_pm_builder(source)
     (source / "hermes_cli" / "immutable_releases.py").write_text("# test\n")
     (source / "pyproject.toml").write_text(
         "[project]\nname='s2-relocation-probe'\nversion='0.1.0'\nrequires-python='>=3.11'\n"

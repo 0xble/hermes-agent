@@ -3,6 +3,7 @@ that keeps mtime and size through an atomic replacement."""
 import os
 
 from gateway.run_profile_reconcile import profile_serve_signature
+from tests.waiting import wait_for_ctime_tick
 
 
 def test_profile_serve_signature_changes_on_replacement_with_pinned_mtime(tmp_path):
@@ -11,6 +12,7 @@ def test_profile_serve_signature_changes_on_replacement_with_pinned_mtime(tmp_pa
     before = profile_serve_signature(tmp_path)
     assert profile_serve_signature(tmp_path) == before  # unchanged file: stable
     st = cfg.stat()
+    wait_for_ctime_tick(tmp_path, st.st_ctime_ns)
     other = tmp_path / "other"
     other.write_text("y" * 64, encoding="utf-8")
     # Replace the inode without depending on a filesystem clock tick (#112042).

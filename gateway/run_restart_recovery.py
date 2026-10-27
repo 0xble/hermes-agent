@@ -6,7 +6,7 @@ import time
 from contextlib import nullcontext, suppress
 
 from agent.i18n import t
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, turn_origin_for_event
 from gateway.replay_scheduler import REPLAY_PRIORITY_STARTUP, REPLAY_PRIORITY_RESUME, REPLAY_PRIORITY_SYNTHETIC
 
 logger = logging.getLogger("gateway.run")
@@ -407,6 +407,8 @@ class RestartRecoveryMixin:
 
             profile_home = self._resolve_profile_home_for_source(source)
             if resume_task is not None and not resume_task.done():
+                if turn_origin_for_event(event) == "user" and not getattr(event, "_hermes_recovered_declined", False):
+                    self._promote_background_admission(key)  # a person's input waits on this resume
                 async def _defer_until_resume(
                     event=event, key=key, profile_home=profile_home,
                     resume_task=resume_task, dispatch_now=_dispatch,
@@ -576,6 +578,14 @@ class RestartRecoveryMixin:
             return None, "stale"
         if self._is_session_running(entry.session_key):
             return None, "already-running"
+        from gateway.session_authorities import admission_owner, all_authorities
+        for authority in all_authorities(self):
+            owner = admission_owner(authority, entry.session_id)
+            if owner and authority.db._read_one(
+                "SELECT 1 FROM session_admissions WHERE target_session_id IN (?, ?) AND status = 'unknown' LIMIT 1",
+                (entry.session_id, owner),
+            ):
+                return None, "admission-unknown"
         source = self._restored_source(entry)
         adapter = self._delivery_adapter_for(source)
         authorization = self._resume_owner_authorized(entry.session_key, source)
@@ -671,6 +681,7 @@ class RestartRecoveryMixin:
                 ),
                 profile_home=self._resolve_profile_home_for_source(source),
                 on_drop=lambda key=entry.session_key: self._drop_queued_resume(key),
+                gated=True,
             )
 
             async def _follow_resume(handle=handle):

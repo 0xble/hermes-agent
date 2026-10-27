@@ -88,11 +88,15 @@ def test_ws_transport_records_only_server_authenticated_identity():
     assert transport.auth_identity == identity
 
 
-def test_cloud_agent_context_binds_registration_principal_and_transport_family():
+@pytest.mark.parametrize("in_mailbox", [False, True])
+def test_cloud_agent_context_binds_registration_principal_and_transport_family(in_mailbox):
     from gateway.session_context import clear_session_vars, get_session_env
+    from tui_gateway.transport import FanoutTransport
 
     identity = {"user_id": "user-fixture", "provider": "provider-fixture"}
-    transport = SimpleNamespace(auth_identity=identity)
+    peer = SimpleNamespace(auth_identity=identity, write=lambda _obj: True, close=lambda: None)
+    # Live sessions publish through a fan-out mailbox; the identity is on its peer.
+    transport = FanoutTransport(peer) if in_mailbox else peer
     server._sessions["context-session-fixture"] = {
         "transport": transport,
         "session_key": "stored-context-session",

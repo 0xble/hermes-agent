@@ -36,6 +36,7 @@ TERMINAL_PIPELINE_STATES = {"completed", "failed", "retry_scheduled"}
 ACTIVE_PIPELINE_STATES = {
     "received", "resolving_meeting", "fetching_transcript", "downloading_recording",
     "transcribing_audio", "summarizing", "writing_notion", "writing_linear", "sending_teams"}
+_EXTERNAL_PIPELINE_STATES = {"writing_notion", "writing_linear", "sending_teams"}
 _AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac", ".webm"}
 _SUMMARY_SYSTEM_PROMPT = (
     "You summarize meeting transcripts. Return only valid JSON with keys: "
@@ -219,6 +220,19 @@ class TeamsMeetingPipeline:
 
     async def run_job(self, job_or_id: TeamsMeetingPipelineJob | str) -> TeamsMeetingPipelineJob:
         job = self._coerce_job(job_or_id)
+        if job.status in _EXTERNAL_PIPELINE_STATES:
+            error_info = {
+                "type": "TeamsPipelineSinkError",
+                "message": (
+                    f"Interrupted at {job.status}. External outcome is unconfirmed. "
+                    "Automatic replay is held. Reconcile the existing sink record "
+                    "and provider receipt before any retry."
+                ),
+            }
+            if job.error_info != error_info:
+                logger.warning("Teams job %s: %s", job.job_id, error_info["message"])
+                return self._persist_job(job, error_info=error_info)
+            return job
         meeting_ref = job.meeting_ref
         if meeting_ref is None:
             raise TeamsPipelineError(f"Job {job.job_id} has no meeting_ref.")

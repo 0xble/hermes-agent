@@ -4,11 +4,15 @@ Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
 init_session() failure handling, and the CWD marker contract.
 """
 
+from concurrent.futures import ThreadPoolExecutor, wait
 from unittest.mock import MagicMock
+import os
+import threading
 
 import pytest
 
 from tools import terminal_tool_sudo
+from tools.environments import base_output
 import tools.environments.base as base_environment
 from tools.environments.base import BaseEnvironment, _load_json_store
 from tools.environments.base_output import _BoundedOutputCollector
@@ -28,7 +32,7 @@ def test_snapshot_store_reads_dict_and_tolerates_missing_or_damaged_file(tmp_pat
 class _TestableEnv(BaseEnvironment):
     """Concrete subclass for testing base class methods."""
 
-    _sudo_nopasswd_probe_supported = True
+    _passwordless_sudo_probe_supported = True
 
     def __init__(self, cwd="/tmp", timeout=10):
         super().__init__(cwd=cwd, timeout=timeout)
@@ -62,7 +66,7 @@ def test_nopasswd_probe_runs_sudo_n_inside_backend_only_when_supported(
     monkeypatch, supported, returncode, expected, probed
 ):
     env = _TestableEnv()
-    env._sudo_nopasswd_probe_supported = supported
+    env._passwordless_sudo_probe_supported = supported
     run = MagicMock(return_value=object())
     monkeypatch.setattr(env, "_run_bash", run)
     monkeypatch.setattr(env, "_wait_for_process", MagicMock(return_value={"returncode": returncode}))
@@ -120,6 +124,122 @@ class TestBoundedOutputCollector:
         assert "[OUTPUT TRUNCATED" in rendered
 
 
+class TestSpillPruning:
+    """Regression: every bounded terminal call used to enumerate and stat the
+    whole spill directory on the calling thread (a live gateway had 15 stacks
+    doing this concurrently over ~6,400 files)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_inherited_prune(self):
+        # A prune started by an earlier test must not make this one's caller skip.
+        self._join_prune()
+
+    @staticmethod
+    def _setup(tmp_path, monkeypatch, scandir_hook=None):
+        spill_dir = tmp_path / "cache" / "terminal-output"
+        spill_dir.mkdir(parents=True)
+        monkeypatch.setattr(base_output, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(base_output, "_spill_prune_last", {}, raising=False)
+        original_scandir = os.scandir
+        scans = []
+        scans_lock = threading.Lock()
+
+        def counting_scandir(path=None):
+            # pathlib scans "<dir>/"; normalize so any scan of the directory counts.
+            if path is not None and os.path.normpath(os.fspath(path)) == os.path.normpath(spill_dir):
+                with scans_lock:
+                    scans.append(path)
+                if scandir_hook is not None:
+                    scandir_hook()
+            return original_scandir(path) if path is not None else original_scandir()
+
+        monkeypatch.setattr(os, "scandir", counting_scandir)
+        return spill_dir, scans
+
+    @staticmethod
+    def _join_prune():
+        thread = getattr(base_output, "_spill_prune_thread", None)
+        if thread is not None:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+    def test_concurrent_collectors_trigger_at_most_one_prune_and_never_wait(
+        self, tmp_path, monkeypatch
+    ):
+        scan_started = threading.Event()
+        release_scan = threading.Event()
+
+        def block():
+            scan_started.set()
+            release_scan.wait(timeout=10)
+
+        _, scans = self._setup(tmp_path, monkeypatch, scandir_hook=block)
+        # Rate limiting off: only single-flight can keep this at one scan.
+        monkeypatch.setattr(base_output, "_SPILL_PRUNE_INTERVAL_S", 0.0, raising=False)
+        try:
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                futures = [
+                    pool.submit(base_output._new_output_collector, object(), True)
+                    for _ in range(20)
+                ]
+                done, _ = wait(futures, timeout=5)
+                # Collector creation must not wait on the in-flight scan.
+                assert len(done) == 20
+                assert scan_started.wait(timeout=5)
+                assert len(scans) == 1
+        finally:
+            release_scan.set()
+            self._join_prune()
+        assert len(scans) == 1
+
+    def test_second_collector_within_interval_skips_scan_then_scans_again(
+        self, tmp_path, monkeypatch
+    ):
+        _, scans = self._setup(tmp_path, monkeypatch)
+        clock = [100.0]
+        monkeypatch.setattr(base_output, "_monotonic", lambda: clock[0], raising=False)
+
+        base_output._new_output_collector(object(), True)
+        self._join_prune()
+        clock[0] += 1.0
+        base_output._new_output_collector(object(), True)
+        self._join_prune()
+        assert len(scans) == 1
+
+        clock[0] += base_output._SPILL_PRUNE_INTERVAL_S
+        base_output._new_output_collector(object(), True)
+        self._join_prune()
+        assert len(scans) == 2
+
+    @pytest.mark.platforms("linux", "macos")
+    def test_fork_while_gate_held_leaves_child_able_to_prune(self):
+        gate = base_output._spill_prune_gate
+        assert gate.acquire(blocking=False)
+        try:
+            pid = os.fork()
+            if pid == 0:  # child: only os._exit, never return into pytest
+                os._exit(0 if base_output._spill_prune_gate.acquire(blocking=False) else 1)
+        finally:
+            gate.release()
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0, "child inherited a held prune gate"
+
+    def test_old_spills_are_still_pruned_and_fresh_ones_kept(self, tmp_path, monkeypatch):
+        spill_dir, _ = self._setup(tmp_path, monkeypatch)
+        stale = spill_dir / "out-1-2-dead.log"
+        fresh = spill_dir / "out-2-3-beef.log"
+        unrelated = spill_dir / "keep-me.txt"
+        for path in (stale, fresh, unrelated):
+            path.write_text("x")
+        os.utime(stale, (1, 1))
+        os.utime(unrelated, (1, 1))
+
+        base_output._new_output_collector(object(), True)
+        self._join_prune()
+
+        assert not stale.exists()
+        assert fresh.exists()
+        assert unrelated.exists()
 
 
 class TestAtomicSnapshotWrite:

@@ -47,7 +47,11 @@ async def test_gateway_titles_original_request_without_changing_model_input(tmp_
     runner._pinned_session_context_prompt = lambda *args, **kwargs: ""
     runner._hmwa_acquire_turn_lease = AsyncMock()
     runner._mark_durable_active_turn = AsyncMock()
-    runner.session_store = object()
+    runner.session_store = SimpleNamespace(
+        get_model_role=lambda _key: None,
+        get_model_override=lambda _key: None,
+        get_model_override_scope=lambda _key: "session",
+    )
     runner._async_session_store = SimpleNamespace(
         _store=runner.session_store,
         load_transcript=AsyncMock(return_value=[]),

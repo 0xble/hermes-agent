@@ -16,7 +16,9 @@ from gateway.control_socket import query_gateway_control
 from gateway.session import SessionSource, SessionStore
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_state import AsyncSessionDB
+from gateway.runtime_bootstrap import TicketStore
 from hermes_cli.gateway import _cmd_update
+from datetime import UTC
 
 
 def test_agent_update_resolver_error_is_user_facing_without_marker(tmp_path):
@@ -78,6 +80,7 @@ def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watch
         watched.set()
 
     runner = SimpleNamespace(
+        session_ticket_store=TicketStore("launcher-fixture", frozenset({str(tmp_path.resolve())})),
         _session_db=AsyncSessionDB(store._db), _schedule_update_notification_watch=watch,
         request_restart=Mock(),
     )
@@ -138,6 +141,7 @@ def test_agent_update_invalid_reason_or_route_has_no_side_effects(tmp_path):
     store, _direct_id, _nested_id = _real_store_with_routes(tmp_path)
     spawn = Mock()
     runner = SimpleNamespace(
+        session_ticket_store=TicketStore("launcher-fixture", frozenset({str(tmp_path.resolve())})),
         _session_db=AsyncSessionDB(store._db), _schedule_update_notification_watch=Mock(), request_restart=Mock(),
     )
 
@@ -179,7 +183,7 @@ def test_finished_undelivered_v2_notice_does_not_block_next_update(tmp_path):
     from datetime import datetime, timezone
 
     old = {"platform": "telegram", "chat_id": "42", "reason": "Earlier update",
-           "timestamp": datetime.now(timezone.utc).isoformat(), "notification_version": 2}
+           "timestamp": datetime.now(UTC).isoformat(), "notification_version": 2}
     (tmp_path / ".update_pending.json").write_text(json.dumps(old), encoding="utf-8")
     finalize_update(tmp_path)
     spawn = Mock()
@@ -202,7 +206,7 @@ def test_replacement_clears_prior_update_lifecycle_artifacts_and_offset(tmp_path
 
     marker = tmp_path / ".update_pending.json"
     marker.write_text(json.dumps({"notification_version": 2, "reason": "prior",
-                                  "timestamp": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+                                  "timestamp": datetime.now(UTC).isoformat()}), encoding="utf-8")
     finalize_update(tmp_path)
     (tmp_path / ".update_output.txt").write_text("stale output", encoding="utf-8")
     (tmp_path / ".update_prompt.json").write_text("stale prompt", encoding="utf-8")
@@ -226,7 +230,7 @@ def test_failed_superseding_spawn_restores_old_notice(tmp_path):
     from tests.gateway.update_fixtures import finalize_update
     from datetime import datetime, timezone
     old = {"notification_version": 2, "reason": "prior",
-           "timestamp": datetime.now(timezone.utc).isoformat()}
+           "timestamp": datetime.now(UTC).isoformat()}
     marker = tmp_path / ".update_pending.json"
     marker.write_text(json.dumps(old), encoding="utf-8")
     finalize_update(tmp_path)
@@ -254,7 +258,7 @@ def test_finished_marker_admission_is_exclusive_across_threads(tmp_path):
 
     marker = tmp_path / ".update_pending.json"
     marker.write_text(json.dumps({"notification_version": 2, "reason": "prior",
-                                  "timestamp": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+                                  "timestamp": datetime.now(UTC).isoformat()}), encoding="utf-8")
     finalize_update(tmp_path)
     spawn = Mock()
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -270,7 +274,7 @@ def test_unfinished_marker_remains_exclusive_even_with_a_receipt(tmp_path):
     from datetime import datetime, timezone
     marker = tmp_path / ".update_pending.json"
     marker.write_text(json.dumps({"notification_version": 2, "reason": "running",
-                                  "timestamp": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+                                  "timestamp": datetime.now(UTC).isoformat()}), encoding="utf-8")
     spawn = Mock()
     assert launch_native_update(home=tmp_path, hermes_cmd=["hermes"], pending={"reason": "new"}, spawn=spawn) == {
         "started": False, "pending": True}

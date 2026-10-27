@@ -112,8 +112,9 @@ def _legacy_batch(monkeypatch, *, shape="tasks"):
     assert payload["status"] == "recovery_claimed"
     task = dict(payload["tasks"][0])
     brief = task.pop("context") if shape == "legacy" else None
-    batch = SimpleNamespace(
-        task_list=[task], context=brief, children=[(0, task, object())],
+    batch = dispatch._Batch(
+        max_children=1, origin_owner_transport=None, origin_owner_session_record=None,
+                            overall_start=time.monotonic(), task_list=[task], context=brief, children=[(0, task, object())],
         parent_agent=_Parent(), creds={"model": "m"}, top_role="leaf", live_writers=[],
         live_paths=[], live_deleg_id="deleg_legacy_storage_replacement", origin_wake_sid="wake",
         origin_session_history_delivery=True, origin_ui_session_id="tui-tab",
@@ -131,7 +132,7 @@ def _legacy_batch(monkeypatch, *, shape="tasks"):
 
 @pytest.mark.parametrize("shape", ["tasks", "legacy"])
 def test_legacy_child_persist_failure_never_runs_inline_or_consumes_claim(monkeypatch, shape):
-    did, batch, task = _legacy_batch(monkeypatch, shape=shape)
+    did, batch, _task = _legacy_batch(monkeypatch, shape=shape)
     original_persist = ad._persist_dispatch
 
     def fail_insert(record):

@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
+from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
 outcome_logger = logging.getLogger("gateway.run")
@@ -49,7 +50,7 @@ def _get_flush_dir():
     flush_dir = get_hermes_home() / "pending_messages"
     from hermes_constants import assert_named_profile_home_live
     assert_named_profile_home_live(flush_dir)
-    flush_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    make_user_dir(flush_dir, parents=True, exist_ok=True, mode=0o700)
     if os.name == "posix":
         os.chmod(flush_dir, 0o700)
     return flush_dir
@@ -268,6 +269,7 @@ def _serialise_value(value: Any) -> Optional[dict]:
         if recovery_id is not None and _json_safe(recovery_id):
             result["recovery_id"] = recovery_id
         for attr in ("user_id", "user_name", "media_urls", "media_types", "media_text_inlined",
+                     "_attended_activity_received_at",
                      "reply_to_message_id", "reply_to_text", "reply_to_author_id", "reply_to_author_name"):
             val = getattr(value, attr, None)
             if val is not None and _json_safe(val):
@@ -534,7 +536,8 @@ def _upgrade_shutdown_follow_up(payload: Dict[str, Any], data: Dict[str, Any]) -
     resume marker was cleared by delivery recovery. Upgrade legacy spools at read time too:
     False from the deferral callback otherwise appends them to history and deletes the spool."""
     if payload.get("reason") in ("shutdown_follow_up", "turn_lease_wait"):
-        return {**data, "drain_deferred": True, "shutdown_follow_up": True}
+        return {**data, "drain_deferred": True, "shutdown_follow_up": True,
+                "_recovery_reason": payload["reason"]}
     return data
 
 

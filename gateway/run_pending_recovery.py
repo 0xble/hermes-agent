@@ -1,6 +1,7 @@
 """Replay shutdown spools under each owning gateway profile at startup."""
 
 import logging
+import math
 from pathlib import Path
 from functools import partial
 
@@ -83,9 +84,10 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
                   and entry.session_id == session_id and entry.origin):
             return False
 
-    # Live deferred turns own their spools through their inbound finalizer, including
-    # the window after writing the user row. A reconnect is not a restart decision.
-    if drain_deferred and runner._is_session_running(key):
+    # Only a reconnect observing this process's live lease waiter defers to its finalizer.
+    # Startup recovery and unrelated durable shutdown follow-ups still need a decision.
+    if (reconnect_recovery and drain_deferred and data.get("_recovery_reason") == "turn_lease_wait"
+            and runner._is_session_running(key)):
         return None
     followup = data.get("shutdown_follow_up") is True
     candidate_ids = recovered_input_candidate_ids(data.get("recovery_id"), data.get("message_id"))
@@ -245,6 +247,11 @@ def _recovered_followup_event(data, source, author_id):
         metadata=data.get("metadata") or {},
         reply_expected=data["reply_expected"] if isinstance(data.get("reply_expected"), bool) else None,
     )
+    receipt = data.get("_attended_activity_received_at")
+    if (not isinstance(receipt, (int, float)) or isinstance(receipt, bool)
+            or (isinstance(receipt, float) and not math.isfinite(receipt))):
+        receipt = None
+    setattr(event, "_attended_activity_received_at", receipt)
     if recovery_id is not None:
         setattr(event, "_hermes_recovery_id", recovery_id)
     return event

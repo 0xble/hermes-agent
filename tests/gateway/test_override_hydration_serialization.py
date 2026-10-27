@@ -188,3 +188,26 @@ async def test_reasoning_hydration_cannot_overwrite_newer_picker(monkeypatch, tm
         await asyncio.to_thread(controller.join, 10)
         if runner._executor is not None:
             await asyncio.to_thread(runner._executor.shutdown)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_mode", ["absent", "none"])
+@pytest.mark.parametrize("live_role", [None, "coding"])
+async def test_model_selection_hydration_without_store_preserves_live_state(store_mode, live_role):
+    runner = object.__new__(GatewayRunner)
+    if store_mode == "none":
+        runner.session_store = None
+    key = "agent:main:telegram:dm:123"
+    state = runner._session_state(key)
+    state.conversation.model_role = live_role
+    override = {"model": "live-pick"} if live_role is None else None
+    state.conversation.model_override = override
+    state.conversation.model_override_scope = "once"
+    state.persistent.model_override_epoch = 7
+
+    await runner._rehydrate_session_model_selection_async(key)
+
+    assert state.conversation.model_role == live_role
+    assert state.conversation.model_override is override
+    assert state.conversation.model_override_scope == "once"
+    assert state.persistent.model_override_epoch == 7

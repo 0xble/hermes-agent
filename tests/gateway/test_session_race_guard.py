@@ -295,35 +295,35 @@ async def test_stop_during_sentinel_force_cleans_session():
     session_key = build_session_key(event1.source)
 
     barrier = asyncio.Event()
-    agent_setup_entered = asyncio.Event()
+    setup_entered = asyncio.Event()
 
     async def slow_inner(self_inner, ev, src, qk, generation):
-        agent_setup_entered.set()
+        setup_entered.set()
         await barrier.wait()
         return "ok"
 
     with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
         task1 = asyncio.create_task(runner._handle_message(event1))
-        await asyncio.wait_for(agent_setup_entered.wait(), timeout=10)
+        try:
+            await asyncio.wait_for(setup_entered.wait(), timeout=10)
+            # Sentinel should be set before agent setup can start.
+            assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
 
-        # Sentinel should be set before the blocked agent setup.
-        assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
+            # Send /stop — should force-clean the sentinel
+            stop_event = _make_event(text="/stop")
+            result = await runner._handle_message(stop_event)
+            assert result is not None, "/stop during sentinel should return a message"
+            assert "stopped" in result.lower()
+            assert session_key not in runner._running_agents, (
+                "/stop must remove sentinel so the session is unlocked"
+            )
 
-        # Send /stop — should force-clean the sentinel
-        stop_event = _make_event(text="/stop")
-        result = await runner._handle_message(stop_event)
-        assert result is not None, "/stop during sentinel should return a message"
-        assert "stopped" in result.lower()
-        assert session_key not in runner._running_agents, (
-            "/stop must remove sentinel so the session is unlocked"
-        )
-
-        # Should NOT be queued as pending
-        adapter = runner.adapters[Platform.TELEGRAM]
-        assert session_key not in adapter._pending_messages
-
-        barrier.set()
-        await task1
+            # Should NOT be queued as pending
+            adapter = runner.adapters[Platform.TELEGRAM]
+            assert session_key not in adapter._pending_messages
+        finally:
+            barrier.set()
+            await task1
 
 
 # ------------------------------------------------------------------

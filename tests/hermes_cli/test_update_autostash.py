@@ -529,28 +529,25 @@ def test_autostash_survives_intent_to_add_entries(tmp_path):
 
 
 class _ReceiptProbe:
-    """Minimal stand-in for the active update receipt: records steps.
-
-    ``record_step`` clones the active receipt before mutating it (copy-on-write per context),
-    so the steps list is shared by reference for the probe to observe.
-    """
+    """Observe production receipt steps after copy-on-write recording."""
 
     def __init__(self):
         self.steps = []
-        self.data = {}  # copied per record; ``steps`` is shared by reference
-
-    def step(self, name, ok, detail=""):
-        self.steps.append({"name": name, "ok": ok, "detail": detail})
 
 
 @contextlib.contextmanager
 def _active_receipt(probe):
     from hermes_cli import update_receipt
 
-    token = update_receipt._current.set(probe)
+    token = update_receipt._current.set(update_receipt.UpdateReceipt())
     try:
         yield
     finally:
+        # Recording replaces the context's receipt, so read its latest clone rather
+        # than a shared mutable list that bypasses the production step contract.
+        current = update_receipt._current.get()
+        assert current is not None
+        probe.steps = current.data["steps"]
         update_receipt._current.reset(token)
 
 

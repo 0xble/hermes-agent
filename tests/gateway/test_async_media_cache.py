@@ -97,3 +97,31 @@ async def test_async_cache_wrapper_uses_active_profile_home(monkeypatch, tmp_pat
     cached_path = Path(cached)
     assert cached_path.parent == profile_home / "cache" / "images"
     assert cached_path.read_bytes() == b"\x89PNG\r\n\x1a\nminimal"
+
+
+def test_heic_screenshot_is_cached_as_png(tmp_path, monkeypatch):
+    """2026-10-24: a Slack HEIC screenshot was refused as "non-image data", so the turn ran blind."""
+    pytest.importorskip("pillow_heif")
+    from io import BytesIO
+
+    import pillow_heif
+    from PIL import Image
+
+    monkeypatch.setattr(base, "get_image_cache_dir", lambda: tmp_path)
+    buf = BytesIO()
+    pillow_heif.from_pillow(Image.new("RGB", (4, 4), "red")).save(buf, format="HEIF")
+    heic = buf.getvalue()
+    assert heic[4:8] == b"ftyp" and not base._looks_like_image(heic)
+
+    path = Path(base.cache_image_from_bytes(heic, ".heic"))
+
+    assert path.suffix == ".png"
+    assert path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_html_error_page_is_still_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(base, "get_image_cache_dir", lambda: tmp_path)
+    with pytest.raises(ValueError, match="non-image data"):
+        base.cache_image_from_bytes(b"<!DOCTYPE html><html>sign in</html>", ".jpg")
+    with pytest.raises(ValueError, match="non-image data"):
+        base.cache_image_from_bytes(b'<svg xmlns="http://www.w3.org/2000/svg"></svg>', ".png")

@@ -10,25 +10,57 @@ When the attended configuration is unset or disabled, all attended activity trac
 
 ## Attended Session Pin
 
-`/attend` pins this session to the live attended configuration until `/attend off`.
-`/attend status` reports the pin and current effective route. All 3 forms dispatch
-while a turn is running without interrupting it. The pin is 1 persisted boolean on
-the session routing entry, not a concrete model override, and survives gateway
-restart. Existing explicit `/model` picks and held roles retain precedence.
+`/attend` pins this session to the live attended configuration permanently,
+until `/attend off` or a session boundary. `/attend 30m`, `/attend 2h`,
+`/attend 1h30m`, and `/attend 1d` pin it for a positive duration.
+`/attend status` reports whether the pin is permanent, timed, or inactive and
+shows the current effective route. Timed confirmations and status include the
+release date and time in the owning profile's local timezone, with AM/PM and
+the timezone abbreviation. Status also shows the remaining duration. These
+forms dispatch while a turn is running without interrupting it.
 
-Pinned sessions have no attended idle expiry or switch-back notice. Legacy idle
-expiry of temporary model and reasoning picks is also suspended, while an explicit
-model-pick TTL still expires on its own deadline. Unpinning atomically resets
-`last_user_activity_at` to now, restoring the configured idle window without
-reverting immediately. Releasing an already-unpinned session reports its current
-status without restarting that idle window. The pin survives non-boundary
-session repoints, including topic-binding repair, delegation completion, and CLI
-handoff. Session reset, `/resume`, and `/branch` start unpinned conversations.
+Durations use the shared `parse_duration_seconds` parser, including seconds,
+minutes, hours, days, weeks, fractional units such as `1.5h`, and compact
+combinations such as `1h30m`. `/attend` requires a unit. Zero, negative,
+non-finite, malformed, and out-of-range durations return usage without mutating
+session state. Examples of invalid input are `/attend 0m`, `/attend -2h`,
+`/attend NaN`, `/attend 30`, and `/attend tomorrow`. Re-pinning with a duration
+replaces the deadline with now plus that duration. Re-pinning with plain
+`/attend` removes the deadline and makes the pin permanent.
+
+The pin is a persisted `attended_pinned` boolean plus the nullable
+`attended_pin_until` Unix timestamp on the session routing entry, not a concrete
+model override, and survives gateway restart. A legacy true boolean without a
+deadline remains a permanent pin. Existing explicit `/model` picks and held
+roles retain precedence.
+
+Active pinned sessions have no attended idle expiry or switch-back notice.
+Legacy idle expiry of temporary model and reasoning picks is also suspended,
+while an explicit model-pick TTL still expires on its own deadline. At or after
+the timed deadline, pure resolution treats the pin as inactive and uses
+`max(last_user_activity_at, attended_pin_until)` as the activity floor. Thus the
+normal idle window starts at the deadline, not at the last message before the
+pin, and subsequent genuine activity can extend it. Expiry performs no routing
+persistence write and no immediate model switch. The historical boolean and
+deadline remain until a re-pin, explicit release, or session boundary. The
+existing API-call quiet window and destination compression guard still apply
+before the next real API-request boundary can switch back.
+
+Unpinning atomically resets `last_user_activity_at` to now, restoring the
+configured idle window without reverting immediately. Releasing an
+already-unpinned or expired session reports its current status without
+restarting that idle window. The pin and deadline survive non-boundary session
+repoints, including topic-binding repair, delegation completion, and CLI
+handoff. Session reset, `/resume`, and `/branch` start unpinned conversations
+with no deadline.
 
 Run `tests/gateway/test_attend_command.py` alongside the attended routing, busy
-activity, API-boundary, and topic readback tests. `expiry_time` has no live gateway
-caller, but returns no deadline for a pin. The synchronous and asynchronous
-turn-expiry paths and inspection path all share the pinned activity predicate.
+activity, API-boundary, and topic readback tests. `expiry_time` returns no deadline
+for a permanent pin and returns the deadline activity floor plus the idle window
+for a timed pin. `/attend` commands are
+excluded from generic receipt-activity stamping, so inspections and rejected
+input cannot extend the idle window. The synchronous and asynchronous turn-expiry
+paths and inspection path all share the pinned activity predicate.
 
 ## Precedence and Telegram topic edits
 
@@ -72,8 +104,10 @@ any DM sender, including bots and non-owners, independently of the env path.
 
 Role assignment is bound to a turn, not to its starting config snapshot. Busy
 topic edits and bulk conversions take effect next turn, even before the current
-turn's first API request. Gateway turn assembly captures assignment synchronously
-and supplies it to TurnRunner. Callback-only construction does not read routing
+turn's first API request. Durable role and concrete picks hydrate under their
+shared route lock before gateway turn assembly captures the assignment
+synchronously and supplies it to TurnRunner. Worker initialization and request
+callbacks use that same assignment. Callback-only construction does not read routing
 state. At each real request,
 the current assignment follows fresh model, provider and reasoning config from
 the owning profile through the existing preset loaders. An empty `@attended`
@@ -191,6 +225,8 @@ reasoning idle expiry. Pair it with `test_attended_model.py`,
 Run `tests/gateway/test_attended_busy_activity.py` when changing busy admission.
 Genuine replies must refresh activity at receipt on both runner and adapter paths,
 including Telegram grace queueing and foreign-owner handover, without counting automation or refreshing again when the same event drains. The old turn owner must observe the successor's durable activity at the next API boundary, but never adopt a replacement session's timestamp. Receipt tasks are retained until completion and capture the timestamp before worker hops. An in-flight receipt is joined during drain, and out-of-order workers cannot move the local activity clock backward. Durable refresh is opt-in for the off-loop routing snapshot and committed request boundary, not every cached getter.
+
+Shutdown and drain-deferred follow-ups preserve `_attended_activity_received_at` through the shared spool serializer and recovery builder. Genuine input captures its receipt at common admission before startup/reconnect restore, compression deferral, or orphan FIFO rescue can buffer it. Restore queues retain only receipt metadata. Durable bookkeeping waits for the existing user-authorization and bot-admission checks on drain. Bot-origin input never counts as genuine activity, even when bot admission permits it to run. A recovered follow-up may publish only that original receipt, never its reconstruction or replay time. Recovery treats non-numeric, boolean, and non-finite receipts as missing. Legacy spools without the receipt do not count as fresh activity, because their ordering `ts` may instead be a shutdown flush time. Startup auto-resume remains internal and cannot reset activity. The busy-activity regressions round-trip both spool kinds through durable activity writes, including arrivals interrupted before their receipt write completes.
 
 Activity ordering compares instants, not naive wall times. The repeated DST hour
 must advance both activity and `updated_at`, survive durable reload with its fold

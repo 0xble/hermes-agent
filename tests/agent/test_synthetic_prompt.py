@@ -602,7 +602,8 @@ def test_agent_init_reads_prefetch_max_age_from_config(monkeypatch):
         memory = {"provider": "buffering", "memory_enabled": False, "user_profile_enabled": False}
         if configured is not None:
             memory["prefetch_max_age_seconds"] = configured
-        agent = SimpleNamespace(enabled_toolsets=None, disabled_toolsets=None, tools=None)
+        agent = SimpleNamespace(enabled_toolsets=None, disabled_toolsets=None, tools=None,
+                                _emit_startup_warning=lambda text: None)
         agent_init._init_memory(agent, {"memory": memory}, False, "cli")
         assert agent._memory_manager._prefetch_max_age == expected
 

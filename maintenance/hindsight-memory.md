@@ -1,6 +1,6 @@
 # Hindsight memory provider
 
-**Patch identity:** `hindsight-retain-visibility` and `evict-memory-shutdown`.
+**Patch identity:** `hindsight-retain-visibility`, `evict-memory-shutdown`, and `hindsight-client-selection`.
 
 Soft agent-cache eviction must drain and shut down the agent's memory manager
 (including Hindsight's writer and the mem-sync executor), then release clients
@@ -8,8 +8,20 @@ off the gateway event loop. Eviction removes the cache entry first, so a refetch
 turn builds a fresh manager while retirement completes. Only idle-TTL, LRU-cap
 and memory-pressure evictions commit the transcript (`on_session_end`) first;
 same-session evictions (`/model`, fallback drift, config signature,
-cross-process) never do. Not covered yet: fallback drift and mid-turn `/model`
-evict while the agent is running, so they skip the soft release entirely.
+cross-process) never do. Running eviction removes only the cache entry. The existing
+turn worker retains the exact agent and soft-releases it after both its blocking
+work and the outer turn cleanup have drained, including errors and cancellation.
+The worker and turn completion events bind during agent lookup, before publication
+in the cache. Completion checks cache identity without removing a successor or
+clearing its generation. A per-agent handoff-lock claim prevents duplicate soft
+release when idle eviction races turn completion. Idle, LRU-cap and pressure sweeps
+record the session-end key on the agent while popping it under the cache lock. When
+that agent's turn has not drained, the drain-time release commits with the key, so
+the end-of-session commit still runs exactly once. Resolver doubles that reuse an
+agent across turns must model cache ownership and match the configured default
+model. Otherwise outer-turn cleanup correctly retires their uncached client.
+Silence-retry coverage keeps its call-count, retry-budget and history assertions
+with that ownership modeled in the shared fixture.
 An agent whose `shutdown_memory_provider()` already ran
 (`_memory_provider_shutdown`, the `/new` and `/reset` cleanup) is detached without
 a second commit or shutdown: `shutdown_memory_provider()` sets that flag and
@@ -28,18 +40,15 @@ auxiliary client.
 Hindsight prefetch keeps one in-flight worker and one latest-wins pending query;
 discard and shutdown fence both the pending query and the worker's publication,
 and a `BaseException` leaving the worker clears its running flag.
-Proof: `scripts/run_tests.sh tests/gateway/test_agent_cache_memory_lifetime.py`
+Proof: `scripts/run_tests.sh tests/gateway/test_agent_cache_memory_lifetime.py tests/gateway/test_running_agent_eviction_memory.py`
 and `scripts/run_tests.sh tests/plugins/memory/test_hindsight_prefetch_lifetime.py`.
+The running-eviction regression traverses model/fallback selection and the production
+turn worker with real manager, provider-writer and mem-sync thread identities. It
+proves those isolated resources terminate, not a match to live gateway objects.
 Retire when upstream soft eviction retires memory providers and Hindsight
 prefetch is single-flight. Roll back by reverting the commits carrying
 `Fork-Patch: evict-memory-shutdown`; evicted agents then keep their writer and
 mem-sync threads until process exit again.
-
-Follow up:
-- Fallback-drift and mid-turn `/model` eviction (`gateway/run_turn.py`
-  `_run_agent_evict_on_fallback`) reach `_evict_cached_agent` while the agent is
-  in `_running_agent_ids()`, which returns before the soft release, so that
-  agent's Hindsight writer and mem-sync executor still leak. Predates this patch.
 
 Accepted asynchronous retain operations remain tracked after the first prefetch
 visibility wait expires. Later prefetches do not repeat that wait. The existing
@@ -156,6 +165,55 @@ strategy and cron-exclusion behavior.
   already drops it on /new, /resume, /branch and compression. In a shared chat it can carry one
   participant's recall to another's next turn, which every async turn already did before this gate. Proof:
   `tests/agent/test_synthetic_prompt.py` (`test_buffered_recall_*`).
+
+## Client Dependency Selection And Passive Readiness
+
+The configured bundled provider must join PM's complete profile dependency union
+without a second copy under the home plugin directory. Both selection gates need
+the bundled path: `pm.plugins_state._provider_from_config` admits it, and
+`pm.workspace.enabled_plugin_entries` resolves it before a same-name user copy.
+Update conflict recovery seats bundled providers first and never clears their
+`memory.provider` setting. A release-incompatible bundled provider fails before
+publishing a new dependency generation or changing profile selections.
+
+These PM changes and the first-generation/conflict regressions are adapted from
+[PR #564](https://github.com/0xble/hermes-agent/pull/564), exact head
+`37e7a37434beb6d4f80a5d8761243f439df52ab7`. This incident repair does not merge,
+rebase, or authorize activation of that branch. It adds the separate status fix:
+Hindsight availability checks the same client version/import prerequisite as its
+operation factory in every mode. `hermes memory status` prints the actionable
+`unavailable_reason` instead of claiming an SDK problem is a missing API key.
+Availability is local readiness, not server reachability or a recall test. Status
+retains its existing exit contract and performs no new client construction,
+provider initialization, dependency installation, or memory API requests. Normal
+CLI home/registry bootstrap and auth read locks retain their existing behavior.
+
+Upstream governing guidance was checked at
+`NousResearch/hermes-agent@9976f4857b72439d79016354d7b6e1a3ee952e2f`:
+`AGENTS.md` and `plugins/AGENTS.md` require a verified premise, an existing
+extension point, passive availability, and bounded dependencies. Upstream
+[#143970](https://github.com/NousResearch/hermes-agent/issues/143970) reports the
+related missing-client symptom. [#144642](https://github.com/NousResearch/hermes-agent/issues/144642)
+is related Windows import behavior. Neither establishes this exact PM path bug.
+
+The immutable-release boundary already carries declared extras from the previous
+release's committed PM generation, not just its base `.venv`. The `hindsight`
+extra is declared in this source, so the recorded recovery selection survives
+`prepare_venv`. A ready candidate built by older code uses `carry_active_extras`
+from the candidate's own code before activation. The existing tests in
+`tests/hermes_cli/test_immutable_releases.py` cover build-time carry, old-builder
+ready-candidate carry, and selecting the committed-generation smoke interpreter.
+No separate extras framework or release activation path is added here. Subsequent
+PM rebuilds are protected by the configured-provider union fix, independently of
+the retained extra. Release integration and promotion remain with Maintenance.
+
+Additional isolated proof lives in
+`tests/pm/test_bundled_memory_selection.py` (real offline union build with a named
+profile and recorded extra, including same-name shadowing) and
+`tests/hermes_cli/test_memory_status_client_dependency.py` (all client modes,
+missing metadata, unsupported versions, failed import, and supported client).
+The status regressions reject network access, SDK construction, initialization,
+and dependency preparation and preserve the initialized fixture home's files.
 
 ## Proof surface
 

@@ -24,6 +24,7 @@ from collections import deque
 from contextlib import contextmanager, suppress
 from hermes_state_publication import state_lock, measure_write, raise_if_nonretryable_contention
 from pathlib import Path
+from hermes_dir_acl import make_user_dir
 
 from hermes_constants import get_hermes_home, mkdir_under_hermes_home
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, cast
@@ -63,11 +64,14 @@ from hermes_loop_guard import LoopGuardedLock, check as check_loop_thread
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
-    _watched_sqlite_sidecar_paths, has_invalid_sqlite_header_preopen, is_zeroed_state_db, quarantine_cross_process_lock,
+    _watched_sqlite_sidecar_paths, has_invalid_sqlite_header_preopen, has_valid_sqlite_header_preopen,
+    is_zeroed_state_db, quarantine_cross_process_lock,
     quarantine_invalid_state_db,
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
 )
 from hermes_state_messages import SessionMessagesMixin
+from hermes_state_prune_rewrite import SessionPruneRewriteMixin
+from hermes_state_api_content import SessionApiContentMixin
 from hermes_state_coverage import SessionCoverageMixin
 from hermes_state_rewind import SessionRewindMixin
 from hermes_state_wal import (
@@ -441,7 +445,7 @@ def divert_session_transcript_jsonl(session_id: str, messages) -> Optional[Path]
     if not sid or not messages:
         return None
     sessions_dir = get_hermes_home() / "sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
+    make_user_dir(sessions_dir, parents=True, exist_ok=True)
     path = sessions_dir / f"{sid}.jsonl"
     with path.open("a", encoding="utf-8") as handle:
         for msg in messages:
@@ -492,7 +496,7 @@ class SessionDB(
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
-    SessionMessagesMixin, SessionCoverageMixin, SessionRewindMixin, SessionProfileRepairMixin,
+    SessionMessagesMixin, SessionPruneRewriteMixin, SessionApiContentMixin, SessionCoverageMixin, SessionRewindMixin, SessionProfileRepairMixin,
 ):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
 
@@ -646,10 +650,10 @@ class SessionDB(
         # per-thread connections pinned fds for the process lifetime and hit EMFILE.
         self._read_pool: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue(maxsize=_READ_POOL_MAX)
         # Permits bound PEAK descriptors (the pool bounds only the idle set), shared per
-        # DATABASE PATH; acquired non-blocking so a permitless reader degrades to the writer lock.
+        # DATABASE PATH; ordinary reads degrade to the writer lock, searches queue separately.
         # One permit per live read connection, held from before the open in _get_read_conn() until after the
         # close in _close_read_conn(). See _READ_POOL_MAX. Acquired non-blocking on purpose: a reader that
-        # cannot get a permit must degrade to the writer lock, not queue here — blocking would convert fd
+        # cannot get a permit must degrade (ordinary reads) or use bounded search admission — blocking here converts fd
         # exhaustion into a stall, which is the same outage with a different stack trace. Permits are shared
         # per DATABASE PATH, not per instance: the descriptors they ration belong to the file, and one
         # process holds several SessionDB objects on the same state.db (#98573). See _PathReadBudget.
@@ -732,22 +736,29 @@ class SessionDB(
         # Never materialize a deleted/archived named profile's home: a multiplexer or Desktop backend
         # still holding the profile's route would otherwise re-scaffold it on the next turn (#94590).
         mkdir_under_hermes_home(self.db_path.parent)
-        # Read-only file/sidecar preflight BEFORE the first connection: an actionable message
-        # instead of an opaque "attempt to write a readonly database" from inside _init_schema.
-        preflight_db_writability(self.db_path, db_label="state.db")
         try:
-            # Serialize zero-byte check, quarantine, connect and schema commit so concurrent
-            # openers don't race the absent-path -> schema-commit window.
-            if not self.db_path.exists() or has_invalid_sqlite_header_preopen(self.db_path):
+            # Only a positively observed SQLite header can bypass startup serialization.
+            # Permission repair can reveal a damaged header after an indeterminate probe.
+            if not has_valid_sqlite_header_preopen(self.db_path):
+                # The directory must be writable before the lock file can be created in it; the
+                # directory never vanishes mid-quarantine, so checking it unlocked is race-free.
+                preflight_db_writability(self.db_path, db_label="state.db", directory_only=True)
                 with quarantine_cross_process_lock(self.db_path) as lock_acquired:
                     if not lock_acquired:
                         logger.warning(
                             "startup quarantine lock for %s not acquired within 5s; proceeding",
                             self.db_path,
                         )
+                    # Preflight under the lock: unlocked, it can list state.db just before a
+                    # concurrent opener renames it aside, and os.access on the vanished path
+                    # then reports a writable DB as "read-only for this user".
+                    preflight_db_writability(self.db_path, db_label="state.db")
                     self._handle_quarantine_if_invalid(already_locked=lock_acquired)
                     self._connect_and_init_with_lock_patience()
             else:
+                # Read-only file/sidecar preflight BEFORE the first connection: an actionable message
+                # instead of an opaque "attempt to write a readonly database" from inside _init_schema.
+                preflight_db_writability(self.db_path, db_label="state.db")
                 self._handle_quarantine_if_invalid(already_locked=False)
                 self._connect_and_init_with_lock_patience()
         except sqlite3.DatabaseError as exc:
@@ -906,25 +917,25 @@ class SessionDB(
 
     # ── Read-path split ──
 
-    def _get_read_conn(self) -> Optional[sqlite3.Connection]:
+    def _get_read_conn(self, *, independent: bool = False) -> Optional[sqlite3.Connection]:
         """Open a fresh read-only connection, or None when unavailable (callers
-        return it to self._read_pool). WAL only: WAL readers never block on the
-        writer, so reads skip self._lock; under DELETE journal mode (NFS fallback)
-        readers hit SQLITE_BUSY storms, so the legacy locked path stays. Autocommit
-        reads see everything committed so far (read-your-writes for flush-then-search)."""
-        if not self._wal_active or self.read_only:
+        return it to self._read_pool). Ordinary reads retain their legacy non-WAL
+        fallback. Independent searches always use mode=ro, even on read-only handles
+        or DELETE journals, where SQLite contention surfaces explicitly instead.
+        Autocommit sees commits so far (read-your-writes for flush-then-search)."""
+        if not independent and (not self._wal_active or self.read_only):
             return None
         with self._read_conns_lock:
             failed_at = self._read_open_failed_at
             backing_off = failed_at and time.monotonic() - failed_at < _READ_OPEN_RETRY_SECONDS
-            if self._read_conns_closed or backing_off:
+            if independent and self._read_conns_closed:
+                raise sqlite3.OperationalError("session database closed during search")
+            if self._read_conns_closed or (backing_off and not independent):
                 return None
         # Permit BEFORE the open: openers race for permits, not descriptors.
         if not self._read_budget.acquire(self):
-            logger.debug(
-                "read pool at capacity (%d) for %s; serving this read from the "
-                "locked writer connection", _READ_POOL_MAX, self.db_path,
-            )
+            logger.debug("read pool at capacity (%d) for %s; %s", _READ_POOL_MAX, self.db_path,
+                         "search queued for a reader" if independent else "using locked writer fallback")
             return None
         conn = None  # bound before the try so the handlers can close a half-open one
         try:
@@ -939,7 +950,7 @@ class SessionDB(
             if conn is not None:
                 self._close_conn_logged(conn, "partially-opened read conn")
             self._read_budget.release()
-            if not isinstance(exc, sqlite3.Error):
+            if independent or not isinstance(exc, sqlite3.Error):
                 raise
             with self._read_conns_lock:
                 self._read_open_failed_at = time.monotonic()
@@ -964,42 +975,53 @@ class SessionDB(
         finally:
             self._read_budget.release()
 
-    def _checkout_read_conn(self) -> Optional[sqlite3.Connection]:
+    def _checkout_read_conn(self, *, independent: bool = False) -> Optional[sqlite3.Connection]:
         """Borrow a read connection, opening on a miss; None when the read path is unavailable.
         A pool hit costs no permit (the connection already holds one)."""
-        if not self._wal_active or self.read_only:
+        if not independent and (not self._wal_active or self.read_only):
             return None
+        if independent and self._read_conns_closed:
+            raise sqlite3.OperationalError("session database closed during search")
         try:
             return self._read_pool.get_nowait()
         except queue.Empty:
-            return self._get_read_conn()
+            return self._get_read_conn(independent=True) if independent else self._get_read_conn()
+
+    def _return_read_conn(self, conn) -> None:
+        with self._read_conns_lock:
+            if not self._read_conns_closed:
+                try:
+                    self._read_pool.put_nowait(conn)
+                    return
+                except queue.Full:
+                    pass
+        self._close_read_conn(conn)
 
     @contextmanager
-    def _read_ctx(self) -> Iterator[sqlite3.Connection]:
+    def _read_ctx(self, *, reopen: bool = True) -> Iterator[sqlite3.Connection]:
         """Yield a connection for read-only statements: a pooled read-only
         connection with NO lock under WAL; otherwise (non-WAL, open failure,
         ceiling reached) the writer connection under self._lock — deliberate
-        degradation: slower beats EMFILE, which the supervisor cannot see."""
+        degradation: slower beats EMFILE, which the supervisor cannot see. A search
+        scope overrides that fallback for all of its reads, including hydration.
+        ``reopen=False``: a read after ``close()`` raises instead of reopening the
+        writer (an optional reader must not hold a home that is being deleted)."""
+        from hermes_state_search_runtime import current_search
+        operation = current_search(self)
+        if operation is not None:
+            yield operation.connection
+            return
         conn = self._checkout_read_conn()
         if conn is not None:
             try:
                 yield conn
             finally:
-                returned = False
-                with self._read_conns_lock:
-                    if not self._read_conns_closed:
-                        try:
-                            self._read_pool.put_nowait(conn)
-                            returned = True
-                        except queue.Full:
-                            pass
-                if not returned:
-                    # close() drained the pool (or queue.Full: unreachable while
-                    # permits == maxsize, load-bearing if they drift): surplus.
-                    self._close_read_conn(conn)
+                self._return_read_conn(conn)
             return
         with state_lock(self._lock, db_path=self.db_path):
             if self._conn is None:  # close() raced a still-unwinding reader
+                if not reopen:
+                    raise sqlite3.ProgrammingError(f"SessionDB for {self.db_path} is closed")
                 self._reopen_after_close_locked(context="read")
             conn = cast(sqlite3.Connection, self._conn)
             if self._wal_active or self.read_only:  # WAL: no SHARED-lock wait; ro: opened with the read budget
@@ -1218,7 +1240,9 @@ class SessionDB(
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
                 with self._read_ctx() as conn:
-                    return fn(conn)
+                    from hermes_state_search_runtime import search_stage
+                    with search_stage(self, "sql_ms"):
+                        return fn(conn)
             except sqlite3.OperationalError as exc:
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or _DISK_IO_ERROR_MARKER not in str(exc).lower():
                     note_storage_error(self.db_path, exc)

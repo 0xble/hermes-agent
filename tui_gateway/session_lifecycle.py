@@ -62,9 +62,9 @@ _AUTOMATIC_SESSION_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "
 
 
 def _lease_metadata(live_session_id: str) -> dict:
-    """Writer identity for a lease: ``live_session_id`` is half of ``_is_same_writer``; the delivery flag is
-    what Bot Chat gates live delivery on (session_notifications)."""
-    return {"live_session_id": live_session_id, "bot_live_delivery_consumer": True}
+    """Writer identity for a lease: ``live_session_id`` is half of ``_is_same_writer``. Bot Chat delivery is
+    admitted by the session authority (gateway/session_bot), never gated on a lease flag."""
+    return {"live_session_id": live_session_id}
 
 
 def _claim_active_session_slot(
@@ -124,6 +124,8 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
     that starve the messaging gateway sharing the cap. Anything holding a slot must be user-visible. An
     inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream."""
+    if (canonical := _canonical_ledger_refusal(session)) is not None:
+        return canonical
     if session.get("active_session_lease") is not None:
         return None
     key = str(session.get("session_key") or "")
@@ -136,6 +138,81 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     if getattr(limit_message, "reason", None) == SESSION_NOT_OWNED and _take_over_detached_runtime_lease(sid, session, key):
         return None
     return limit_message
+
+
+_CANONICAL_PENDING_SQL = """SELECT status FROM session_admissions WHERE target_session_id=? AND status!='terminal'
+    UNION ALL SELECT status FROM worker_executions WHERE session_id=? AND status!='terminal' LIMIT 1"""
+
+
+def _end_unless_ledger_busy(db, session_id: str, session_key, end_reason: str) -> bool:
+    """End *session_id*'s row unless the gateway's durable ledger still holds work for it; True when
+    the row may end (ended now, or already ended). The check and the stamp share one write txn.
+
+    A viewer process (a dashboard, a second Desktop window) runs this reaper for a session the
+    owning gateway is still executing; stamping it ended mid-turn made the owner treat its own live
+    route as stale (#54878) and replace the conversation (#140642). The ledger names a local session
+    by its logical id (the row's ``chat_id``), so the physical id, the key and that id are checked: a
+    ``local-`` id, or the lineage owner its receipt names (an adopted conversation keeps its legacy id)."""
+    execute_write = getattr(db, "_execute_write", None)
+    if execute_write is None:
+        db.end_session(session_id, end_reason)
+        return True
+
+    def write(conn):
+        row = conn.execute("SELECT chat_id FROM sessions WHERE id=?", (session_id,)).fetchone()
+        ids = {session_id, str(session_key or "")}
+        if row is not None and str(row[0] or "").startswith("local-"):
+            ids.add(str(row[0]))
+        from hermes_state_local import local_lineage_owner
+        ids.add(local_lineage_owner(conn, session_id))
+        for sid in filter(None, ids):
+            if conn.execute(_CANONICAL_PENDING_SQL, (sid, sid)).fetchone() is not None:
+                return False
+        db._end_and_bump(conn, "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL",
+                         (time.time(), end_reason, session_id), session_id, end_reason)
+        return True
+
+    if execute_write(write):
+        return True
+    logger.info("Preserving session %s during %s: the gateway's ledger still holds its turn", session_id, end_reason)
+    return False
+
+
+def _canonical_ledger_refusal(session: dict):
+    """Refusal when the gateway's durable ledger still holds work for this stored session, else None.
+
+    The registry lease only fences other legacy backends. A session a gateway once owned can carry
+    an ``unknown`` admission (outcome lost across an owner restart: never replayed, only Discard
+    resolves it), queued input or a running worker; a legacy turn would run past that barrier
+    and write the transcript beside the canonical FIFO. Checked on every turn, not only at the
+    first claim, because a gateway may admit work while this backend still holds its lease."""
+    import sqlite3
+    from hermes_cli.active_sessions import (
+        ActiveSessionRefusal, SESSION_COORDINATION_UNAVAILABLE, SESSION_NOT_OWNED)
+    key = str(session.get("session_key") or "")
+    if not key:
+        return None
+    try:
+        with _session_db(session) as db:
+            read_ctx = getattr(db, "_read_ctx", None)
+            if read_ctx is None:
+                return None
+            with read_ctx() as conn:
+                row = next(iter(conn.execute(_CANONICAL_PENDING_SQL, (key, key))), None)
+    except sqlite3.Error:
+        logger.warning("canonical ledger read failed for %s", key, exc_info=True)
+        return ActiveSessionRefusal(_SESSION_OWNERSHIP_UNAVAILABLE, SESSION_COORDINATION_UNAVAILABLE)
+    if row is None:
+        return None
+    logger.info("Refusing legacy turn for %s: canonical ledger holds %s work", key, row[0])
+    refusal = ActiveSessionRefusal(
+        f"Session {key} has {'outcome-unknown' if row[0] == 'unknown' else 'pending'} work in the gateway's "
+        "durable queue. Resume it through the gateway (hermes chat --resume, Desktop or the TUI) to "
+        "resolve it; nothing was run here.", SESSION_NOT_OWNED)
+    # prompt.submit forwards a typed prompt to the owner's FIFO for work that ends on its own
+    # (tui_gateway/owner_forward.py); an ``unknown`` admission is never forwarded past.
+    refusal.ledger_status = row[0]
+    return refusal
 
 
 def _attach_lease(session: dict, lease) -> None:
@@ -424,7 +501,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                         # Automatic Desktop cleanup (ws_orphan_reap, idle_timeout, etc.) reclaims
                         # runtime but must not end the durable row — the conversation stays open
                         # and resumable until the user explicitly closes or archives it.  #105588
-                        db.end_session(session_id, end_reason)
+                        # A turn the gateway's ledger still holds keeps the row open too (#140642).
+                        if not _end_unless_ledger_busy(db, session_id, session_key, end_reason):
+                            _tui_owns_lifecycle = False
     # ``_teardown_session`` follows with ``agent.close()``, whose ``_finalize_owned_session_row`` ends the row as
     # ``agent_close`` through the agent's own handle — every spare decision above would be undone one call later.
     if agent is not None and (_desktop_automatic_cleanup or not _tui_owns_lifecycle):
@@ -583,7 +662,12 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
             logger.debug("failed waiting for session turn thread", exc_info=True)
     if end_reason != "tui_shutdown":
         _settle_isolated_turn_before_close(session)
-    _teardown_session(session, end_reason=end_reason)
+    try:
+        _teardown_session(session, end_reason=end_reason)
+    finally:
+        # finally: a raising finalize (callers log and move on) must still free the ring.
+        from tui_gateway.event_replay import forget_session
+        forget_session(session.get("_sid") or "")
     return True
 
 
@@ -677,12 +761,16 @@ def _close_session_by_id(
 
 
 def _ws_session_is_detached(session: dict | None) -> bool:
-    """True if a live session is still bound to the disconnected-WS sentinel."""
-    return bool(session and not session.get("_finalized") and session.get("transport") is _detached_ws_transport)
+    """True for a parked mailbox (or a legacy disconnected-WS sentinel)."""
+    if not session or session.get("_finalized"):
+        return False
+    transport = session.get("transport")
+    return (transport is _detached_ws_transport
+            or isinstance(transport, FanoutTransport) and not transport.transports())
 
 
 def _ws_session_is_orphaned(session: dict | None) -> bool:
-    """True if a WS session sits on ``_detached_ws_transport`` (where ``handle_ws`` parks disconnected clients), idle."""
+    """True if a WS session has no attached peer and is idle."""
     return bool(_ws_session_is_detached(session) and not session.get("running"))
 
 
@@ -940,9 +1028,11 @@ def _schedule_ws_orphan_reap(
             if _session_has_active_delegations(sid, current) or (
                     not current.get("running")
                     and not current.get("_client_gone_interrupt_requested")
-                    and _session_owns_live_wakeup_schedule(current)):
-                # Live background work, or an active /loop or /heartbeat only this process's poller can fire. A
-                # settled client-gone interrupt wins over the schedule: its latches block every tick and reattach.
+                    and (_session_owns_live_wakeup_schedule(current)
+                         or _session_owns_pending_process_notification(current))):
+                # Live background work, or a wake-up only this process's poller can deliver: an active /loop or
+                # /heartbeat, or a running process that will notify this session. A settled client-gone interrupt
+                # wins over both: its latches block every tick and reattach.
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif not current.get("running"):
                 session = _pop_session_by_id(sid)
@@ -1001,14 +1091,12 @@ def _schedule_ws_orphan_reap(
 
 
 def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect") -> tuple[int, int]:
-    """Single WS-disconnect teardown entry point: reap close_on_disconnect sessions (sidecar/dashboard) immediately;
-    re-point the rest at the detached transport (later emits miss the dead socket) for the grace-windowed WS-orphan
-    reaper. Returns ``(reaped, detached)`` counts.
+    """Detach a departing WS peer from every session, preserving other viewers' streams.
 
-    Multi-client fan-out: the departing transport is DETACHED from every session first. A session that still has
-    another client attached keeps streaming and is neither parked nor reaped — a watcher leaving must not end the
-    turn the remaining client is reading. Only the sessions left clientless take the historical
-    close_on_disconnect / park-sentinel path, so a single-client disconnect behaves exactly as it always has."""
+    Clientless close_on_disconnect sessions are reaped immediately. The rest keep
+    their empty mailbox through the WS-orphan grace window and any reconnect.
+    Returns ``(reaped, detached)`` counts.
+    """
     clientless = _detach_transport_from_sessions(transport)
     reaped = detached = 0
     for sid, session in clientless:
@@ -1035,9 +1123,8 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
             if current.get("close_on_disconnect"):
                 claimed_for_teardown = _pop_session_by_id(sid)
             else:
-                # Point at the drop sentinel (NOT real stdio) so _ws_session_is_orphaned recognizes it; standalone
-                # `hermes --tui` keeps real _stdio. UNLESS another window (pop-out viewer) still shows the session:
-                # re-bind to the most recent surviving viewer instead.
+                # Attach any surviving legacy viewer to the stable mailbox.
+                # A disconnected WebSocket must never fall back to process stdio.
                 viewers = current.get("viewers") or {}
                 # See #83716.
                 viewers.pop(transport, None)
@@ -1045,7 +1132,8 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
                 if live:
                     _rebind_live_transport(sid, current, live[-1])
                 else:
-                    current["transport"] = _detached_ws_transport
+                    # Keep the empty mailbox and any in-flight detached writer.
+                    # Reconnect changes membership, never the ordering authority.
                     current.pop("_client_gone_interrupt_requested", None)
                     current.pop("_client_gone_interrupt_polls", None)
                     should_schedule_reap = True

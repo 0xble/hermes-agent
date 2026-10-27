@@ -291,7 +291,7 @@ class TestBrowseShape:
                 return []
 
         db = _DB()
-        monkeypatch.setattr("hermes_state_registry.acquire", lambda: db)
+        monkeypatch.setattr("tools.session_search_tool._open_current_db", lambda: db)
         monkeypatch.setattr(
             "hermes_state_registry.release_or_close",
             lambda _: setattr(db, "released", db.released + 1),
@@ -301,6 +301,23 @@ class TestBrowseShape:
 
         assert result["success"] is True
         assert db.released == 1
+
+    def test_failed_release_keeps_the_finished_result(self, monkeypatch):
+        import sqlite3
+
+        class _DB:
+            def list_recent_sessions_bounded(self, **_kwargs):
+                return []
+
+        def _release(_db):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr("tools.session_search_tool._open_current_db", lambda: _DB())
+        monkeypatch.setattr("hermes_state_registry.release_or_close", _release)
+
+        result = json.loads(session_search())
+
+        assert result["success"] is True
 
     def test_cross_profile_database_is_closed_but_shared_database_is_not(
         self, monkeypatch
@@ -1380,6 +1397,19 @@ def _set_started(db, **started_at_by_sid):
 
 
 class TestDiscoveryTemporalNarrowing:
+    @pytest.mark.parametrize("after,before", [("not-a-date", None), (None, "not-a-date")])
+    def test_invalid_date_precedes_reader_admission(self, db, monkeypatch, after, before):
+        import hermes_state_search_runtime as runtime
+        from tools.session_search_tool import _parse_iso_bound
+
+        with pytest.raises(ValueError) as invalid_bound:
+            _parse_iso_bound(after or before)
+        monkeypatch.setattr(runtime, "_MAX_WAITERS", 0)
+        result = json.loads(session_search(query="needle", db=db, after=after, before=before))
+        assert result["success"] is False
+        assert result["error"] == str(invalid_bound.value)
+        assert "database busy" not in result["error"]
+
     @pytest.mark.parametrize("value, expected", [
         ("24h", 86400), ("1d", 86400), ("2w", 2 * 604800), ("7D", 7 * 86400), (" 3 d ", 3 * 86400),
         ("2026-06-01", _unix(2026, 6, 1)), ("2026-06-01T12:00:00Z", _unix(2026, 6, 1) + 43200),

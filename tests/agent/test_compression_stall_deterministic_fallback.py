@@ -162,6 +162,7 @@ def test_cancelled_stale_worker_cannot_rearm_next_attempt_cooldown(tmp_path, fas
     compressor = agent.context_compressor
     calls = []
     live = _transcript()
+    first_host_returned = threading.Event()
     stale_record_entered = threading.Event()
     next_summary_started = threading.Event()
     stale_record_finished = threading.Event()
@@ -187,18 +188,28 @@ def test_cancelled_stale_worker_cannot_rearm_next_attempt_cooldown(tmp_path, fas
                 compressor._summary_failure_cooldown_until > time.monotonic(),
                 compressor._session_db.get_compression_failure_cooldown(compressor._session_id) is not None,
             ))
+        else:
+            # The host also writes the timeout cooldown. Let it finish before
+            # the fake call raises cancellation and rollback verifies its row.
+            assert first_host_returned.wait(5), "first compression host did not return"
         return original_call(**kwargs)
 
     monkeypatch.setattr(cc, "_record_stall_interrupted_backoff", delayed_record)
     with patch("agent.context_compressor.call_llm", side_effect=stalled_summary), \
             patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": []}):
-        first, _ = agent._compress_context(live, "sys", approx_tokens=50_000)
-        assert first is live
-        assert stale_record_entered.wait(2), "first cancelled worker did not reach the record boundary"
-        compressor._consecutive_timeout_failures = 1
-        compressor._summary_failure_cooldown_until = 0.0
-        compressor._session_db.clear_compression_failure_cooldown(compressor._session_id)
-        agent._compress_context(live, "sys", approx_tokens=50_000)
+        try:
+            first, _ = agent._compress_context(live, "sys", approx_tokens=50_000)
+            first_host_returned.set()
+            assert first is live
+            assert stale_record_entered.wait(2), "first cancelled worker did not reach the record boundary"
+            compressor._consecutive_timeout_failures = 1
+            compressor._summary_failure_cooldown_until = 0.0
+            compressor._session_db.clear_compression_failure_cooldown(compressor._session_id)
+            agent._compress_context(live, "sys", approx_tokens=50_000)
+        finally:
+            first_host_returned.set()
+            next_summary_started.set()
+            assert stale_record_finished.wait(5), "cancelled worker did not finish recording"
 
     assert calls == ["primary", "primary"]
     assert cooldown_during_next_summary == [(False, False)]

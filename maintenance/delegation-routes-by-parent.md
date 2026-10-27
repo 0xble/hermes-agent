@@ -38,7 +38,15 @@ config expansion stays idempotent and serializable. Its `delegation_runtime_conf
 resolves target routes at the delegation loader boundary. `tools/delegate_tool_config.py::_select_routing_cfg`
 is the shared runtime selector.
 
-`tools/delegate_tool.py::delegate_task` selects before building children.
+`tools/delegate_tool_routes.py::resolve_task_routes` selects the live-parent
+configuration before calling the native delegation provider. Backend selection
+stays global or session-owned. Each `TaskRoute.reasoning_cfg` carries the
+selected route's reasoning context through `_route_overrides` to the real child
+builder, rather than re-reading the globally pinned route after provider dispatch.
+Internal credential owners use `route_for_config`, bypassing provider and
+parent-map selection while preserving global reasoning ownership.
+
+`tools/delegate_tool.py::delegate_task` builds children from these resolved routes.
 Synchronous, background, and batch execution use those already-built children.
 `agent/subagent_lifecycle.py::SubagentLifecycleService.launch` uses the same
 selector unless a launch explicitly supplies a provider. Explicit launch
@@ -70,7 +78,9 @@ of their respective behavior.
 ```bash
 scripts/run_tests.sh tests/tools/test_delegate_by_parent.py \
   tests/hermes_cli/test_delegation_by_parent_presets.py \
-  tests/agent/test_subagent_by_parent.py tests/agent/test_subagent_lifecycle.py
+  tests/agent/test_subagent_by_parent.py tests/agent/test_subagent_lifecycle.py \
+  tests/tools/test_delegate_provider_fork_contracts.py \
+  tests/tools/test_delegation_backends.py tests/tools/test_delegation_profile_route.py
 ```
 
 These tests exercise real config loading and child construction, replacing only

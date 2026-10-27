@@ -158,7 +158,7 @@ def _without_release_age(text: str) -> str:
 
 
 def _is_member_candidate(plugin_dir: Path) -> bool:
-    return read_python_declaration(plugin_dir).is_member
+    return read_python_declaration(plugin_dir).installs_packages
 
 
 def enabled_plugin_entries(*, proposed_home=None, enabled=None, disabled=None,
@@ -168,7 +168,9 @@ def enabled_plugin_entries(*, proposed_home=None, enabled=None, disabled=None,
 
     The key is what the home's config names, so a caller can edit that home's selection.
     """
-    from pm.plugins_state import _is_directory, enabled_plugins_ordered
+    from pm.plugins_state import (
+        _is_directory, enabled_plugins_ordered, provider_directory, read_home_selection,
+    )
 
     selection = enabled_plugins_ordered(
         proposed_home=proposed_home, enabled=enabled, disabled=disabled, installing=installing,
@@ -176,10 +178,18 @@ def enabled_plugin_entries(*, proposed_home=None, enabled=None, disabled=None,
     )
     entries = []
     for plugins_dir, names in selection.items():
+        config = read_home_selection(plugins_dir.parent) or {}
+        provider = ((config.get("memory") or {}).get("provider") or "").strip()
         for name in names:
             relative = Path(name)
             if relative.is_absolute() or ".." in relative.parts:
                 raise InstallError("venv", f"invalid plugin key: {name}")
+            if name == provider:
+                # Activation prefers an in-tree memory provider over a user copy.
+                plugin_dir = provider_directory(plugins_dir.parent, name, installing=installing)
+                if plugin_dir is not None:
+                    entries.append((plugins_dir, name, plugin_dir))
+                    continue
             plugin_dir = plugins_dir / relative
             proposed = installing is not None and plugin_dir.resolve() == installing.resolve()
             if not proposed and not _is_directory(plugin_dir):
@@ -218,7 +228,7 @@ def enabled_member_dirs(*, proposed_home=None, enabled=None, disabled=None) -> l
         reason = manifest_version_error(declaration.manifest, path.name)
         if reason:
             raise InstallError("venv", reason)
-        if declaration.is_member:
+        if declaration.installs_packages:
             members.append(path)
     return members
 

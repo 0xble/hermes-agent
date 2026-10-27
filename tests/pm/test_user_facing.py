@@ -12,7 +12,7 @@ def test_user_tools_come_before_hermes_and_python_stops_at_the_store_stub(tmp_pa
     npm, node, python, rg = (str(tmp_path / "store" / name) for name in ("npm", "node", "python", "rg"))
     stub = tmp_path / "AppData" / "Local" / "Microsoft" / "WindowsApps"
     stub.mkdir(parents=True)
-    monkeypatch.setattr(pm.install, "_store_path_dirs", lambda: [npm, node, python, rg])
+    monkeypatch.setattr(pm.install, "cached_store_path_dirs", lambda: [npm, node, python, rg])
     monkeypatch.setattr(pm.user_facing, "_python_dirs", lambda: [python])
     path = os.pathsep.join([npm, node, python, rg, "/usr/bin", str(stub), "/home/u/bin"])
 
@@ -25,7 +25,7 @@ def test_user_tools_come_before_hermes_and_python_stops_at_the_store_stub(tmp_pa
     assert user_facing_path(path).split(os.pathsep) == [
         "/usr/bin", str(stub), "/home/u/bin", python, npm, node, rg]
 
-    monkeypatch.setattr(pm.install, "_store_path_dirs", list)
+    monkeypatch.setattr(pm.install, "cached_store_path_dirs", list)
     assert user_facing_path(path) == path
 
 

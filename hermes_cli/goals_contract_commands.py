@@ -4,7 +4,9 @@ Facade dependencies are late-bound so evaluator and command test seams remain sh
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from hermes_cli.lifecycle_snapshot import snapshot_control
@@ -15,6 +17,21 @@ if TYPE_CHECKING:
     from hermes_cli.goals import GoalContract, GoalGate, GoalState
 
 
+def _recorded_result_text(content: str) -> str:
+    """Decode one JSON envelope without joining fields or dropping negative context."""
+    try:
+        json.loads(content)
+    except (json.JSONDecodeError, RecursionError):
+        return content
+    # Preserve field separators and all metadata. Only undo serialization escaping,
+    # once, so literal backslashes and excerpts spanning distinct fields stay distinct.
+    return re.sub(
+        r'"(?:[^"\\]|\\.)*"',
+        lambda match: '"' + json.loads(match.group(0)) + '"',
+        content,
+    )
+
+
 class GoalContractCommandsMixin:
     # --- revisions ------------------------------------------------------
     # Public revise()/replace() live on GoalRevisionsMixin (snapshot/CAS boundary); this mixin
@@ -23,12 +40,13 @@ class GoalContractCommandsMixin:
     def _recorded_evidence_error(self, evidence: str, state: GoalState) -> Optional[Dict[str, str]]:
         """Require evidence-backed revisions to cite an eligible recorded tool result.
 
-        Matching uses word-bounded raw or identically whitespace-normalized token sequences.
+        Matching uses word-bounded decoded or identically whitespace-normalized token sequences.
         This accepts a multiline excerpt copied from a result without accepting partial tokens or prose
         fabricated by the agent: every candidate still comes from a recorded tool row in this session.
         """
         from hermes_cli.goals import (
             _bounded_evidence_match, _evidence_is_negated, _evidence_tool_excluded, _get_session_db,
+            goal_autonomy_enabled,
         )
 
         db = _get_session_db()
@@ -52,9 +70,12 @@ class GoalContractCommandsMixin:
                 for row in rows:
                     if _evidence_tool_excluded(str(row.get("tool_name") or "")):
                         continue
-                    content = str(row.get("content") or "")
+                    raw_content = str(row.get("content") or "")
+                    content = _recorded_result_text(raw_content)
                     if _bounded_evidence_match(raw_evidence, content):
-                        if _evidence_is_negated(content, raw_evidence):
+                        # Decoded punctuation must not remove an existing envelope veto.
+                        if any(_evidence_is_negated(candidate, raw_evidence, include_no=goal_autonomy_enabled())
+                               for candidate in (raw_content, content)):
                             found_negated = True
                             continue
                         return None
@@ -94,7 +115,9 @@ class GoalContractCommandsMixin:
         if "goal" in changed:
             return {
                 "ok": False, "error_code": "destructive_change_requires_command",
-                "error": f"Destructive goal changes require /goal replace <text> or {goal_remove_usage()}. Goal unchanged and still running.",
+                "error": f"Use goal_set action=replace through session controls with a current user instruction "
+                         f"or approval, or an explicit /goal replace <text> or {goal_remove_usage()}. "
+                         "Goal unchanged and still running.",
             }
 
         item_diffs = {key: _requirement_diff(key, before[key], after[key]) for key in changed}
@@ -102,7 +125,9 @@ class GoalContractCommandsMixin:
         if destructive:
             return {
                 "ok": False, "error_code": "destructive_change_requires_command",
-                "error": f"Destructive goal changes require /goal replace <text> or {goal_remove_usage()}. Goal unchanged and still running.",
+                "error": f"Use goal_set action=replace through session controls with a current user instruction "
+                         f"or approval, or an explicit /goal replace <text> or {goal_remove_usage()}. "
+                         "Goal unchanged and still running.",
             }
 
         if evidence and len(" ".join(evidence.split())) < _REVISION_EVIDENCE_MIN_CHARS:
@@ -116,7 +141,9 @@ class GoalContractCommandsMixin:
         if verification_removed and not evidence:
             return {
                 "ok": False, "error_code": "destructive_change_requires_command",
-                "error": f"Destructive goal changes require /goal replace <text> or {goal_remove_usage()}. Goal unchanged and still running.",
+                "error": f"Use goal_set action=replace through session controls with a current user instruction "
+                         f"or approval, or an explicit /goal replace <text> or {goal_remove_usage()}. "
+                         "Goal unchanged and still running.",
             }
         if evidence:
             if evidence_error:
@@ -125,8 +152,9 @@ class GoalContractCommandsMixin:
                 return {
                     "ok": False, "error_code": "evidence_cannot_retire_verification",
                     "error": "recorded evidence has no per-check retirement disposition; "
-                             "retain every existing verification check or ask the user to use "
-                             "/goal remove check <n>. Goal unchanged and still running.",
+                             "retain every existing verification check or propose goal_set action=replace "
+                             "through session controls. Explicit /goal remove check <n> is also available. "
+                             "Goal unchanged and still running.",
                 }
 
         authority = "evidence" if evidence else "agent_addition"
@@ -332,7 +360,7 @@ class GoalContractCommandsMixin:
         retry cap below still bounds a genuinely stuck red suite.
         """
         from hermes_cli.goals import (
-            CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE, _decision, _gate_workspace, _goal_budget_label,
+            _decision, _gate_workspace, _goal_budget_label,
             run_gate,
         )
 
@@ -368,10 +396,7 @@ class GoalContractCommandsMixin:
                 )
 
             self._save()
-            prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
-                goal=state.goal, command=gate.command, exit_code=exit_code, attempt=gate.attempts,
-                max_retries=gate.max_retries, output=tail or "(no output)",
-            )
+            prompt = self._gate_failure_prompt(gate, exit_code, tail)
             return _decision(
                 "active", True, prompt, "gate_failed",
                 f"gate failed (exit {exit_code}): $ {gate.command}",

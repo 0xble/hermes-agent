@@ -416,6 +416,9 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
         async def wait_for_shutdown(self):
             calls.append("wait_for_shutdown")
 
+        async def stop(self):
+            pass
+
         def _start_systemd_watchdog(self):
             pass
 

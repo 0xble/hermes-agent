@@ -32,7 +32,7 @@ import { mcpTargets, toolLabels } from '@/lib/connector-tools'
 import { generatedImageFromResult } from '@/lib/generated-images'
 import { separateGluedReasoningBlocks } from '@/lib/reasoning-blocks'
 import { isTodoToolName } from '@/lib/todos'
-import { type CardToolName, isCardTool, isCardToolName } from '@/lib/tool-render-class'
+import { type CardToolName, isCardTool, isCardToolName, isSilentTool } from '@/lib/tool-render-class'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { onboardingChatStore } from '@/store/onboarding-session'
@@ -163,9 +163,9 @@ const ChainToolFallback: FC<TimelineToolCallProps> = props => {
   }
 
   // A reaction's UI is the emoji landing on the bubble (message.reaction
-  // event) — a "React To Message" tool block next to it would be the agent
-  // narrating its own tapback. Failures still render so they're debuggable.
-  if (props.toolName === 'react_to_message' && !props.isError) {
+  // event), not a tool block narrating its own tapback. Failures still render
+  // so they're debuggable. The shared classification also covers old transcripts.
+  if (isSilentTool(props.toolName) && !props.isError) {
     return null
   }
 

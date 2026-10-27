@@ -20,7 +20,7 @@ from gateway.run import GatewayRunner
 
 def _bare_runner(multiplex: bool = True):
     runner = object.__new__(GatewayRunner)
-    runner.config = MagicMock(multiplex_profiles=multiplex)
+    runner.config = MagicMock(multiplex_profiles=multiplex, _runtime_profile_homes=None)
     runner.adapters = {}
     runner._profile_adapters = {}
     runner.pairing_store = MagicMock()
@@ -46,6 +46,7 @@ def test_secondary_profile_pairing_stores_created(tmp_path, monkeypatch):
     runner._adapter_credential_fingerprint = lambda adapter: None
 
     with patch("hermes_cli.profiles.profiles_to_serve", return_value=[
+        ("default", tmp_path / ".hermes"),
         ("coder", tmp_path / ".hermes" / "profiles" / "coder"),
     ]), patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
         runner._profile_adapters["coder"] = {}
@@ -75,6 +76,7 @@ def test_pairing_store_scoped_to_profile_dir(tmp_path, monkeypatch):
     runner._adapter_credential_fingerprint = lambda adapter: None
 
     with patch("hermes_cli.profiles.profiles_to_serve", return_value=[
+        ("default", tmp_path / ".hermes"),
         ("ops", tmp_path / ".hermes" / "profiles" / "ops"),
     ]), patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
         runner._profile_adapters["ops"] = {}

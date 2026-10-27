@@ -5,7 +5,7 @@
     "properties": {
       "annotate": {
         "default": false,
-        "description": "If true, overlay numbered [N] labels on interactive elements. Each [N] maps to ref @eN for subsequent browser commands. Useful for QA and spatial reasoning about page layout.",
+        "description": "If true, overlay numbered [N] labels on interactive elements. Each [N] maps to ref @eN for subsequent browser commands. Camofox does not support image overlays and reports this limitation with an unannotated screenshot.",
         "type": "boolean"
       },
       "question": {

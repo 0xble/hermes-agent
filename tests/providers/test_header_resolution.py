@@ -50,7 +50,7 @@ if sys.argv[1] == 'gateway':
     import gateway.config
     import agent.auxiliary_client
 elif sys.argv[1] == 'request-metadata':
-    for name in ('agent.gemini_native_adapter', 'gateway.platforms.yuanbao',
+    for name in ('agent.gemini_native_adapter', 'plugins.platforms.yuanbao.adapter',
                  'hermes_cli.model_catalog', 'hermes_cli.models',
                  'hermes_cli.doctor_connectivity', 'hermes_cli.models_pricing',
                  'hermes_cli.models_local', 'hermes_cli.models_reasoning_caps',
@@ -140,7 +140,7 @@ def _check_native_gemini(monkeypatch, module, expected):
 def _check_yuanbao(monkeypatch, module, expected):
     import asyncio
     import httpx
-    from gateway.platforms import yuanbao_proto as proto
+    from plugins.platforms.yuanbao import yuanbao_proto as proto
 
     observed, frames = [], []
     real_client = httpx.AsyncClient
@@ -325,7 +325,7 @@ def _check_perplexity(monkeypatch, module, expected):
 
 _REQUEST_CONSUMERS = {
     "native-gemini": ("agent.gemini_native_adapter", "hermes-agent", _check_native_gemini),
-    "yuanbao": ("gateway.platforms.yuanbao", "", _check_yuanbao),
+    "yuanbao": ("plugins.platforms.yuanbao.adapter", "", _check_yuanbao),
     "manifest": ("hermes_cli.model_catalog", "hermes-cli", _check_manifest),
     "cli-catalogs": ("hermes_cli.models", "hermes-cli", _check_cli_catalogs),
     "telegram-onboarding": ("hermes_cli.web_server_messaging", "HermesDashboard", _check_telegram_onboarding),

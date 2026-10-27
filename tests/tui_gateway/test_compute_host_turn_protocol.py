@@ -267,3 +267,108 @@ def test_host_builds_the_session_agent_with_the_frame_login(monkeypatch):
     assert captured["auth_user_id"] == "basic:alice"
     assert session["auth_user_id"] == "basic:alice"
     assert server._session_auth_user_id(session) == "basic:alice"
+
+
+@pytest.mark.parametrize("dependency", ["version", "tools"])
+def test_interrupted_turn_settles_while_cold_metadata_is_blocked(turn_env, monkeypatch, dependency):
+    """Cold discovery cannot gate settlement, but final-event delivery still must."""
+    import builtins
+    import queue
+
+    from hermes_cli import banner, version_info
+    from tools.registry import registry
+
+    progress = queue.Queue()
+    provider_started, stop = threading.Event(), threading.Event()
+    metadata_entered, release_metadata = threading.Event(), threading.Event()
+    release_peer, ended = threading.Event(), threading.Event()
+    identity = version_info.VersionInfo("1.2.3", "1.2.3+4.gabcdef0", 4, "abcdef0", "main", "git")
+
+    def block_metadata():
+        metadata_entered.set()
+        if threading.current_thread() is session.get("_run_thread"):
+            progress.put("metadata-blocked-turn")
+        assert release_metadata.wait(10), "cold metadata was never released"
+
+    monkeypatch.setattr(version_info, "_cached_version_info", None if dependency == "version" else identity)
+    monkeypatch.setattr(version_info, "_stamp_version_info", lambda: None)
+    monkeypatch.setattr(version_info, "_resolve_repo_dir", lambda: ".")
+
+    probes = []
+
+    def slow_git(_repo):
+        probes.append(True)
+        block_metadata()
+        return identity
+
+    monkeypatch.setattr(version_info, "_git_version_info", slow_git)
+    monkeypatch.setattr(banner, "get_available_skills", dict)
+    monkeypatch.setattr(banner, "get_update_result", lambda **_: None)
+    monkeypatch.setattr(registry, "get_toolset_for_tool", lambda _: "registered-tools")
+    original_import = builtins.__import__
+
+    def cold_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if dependency == "tools" and name == "model_tools" and "get_toolset_for_tool" in fromlist:
+            block_metadata()
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", cold_import)
+
+    class FinalEventStream(io.StringIO):
+        def write(self, text):
+            if text.strip():
+                frame = json.loads(text)
+                if frame.get("type") == "rpc" and frame["message"]["params"]["type"] == "session.info":
+                    progress.put("final-event-ready")
+                    assert release_peer.wait(10), "final-event peer was never released"
+                result = super().write(text)
+                if frame.get("type") == "turn.end":
+                    ended.set()
+                return result
+            return super().write(text)
+
+    def provider(*args, **kwargs):
+        provider_started.set()
+        assert stop.wait(10), "interrupt did not reach provider"
+        return {"final_response": "interrupted", "interrupted": True}
+
+    agent = types.SimpleNamespace(session_id="cold-metadata-key", run_conversation=provider,
+                                  clear_interrupt=lambda: None, hard_interrupt=stop.set,
+                                  tools=[{"function": {"name": "registered-tool"}}])
+    sid = "cold-metadata"
+    session = _session(agent)
+    monkeypatch.setitem(server._sessions, sid, session)
+    out = FinalEventStream()
+    host = ComputeHost(stdout=out, heartbeat_secs=0)
+    try:
+        host.handle_frame({"type": "turn.start", "sid": sid, "request_id": "turn", "prompt": "go"})
+        assert provider_started.wait(5)
+        host.handle_frame({"type": "interrupt", "sid": sid, "request_id": "stop"})
+        assert any(f["type"] == "interrupt.ack" and f["applied"] for f in _frames(out))
+        assert progress.get(timeout=5) == "final-event-ready", "cold metadata blocked the interrupted worker"
+        assert session["running"] is False
+        assert not ended.is_set(), "turn.end overtook the blocked final event"
+        release_peer.set()
+        assert ended.wait(5), "turn.end still depended on cold metadata"
+        frames = _frames(out)
+        assert frames[-1]["type"] == "turn.end"
+        assert frames[-1]["interrupted"] is True
+        infos = [f["message"]["params"]["payload"] for f in frames
+                 if f["type"] == "rpc" and f["message"]["params"]["type"] == "session.info"]
+        assert infos[-1]["tools"] == {"registered-tools": ["registered-tool"]}
+        if dependency == "version":
+            assert metadata_entered.wait(5)
+            assert not release_metadata.is_set()
+            assert infos[-1]["version"] == ""
+            assert probes == [True], "cold snapshots started competing version resolvers"
+    finally:
+        stop.set()
+        release_metadata.set()
+        release_peer.set()
+        host._executor.shutdown(wait=True)
+        prefetch = getattr(version_info, "_version_info_prefetch_thread", None)
+        if prefetch is not None:
+            prefetch.join(timeout=5)
+            assert not prefetch.is_alive()
+        host.close()
+    assert server._session_info(agent, session)["version"] == "1.2.3"

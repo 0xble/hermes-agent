@@ -268,6 +268,7 @@ from tests._fixtures.live_system_guard import (
     _LIVE_SYSTEM_GUARD_BYPASS_MARK,
     _live_system_guard,
 )
+from tests._fixtures.model_peer import model_peer  # fixture registers here
 from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
 from tests._fixtures.repair_capacity import adequate_repair_capacity  # noqa: F401 — registers fixture
 
@@ -336,6 +337,9 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
                                            sources=(install_state._active_root,))
     monkeypatch.setattr(install_state, "machine_places", lambda: isolated_places)
     install_state.probe.cache_clear()
+    # The per-process terminal PATH composition cache must not carry one test's store into the next.
+    if "pm.install" in sys.modules:
+        sys.modules["pm.install"]._store_path_dirs_cache.clear()
     from hermes_cli import onboarding_due
 
     onboarding_due.reset_for_tests()
@@ -401,6 +405,11 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
                 _state.clear()
         if hasattr(tui_server_mod, "_last_idle_check"):
             monkeypatch.setattr(tui_server_mod, "_last_idle_check", 0.0)
+
+    # A classic CLI's gateway-session toolset reader is process-global too (``_ensure_gateway_session``).
+    tools_config_mod = sys.modules.get("hermes_cli.tools_config")
+    if tools_config_mod is not None and hasattr(tools_config_mod, "_gateway_plugin_toolsets"):
+        monkeypatch.setattr(tools_config_mod, "_gateway_plugin_toolsets", None)
 
     hermes_state_mod = sys.modules.get("hermes_state")
     if hermes_state_mod is not None and hasattr(hermes_state_mod, "DEFAULT_DB_PATH"):
@@ -1127,6 +1136,59 @@ def _remove_relocated_basetemp(config) -> None:
         shutil.rmtree(safe, ignore_errors=True)
 
 
+def _processes_with_hermes_home_under(roots) -> list[int]:
+    """PIDs (never this process) whose environment names a ``HERMES_HOME`` inside one of *roots*.
+
+    Linux only (``/proc/<pid>/environ``; unreadable entries are another user's and skipped).
+    Elsewhere the scan is empty: a test-spawned daemon there is the per-test guard's problem.
+    """
+    if not sys.platform.startswith("linux") or not os.path.isdir("/proc"):
+        return []
+    resolved = [Path(r).resolve() for r in roots if r]
+    found = []
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/environ", "rb") as handle:
+                environ = handle.read().split(b"\0")
+        except OSError:
+            continue
+        home = next((item[12:] for item in environ if item.startswith(b"HERMES_HOME=")), None)
+        if not home:
+            continue
+        try:
+            path = Path(os.fsdecode(home)).resolve()
+        except (OSError, ValueError):
+            continue
+        if any(path == root or path.is_relative_to(root) for root in resolved):
+            found.append(int(entry.name))
+    return found
+
+
+def _reap_session_hermes_processes(config) -> list[int]:
+    """SIGTERM every process still running against a Hermes home this session created.
+
+    Tests that run a real ``hermes chat -q`` child get a grandchild ``gateway run`` (detached, own
+    session) that no per-test subprocess patch can see, and pytest's tmp cleanup removes only
+    directories: each one used to outlive the run at ~250 MB. The session basetemp and the session
+    sandbox home bound exactly what this run created, so nothing else is ever signalled.
+    """
+    import signal
+
+    factory = getattr(config, "_tmp_path_factory", None)
+    # The basetemp pytest already created (never create one at teardown just to scan it).
+    roots = [getattr(config, "_hermes_relocated_basetemp", None), os.environ.get("HERMES_TEST_SANDBOX_HOME"),
+             getattr(factory, "_basetemp", None)]
+    pids = _processes_with_hermes_home_under(roots)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return pids
+
+
 def _pinned_mcp_sdk_version() -> str:
     """The ``mcp==X`` pin carried by the ``[mcp]`` extra in pyproject.toml."""
     import tomllib
@@ -1162,6 +1224,7 @@ def require_mcp_2_sdk():
 
 
 def pytest_unconfigure(config):
+    _reap_session_hermes_processes(config)
     _remove_relocated_basetemp(config)
 
 
@@ -1526,8 +1589,8 @@ def _capture_real_hermes_root() -> list[Path]:
             pass
     return roots
 
-
 _REAL_HERMES_ROOT_CANDIDATES = _capture_real_hermes_root()
+
 # Captured before any test can patch sys.platform, HOME or XDG_*: a test that runs the real
 # GUI uninstall or update swap would otherwise delete the developer's own Hermes app. Only the
 # ones present (none on CI runners, so the guard costs nothing there), each literal and resolved.
@@ -1536,6 +1599,24 @@ from hermes_cli.gui_uninstall import packaged_gui_app_paths
 _REAL_INSTALLED_GUI_APPS = sorted({
     os.path.normcase(form) for app in packaged_gui_app_paths() if os.path.lexists(app)
     for form in (os.path.abspath(app), os.path.realpath(app))})
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_user_path_writes(monkeypatch):
+    """Fail a test that would add an entry to the real Windows User PATH.
+
+    The registry has no temporary-home equivalent: a test home that reached
+    these writers stayed on the developer's PATH after the run. Tests of the
+    writers' callers inject fakes (``write_user_path=``) or stub them.
+    """
+    if sys.platform != "win32":
+        return
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("TEST BUG: write to the real Windows User PATH (HKCU\\Environment)")
+
+    monkeypatch.setattr("hermes_cli._launchers._register_windows_user_path", refuse)
+    monkeypatch.setattr("hermes_cli._install_repair._write_user_path_raw", refuse)
 
 # Installer destinations are account-scoped, outside HERMES_HOME. Capture both HOME and
 # the native account home before fixtures replace either, including currently absent dirs.

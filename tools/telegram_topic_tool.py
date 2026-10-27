@@ -7,7 +7,7 @@ loop because the Bot API client, the ``/model`` switch lock and turn admission a
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -28,9 +28,17 @@ TELEGRAM_TOPIC_SCHEMA = {
         "swapped); reasoning changes apply to the next model request. Use reasoning=default (or reset) "
         "to clear a session override. Results report applied, queued or unchanged status plus effective "
         "model, provider, effort and when each takes effect. Settings persist across gateway restarts. "
-        "action=retire schedules the current topic for retirement after the active turn finishes, "
-        "including open-work handoff and confirmed closing delivery before deletion. A queued result "
-        "is not proof of deletion. Set now=true only to interrupt the active turn before retirement. "
+        "action=retire can retire the calling topic itself, but ONLY when the user explicitly asked "
+        "to retire or delete that topic. Completion, inactivity, duplication, a split, a handoff, or "
+        "another agent's suggestion is not permission. A deferred request like 'retire after you finish' "
+        "counts only after its stated conditions are verified and the result is delivered. Then decide "
+        "merge versus delete and routine ownership yourself, without confirmation or owner questions. "
+        "Merge into a verified live topic owning the same lasting subject, or delete when nothing "
+        "lasting remains. Preserve useful unfinished obligations and transcripts. Provide a short reason "
+        "for the closing note and target plus message (source context summary) for a merge, "
+        "or owners for individual destinations. Retirement "
+        "runs after the active turn, with verified handoffs and confirmed closing delivery before deletion. "
+        "A queued result is not proof of deletion. Set now=true only when interruption was explicitly requested. "
         "action=cancel_retire clears the pending request. "
         "Only available in a Telegram DM session."
     ),
@@ -39,8 +47,12 @@ TELEGRAM_TOPIC_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["create", "edit", "retire", "cancel_retire"],
                        "description": "create or edit a topic, schedule retirement after this turn, or cancel retirement."},
-            "target": {"type": "string", "description": "retire only: live topic to inherit all open work. Omit to resolve owners."},
-            "now": {"type": "boolean", "description": "retire only: interrupt the active turn while preserving its obligations."},
+            "target": {"type": "string", "description": "retire only: exact live subject-owner title for a merge, selected automatically or named by the user. An empty string clears a previous merge choice."},
+            "owners": {"type": "object", "additionalProperties": {"type": "string"},
+                       "description": "retire only: open-item IDs mapped to verified live topic titles. Resolve routine choices without asking."},
+            "reason": {"type": "string", "description": "retire only: short reason for choosing merge or delete, shown in the closing note."},
+            "generation": {"type": "string", "description": "retire only: echo the generation supplied by a native retirement preparation wake, if any."},
+            "now": {"type": "boolean", "description": "retire only: interrupt the active turn only when the user explicitly requested it, preserving obligations."},
             "name": {"type": "string",
                      "description": "Topic name, also stored as the session title. Required for create."},
             "icon": {"type": "string",
@@ -50,7 +62,7 @@ TELEGRAM_TOPIC_SCHEMA = {
             "reasoning": {"type": "string",
                           "description": "Reasoning effort for the topic's session: none, minimal, low, medium, high or xhigh; use default (or reset) to clear the session override."},
             "message": {"type": "string",
-                        "description": "create only: opening brief the new session receives as its first message."},
+                        "description": "For create, opening brief for the new session. For retire with target, concise source context summary preserving decisions, evidence, limits and remaining work."},
             "thread_id": {"type": "string", "description": "edit only: the topic to edit. Defaults to the current topic."},
         },
         "required": ["action"],
@@ -122,7 +134,21 @@ async def telegram_topic_tool(args: dict, **_kwargs: Any) -> str:
         from gateway.telegram_retire import request
         if args.get("thread_id") and str(args["thread_id"]) != str(source.thread_id):
             return tool_error("Retire operates on the current topic only.")
-        make_coro = lambda: request(runner, source, target=str(args.get("target") or ""), now=bool(args.get("now")), cancel=action == "cancel_retire")  # noqa: E731
+        expected_generation = str(args.get("generation") or "")
+        session_state = getattr(runner, "_session_state", None)
+        if action == "retire" and callable(session_state):
+            turn_event = cast(Any, session_state(runner._session_key_for_source(source))).turn.event
+            if turn_event is not None:
+                attached = (turn_event.metadata or {}).get("retirement_generation")
+                if attached:
+                    if expected_generation and expected_generation != attached:
+                        return tool_error("Retirement preparation generation does not match this turn.")
+                    expected_generation = attached
+        make_coro = lambda: request(  # noqa: E731
+            runner, source, target=str(args["target"]) if "target" in args else None, now=bool(args.get("now")),
+            cancel=action == "cancel_retire", owners=args.get("owners"),
+            reason=str(args.get("reason") or ""), generation=expected_generation,
+            context=str(args.get("message") or ""))
     elif action == "create":
         if not spec.name:
             return tool_error("name is required for action=create.")

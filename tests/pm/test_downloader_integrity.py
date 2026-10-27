@@ -94,18 +94,18 @@ def test_fragmented_resume_obeys_connection_limit(tmp_path):
     import hashlib
     import json
     from threading import Event, Lock
-    import time
 
     payload = bytes(range(256)) * 16
     entered = Event()
+    overlap = Event()
     release = Event()
     lock = Lock()
-    active = 0
-    maximum = 0
+    pending = 0
+    requested = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            nonlocal active, maximum
+            nonlocal pending
             start, end = map(int, re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers["Range"]).groups())
             is_probe = (start, end) == (0, 0)
             self.send_response(206)
@@ -115,16 +115,16 @@ def test_fragmented_resume_obeys_connection_limit(tmp_path):
             self.end_headers()
             if not is_probe:
                 with lock:
-                    active += 1
-                    maximum = max(maximum, active)
-                    entered.set()
-                release.wait(timeout=8)
-            try:
-                self.wfile.write(payload[start:end + 1])
-            finally:
-                if not is_probe:
-                    with lock:
-                        active -= 1
+                    requested.append((start, end + 1))
+                    # Count only arrivals while bodies are withheld. After
+                    # release, a finished handler can outlive its client socket.
+                    if not release.is_set():
+                        pending += 1
+                        entered.set()
+                        if pending > 1:
+                            overlap.set()
+                assert release.wait(timeout=8), "test did not release range bodies"
+            self.wfile.write(payload[start:end + 1])
 
         def log_message(self, *args):
             pass
@@ -156,18 +156,21 @@ def test_fragmented_resume_obeys_connection_limit(tmp_path):
     worker.start()
     try:
         assert entered.wait(timeout=8)
-        # Existing scheduler launches every gap. Leave the response pending
-        # while its sibling sockets enter the real server.
-        time.sleep(2)
+        # Give incorrectly parallel gap workers a bounded opportunity to enter
+        # while the first body is still withheld, never during handler cleanup.
+        overlap.wait(timeout=2)
     finally:
-        release.set()
+        with lock:
+            pending_at_release = pending
+            release.set()
         worker.join(timeout=15)
         server.shutdown()
         server.server_close()
         serving.join(timeout=5)
     assert not worker.is_alive() and not errors, errors
     assert source.dest.read_bytes() == payload
-    assert maximum == 1
+    assert sorted(requested) == [(512, 1024), (1536, 2048), (2560, len(payload))]
+    assert pending_at_release == 1, "concurrent range transfers while the first body was withheld"
 
 
 def test_processes_share_partial_ownership_without_losing_destinations(tmp_path):
@@ -203,14 +206,14 @@ def test_processes_share_partial_ownership_without_losing_destinations(tmp_path)
                     if active > 1:
                         both.set()
                 release.wait(timeout=15)
+                # As above, completed-body handler cleanup is not a live transfer.
+                # Release the counter before the client can start its next request.
+                with lock:
+                    active -= 1
             try:
                 self.wfile.write(payload[start:end + 1])
             except (BrokenPipeError, ConnectionResetError):
                 pass
-            finally:
-                if not probe:
-                    with lock:
-                        active -= 1
 
         def log_message(self, *args):
             pass

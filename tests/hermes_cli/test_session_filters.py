@@ -30,6 +30,9 @@ class TestParseDurationSeconds:
         [
             ("30m", 1800),
             ("5h", 18000),
+            ("1h30m", 5400),
+            ("1d2h3m4s", 93784),
+            ("1.5h30m", 7200),
             ("2d", 172800),
             ("1w", 604800),
             ("90", 90 * 86400),   # bare number = days (back-compat)
@@ -40,6 +43,11 @@ class TestParseDurationSeconds:
     )
     def test_valid(self, value, expected):
         assert parse_duration_seconds(value) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("value", ["1h-30m", "1h30", "2h junk", "1h 30m", "-1d", "", "abc"])
+    def test_invalid_compound(self, value):
+        assert parse_duration_seconds(value) is None
+
 
 class TestParsePointInTime:
     def test_duration_is_relative_to_now(self):

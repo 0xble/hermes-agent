@@ -10,6 +10,20 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _paused_by_contract_verdict(state) -> bool:
+    """Whether the judge paused this goal over its contract (a BLOCKED verdict).
+
+    A user-authorized replacement supersedes that contract, so it may lift such a pause. User and
+    interrupt pauses, an exhausted budget, and judge-infrastructure or barrier pauses are not about
+    the contract and stay until ``/goal resume``."""
+    from hermes_cli.goals import _BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX
+
+    reason = state.paused_reason or ""
+    if state.status != "paused":
+        return False
+    return state.last_verdict == "blocked" and reason.startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX))
+
+
 def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
     from hermes_cli.goals import GoalState, _get_session_db
     from hermes_cli.goals_evaluation import (
@@ -20,6 +34,11 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
     from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot
 
     replace_mode = bool(kwargs.pop("_replace", False))
+    complete_mode = bool(kwargs.pop("_complete", False))
+
+    def apply(target):
+        method = target._complete if complete_mode else target._replace if replace_mode else target._revise
+        return method(**kwargs)
     if (replace_mode and kwargs.get("actor") == "user" and manager.session_id
             and getattr(manager, "_cursor", None) is None):
         return _replace_from_durable_row(manager, **kwargs)
@@ -29,12 +48,12 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
     if replace_mode and original is None:
         return manager._replace(**kwargs)
     if not manager.session_id:
-        return manager._replace(**kwargs) if replace_mode else manager._revise(**kwargs)
+        return apply(manager)
     if getattr(manager, "_cursor", None) is not None:
         # The caller already holds the write transaction and the manager loaded its state through
         # that cursor, so the snapshot is current and writers are serialized. Re-entering the
         # SessionDB lock for a separate read/CAS here would deadlock (session_controls.apply).
-        return manager._replace(**kwargs) if replace_mode else manager._revise(**kwargs)
+        return apply(manager)
     expected = original.to_json()
     db = None
     try:
@@ -48,11 +67,16 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
         staged = copy.copy(manager)
         staged._state = GoalState.from_json(expected)
         staged._evaluation_snapshot = (db, expected)
-        result = staged._replace(**kwargs) if replace_mode else staged._revise(**kwargs)
+        result = apply(staged)
+        # User authority can race independently of the goal row. Recheck a removal quote
+        # under the same writer lock as the contract delta.
+        from hermes_cli.goals_autonomy import validate_removal_quote
+        def precondition(cursor):
+            validate_removal_quote(staged.state, expected, cursor)
         # No-op and validation returns must also observe conflicting command writes.
         commit_and_publish_snapshot(
             manager, staged.state,
-            lambda: commit_goal_snapshot(manager.session_id, expected, staged.state, db),
+            lambda: commit_goal_snapshot(manager.session_id, expected, staged.state, db, precondition=precondition),
             lambda: _read_goal(manager.session_id, db),
         )
         return result
@@ -156,8 +180,9 @@ def stop_condition_only(state: Any, *, goal: str, contract: Any,
 
     if state is None or contract is None:
         return False
-    contract = contract if isinstance(contract, GoalContract) else GoalContract.from_dict(contract)
-    before, after = state.contract.to_dict(), contract.to_dict()
+    before = state.contract.to_dict()
+    after = (contract.to_dict() if isinstance(contract, GoalContract)
+             else GoalContract.from_dict({**before, **contract}).to_dict())
     return (goal == state.goal and bool(before["stop_when"])
             and before["stop_when"] != after["stop_when"]
             and all(after[key] == value for key, value in before.items() if key != "stop_when")
@@ -171,14 +196,14 @@ class GoalRevisionsMixin:
                user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
         """Apply an additive revision through the durable snapshot/CAS boundary.
 
-        Objective changes and removed or reworded requirements are destructive and fail closed;
-        explicit user commands own them. ``user_quote``/``user_messages`` are accepted only for
-        older model-tool callers and never grant authority. Stale revisions preserve the durable
-        winner and return ``state_changed``.
+        Default mode is additive-only and quotes do not grant removal authority. Opt-in autonomy
+        allows objective edits while preserving requirements unless an exact recorded removal
+        quote authorizes the delta. Stale revisions preserve the durable winner and return
+        ``state_changed``. ``user_messages`` is compatibility input, never authority.
         """
         return revise_goal_snapshot(
             self, reason=reason, actor=actor, goal=goal, contract=contract,
-            subgoals=subgoals, evidence=evidence,
+            subgoals=subgoals, evidence=evidence, user_quote=user_quote,
         )
 
     def replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
@@ -191,8 +216,12 @@ class GoalRevisionsMixin:
 
     def _revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
                 contract: Optional[Dict[str, str]] = None, subgoals: Optional[List[str]] = None,
-                evidence: str = "") -> Dict[str, Any]:
+                evidence: str = "", user_quote: str = "") -> Dict[str, Any]:
         """Validate and apply an additive revision to this manager's (staged) state."""
+        from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
+        if goal_autonomy_enabled() and actor == "agent":
+            return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
+                                   subgoals=subgoals, user_quote=user_quote)
         state = self._require_goal()
         reason = (reason or "").strip()
         if not reason:
@@ -216,13 +245,18 @@ class GoalRevisionsMixin:
         the superseded contract (blocked/disputed) is lifted; every other pause stays.
         """
         from hermes_cli.goals import (
-            GoalContract, _paused_by_contract_verdict, goal_remove_usage, normalize_goal_max_turns,
+            GoalContract, goal_remove_usage, normalize_goal_max_turns,
         )
 
+        from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
+        if goal_autonomy_enabled() and actor == "agent":
+            return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
+                                   max_turns=max_turns, user_quote=user_quote, kind="replace")
         if actor != "user":
             return {"ok": False, "error_code": "destructive_change_requires_command",
-                    "error": f"Destructive goal changes require /goal replace <text> or "
-                             f"{goal_remove_usage()}. Goal unchanged and still running."}
+                    "error": f"Use goal_set action=replace through session controls with a current user instruction "
+                             f"or approval, or an explicit /goal replace <text> or {goal_remove_usage()}. "
+                             "Goal unchanged and still running."}
         state = self._state
         if state is None or state.status not in {"active", "paused"}:
             return {"ok": False, "error_code": "no_goal",
@@ -247,16 +281,16 @@ class GoalRevisionsMixin:
                     "status": state.status, "turns_used": state.turns_used, "subgoals": list(state.subgoals)}
 
         previous = snapshot()
-        stop_only = stop_condition_only(state, goal=goal, contract=contract, max_turns=max_turns)
         lift_judge_pause = _paused_by_contract_verdict(state)
         state.goal = goal
         state.created_at = max(time.time(), float(state.created_at or 0.0) + 1e-6)
         if contract is not None:
-            state.contract = contract if isinstance(contract, GoalContract) else GoalContract.from_dict(contract)
-        # Only a broader approved replacement drops additive criteria. Stop-only edits and
-        # slash replacements preserve them, regardless of how the control was authorized.
-        if approved and not stop_only:
-            state.subgoals = []
+            # A sparse edit must not turn omission into user-authorized removal. Typed
+            # GoalContract values are complete contracts, mappings patch only named fields.
+            state.contract = (contract if isinstance(contract, GoalContract)
+                              else GoalContract.from_dict({**state.contract.to_dict(), **contract}))
+        # Replacing an objective does not remove independent additive criteria. Their
+        # existing explicit user removal controls remain the only removal path.
         if max_turns is not None:
             state.max_turns = normalize_goal_max_turns(max_turns, self.default_max_turns)
         # Status and turns_used are kept. Only a judge pause over the superseded contract lifts;

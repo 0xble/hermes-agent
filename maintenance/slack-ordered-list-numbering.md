@@ -1,6 +1,6 @@
-# Slack ordered list numbering
+# Slack Rich-Text Rendering
 
-Load when changing Slack rich-text list parsing, list grouping, or outbound Block Kit rendering.
+Load when changing Slack rich-text list parsing, list grouping, inline formatting, or outbound Block Kit rendering.
 
 ## Required behavior
 
@@ -18,3 +18,11 @@ Each ordered `rich_text_list` run starts at its first authored number, even when
 The behavior contract is `tests/plugins/platforms/slack/test_ordered_list_numbering.py`. Existing renderer and Slack adapter tests remain the surrounding regression surface.
 
 Retire this patch only when the selected upstream release passes that contract without the local implementation. Do not substitute the earlier blank-line-only regression for full coverage. Revert the owned parser/builder change to roll back; runtime adoption remains a separate release decision.
+
+## Inline Emphasis Across Links
+
+Patch identity: `slack-linked-emphasis`. The same renderer split Markdown and Slack links into separate runs before resolving emphasis, leaving literal delimiters around linked labels in lists, quotes, and table cells. Code spans and links now share opaque placeholders until surrounding emphasis is resolved. Restoration preserves literal labels, URLs, and code content, carries surrounding styles onto links, and selects a placeholder prefix absent from the input. Nested emphasis is resolved from its earliest opening span.
+
+The existing inline-code adaptation from fork PR #783 remains part of this behavior. Upstream PR [#105534](https://github.com/NousResearch/hermes-agent/pull/105534), inspected at `be3494cc59be3b41455a71a596e7fa24723124ee`, uses the same opaque-span and outermost-emphasis approach but does not cover this fork's native Slack autolinks. Adapt rather than replace that supported link path.
+
+The regression boundary is `tests/plugins/platforms/slack/test_linked_emphasis.py`: the reported linked labels, Markdown and Slack links across native containers, nested emphasis, opaque code/link content, literal placeholder characters, and adjacent unstyled content. Existing renderer and adapter suites remain required. Retire the local inline change only when a selected upstream release passes those contracts, including the native Slack link forms, without it.

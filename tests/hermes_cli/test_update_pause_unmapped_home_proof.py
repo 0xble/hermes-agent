@@ -24,6 +24,7 @@ from gateway.status import get_process_start_time
 from hermes_cli import dashboard_procs, gateway, process_identity, update_cmd_windows
 from hermes_cli import update_pause_record as pause_record
 from hermes_cli.update_cmd_windows import _pause_windows_gateways_for_update, _unmapped_ready_filter
+from tests.waiting import wait_until
 
 
 @pytest.fixture
@@ -41,6 +42,16 @@ def homes_and_spawn(tmp_path):
     def spawn(home) -> subprocess.Popen:
         proc = subprocess.Popen(argv, env={**os.environ, "HERMES_HOME": str(home)})
         procs.append(proc)
+        def metadata_ready():
+            try:
+                child = psutil.Process(proc.pid)
+                return child.cmdline() == argv and child.environ().get("HERMES_HOME") == str(home)
+            except (psutil.Error, OSError):
+                return False
+
+        # Popen can return before /proc publishes argv and environment during exec.
+        wait_until(metadata_ready, timeout=10,
+                   what=f"child {proc.pid} cmdline {argv!r} and HERMES_HOME={str(home)!r}")
         return proc
 
     yield home_a, home_b, spawn
@@ -54,7 +65,6 @@ def homes_and_spawn(tmp_path):
 def test_a_ledger_proven_unmapped_gateway_is_recorded_with_its_home(homes_and_spawn, monkeypatch):
     home_a, home_b, spawn = homes_and_spawn
     a = spawn(home_a)
-    time.sleep(0.05)
     ct = process_identity._process_create_time(a.pid)
     assert process_identity._append_entry(process_identity.LedgerEntry(
         a.pid, ct, "gateway", process_identity.install_id(), None, None, time.time(), "", hermes_home=home_a))
@@ -99,3 +109,47 @@ def test_a_recorded_but_empty_home_is_never_matched_only_a_pre_home_entry_is(hom
         "a newly incomplete record took the legacy argv-only match"
     # A token from an updater that predates the home field has nothing else to match on.
     assert _unmapped_ready_filter({"pid": old.pid, "argv": argv}, set())([sibling.pid]) == [sibling.pid]
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.spawns_gateway_lookalike
+@pytest.mark.parametrize("initial_metadata", ["empty-cmdline", "partial-cmdline", "missing-home", "never"])
+def test_spawn_waits_for_child_metadata(homes_and_spawn, monkeypatch, initial_metadata):
+    home_a, _, spawn = homes_and_spawn
+    real_cmdline, real_environ = psutil.Process.cmdline, psutil.Process.environ
+    pending = True
+
+    def cmdline(proc):
+        nonlocal pending
+        if pending and initial_metadata != "missing-home":
+            pending = False
+            return [] if initial_metadata == "empty-cmdline" else [sys.executable]
+        return real_cmdline(proc)
+
+    def environ(proc):
+        nonlocal pending
+        if pending and initial_metadata == "missing-home":
+            pending = False
+            return {}
+        return real_environ(proc)
+
+    if initial_metadata == "never":
+        real_wait_until = wait_until
+
+        def no_wait(predicate, **kwargs):
+            return real_wait_until(predicate, timeout=0, what=kwargs["what"])
+
+        monkeypatch.setattr(sys.modules[__name__], "wait_until", no_wait)
+        monkeypatch.setattr(psutil.Process, "cmdline", lambda proc: [])
+        with pytest.raises(AssertionError, match="child .*cmdline.*HERMES_HOME"):
+            spawn(home_a)
+        return
+
+    monkeypatch.setattr(psutil.Process, "cmdline", cmdline)
+    monkeypatch.setattr(psutil.Process, "environ", environ)
+    child = spawn(home_a)
+    argv = list(psutil.Process(child.pid).cmdline())
+    assert _unmapped_ready_filter({"pid": 0, "argv": argv}, set())([child.pid]) == [child.pid], (
+        f"recorded argv={argv!r}, live argv={real_cmdline(psutil.Process(child.pid))!r}"
+    )
+    assert psutil.Process(child.pid).environ()["HERMES_HOME"] == home_a

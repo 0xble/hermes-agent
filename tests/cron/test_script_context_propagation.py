@@ -61,8 +61,20 @@ def test_job_script_callers_propagate_cron_context(tmp_path, monkeypatch, mode):
 
             assert "Script Output" in _build_job_prompt(job)
         else:
-            success, _doc, _response, error = run_job(job)
-            assert success, error
+            from types import SimpleNamespace
+            from gateway import session_cron
+            from hermes_state_registry import acquire, release
+
+            # Exercise the admitted worker using its canonical shared store, not the RPC client.
+            db = acquire(home / "state.db")
+            token = session_cron.bind_execution(
+                SimpleNamespace(db=db), "cron_context-probe", job["id"], None)
+            try:
+                success, _doc, _response, error = run_job(job)
+                assert success, error
+            finally:
+                session_cron._execution.reset(token)
+                release(db)
         assert json.loads(observed.read_text(encoding="utf-8")) == {
             "HERMES_SESSION_ID": "cron_context-probe",
             "HERMES_SESSION_PROFILE": "default",

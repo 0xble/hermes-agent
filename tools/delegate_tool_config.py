@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
+from agent.fast_mode import BOUNDED_MODES, STATIC_TIERS
 from utils import base_url_hostname, is_truthy_value
 from hermes_cli.fallback_config import scoped_fallback_chain
 
@@ -193,7 +194,7 @@ def _inherit_service_tier() -> bool:
     return is_truthy_value(_cfg().get("inherit_service_tier", False))
 
 
-_INHERITABLE_FAST_MODES = frozenset({"priority", "auto", "cold"})
+_INHERITABLE_FAST_MODES = BOUNDED_MODES | STATIC_TIERS
 
 
 def explicit_parent_reasoning(parent_agent) -> Any:
@@ -209,7 +210,11 @@ def explicit_parent_reasoning(parent_agent) -> Any:
     return override
 
 
-def _resolve_child_service_tier(parent_agent, explicit_overrides: Optional[Dict[str, Any]]) -> Optional[str]:
+def _resolve_child_service_tier(
+    parent_agent, explicit_overrides: Optional[dict[str, Any]], *,
+    child_model: Optional[str] = None, child_provider: Optional[str] = None,
+    child_base_url: Optional[str] = None, child_api_key: Optional[str] = None,
+) -> Optional[str]:
     """The child's Fast mode: the parent's mode verbatim when inheritance is on.
 
     The mode, not the parent's wire fields, crosses to the child, so a pinned
@@ -220,9 +225,20 @@ def _resolve_child_service_tier(parent_agent, explicit_overrides: Optional[Dict[
     """
     if not _inherit_service_tier():
         return None
-    if isinstance(explicit_overrides, dict) and any(key in explicit_overrides for key in _FAST_REQUEST_OVERRIDE_KEYS):
-        return None
+    if isinstance(explicit_overrides, dict):
+        extra = explicit_overrides.get("extra_body")
+        if any(key in explicit_overrides or (isinstance(extra, dict) and key in extra)
+               for key in _FAST_REQUEST_OVERRIDE_KEYS):
+            return None
     mode = getattr(parent_agent, "service_tier", None)
+    if mode == "ultrafast":
+        # Ultrafast crosses only to a child route and credential that offer it, never as a paid Priority fallback.
+        from agent.codex_service_tiers import ultrafast_offered
+
+        if not child_model or not ultrafast_offered(
+            child_model, provider=child_provider, base_url=child_base_url, access_token=child_api_key,
+        ):
+            return None
     return mode if mode in _INHERITABLE_FAST_MODES else None
 
 
@@ -232,13 +248,14 @@ def _resolve_child_request_overrides(
     child_model: Optional[str],
     child_provider: Optional[str],
     child_base_url: Optional[str],
-    explicit_overrides: Optional[Dict[str, Any]],
+    child_api_key: Optional[str] = None,
+    explicit_overrides: Optional[dict[str, Any]],
     inherit_parent_route: bool,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Resolve child request overrides without leaking transient parent fast state.
 
     Non-fast parent overrides remain available when the child stays on the parent's
-    route. A static-priority Fast mode inherited through ``_resolve_child_service_tier``
+    route. A static Fast tier inherited through ``_resolve_child_service_tier``
     is pinned here, re-derived for the child's route; bounded modes are applied per
     request by ``agent.fast_mode``. Explicit child overrides win over inherited state.
     """
@@ -249,19 +266,23 @@ def _resolve_child_request_overrides(
     if inherit_parent_route:
         parent_overrides = getattr(parent_agent, "request_overrides", {})
         if isinstance(parent_overrides, dict):
-            inherited = copy.deepcopy(parent_overrides)
-        for key in _FAST_REQUEST_OVERRIDE_KEYS:
-            inherited.pop(key, None)
+            from tools.delegate_tool_tuning import without_service_tier
+            inherited = without_service_tier(parent_overrides)
 
     # Route-independent: a pinned delegation.provider inherits too. No parent wire field
     # crosses routes; the child's own model/provider/base_url decide (None on an
     # unsupported route, e.g. a proxy, so nothing is sent there).
-    if _resolve_child_service_tier(parent_agent, explicit) == "priority":
+    tier = _resolve_child_service_tier(
+        parent_agent, explicit, child_model=child_model, child_provider=child_provider,
+        child_base_url=child_base_url, child_api_key=child_api_key,
+    )
+    if tier in STATIC_TIERS:
         from hermes_cli.models import resolve_fast_mode_overrides
         child_fast = resolve_fast_mode_overrides(
             child_model,
             provider=child_provider,
             base_url=child_base_url,
+            tier=tier,
         )
         if child_fast:
             inherited.update(child_fast)
@@ -359,7 +380,11 @@ def _resolve_child_credential_pool(
             )
             if parent_pool is not None and parent_provider == "custom" and parent_key is not None and parent_key == child_key:
                 return parent_pool
-            return _loaded_pool(child_key)
+            # The entry's slug may also be a same-named built-in's pool: lease only the rows the entry
+            # owns, or a fixed entry credential becomes the built-in's account on a shared endpoint.
+            from agent.custom_entry_pool import custom_entry_for_endpoint, entry_scoped_pool
+            owner = custom_entry_for_endpoint(effective_base_url, effective_requested_provider)
+            return entry_scoped_pool(_loaded_pool(child_key), child_key, owner[1] if owner else None)
         if effective_provider == parent_provider:
             # A same-provider parent with no pool is using a fixed credential.
             # Loading a separate provider pool here can replace the inherited
@@ -598,11 +623,42 @@ def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool) 
         pinned=pinned, owner="delegation")
 
 
+class ResolvedReasoning(NamedTuple):
+    """A route's FINAL reasoning config, used as-is (``None`` included = the route's own default): a profile route
+    resolves its profile's ``agent.reasoning_effort`` / ``reasoning_overrides``, so neither the launching profile's
+    ``delegation.reasoning_effort`` nor the parent's level may fill it in."""
+
+    config: Optional[dict]
+
+
+def _child_reasoning(parent_agent, delegation_cfg: dict, route_effort: Any) -> Any:
+    """Child reasoning config: a :class:`ResolvedReasoning` route value as-is, else the route's raw effort >
+    ``delegation.reasoning_effort`` > the parent's level. Keep the raw value — a YAML ``false`` must disable
+    thinking, not coerce to "" and inherit."""
+    if isinstance(route_effort, ResolvedReasoning):
+        return route_effort.config
+    parent_override = explicit_parent_reasoning(parent_agent)
+    if parent_override is not None:
+        return parent_override
+    child_reasoning = getattr(parent_agent, "reasoning_config", None)
+    delegation_effort = route_effort
+    if not (delegation_effort or delegation_effort is False):
+        delegation_effort = (delegation_cfg or {}).get("reasoning_effort")
+    if delegation_effort or delegation_effort is False:
+        from hermes_constants import parse_reasoning_effort
+        parsed = parse_reasoning_effort(delegation_effort)
+        if parsed is None:
+            logger.warning("Unknown delegation.reasoning_effort '%s', inheriting parent level", delegation_effort)
+        else:
+            child_reasoning = parsed
+    return child_reasoning
+
+
 def _resolve_child_runtime(
     parent_agent, delegation_cfg: dict, parent_api_key: Any, *, model: Optional[str], override_provider: Optional[str],
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[list[str]],
-    routing_cfg: Optional[dict[str, Any]] = None,
+    routing_cfg: Optional[dict[str, Any]] = None, override_reasoning_effort: Any = None,
 ) -> dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
@@ -678,27 +734,7 @@ def _resolve_child_runtime(
             getattr(parent_agent, "requested_provider", None) or effective_provider
         )
 
-    # Reasoning: an explicit parent choice > delegation.reasoning_effort > parent's configured level.
-    # ``reasoning_override`` is the user's explicit pick (session /reasoning, --reasoning, /model
-    # --reasoning), kept apart from ``reasoning_config`` so config re-resolution (model switch,
-    # fallback) never masquerades as intent. A configured parent level is only a default, so the
-    # child's own configured default beats it. Keep the raw value: a YAML ``false`` must disable
-    # thinking, not coerce to "" and inherit. Transports clamp the level onto the child's route.
-    child_reasoning = getattr(parent_agent, "reasoning_config", None)
-    parent_override = explicit_parent_reasoning(parent_agent)
-    try:
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if parent_override is not None:
-            child_reasoning = parent_override
-        elif delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is None:
-                logger.warning("Unknown delegation.reasoning_effort '%s', inheriting parent level", delegation_effort)
-            else:
-                child_reasoning = parsed
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+    child_reasoning = _child_reasoning(parent_agent, delegation_cfg, override_reasoning_effort)
     child_reasoning = dict(child_reasoning) if isinstance(child_reasoning, dict) else child_reasoning
 
     kwargs: dict[str, Any] = {

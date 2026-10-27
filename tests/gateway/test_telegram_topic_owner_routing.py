@@ -327,6 +327,50 @@ def test_creating_reservation_for_another_topic_is_not_shared_onto_owned_thread(
     assert not second["canonical_owner_key"]
 
 
+@pytest.mark.asyncio
+async def test_retirement_merge_redirects_old_and_shared_owner_delivery_after_recovery(db):
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    from gateway.telegram_retire import save
+    from gateway.telegram_retire_prepare import redirect_owner
+    from hermes_state import AsyncSessionDB
+
+    _live_session(db, "old", "Old Service", 10, managed_mode="automation")
+    _live_session(db, "next", "Service Operations", 20, managed_mode="automation")
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="job:old", topic_name="Old Service")
+    db.set_telegram_topic_owner_active(chat_id="123", owner_key="job:old", thread_id="10", topic_name="Old Service")
+    db.reserve_telegram_topic_owner(chat_id="123", owner_key="job:shared", topic_name="Shared Service")
+    db.set_telegram_topic_owner_shared(chat_id="123", owner_key="job:shared", canonical_owner_key="job:old",
+                                       topic_name="Shared Service")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", thread_id="10", chat_type="dm")
+    runner = SimpleNamespace(_session_db=AsyncSessionDB(db))
+    state = {"generation": "merge", "phase": "deleting", "session_id": "old",
+             "merge_destination": {"thread_id": "20", "session_id": "next", "title": "Service Operations"}}
+    await save(runner, source, state)
+    await redirect_owner(runner, source, state)
+    await redirect_owner(runner, source, state)
+    db.delete_telegram_topic_binding(chat_id="123", thread_id="10")
+    adapter = _adapter(db)
+    assert await adapter.ensure_dm_topic("123", "Old Service", owner_key="job:old") == "20"
+    assert await adapter.ensure_dm_topic("123", "Shared Service", owner_key="job:shared") == "20"
+    adapter._bot.create_forum_topic.assert_not_awaited()
+    assert db.get_session("old") is not None
+    db.delete_telegram_topic_binding(chat_id="123", thread_id="20")
+    with pytest.raises(RuntimeError, match="no live Hermes binding"):
+        await adapter.ensure_dm_topic("123", "Old Service", owner_key="job:old")
+    adapter._bot.create_forum_topic.assert_not_awaited()
+
+
+def test_shared_owner_cycles_fail_closed_instead_of_creating_a_topic(db):
+    for key in ("a", "b"):
+        db.reserve_telegram_topic_owner(chat_id="123", owner_key=key, topic_name=key)
+    db.set_telegram_topic_owner_shared(chat_id="123", owner_key="a", canonical_owner_key="b", topic_name="a")
+    db.set_telegram_topic_owner_shared(chat_id="123", owner_key="b", canonical_owner_key="a", topic_name="b")
+    with pytest.raises(RuntimeError, match="redirect cycle"):
+        db.resolve_telegram_topic_owner(chat_id="123", owner_key="a")
+    assert db.resolve_telegram_topic_owner(chat_id="123", owner_key="a", profile_name="secondary") is None
+
+
 def test_numeric_topic_without_binding_fails_closed(db):
     adapter = _adapter(db)
     with pytest.raises(RuntimeError, match="no live Hermes binding"):

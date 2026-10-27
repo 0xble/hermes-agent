@@ -44,16 +44,21 @@ class ApiCallVerdict:
 
 
 def _should_stream(agent: Any) -> bool:
-    """Streaming is preferred even without consumers (stale-stream / read-timeout health
-    checks); disabled on provider signal, ACP providers (``acp://`` scheme or an
-    external-process provider profile), MoA without a display consumer, or Mock clients in
-    tests (SimpleNamespace, not stream iterators)."""
+    """Prefer streaming for liveness even without display consumers. Process providers
+    must opt in; ACP transports and explicit session/provider disables stay non-streaming."""
     if getattr(agent, "_disable_streaming", False):
         return False
     _base = str(agent.base_url or "").lower()
+    if _base.startswith(("acp://", "acp+tcp://")):
+        return False
+    from providers import get_provider_profile
     from hermes_cli.runtime_provider_backends import _is_external_process_provider
 
-    if _base.startswith(("acp://", "acp+tcp://")) or _is_external_process_provider(agent.provider):
+    profile = get_provider_profile(agent.provider)
+    streaming = getattr(profile, "supports_streaming", None)
+    if streaming is False:
+        return False
+    if _is_external_process_provider(agent.provider) and streaming is not True:
         return False
     if not agent._has_stream_consumers():
         if agent.provider == "moa":
@@ -86,37 +91,42 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        from agent import relay_llm
+        from agent.turn_usage import log_response_service_tier
+
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
-        if _use_streaming:
-            return agent._interruptible_streaming_api_call(
-                next_api_kwargs, on_first_delta=_stop_spinner
-            )
-        from agent import relay_llm
-
-        return relay_llm.execute(
-            next_api_kwargs,
-            agent._interruptible_api_call,
-            session_id=str(agent.session_id or ""),
-            name=str(agent.provider or "provider"),
-            model_name=str(agent.model or ""),
-            metadata={
-                "api_mode": agent.api_mode,
-                "api_request_id": api_request_id,
-                "call_role": (
-                    "delegated"
-                    if getattr(agent, "is_subagent", False)
-                    else "fallback"
-                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                    else "primary"
-                ),
-                "retry_count": retry_count,
-            },
-            defer_logical_completion=True,
-        )
+        with relay_llm.capture_provider_request(next_api_kwargs) as provider_kwargs:
+            if _use_streaming:
+                result = agent._interruptible_streaming_api_call(
+                    next_api_kwargs, on_first_delta=_stop_spinner
+                )
+            else:
+                result = relay_llm.execute(
+                    next_api_kwargs,
+                    agent._interruptible_api_call,
+                    session_id=str(agent.session_id or ""),
+                    name=str(agent.provider or "provider"),
+                    model_name=str(agent.model or ""),
+                    metadata={
+                        "api_mode": agent.api_mode,
+                        "api_request_id": api_request_id,
+                        "call_role": (
+                            "delegated"
+                            if getattr(agent, "is_subagent", False)
+                            else "fallback"
+                            if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                            else "primary"
+                        ),
+                        "retry_count": retry_count,
+                    },
+                    defer_logical_completion=True,
+                )
+        log_response_service_tier(agent, result, provider_kwargs)
+        return result
 
     from hermes_cli.middleware import run_llm_execution_middleware
 

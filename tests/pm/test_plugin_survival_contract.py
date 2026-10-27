@@ -37,6 +37,7 @@ import hermes_yaml as yaml
 
 import pm.workspace as ws
 from pm.plugin_inputs import Members
+from tests.pm import _fixtures
 
 
 def _write_enabled(home: Path, enabled: list, provider: str | None = None) -> None:
@@ -281,12 +282,7 @@ def test_malformed_secondary_cannot_evict_recorded_member(admission_env, monkeyp
     profile = home_a / "profiles" / "work"
     profile.mkdir(parents=True)
     _write_enabled(profile, ["profile-dep"])
-    member = profile / "plugins" / "profile-dep"
-    member.mkdir(parents=True)
-    (member / "pyproject.toml").write_text(
-        '[project]\nname="profile-dep"\nversion="1"\nrequires-python=">=3.11"\n'
-        'dependencies=[]\n[tool.uv]\npackage=false\n', encoding="utf-8",
-    )
+    _fixtures.installing_member(profile / "plugins" / "profile-dep", "profile-dep", tmp_path / "wheels")
     sync_venv(explicit=True)
     recorded = Facts(runtime_facts_path(core), strict=True).get("venv")
     selected = selected_venv(core)
@@ -295,12 +291,7 @@ def test_malformed_secondary_cannot_evict_recorded_member(admission_env, monkeyp
 
     bad = profile / "config.yaml"
     bad.write_text("plugins: [broken]\n", encoding="utf-8")
-    candidate = home_a / "plugins" / "new-dep"
-    candidate.mkdir(parents=True)
-    (candidate / "pyproject.toml").write_text(
-        '[project]\nname="new-dep"\nversion="1"\nrequires-python=">=3.11"\n'
-        'dependencies=[]\n[tool.uv]\npackage=false\n', encoding="utf-8",
-    )
+    _fixtures.installing_member(home_a / "plugins" / "new-dep", "new-dep", tmp_path / "wheels")
     _write_enabled(home_a, ["new-dep"])
     assert venv_is_current(project_root=core) is False
     assert str(bad) in caplog.text
@@ -333,6 +324,135 @@ def test_malformed_secondary_cannot_evict_recorded_member(admission_env, monkeyp
 
 
 @pytest.mark.skipif(not _uv_available(), reason="uv not on PATH")
+def test_plugin_whose_pyproject_installs_nothing_keeps_the_environment(admission_env):
+    """``dependencies = []`` (the official agent-importers plugin) puts nothing in the environment:
+    enabling that plugin, and each later change to its files, keeps the selected generation instead
+    of locking and syncing a new one. A plugin with a real dependency still joins the workspace."""
+    import tomllib
+
+    from hermes_cli import plugins_admission as admission
+    from pm.environments import runtime_facts_path, selected_venv
+    from pm.install import sync_venv, venv_is_current
+    from pm.lock import Facts
+
+    tmp_path, home = admission_env
+    core = tmp_path / "core"
+    sync_venv(explicit=True)
+    selected = selected_venv(core)
+    recorded = Facts(runtime_facts_path(core), strict=True).get("venv")
+    plugin = home / "plugins" / "importers"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text("name: importers\n", encoding="utf-8")
+    (plugin / "__init__.py").write_text("VERSION = 1\n", encoding="utf-8")
+    (plugin / "pyproject.toml").write_text(
+        '[project]\nname="importers"\nversion="1"\nrequires-python=">=3.11"\ndependencies=[]\n', encoding="utf-8")
+
+    admission.admit_plugin_set_change({"importers"}, set(), active_plugins_dir=home / "plugins")
+
+    assert yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))["plugins"]["enabled"] == ["importers"]
+    assert selected_venv(core) == selected
+    assert Facts(runtime_facts_path(core), strict=True).get("venv") == recorded
+    (plugin / "__init__.py").write_text("VERSION = 2\n", encoding="utf-8")  # what an update changes
+    assert venv_is_current(project_root=core) is True
+
+    real = home / "plugins" / "real"
+    _fixtures.installing_member(real, "real", tmp_path / "wheels")
+    (real / "plugin.yaml").write_text("name: real\n", encoding="utf-8")
+    admission.admit_plugin_set_change({"importers", "real"}, set(), active_plugins_dir=home / "plugins")
+    workspace = Path(Facts(runtime_facts_path(core), strict=True).get("venv")["resolved_lock"]).parent
+    members = tomllib.loads((workspace / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["uv"]["workspace"]["members"]
+    assert [Path(member).name.split("-")[0] for member in members] == ["real"]
+    assert selected_venv(core) != selected
+    assert venv_is_current(project_root=core) is True
+
+
+def _bundled_provider(core: Path, shared: Path, requires_python: str) -> Path:
+    """A release-owned provider pinning *shared*'s sharedlib; plug-a pins the other source,
+    an unsatisfiable union that uv resolves offline."""
+    provider = core / "plugins" / "memory" / "bundled-provider"
+    provider.mkdir(parents=True)
+    (provider / "__init__.py").write_text("", encoding="utf-8")
+    (provider / "plugin.yaml").write_text("name: bundled-provider\n", encoding="utf-8")
+    (provider / "pyproject.toml").write_text(
+        '[project]\nname="bundled-provider"\nversion="1"\n'
+        f'requires-python="{requires_python}"\n'
+        'dependencies=["sharedlib==2.0.0"]\n[tool.uv]\npackage=false\n'
+        f'[tool.uv.sources]\nsharedlib = {{ path = "{shared.as_posix()}" }}\n',
+        encoding="utf-8",
+    )
+    return provider
+
+
+@pytest.mark.skipif(not _uv_available(), reason="uv not on PATH")
+def test_update_sync_evicts_third_party_plugin_conflicting_with_bundled_provider(admission_env):
+    """An update never fails because of a plugin: when a third-party plugin's pins conflict
+    with a bundled provider's, the provider is seated first and the third-party plugin is
+    the one disabled, even though config order lists it before the provider."""
+    from pm.environments import runtime_facts_path
+    from pm.install import sync_venv, venv_is_current
+    from pm.lock import Facts
+
+    tmp_path, home = admission_env
+    core = tmp_path / "core"
+    _plug_a, _plug_b, _shared1, shared2 = _local_conflict_members(home)
+    _bundled_provider(core, shared2, ">=3.11")
+    _write_enabled(home, ["plug-a"], provider="bundled-provider")
+
+    sync_venv(explicit=True, evict_incompatible_plugins=True)
+
+    cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert cfg["memory"]["provider"] == "bundled-provider"
+    assert cfg["plugins"]["disabled"] == ["plug-a"]
+    workspace = Path(Facts(runtime_facts_path(core), strict=True).get("venv")["resolved_lock"]).parent
+    members = (workspace / "pyproject.toml").read_text()
+    assert "bundled-provider" in members and "plug-a" not in members
+    warnings = json.dumps(_latest_receipt(home).get("warnings"))
+    assert "Disabled plugin 'plug-a'" in warnings
+    assert venv_is_current(project_root=core) is True
+
+
+@pytest.mark.skipif(not _uv_available(), reason="uv not on PATH")
+def test_update_sync_cannot_evict_bundled_memory_provider(admission_env):
+    """A bundled provider that cannot fit the release on its own fails the update loudly
+    rather than letting eviction clear ``memory.provider`` and silently disable memory."""
+    from pm.install import sync_venv
+    from pm.package import InstallError
+
+    tmp_path, home = admission_env
+    _plug_a, _plug_b, _shared1, shared2 = _local_conflict_members(home)
+    _bundled_provider(tmp_path / "core", shared2, ">999")
+    _write_enabled(home, ["plug-a"], provider="bundled-provider")
+    before = (home / "config.yaml").read_bytes()
+
+    with pytest.raises(InstallError, match="bundled memory provider"):
+        sync_venv(explicit=True, evict_incompatible_plugins=True)
+
+    assert (home / "config.yaml").read_bytes() == before
+    cfg = yaml.safe_load(before)
+    assert cfg["memory"]["provider"] == "bundled-provider"
+    assert "bundled-provider" not in cfg.get("plugins", {}).get("disabled", [])
+
+
+def test_bundled_provider_recognised_by_bare_and_memory_prefixed_key(tmp_path, monkeypatch):
+    """``memory.provider`` names the bare provider; a plugins.enabled key may be ``memory/<name>``."""
+    import pm.paths
+    from pm.plugin_eviction import _is_bundled_provider
+
+    core = tmp_path / "core"
+    provider = core / "plugins" / "memory" / "hindsight"
+    provider.mkdir(parents=True)
+    user_copy = tmp_path / "home" / "plugins" / "hindsight"
+    user_copy.mkdir(parents=True)
+    monkeypatch.setattr(pm.paths, "repo_root", lambda: core)
+    plugins_dir = tmp_path / "home" / "plugins"
+
+    assert _is_bundled_provider((plugins_dir, "hindsight", provider))
+    assert _is_bundled_provider((plugins_dir, "memory/hindsight", provider))
+    assert not _is_bundled_provider((plugins_dir, "hindsight", user_copy))
+    assert not _is_bundled_provider((plugins_dir, "memory/other", provider))
+
+
+@pytest.mark.skipif(not _uv_available(), reason="uv not on PATH")
 def test_update_sync_disables_plugin_excluded_by_requires_python(admission_env):
     """An update never fails because of a plugin: a member whose requires-python excludes the
     interpreter core now runs on is disabled in every home that enables it (plugins.enabled in
@@ -345,12 +465,7 @@ def test_update_sync_disables_plugin_excluded_by_requires_python(admission_env):
     tmp_path, home = admission_env
     core = tmp_path / "core"
     for name, requires in (("fits", ">=3.11"), ("too-old", f"<{sys.version_info[0]}.{sys.version_info[1]}")):
-        plugin = home / "plugins" / name
-        plugin.mkdir(parents=True)
-        (plugin / "pyproject.toml").write_text(
-            f'[project]\nname="{name}"\nversion="1"\nrequires-python="{requires}"\n'
-            'dependencies=[]\n[tool.uv]\npackage=false\n', encoding="utf-8",
-        )
+        _fixtures.installing_member(home / "plugins" / name, name, tmp_path / "wheels", requires_python=requires)
     (home / "config.yaml").write_text("# operator note\nplugins:\n  enabled: [fits, too-old]\n", encoding="utf-8")
     profile = home / "profiles" / "work"
     _write_enabled(profile, [], provider="too-old")
@@ -402,12 +517,7 @@ def test_update_sync_survives_unreadable_secondary_profile(admission_env):
 
     tmp_path, home = admission_env
     core = tmp_path / "core"
-    member = home / "plugins" / "primary-dep"
-    member.mkdir(parents=True)
-    (member / "pyproject.toml").write_text(
-        '[project]\nname="primary-dep"\nversion="1"\nrequires-python=">=3.11"\n'
-        'dependencies=[]\n[tool.uv]\npackage=false\n', encoding="utf-8",
-    )
+    _fixtures.installing_member(home / "plugins" / "primary-dep", "primary-dep", tmp_path / "wheels")
     _write_enabled(home, ["primary-dep"])
     broken = home / "profiles" / "work" / "config.yaml"
     broken.parent.mkdir(parents=True)
@@ -441,12 +551,7 @@ def test_plugin_our_version_rejects_sits_out_without_being_disabled(admission_en
     # A tagless checkout (CI's) has no parseable version, which makes requires_hermes permissive.
     monkeypatch.setattr(plugins_manifest, "running_hermes_version", lambda: "1.0.0")
     for name in ("fits", "needs-newer"):
-        plugin = home / "plugins" / name
-        plugin.mkdir(parents=True)
-        (plugin / "pyproject.toml").write_text(
-            f'[project]\nname="{name}"\nversion="1"\nrequires-python=">=3.11"\n'
-            'dependencies=[]\n[tool.uv]\npackage=false\n', encoding="utf-8",
-        )
+        _fixtures.installing_member(home / "plugins" / name, name, tmp_path / "wheels")
     manifest = home / "plugins" / "needs-newer" / "plugin.yaml"
     manifest.write_text("name: needs-newer\nrequires_hermes: '>=999'\n", encoding="utf-8")
     _write_enabled(home, ["fits", "needs-newer"])

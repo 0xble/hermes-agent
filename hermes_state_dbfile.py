@@ -763,6 +763,12 @@ def is_zeroed_state_db(path: Path, *, probe_bytes: int = 100, force: bool = Fals
     return head is not None and not head.startswith(b"SQLite format 3") and all(b == 0 for b in head)
 
 
+def has_valid_sqlite_header_preopen(path: Path) -> bool:
+    """Require an observed SQLite header, not an unreadable or deliberately skipped probe."""
+    head = _preopen_header(path, 100, False)
+    return head is not None and head.startswith(b"SQLite format 3")
+
+
 def has_invalid_sqlite_header_preopen(path: Path, *, probe_bytes: int = 100, force: bool = False) -> bool:
     """A pre-existing state.db whose first page is not SQLite: 0-byte, NUL, or clobbered page 0
     (#102198).  Zeroed files are the subset :func:`is_zeroed_state_db` names."""
@@ -870,7 +876,8 @@ def collect_state_db_stats(db_path: Path) -> dict[str, Any]:
     from hermes_state import _connect_tracked_db
     stats: dict[str, Any] = dict.fromkeys((
         "page_count", "page_size", "freelist_count", "logical_size_bytes", "wal_size_bytes", "journal_mode",
-        "messages", "sessions", "fts_tables", "fts_storage_version", "fts_rebuild_pending",
+        "messages", "sessions", "fts_tables", "fts_storage_version", "fts_storage_upgrade_needed",
+        "fts_teardown_pending", "fts_rebuild_pending",
         "fts_rebuild_high_water", "fts_rebuild_progress", "fts_rebuild_deferral"))
     # WAL sidecar size needs no connection at all.
     with contextlib.suppress(OSError):
@@ -918,6 +925,14 @@ def collect_state_db_stats(db_path: Path) -> dict[str, Any]:
             stats["fts_tables"] = {t: (t in names) for t in _FTS_TABLE_NAMES}
         # Raw state_meta reads — cheap, and independent of SessionDB.
         stats["fts_storage_version"] = _meta_int("fts_storage_version")
+        with contextlib.suppress(Exception):
+            from hermes_state_fts import fts_layout_drift
+            stats["fts_storage_upgrade_needed"] = bool(fts_layout_drift(conn.cursor()))
+        with contextlib.suppress(Exception):
+            # Demoted old-index tables still awaiting teardown: an optimize-storage run stopped after its backfill.
+            stats["fts_teardown_pending"] = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name LIKE 'fts\\_v22\\_trash\\_%' ESCAPE '\\' "
+                "LIMIT 1").fetchone() is not None
         stats["fts_rebuild_high_water"] = high_water = _meta_int("fts_rebuild_high_water")
         stats["fts_rebuild_progress"] = progress = _meta_int("fts_rebuild_progress")
         stats["fts_rebuild_pending"] = False if high_water is None else (progress or 0) < high_water

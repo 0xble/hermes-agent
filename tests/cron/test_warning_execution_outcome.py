@@ -5,6 +5,17 @@ from cron import executions, incidents, jobs, scheduler
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 
 
+def delivery_queue_rows():
+    """Read durable delivery rows for queue-lane diagnostics."""
+    from cron.delivery_queue import _connect
+
+    conn = _connect()
+    try:
+        return [dict(r) for r in conn.execute("SELECT execution_id, status FROM deliveries")]
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("worker, job_id, adapters, platforms, expected", [
     ("run-1", "run-1", None, ["telegram"], True),
     ("run-1", "run-2", None, ["telegram"], False),
@@ -62,6 +73,17 @@ def test_real_run_ledger_and_incident_match_actual_presentation(tmp_path, monkey
     scheduler.run_one_job(job)
     row = executions.latest_execution(job["id"])
     expected_suppression = suppress and mode != "success"
+    # Every agent run (in-process or restart-safe worker) hands its send to the durable queue
+    # (gateway-attached cron): the ledger books the handoff and the gateway's drain performs
+    # (or suppresses) the send. Only a crash notice is sent inline.
+    queued_lane = mode != "crash"
+    if queued_lane:
+        assert len(sent) == 0
+        assert row["delivery_outcome"] == "queued"
+        assert scheduler.drain_delivery_queue({}, None) == 1
+        (queued,) = delivery_queue_rows()
+        assert queued["status"] == ("suppressed" if expected_suppression else "delivered")
+        row = executions.latest_execution(job["id"])  # the drain writes its outcome back
     assert len(sent) == (0 if expected_suppression else 1)
     assert row["delivery_outcome"] == ("suppressed" if expected_suppression else "delivered")
     saved = jobs.get_job(job["id"])

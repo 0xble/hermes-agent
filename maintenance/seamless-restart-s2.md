@@ -48,7 +48,7 @@ The gateway's macOS supervised-child watcher checks for its own PID in `running`
 
 | Runtime surface | Candidate treatment and gate |
 |---|---|
-| Active extras and transitive packages | Infer installed optional leaf groups and orphan locked dependency closure from source interpreter and candidate `pyproject.toml`/`uv.lock`; `uv sync --frozen --extra` uses candidate lock pins and the source interpreter's Python version. Restore source packages absent from lock with `uv pip --no-deps`; fail staging if **any** source distribution is missing (except project itself), if an unlocked version changes, or if installed plugin entry points disappear. `Provides-Extra` lists availability, not the install's selected extras. |
+| Active extras and transitive packages | Infer installed optional leaf groups and orphan locked dependency closure from the source interpreter and the active release's committed PM environment ([release extras carry](release-extras-carry.md)) against the candidate `pyproject.toml`/`uv.lock`; `uv sync --frozen --extra` uses candidate lock pins and PM's pinned Python ABI, independently of the source interpreter version. Restore source packages absent from lock with `uv pip --no-deps`; fail staging if **any** source distribution is missing (except project itself), if an unlocked version changes, or if installed plugin entry points disappear. `Provides-Extra` lists availability, not the install's selected extras. |
 | Shared `~/.hermes/plugins` | Never copy mutable plugins into releases. Smoke-import enabled directory and installed entry-point plugins with candidate Python under a copied disposable home; candidate dependency parity prevents missing installed plugin requirements, though plugin `register()` remains outside this pre-activation smoke. |
 | Console scripts, editable `.pth`, native artifacts | Build a fresh venv within unique staging, rewrite text paths including entry-point shebangs and `.pth`, remove regenerable compiled `__pycache__/*.pyc` with staging paths, fail for any other binary containing one. `UV_COMPILE_BYTECODE=0` explicitly leaves uv bytecode compilation to runtime; smoke can independently generate caches. Native wheels come from locked uv platform resolution, not copied source binaries. Qualification exercises relocated `hermes` and imports after publication. |
 | Node/web assets and ignored generated files | Archive the exact fetched SHA into a private build-aside directory, run npm and the web build **there**, then build the candidate venv there. Never copy source `web_dist` or run npm in the source checkout: A's ignored generated files cannot become B's assets. A failed build cannot publish a ready candidate. |
@@ -141,8 +141,45 @@ The two-release native fixture owns a real minimal source `.venv`, so optional-f
 
 ## Selected Release Launchers
 
+### Candidate-Owned Update Policy
+
+The migration source is intentionally frozen. Release-origin CLI and gateway
+updates keep the running release's updater code and interpreter, while binding
+Git operations to the source path validated by `release-layout.json`. They must
+not execute the migration source's stale updater or rebuild its dependencies.
+The candidate's isolated `pm/build_env.py` owns its build policy and pinned target
+ABI. The maintained updater's interpreter supplies the stdlib bootstrap, not the
+build target. Never select the migration source's older interpreter for that
+bootstrap: a cold candidate PM runtime can require a newer Python than the source.
+
+This distinction matters for locked dependency overrides: an old PM can install
+the candidate's Pillow 13 override, then incorrectly reject browser-harness's
+upstream Pillow 12 metadata because it predates lock-aware validation. Retain
+the security override and the candidate PM's rejection of every unexplained
+incompatibility. Dependency failure notices retain the offending requirement,
+not just pip-check's progress line.
+
+Regression ownership: `tests/hermes_cli/test_immutable_candidate_pm.py` proves a
+real isolated child loads candidate PM despite stale PM already loaded in the
+parent, propagates candidate failures, and preserves the conflict in the notice.
+`test_release_update_keeps_current_code_and_targets_source_git` in the immutable
+release suite qualifies source binding without stale-code re-entry. Keep the
+existing lock-aware `tests/pm/test_pip_check.py` coverage. Retire this adaptation
+only when the upstream immutable updater owns both code and build-policy handoff
+without relaxing dependency validation or mutating the migration rollback tree.
+
+An already-installed pre-fix updater cannot bootstrap this correction by retrying
+the same failing stage. A parent owner must first stage the exact qualified
+candidate through that candidate's `stage_release` entry point without promotion,
+then use the normal installed update command to consume the ready release. Do not
+edit the frozen updater, installed release, live environment, or pointer manually.
+
 Native PM source services persist the installation launcher, which intentionally follows the source install's current Python tool. Reusing that launcher for an immutable release discarded the release interpreter and loaded the source checkout in both the stderr wrapper and gateway. Release plist generation now binds both runtime commands to the explicitly selected release root and interpreter, while ordinary source services retain their installation launcher. The generated-plist invariant executes the source service and A→B→A release commands with disposable payloads, checking imported roots, bootstrap roots, interpreter identity and external supervision. It fails on the unchanged renderer because the source payload runs instead of the selected release. Upstream PR #130125 addresses a related managed-workspace canonical-root defect, not this fork-owned immutable selection. Retire this adaptation only when upstream's native release renderer demonstrates the same selected-tree and interpreter contract.
 
 ## Generated Launcher Acknowledgement
 
 The supervised acknowledgement accepted only `python -m hermes_cli.main`, but the release plist this unit generates starts the gateway as `python -I -c <bootstrap> gateway run --external-supervisor`. Every immutable update therefore activated the intended release, then timed out waiting for an acknowledgement it could never observe, leaving `release-txn.json` pending and the receipt `partial`. The acknowledgement now also accepts that launcher, but only when its `-c` code equals the bootstrap `runtime_command` renders for the intended release root. An arbitrary `-c` program or another release's launcher is rejected, and the interpreter image, cwd and `PYTHONPATH` checks are unchanged. Guard: `test_generated_launchd_gateway_acknowledges_only_its_release` in `tests/hermes_cli/test_immutable_release_transactions.py`, driven by the real generated plist. It fails on the unchanged matcher.
+
+## Isolated Launcher Environment
+
+PM exports the selected project and dependency paths as `PYTHONPATH` for children, including the gateway spawned by the timestamp wrapper. A nonempty observed value is not evidence of import contamination for the exact generated isolated bootstrap: `-I` ignores inherited paths and the bootstrap clears them before importing. Acknowledgement qualifies this environment with the entrypoint, while non-isolated `-m` commands still require an empty value. The environment regression exercises observation-only recovery, durable acknowledgement and idempotence for both launch shapes, plus rejection of another release and arbitrary code. Keep all release, plist, supervisor, interpreter and cwd predicates intact.

@@ -29,7 +29,8 @@ async def cli(runner, source, *args, timeout=30):
     from tools.environments.local import served_profile_child_env
     home = runner._resolve_profile_home_for_source(source)
     env = served_profile_child_env(target_home=home, inherit_credentials=True)
-    session_id = runner.session_store.peek_session_id(runner._session_key_for_source(source))
+    session_id = await asyncio.to_thread(
+        runner.session_store.peek_session_id, runner._session_key_for_source(source))
     env.update(HERMES_SESSION_ID=session_id or "", HERMES_SESSION_PROFILE=source.profile or "default",
                HERMES_SESSION_KEY=runner._session_key_for_source(source))
     executable = locate_command(args[0]).command
@@ -54,7 +55,11 @@ async def cli(runner, source, *args, timeout=30):
     return result
 
 
-async def inventory(runner, source, state):
+class WorkInProgress(RuntimeError):
+    """Execution tokens must settle normally, not be transferred or discarded."""
+
+
+async def inventory(runner, source, state) -> list[dict]:
     from cron.jobs import list_jobs, is_terminal_job
     from tools.async_delegation import retirement_inventory
     from tools.process_registry import process_registry
@@ -96,7 +101,7 @@ async def inventory(runner, source, state):
         if not isinstance(claims, list):
             raise RuntimeError("Task claim inventory returned an incomplete response")
         if claims:
-            raise RuntimeError("Active task execution must settle before its topic retires. No claim token was reassigned.")
+            raise WorkInProgress("Active task execution must settle before its topic retires. No claim token was reassigned.")
         tasks = await cli(runner, source, "tasks", "--json", "inbox", "--session", origin_address)
         if not isinstance(tasks, list):
             raise RuntimeError("Task inventory returned an incomplete response")
@@ -121,31 +126,6 @@ async def destination(runner, source, selector):
     if pending and pending["phase"] not in {"cancelled", "done", "failed"}:
         raise ValueError(f"Owner '{selector}' is also retiring.")
     return candidate
-
-
-async def resolve_answers(runner, source, state, text):
-    """Accept only a complete numbered owner answer, never start a new model turn."""
-    matches = re.findall(r"(?:^|[;\n])\s*(\d+)[.):]?\s+([^;\n]+)", text.strip())
-    if not matches:
-        return False
-    questions = state["questions"]
-    selections = {}
-    try:
-        for number, name in matches:
-            index = int(number) - 1
-            if index < 0 or index >= len(questions) or index in selections:
-                return False
-            await destination(runner, source, name.strip())
-            selections[index] = name.strip()
-    except ValueError:
-        return False
-    if len(selections) != len(questions):
-        return False
-    state.setdefault("owners", {}).update({questions[index]["id"]: name for index, name in selections.items()})
-    state.pop("questions", None)
-    state["phase"] = "pending"
-    await save(runner, source, state)
-    return True
 
 
 def handoff_key(state, item):
@@ -203,8 +183,13 @@ async def assign_task(runner, source, state, task_id, target, record=None):
 
 
 async def receipt(runner, source, state, item, dest):
-    """Task-linked relay with stable keys, then exact receipt reconciliation."""
+    """Preserve work as tasks, or context alone as a non-actionable merge settlement."""
     target = address(source, dest["session_id"])
+    if item["kind"] == "context":
+        body = ("📨 Topic merged\nThe retired topic's lasting subject now lives here. "
+                "This context transfer requests no new work or reply.\n---\n"
+                + json.dumps(item["record"], ensure_ascii=False))
+        return await send_receipt(runner, source, state, item, dest, body, ("--fyi",))
     if item["kind"] == "task":
         task_id = str(item["record"]["id"])
     else:
@@ -213,7 +198,7 @@ async def receipt(runner, source, state, item, dest):
         owner_source = replace(source, thread_id=str(dest["thread_id"]))
         owner_key = runner._session_key_for_source(owner_source)
         if (owner_key != dest["session_key"]
-                or runner.session_store.peek_session_id(owner_key) != dest["session_id"]):
+                or await asyncio.to_thread(runner.session_store.peek_session_id, owner_key) != dest["session_id"]):
             raise RuntimeError("Handoff destination binding changed")
         title = f"Retired topic: {item['kind']}"
         context = "Own the transferred work. Preserve its original limits and report to this topic.\n" + json.dumps(item, ensure_ascii=False)
@@ -227,6 +212,12 @@ async def receipt(runner, source, state, item, dest):
                       item["record"] if item["kind"] == "task" else None)
     # The full resumption context is already in the canonical ledger.
     body = f"📦 Topic handoff\nContinue task {task_id} from the retiring topic. Read its current ledger context before acting."
+    return await send_receipt(runner, source, state, item, dest, body, ("--task", task_id))
+
+
+async def send_receipt(runner, source, state, item, dest, body, intent):
+    """Use the same idempotency and exact-transcript receipt gate for either intent."""
+    target = address(source, dest["session_id"])
     from pathlib import Path
     from tempfile import NamedTemporaryFile
     from hermes_constants import get_hermes_home
@@ -236,10 +227,10 @@ async def receipt(runner, source, state, item, dest):
         payload.write(body)
         path = Path(payload.name)
     try:
-        sent = await cli(runner, source, "relay", "--json", "send", target, "--task", task_id,
+        sent = await cli(runner, source, "relay", "--json", "send", target, *intent,
                          "--key", handoff_key(state, item), "--body-file", str(path))
     finally:
-        path.unlink(missing_ok=True)
+        await asyncio.to_thread(path.unlink, missing_ok=True)
     receipt_id = sent.get("id")
     if not receipt_id:
         raise RuntimeError("Handoff did not return a relay receipt")
@@ -365,6 +356,7 @@ async def transfer(runner, source, state, item, dest):
 
 
 async def prepare(runner, source, state):
+    from gateway.telegram_retire_prepare import queue_preparation
     # Reconcile receipts independently of source inventory. A crash after moving
     # an item must not forget a still-unconfirmed handoff just because it moved.
     for item_id, handoff in state["handoffs"].items():
@@ -379,24 +371,48 @@ async def prepare(runner, source, state):
             handoff["moved"] = True
             await save(runner, source, state)
 
-    items = await inventory(runner, source, state)
+    try:
+        items = await inventory(runner, source, state)
+    except WorkInProgress as exc:
+        return await queue_preparation(runner, source, state, [], busy=str(exc))
+    if not state.get("reason") or (state.get("target") and not state.get("context")):
+        return await queue_preparation(runner, source, state, items)
     owners = state.setdefault("owners", {})
-    questions, selected = [], []
+    unresolved, selected = [], []
+    if state.get("target"):
+        try:
+            dest = await destination(runner, source, state["target"])
+        except ValueError as exc:
+            return await queue_preparation(runner, source, state, items,
+                busy=f"Merge destination {state['target']} is unavailable: {exc}")
+        state["merge_destination"] = dest
+        context = {"id": "context:" + dest["session_id"], "kind": "context",
+                   "title": "Topic context", "record": {
+                       "source_session": state["session_id"], "source_thread": str(source.thread_id),
+                       "reason": state["reason"],
+                       "summary": state["context"],
+                       "history": "Prior decisions, evidence and limits remain searchable in source_session."}}
+        if context["id"] not in state["handoffs"]:
+            selected.append((context, dest))
     for item in items:
         if item["id"] in state["handoffs"]:
             raise RuntimeError(f"Previously handed-off work still targets this topic: {item['id']}")
-        selector = state.get("target") or owners.get(item["id"])
+        selector = owners.get(item["id"]) or state.get("target")
         if not selector:
-            # Use the same exact-subject matcher as named Telegram delivery. A
-            # title overlap or recency is never enough to silently pick an owner.
-            try:
-                dest = await destination(runner, source, item["title"])
-            except ValueError:
-                questions.append({"id": item["id"], "title": item["title"][:150],
-                                  "suggestion": item["title"][:80]})
-                continue
-        else:
+            # An exact-title hit is a candidate, not proof of subject ownership.
+            # The normal session turn verifies the context and records a choice.
+            unresolved.append(item)
+            continue
+        try:
             dest = await destination(runner, source, selector)
+        except ValueError as exc:
+            unresolved.append({**item, "blocked_owner": selector, "blocked_reason": str(exc)})
+            continue
+        if item["kind"] in {"goal", "loop"} and await runner._session_db.get_meta(
+                f"{item['kind']}:{dest['session_id']}") is not None:
+            unresolved.append({**item, "blocked_owner": dest["title"],
+                               "blocked_reason": "Destination already has a control. Choose a compatible successor, do not overwrite it."})
+            continue
         selected.append((item, dest))
     for item, dest in selected:
         # Save the intent before either external side effect. Both receipt and
@@ -409,21 +425,8 @@ async def prepare(runner, source, state):
         await transfer(runner, source, state, item, dest)
         handoff["moved"] = True
         await save(runner, source, state)
-    if questions:
-        if not state.get("questions"):
-            state["questions"] = questions
-            state["phase"] = "waiting"
-            await save(runner, source, state)
-            lines = ["Where should this open work go? Reply with each number and its live topic name."]
-            lines.extend(f"{n}. {q['title']} (suggested: {q['suggestion']})" for n, q in enumerate(questions, 1))
-            from gateway.telegram_retire import confirmed
-            sent = await runner._delivery_adapter_for(source).send(
-                str(source.chat_id), "\n".join(lines), metadata={"thread_id": str(source.thread_id)})
-            if not confirmed(sent, source):
-                state.pop("questions", None)
-                await save(runner, source, state)
-                raise RuntimeError("Owner question was not delivered")
-        return False
+    if unresolved:
+        return await queue_preparation(runner, source, state, unresolved)
     # Repeating discovery catches work created by a final tool call and stale
     # destinations. Nothing can be deleted on an incomplete/failed inventory.
     if await inventory(runner, source, state):

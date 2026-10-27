@@ -49,6 +49,9 @@ def completion(tmp_path, monkeypatch):
                         ignore=shutil.ignore_patterns("__pycache__", "web_dist", "tui_dist"))
     shutil.copytree(ROOT / "scripts/build", source / "scripts/build",
                     ignore=shutil.ignore_patterns("__pycache__"))
+    # The TUI product includes these runtime helpers even for the tiny graph.
+    shutil.copytree(ROOT / "ui-tui/scripts", source / "ui-tui/scripts",
+                    ignore=shutil.ignore_patterns("__pycache__"))
     _put(source, "pyproject.toml", '[project]\nname="takeover-fixture"\nversion="2.0"\n')
     # Successful completion stamps the selected checkout's own git identity.
     git_env = {**os.environ, "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
@@ -446,6 +449,8 @@ def test_selected_child_builds_and_finalizes_under_parent_lock(completion):
     built = subprocess.run([node, str(source / "ui-tui/dist/entry.js")],
                            capture_output=True, text=True, check=True)
     assert built.stdout.strip() == "compiled local graph"
+    for name in ("gateway_bootstrap.py", "clipboard_image.py"):
+        assert (source / "ui-tui/dist/scripts" / name).read_bytes() == (source / "ui-tui/scripts" / name).read_bytes()
     assert (source / "hermes_cli/web_dist/index.html").is_file()
     assert any("compiled local graph" in p.read_text() for p in (source / "hermes_cli/web_dist/assets").glob("*.js"))
     assert (source / "node_modules/.hermes-node-deps").is_file()
