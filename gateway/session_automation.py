@@ -269,10 +269,10 @@ def _owner(runner, event, authority):
     if entry is None:
         # A route not yet restored is not proof its work is stale. Only a known
         # absent/ended target in this source's proven runtime home is stale.
-        from gateway.session_identity import identity_of
-        identity = identity_of(event.source)
-        same_home = (identity is not None and
-                     identity.store_path.resolve() == Path(authority.db.db_path).resolve())
+        from gateway.session_identity import proven_runtime_home
+        home = proven_runtime_home(event.source)
+        same_home = (home is not None and
+                     (home / 'state.db').resolve() == Path(authority.db.db_path).resolve())
         same_route = runner.session_store._generate_session_key(event.source) == route
         expected = event.metadata.get('gateway_session_id')
         tip = authority.db.get_compression_tip(expected) if expected else None

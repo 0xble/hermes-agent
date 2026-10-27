@@ -129,10 +129,16 @@ async def test_missing_route_only_excludes_a_proven_gone_target(upgraded_chat, m
     source = runner._restored_source(runner.session_store.lookup_by_session_key(entry.session_key))
     if proof == 'foreign':
         from dataclasses import replace
-        from gateway.session_identity import identity_of
+        from gateway.session_identity import identity_of, proven_runtime_home
+        home = proven_runtime_home(source)
+        assert home is not None
+        foreign = home / 'foreign'
+        # Standalone restore does not pin a RoutingIdentity. Move whichever
+        # proof exists so a foreign home cannot borrow this runtime's exclusion.
+        source._restored_runtime_home = foreign
         identity = identity_of(source)
-        assert identity is not None
-        source._identity = replace(identity, runtime_home=identity.runtime_home / 'foreign')
+        if identity is not None:
+            source._identity = replace(identity, runtime_home=foreign)
     elif proof == 'absent':
         from gateway.session import SessionSource
         source = SessionSource.from_dict(source.to_dict())

@@ -43,10 +43,14 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   count. `release-admission-canary.json` retains the terminal result across the
   rollback, and the shared guardian lock prevents duplicate rollback attempts.
 - Only proven absent/ended targets in the source's runtime home and explicitly
-  suspended routes are excluded from automation outage evidence. Missing routes with a live durable target,
+  suspended routes are excluded from automation outage evidence. Standalone
+  restore proves that home with a wire-invisible stamp, not a RoutingIdentity.
+  A source rebuilt from its wire dict, or one whose proven home is not this
+  runtime's state DB, stays counted. Missing routes with a live durable target,
   native refusals, connector/auth failures and invalid producer payloads still
-  count. The threshold, observation window and acknowledged-process fence are
-  unchanged.
+  count. An unproven relay flag with no live relay adapter reaches admission
+  and is counted; a committed envelope waits for that adapter. The threshold,
+  observation window and acknowledged-process fence are unchanged.
 - Guards: `tests/hermes_cli/test_admission_canary.py`,
   `tests/gateway/test_admission_canary.py`,
   `tests/gateway/test_automation_upgrade_admission.py`, and existing guardian/release tests.

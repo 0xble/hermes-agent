@@ -45,6 +45,24 @@ def _env_truthy(name: str) -> bool:
     return _auth_env(name).lower() in _TRUTHY
 
 
+def _standalone_runtime_home(runner) -> Optional[Path]:
+    """Parent of this runner's session DB, else the process home.
+
+    A partial runner (identity-restore fixtures) may not have opened a DB.
+    """
+    db = None
+    with contextlib.suppress(Exception):
+        db = runner._session_db
+    inner = getattr(db, "_db", db)
+    path = getattr(inner, "db_path", None)
+    if path:
+        return Path(path).resolve().parent
+    with contextlib.suppress(Exception):
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    return None
+
+
 def authz_field(name, field, entry):
     """Late-bound :func:`gateway.platform_env.authz_field` (entry field, else the bundled declaration)."""
     from gateway.platform_env import authz_field as _field
@@ -400,8 +418,16 @@ class GatewayAuthorizationMixin:
         source = getattr(entry, "origin", None)
         if source is None:
             return None
-        from gateway.session_identity import restore_identity
+        from gateway.session_identity import identity_of, restore_identity
         restore_identity(source, runner=self, transport_profile=getattr(entry, "transport_profile", None))
+        # Standalone has one bot and one home, so restore does not pin a
+        # RoutingIdentity. Automation still needs affirmative proof this source
+        # was restored here; a wire rebuild has no stamp and stays unproven.
+        if (identity_of(source) is None
+                and not getattr(getattr(self, "config", None), "multiplex_profiles", False)):
+            home = _standalone_runtime_home(self)
+            if home is not None:
+                source._restored_runtime_home = home
         return source
 
     def _adapter_flag(self, platform, name: str, profile) -> bool:

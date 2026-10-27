@@ -29,8 +29,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _IDENTITY_ATTR = "_identity"
+# Standalone restore must not pin a RoutingIdentity. This stamp is the only
+# affirmative proof that source was restored into this process home.
+_RESTORED_HOME_ATTR = "_restored_runtime_home"
 # Wire-invisible provenance copied alongside the identity when a source is duplicated.
-_PROVENANCE_ATTRS = ("_transport_adapter_ref", "_authorization_profile_home", _IDENTITY_ATTR)
+_PROVENANCE_ATTRS = (
+    "_transport_adapter_ref", "_authorization_profile_home", _IDENTITY_ATTR, _RESTORED_HOME_ATTR,
+)
 
 
 class IdentityUnresolved(RuntimeError):
@@ -90,6 +95,20 @@ def identity_of(source: Any) -> Optional[RoutingIdentity]:
     """The identity pinned on *source* by :func:`resolve_identity`, if any."""
     identity = getattr(source, _IDENTITY_ATTR, None)
     return identity if isinstance(identity, RoutingIdentity) else None
+
+
+def proven_runtime_home(source: Any) -> Optional[Path]:
+    """Home *source* has proven, or None when neither ingress nor restore pinned one.
+
+    A pinned :class:`RoutingIdentity` wins. Standalone restore cannot pin one, so
+    it stamps :data:`_RESTORED_HOME_ATTR` instead. A ``from_dict`` source has
+    neither and stays unproven: a missing route alone is not same-home proof.
+    """
+    identity = identity_of(source)
+    if identity is not None:
+        return identity.runtime_home
+    home = getattr(source, _RESTORED_HOME_ATTR, None)
+    return None if home is None else Path(home)
 
 
 def clear_identity(source: Any) -> None:
