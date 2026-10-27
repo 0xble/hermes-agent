@@ -398,6 +398,9 @@ class SessionCompressionMixin:
             require_compression_lease=require_compression_lease, require_lease_refresh=require_lease_refresh,
             lease_ttl_seconds=lease_ttl_seconds, watermark=watermark, watermark_ceiling=watermark_ceiling),
             messages, session_id=child_session_id)
+        # The caller adopts the committed handoff in memory: one dict per message_uid, as stored.
+        from hermes_state_identity import _newest_message_uid_rows
+        messages[:] = _newest_message_uid_rows(messages)
 
     def _publish_compression_child_on_conn(
             self, conn, *, parent_session_id: str, child_session_id: str, source: str,
@@ -409,6 +412,8 @@ class SessionCompressionMixin:
         """:meth:`publish_compression_child` on the caller's write transaction (never commits). The
         owner and the worker/canonical-mutation verbs share this one body so they cannot drift."""
         from hermes_state_errors import CompressionSessionBusyError
+        from hermes_state_identity import _compaction_messages
+        from hermes_state_message_archive import clone_tail_survivors
         if require_lease_refresh and compression_lock_holder:
             conn.execute(
                 "UPDATE compression_locks SET expires_at = ? WHERE session_id = ? AND holder = ?",
@@ -451,20 +456,21 @@ class SessionCompressionMixin:
         # `now`, breaking their _display_dedupe_key identity with the parent's durable originals
         # and duplicating them in the lineage display read (#59661).
         self._carry_parent_timestamps(conn, parent_session_id, messages)
-        total_messages, total_tool_calls = self._insert_message_rows(conn, child_session_id, messages)
+        total_messages, total_tool_calls = self._insert_message_rows(
+            conn, child_session_id, _compaction_messages(messages))
         if watermark is not None:
             # Clone the parent's concurrent tail into the child after the handoff;
             # originals stay in the closed parent for lineage recovery.
             bounded = watermark_ceiling is not None
-            tail_ids, tail_tool_calls = self._tail_rows_after_watermark(
+            tail_ids, _ = self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages "
                 "WHERE session_id = ? AND active = 1 AND id > ?"
                 f"{' AND id <= ?' if bounded else ''} ORDER BY id",
                 [parent_session_id, int(watermark), *([int(watermark_ceiling)] if bounded else [])])
             if tail_ids:
-                self._clone_message_rows(conn, tail_ids, session_id=child_session_id)
-                total_messages += len(tail_ids)
-                total_tool_calls += tail_tool_calls
+                cloned, cloned_tools = clone_tail_survivors(self, conn, tail_ids, session_id=child_session_id)
+                total_messages += cloned
+                total_tool_calls += cloned_tools
         conn.execute(
             "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
             (total_messages, total_tool_calls, child_session_id))

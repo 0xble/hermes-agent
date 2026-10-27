@@ -34,6 +34,18 @@ deferred summary adoption, the hygiene token count stored on the session entry, 
   Micro-compaction defrag edits the live marker dict, and an aliased snapshot would refuse every defrag of the current
   generation as stale.
 
+A compaction commit must leave only 1 active row per `message_uid`, including late adoption and rotation.
+The carried handoff is authoritative (it may contain pruned content). Concurrent-tail clones skip uids
+already carried and keep only the newest physical source per remaining uid. Handoffs themselves keep
+the last occurrence of a uid. Concurrent carried slots never consume positional rewind slots below the
+watermark. Counters count only inserted survivors. Historical payloads stay intact.
+Active model replay of a single session also keeps the newest-positioned uid for already-corrupt
+sessions, without writing back or collapsing unknown uids, distinct logical messages with identical
+content, lineage reads, or forensic reads. This can hide divergent payloads under a reused uid, which
+violates the durable logical-identity contract. The caller's in-memory handoff list is collapsed the
+same way after the commit, on both direct `SessionDB` and the worker facade, so a dropped duplicate dict
+never flushes back as a second active copy. The worker owner's history read mirrors the replay rule.
+
 Fork patch identity: `hygiene-deferred-adoption`.
 
 ## Why
@@ -46,6 +58,7 @@ prompt count was also stale, so hygiene ran a 93-second compression for a 33-to-
 ## Verification
 
 - `scripts/run_tests.sh tests/gateway/test_session_hygiene_turnhold_adoption.py tests/hermes_state/test_stale_held_generation_guard.py tests/agent/test_micro_compaction.py tests/agent/test_proactive_prune_restart_safety.py tests/gateway/test_replay_entry_fields.py`
+- `scripts/run_tests.sh tests/hermes_state/test_compaction_active_uid.py tests/hermes_state/test_compression_watermark_commit.py tests/hermes_state/test_repaired_history_commit_coverage.py tests/hermes_state/test_compression_lease_refresh_before_publish.py tests/hermes_state/test_display_fold_incremental.py tests/hermes_state/test_runtime_worker_compression_annotations.py`
 - Live: a deferred adoption logs `summary adopted at the watermark-fenced commit boundary` and sends no chat notice.
   The next turn's hygiene check does not report a pre-compaction `actual` token count.
 
