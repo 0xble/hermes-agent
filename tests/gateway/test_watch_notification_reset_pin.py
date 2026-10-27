@@ -4,6 +4,7 @@ Real GatewayRunner, DiscordAdapter, SessionAuthority and drain over SQLite; no a
 import asyncio
 import logging
 import queue
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -150,9 +151,12 @@ async def test_refused_notice_backs_off_and_only_a_permanent_refusal_drops(monke
     proven-permanent refusal (``not_found``: the route holds no session) drops it at the cap. A
     notice pinned to another chat's live session (``admission_conflict``) or refused by a restart's
     after-turn wait (``runtime_draining``) is never dropped: it waits however long it takes."""
-    from gateway import run_notifications
+    from gateway import run_notifications, session_automation
     from gateway.run_notifications import _MAX_COMPLETION_INJECTION_ATTEMPTS
     runner, authority, entry = await _gateway(monkeypatch)
+    # Refusal logs are aggregated. Count calls through the real admission path, not log lines.
+    admit = AsyncMock(wraps=session_automation.admit_process_notice)
+    monkeypatch.setattr(session_automation, 'admit_process_notice', admit)
     try:
         pinned = {'permanent': lambda: _route_gone(runner, entry), 'transient': lambda: entry.session_id}.get(
             refusal)
@@ -171,7 +175,7 @@ async def test_refused_notice_backs_off_and_only_a_permanent_refusal_drops(monke
                 clock.now += 1
 
         messages = [r.getMessage() for r in caplog.records]
-        refused = sum('not admitted' in m for m in messages)
+        refused = admit.await_count
         if refusal == 'permanent':
             assert pending.empty()
             assert refused == _MAX_COMPLETION_INJECTION_ATTEMPTS
