@@ -1153,3 +1153,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   forces the interleave through real SQLite settlement and `refresh_receipt` and
   expects `settled` with reply `pong`. The paused-resume contract and its timeout
   are unchanged.
+
+## API admission drain check off the owner loop
+
+- Fork patch identity: `api-drain-owner-no-import`.
+- `gateway/platforms/api_server.py` imported `gateway.run` synchronously on the owner loop
+  to read the global runner's drain flags, stalling the loop (~0.85 s cold) ahead of the
+  off-loop SQLite admission. Read the adapter-attached runner first; keep the standalone
+  global fallback.
+- Guards: `tests/gateway/test_api_drain_owner.py` (both drain flags, no-import boundary) and
+  `tests/gateway/test_api_admission_off_loop.py`.
