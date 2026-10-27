@@ -28,10 +28,7 @@ from gateway.attended_model import (
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.platforms.typing_state import (
-    call_typing_with_metadata, pause_typing_for_prompt, resume_typing_after_prompt,
-    typing_metadata_for_source,
-)
+from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typing_after_prompt, typing_metadata_for_source
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext, silence_retry_prompt
@@ -275,22 +272,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     platform=ctx.source.platform, user_config=ctx.user_config)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
-    def _progress_live_status(self, event_type: str, tool_name, args) -> None:
-        """Live status line (Slack assistant status): stash the tool phrase on the adapter; the
-        _keep_typing refresh renders it. Plain dict write, safe from the sync worker thread."""
-        ctx = self._ctx
-        adapter = ctx._live_status_adapter
-        if adapter is None or ctx._live_status_mode == "off" or tool_name == "_thinking":
-            return
-        try:
-            if event_type == "tool.started" and tool_name and ctx._run_still_current():
-                from agent.display import build_status_phrase
-                call_typing_with_metadata(adapter.set_status_text, ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None), metadata=typing_metadata_for_source(ctx.source, ctx.event_message_id))
-            elif event_type == "tool.completed":
-                # Between tools the model is genuinely "thinking" again — revert to the static default.
-                call_typing_with_metadata(adapter.set_status_text, ctx.source.chat_id, None, metadata=typing_metadata_for_source(ctx.source, ctx.event_message_id))
-        except Exception as err:
-            logger.debug("live status update failed: %s", err)
 
     def _progress_onboarding_hint(self, kwargs: dict) -> None:
         """First-touch onboarding: the first time a tool exceeds _LONG_TOOL_THRESHOLD_S while
