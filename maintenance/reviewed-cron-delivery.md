@@ -21,7 +21,7 @@ Final presentation uses the ordinary bot send path with the contract envelope in
 
 ## Ownership and Compatibility
 
-The scheduler owns the decision state machine in `cron/scheduler_review.py`. `cron/review.py` is the single owner of the declarative contract checker. The installed output-guard's `cron_report` rule targets non-local delivery and prompt-derived presentation rules, so it cannot provide this local job's declarative contract API without a runtime plugin dependency. Contracts ship in the wheel through setuptools package data and can be overridden under the profile's `cron/contracts/`.
+The scheduler owns the decision state machine in `cron/scheduler_review.py`. `cron/review.py` is the single owner of the declarative contract checker. The installed output-guard's `cron_report` rule targets non-local delivery and prompt-derived presentation rules, so it cannot provide this local job's declarative contract API without a runtime plugin dependency. Contracts ship in the wheel through setuptools package data and can be overridden under the profile's `cron/contracts/`. The shipped `reports/stripe-brief.yaml` is the Stripe Daily envelope: `Status`, `Move`, `Running`, and `Needs You`, with optional numbers, dependencies, and schedule sections. Its job retains local reviewed delivery and the exact subject binding when the format changes.
 
 Relay is not involved. Its existing presentation path creates a user message, while the scheduler already needs the gateway's internal admission and captured reply. A relay wrapper would add an extra hand-in layer without changing that boundary.
 

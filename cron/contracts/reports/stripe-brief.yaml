@@ -1,13 +1,14 @@
-title: Stripe Priorities
+title: Stripe Daily
 required_lines:
-  - "**Focus:**"
+  - "**Status:**"
+  - "**Move:**"
+  - "**Running:**"
 required_sections:
-  - Priorities
+  - Needs You
 optional_sections:
-  - Upcoming
-  - Waiting / Blocked
-  - Changes
-  - Standup
+  - Numbers and Changes
+  - Dependencies and Parallel Work
+  - Schedule
 word_cap: 400
 silence_markers:
   - "[SILENT]"

@@ -342,18 +342,18 @@ def test_subject_must_still_be_live_and_same_at_final_send(
 @pytest.mark.parametrize(
     "report, passed",
     [
-        ("# Stripe Priorities — October 14, 2026\n", True),
-        ("# Stripe Priorities — Wednesday, October 14, 2026\n", True),
-        ("# Stripe Priorities — October 14, 2026 at 8:01 AM\n", True),
-        ("# Stripe Priorities — Wednesday, October 14, 2026 at 8:01 AM\n", True),
-        ("# Stripe Priorities — Friday, October 16\n", True),
-        ("# Stripe Priorities — Friday, October 16 at 8:10 AM\n", True),
-        ("# Stripe Priorities\n", True),
+        ("# Stripe Daily — October 14, 2026\n", True),
+        ("# Stripe Daily — Wednesday, October 14, 2026\n", True),
+        ("# Stripe Daily — October 14, 2026 at 5:15 AM\n", True),
+        ("# Stripe Daily — Wednesday, October 14, 2026 at 5:15 AM\n", True),
+        ("# Stripe Daily — Friday, October 16\n", True),
+        ("# Stripe Daily — Friday, October 16 at 5:15 AM\n", True),
+        ("# Stripe Daily\n", True),
         ("# Daily Brief — October 14, 2026\n", False),
-        ("# Stripe Priorities (draft)\n", False),
-        ("# Stripe PrioritiesXYZ\n", False),
+        ("# Stripe Daily (draft)\n", False),
+        ("# Stripe DailyXYZ\n", False),
         (
-            "Sure, here is the corrected brief:\n\n# Stripe Priorities — October 14, 2026\n",
+            "Sure, here is the corrected brief:\n\n# Stripe Daily — October 14, 2026\n",
             False,
         ),
     ],
@@ -370,5 +370,28 @@ def test_shipped_stripe_contract_accepts_only_the_dated_title_first(report, pass
         / "reports"
         / "stripe-brief.yaml"
     )
-    report += "\n**Focus:** billing\n\n## Priorities\n1. Ship it\n"
+    report += "\n**Status:** fixture status\n\n## Needs You\n**Move:** fixture move\n1. Fixture task\n\n**Running:** unknown\n"
     assert check_contract(report, load_contract(str(shipped)))["passed"] is passed
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda text: text.replace("**Status:** fixture", "fixture"),
+        lambda text: text.replace("**Move:** fixture", "fixture"),
+        lambda text: text.replace("**Running:** unknown", "unknown"),
+        lambda text: text.replace("## Needs You", "## Priorities"),
+        lambda text: text + "\n## Unexpected\nfixture\n",
+        lambda text: text + "\n" + "fixture " * 401,
+    ],
+)
+def test_shipped_stripe_daily_contract_rejects_missing_envelope(change):
+    from pathlib import Path
+
+    import cron
+    from cron.review import load_contract
+
+    contract = load_contract(str(Path(cron.__file__).resolve().parent / "contracts/reports/stripe-brief.yaml"))
+    text = "# Stripe Daily — October 14, 2026\n\n**Status:** fixture\n\n## Needs You\n**Move:** fixture\n1. Fixture task\n\n**Running:** unknown\n"
+    assert check_contract(text, contract)["passed"]
+    assert not check_contract(change(text), contract)["passed"]
