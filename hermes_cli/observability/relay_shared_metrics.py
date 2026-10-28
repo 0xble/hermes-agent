@@ -263,7 +263,8 @@ class _Runtime:
         self._snapshot_checked_ns: int | None = None
         self._subscriber_name = f"{SUBSCRIBER_NAME}.{self.host.runtime_id}"
         self.subscriber = SharedMetricsSubscriber(
-            SharedMetricsStore(), get_version_info().base_version, runtime_id=self.host.runtime_id
+            SharedMetricsStore(), get_version_info().base_version, runtime_id=self.host.runtime_id,
+            consent_check=self._collection_consented,
         )
         self.relay.subscribers.register(self._subscriber_name, self.subscriber)
         self.host.retain_managed_execution(self._subscriber_name)
@@ -663,6 +664,10 @@ class _Runtime:
             yield
         finally:
             reset_hermes_home_override(token)
+
+    def _collection_consented(self) -> bool:
+        with self._owner_scope():
+            return _collection_enabled()
 
     def _deregister(self) -> None:
         self._safe(self.relay.subscribers.deregister, self._subscriber_name)
@@ -1362,9 +1367,8 @@ def _reconcile_store_consent(store: SharedMetricsStore, send_enabled: bool) -> N
             reconcile_send_consent(connection, send_enabled)
 
 
-def enabled() -> bool:
-    """Return the shared-metrics policy for the active Hermes profile."""
-    profile_key = relay_runtime.current_profile_key()
+def _collection_enabled() -> bool:
+    """Read consent without runtime teardown, including on the Relay subscriber thread."""
     try:
         config: Any = _raw_config()
     except Exception:
@@ -1372,7 +1376,13 @@ def enabled() -> bool:
         config = None
     for key in ("telemetry", "shared_metrics"):
         config = config.get(key) if isinstance(config, dict) else None
-    if isinstance(config, dict) and config.get("enabled") is True:
+    return isinstance(config, dict) and config.get("enabled") is True
+
+
+def enabled() -> bool:
+    """Return the shared-metrics policy for the active Hermes profile."""
+    profile_key = relay_runtime.current_profile_key()
+    if _collection_enabled():
         return True
     if profile_key not in _RUNTIMES:  # the opted-out hot path: nothing to tear down, no lock
         return False
