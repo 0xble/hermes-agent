@@ -42,7 +42,7 @@ this is local integration coverage, not live Telegram E2E.
 The companion [quiet unchanged-wait repair](goal-external-wait-backoff.md)
 records pinned upstream guidance, prior-art disposition and the focused RED/GREEN
 proof. Implementer: Hermes subagent, `gpt-6.1-sol` through
-`custom:codex-proxy`. Parent owns independent exact-candidate review, exact-head
+`custom:openai-proxy`. Parent owns independent exact-candidate review, exact-head
 portable/hosted qualification, integration and live activation. Existing patch
 identity, rollback and retirement remain in force; retire classification only
 when upstream passes the same meaningful-versus-routine quota tests.

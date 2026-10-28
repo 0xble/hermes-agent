@@ -2139,7 +2139,7 @@ A local proxy that forwards requests to OpenAI (Codex) or Anthropic with your ow
 
 ```yaml
 providers:
-  codex-proxy:
+  openai-proxy:
     api: http://127.0.0.1:8317/v1
     api_mode: codex_responses
     capabilities:
@@ -3132,7 +3132,7 @@ parent's live model is the model selected by `@uncensored`:
 model_presets:
   uncensored: {provider: custom:venice, model: abliteration-abliterated-model-large-v2}
   delegation-sol:
-    provider: custom:codex-proxy
+    provider: custom:openai-proxy
     model: gpt-6.1-sol
     reasoning_effort: high
     fallbacks:

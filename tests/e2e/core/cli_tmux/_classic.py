@@ -8,14 +8,17 @@ run's exact ``HERMES_HOME`` (never a pattern kill).
 
 Driver rule (the CLI reads an Enter processed within 50 ms of the last buffer change as a pasted
 newline): type with ``send-keys -l``, wait until the composer shows the text, pause, then send
-``Enter`` separately. Each step waits for its needle, then until the screen (digits masked) has
-been static for ``quiet`` seconds.
+``Enter`` separately. Ordinary input echoes as ``❯ {text}``. A slash command opens the completion
+menu, and that redraw can leave the buffer on its own line with the prompt glyph no longer
+adjacent; that exact line is still acknowledgement. A menu row that only names the command is not:
+a prefix can surface the full name before the buffer has it. Each step waits for its needle, then
+until the screen (digits masked) has been static for ``quiet`` seconds.
 
 Stale output never counts: every ``submit``/``keys``/``launch`` snapshots the scrollback first, and
 ``wait`` accepts a needle only when it occurs more often than in that snapshot. An unchanged
 transcript (a no-op command) therefore fails the step instead of matching old output.
 
-Linux only: process discovery and cleanup read ``/proc/<pid>/environ``.
+Process discovery reads ``/proc/<pid>/environ`` on Linux and psutil environments on macOS.
 
 Run environment: the CLI catches SIGTERM/SIGHUP and exits cleanly ("Shutting down…", "Goodbye!",
 status 0), so a signal from outside the test looks like the CLI quitting on its own. A container
@@ -34,6 +37,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -61,7 +65,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 COLS, ROWS = 160, 50
 PROMPT = "\u276f"
 STATUS_BAR = f"\u2624 {MODEL_ID}"
-_DIGITS = re.compile(r"\d")
+_ANIMATION = re.compile(r"[\d⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]")
 _TRACEBACK = "Traceback (most recent call last)"
 
 
@@ -73,8 +77,31 @@ def new_needle(needles: list[str], before: str, after: str) -> str | None:
     return None
 
 
+def buffer_line_grew(text: str, before: str, after: str) -> bool:
+    """A new line whose only content is *text* (capture-pane padding ignored).
+
+    The completion menu's suggestion row keeps a description after the name, so it
+    does not count. Trailing spaces from ``capture-pane`` without ``-T`` do.
+    """
+    def lines(blob: str) -> int:
+        return sum(line.strip() == text for line in blob.splitlines())
+
+    return lines(after) > lines(before)
+
+
 def home_pids(hermes_home: Path) -> set[int]:
     """PIDs (never this one) whose environ carries exactly ``HERMES_HOME=<hermes_home>``."""
+    if sys.platform == "darwin":
+        import psutil
+
+        found = set()
+        for proc in psutil.process_iter():
+            try:
+                if proc.pid != os.getpid() and proc.environ().get("HERMES_HOME") == str(hermes_home):
+                    found.add(proc.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return found
     needle = f"HERMES_HOME={hermes_home}".encode()
     found: set[int] = set()
     for entry in os.listdir("/proc"):
@@ -189,18 +216,27 @@ class ClassicHome:
         return [sys.executable, "-m", "hermes_cli.main", *args]
 
     def run(self, *args: str, timeout: float = 180.0) -> subprocess.CompletedProcess:
-        """A non-TTY run (stdout piped): ``chat -q`` one-shots, ``gateway stop``."""
+        """A non-TTY run (stdout captured): ``chat -q`` one-shots, ``gateway stop``."""
         argv = self.argv(*args)
-        with subprocess.Popen(argv, cwd=self.work, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              stdin=subprocess.DEVNULL, text=True) as proc:
+        # A daemon or tool child can inherit stdout/stderr. Pipe EOF then depends on
+        # that child's lifetime, even after the command is killed. Files let us wait
+        # only for the command, with bounded reaping and immediately readable output.
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout, \
+                tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
+            proc = subprocess.Popen(argv, cwd=self.work, env=self.env(), stdout=stdout, stderr=stderr,
+                                    stdin=subprocess.DEVNULL, text=True)
             self.spawned.append((proc.pid, " ".join(args)))
             try:
-                out, err = proc.communicate(timeout=timeout)
+                proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                out, err = proc.communicate()
-                raise subprocess.TimeoutExpired(argv, timeout, out, err) from None
-        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+                proc.wait(timeout=5)
+                stdout.seek(0)
+                stderr.seek(0)
+                raise subprocess.TimeoutExpired(argv, timeout, stdout.read(), stderr.read()) from None
+            stdout.seek(0)
+            stderr.seek(0)
+            return subprocess.CompletedProcess(argv, proc.returncode, stdout.read(), stderr.read())
 
     def pids(self) -> set[int]:
         return home_pids(self.hermes_home)
@@ -268,14 +304,22 @@ class Pane:
         self.baseline = self.scrollback()
         self.tmux("send-keys", "-t", "p", *k)
 
-    def wait(self, needles: list[str], timeout: float = 60.0, *, since: str | None = None) -> str | None:
-        """The first needle that appeared after the latest input (or after *since*), None on timeout/exit."""
+    def wait(self, needles: list[str], timeout: float = 60.0, *, since: str | None = None,
+             exact_line: str | None = None) -> str | None:
+        """The first needle that appeared after the latest input (or after *since*), None on timeout/exit.
+
+        *exact_line* also accepts a new line whose only content is that text. Slash-command
+        completion redraws the prompt glyph off the buffer line; the menu suggestion does not match.
+        """
         before = self.baseline if since is None else since
         end = time.monotonic() + timeout
         while time.monotonic() < end:
-            hit = new_needle(needles, before, self.scrollback())
+            after = self.scrollback()
+            hit = new_needle(needles, before, after)
             if hit is not None:
                 return hit
+            if exact_line is not None and buffer_line_grew(exact_line, before, after):
+                return exact_line
             if self.dead():
                 return None
             time.sleep(0.25)
@@ -285,12 +329,15 @@ class Pane:
         end = time.monotonic() + timeout
         last, since = None, time.monotonic()
         while time.monotonic() < end:
-            text = _DIGITS.sub("#", self.screen())
+            # Spinner frames and elapsed/countdown digits repaint without changing
+            # whether the modal/composer can accept the next input.
+            text = _ANIMATION.sub("#", self.screen())
             if text != last:
                 last, since = text, time.monotonic()
             elif time.monotonic() - since >= quiet:
                 return
             time.sleep(0.2)
+        raise AssertionError(f"screen did not settle within {timeout:g}s:\n{self.screen()}\n{self.ch.diagnostics()}")
 
     def paste_gap(self) -> None:
         """Keep the next key out of the input batch the app is still reading: prompt_toolkit takes an
@@ -300,7 +347,8 @@ class Pane:
     def submit(self, text: str) -> None:
         self.baseline = self.scrollback()
         self.tmux("send-keys", "-t", "p", "-l", text)
-        self.wait([f"{PROMPT} {text}"[-40:]], 10, since=self.baseline)
+        assert self.wait([f"{PROMPT} {text}"], 10, since=self.baseline, exact_line=text), (
+            f"composer never showed {text!r} within 10s:\n{self.screen()}\n{self.ch.diagnostics()}")
         self.paste_gap()
         self.tmux("send-keys", "-t", "p", "Enter")
 

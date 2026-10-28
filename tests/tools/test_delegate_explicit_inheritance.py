@@ -111,7 +111,7 @@ def test_route_without_fast_mode_gets_no_fast_fields():
     """A proxy route has no fast parameters: the child sends none (no surprise billing tier)."""
     with patch.object(config, "_cfg", return_value={"inherit_service_tier": True}):
         result = config._resolve_child_request_overrides(
-            _fast_parent("priority"), child_model="gpt-5.4", child_provider="custom:codex-proxy",
+            _fast_parent("priority"), child_model="gpt-5.4", child_provider="custom:openai-proxy",
             child_base_url="http://127.0.0.1:8317/v1", explicit_overrides=None,
             inherit_parent_route=False,
         )

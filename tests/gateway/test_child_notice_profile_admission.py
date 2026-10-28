@@ -192,7 +192,7 @@ async def test_process_watcher_follows_the_owning_profile(
             clock.setattr(asyncio, "sleep", tick)
             await rig.runner._run_process_watcher(leg.watcher)
         own_profile_surfaces = surface_a if leg.name == "a" else not surface_a
-        expected_admissions = int(leg.surfaced and path == "agent")
+        expected_admissions = int(leg.surfaced and path == "agent" and mode != "off")
         expected_sends = 0
         if leg.surfaced and path == "raw":
             if mode == "all":

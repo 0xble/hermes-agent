@@ -28,7 +28,7 @@ def loop_agent():
             api_key="test-key-1234567890",
             base_url="https://chatgpt.com/backend-api/codex",
             model="gpt-6.1-sol",
-            provider="custom:codex-proxy",
+            provider="custom:openai-proxy",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,

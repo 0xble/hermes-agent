@@ -64,12 +64,18 @@ class TestLogicalLineStreaming:
         assert "newline" in cli._spinner_text
 
 
-    def test_interrupt_fixture_keeps_progress_visible_after_batched_delivery(self, cli_stub):
+    @pytest.mark.parametrize("scenario,prompt,witness", [
+        ("test_classic_cli_main_parity", "STEP8 tell me a very long story", "w040"),
+        ("test_classic_cli_live_session", "LIVE20 long story", "w030"),
+    ])
+    def test_interrupt_fixture_keeps_progress_visible_after_batched_delivery(self, cli_stub, scenario, prompt, witness):
         """A delayed repaint must still see a pending turn, never the completed reply."""
         import json
         from urllib.request import Request, urlopen
 
-        from tests.e2e.core.cli_tmux.test_classic_cli_main_parity import _main
+        from importlib import import_module
+
+        _main = import_module(f"tests.e2e.core.cli_tmux.{scenario}")._main
         from tests.fakes.fake_llm_provider import FakeLLMServer
 
         cli, emitted = cli_stub
@@ -81,7 +87,7 @@ class TestLogicalLineStreaming:
                 data=json.dumps({
                     "model": "fake-model", "stream": True,
                     "tools": [{"type": "function", "function": {"name": "terminal"}}],
-                    "messages": [{"role": "user", "content": "STEP8 tell me a very long story"}],
+                    "messages": [{"role": "user", "content": prompt}],
                 }).encode(),
                 headers={"Content-Type": "application/json"},
             )
@@ -91,7 +97,7 @@ class TestLogicalLineStreaming:
                         continue
                     payload = json.loads(line[6:])
                     chunks.append(payload["choices"][0]["delta"].get("content", ""))
-                    if not stopped and "w040" in "".join(chunks):
+                    if not stopped and witness in "".join(chunks):
                         # Release a held fixture only at teardown. Text fixtures keep running to
                         # completion, exposing the stale-marker race in the old scenario.
                         server.stop()
@@ -100,7 +106,7 @@ class TestLogicalLineStreaming:
         # Batch every delivered delta before the first repaint, as a busy event loop can do.
         cli._stream_delta("".join(chunks))
         assert stopped, "the interrupt progress witness was never streamed"
-        assert "w040" in cli._spinner_text, "progress vanished before the driver observed it"
+        assert witness in cli._spinner_text, "progress vanished before the driver observed it"
         assert "THE-END" not in cli._stream_buf
         assert not any("THE-END" in line for line in emitted)
 

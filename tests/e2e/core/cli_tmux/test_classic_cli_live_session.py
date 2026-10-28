@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import time
 from collections import Counter
 from pathlib import Path
@@ -30,13 +31,13 @@ from typing import Any, Callable
 import pytest
 
 from tests.e2e.core.cli_tmux._classic import ClassicHome, Pane, last_user, new_needle, require_tmux, text_of
-from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall
+from tests.fakes.fake_llm_provider import FakeLLMServer, StallMidStream, Text, ToolCall
 
-# Process discovery, cleanup and the witness's pid accounting read /proc.
-pytestmark = pytest.mark.platforms("linux")
+pytestmark = pytest.mark.platforms("linux", "macos")
 
 WITNESS_DIR = Path(__file__).resolve().parent / "witness"
 TITLE = "Live session title"
+INTERRUPT_TEXT = "LIVE20 " + " ".join(f"w{i:03d}" for i in range(500)) + " THE-END"
 EXTRA_CONFIG = """memory:
   memory_enabled: true
   user_profile_enabled: false
@@ -77,8 +78,9 @@ def _main(record: dict[str, Any]):
         "LIVE10": lambda: ToolCall("terminal", {"command": "sleep 3; echo live10-bg-finished", "background": True,
                                                 "notify_on_complete": True}),
         "LIVE14": lambda: Text("LIVE14 background answer: computed in the background."),
-        "LIVE20": lambda: Text("LIVE20 " + " ".join(f"w{i:03d}" for i in range(500)) + " THE-END",
-                               chunk_chars=6, delay_per_chunk=0.04),
+        # Keep the pending turn and its last-60-character preview stable until Ctrl+C.
+        "LIVE20": lambda: StallMidStream(
+            INTERRUPT_TEXT, after_chars=INTERRUPT_TEXT.index("w030") + len("w030")),
     }
     fn = table.get(mark)
     return fn() if fn else Text(f"{mark or 'plain'} ok.")
@@ -116,20 +118,27 @@ class Session:
         self.steps = 0
 
     def step(self, name: str, action: Callable[[], Any], needles: list[str], *, timeout: float = 60.0,
-             quiet: float = 2.0) -> str:
-        """Run *action*, then require one of *needles* to appear in output produced after the step's
-        latest input (``Pane.wait``): text already in the scrollback never satisfies a step."""
+             quiet: float = 0.5) -> str:
+        """Require new output after *action*, never an old scrollback match. Subsequent
+        input also requires a composer acknowledgement, not a multi-second cushion."""
         self.steps += 1
         started = time.monotonic()
-        action()
-        hit = self.pane.wait(needles, timeout) if needles else True
-        self.pane.settle(quiet=quiet, timeout=30)
-        text = self.pane.scrollback()
-        self.timings.append((name, round(time.monotonic() - started, 1)))
-        if not hit:
-            self.failures.append(f"{name}: none of {needles!r} appeared; screen:\n{self.pane.screen()[-2500:]}")
-        if "Traceback (most recent call last)" in text:
-            self.failures.append(f"{name}: a traceback reached the terminal")
+        try:
+            action()
+            hit = self.pane.wait(needles, timeout) if needles else True
+            assert hit, f"none of {needles!r} appeared within {timeout:g}s"
+            self.pane.settle(quiet=quiet, timeout=30)
+            text = self.pane.scrollback()
+            assert "Traceback (most recent call last)" not in text, "a traceback reached the terminal"
+        except (AssertionError, subprocess.TimeoutExpired) as exc:
+            try:
+                screen = self.pane.screen()[-2500:]
+            except subprocess.TimeoutExpired as capture_error:
+                screen = f"capture unavailable: {capture_error}"
+            raise AssertionError(f"step {name}: {exc}\nscreen:\n{screen}\n"
+                                 f"{self.pane.ch.diagnostics()}") from exc
+        finally:
+            self.timings.append((name, round(time.monotonic() - started, 1)))
         return text
 
 
@@ -215,26 +224,27 @@ def test_classic_cli_live_session_runs_every_turn_in_the_gateway(tmp_path: Path)
             s.step("turn on the branch", lambda: pane.submit("LIVE31 on the branch"), ["LIVE31 ok."])
             s.step("/compress", lambda: pane.submit("/compress"), ["Compressed:", "No changes from compression"],
                    timeout=90, quiet=3.0)
-            s.step("interrupt", lambda: (pane.submit("LIVE20 long story"), pane.wait(["w030"], 60), pane.keys("C-c")),
-                   ["Interrupted"], timeout=45, quiet=3.0)
+            s.step("interrupt progress", lambda: pane.submit("LIVE20 long story"), ["w030"], timeout=60)
+            s.step("interrupt", lambda: pane.keys("C-c"), ["Interrupted"], timeout=45, quiet=3.0)
             if "THE-END" in pane.scrollback():
                 s.failures.append("interrupt: the turn streamed to THE-END")
             s.step("/new", lambda: pane.submit("/new"), ["destroys conversation state"], timeout=30, quiet=1.5)
             s.step("/new confirm", lambda: pane.keys("Enter"), ["New session started"], timeout=30)
             s.step("plain turn after /new", lambda: pane.submit("LIVE30 hello again"), ["LIVE30 ok."])
             s.step("/quit", lambda: pane.submit("/quit"), ["Resume this session with:"], timeout=30)
-            if not pane.wait_dead(30):
-                s.failures.append("/quit: the CLI was still running 30 s later")
+            assert pane.wait_dead(30), f"/quit: CLI still running:\n{pane.screen()}\n{ch.diagnostics()}"
             s.step("resume -c", lambda: pane.launch("-c"), ["Resumed session"], timeout=120, quiet=3.0)
             s.step("/quit after resume", lambda: pane.submit("/quit"), ["Resume this session with:"], timeout=30)
-            pane.wait_dead(30)
+            assert pane.wait_dead(30), f"/quit after resume: CLI still running:\n{pane.screen()}\n{ch.diagnostics()}"
             s.steps += 1
             piped = ch.run("chat", "-q", "LIVE01 one shot")
             if piped.returncode != 0 or "LIVE01 end." not in piped.stdout:
                 s.failures.append(f"chat -q piped: exit={piped.returncode}\n{piped.stdout[-1500:]}\n{piped.stderr[-1500:]}")
         finally:
-            pane.kill()
-            ch.reap()
+            try:
+                pane.kill()
+            finally:
+                ch.reap()
 
     print("step timings (s):", s.timings)
     assert not s.failures, (f"{len(s.failures)}/{s.steps} steps failed:\n\n" + "\n\n".join(s.failures[:5])

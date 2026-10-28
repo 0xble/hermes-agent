@@ -1,7 +1,9 @@
 """Explicit worker persistence facade; never opens the canonical SQLite store.
 
-This first operation family is deliberately NOT a complete SessionDB substitute.
-No existing cron/child/compute consumer is switched until its inventory is covered.
+This operation family is deliberately NOT a complete SessionDB substitute.
+Detached cron uses the covered lifecycle, transcript, usage and compression
+inventory through cron.detached_authority. Other consumers must inventory their
+store calls before switching to this facade.
 """
 from __future__ import annotations
 

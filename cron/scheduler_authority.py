@@ -109,6 +109,17 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             if cancel_event is not None and cancel_event.is_set():
                 await call('cancel', receipt)
             state = await call('status', receipt)
+            from cron.detached_authority import owns_detached_execution, run_detached
+            if state['status'] == 'started' and owns_detached_execution(job['id'], request_id):
+                # The admitted policy, not the firer's mutable snapshot, owns
+                # execution inputs just as it does for gateway-hosted cron.
+                state = await call('recover', params)
+                if state['status'] != 'started':
+                    continue
+                value = await asyncio.to_thread(run_detached, dict(state['job']), receipt, state, record, save,
+                    execution_id=request_id, extra_prompt=params['extra_prompt'], cancel_event=cancel_event)
+                job.update(record['worker_result']['job_flags'])
+                return value
             if state.get('progress_at') not in (None, progress):
                 # The owner's agent is still working: refresh OUR ledger row (the owner's stamp is
                 # fenced to the row's owner), once per owner stamp, so the stale-claim sweep measures
@@ -141,6 +152,8 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 observe(lambda op, data: operation(authority, op, data)), loop).result()
         return asyncio.run(remote())
     except Exception as exc:
+        if record.get('worker_result') is not None:
+            return tuple(record['worker_result']['result'])
         if attempted:
             raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
         error = f'{type(exc).__name__}: {exc}'
@@ -175,10 +188,12 @@ def reconcile_pending(*, allow_connect=True):
                 # output or re-marking the job on every tick would duplicate its side effects.
                 continue
             row = get_execution(params['request_id'])
-            if row is not None and row['job_id'] == params['job_id'] and row['status'] in {'completed', 'failed'}:
-                # The firer booked this attempt's terminal outcome itself (ownership lost, shutdown
-                # interrupt, a crashed tail): the receipt is not a result to save or deliver again.
+            terminal_execution = (row is not None and row['job_id'] == params['job_id']
+                                  and row['status'] in {'completed', 'failed'})
+            pending_canonical = 'worker_result' in record and not record.get('canonical_settled')
+            if terminal_execution and not pending_canonical:
                 journal.unlink(missing_ok=True)
+                journal.with_suffix('.cancel').unlink(missing_ok=True)
                 continue
             if 'refusal' in record:
                 state = {'status': 'terminal', 'result': record['refusal'], 'job': record['job']}
@@ -195,12 +210,22 @@ def reconcile_pending(*, allow_connect=True):
                     state = asyncio.run_coroutine_threadsafe(observe(), owner[1]).result(timeout=20)
                 else:
                     state = asyncio.run(observe())
+            if terminal_execution:
+                # The worker already booked output/delivery, but the replacement
+                # owner must import its captured result before deleting the only link.
+                # cron.recover uses the same settlement path as cron.status.
+                settled = json.loads(journal.read_text(encoding='utf-8-sig')).get('canonical_settled')
+                if state['status'] == 'terminal' and settled:
+                    journal.unlink(missing_ok=True)
+                    journal.with_suffix('.cancel').unlink(missing_ok=True)
+                continue
             if state['status'] == 'missing':
                 # The owner holds no admission for this fire: a definite non-admission, booked as
                 # the same failed run the in-submit refusal books. Only ``unknown`` pauses.
                 current = get_job(params['job_id'])
                 if current is None:
-                    journal.unlink(missing_ok=True)
+                    if not pending_canonical:
+                        journal.unlink(missing_ok=True)
                     continue
                 error = 'Cron admission missing: the owner never admitted this fire'
                 state = {'status': 'terminal', 'job': current,

@@ -123,6 +123,30 @@ class TestLoadBackgroundNotificationsMode:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("notify", [False, True])
+@pytest.mark.parametrize("mode", ["off", "'off'", "concise"])
+async def test_off_suppresses_watcher_completion_even_with_notify(monkeypatch, tmp_path, notify, mode):
+    import tools.process_registry as pr_module
+
+    registry = _FakeRegistry([SimpleNamespace(
+        output_buffer="done\n", exited=True, exit_code=0, command="echo done", started_at=None,
+    )])
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    runner = _build_runner(monkeypatch, tmp_path, mode)
+    runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
+    runner._launching_turn_active = AsyncMock(return_value=False)
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher({**_watcher_dict(), "notify_on_complete": notify})
+
+    enabled = mode == "concise"
+    assert runner._enqueue_process_completion_notification.await_count == int(enabled and notify)
+    assert adapter.send.await_count == int(enabled and not notify)
+    adapter.handle_message.assert_not_awaited()
+    assert not registry.is_completion_consumed("proc_test")
+
+
+@pytest.mark.asyncio
 async def test_consumed_completion_skips_raw_notification(monkeypatch, tmp_path):
     """#65379: after process(wait) already returned the completion inline,
     the gateway watcher must NOT also push the raw

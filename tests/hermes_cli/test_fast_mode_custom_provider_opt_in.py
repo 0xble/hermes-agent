@@ -28,7 +28,7 @@ def _write_providers(codex_fast: bool | None, claude_fast: bool | None) -> None:
         return {"base_url": PROXY, "api_mode": api_mode, "key_env": "PROXY_KEY", "capabilities": capabilities}
 
     config = {"providers": {
-        "codex-proxy": entry("codex_responses", codex_fast),
+        "openai-proxy": entry("codex_responses", codex_fast),
         "claude-proxy": entry("anthropic_messages", claude_fast),
     }}
     (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -53,9 +53,9 @@ def _claude_kwargs(agent=None) -> dict:
 
 def test_opted_in_codex_proxy_receives_priority_and_the_warning_stops():
     _write_providers(codex_fast=True, claude_fast=None)
-    assert resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:codex-proxy", base_url=PROXY) == {
+    assert resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:openai-proxy", base_url=PROXY) == {
         "service_tier": "priority"}
-    assert not fast_mode_route_ignored(CODEX_MODEL, "custom:codex-proxy", PROXY)
+    assert not fast_mode_route_ignored(CODEX_MODEL, "custom:openai-proxy", PROXY)
 
 
 def test_opting_in_codex_leaves_the_claude_proxy_on_the_same_url_closed():
@@ -86,14 +86,14 @@ def test_opted_in_claude_proxy_receives_speed_and_the_beta():
 @pytest.mark.parametrize("codex_fast", [None, False])
 def test_custom_route_without_an_explicit_true_stays_closed(codex_fast):
     _write_providers(codex_fast=codex_fast, claude_fast=None)
-    assert resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:codex-proxy", base_url=PROXY) is None
-    assert fast_mode_route_ignored(CODEX_MODEL, "custom:codex-proxy", PROXY)
+    assert resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:openai-proxy", base_url=PROXY) is None
+    assert fast_mode_route_ignored(CODEX_MODEL, "custom:openai-proxy", PROXY)
 
 
 def test_opt_in_never_crosses_model_families():
     """A Codex-transport opt-in cannot carry Anthropic ``speed``, and vice versa."""
     _write_providers(codex_fast=True, claude_fast=True)
-    assert resolve_fast_mode_overrides(CLAUDE_MODEL, provider="custom:codex-proxy", base_url=PROXY) is None
+    assert resolve_fast_mode_overrides(CLAUDE_MODEL, provider="custom:openai-proxy", base_url=PROXY) is None
     assert resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:claude-proxy", base_url=PROXY) is None
 
 
@@ -115,7 +115,7 @@ def test_delegated_child_on_an_opted_in_proxy_inherits_priority(monkeypatch):
     parent = SimpleNamespace(service_tier="priority", request_overrides={}, provider="custom:claude-proxy",
                              base_url=PROXY, model=CLAUDE_MODEL)
     overrides = _resolve_child_request_overrides(
-        parent, child_model=CODEX_MODEL, child_provider="custom:codex-proxy", child_base_url=PROXY,
+        parent, child_model=CODEX_MODEL, child_provider="custom:openai-proxy", child_base_url=PROXY,
         explicit_overrides=None, inherit_parent_route=False)
     assert overrides.get("service_tier") == "priority"
     assert "speed" not in overrides
@@ -125,7 +125,7 @@ def test_named_route_moved_to_another_url_is_not_opted_in():
     """A fallback or pin that keeps an opted-in name but routes elsewhere must not bill fast."""
     _write_providers(codex_fast=True, claude_fast=True)
     elsewhere = "http://127.0.0.1:9999/v1"
-    assert resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:codex-proxy", base_url=elsewhere) is None
+    assert resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:openai-proxy", base_url=elsewhere) is None
     assert "speed" not in (_claude_kwargs(_claude_agent(base_url=elsewhere)).get("extra_body") or {})
 
 
@@ -162,7 +162,7 @@ def test_opt_in_is_read_from_the_active_profile_home(tmp_path):
     def priority_in(name):
         token = set_hermes_home_override(homes[name])
         try:
-            return resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:codex-proxy", base_url=PROXY)
+            return resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:openai-proxy", base_url=PROXY)
         finally:
             reset_hermes_home_override(token)
 
