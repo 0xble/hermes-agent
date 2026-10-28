@@ -56,9 +56,14 @@ async def check_memory_health(runner) -> None:
         return
     async with lock:
         for profile, home in _handoff_watch_scopes(runner):
-            home = Path(home or get_hermes_home())
-            async with _async_profile_runtime_scope(home):
-                await _check_profile_health(runner, profile, home)
+            try:
+                home = Path(home or get_hermes_home())
+                async with _async_profile_runtime_scope(home):
+                    await _check_profile_health(runner, profile, home)
+            except Exception:
+                # Advisory probes must not block startup or the remaining profiles.
+                logger.error("Memory readiness check failed [profile=%s, home=%s]",
+                             profile, home, exc_info=True)
 
 
 def _pending_notice(home: Path) -> tuple[Path, str, bool]:
@@ -79,6 +84,8 @@ def _pending_notice(home: Path) -> tuple[Path, str, bool]:
 
 
 async def _check_profile_health(runner, profile, home: Path) -> None:
+    from gateway.warning_notifications import present_notification
+
     marker, issue, first = await asyncio.to_thread(_pending_notice, home)
     if not issue:
         return
@@ -87,10 +94,28 @@ async def _check_profile_health(runner, profile, home: Path) -> None:
     for owner, platform, _config, channel, transport in runner._served_home_channel_transports():
         if owner != profile:
             continue
-        if await runner._send_home_channel_message(
-                platform, channel, transport, issue, "Memory health notice failed for %s:%s: %s"):
+        sent = False
+
+        async def send() -> None:
+            nonlocal sent
+            sent = await runner._send_home_channel_message(
+                platform, channel, transport, issue, "Memory health notice failed for %s:%s: %s")
+
+        await present_notification(send, platform=platform)
+        # Muted diagnostics remain log-only, not delivered. Keep the notice eligible
+        # if the owning profile later enables warning notifications for this release.
+        if sent:
             await asyncio.to_thread(marker.with_suffix(".notified").touch)
             break
+
+
+def _log_memory_health_failure(done) -> None:
+    if done.cancelled():
+        return
+    error = done.exception()
+    if error is not None:
+        logger.error("Periodic memory readiness check failed",
+                     exc_info=(type(error), error, error.__traceback__))
 
 
 def schedule_memory_health(runner, loop) -> None:
@@ -99,12 +124,17 @@ def schedule_memory_health(runner, loop) -> None:
     if future is not None and not future.done():
         return
     runner._memory_health_future = asyncio.run_coroutine_threadsafe(check_memory_health(runner), loop)
+    runner._memory_health_future.add_done_callback(_log_memory_health_failure)
 
 
 async def install_health_notices(runner) -> None:
-    from gateway.cron_store_notices import install_cron_store_notices
-    install_cron_store_notices(runner, asyncio.get_running_loop())
-    await check_memory_health(runner)
+    """Notice setup is best-effort, never a prerequisite for gateway availability."""
+    try:
+        from gateway.cron_store_notices import install_cron_store_notices
+        install_cron_store_notices(runner, asyncio.get_running_loop())
+        await check_memory_health(runner)
+    except Exception:
+        logger.error("Health notice setup failed", exc_info=True)
 
 
 def health_notice_chores(runner, loop) -> list:
