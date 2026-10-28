@@ -97,7 +97,21 @@ also retains real process exit under inherited supervisor markers. The marker
 strip adapts upstream [PR #143630](https://github.com/NousResearch/hermes-agent/pull/143630)
 and extends it to Desktop. Retire that runtime hunk once the accepted upstream
 release includes equivalent stripping, but retain fixture custody until upstream
-owns both group cleanup and parent-death behavior.
+owns both group cleanup and parent-death behavior. The nested fixture publishes
+PID and creation time before shutdown, so observing a brief running-state snapshot
+is not required and PID reuse cannot redirect cleanup. Normal-return cases read
+that witness only after nested pytest exits.
+
+The classic CLI live-session file keeps the ordinary 300-second CI bound. Its
+prior 600-second override had timeout reports and a native-host completion, not
+the passing hosted timing required by [ci-slow-file-timeouts.md](ci-slow-file-timeouts.md).
+
+The idle-exit unit fixture stubs `_served_homes` rather than patching
+`gateway.run._cron_tick_profile_homes`: resolving the deeper patch imports the
+side-effectful gateway bootstrap before the patch is installed. With the checkout
+under the real Hermes home, that import can reach real-home configuration and I/O.
+Keep the unit seam in the side-effect-free idle-exit module. Real-process routing
+and idle-exit regressions retain production home discovery under isolated homes.
 
 Chaos scenario workers build child environments while pytest changes the parent
 process environment between tests. Filter names before reading values and omit
