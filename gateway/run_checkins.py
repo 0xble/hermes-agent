@@ -5,6 +5,7 @@ FIFO, reauthorization, restart recovery and delivery, just as for other generate
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import functools
 import inspect
@@ -59,30 +60,33 @@ async def poll_checkins(runner):
     from gateway.platforms.event import MessageEvent
     from hermes_state_runtime import list_session_admissions
 
+    if getattr(runner, "_startup_restore_in_progress", False):
+        return  # Registries and queued human input have not finished recovering yet.
     # New session identities are inspected once, including restored sessions after a restart.
     # Only armed/error candidates are observed on subsequent ticks, not the whole transcript DB.
     seen = getattr(runner, "_checkin_seen", None)
     if seen is None:
         seen = runner._checkin_seen = set()
-    for entry in runner.session_store.list_sessions():
-        if entry.session_id in seen or entry.suspended or not entry.origin:
+    for entry in await runner._run_in_executor_with_context(runner.session_store.list_sessions):
+        identity = (entry.session_key, entry.session_id)
+        if identity in seen or entry.suspended or not entry.origin:
             continue
         source = runner._restored_source(entry)
         if source is None:
             continue
-        scope = runner._profile_scope_for_source(source)
+        scope = runner._async_profile_scope_for_source(source)
         if scope is None:
             continue
-        with scope:
-            seen.add(entry.session_id)
+        async with scope:
+            seen.add(identity)
             await reconcile_turn(runner, source, entry.session_key)
 
     for route, (source, expected) in list(getattr(runner, "_checkin_watch", {}).items()):
         try:
-            scope = runner._profile_scope_for_source(source)
+            scope = runner._async_profile_scope_for_source(source)
             if scope is None:
                 continue
-            with scope:
+            async with scope:
                 from agent import estop
                 if (getattr(runner, "_draining", False) or estop.paused_reply() is not None
                         or getattr(runner, "_user_stop_latched", lambda *_: False)(route)):
@@ -228,14 +232,18 @@ def install_visible_observer(runner, adapter):
                         if threads is None:
                             threads = adapter._checkin_message_threads = {}
                         thread = bound.get("thread_id") or metadata.get("thread_id")
-                        if name == "edit_message" and thread is None:
-                            thread = threads.get((str(chat_id), str(bound.get("message_id"))))
+                        previous = threads.get((str(chat_id), str(bound.get("message_id"))))
+                        if name == "edit_message" and thread is None and previous:
+                            thread = previous[0]
+                        content = bound.get("content")
+                        changed = name != "edit_message" or previous is None or previous[1] != content
                         for mid in (getattr(result, "message_id", None), *getattr(result, "continuation_message_ids", ())):
                             if mid:
-                                threads[(str(chat_id), str(mid))] = thread
+                                threads[(str(chat_id), str(mid))] = (thread, content)
                         while len(threads) > 2000:
                             threads.pop(next(iter(threads)))
-                        await record_visible(runner, adapter, chat_id, thread, bound.get("platform"))
+                        if changed:
+                            await record_visible(runner, adapter, chat_id, thread, bound.get("platform"))
                 except Exception:
                     logger.warning("Could not record supervisor visible-output anchor", exc_info=True)
                 return result
@@ -248,8 +256,13 @@ async def record_visible(runner, adapter, chat_id, thread_id=None, platform=None
     if chat_id is None:
         return
 
+    from gateway.session_context import get_session_env
+    owner = get_session_env("HERMES_SESSION_KEY", "")
+    task = asyncio.current_task()
+    owner = next((key for key, running in getattr(adapter, "_session_tasks", {}).items() if running is task), owner)
     now = time.time()
-    for entry in runner.session_store.list_sessions():
+    candidates = []
+    for entry in await runner._run_in_executor_with_context(runner.session_store.list_sessions):
         origin = entry.origin
         if (not origin or entry.suspended or str(origin.chat_id) != str(chat_id)
                 or str(origin.thread_id or "") != str(thread_id or "")):
@@ -257,12 +270,19 @@ async def record_visible(runner, adapter, chat_id, thread_id=None, platform=None
         source = runner._restored_source(entry)
         if source is None or (platform is not None and source.platform != platform):
             continue
-        scope = runner._profile_scope_for_source(source)
+        scope = runner._async_profile_scope_for_source(source)
         if scope is None:
             continue
-        with scope:
+        async with scope:
             if runner._delivery_adapter_for(source) is not adapter:
                 continue
+            candidates.append((entry, source))
+    owned = [item for item in candidates if item[0].session_key == owner]
+    # Per-user group sessions can share a thread. An unowned send must not postpone
+    # all their supervisors merely because its transport destination is the same.
+    targets = owned or (candidates if len(candidates) == 1 else [])
+    for entry, source in targets:
+        async with runner._async_profile_scope_for_source(source):
             visible = getattr(runner, "_checkin_visible", None)
             if visible is None:
                 visible = runner._checkin_visible = {}

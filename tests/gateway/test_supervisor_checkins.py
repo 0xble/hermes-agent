@@ -32,7 +32,7 @@ def fixture(tmp_path, monkeypatch):
                             _db_for_key=lambda _: db)
     adapter = SimpleNamespace(_pending_messages={}, _text_batches={}, _active_sessions={})
     runner = SimpleNamespace(session_store=store, _draining=False, _is_session_running=lambda _: False,
-                             _restored_source=lambda _: source, _profile_scope_for_source=lambda _: nullcontext(),
+                             _restored_source=lambda _: source, _async_profile_scope_for_source=lambda _: nullcontext(),
                              _run_in_executor_with_context=asyncio.to_thread, _delivery_adapter_for=lambda _: adapter,
                              _is_intentional_silence=lambda result, text: text.strip() in {"NO_REPLY", "[SILENT]"})
     pending = []
@@ -182,11 +182,38 @@ async def test_send_and_streamed_edit_ack_reset_correct_topic_only(fixture):
     f.clock.now = 220
     await f.adapter.edit_message("42", "sent", "streamed")
     assert f.manager.state.due_at == 1420
+    f.clock.now = 230
+    await f.adapter.edit_message("42", "sent", "streamed")
+    assert f.manager.state.due_at == 1420
     for failed in (SendResult(success=False), SendResult(success=True, deferred=True), SendResult(success=True, held=True)):
         ack.result = failed
         f.clock.now = 400
         assert await f.adapter.send("42", "not visible", metadata={"thread_id": "3"}) is failed
         assert f.manager.state.due_at == 1420
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["stop", "startup"])
+async def test_supervisor_respects_user_stop_and_startup_recovery(fixture, boundary):
+    f = fixture
+    await run_checkins.reconcile_turn(f.runner, f.source, f.entry.session_key)
+    f.clock.now = 1400
+    if boundary == "stop":
+        f.runner._user_stop_latched = lambda *_: True
+    else:
+        f.runner._startup_restore_in_progress = True
+    await run_checkins.poll_checkins(f.runner)
+    f.authority.admit_automation.assert_not_awaited()
+    assert f.manager.state.due_at == 1300
+
+
+@pytest.mark.asyncio
+async def test_visible_output_before_turn_ends_is_the_first_cadence_anchor(fixture):
+    f = fixture
+    await run_checkins.record_visible(f.runner, f.adapter, "42", "3")
+    f.clock.now = 500
+    await run_checkins.reconcile_turn(f.runner, f.source, f.entry.session_key)
+    assert f.manager.state.due_at == 1300
 
 
 def test_checkin_descriptor_is_not_accepted_from_human_metadata(fixture):

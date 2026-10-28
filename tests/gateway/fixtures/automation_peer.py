@@ -143,7 +143,7 @@ async def probe(root, base, mode):
                         await ws.send(json.dumps({'type': 'inbound', 'event': {'text': text,
                             'message_id': identity, 'source': {'platform': 'telegram', 'chat_id': 'automation-chat',
                             'chat_type': 'dm', 'user_id': 'fixture-user',
-                            **({'thread_id': 'supervisor-topic'} if mode == 'checkin' else {})}}}) + '\n')
+                            **({'thread_id': '103'} if mode == 'checkin' else {})}}}) + '\n')
                     await send('spawn', 'SPAWN_AUTOMATION' if mode in {'terminal', 'checkin'} else 'WARM_AUTOMATION')
                     await wait_for(lambda: any(r['request_id'] == 'spawn' and r['status'] == 'terminal' for r in rows()))
                     if mode in {'terminal', 'checkin'}:
@@ -168,13 +168,13 @@ async def probe(root, base, mode):
                         automatic = [r for r in rows() if 'supervisor-checkin' in r['request_id']]
                         assert len(automatic) == 1 and automatic[0]['status'] == 'terminal', automatic
                         assert state()['fired'] and state()['due_at'] > time.time() + 1700
-                        assert 'supervisor-topic' in json.dumps(outgoing), outgoing
+                        assert '103' in json.dumps(outgoing), outgoing
                         model.gate.touch()
                         await wait_for(lambda: 'COMPLETION_STATUS' in json.dumps(outgoing))
                         await wait_for(lambda: state() is None)
                         assert model.checkin_turns == 1
                         print(json.dumps({'supervisor_turns': model.checkin_turns, 'silence_recovered': True,
-                                          'completion_disarmed': True, 'topic': 'supervisor-topic'}))
+                                          'completion_disarmed': True, 'topic': '103'}))
                         return
                     async with websocket(home, desc) as observer:
                         assert 'result' in await rpc(observer, 'session.resume', session_id=sid)
