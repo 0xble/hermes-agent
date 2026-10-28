@@ -173,8 +173,9 @@ def test_handoff_survives_child_cleanup_and_transfers_completion(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("notify", [False, True])
 @pytest.mark.parametrize("new_session", [False, True])
+@pytest.mark.parametrize("mode", ["concise", "off"])
 async def test_gateway_watcher_follows_handoff_without_child_pin_or_duplicate(
-    tmp_path, monkeypatch, handoff_runtime, notify, new_session,
+    tmp_path, monkeypatch, handoff_runtime, notify, new_session, mode,
 ):
     import gateway.run as gateway_run
     from gateway.config import GatewayConfig, Platform
@@ -182,7 +183,7 @@ async def test_gateway_watcher_follows_handoff_without_child_pin_or_duplicate(
     from gateway.session import SessionSource
 
     reg = handoff_runtime
-    (tmp_path / "config.yaml").write_text("display:\n  background_process_notifications: off\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(f"display:\n  background_process_notifications: {mode}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
@@ -234,8 +235,9 @@ async def test_gateway_watcher_follows_handoff_without_child_pin_or_duplicate(
         await async_wait_until(lambda: bool(watchers), timeout=10)
         await asyncio.wait_for(asyncio.gather(*watchers), timeout=10)
         assert len(watchers) == 1
-        assert adapter.handle_message.await_count == (0 if new_session else 1)
-        if not new_session:
+        admitted = not new_session and mode != "off"
+        assert adapter.handle_message.await_count == int(admitted)
+        if admitted:
             event = adapter.handle_message.await_args.args[0]
             assert event.metadata["gateway_session_id"] == parent.session_id
             assert event.metadata["gateway_session_key"] == entry.session_key
@@ -243,6 +245,13 @@ async def test_gateway_watcher_follows_handoff_without_child_pin_or_duplicate(
             assert runner.session_store.lookup_by_session_key(entry.session_key).session_id == parent.session_id
         assert db.get_session(child.session_id)["source"] == "subagent"
         adapter.send.assert_not_awaited()
+        if mode == "off" and not new_session:
+            assert child.proc is not None
+            with scoped_current_session_id(parent.session_id):
+                result = _call("process_manage", {
+                    "action": "wait", "session_id": child.proc.id, "timeout": 10,
+                }, parent._current_task_id)
+            assert result["exit_code"] == 0 and "HANDOFF_RESULT" in result["output"]
     finally:
         gate.touch()
         for watcher in watchers:
