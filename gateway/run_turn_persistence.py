@@ -326,13 +326,11 @@ class GatewayTurnPersistenceMixin:
     async def _hmwa_compression_exhaustion_reset(
         self, agent_result, response, session_entry, session_key, source,
     ):
-        """Auto-reset a permanently oversized session so the next message starts fresh instead of
-        replaying the oversized context forever. Never on a lock-contended defer — that is the
-        OPPOSITE case (a concurrent path holds the lock and is shrinking it). Returns
-        ``(response, session_entry)``."""
-        # When compression is exhausted, the session is permanently too large to process. (#9893) Never wipe
-        # the session for that — retry-next-message semantics apply (#69870 lock-skip consumer; salvaged
-        # from #49874).
+        """Pause compression failures on their original session, never implicitly start /new.
+
+        Retain the failure response and append the existing recovery notice for messaging callers.
+        Deferred compression and API callers keep their existing response contract.
+        """
         if agent_result.get("compression_deferred"):
             logger.info(
                 "Compression deferred for session %s — the compression "
@@ -347,9 +345,8 @@ class GatewayTurnPersistenceMixin:
             logger.info("Keeping API session %s after compression exhaustion.",
                         session_entry.session_id if session_entry else "?")
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
-            if not self._hmwa_defer_exhaustion_reset(session_entry, session_key, source):
-                session_entry = await self._hmwa_rotate_exhausted_session(session_entry, session_key, source)
-            response = (response or "") + t("gateway.session.auto_reset_context_exhausted")
+            logger.warning("Keeping session %s after compression exhaustion.", session_entry.session_id)
+            response = (response or "") + "\n\n" + t("gateway.compress.hygiene_failed")
         return response, session_entry
 
     def _hmwa_defer_exhaustion_reset(self, session_entry, session_key, source):
