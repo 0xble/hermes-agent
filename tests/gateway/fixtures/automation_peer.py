@@ -31,6 +31,14 @@ class Model(BaseHTTPRequestHandler):
             self.server.blocked.set()
             self.server.release.wait(120)
         message = {'role': 'assistant', 'content': 'AUTOMATION_ACK'}
+        if getattr(self.server, 'checkin', False):
+            if '[Supervisor check-in]' in str(last):
+                self.server.checkin_turns += 1
+                message['content'] = 'NO_REPLY'
+            elif 'Write the required supervisor status.' in str(last):
+                message['content'] = 'SUPERVISOR_STATUS: tests are running. Next check in 30 minutes.'
+            elif 'REAL_TERMINAL_COMPLETION' in str(last):
+                message['content'] = 'COMPLETION_STATUS: background work finished.'
         if 'SPAWN_AUTOMATION' in str(last) and messages[-1]['role'] != 'tool':
             code = ('import pathlib,time; p=pathlib.Path(' + repr(str(self.server.gate)) + '); '
                     '\nwhile not p.exists(): time.sleep(.02)\nprint("REAL_TERMINAL_COMPLETION",flush=True)')
@@ -78,6 +86,8 @@ async def probe(root, base, mode):
     model.requests = []
     model.blocked, model.release = threading.Event(), threading.Event()
     model.gate = home / 'release-terminal'
+    model.checkin = mode == 'checkin'
+    model.checkin_turns = 0
     threading.Thread(target=model.serve_forever, daemon=True).start()
     ready = asyncio.Queue()
     outgoing = []
@@ -86,7 +96,7 @@ async def probe(root, base, mode):
         assert hello['platform'] == 'telegram', hello
         descriptor = {'contract_version': 1, 'platform': 'telegram', 'label': 'Fixture',
             'max_message_length': 4096, 'supports_draft_streaming': False, 'supports_edit': True,
-            'supports_threads': False, 'markdown_dialect': 'plain', 'len_unit': 'chars'}
+            'supports_threads': mode == 'checkin', 'markdown_dialect': 'plain', 'len_unit': 'chars'}
         await ws.send(json.dumps({'type': 'descriptor', 'descriptor': descriptor}) + '\n')
         await ready.put(ws)
         async for line in ws:
@@ -132,15 +142,40 @@ async def probe(root, base, mode):
                     async def send(identity, text):
                         await ws.send(json.dumps({'type': 'inbound', 'event': {'text': text,
                             'message_id': identity, 'source': {'platform': 'telegram', 'chat_id': 'automation-chat',
-                            'chat_type': 'dm', 'user_id': 'fixture-user'}}}) + '\n')
-                    await send('spawn', 'SPAWN_AUTOMATION' if mode == 'terminal' else 'WARM_AUTOMATION')
+                            'chat_type': 'dm', 'user_id': 'fixture-user',
+                            **({'thread_id': 'supervisor-topic'} if mode == 'checkin' else {})}}}) + '\n')
+                    await send('spawn', 'SPAWN_AUTOMATION' if mode in {'terminal', 'checkin'} else 'WARM_AUTOMATION')
                     await wait_for(lambda: any(r['request_id'] == 'spawn' and r['status'] == 'terminal' for r in rows()))
-                    if mode == 'terminal':
+                    if mode in {'terminal', 'checkin'}:
                         assert 'REAL_TERMINAL_COMPLETION' in json.dumps(model.requests), 'model did not request real terminal'
                     else:
                         await send('timer-config', '/heartbeat every 1m TIMER_AUTOMATION')
                         await wait_for(lambda: 'Heartbeat' in json.dumps(outgoing))
                     sid = rows()[0]['target_session_id']
+                    if mode == 'checkin':
+                        def state():
+                            with sqlite3.connect(home / 'state.db') as db:
+                                row = db.execute('SELECT value FROM state_meta WHERE key=?', ('checkin:' + sid,)).fetchone()
+                                return json.loads(row[0]) if row and row[0] else None
+                        await wait_for(lambda: state() is not None)
+                        armed = state()
+                        # Advance only this test timer, not the daemon's clock or production config.
+                        armed['due_at'] = time.time() - 1
+                        with sqlite3.connect(home / 'state.db') as db:
+                            db.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(armed), 'checkin:' + sid))
+                        await wait_for(lambda: 'SUPERVISOR_STATUS' in json.dumps(outgoing))
+                        assert model.checkin_turns == 1, model.requests
+                        automatic = [r for r in rows() if 'supervisor-checkin' in r['request_id']]
+                        assert len(automatic) == 1 and automatic[0]['status'] == 'terminal', automatic
+                        assert state()['fired'] and state()['due_at'] > time.time() + 1700
+                        assert 'supervisor-topic' in json.dumps(outgoing), outgoing
+                        model.gate.touch()
+                        await wait_for(lambda: 'COMPLETION_STATUS' in json.dumps(outgoing))
+                        await wait_for(lambda: state() is None)
+                        assert model.checkin_turns == 1
+                        print(json.dumps({'supervisor_turns': model.checkin_turns, 'silence_recovered': True,
+                                          'completion_disarmed': True, 'topic': 'supervisor-topic'}))
+                        return
                     async with websocket(home, desc) as observer:
                         assert 'result' in await rpc(observer, 'session.resume', session_id=sid)
                     await send('held', 'HOLD_AUTOMATION')

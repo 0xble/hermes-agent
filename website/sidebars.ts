@@ -115,6 +115,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/kanban-multi-gateway',
             'user-guide/features/goals',
             'user-guide/features/heartbeat',
+            'user-guide/features/supervisor-checkins',
             'user-guide/features/loops',
             'user-guide/features/code-execution',
             'user-guide/features/hooks',

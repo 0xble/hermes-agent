@@ -307,6 +307,11 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 watch = getattr(self, "_heartbeat_watch", None)
                 if watch:
                     await self._heartbeat_poll_once(watch)
+                from gateway.run_checkins import poll_checkins
+                try:
+                    await poll_checkins(self)
+                except Exception:
+                    logger.warning("Supervisor scan deferred", exc_info=True)
 
         try:
             task = self._heartbeat_poll_task = asyncio.create_task(_poll_loop())
