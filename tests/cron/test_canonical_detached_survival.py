@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from tests.gateway.fixtures.local_recovery_probe import child_env, daemon, rpc, websocket
+from tests.gateway.fixtures.local_recovery_probe import child_env, daemon
 
 
 def wait_for(fn, *, timeout=90):
@@ -183,13 +183,12 @@ scheduler.run_one_job(job, adapters=None, loop=None)
                 done = wait_for(lambda: executions() if executions()['status'] == 'completed' else None)
                 assert done['id'] == row['id'] and done['pid'] == worker_pid
 
-                async def receipt():
-                    async with websocket(home, desc) as ws:
-                        return await rpc(ws, 'cron.status', session_id=original[0]['target_session_id'],
-                                         admission_id=original[0]['admission_id'])
-                status = asyncio.run(receipt())
-                assert status['result']['status'] == 'terminal', status
-                assert status['result']['result'][0] is True, status
+                # No cron.status poll: the replacement ticker must settle the
+                # captured completion before cleaning up the terminal execution.
+                settled = wait_for(lambda: admissions() if admissions()[0]['status'] == 'terminal' else None)
+                assert settled[0]['outcome'] == 'completed', settled
+                with sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True) as db:
+                    assert db.execute("SELECT COUNT(*) FROM worker_executions WHERE status!='terminal'").fetchone()[0] == 0
                 assert effect.read_text().splitlines() == ['once']
                 assert len(requests) == 2
             rows = admissions()

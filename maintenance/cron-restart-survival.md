@@ -21,7 +21,12 @@ or tools. Explicit cron cancellation uses the admission's durable cancellation
 marker. Gateway shutdown is not that cancellation.
 
 The existing admission journal captures the worker's result until the canonical
-owner commits the same admission's terminal receipt. A live detached assignment
+owner commits the same admission's terminal receipt. Reconciliation imports that
+completion before cleaning up a terminal execution journal, without requiring a
+client status poll or repeating delivery. Captured-completion recovery retires
+the linked worker under its original epoch before adopting the admission. A Stop
+accepted between admission claim and submit-receipt persistence writes its marker
+from the admitted identity, independent of that receipt. A live detached assignment
 is excluded from unattended interruption recovery. A dead executor with no
 completion receipt is reconciled interrupted, never resubmitted. Admission,
 execution and delivery identities are unchanged, and release/activation holds

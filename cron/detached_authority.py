@@ -39,13 +39,20 @@ def owns_detached_execution(job_id, execution_id):
     return row is not None and row['pid'] == os.getpid()
 
 
+def _request(row):
+    """The admitted identity is durable before the firer receives its submit answer."""
+    from hermes_state_keys import CRON_PRINCIPAL_ID
+    request = row.get('request_id', '').split(':', 2)
+    if (row.get('principal_id') != CRON_PRINCIPAL_ID
+            or len(request) != 3 or request[0] != 'cron'):
+        return None
+    return request
+
+
 def _record(row):
     """The frozen cron identity, never a caller-selected session or job override."""
-    from hermes_state_keys import CRON_PRINCIPAL_ID
-    if row.get('principal_id') != CRON_PRINCIPAL_ID:
-        return None
-    request = row.get('request_id', '').split(':', 2)
-    if len(request) != 3 or request[0] != 'cron':
+    request = _request(row)
+    if request is None:
         return None
     from cron.scheduler_authority import journal_path
     path = journal_path(request[1], request[2])
@@ -67,11 +74,12 @@ def _cancel_path(job_id, execution_id):
 
 
 def cancel_detached(row):
-    found = _record(row)
-    if found is not None:
+    request = _request(row)
+    if request is not None:
         from utils import atomic_json_write
-        params = found[1]['params']
-        atomic_json_write(_cancel_path(params['job_id'], params['request_id']),
+        # The owner can accept Stop after claim but before the submit answer is
+        # saved. A process-local event or a receipt-dependent marker loses that Stop.
+        atomic_json_write(_cancel_path(request[1], request[2]),
                           {'cancelled': True}, mode=0o600, fsync_dir=True)
 
 
@@ -132,7 +140,7 @@ def recover_detached(db, epoch, row):
     result = detached_result(row)
     if result is None:
         return False
-    from hermes_state_runtime import _admission, _epoch, _session
+    from hermes_state_runtime import _admission, _epoch, _session, _retire_admission_workers
     from gateway.session_results import finish_result, _redacted
 
     def capture(conn):
@@ -149,6 +157,9 @@ def recover_detached(db, epoch, row):
                 or current['generation'] != row['generation']
                 or _session(conn, row['target_session_id'])['runtime_generation'] != row['generation']):
             return None
+        # Retire the captured executor under its original epoch before moving
+        # the admission. Settlement can only retire workers owned by the new epoch.
+        _retire_admission_workers(conn, current, current['owner_epoch'])
         # This is adoption of a captured completion, not a new execution. The
         # same journal survives a crash between this stamp and settlement.
         conn.execute("UPDATE session_admissions SET status='started',owner_epoch=? WHERE admission_id=?",
