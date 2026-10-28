@@ -13,13 +13,13 @@ import threading
 
 root = Path(__file__).parent
 host, command = sys.argv[-2:]
-state = json.loads((root / "state.json").read_text())
+state = json.loads((root / "state.json").read_text(encoding="utf-8-sig"))
 settings = state.get(host, {})
 log = root / "calls.jsonl"
 
 
 def record(name, args=None):
-    with log.open("a") as f:
+    with log.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"host": host, "pid": os.getpid(), "name": name, "args": args or {}}) + "\n")
 
 
@@ -52,7 +52,7 @@ record("mcp_spawn", {"argv": sys.argv[1:], "home": os.environ.get("HERMES_HOME")
 if settings.get("race_standard"):
     settings["permission_mode"] = "standard"
     state[host] = settings
-    (root / "state.json").write_text(json.dumps(state))
+    (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
 if settings.get("stall_handshake"):
     threading.Event().wait()
 session = None

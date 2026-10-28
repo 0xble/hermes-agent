@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+import importlib
 import io
 import json
 import os
@@ -35,7 +36,7 @@ def config(path, default="studio", hosts=None):
         "nodes": {"default": default, "hosts": hosts or {
             "studio": {"ssh": "studio-alias", "platform": "macos", "computer_use": {"permission_mode": "unrestricted"}},
             "book": {"ssh": "book-alias", "platform": "macos", "computer_use": {"permission_mode": "unrestricted"}}}},
-        "computer_use": {"backend": "cua", "max_image_dimension": 64}}))
+        "computer_use": {"backend": "cua", "max_image_dimension": 64}}), encoding="utf-8")
 
 
 @pytest.fixture
@@ -44,7 +45,8 @@ def endpoint(tmp_path, monkeypatch, grant_computer_use_approvals):
     root.mkdir()
     fixture = Path(__file__).parent / "fixtures" / "node_ssh.py"
     executable = root / "ssh"
-    executable.write_text(f"#!{sys.executable}\n" + fixture.read_text())
+    fixture_source = fixture.read_text(encoding="utf-8-sig")
+    executable.write_text(f"#!{sys.executable}\n" + fixture_source, encoding="utf-8")
     executable.chmod(0o755)
     image = io.BytesIO()
     Image.new("RGB", (128, 80), "white").save(image, format="PNG")
@@ -52,7 +54,7 @@ def endpoint(tmp_path, monkeypatch, grant_computer_use_approvals):
 
     def update(**values):
         state.update(values)
-        (root / "state.json").write_text(json.dumps(state))
+        (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
 
     update()
     monkeypatch.setenv("PATH", str(root) + os.pathsep + os.environ["PATH"])
@@ -62,10 +64,7 @@ def endpoint(tmp_path, monkeypatch, grant_computer_use_approvals):
     # A remote adapter must never call either controller acquisition/start path.
     from tools.bot_desktop import runtime
     from tools.computer_use import cua_backend_driver, cua_backend, cua_backend_capture
-    from plugins.computer_use import cua as cua_provider
-    from types import SimpleNamespace
-    monkeypatch.setattr(cua_provider, "sys", SimpleNamespace(platform="linux"))
-    monkeypatch.setattr(cua_backend_capture, "sys", SimpleNamespace(platform="linux"))
+
     def wrong_target(*args, **kwargs):
         raise AssertionError("controller desktop/driver was consulted for a node")
     monkeypatch.setattr(runtime, "ensure_started_for_tool", wrong_target)
@@ -73,14 +72,14 @@ def endpoint(tmp_path, monkeypatch, grant_computer_use_approvals):
     monkeypatch.setattr(cua_backend, "desktop_identity", wrong_target)
     monkeypatch.setattr(cua_backend_capture, "_linux_x11_active_window_id", wrong_target)
     tool.reset_backend_for_tests()
-    import tools.computer_use_tool  # noqa: F401, installs the real public registration
+    importlib.import_module("tools.computer_use_tool")
     a, b = tmp_path / "profile-a", tmp_path / "profile-b"
     config(a)
     config(b, "book")
 
     def calls():
         log = root / "calls.jsonl"
-        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return [json.loads(line) for line in log.read_text(encoding="utf-8-sig").splitlines()] if log.exists() else []
 
     from agent.secret_scope import is_multiplex_active, set_multiplex_active
     before = is_multiplex_active()
@@ -100,7 +99,7 @@ def dispatch(action="capture", **args):
 
 @pytest.mark.platforms("posix")
 def test_default_explicit_node_image_capture_input_and_profile_interleaving(endpoint):
-    a, b, update, calls = endpoint
+    a, b, _update, calls = endpoint
     with home(a):
         assert tool.check_computer_use_requirements()
         first = dispatch()
@@ -213,22 +212,22 @@ def test_write_transport_loss_is_not_replayed_and_new_transport_requires_capture
 
 @pytest.mark.platforms("posix")
 def test_unknown_node_and_bad_shared_config_do_not_fall_back(endpoint):
-    a, _, update, calls = endpoint
+    a, _, _update, calls = endpoint
     with home(a):
         assert "Unknown node" in dispatch(node="typo")["error"]
         assert "nonempty" in dispatch(node="")["error"]
-        (a / "config.yaml").write_text("nodes:\n  hosts: []\n")
+        (a / "config.yaml").write_text("nodes:\n  hosts: []\n", encoding="utf-8")
         assert "mapping" in dispatch()["error"]
-        (a / "config.yaml").write_text("nodes: [broken\n")
+        (a / "config.yaml").write_text("nodes: [broken\n", encoding="utf-8")
         assert "error" in dispatch()
-        (a / "config.yaml").write_text("computer_use:\n  nodes: {}\n")
+        (a / "config.yaml").write_text("computer_use:\n  nodes: {}\n", encoding="utf-8")
         assert "shared nodes.hosts" in dispatch()["error"]
     assert not calls()
 
 
 @pytest.mark.platforms("posix")
 def test_probe_deadline_is_bounded_and_unknown_is_not_missing_permission(endpoint):
-    a, _, update, calls = endpoint
+    a, _, update, _calls = endpoint
     update(**{"book-alias": {"stall_probe": True}})
     started = time.monotonic()
     with home(a):
@@ -255,7 +254,7 @@ def test_handshake_deadline_cleans_up_ssh_child(endpoint):
 
 @pytest.mark.platforms("posix")
 def test_node_approval_remains_fail_closed_and_identifies_target(endpoint):
-    a, _, update, calls = endpoint
+    a, _, _update, calls = endpoint
     prompts = []
     def deny(command, description, **kwargs):
         prompts.append((command, description))
@@ -290,7 +289,7 @@ def test_slow_node_does_not_serialize_another_nodes_startup(endpoint):
 
 
 def test_no_config_preserves_local_provider_and_explicit_local_is_not_a_magic_fallback(tmp_path, monkeypatch):
-    (tmp_path / "config.yaml").write_text("{}")
+    (tmp_path / "config.yaml").write_text("{}", encoding="utf-8")
     seen = []
     def local_handler(args, **kwargs):
         seen.append(args)
@@ -319,7 +318,7 @@ def test_node_registry_is_shared_and_ssh_command_quotes_remote_path(tmp_path):
 
 @pytest.mark.platforms("posix")
 def test_doctor_distinguishes_observed_false_true_and_unknown_and_cli_defaults(endpoint, capsys):
-    a, _, update, calls = endpoint
+    a, _, update, _calls = endpoint
     from argparse import Namespace
     from hermes_cli.subcommands.computer_use import _cu_doctor
     from tools.computer_use.node_doctor import parse_observations
