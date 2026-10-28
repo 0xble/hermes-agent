@@ -86,6 +86,14 @@ class WebSearchProvider(ProviderBase):
         the dispatcher awaits coroutine functions)."""
         return False
 
+    def prepare_search(self, query: str, *, stakes: str | None = None) -> WebSearchProvider:
+        """Return a request-local provider with quality/cache dimensions selected.
+
+        The default preserves existing providers. Overrides must not mutate the
+        registered instance, which concurrent sessions share.
+        """
+        return self
+
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         """Execute a web search. Callers gate on :meth:`supports_search`."""
         raise NotImplementedError(
