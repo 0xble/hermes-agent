@@ -120,7 +120,8 @@ exact-title matcher can select unambiguous subject-owner candidates. A bare
 command or unresolved owner quietly reuses the source session's normal internal
 turn to decide merge versus delete and choose compatible owners, creating a
 subject-specific successor only when needed. This wake is pinned to the source
-session and retirement generation. A cancelled or superseded wake cannot re-arm
+session ID, routing key and retirement generation, including at strict-pin
+admission. A cancelled or superseded wake cannot re-arm
 retirement. Active claims are a quiet wait, not a failed retirement. No standing
 commitment is cancelled merely because its owner is unclear. A merge hands off
 the source context summary (the tool's existing `message` field) even with no
@@ -151,6 +152,13 @@ may differ in the original brief, never its instance, prompt, cadence, limits,
 stop condition, route or authored revisions. Fresh unaccepted task creation
 still requires the complete requested context byte for byte.
 
+An unaccepted goal/loop may replace a terminal successor control (`cleared`,
+`done`, `completed` or `stopped`), but never an active, paused or unknown control.
+Inventory, preparation and the atomic transfer share this eligibility rule.
+Moving a loop redirects its persisted wake route to the successor topic in the
+same transaction as source clearance and recovery proof. Accepted destination
+controls remain independently owned and are not rewritten.
+
 Deletion requires the same generation's complete successful closing SendResult,
 including a message ID and the original thread. Partial, deferred, held,
 thread-fallback, failed or cancelled sends never authorize it. Callback execution
@@ -170,8 +178,19 @@ Confirmed absence only cleans up its binding. Confirmed existence permits
 cancellation or a fresh generation that inventories again and requires a new
 closing receipt. An unknown result never repeats the previous dispatch.
 
-Proof surfaces: `tests/gateway/test_telegram_retire.py` and
-`test_telegram_retire_work.py`, plus the existing topic-tool, topic-mode,
+A failed retirement for an independently confirmed absent topic can also finish
+through native housekeeping. It rechecks the saved generation and session owner,
+reconciles saved handoffs and requires an empty work inventory before unbinding.
+A merge must already have its saved context handoff and destination. Recovery
+never queues source preparation, sends a closing message or dispatches another
+delete. Missing read-only lookup support, unsettled work, a successor conflict
+or a rebound route keeps it failed. Finalization idempotently removes partial
+DM and gateway routing bindings and clears the original session's `session_key`
+without deleting the session or transcript.
+
+Proof surfaces: `tests/gateway/test_telegram_retire.py`,
+`test_telegram_retire_work.py`, `test_telegram_retire_prepare.py` and
+`test_telegram_retire_finalize.py`, plus the existing topic-tool, topic-mode,
 process-registry, async-delegation and completion-delivery regression suites.
 Live validation must use disposable topics and preserve their session histories.
 Roll back the gateway/tool hooks and retirement modules together. The additive

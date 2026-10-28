@@ -382,6 +382,19 @@ class SessionGatewayMixin:
                 "SELECT 1 FROM gateway_routing WHERE scope = :scope AND session_key = wanted.key)", params)}
         return self._execute_write(_do)
 
+    def unbind_gateway_session_peer(self, session_key: str, expected_session_id: str) -> bool:
+        """Finish a partial routing unbind without deleting transcript history."""
+        def _do(conn):
+            rows = conn.execute("SELECT entry_json FROM gateway_routing WHERE session_key = ?",
+                                (session_key,)).fetchall()
+            if any(json.loads(row[0]).get("session_id") != expected_session_id for row in rows):
+                return False
+            conn.execute("DELETE FROM gateway_routing WHERE session_key = ?", (session_key,))
+            conn.execute("UPDATE sessions SET session_key = NULL WHERE id = ? AND session_key = ?",
+                         (expected_session_id, session_key))
+            return True
+        return self._execute_write(_do)
+
     def load_gateway_routing_entries(self, *, scope: str = "") -> dict[str, str]:
         """Load routing entries for *scope* as {session_key: entry_json}."""
         rows = self._read_all("SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (scope,))

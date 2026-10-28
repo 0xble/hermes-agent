@@ -375,19 +375,69 @@ async def test_goal_and_loop_use_actual_persisted_migration(runtime, monkeypatch
     loops.save_loop("old", loop)
     items = await work.inventory(r.runner, r.source, r.state)
     for item in items:
-        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next"})
+        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
         moved = json.loads(r.db.get_meta(f"{item['kind']}:next"))
-        assert {k: v for k, v in moved.items() if k not in {"mutation_id", "control_generation"}} == {
-            k: v for k, v in item["record"].items() if k not in {"mutation_id", "control_generation"}}
+        assert {k: v for k, v in moved.items() if k not in {"mutation_id", "control_generation", "route"}} == {
+            k: v for k, v in item["record"].items() if k not in {"mutation_id", "control_generation", "route"}}
+        if item["kind"] == "loop":
+            assert moved["route"]["thread_id"] == "18"
         # Reopen the durable state, with no in-memory movement acknowledgement.
         recovered = await retire.load(r.runner, r.source)
         assert not recovered["handoffs"][item["id"]]["moved"]
-        await work.transfer(r.runner, r.source, recovered, item, {"session_id": "next"})
+        await work.transfer(r.runner, r.source, recovered, item, {"session_id": "next", "thread_id": "18"})
         assert json.loads(r.db.get_meta(f"{item['kind']}:next")) == moved
     assert goals.load_goal("old").status == "cleared"
     assert goals.load_goal("next").goal == "Maintain Service"
     assert loops.load_loop("old").status == "cleared"
     assert loops.load_loop("next").prompt == "Watch Service"
+
+
+@pytest.mark.asyncio
+async def test_transferred_loop_wakes_in_successor_topic_after_restart(runtime, monkeypatch):
+    from hermes_cli import loops
+    r = runtime
+    monkeypatch.setattr(loops, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    route = {"platform": "telegram", "chat_id": "101", "chat_type": "dm", "thread_id": "17", "user_id": "101"}
+    loops.save_loop("old", loops.LoopState(prompt="Watch Service", route=route))
+    item = (await work.inventory(r.runner, r.source, r.state))[0]
+    dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
+    await work.transfer(r.runner, r.source, r.state, item, dest)
+    assert loops.load_loop("next").route == {**route, "thread_id": "18"}
+    assert loops.load_loop("old").status == "cleared"
+    recovered = await retire.load(r.runner, r.source)
+    await work.transfer(r.runner, r.source, recovered, item, dest)
+    assert loops.load_loop("next").route == {**route, "thread_id": "18"}
+    assert json.loads(recovered["handoffs"]["loop"]["control_receipt"]["destination"])["route"] == {**route, "thread_id": "18"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("status", ["done", "cleared", "completed", "stopped"])
+async def test_terminal_destination_controls_allow_preparation_and_atomic_transfer(runtime, monkeypatch, kind, status):
+    from hermes_cli import goals, loops
+    r = runtime
+    monkeypatch.setattr(goals, "_get_session_db", lambda: r.db)
+    monkeypatch.setattr(loops, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    current = {"status": "active", "goal" if kind == "goal" else "prompt": "Preserve original work"}
+    item = {"id": kind, "kind": kind, "record": current}
+    dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18", "title": "Successor"}
+    r.db.set_meta(f"{kind}:old", json.dumps(current))
+    r.db.set_meta(f"{kind}:next", json.dumps({"status": status}))
+    r.state["owners"] = {kind: "Successor"}
+    monkeypatch.setattr(work, "inventory", AsyncMock(side_effect=[[item], []]))
+    monkeypatch.setattr(work, "destination", AsyncMock(return_value=dest))
+    receipt = AsyncMock(return_value={"receipt_id": "r1"})
+    monkeypatch.setattr(work, "receipt", receipt)
+    monkeypatch.setattr("gateway.telegram_retire_prepare.queue_preparation", AsyncMock(return_value=False))
+    assert await work.prepare(r.runner, r.source, r.state)
+    receipt.assert_awaited_once()
+    assert json.loads(r.db.get_meta(f"{kind}:old"))["status"] == "cleared"
+    moved = json.loads(r.db.get_meta(f"{kind}:next"))
+    assert moved["status"] == "active"
+    assert moved["goal" if kind == "goal" else "prompt"] == "Preserve original work"
+    assert r.state["handoffs"][kind]["control_receipt"]
 
 
 @pytest.mark.asyncio
@@ -419,7 +469,7 @@ async def test_control_transfer_refuses_conflicts_and_rolls_back_without_proof(r
             return original(key, value, **kwargs)
         monkeypatch.setattr(r.db, "set_meta", fail)
     with pytest.raises(RuntimeError, match="Cannot transfer|proof write failed"):
-        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next"})
+        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
     assert (r.db.get_meta(f"{kind}:old"), r.db.get_meta(f"{kind}:next")) == before
     assert r.db.get_meta(retire.state_key(r.source)) is None
 

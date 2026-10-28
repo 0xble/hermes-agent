@@ -64,6 +64,11 @@ class WorkInProgress(RuntimeError):
     """Execution tokens must settle normally, not be transferred or discarded."""
 
 
+def open_control(raw):
+    """Use the inventory's terminal semantics for successor admission too."""
+    return raw is not None and json.loads(raw).get("status") not in {"cleared", "done", "completed", "stopped"}
+
+
 async def inventory(runner, source, state) -> list[dict]:
     from cron.jobs import list_jobs, is_terminal_job
     from tools.async_delegation import retirement_inventory
@@ -75,7 +80,7 @@ async def inventory(runner, source, state) -> list[dict]:
         raw = await runner._session_db.get_meta(f"{kind}:{sid}")
         if raw:
             record = json.loads(raw)
-            if record.get("status") not in {"cleared", "done", "completed", "stopped"}:
+            if open_control(raw):
                 items.append({"id": kind, "kind": kind, "title": record.get("goal") or record.get("prompt") or kind,
                               "record": record})
     origin_address = address(source, sid)
@@ -399,13 +404,16 @@ async def transfer_control(runner, source, state, item, dest):
                 return proof
             raise RuntimeError(f"Transferred {kind} changed before retirement recovery")
         if (not old or json.loads(old) != item["record"]
-                or (not accepted_task_id and new is not None)):
+                or (not accepted_task_id and open_control(new))):
             raise RuntimeError(f"Cannot transfer {kind}: destination already owns one or the source changed")
         if kind == "loop":
             current_loop, retired_loop = LoopState.from_json(old), LoopState.from_json(old)
             retired_loop.status = "cleared"
             retired_loop.awaiting_response = False
             if not accepted_task_id:
+                current_loop.route = {**current_loop.route, "platform": source.platform.value,
+                                      "chat_id": str(source.chat_id), "chat_type": source.chat_type,
+                                      "thread_id": str(dest["thread_id"])}
                 save_loop(dest["session_id"], current_loop, cursor=conn)
             save_loop(state["session_id"], retired_loop, cursor=conn)
         else:
@@ -488,8 +496,7 @@ async def transfer(runner, source, state, item, dest):
             raise RuntimeError("Process ownership changed before transfer")
 
 
-async def prepare(runner, source, state):
-    from gateway.telegram_retire_prepare import queue_preparation
+async def settle_handoffs(runner, source, state):
     # Reconcile receipts independently of source inventory. A crash after moving
     # an item must not forget a still-unconfirmed handoff just because it moved.
     for item_id, handoff in state["handoffs"].items():
@@ -504,6 +511,10 @@ async def prepare(runner, source, state):
             handoff["moved"] = True
             await save(runner, source, state)
 
+
+async def prepare(runner, source, state):
+    from gateway.telegram_retire_prepare import queue_preparation
+    await settle_handoffs(runner, source, state)
     try:
         items = await inventory(runner, source, state)
     except WorkInProgress as exc:
@@ -541,8 +552,8 @@ async def prepare(runner, source, state):
         except ValueError as exc:
             unresolved.append({**item, "blocked_owner": selector, "blocked_reason": str(exc)})
             continue
-        if item["kind"] in {"goal", "loop"} and await runner._session_db.get_meta(
-                f"{item['kind']}:{dest['session_id']}") is not None:
+        if item["kind"] in {"goal", "loop"} and open_control(await runner._session_db.get_meta(
+                f"{item['kind']}:{dest['session_id']}")):
             unresolved.append({**item, "blocked_owner": dest["title"],
                                "blocked_reason": "Destination already has a control. Choose a compatible successor, do not overwrite it."})
             continue

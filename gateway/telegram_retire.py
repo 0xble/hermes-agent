@@ -221,15 +221,40 @@ async def _unbind(runner, source, state):
         chat_id=str(source.chat_id), thread_id=str(source.thread_id), profile_name=profile)
     if not await asyncio.to_thread(runner.session_store.unbind_session, state["session_key"], state["session_id"]):
         raise RuntimeError("Topic routing changed before unbinding, session was preserved")
+    if not await runner._session_db.unbind_gateway_session_peer(state["session_key"], state["session_id"]):
+        raise RuntimeError("Persisted topic routing changed before unbinding, session was preserved")
     state["phase"] = "done"
     await save(runner, source, state)
+
+
+async def _finalize_absent(runner, source, state, bot):
+    """A failed request can finish quietly after independently confirmed absence."""
+    from gateway.telegram_retire_work import inventory, settle_handoffs
+    key, generation = state["session_key"], state["generation"]
+    if await asyncio.to_thread(runner.session_store.peek_session_id, key) not in {None, state["session_id"]}:
+        return
+    if bot is None or not await _probe_deleted(bot, source, runner=runner, read_only=True):
+        return
+    # No new source-topic turn or closing send is possible. A requested merge
+    # must already have a saved destination and context handoff to reconcile.
+    if state.get("target") and (not state.get("merge_destination") or not any(
+            record.get("item", {}).get("kind") == "context" for record in state["handoffs"].values())):
+        return
+    await settle_handoffs(runner, source, state)
+    if await inventory(runner, source, state):
+        return
+    current = await _current(runner, source, generation)
+    if (not current or current["phase"] != "failed" or runner._is_session_running(key)
+            or await asyncio.to_thread(runner.session_store.peek_session_id, key) not in {None, state["session_id"]}):
+        return
+    await _unbind(runner, source, current)
 
 
 async def advance(runner, source):
     """Resume persisted retirement only after the active turn relinquishes its lane."""
     from gateway.telegram_retire_work import HandoffPending
     state = await load(runner, source)
-    if not state or state["phase"] in {"cancelled", "done", "failed"}:
+    if not state or state["phase"] in {"cancelled", "done"}:
         return
     key = state["session_key"]
     adapter = runner._delivery_adapter_for(source)
@@ -247,10 +272,16 @@ async def advance(runner, source):
         return
     async with lock:
         state = await _current(runner, source, state["generation"])
-        if not state or state["phase"] == "failed":
+        if not state:
             return
         generation = state["generation"]
         bot = getattr(adapter, "_bot", None)
+        if state["phase"] == "failed":
+            try:
+                await _finalize_absent(runner, source, state, bot)
+            except Exception:
+                logger.debug("Absent-topic retirement recovery remains blocked for %s", key, exc_info=True)
+            return
         try:
             if bot is None:
                 raise RuntimeError("Telegram bot is disconnected")
@@ -349,7 +380,7 @@ async def resume_all(runner):
     for _, raw in await runner._session_db.list_meta_prefix(PREFIX):
         try:
             state = json.loads(raw)
-            if state["phase"] not in {"cancelled", "done", "failed"}:
+            if state["phase"] not in {"cancelled", "done"}:
                 source = SessionSource(**{**state["source"], "platform": Platform.TELEGRAM})
                 async with runner._async_profile_scope_for_source(source):
                     await advance(runner, source)

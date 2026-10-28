@@ -22,6 +22,7 @@ def setup_retire(monkeypatch):
         set_meta=AsyncMock(side_effect=lambda key, value: meta.__setitem__(key, value)),
         get_telegram_topic_owner_for_thread=AsyncMock(return_value={"owner_key": "monitor"}),
         set_telegram_topic_owner_state=AsyncMock(), delete_telegram_topic_binding=AsyncMock(),
+        unbind_gateway_session_peer=AsyncMock(return_value=True),
         list_meta_prefix=AsyncMock(side_effect=lambda prefix: list(meta.items())),
     )
     bot = SimpleNamespace(delete_forum_topic=AsyncMock(return_value=True),
