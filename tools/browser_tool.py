@@ -1493,10 +1493,17 @@ def _routed_check_fn(name: str):
 
 def _routed_handler(name: str, fallback):
     def handler(args, **kw):
-        return record_browser_call(lambda legacy: routed_browser_handler(
-            name, args, fallback=lambda: legacy(lambda: fallback(args, kw)),
+        served_by_legacy = False
+
+        def legacy():
+            nonlocal served_by_legacy
+            served_by_legacy = True
+            return fallback(args, kw)
+
+        return record_browser_call(lambda: routed_browser_handler(
+            name, args, fallback=legacy,
             task_id=kw.get("task_id"), session_id=kw.get("session_id"),
-        ), _cloud.browser_backend_name)
+        ), lambda: _cloud.browser_backend_name() if served_by_legacy else "extension")
     return handler
 
 

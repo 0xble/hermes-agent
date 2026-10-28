@@ -1860,10 +1860,11 @@ def _main_model_pin() -> tuple[Optional[str], Optional[str]]:
     """``(provider, model)`` the main agent runs on right now (``model.default`` + the provider it
     resolves to), for ``pinned=True`` jobs: the lock is a plain per-job pin, so the scheduler needs
     no second precedence axis. ``(None, None)`` when nothing is configured (the job stays unpinned)."""
+    from hermes_cli.config_backend import config_exists
     from hermes_cli.config_effective import load_user_config_effective
 
     cfg_path = get_hermes_home() / "config.yaml"
-    cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
+    cfg = load_user_config_effective(cfg_path) if config_exists(cfg_path) else {}
     from hermes_cli.model_preset_runtime import resolve_default_route
     route = resolve_default_route(cfg)
     if not route.model:

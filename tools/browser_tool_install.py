@@ -6,7 +6,7 @@ import functools
 import os
 import shutil
 
-from hermes_constants import agent_browser_runnable, is_termux as _is_termux_environment
+from hermes_constants import node_tool_runnable, is_termux as _is_termux_environment
 from tools.browser_tool_origin import origin_module as _origin
 from tools import browser_tool_cdp as _cdp
 from tools import browser_tool_cloud as _cloud
@@ -72,7 +72,7 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         installed = pm.installed_package("agent-browser")
         if installed and installed.binary is not None:
             return str(installed.binary)
-    usable = agent_browser_runnable if validate else _agent_browser_candidate_present
+    usable = node_tool_runnable if validate else _agent_browser_candidate_present
     for search_path in (None, _merge_browser_path("")):
         if search_path == "":
             continue

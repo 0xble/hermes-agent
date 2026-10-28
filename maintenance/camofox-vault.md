@@ -5,6 +5,23 @@ the browser vault fill tool, or the 1Password backends.
 
 - Fork patch identity: `vault-origin-aliases`.
 
+## Native Browser Extraction Boundary
+
+Upstream main `69f73ec5f11f5a945cc864f29c4e2ad2307eaec3` extracts the native
+browser and Camofox into catalog plugins. Keep the maintained native owner until
+an extracted provider preserves named identity resolution, vault authorization,
+and authenticated browser-controller ownership together. Do not mix its session
+cache or lifecycle with the extracted browser-session owner, and do not install
+a second Camofox provider during configuration migration. Preserve
+`browser.backend` and `browser.extension_control` while adopting the upstream
+launcher-setting migration. The Camofox no-install and v52 migration regressions
+exercise that intentional fork contract rather than upstream's removal policy.
+
+Adopt upstream vault `fill_context`, guarded metadata snapshots, and protected
+OTP writes around the native origin and account checks. Attribute Browser Use
+metrics to the session that served the call, including cloud-to-local fallback,
+without changing the native browser or its consent surface.
+
 ## Required behavior
 
 - A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.

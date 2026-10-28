@@ -36,6 +36,7 @@ from typing import Any, Dict, Optional
 
 from agent.vault_login_classifier import build_form_probe_js
 from tools.registry import no_cache_check_fn
+from tools.browser_vault_context import plugin_errors_as_refusal, snapshot_refusal, write_backend_code
 
 logger = logging.getLogger(__name__)
 
@@ -145,9 +146,7 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     if is_camofox_mode():
         return _eval_js_secret(task_id, expression)
     try:
-        from tools.browser_supervisor import SUPERVISOR_REGISTRY
-
-        supervisor = SUPERVISOR_REGISTRY.get(task_id)
+        supervisor = _ensure_supervisor(task_id)
         if supervisor is not None:
             sup = supervisor.evaluate_runtime(expression)
             if sup.get("ok"):
@@ -542,6 +541,7 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
                       ensure_ascii=False)
 
 
+@plugin_errors_as_refusal
 def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
     authenticator seed, the code is minted server-side and nobody is asked. Otherwise the caller should fetch the
@@ -639,48 +639,44 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                            "error": "The page navigated before the code could be resolved. Nothing was written."})
     if raw_meta is not None and (refusal := _alias_fill_revalidation_refusal(raw_meta, origin)):
         return refusal
-    code: Optional[str] = None
-    source = "user"
+    def write(code: str, source: str) -> str:
+        register_vault_redaction_value(code)
+        if raw_meta is not None and (refusal := _alias_fill_revalidation_refusal(raw_meta, origin)):
+            return refusal  # a manual-code prompt can outlive alias authorization too
+        if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
+            return refusal  # re-checked at the write: the browser selection may have changed meanwhile
+        fills = build_otp_fills(otp_controls, code)
+        result = _eval_js_secret(browser_key, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+        del code
+        if not result.get("success"):
+            return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
+        parsed = _parse_json_result(result.get("result"))
+        if isinstance(parsed, str):
+            parsed = _parse_json_result(parsed)
+        if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
+            return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
+        filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+        return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
+                           "next": "Submit the form (many sites auto-submit when the last digit lands)."})
+
+
     if backend is not None:
-        try:
-            code = backend.resolve_otp(handle)
-        except MissingCredential as exc:
-            return json.dumps({"success": False, "error_type": "credential_missing", "error": str(exc)[:200]})
-        except Exception:
-            code = None
-        if code:
-            source = backend.name
+        written = write_backend_code(backend, handle, meta, origin, lambda code: write(code, backend.name))
+        if written is not None:
+            return written
+    prompt = get_code_prompt_callback()
+    if prompt is None or not can_prompt_here():
+        return json.dumps({"success": False, "error_type": "prompt_unavailable",
+                           "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
+                                     "Save an authenticator key for this login so codes can be generated automatically.")})
+    code = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
     if not code:
-        prompt = get_code_prompt_callback()
-        if prompt is None or not can_prompt_here():
-            return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                               "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
-                                         "Save an authenticator key for this login so codes can be generated automatically.")})
-        code = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
-        if not code:
-            return json.dumps({"success": False, "error_type": "code_declined",
-                               "error": "The user did not enter a code. Do not ask again this turn."})
-
-    register_vault_redaction_value(code)
-    if raw_meta is not None and (refusal := _alias_fill_revalidation_refusal(raw_meta, origin)):
-        return refusal  # a manual-code prompt can outlive alias authorization too
-    if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
-        return refusal  # re-checked at the write: the browser selection may have changed meanwhile
-    fills = build_otp_fills(otp_controls, code)
-    result = _eval_js_secret(browser_key, build_fill_js(fills, expected_origin=origin, nonce=nonce))
-    del code
-    if not result.get("success"):
-        return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
-    parsed = _parse_json_result(result.get("result"))
-    if isinstance(parsed, str):
-        parsed = _parse_json_result(parsed)
-    if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
-        return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
-    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
-    return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
-                       "next": "Submit the form (many sites auto-submit when the last digit lands)."})
+        return json.dumps({"success": False, "error_type": "code_declined",
+                           "error": "The user did not enter a code. Do not ask again this turn."})
+    return write(code, "user")
 
 
+@plugin_errors_as_refusal
 def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     """Fill the current page's password field from a vault handle.
 
@@ -902,147 +898,152 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     if alias_only and (refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin)):
         _discard_fill_metadata()
         return refusal
-    try:
-        if meta.kind == "login":
-            secret = {"password": backend.resolve_password(handle)}
-            fills = select_password_fill(classified, secret["password"])
-        elif meta.kind == "protected_field":
-            secret = backend.resolve_secret(handle)
-            fills = select_protected_field_fills(
-                classified, str(meta.field_token or ""), secret.get("value", "")
+    with backend.fill_context():
+        refusal = snapshot_refusal(backend, handle, meta, page_origin)
+        if refusal is not None:
+            _discard_fill_metadata()
+            return json.dumps(refusal)
+        try:
+            if meta.kind == "login":
+                secret = {"password": backend.resolve_password(handle)}
+                fills = select_password_fill(classified, secret["password"])
+            elif meta.kind == "protected_field":
+                secret = backend.resolve_secret(handle)
+                fills = select_protected_field_fills(
+                    classified, str(meta.field_token or ""), secret.get("value", "")
+                )
+            else:
+                secret = backend.resolve_secret(handle)
+                fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
+        except UnlockRequired:
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+        if not fills:
+            return json.dumps(
+                {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
             )
+
+        # Register before injection. PAN/CVC remain profile-global exact secrets; short,
+        # human-readable card metadata uses the existing tab/origin component registry.
+        from agent.redact import (
+            mark_vault_protected_tab, register_vault_card_component,
+            register_vault_date_component,
+        )
+        protected_tab = browser_key if meta.kind in ("payment", "protected_field") else effective_task_id
+        if meta.kind == "payment":
+            # A manager can store a formatted PAN; register its canonical digits
+            # too, so the redactor handles whatever separator the page adds/removes.
+            number = secret.get("card_number", "")
+            canonical_number = "".join(ch for ch in number if ch.isascii() and ch.isdigit())
+            if (13 <= len(canonical_number) <= 19
+                    and all((ch.isascii() and ch.isdigit()) or ch.isspace() or ch == "-" for ch in number)):
+                register_vault_redaction_value(canonical_number)
+            for field in ("card_number", "cvc"):
+                register_vault_redaction_value(secret.get(field, ""))
+            for field in ("cardholder_name", "exp_month", "exp_year", "billing_postal_code"):
+                value = secret.get(field, "")
+                register_vault_card_component(field, value, tab=protected_tab, origin=page_origin)
+                if field == "exp_month" and value.isdigit():
+                    for variant in (str(int(value)), f"{int(value):02d}"):
+                        register_vault_card_component(field, variant, tab=protected_tab, origin=page_origin)
+                if field == "exp_year" and value.isdigit() and len(value) == 4:
+                    register_vault_card_component(field, value[-2:], tab=protected_tab, origin=page_origin)
         else:
-            secret = backend.resolve_secret(handle)
-            fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
-    except UnlockRequired:
-        return json.dumps({"success": False, "error_type": "unlock_required",
-                           "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
-    if not fills:
-        return json.dumps(
-            {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
-        )
+            for value in (secret.values() if meta.kind == "protected_field" else [secret.get("password", "")]):
+                register_vault_redaction_value(value)
+        if meta.kind == "protected_field":
+            # Key protected state by the pinned browser session key, the one every reader resolves
+            # (_last_session_key): a remapped task (e.g. a hybrid sidecar) must hit the same registry
+            # entry from snapshot, eval, CDP, exec and pixel guards as the fill itself wrote to.
+            protected_tab = browser_key
+            mark_vault_protected_tab(protected_tab, page_origin)
+            # Register every component derived from the normalized protected value itself,
+            # including padded and unpadded month/day forms. This one tab/origin rule
+            # protects combined date inputs and arbitrary reads alike.
+            year, month, day = secret["value"].split("-")
+            for token, component in (("bday-year", year), ("bday-month", month), ("bday-day", day)):
+                register_vault_date_component(token, component, tab=protected_tab, origin=page_origin)
+                if token in ("bday-month", "bday-day"):
+                    register_vault_date_component(token, str(int(component)), tab=protected_tab, origin=page_origin)
 
-    # Register before injection. PAN/CVC remain profile-global exact secrets; short,
-    # human-readable card metadata uses the existing tab/origin component registry.
-    from agent.redact import (
-        mark_vault_protected_tab, register_vault_card_component,
-        register_vault_date_component,
-    )
-    protected_tab = browser_key if meta.kind in ("payment", "protected_field") else effective_task_id
-    if meta.kind == "payment":
-        # A manager can store a formatted PAN; register its canonical digits
-        # too, so the redactor handles whatever separator the page adds/removes.
-        number = secret.get("card_number", "")
-        canonical_number = "".join(ch for ch in number if ch.isascii() and ch.isdigit())
-        if (13 <= len(canonical_number) <= 19
-                and all((ch.isascii() and ch.isdigit()) or ch.isspace() or ch == "-" for ch in number)):
-            register_vault_redaction_value(canonical_number)
-        for field in ("card_number", "cvc"):
-            register_vault_redaction_value(secret.get(field, ""))
-        for field in ("cardholder_name", "exp_month", "exp_year", "billing_postal_code"):
-            value = secret.get(field, "")
-            register_vault_card_component(field, value, tab=protected_tab, origin=page_origin)
-            if field == "exp_month" and value.isdigit():
-                for variant in (str(int(value)), f"{int(value):02d}"):
-                    register_vault_card_component(field, variant, tab=protected_tab, origin=page_origin)
-            if field == "exp_year" and value.isdigit() and len(value) == 4:
-                register_vault_card_component(field, value[-2:], tab=protected_tab, origin=page_origin)
-    else:
-        for value in (secret.values() if meta.kind == "protected_field" else [secret.get("password", "")]):
-            register_vault_redaction_value(value)
-    if meta.kind == "protected_field":
-        # Key protected state by the pinned browser session key, the one every reader resolves
-        # (_last_session_key): a remapped task (e.g. a hybrid sidecar) must hit the same registry
-        # entry from snapshot, eval, CDP, exec and pixel guards as the fill itself wrote to.
-        protected_tab = browser_key
-        mark_vault_protected_tab(protected_tab, page_origin)
-        # Register every component derived from the normalized protected value itself,
-        # including padded and unpadded month/day forms. This one tab/origin rule
-        # protects combined date inputs and arbitrary reads alike.
-        year, month, day = secret["value"].split("-")
-        for token, component in (("bday-year", year), ("bday-month", month), ("bday-day", day)):
-            register_vault_date_component(token, component, tab=protected_tab, origin=page_origin)
-            if token in ("bday-month", "bday-day"):
-                register_vault_date_component(token, str(int(component)), tab=protected_tab, origin=page_origin)
+        if refusal := _browser_account_refusal(backend, effective_task_id):
+            return refusal  # re-checked at the write: the browser selection may have changed meanwhile
+        if meta.kind == "protected_field" and (refusal := _private_protected_field_refusal(effective_task_id, browser_key)):
+            return refusal  # selection may have changed during inspection
+        if alias_only and (refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin)):
+            _discard_fill_metadata()
+            return refusal
+        try:
+            fill_result = _eval_js_secret(
+                browser_key, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
+            )
+        except Exception as exc:
+            # Strip any secret material from exception text before surfacing.
+            return json.dumps(
+                {"success": False, "error": scrub_secret_from_text(str(exc), secret)}
+            )
+        if not fill_result.get("success"):
+            err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
+            out = {"success": False, "error": err}
+            if fill_result.get("error_type"):
+                out["error_type"] = fill_result["error_type"]
+            return json.dumps(out)
 
-    if refusal := _browser_account_refusal(backend, effective_task_id):
-        return refusal  # re-checked at the write: the browser selection may have changed meanwhile
-    if meta.kind == "protected_field" and (refusal := _private_protected_field_refusal(effective_task_id, browser_key)):
-        return refusal  # selection may have changed during inspection
-    if alias_only and (refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin)):
-        _discard_fill_metadata()
-        return refusal
-    try:
-        fill_result = _eval_js_secret(
-            browser_key, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
-        )
-    except Exception as exc:
-        # Strip any secret material from exception text before surfacing.
-        return json.dumps(
-            {"success": False, "error": scrub_secret_from_text(str(exc), secret)}
-        )
-    if not fill_result.get("success"):
-        err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
-        out = {"success": False, "error": err}
-        if fill_result.get("error_type"):
-            out["error_type"] = fill_result["error_type"]
+        parsed = _parse_json_result(fill_result.get("result"))
+        if isinstance(parsed, str):
+            parsed = _parse_json_result(parsed)
+        if isinstance(parsed, dict) and meta.kind == "protected_field":
+            # Internal supervisor result only; the public reply reports counts.
+            for option in parsed.get("selectedOptions", []):
+                if option.get("token") not in {f["token"] for f in fills}:
+                    continue
+                label = option.get("label")
+                selected_value = option.get("value")
+                if isinstance(label, str) and label.strip() and not label.strip().isdigit():
+                    register_vault_redaction_value(label.strip())
+                # The option's own value can differ from the date (zero-based "3" = April,
+                # or opaque "x3"), so a later read of el.value must be masked as well.
+                if isinstance(selected_value, str) and selected_value.strip():
+                    selected_value = selected_value.strip()
+                    if selected_value.isdigit():
+                        register_vault_date_component(option["token"], selected_value,
+                                                      tab=protected_tab, origin=page_origin)
+                        register_vault_date_component(option["token"], str(int(selected_value)),
+                                                      tab=protected_tab, origin=page_origin)
+                    else:
+                        register_vault_redaction_value(selected_value)
+        if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
+            return json.dumps(
+                {
+                    "success": False,
+                    "error_type": "origin_changed",
+                    "error": (
+                        "Refused: the page navigated away from the bound origin "
+                        f"({page_origin}) before the fill could run "
+                        f"(now on {parsed.get('found') or 'unknown'}). "
+                        "Nothing was written."
+                    ),
+                }
+            )
+        filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
+        if meta.kind == "protected_field" and filled and int(filled) != len(fills):
+            # A partial date is a wrong date: report failure rather than a half-filled success.
+            return json.dumps({"success": False, "error_type": "partial_fill", "filled_fields": int(filled),
+                               "error": "Could not fill every birth-date part unambiguously; check the form "
+                                        "or use browser_handoff for the user to finish it."})
+
+        out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
+               "kind": meta.kind, "origin": page_origin}
+        if meta.kind == "login":
+            out["next"] = ("Submit. If the site then asks for a verification code, "
+                           + ("call browser_vault_enter_code with this handle (a code will be generated automatically)."
+                              if meta.has_otp else
+                              "fetch the newest matching code from the intended 1Password item, mailbox, or phone and "
+                              "type it with the browser input tool; call browser_vault_enter_code only when no such source "
+                              "exists."))
+        if meta.kind != "login":
+            out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
         return json.dumps(out)
-
-    parsed = _parse_json_result(fill_result.get("result"))
-    if isinstance(parsed, str):
-        parsed = _parse_json_result(parsed)
-    if isinstance(parsed, dict) and meta.kind == "protected_field":
-        # Internal supervisor result only; the public reply reports counts.
-        for option in parsed.get("selectedOptions", []):
-            if option.get("token") not in {f["token"] for f in fills}:
-                continue
-            label = option.get("label")
-            selected_value = option.get("value")
-            if isinstance(label, str) and label.strip() and not label.strip().isdigit():
-                register_vault_redaction_value(label.strip())
-            # The option's own value can differ from the date (zero-based "3" = April,
-            # or opaque "x3"), so a later read of el.value must be masked as well.
-            if isinstance(selected_value, str) and selected_value.strip():
-                selected_value = selected_value.strip()
-                if selected_value.isdigit():
-                    register_vault_date_component(option["token"], selected_value,
-                                                  tab=protected_tab, origin=page_origin)
-                    register_vault_date_component(option["token"], str(int(selected_value)),
-                                                  tab=protected_tab, origin=page_origin)
-                else:
-                    register_vault_redaction_value(selected_value)
-    if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
-        return json.dumps(
-            {
-                "success": False,
-                "error_type": "origin_changed",
-                "error": (
-                    "Refused: the page navigated away from the bound origin "
-                    f"({page_origin}) before the fill could run "
-                    f"(now on {parsed.get('found') or 'unknown'}). "
-                    "Nothing was written."
-                ),
-            }
-        )
-    filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
-    if meta.kind == "protected_field" and filled and int(filled) != len(fills):
-        # A partial date is a wrong date: report failure rather than a half-filled success.
-        return json.dumps({"success": False, "error_type": "partial_fill", "filled_fields": int(filled),
-                           "error": "Could not fill every birth-date part unambiguously; check the form "
-                                    "or use browser_handoff for the user to finish it."})
-
-    out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
-           "kind": meta.kind, "origin": page_origin}
-    if meta.kind == "login":
-        out["next"] = ("Submit. If the site then asks for a verification code, "
-                       + ("call browser_vault_enter_code with this handle (a code will be generated automatically)."
-                          if meta.has_otp else
-                          "fetch the newest matching code from the intended 1Password item, mailbox, or phone and "
-                          "type it with the browser input tool; call browser_vault_enter_code only when no such source "
-                          "exists."))
-    if meta.kind != "login":
-        out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
-    return json.dumps(out)
 
 
 def _payment_fill_refusal(decision: str, retry_key: tuple[str, str, str]) -> str:
