@@ -137,7 +137,7 @@ def build_models_payload(
 
     # A local proxy serving a model also in an aggregator's catalog would show under both, and picking
     # the aggregator row silently breaks the call — aggregators only list models no specific provider has.
-    _strip_aggregator_overlaps(rows)
+    _strip_aggregator_overlaps(rows, allow_network=not non_blocking_catalogs)
 
     if include_unconfigured:
         rows = list(rows) + _without_slug(_append_unconfigured_rows(rows, ctx), "moa")
@@ -170,7 +170,7 @@ def build_models_payload(
     return {"providers": rows, "model": ctx.current_model, "provider": ctx.current_provider}
 
 
-def _strip_aggregator_overlaps(rows: list[dict]) -> None:
+def _strip_aggregator_overlaps(rows: list[dict], *, allow_network: bool = True) -> None:
     """Drop models from TRUE routing aggregators (OpenRouter, custom:* proxies) that a user-defined
     provider also serves. The is_user_defined guard matters: is_routing_aggregator() is True for every
     custom:* slug, so without it the dedup would empty a user's own custom row. Flat-namespace
@@ -182,7 +182,7 @@ def _strip_aggregator_overlaps(rows: list[dict]) -> None:
 
     builtin_aggregators = {
         _slug(row) for row in rows
-        if not row.get("is_user_defined") and is_routing_aggregator(_slug(row))
+        if not row.get("is_user_defined") and is_routing_aggregator(_slug(row), allow_network=allow_network)
     }
 
     def _duplicates_builtin_aggregator(row: dict) -> bool:
@@ -210,7 +210,7 @@ def _strip_aggregator_overlaps(rows: list[dict]) -> None:
     if not user_models:
         return
     for row in rows:
-        if row.get("is_user_defined") or not is_routing_aggregator(row.get("slug", "")):
+        if row.get("is_user_defined") or not is_routing_aggregator(row.get("slug", ""), allow_network=allow_network):
             continue
         # Only strip overlaps from TRUE routing aggregators (OpenRouter, custom:* proxies). Flat-namespace
         # resellers (opencode-go / opencode-zen) serve every listed model as a first-party model, so their

@@ -16,7 +16,7 @@ logger = logging.getLogger("acp_adapter.server")
 ACP_MAX_MODELS_PER_PROVIDER = 200
 
 
-def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
+def _named_custom_provider_catalogs(*, cache_only: bool = False) -> list[tuple[str, str, list[tuple[str, str]]]]:
     """``(slug, label, [(model_id, description), ...])`` for named endpoints (v12 ``providers:``
     and legacy ``custom_providers:``), which canonical provider enumeration never lists.
 
@@ -27,7 +27,7 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
     try:
         from hermes_cli.config import (get_compatible_custom_providers, is_provider_enabled, load_config)
         from hermes_cli.model_switch import _declared_model_ids, _entry_models_discovered, _models_config_is_allowlist
-        from hermes_cli.model_switch_providers import _NativePickerModelList, _fetch_picker_live_models
+        from hermes_cli.model_switch_providers import _NativePickerModelList, _discover_endpoint_models
         from hermes_cli.model_switch_providers import _discover_flag
         from hermes_cli.models_local import should_use_ollama_native_catalog
         from hermes_cli.providers import custom_provider_slug
@@ -76,10 +76,11 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
         live = None
         if _discover_flag(entry) and (api_key or is_native_ollama):
             try:
-                live = _fetch_picker_live_models(
+                live, _empty = _discover_endpoint_models(
                     api_key, base_url, provider_key if is_native_ollama and is_ollama_key else "custom",
                     _models_config_is_allowlist(models_cfg, _entry_models_discovered(entry)),
-                    headers=native_headers, timeout=1.5, api_mode=entry.get("api_mode"),
+                    headers=native_headers, api_mode=entry.get("api_mode"),
+                    probe_live=not cache_only, discovery_allowed=True, fast_custom_probe=True,
                 )
             except Exception:
                 live = None
@@ -239,19 +240,23 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
     """Picker state from the shared inventory + named endpoints; ``None`` when nothing is listable
     (caller falls back to a single current-model row). Raises on inventory failure."""
     from hermes_cli.inventory import build_models_payload, load_picker_context
+    from hermes_cli.model_switch_providers import prewarm_picker_cache_async
     from hermes_cli.models import normalize_provider, provider_label
 
+    # Session setup must not wait for optional catalogs. Keep live discovery in
+    # the shared background warmer so subsequent snapshots can include new models.
+    prewarm_picker_cache_async()
     normalized_provider = normalize_provider(provider)
     context = load_picker_context().with_overrides(
         current_provider=normalized_provider, current_model=model, current_base_url=base_url,
     )
     payload = build_models_payload(
         context, explicit_only=True, include_unconfigured=False, picker_hints=False,
-        canonical_order=True, pricing=False, capabilities=False, refresh=False,
+        canonical_order=True, pricing=False, capabilities=False, refresh=False, non_blocking_catalogs=True,
         probe_custom_providers=False, probe_current_custom_provider=False, max_models=ACP_MAX_MODELS_PER_PROVIDER,
     )
 
-    named_catalogs = _named_custom_provider_catalogs()
+    named_catalogs = _named_custom_provider_catalogs(cache_only=True)
     named_slugs = {str(slug).strip().lower() for slug, _label, _models in named_catalogs}
     current_choice_provider = str(provider or "").strip().lower()
     current_base = base_url.strip().rstrip("/").lower()
