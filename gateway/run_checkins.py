@@ -122,7 +122,7 @@ async def poll_checkins(runner):
                 descriptor = [manager.root, state.due_at]
                 # The logical due identity is fenced by start(). A refused or pre-execution
                 # cancelled admission must not tombstone it forever in the durable FIFO.
-                identity = json.dumps(["supervisor-checkin", root, state.due_at, uuid.uuid4().hex],
+                identity = json.dumps(["supervisor-checkin", manager.root, state.due_at, uuid.uuid4().hex],
                                       separators=(",", ":"))
                 event = MessageEvent(text="[Supervisor check-in]", source=source, internal=True,
                                      message_id=identity, metadata={"gateway_session_key": route,
