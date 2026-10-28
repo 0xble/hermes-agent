@@ -272,6 +272,27 @@ class, and omits upstream opt-out tests the fork already removed. A logging
 `afplay` shim on `PATH` recorded one call on the base and none with the patch.
 Retire when a released upstream revision carries equivalent guard coverage.
 
+## Desktop handoff fixture teardown
+
+The `fork-ci-reliability` identity covers the sidecar-publication timeout cell in
+`tests/scripts/desktop_update/test_handoff_delegate_publication.py`. After the
+real 10-second A7 deadline refused delegate publication, the fixture released A7
+then raced the handoff's natural exit with `os.killpg`. The live-system guard
+correctly refuses a group whose leader has exited and whose remaining helpers
+can no longer prove test ancestry. Let the real handoff finish and reap its
+custodian after releasing A7, using the existing 10-second teardown bound.
+Require exit code 3 and marker removal in addition to retaining the parked-update
+and no-delegate assertions. A Linux scheduling probe that lets the handoff exit
+while the guard checks ancestry reproduces the exact guard refusal on the old
+fixture and passes on this cleanup. The guard and product are unchanged. Retire
+when upstream uses cooperative teardown for this cell.
+
+The Codex single-query approval cell now also requires a successful CLI exit and
+prints its captured result before inspecting approval traffic. Empty traffic can
+mean `session.create` failed before the fake app-server started, not that an
+approval reply was lost. This is diagnostic strengthening, not a fix for cold
+catalog discovery on the gateway's schema-generation path.
+
 ## Linked worktree test venv
 
 The `fork-ci-reliability` identity also covers the canonical runner's venv
