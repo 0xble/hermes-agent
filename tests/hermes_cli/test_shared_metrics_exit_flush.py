@@ -64,6 +64,7 @@ def _zero_plugin_runtimes(monkeypatch) -> None:
     relay_runtime._reset_for_tests()
     manager = PluginManager()
     manager._discovered = True  # a runtime with zero plugins (#64178)
+    manager._discovery_complete = True
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
 
 

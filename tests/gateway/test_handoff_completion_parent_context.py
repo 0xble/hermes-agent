@@ -155,7 +155,7 @@ def test_handed_off_completion_turn_runs_as_the_parent(tmp_path):
     thread.start()
     url = f'http://127.0.0.1:{peer.server_port}/v1'
     config = {
-        'gateway': {'multiplex_profiles': True},
+        'gateway': {'multiplex_profiles': True, 'completion_notification_batch_window_seconds': 0},
         'model': {'provider': 'openrouter', 'default': 'openai/gpt-5', 'base_url': url,
                   'api_key': 'loopback-only', 'api_mode': 'chat_completions'},
         'auxiliary': {'title_generation': {'enabled': False}},

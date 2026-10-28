@@ -29,7 +29,8 @@ def _launch(api, admitted, run_id='run_test'):
     api._run_streams[run_id] = queue
     api._run_statuses[run_id] = {}
     launch = _RunLaunch(api, run_id, queue, admitted[1].session_id, None, False, 'hello', [], False,
-                        agent_kwargs={}, request_profile=None, admission=admitted)
+                        agent_kwargs={}, request_profile=None, admission=admitted,
+                        browser_control_principal=None, browser_control_transport_family=None)
     return launch, queue
 
 

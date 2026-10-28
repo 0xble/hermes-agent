@@ -168,13 +168,14 @@ def test_default_active_still_migrates_named_siblings(monkeypatch, tmp_path):
 
 
 def test_sibling_step_notices_reach_the_update_output(monkeypatch, tmp_path, capsys):
-    """A sibling migrates quietly; what its steps changed (v52: `backend: off` gone, and how to turn
-    browsing off now) is printed under its profile line, as for the active profile. New default keys
+    """A sibling migrates quietly; a v52 launcher-setting notice is printed under
+    its profile line, while the maintained native backend survives. New default keys
     are not changes and stay out."""
     active = _write_profile(tmp_path / "profiles", "active", _latest_version())
     work = tmp_path / "profiles" / "work"
     work.mkdir(parents=True)
     (work / "config.yaml").write_text("_config_version: 51\nbrowser:\n  backend: off\n", encoding="utf-8")
+    (work / ".env").write_text("AGENT_BROWSER_PROFILE=relative-profile\n", encoding="utf-8")
     _setup(monkeypatch, tmp_path, active)
     monkeypatch.setenv("HERMES_HOME", str(active))
     monkeypatch.setattr(update_cmd_config, "_restore_snapshot_safety_nets", lambda _sid: None)
@@ -185,8 +186,10 @@ def test_sibling_step_notices_reach_the_update_output(monkeypatch, tmp_path, cap
 
     out = capsys.readouterr().out
     profile_line = out.index("Profile 'work': config format updated (v51")
-    notice = out.index("removed browser.backend: off")
+    notice = out.index("pinned browser.user_data_dir")
     assert profile_line < notice
-    assert "`browser` toolset in `hermes tools`" in out[notice:]
+    assert "AGENT_BROWSER_PROFILE=relative-profile" in out[notice:]
     assert "display.new_option" not in out[profile_line:]
-    assert "backend" not in (yaml.safe_load((work / "config.yaml").read_text()).get("browser") or {})
+    browser = yaml.safe_load((work / "config.yaml").read_text())["browser"]
+    assert browser["backend"] in (False, "off")
+    assert Path(browser["user_data_dir"]).is_absolute()

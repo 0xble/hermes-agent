@@ -26,6 +26,7 @@ def _forced_install_fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_cli.gateway_service_owner, "refuse_temp_home_service_write", lambda *_a: False)
     monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
     monkeypatch.setattr(gateway_cli, "_launchd_reload_budget", lambda: 45.0)
+    monkeypatch.setattr("hermes_cli.gateway_launchd._launchd_old_gateway_exit_budget", lambda: 45.0)
     monkeypatch.setattr(
         gateway_cli, "_wait_for_pid_exit",
         lambda pid, timeout: events.append(("wait", pid, timeout)) or True,

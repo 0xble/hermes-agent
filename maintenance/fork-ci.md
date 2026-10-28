@@ -20,6 +20,15 @@ Hermes application checkout. A selected lane (`check --lane`) is partial evidenc
 profile uses changed-file classification, and the complete profile never substitutes a
 smoke manifest for complete discovery.
 
+Upstream-sync fixtures retain the fork's admission, detached-pruner, native
+browser, resident-completion and degraded-platform contracts. Use a real base
+interpreter and valid `pyvenv.cfg` when a release fixture executes Python,
+instead of linking a fake environment back through another virtualenv. A
+parked bot keeps the gateway serving local clients, while ownership conflicts
+still terminate startup. Assertions must verify those outcomes, not merely
+relax an exit-code expectation. Regenerate prompt-surface fixtures through
+`scripts/ci/prompt_surface.py render` after changing tool catalog descriptions.
+
 Shared update E2E signal injection must never enumerate or signal another file's
 processes when CI lacks usable bubblewrap. The existing fixture HOME boundary
 scopes the command agent's process table and each signal request. Fallback close

@@ -165,7 +165,7 @@ def test_bootstrap_import_exports_scratch_to_process_and_children(tmp_path):
     expected = str(tmp_path / "cache" / "scratch")
     assert out.stdout.split() == [expected, expected]
 
-def test_user_tmpdir_does_not_disable_scratch_pruning(tmp_path, monkeypatch):
+def test_user_tmpdir_does_not_disable_scratch_pruning(tmp_path, monkeypatch, scratch_prune_spawns):
     """macOS exports TMPDIR, so maintenance must still run without overriding it."""
     import hermes_constants
 
@@ -182,6 +182,9 @@ def test_user_tmpdir_does_not_disable_scratch_pruning(tmp_path, monkeypatch):
 
     assert apply_scratch_tmp_env(env) is False
     assert env["TMPDIR"] == "/var/folders/system-temp"
+    assert scratch_prune_spawns == [scratch]
+    # The autouse fixture captures child launches. Exercise the same pass synchronously here.
+    assert hermes_constants.prune_scratch_dir(scratch) == 1
     assert not idle.exists()
 
 

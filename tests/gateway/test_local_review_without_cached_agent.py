@@ -39,7 +39,7 @@ def test_local_review_reviews_the_stored_conversation_once_the_cached_agent_is_g
     thread.start()
     url = f'http://127.0.0.1:{peer.server_port}/v1'
     config = {
-        'gateway': {'multiplex_profiles': False},
+        'gateway': {'multiplex_profiles': False, 'completion_notification_batch_window_seconds': 0},
         'model': {'provider': 'openrouter', 'default': 'openai/gpt-5', 'base_url': url,
                   'api_key': 'loopback-only', 'api_mode': 'chat_completions'},
         'auxiliary': {'title_generation': {'enabled': False}},

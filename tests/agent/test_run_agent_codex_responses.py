@@ -2656,6 +2656,8 @@ def test_codex_text_only_max_output_incomplete_keeps_codex_continuation(monkeypa
     never takes the length path's nudge (no double continuation, #91770)."""
     agent = _build_relay_agent(monkeypatch)
     responses = [_codex_max_output_incomplete_response("Partial"), _codex_message_response("rest.")]
+    for response in responses:
+        response.usage = SimpleNamespace(input_tokens=100, output_tokens=10, total_tokens=110)
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
 
     result = agent.run_conversation("write")

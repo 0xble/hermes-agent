@@ -157,6 +157,12 @@ def gateway_tts_turn(monkeypatch, tmp_path):
     from gateway.run_turn_runner import TurnRunner
     from gateway.stream_consumer import StreamConsumerConfig
     from gateway.turn_context import TurnContext
+    from hermes_cli import plugins
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    manager._discovered = manager._discovery_complete = True
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
 
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))

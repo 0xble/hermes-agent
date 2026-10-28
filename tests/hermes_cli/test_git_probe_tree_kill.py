@@ -18,6 +18,7 @@ import textwrap
 import time
 
 import pytest
+import psutil
 
 from hermes_cli import _subprocess_compat
 from hermes_cli._subprocess_compat import bounded_git_probe, kill_process_tree
@@ -46,10 +47,10 @@ def _write_forking_script(tmp_path, marker_name="child.pid"):
 
 def _pid_alive(pid: int) -> bool:
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        process = psutil.Process(pid)
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
         return False
-    return True
 
 
 def _wait_marker(marker, timeout=5.0) -> int:

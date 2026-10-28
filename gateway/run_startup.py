@@ -1895,9 +1895,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 )
             return False
         if startup_nonretryable_errors and not startup_retryable_errors:
+            reason = "; ".join(startup_nonretryable_errors)
             if self._startup_ownership_conflict:
                 # Another gateway owns a token/profile: staying up would be a second, deaf owner.
-                reason = "; ".join(startup_nonretryable_errors)
                 logger.error("Gateway hit a non-retryable startup conflict: %s", reason)
                 self._startup_fail_fatal_config(reason)
                 return True

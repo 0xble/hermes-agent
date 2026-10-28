@@ -2938,6 +2938,13 @@ see the [Browser feature page](./features/browser.md) for how the browser source
 
 ```yaml
 browser:
+  backend: ""                    # Native auto routing; browser-use, camofox or off may be selected explicitly
+  snapshot_threshold: 15000       # Native snapshot character budget
+  record_sessions: false         # Native session recording toggle
+  restrict_evaluate: false       # Native page-evaluation restriction toggle
+  extension_control:
+    enabled: false               # Opt in to the authenticated browser extension controller
+    developer_mode: false        # Permit privileged controller evaluation/CDP capabilities
   inactivity_timeout: 120        # Seconds before an idle browser is closed
   command_timeout: 30            # Chromium launch timeout floor (seconds)
   headed: false                  # true = visible Chromium window (local); keeps the browser open between turns
@@ -2971,7 +2978,7 @@ Docker image) → a system `chromium` / `chromium-browser` on `PATH` (Termux and
 platforms without a packaged build). With none, the browser tool reports a hint
 instead of failing silently.
 
-**Turning browsing off.** There is no browser config switch: disable the `browser`
+**Turning browsing off.** Set `browser.backend: off`, or disable the `browser`
 toolset with `hermes tools` (or `hermes tools disable browser [--platform NAME]`).
 
 **Dialog policies:**
@@ -2982,15 +2989,14 @@ toolset with `hermes tools` (or `hermes tools disable browser [--platform NAME]`
 
 See the [browser feature page](./features/browser.md#browser_dialog) for the full dialog workflow.
 
-**Removed keys (migrated automatically).** `browser.backend` is gone — `browser_exec` is the
-only browser path. An old `backend: off` (quoted or not) is removed with a one-time notice to
-disable the `browser` toolset instead, shown by `hermes update` or, when Hermes migrated the config as it
-started, as a warning at the start of the first session. Any other value is removed with a note naming it
-and what replaced it (`camofox`: the Camofox plugin, `local`: the packaged Chromium browser_exec launches,
-a cloud name: `browser.cloud_provider`).
-`snapshot_threshold`, `record_sessions`, `allow_unsafe_evaluate` and `restrict_evaluate`
-belonged to the removed built-in browser tools and no longer have an effect. The
-`browser.camofox.*` keys are read by the Camofox plugin (`hermes plugins install camofox`), not by core.
+**Native browser settings.** This fork retains built-in browser and Camofox tools,
+including `browser.backend`, `browser.snapshot_threshold`, `browser.record_sessions`,
+`browser.allow_unsafe_evaluate`, `browser.restrict_evaluate`,
+`browser.extension_control.enabled` and `browser.camofox.*`. These settings are
+preserved during launcher-setting migration. Native and Browser Use modes remain
+separate browser owners, and installing a second Camofox provider is unnecessary.
+
+**Launcher settings (migrated automatically).**
 The old `AGENT_BROWSER_*` environment variables are no longer read; on update their values
 are copied from the profile's `.env` into the matching keys when those keys are unset
 (`AGENT_BROWSER_EXECUTABLE_PATH` → `executable_path`, `AGENT_BROWSER_PROFILE` → `user_data_dir`,
