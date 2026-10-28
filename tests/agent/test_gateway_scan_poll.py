@@ -6,6 +6,8 @@ expires, or immediately after the owning cache is cleared. Pytest itself keeps t
 interval at zero so existing freshness tests stay immediate.
 """
 
+import pytest
+
 from utils import filesystem_poll_seconds
 
 
@@ -19,6 +21,22 @@ def test_poll_interval_is_the_default_outside_pytest(monkeypatch):
     monkeypatch.setenv("HERMES_HOME", "/Users/brianle/.hermes")
     assert filesystem_poll_seconds(5.0) == 5.0
     assert filesystem_poll_seconds(0.0) == 0.0
+
+
+@pytest.mark.parametrize("override, expected", [
+    ("0.0", 0.0), ("00", 0.0), ("-1", 0.0), ("OFF", 0.0), ("false", 0.0),
+    ("1", 1.0), ("2.5", 2.5), ("invalid", 5.0), ("nan", 5.0), ("inf", 5.0),
+])
+def test_poll_interval_override_is_finite_seconds(monkeypatch, override, expected):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("HERMES_HOME", "/operator-home")
+    monkeypatch.setenv("HERMES_FS_POLL", override)
+    assert filesystem_poll_seconds(5.0) == expected
+
+
+def test_positive_override_does_not_enable_polling_under_pytest(monkeypatch):
+    monkeypatch.setenv("HERMES_FS_POLL", "1")
+    assert filesystem_poll_seconds(5.0) == 0.0
 
 
 def test_skills_manifest_walks_once_per_poll_then_sees_a_new_file(tmp_path, monkeypatch):

@@ -3,6 +3,7 @@
 import errno
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -42,8 +43,9 @@ def filesystem_poll_seconds(default: float) -> float:
 
     A long-lived gateway must not walk the skills tree on every prompt build.
     The suite keeps a zero interval, including a gateway spawned into a pytest
-    home, so a write is visible on the next read. ``HERMES_FS_POLL=0`` disables
-    the poll explicitly.
+    home, so a write is visible on the next read. ``HERMES_FS_POLL`` overrides
+    the interval in seconds, with nonpositive values, ``off``, or ``false``
+    disabling it. Invalid or nonfinite values retain the caller's default.
     """
     if default <= 0:
         return 0.0
@@ -55,7 +57,11 @@ def filesystem_poll_seconds(default: float) -> float:
     home = os.environ.get("HERMES_HOME", "")
     if "pytest-" in home or "hermes-pytest" in home:
         return 0.0
-    return default
+    try:
+        interval = float(forced)
+    except ValueError:
+        return default
+    return max(0.0, interval) if math.isfinite(interval) else default
 
 
 def file_signature(st: os.stat_result) -> tuple[int, int, int, int]:

@@ -12,6 +12,8 @@ next check after that interval. `clear_skills_system_prompt_cache` and
 `config.yaml` stays signature-checked on every load: a short memo hid an edit
 from a running gateway, including a fresh session and the dashboard.
 Tests and a gateway whose home is a pytest directory keep a zero interval.
+`HERMES_FS_POLL` can set the interval in seconds. Nonpositive values, `off`, and
+`false` disable the memo. Invalid and nonfinite values keep the default.
 Refused watch events keep the bounded retry in `gateway/run_notifications.py`;
 this patch does not drop a completion.
 
