@@ -182,6 +182,16 @@ def maybe_require_edit_approval(tool_name: str, arguments: dict[str, Any]) -> st
     requester = _EDIT_APPROVAL_REQUESTER.get()
     if requester is None:
         return None
+    if tool_name in {"write_file", "patch"}:
+        # ACP proposals read controller files and carry no filesystem identity.
+        # Refuse before preparing a diff rather than open a selected-node path here.
+        from tools.nodes import NodeError, resolve_node
+        try:
+            node = resolve_node(arguments.get("node"))
+        except NodeError as exc:
+            return _denied(f"Edit approval denied: {exc}")
+        if node is not None:
+            return _denied(f"Edit approval denied on node {node.name}: named-node ACP edit proposals are unsupported")
     try:
         proposal = build_edit_proposal(tool_name, arguments)
     except Exception as exc:

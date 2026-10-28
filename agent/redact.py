@@ -1226,15 +1226,15 @@ def _is_under_hermes_home(path: str) -> bool:
     Compare against the resolved homes instead. Only reached for a ``config.yaml`` basename,
     so the resolve cost stays off the per-token command scan.
     """
-    from agent.file_safety import _hermes_dirs
+    from agent.file_safety import _hermes_dirs, _realpath, _named_remote
 
     try:
-        target = os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+        target = os.path.normcase(_realpath(path if _named_remote() else os.path.expanduser(path)))
     except (OSError, ValueError):
         return False
     for home in _hermes_dirs():
         try:
-            base = os.path.normcase(os.path.realpath(str(home)))
+            base = os.path.normcase(_realpath(str(home)))
         except (OSError, ValueError):
             continue
         if target == base or target.startswith(base + os.sep):
