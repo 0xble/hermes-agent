@@ -23,6 +23,14 @@ pre-compaction input checkpoint or queue-recovery machinery. In particular, it
 does not change the current context-overflow transcript-persistence policy, and
 does not promise that an input rejected before durable admission is recoverable.
 
+The peer-DM Bot Chat overflow probes use the same retained-session contract. Both
+serial and already-queued DMs must return typed overflow failures without closing
+or replacing the Bot Chat, preserve the oversized input, and settle every FIFO
+admission. Once the loopback provider accepts the context again, the next DM is
+answered on that same transcript and stored once. Failed DM retries are counted
+against their distinct durable admissions, not mistaken for duplicate writes.
+These real-daemon probes run on POSIX hosts.
+
 Load this unit when changing hard-window recovery, preflight input admission,
 archive-backed request projection or the gateway exhaustion boundary.
 

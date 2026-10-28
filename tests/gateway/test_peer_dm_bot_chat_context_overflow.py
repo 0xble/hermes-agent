@@ -1,12 +1,10 @@
-"""A peer DM that overflows the LOCAL Bot Chat's context auto-resets it, and the follow-up is answered.
+"""Peer DM overflow retains the LOCAL Bot Chat and settles its FIFO without an implicit reset.
 
-``hermes peer dm`` lands in the peer's Bot Chat, a ``source='local'`` session the authority FIFO owns
-(not an API conversation, so the API_SERVER exemption from the compression-exhaustion reset never
-applies). The reset ran INSIDE the overflowing turn, while that turn's own admission was still
-``started``: ``reset_local_target`` refused it (``session_busy``), the exception became a failed turn
-that persisted the DM a second time, and the Bot Chat kept its oversized transcript, so every later
-DM overflowed too (HTTP 502 forever). Real daemon (``python -m gateway.run``), real api_server door,
-real SessionDB and authority; only the model is a loopback window-capped stub.
+``hermes peer dm`` lands in the peer's Bot Chat, a ``source='local'`` session the authority FIFO owns.
+Compression exhaustion must retain that identity and its transcript, including when another DM
+is queued behind the overflowing turn. Until compression succeeds or the caller explicitly changes
+context, follow-ups can overflow too, but must answer with a typed failure rather than wedge the
+FIFO. Real daemon, API door, SessionDB and authority, with a loopback window-capped model.
 """
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,7 +35,7 @@ class WindowCappedModel(BaseHTTPRequestHandler):
     def do_POST(self):
         raw = self.rfile.read(int(self.headers['Content-Length']))
         body = json.loads(raw)
-        if len(raw) > CAP:
+        if len(raw) > getattr(self.server, 'cap', CAP):
             hold = getattr(self.server, 'hold', None)
             if hold is not None and not hold.is_set():  # the race test: park the turn mid-flight
                 self.server.held.set()
@@ -49,6 +47,11 @@ class WindowCappedModel(BaseHTTPRequestHandler):
                                             'code': 'context_length_exceeded'}}).encode()
             return self._send(400, payload, 'application/json')
         text = next((m.get('content', '') for m in reversed(body.get('messages', [])) if m['role'] == 'user'), '')
+        # Alternation repair can combine unanswered user rows, so acknowledge the newest
+        # probe, not the beginning of the retained oversized request.
+        self.server.accepted_user = str(text)
+        if 'recovered DM MKRECOVER' in str(text):
+            text = 'recovered DM MKRECOVER'
         message = {'role': 'assistant', 'content': 'ACK ' + str(text)[:40]}
         payload = json.dumps({'id': 'local', 'model': body.get('model'), 'choices': [
             {'index': 0, 'message': message, 'finish_reason': 'stop'}],
@@ -129,6 +132,9 @@ def overflow_run(tmp_path_factory):
             # ``hermes peer dm`` resolves the Bot Chat by exact title before every DM (``_find_bot_chat``).
             found = _get(api_port, '/api/sessions?limit=200&title=Bot+Chat&include_hidden=1')['data']
             follow = _post(api_port, f'/api/sessions/{sid}/chat', {'message': 'short follow-up MKFOLLOW'})
+            # The provider can accept the retained history again, without the caller starting /new.
+            model.cap = len(big) * 10
+            recovered = _post(api_port, f'/api/sessions/{sid}/chat', {'message': 'recovered DM MKRECOVER'})
     finally:
         model.shutdown()
     log = (home / 'restart.log').read_text(errors='replace')
@@ -138,7 +144,7 @@ def overflow_run(tmp_path_factory):
     with closing(sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True)) as db:
         rows = db.execute("SELECT session_id, role, substr(coalesce(content,''),1,24) FROM messages ORDER BY id").fetchall()
         bot_chat = db.execute('SELECT end_reason FROM sessions WHERE id=?', (sid,)).fetchone()
-    return SimpleNamespace(sid=sid, found=[row['id'] for row in found], first=first, follow=follow, log=log, rows=rows, rejected=model.rejected,
+    return SimpleNamespace(sid=sid, found=[row['id'] for row in found], first=first, follow=follow, recovered=recovered, recovery_input=model.accepted_user, log=log, rows=rows, rejected=model.rejected,
                            bot_chat_end=bot_chat[0])
 
 
@@ -146,34 +152,38 @@ def _stored(run, marker):
     return sum(1 for _, role, text in run.rows if role == 'user' and text.startswith(marker))
 
 
-@pytest.mark.platforms('linux')
-def test_peer_dm_overflow_resets_the_local_bot_chat_and_answers_the_follow_up(overflow_run):
+@pytest.mark.platforms('posix')
+def test_peer_dm_overflow_retains_the_bot_chat_and_recovers_without_reset(overflow_run):
     run = overflow_run
     assert run.rejected >= 1, 'the first DM never overflowed'
     assert 'session_busy' not in run.log, [line for line in run.log.splitlines() if 'session_busy' in line][:5]
-    # The overflow is answered with its typed reason, and the Bot Chat was reset after that turn settled.
+    # Exhaustion is a typed failure, not an implicit /new, even for a LOCAL Bot Chat.
     assert run.first[0] == 502 and run.first[1]['error']['code'] == 'context_overflow', run.first
-    assert run.bot_chat_end == 'session_reset', run.rows
-    # The client's title lookup still finds the reset Bot Chat (no title-collision create).
+    assert run.bot_chat_end is None, run.rows
+    assert {s for s, _, _ in run.rows} == {run.sid}, run.rows
+    assert _stored(run, 'MKBIG ') >= 1, run.rows
+    # The client's title lookup still finds the original Bot Chat.
     assert run.found == [run.sid], run.found
-    # The follow-up runs on the fresh transcript, is answered, and is stored once.
-    assert run.follow[0] == 200, (run.follow, run.rows)
-    assert run.follow[1]['message']['content'].startswith('ACK short follow-up'), run.follow
+    # The retained context may overflow again, but the FIFO answers rather than wedging.
+    assert run.follow[0] == 502 and run.follow[1]['error']['code'] == 'context_overflow', run.follow
     assert _stored(run, 'short follow-up') == 1, run.rows
+    assert run.recovered[0] == 200, run.recovered
+    assert run.recovered[1]['message']['content'].startswith('ACK recovered DM'), run.recovered
+    assert 'MKBIG ' in run.recovery_input and 'recovered DM MKRECOVER' in run.recovery_input
+    assert _stored(run, 'recovered DM') == 1, run.rows
 
 
 def _admissions(home):
     with closing(sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True)) as db:
-        return db.execute('SELECT request_id, status FROM session_admissions ORDER BY rowid').fetchall()
+        return db.execute('SELECT request_id, status, payload_json FROM session_admissions ORDER BY rowid').fetchall()
 
 
 @pytest.fixture(scope='module')
 def racing_run(tmp_path_factory):
     """A second DM lands in the Bot Chat while the oversized one's turn still runs, then a third DM.
 
-    The deferred reset rotates the route after the oversized turn settles. The racing DM is already
-    queued (a ``local_automation_v1`` row naming the pre-reset target): it must run on the fresh
-    session, not pause the Bot Chat's FIFO (``admission_conflict``) forever."""
+    The racing DM is already queued as a ``local_automation_v1`` row naming the original target.
+    It must retain that owner and settle, not pause the Bot Chat's FIFO forever."""
     tmp_path = tmp_path_factory.mktemp('lc23race')
     root = Path(__file__).resolve().parents[2]
     home, user = tmp_path / 'state', tmp_path / 'user'
@@ -222,6 +232,8 @@ def racing_run(tmp_path_factory):
             for thread in threads:
                 thread.join()
             send('third', 'third DM MKTHIRD')
+            model.cap = len(big) * 10
+            send('recovered', 'recovered DM MKRECOVER')
             admissions = _admissions(home)
     finally:
         model.shutdown()
@@ -232,26 +244,29 @@ def racing_run(tmp_path_factory):
     with closing(sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True)) as db:
         rows = db.execute("SELECT session_id, role, substr(coalesce(content,''),1,24) FROM messages ORDER BY id").fetchall()
         bot_chat = db.execute('SELECT end_reason FROM sessions WHERE id=?', (sid,)).fetchone()
-    return SimpleNamespace(sid=sid, results=results, admissions=admissions, log=log, rows=rows,
+    return SimpleNamespace(sid=sid, results=results, admissions=admissions, log=log, rows=rows, recovery_input=model.accepted_user,
                            rejected=model.rejected, bot_chat_end=bot_chat[0])
 
 
-@pytest.mark.platforms('linux')
-def test_a_dm_queued_behind_the_overflowing_turn_runs_on_the_fresh_bot_chat(racing_run):
+@pytest.mark.platforms('posix')
+def test_a_dm_queued_behind_overflow_settles_on_the_original_bot_chat(racing_run):
     run = racing_run
     assert run.rejected >= 1, 'the first DM never overflowed'
     assert run.results['big'][0] == 502, run.results['big']
-    assert run.bot_chat_end == 'session_reset', run.rows
+    assert run.bot_chat_end is None, run.rows
+    assert {s for s, _, _ in run.rows} == {run.sid}, run.rows
+    assert _stored(run, 'MKBIG ') >= 1, run.rows
     assert 'admission_conflict' not in run.log, [l for l in run.log.splitlines() if 'admission_conflict' in l][:5]
-    # The racing DM and the later one are both answered, on the fresh session, each stored there once.
-    # (A racing attempt that ran on the old transcript before the reset was owed failed there and kept
-    # its user row, like any failed turn; that row is the old conversation's, not a re-run.)
-    fresh = {s for s, role, text in run.rows if role == 'user' and text.startswith('third DM')}
-    assert len(fresh) == 1 and run.sid not in fresh, run.rows
+    # Both accepted followers answer with typed failures against the retained oversized context.
     for name, marker in (('race', 'racing short DM'), ('third', 'third DM')):
         status, body = run.results[name]
-        assert status == 200, (name, run.results[name], run.admissions)
-        assert body['message']['content'].startswith('ACK ' + marker), (name, body)
-        on_fresh = [1 for s, role, text in run.rows if role == 'user' and text.startswith(marker) and s in fresh]
-        assert len(on_fresh) == 1, (name, run.rows)
-    assert not [row for row in run.admissions if row[1] == 'queued'], run.admissions
+        assert status == 502 and body['error']['code'] == 'context_overflow', (name, body)
+        # The Bot Chat owner can retry a failed DM. Each admitted attempt must be stored
+        # exactly once on this same transcript, including that existing derived retry.
+        attempts = sum(marker in payload for _, _, payload in run.admissions)
+        assert attempts >= 1 and _stored(run, marker) == attempts, (name, run.rows, run.admissions)
+    status, body = run.results['recovered']
+    assert status == 200 and body['message']['content'].startswith('ACK recovered DM'), body
+    assert 'MKBIG ' in run.recovery_input and 'recovered DM MKRECOVER' in run.recovery_input
+    assert _stored(run, 'recovered DM') == 1, run.rows
+    assert all(status == 'terminal' for _, status, _ in run.admissions), run.admissions
