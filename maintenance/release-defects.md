@@ -882,7 +882,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - The public replace seam now forwards to the extracted bootstrap implementation, restoring
   the durable ownership-refusal stamp while retaining process-slot PID isolation. Its scoped-lock
   release uses the canonical source module, not the removed status export.
+  The refusal is a synchronous persistence checkpoint: it must not return to the CLI hard exit
+  while a slow disk write remains queued. A bounded wait can return false just before
+  `os._exit` kills the daemon writer, leaving the stale `running` record intact.
   Guard: the complete replace-ownership suite, including stamp durability and no-signal refusal.
+  The subprocess durability regression holds the writer until its caller waits and advances the
+  wait clock past the former deadline, then checks the real stamp after hard exit. It neither
+  races equal-duration sleeps nor weakens the persisted-state assertions.
 - Fork patch identity: `v0225-merge-integration`.
 - Integrating fork main through #818 keeps atomic fanout prepare/stamp/admission alongside
   overflow resume notices and their physical-drain barrier. Routing replacement performs its
