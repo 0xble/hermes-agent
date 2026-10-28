@@ -1,5 +1,7 @@
 """Focused stdlib tests of the contributor-gate boundaries (no app dependencies)."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
+from threading import Barrier
 import importlib.util
 import os
 import re
@@ -894,6 +896,30 @@ with ci.checkout_lock():
                     'HERMES_CI_CACHE_DIR': str(checkout / 'inside')}, clear=False):
                 with self.assertRaisesRegex(RuntimeError, 'outside the checkout'):
                     ci.environment(home)
+            self.assertFalse((checkout / 'inside').exists())
+
+    def test_clonefile_probes_are_independent_under_concurrent_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            source = cache / 'source'
+            dest = cache / 'copy'
+            source.write_bytes(b'x')
+            supported = sys.platform == 'darwin' and subprocess.run(
+                ['cp', '-c', str(source), str(dest)], capture_output=True, check=False,
+            ).returncode == 0
+            source.unlink()
+            dest.unlink(missing_ok=True)
+            workers = 64
+            ready = Barrier(workers)
+
+            def probe(_):
+                ready.wait(timeout=30)
+                return ci._clonefile_supported(cache)
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(probe, range(workers)))
+            self.assertEqual(results, [supported] * workers)
+            self.assertEqual(list(cache.iterdir()), [])
 
     def test_unusable_host_download_cache_falls_back_to_checkout_local_cache(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -970,6 +996,19 @@ with ci.checkout_lock():
             busy = repo / '.worktrees' / 'busy'
             outside = base / 'outside-venv'
             outside.mkdir()
+            repo.mkdir()
+            git_env = clean_git_env()
+            git_env.update({
+                'GIT_AUTHOR_NAME': 'fixture', 'GIT_AUTHOR_EMAIL': 'fixture@example.invalid',
+                'GIT_COMMITTER_NAME': 'fixture', 'GIT_COMMITTER_EMAIL': 'fixture@example.invalid',
+            })
+            for command in (
+                ['git', 'init', '-b', 'main', str(repo)],
+                ['git', '-C', str(repo), 'commit', '--allow-empty', '-m', 'fixture'],
+                ['git', '-C', str(repo), 'worktree', 'add', '--detach', str(finished)],
+                ['git', '-C', str(repo), 'worktree', 'add', '--detach', str(busy)],
+            ):
+                subprocess.run(command, env=git_env, check=True, capture_output=True)
             for tree, payload in ((finished, b'finished'), (busy, b'busy')):
                 (tree / '.ci').mkdir(parents=True)
                 (tree / '.ci' / 'blob').write_bytes(payload)

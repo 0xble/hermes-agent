@@ -291,11 +291,11 @@ def host_ci_download_cache(root: Path = ROOT) -> Path:
     """
     override = os.environ.get('HERMES_CI_CACHE_DIR')
     cache = Path(override).expanduser() if override else Path.home() / '.local' / 'state' / 'hermes-ci-downloads'
-    cache.mkdir(parents=True, exist_ok=True)
     cache = cache.resolve()
     root_resolved = root.resolve()
     if cache == root_resolved or root_resolved in cache.parents:
         raise RuntimeError(f'CI download cache must live outside the checkout: {cache}')
+    cache.mkdir(parents=True, exist_ok=True)
     if cache.stat().st_dev != root_resolved.stat().st_dev:
         reason = f'host cache {cache} is not on the same volume as {root_resolved}'
     elif not _clonefile_supported(cache):
@@ -320,16 +320,21 @@ def uv_link_mode(cache: Path) -> str:
 def _clonefile_supported(directory: Path) -> bool:
     if sys.platform != 'darwin':
         return False
-    source = directory / '.clone-probe'
-    dest = directory / '.clone-probe-copy'
+    source = dest = None
     try:
-        source.write_bytes(b'x')
+        # Concurrent setups share this directory, but must never share probe files.
+        with tempfile.NamedTemporaryFile(prefix=f'.clone-probe-{os.getpid()}-', dir=directory, delete=False) as probe:
+            source = Path(probe.name)
+            dest = source.with_name(f'{source.name}-copy')
+            probe.write(b'x')
         command = ['cp', '-c', str(source), str(dest)]
         return subprocess.run(command, capture_output=True).returncode == 0 and dest.is_file()
     except OSError:
         return False
     finally:
         for path in (source, dest):
+            if path is None:
+                continue
             try:
                 path.unlink()
             except OSError:

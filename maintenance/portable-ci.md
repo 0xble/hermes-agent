@@ -59,9 +59,14 @@ If it is on another volume or APFS cloning is unavailable, CI logs the reason
 and retains the previous checkout-local `.ci/cache` paths instead of failing.
 `UV_LINK_MODE` is `clone` when the selected volume supports APFS copy-on-write
 and `copy` otherwise, so caches cannot fall back to hardlinks or symlinks.
+Clone probes use invocation-unique temporary files in the shared cache, so
+concurrent setups cannot invalidate each other's capability checks. Cache paths
+inside the checkout are rejected before creating directories.
 Before setup, a free-space floor sized for one 3-slot wave plus
 headroom reclaims generated directories from finished worktrees and refuses,
 naming the paths and the bytes still required, only when space is still short.
+Generated-output reclaim shares the attended pruner's ownership guards: kanban
+lifecycle trees and live Hermes session locks are preserved before inspection.
 There is no host-wide install lock. Fork patch identity: `ci-shared-download-caches`. Temporary homes live outside the checkout in invocation-owned system temporary directories.
 When Linux makes the normal disk-backed Python scratch path read-only, Python
 fixtures use a unique directory under the runner's original disk-backed HOME,

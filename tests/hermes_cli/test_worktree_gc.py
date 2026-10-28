@@ -223,6 +223,35 @@ class TestAuditVerdicts:
         assert "kanban" in record.reason
 
 
+class TestGeneratedReclaimOwnership:
+    @pytest.mark.parametrize("name,live_lock", [
+        ("t_deadbeef", False),
+        ("hermes-live", True),
+    ])
+    def test_owned_tree_generated_dirs_survive_permissive_safety_report(self, repo, tmp_path, name, live_lock):
+        tree, _ = _add_worktree(repo, name)
+        if live_lock:
+            _git(["worktree", "lock", str(tree),
+                  "--reason", f"hermes pid={os.getpid()}"], repo)
+        for relative in worktree_gc._GENERATED_RECLAIM_RELATIVE:
+            (tree / relative).mkdir(parents=True)
+            (tree / relative / "payload").write_bytes(b"keep")
+        marker = tmp_path / "inspected"
+        script = tmp_path / "safety.py"
+        script.write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).touch()\n"
+            'print(\'{"verdict":"safe-to-remove","reasons":[],"ignored_entries":[],'
+            '"dirty_entries":[],"active_cwd":false,"locked":false,"linked_worktree":true,'
+            '"integrated_or_patch_equivalent":true,"nested_repos":[],"inbound_live_symlinks":[]}\')\n'
+        )
+        removed = worktree_gc.reclaim_finished_generated(str(repo), safety_script=str(script))
+        assert removed == []
+        assert not marker.exists(), "ownership guards must run before external inspection"
+        for relative in worktree_gc._GENERATED_RECLAIM_RELATIVE:
+            assert (tree / relative / "payload").read_bytes() == b"keep"
+
+
 class TestReclaim:
     def test_reap_removes_tree_and_branch(self, repo):
         tree, branch = _add_worktree(repo, "hermes-clean")
