@@ -558,6 +558,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                             chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
                         )
                         if getattr(_edit_res, "success", False):
+                            from gateway.reply_latency import current_receipt, record_first_reply
+                            record_first_reply(current_receipt(), text_content, _edit_res)
                             _reconciled = True
                             delivered_confirmed = True
                             logger.info(
@@ -590,8 +592,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         return False
                     delivered_confirmed = True
         if copy_blocks and session_key and isinstance(adapter, BasePlatformAdapter):
+            from gateway.reply_latency import current_receipt
             queued_copy_event = MessageEvent(
                 text="", source=source, message_id=event_message_id, ledger_message_id=inbound_message_id)
+            queued_copy_event._reply_latency_receipt = current_receipt()
             copy_results = []
             await adapter._send_copy_blocks(
                 queued_copy_event, session_key, copy_blocks, _mark_notify_metadata(metadata),
@@ -674,6 +678,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
         else:
             result = await adapter.send(source.chat_id, text_content, metadata=metadata)
+        from gateway.reply_latency import current_receipt, record_first_reply
+        record_first_reply(current_receipt(), text_content, result)
         if not getattr(result, "success", False):
             logger.warning(
                 "Queued-lane final send to %s failed: %s", getattr(source, "chat_id", "?"),

@@ -29,12 +29,21 @@ The record's `turn_id` is the existing `outbox.transport_id(event)` known before
 admission, not the later randomly allocated outbox admission UUID. Preserve
 this distinction when adopting upstream event identities, or migrate the
 reader and producer together. Missing transport identities stay nullable.
-The local logging must stay independent of the shared-telemetry opt-in.
+The local logging must stay independent of the shared-telemetry opt-in. Stamp
+arrival before buffering, but emit `received` only after authorization. Diagnostic
+identity or log failures must not interrupt intake. Recursive queued follow-ups
+bind their own receipt and restore the head's context on exit. Their terminal
+receipt, including an explicit absence for event-less input, owns the outer final
+send without replacing the head's original receipt.
 
 ## Proof And Retirement
 
 [`test_reply_latency_logs.py`](../tests/gateway/test_reply_latency_logs.py)
-exercises the confirmed transport boundaries and cross-event isolation. Run it
+exercises the confirmed transport boundaries and cross-event isolation.
+[`test_reply_latency_followups.py`](../tests/gateway/test_reply_latency_followups.py)
+drives the real in-band drain through queued, interrupting and nested turns,
+including streaming, final-send attribution, failure and cancellation. It also
+covers unauthorized DMs and diagnostic failures during admission. Run these
 with the existing shared-metrics, stream-consumer and attended-activity tests
 when these lifecycles move. A native-frame or adapter-internal split cannot
 claim a delivery instant earlier than the acknowledgement the caller observes.

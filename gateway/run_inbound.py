@@ -296,8 +296,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
 
         # Capture before any admission buffer can park input for shutdown spooling,
         # including restore gates, compression deferral, and orphan FIFO rescue.
-        from gateway.reply_latency import record_received
-        record_received(event)
+        from gateway.reply_latency import record_received, stamp_received
+        stamp_received(event)
 
         reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
         startup_restore_keys = getattr(self, "_startup_restore_keys", None)
@@ -333,6 +333,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             await _admit_outbox_event(self, event, source)
             return event, source, True
         if getattr(event, "_fifo_only", False):  # a slash command's queued turn: its command passed ingress
+            record_received(event)
             return event, source, False
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
@@ -381,6 +382,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if not self._admit_bot_message_for_source(source):
                 return None
             event._bot_loop_admitted = True
+        record_received(event)
         await _admit_outbox_event(self, event, source)
         return event, source, False
 

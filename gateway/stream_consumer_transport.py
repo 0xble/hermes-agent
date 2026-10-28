@@ -431,6 +431,7 @@ class StreamTransportMixin:
             self._mark_final_delivered(record=text)  # recorded: stale frame can't suppress
         if await self._try_frame(self._send_frame(text, finalize=finalize),
                                  "send_stream_frame raised, disabling native streaming: %s"):
+            # Native-frame success is confirmed delivery, unlike the optimistic finalize above.
             self._record_first_reply(text)
             self._already_sent = True
             self._adopted_unconfirmed = None  # a landed frame supersedes any adopted text

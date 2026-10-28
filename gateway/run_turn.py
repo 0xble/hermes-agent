@@ -3353,6 +3353,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # message's id or it collides with an earlier turn's row carrying the same text. Reply
             # routing is untouched: the anchor still comes from this event.
             if isinstance(agent_result, dict):
+                if "queued_terminal_reply_receipt" in agent_result:
+                    event._terminal_reply_latency_receipt = agent_result["queued_terminal_reply_receipt"]
                 _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
                 if _terminal_inbound:
                     event.ledger_message_id = str(_terminal_inbound)
@@ -5251,7 +5253,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # result, including absorbed inputs, rather than borrowing the chain head's.
             for consumed_event in _consumed_events:
                 consumed_event._agent_turn_succeeded = False
+            from gateway.reply_latency import bind_agent_start, current_receipt, restore_receipt
+            _head_receipt = current_receipt()
             try:
+                bind_agent_start(pending_event)
+                _followup_receipt = current_receipt()
                 followup_result = await self._run_agent(
                     message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                     source=next_source, session_id=session_id, session_key=next_session_key,
@@ -5270,6 +5276,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 for consumed_event in _consumed_events:
                     consumed_event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(followup_result)
             finally:
+                restore_receipt(_head_receipt)
                 set_turn_origin(_head_origin)
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -5297,6 +5304,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             merged = {
                 **merged,
                 "queued_terminal_inbound_id": next_inbound_id,
+                "queued_terminal_reply_receipt": _followup_receipt,
                 "queued_terminal_display_kind": next_display_kind,
                 "queued_terminal_reply_expected": next_reply_expected,
                 "queued_terminal_notification_category": (
