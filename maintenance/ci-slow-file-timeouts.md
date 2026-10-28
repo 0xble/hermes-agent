@@ -15,6 +15,7 @@ Hosted Python/E2E shards must give a known-slow test file a per-file bound that 
 ## Entries
 
 - `tests/e2e/core/delivery/test_cron_virtual_clock_soak.py`: 600 s. Hosted shard 3 timings were 179.1 s (run 37707869254), 283.1 s (run 37709685397) and 294.8 s (run 37705343675) against a 300 s bound, leaving at most 5 s of headroom. 600 s is about 2x the worst observed passing run, so a real hang is still killed.
+- `tests/e2e/core/cli_tmux/test_classic_cli_live_session.py`: 900 s. [Run 40533318818](https://github.com/0xble/hermes-agent/actions/runs/40533318818/job/122314012670) passed all 3 tests in 285.9 s, and [run 40506266645 attempt 2](https://github.com/0xble/hermes-agent/actions/runs/40506266645/attempts/2) passed in 299.9 s. [Run 40534307665](https://github.com/0xble/hermes-agent/actions/runs/40534307665/job/122295247908) instead killed the file at 300.2 s with `returncode=-9`, `300s exceeded`, and only 2 tests complete. 900 s follows the runner's 3x clean-duration policy without relying on an untracked cache. The screen-settle waits also check for late tracebacks and safe next input, and the paste gap protects time-based paste detection, so this change preserves those waits and every needle/witness assertion. The unchanged runner still kills a hung process tree at the finite per-file bound.
 
 Add an entry only with hosted timing evidence. Remove one when its file is consistently well under 300 s.
 

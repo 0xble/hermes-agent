@@ -44,8 +44,15 @@ def refusal_evidence(source: str) -> Iterator[None]:
     try:
         yield
     except RuntimeStoreError as exc:
-        clause = f"{source}: {exc.reason}" + (f" ({exc.field})" if exc.field else "")
-        record_refusal(clause)
+        # Intentional stale-work fences are not a failed admission of live work.
+        # Unknown/restoring routes and missing live connectors still count, as do
+        # all native refusals, even if they happen to use the same reason/field.
+        stale = source == 'automation' and exc.reason == 'not_found' and exc.field in {
+            'automation_target_gone', 'automation_target_suspended',
+        }
+        if not stale:
+            clause = f"{source}: {exc.reason}" + (f" ({exc.field})" if exc.field else "")
+            record_refusal(clause)
         raise
     finally:
         _admitting.reset(token)
