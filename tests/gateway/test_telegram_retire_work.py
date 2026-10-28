@@ -455,7 +455,7 @@ async def test_relay_wait_exhaustion_resumes_persisted_receipt_after_restart(run
     result = await work.send_receipt(restarted, r.source, checkpoint, item, dest, "handoff", ("--task", "t1"))
     assert result["receipt_id"] == "r1"
     assert command.await_count == 3
-    assert command.await_args.args[2] == "status"
+    assert command.await_args.args[-4:] == ("status", "--wait", f"{work.RELAY_CONFIRM_WAIT}s", "r1")
 
 
 @pytest.mark.asyncio
@@ -566,7 +566,7 @@ async def test_task_handoff_preserves_reportback_and_reconciles_assignment(runti
     dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
     assert (await work.receipt(r.runner, r.source, r.state, item, dest))["receipt_id"] == "r1"
     assert (await work.receipt(r.runner, r.source, r.state, item, dest))["receipt_id"] == "r1"
-    assert len(writes) == 1 and len(keys) == 2 and keys[0] == keys[1]
+    assert len(writes) == 1 and len(keys) == 1
     # This is the tasks ledger's reporting predicate, not just a target inbox lookup.
     assert assignments[-1]["assigned_by"] == assignments[-1]["report_to"]
 
@@ -607,7 +607,7 @@ async def test_native_handoff_is_created_under_destination_not_reassigned_on_ret
     for _ in range(2):
         assert (await work.receipt(r.runner, r.source, r.state, item, dest))["receipt_id"] == "r1"
     assert len(keys) == 2 and keys[0] == keys[1]
-    assert len(assignments) == 1 and len(sends) == 2
+    assert len(assignments) == 1 and len(sends) == 1
 
 
 @pytest.mark.asyncio
